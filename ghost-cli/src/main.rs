@@ -22,6 +22,9 @@ enum Command {
         /// Do not record this session (recording is on by default).
         #[arg(long)]
         no_record: bool,
+        /// Scrollback lines retained for replay on attach.
+        #[arg(long, default_value_t = ghost_vt::screen::DEFAULT_SCROLLBACK)]
+        scrollback: usize,
         /// Command to run instead of $SHELL (everything after `--`).
         #[arg(last = true)]
         command: Vec<String>,
@@ -46,6 +49,7 @@ fn main() {
         Command::New {
             name,
             no_record,
+            scrollback,
             command,
         } => {
             let name = name.unwrap_or_else(default_name);
@@ -55,6 +59,7 @@ fn main() {
                 command,
                 size: (80, 24),
                 record,
+                scrollback,
             };
             match server::spawn(opts) {
                 Ok(()) => println!("started session '{name}'"),

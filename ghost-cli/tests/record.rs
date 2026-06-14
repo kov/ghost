@@ -89,3 +89,44 @@ fn no_record_flag_skips_recording() {
         path.display()
     );
 }
+
+#[test]
+fn long_session_writes_checkpoints() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-checkpoints";
+
+    // Emit far more than the host's checkpoint interval, then a sentinel, then
+    // exit. The sentinel lets us know the whole recording has been flushed
+    // before we inspect it (the file is written concurrently as the session
+    // runs, and a mid-write read would be incomplete).
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("XDG_DATA_HOME", data.path())
+        .args(["new", name, "--", "sh", "-c", "seq 1 60000; echo DONE-CHK"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let path = recording_path(data.path(), name);
+    // Wait until the recording is complete (sentinel present) and reconstructs
+    // to the true final screen, with at least one mid-session checkpoint.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let Ok(rec) = record::read(&path) else {
+                return false;
+            };
+            if rec.checkpoint_count() < 1 {
+                return false;
+            }
+            let screen = ghost_vt::screen::Screen::from_recording(&rec, 1000);
+            screen.text().iter().any(|l| l.contains("DONE-CHK"))
+        }),
+        "recording lacked a checkpoint or did not reconstruct to completion at {}",
+        path.display()
+    );
+}

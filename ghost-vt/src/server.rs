@@ -12,7 +12,7 @@
 
 use crate::paths;
 use crate::protocol::{ClientMsg, FrameReader, ServerMsg, encode};
-use crate::screen::{DEFAULT_SCROLLBACK, Screen};
+use crate::screen::Screen;
 use nix::sys::signal::Signal;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, open};
@@ -31,7 +31,14 @@ pub struct SpawnOpts {
     pub size: (u16, u16),
     /// Where to record the session, or `None` to not record.
     pub record: Option<std::path::PathBuf>,
+    /// Bound on retained scrollback lines for resync on attach.
+    pub scrollback: usize,
 }
+
+/// Write a recording checkpoint once this many bytes of output have been
+/// recorded since the last one. Bounds replay cost and gives a safe cut point
+/// for bounding the recording's size.
+const CHECKPOINT_INTERVAL_BYTES: usize = 128 * 1024;
 
 enum Fork {
     Parent,
@@ -132,7 +139,7 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
 
     // Authoritative screen state, fed every byte the child writes so a late
     // attach can be repainted to the current state.
-    let mut screen = Screen::new(cols, rows, DEFAULT_SCROLLBACK);
+    let mut screen = Screen::new(cols, rows, opts.scrollback);
 
     // Optional durable recording. Best-effort: if it cannot be created, the
     // session still runs (just unrecorded).
@@ -140,6 +147,7 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
         .record
         .as_ref()
         .and_then(|path| crate::record::FileRecorder::create(path, cols, rows, &opts.command).ok());
+    let mut bytes_since_checkpoint = 0usize;
 
     let mut client: Option<Client> = None;
     let mut ptybuf = [0u8; 8192];
@@ -183,6 +191,12 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                     screen.feed(&ptybuf[..n]);
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
+                        bytes_since_checkpoint += n;
+                        if bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES {
+                            let (c, rws) = screen.dimensions();
+                            let _ = r.checkpoint(c, rws, &screen.dump());
+                            bytes_since_checkpoint = 0;
+                        }
                     }
                     // Live output only flows once the client has been resynced;
                     // anything before that is already captured in the resync.
@@ -272,13 +286,12 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
         if sig_re.contains(PollFlags::IN) {
             for signo in crate::signals::drain(&sfd)? {
                 match signo {
-                    libc::SIGCHLD => {
-                        if let Ok(Some(status)) = child.try_wait() {
-                            let code = status.code().unwrap_or(0);
-                            notify_exit(&mut client, code);
-                            return Ok(code);
-                        }
-                    }
+                    // The child exiting is NOT our cue to stop: there may still
+                    // be buffered output on the PTY. Exit is driven by PTY EOF
+                    // (read returns 0 / EIO) once the master is fully drained,
+                    // so the tail — and the recording — is complete. The child
+                    // is reaped there via `child_exited`.
+                    libc::SIGCHLD => {}
                     libc::SIGTERM | libc::SIGINT => {
                         let _ = child.kill();
                         let _ = child.wait();

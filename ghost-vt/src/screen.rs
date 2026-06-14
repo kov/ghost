@@ -11,6 +11,7 @@
 //! sequence so the authoritative state is never corrupted (invalid bytes become
 //! U+FFFD, matching `String::from_utf8_lossy`).
 
+use crate::record::{Item, Recording};
 use vt::Vt;
 
 /// Default bound on retained scrollback lines. Keeps host memory bounded; the
@@ -19,6 +20,8 @@ pub const DEFAULT_SCROLLBACK: usize = 1000;
 
 pub struct Screen {
     vt: Vt,
+    cols: u16,
+    rows: u16,
     /// Incomplete trailing UTF-8 bytes carried over from the previous feed.
     pending: Vec<u8>,
 }
@@ -31,8 +34,43 @@ impl Screen {
             .build();
         Screen {
             vt,
+            cols,
+            rows,
             pending: Vec::new(),
         }
+    }
+
+    /// Reconstruct a screen by replaying a recording from its most recent
+    /// checkpoint (or from the start if it has none). The checkpoint's dump
+    /// restores the emulator state; the items after it bring it current. This
+    /// is how the archival recording is turned back into live emulator state
+    /// (for export, or to bound the recording at a checkpoint).
+    pub fn from_recording(rec: &Recording, scrollback_limit: usize) -> Self {
+        let (mut screen, rest) = match rec.latest_checkpoint() {
+            Some(i) => {
+                let Item::Checkpoint {
+                    cols, rows, dump, ..
+                } = &rec.items[i]
+                else {
+                    unreachable!("latest_checkpoint indexes a checkpoint");
+                };
+                let mut screen = Screen::new(*cols, *rows, scrollback_limit);
+                screen.feed(dump);
+                (screen, &rec.items[i + 1..])
+            }
+            None => (
+                Screen::new(rec.header.cols, rec.header.rows, scrollback_limit),
+                &rec.items[..],
+            ),
+        };
+        for item in rest {
+            match item {
+                Item::Output { data, .. } => screen.feed(data),
+                Item::Resize { cols, rows, .. } => screen.resize(*cols, *rows),
+                Item::Checkpoint { .. } => {}
+            }
+        }
+        screen
     }
 
     /// Feed raw PTY bytes, decoding as much valid UTF-8 as possible and holding
@@ -73,7 +111,21 @@ impl Screen {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
         self.vt.resize(cols as usize, rows as usize);
+    }
+
+    /// Current terminal size as `(cols, rows)`.
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
+    /// The emulator state as an extended dump (scrollback + viewport + modes).
+    /// Feeding these bytes to a fresh terminal reconstructs the state; this is
+    /// what a recording checkpoint stores.
+    pub fn dump(&self) -> Vec<u8> {
+        self.vt.dump_with_scrollback().into_bytes()
     }
 
     /// A byte sequence that, sent to a real terminal, clears it and repaints the
@@ -81,9 +133,14 @@ impl Screen {
     /// visible screen only (not the client terminal's own scrollback); the
     /// replayed history scrolls in above the viewport.
     pub fn resync(&self) -> Vec<u8> {
-        let mut seq = String::from("\x1b[2J\x1b[H");
-        seq.push_str(&self.vt.dump_with_scrollback());
-        seq.into_bytes()
+        let mut seq = Vec::from(b"\x1b[2J\x1b[H".as_slice());
+        seq.extend_from_slice(&self.dump());
+        seq
+    }
+
+    /// The current screen as text lines (scrollback + viewport).
+    pub fn text(&self) -> Vec<String> {
+        self.vt.text()
     }
 }
 
@@ -145,5 +202,50 @@ mod tests {
             replay.lines().any(|l| l.text().contains("row-0")),
             "scrolled-off line not replayed"
         );
+    }
+
+    #[test]
+    fn reconstructs_from_checkpoint_and_bound() {
+        use crate::record::{Recorder, read_bytes, truncate_before_latest_checkpoint};
+
+        // Build a recording with a checkpoint partway, plus a resize after it,
+        // while tracking the true (live) state for comparison.
+        let mut live = Screen::new(20, 5, 1000);
+        let mut buf = Vec::new();
+        {
+            let mut rec = Recorder::new(&mut buf, 20, 5, &[]).unwrap();
+            for i in 0..15 {
+                let line = format!("line-{i}\r\n");
+                rec.output(line.as_bytes()).unwrap();
+                live.feed(line.as_bytes());
+            }
+            let (c, r) = live.dimensions();
+            rec.checkpoint(c, r, &live.dump()).unwrap();
+            for i in 15..25 {
+                let line = format!("line-{i}\r\n");
+                rec.output(line.as_bytes()).unwrap();
+                live.feed(line.as_bytes());
+            }
+            rec.resize(30, 5).unwrap();
+            live.resize(30, 5);
+            for i in 25..30 {
+                let line = format!("line-{i}\r\n");
+                rec.output(line.as_bytes()).unwrap();
+                live.feed(line.as_bytes());
+            }
+            rec.flush().unwrap();
+        }
+
+        // Reconstructing from the full recording (which replays from the latest
+        // checkpoint) reproduces the live screen exactly.
+        let full = read_bytes(&buf).unwrap();
+        let from_full = Screen::from_recording(&full, 1000);
+        assert_eq!(from_full.text(), live.text());
+
+        // Bounding the recording at its checkpoint loses no reconstructable
+        // state: it yields the same screen.
+        let bounded = read_bytes(&truncate_before_latest_checkpoint(&buf).unwrap()).unwrap();
+        let from_bounded = Screen::from_recording(&bounded, 1000);
+        assert_eq!(from_bounded.text(), live.text());
     }
 }
