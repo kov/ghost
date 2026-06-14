@@ -40,7 +40,10 @@ pub struct Detacher {
 
 impl Detacher {
     pub fn new(prefix: u8) -> Self {
-        Self { prefix, armed: false }
+        Self {
+            prefix,
+            armed: false,
+        }
     }
 
     pub fn with_default_prefix() -> Self {
@@ -134,7 +137,7 @@ mod tests {
     fn prefix_split_across_feeds() {
         let mut det = d();
         assert_eq!(det.feed(&[P]), vec![]);
-        assert_eq!(det.feed(&[b'd']), vec![Action::Detach]);
+        assert_eq!(det.feed(b"d"), vec![Action::Detach]);
     }
 
     #[test]

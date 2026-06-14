@@ -74,8 +74,7 @@ fn pid_alive(pid: i32) -> bool {
     // Signal 0 performs error checking without sending a signal. EPERM means the
     // process exists but we may not signal it — still "alive" for our purposes.
     unsafe {
-        libc::kill(pid, 0) == 0
-            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
 

@@ -41,7 +41,11 @@ fn main() {
     match cli.command {
         Command::New { name, command } => {
             let name = name.unwrap_or_else(default_name);
-            let opts = SpawnOpts { name: name.clone(), command, size: (80, 24) };
+            let opts = SpawnOpts {
+                name: name.clone(),
+                command,
+                size: (80, 24),
+            };
             match server::spawn(opts) {
                 Ok(()) => println!("started session '{name}'"),
                 Err(e) => fail(&e.to_string()),

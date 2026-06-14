@@ -41,8 +41,8 @@ const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Encode a message as a length-prefixed frame ready to write to a stream.
 pub fn encode<M: Serialize>(msg: &M) -> Vec<u8> {
-    let body = postcard::to_allocvec(msg)
-        .expect("postcard encoding of protocol messages cannot fail");
+    let body =
+        postcard::to_allocvec(msg).expect("postcard encoding of protocol messages cannot fail");
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(&body);
@@ -82,8 +82,12 @@ impl FrameReader {
         if self.buf.len() < 4 + len {
             return Ok(None);
         }
-        let msg = postcard::from_bytes(&self.buf[4..4 + len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("malformed protocol frame: {e}")))?;
+        let msg = postcard::from_bytes(&self.buf[4..4 + len]).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed protocol frame: {e}"),
+            )
+        })?;
         self.buf.drain(..4 + len);
         Ok(Some(msg))
     }
@@ -141,7 +145,10 @@ mod tests {
         bytes.extend_from_slice(&encode(&ClientMsg::Kill));
         let mut r = FrameReader::new();
         r.push(&bytes);
-        assert_eq!(r.next_msg::<ClientMsg>().unwrap().unwrap(), ClientMsg::Detach);
+        assert_eq!(
+            r.next_msg::<ClientMsg>().unwrap().unwrap(),
+            ClientMsg::Detach
+        );
         assert_eq!(r.next_msg::<ClientMsg>().unwrap().unwrap(), ClientMsg::Kill);
         assert!(r.next_msg::<ClientMsg>().unwrap().is_none());
     }

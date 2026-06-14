@@ -1,0 +1,3 @@
+# Skip the vendored avt fork: keep it byte-for-byte close to upstream so rebases
+# stay clean. Our own crates use default rustfmt formatting.
+ignore = ["vt"]

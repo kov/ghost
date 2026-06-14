@@ -71,7 +71,8 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
     // Open the PTY and spawn the child under it.
     let (pty, pts) = pty_process::blocking::open().map_err(io::Error::other)?;
     let (cols, rows) = opts.size;
-    pty.resize(Size::new(rows, cols)).map_err(io::Error::other)?;
+    pty.resize(Size::new(rows, cols))
+        .map_err(io::Error::other)?;
     let (prog, args) = split_command(&opts.command);
     let mut child = PtyCommand::new(&prog)
         .args(&args)
@@ -153,7 +154,11 @@ unsafe fn daemonize() -> io::Result<Fork> {
     }
     let _ = std::env::set_current_dir("/");
     unsafe { libc::umask(0) };
-    if let Ok(devnull) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null") {
+    if let Ok(devnull) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
         let nfd = devnull.as_raw_fd();
         unsafe {
             libc::dup2(nfd, 0);

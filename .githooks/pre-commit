@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit checks for ghost. To enable in this clone:
+#   git config core.hooksPath .githooks
+#
+# We are strict on our own crates (ghost-vt, ghost-cli) but lenient on the
+# vendored avt fork in vt/ (package `avt`): formatting it would create needless
+# diffs against upstream and complicate rebases. So fmt skips vt/ via
+# rustfmt.toml's `ignore`, and clippy excludes the `avt` package here.
+
+cargo fmt --all -- --check || {
+    echo "cargo fmt found issues; run 'cargo fmt --all' to fix" >&2
+    exit 1
+}
+
+cargo clippy --workspace --exclude avt --all-targets -- -D warnings || {
+    echo "cargo clippy found issues" >&2
+    exit 1
+}
