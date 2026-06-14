@@ -250,6 +250,26 @@ mod tests {
     }
 
     #[test]
+    fn dump_restores_non_display_modes() {
+        let mut vt = Vt::new(20, 5);
+        // An app enables mouse tracking, SGR coordinates, focus, and paste.
+        vt.feed_str("\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
+        let dump = vt.dump();
+        for seq in ["\x1b[?1000h", "\x1b[?1006h", "\x1b[?1004h", "\x1b[?2004h"] {
+            assert!(dump.contains(seq), "dump missing {seq:?}: {dump:?}");
+        }
+
+        // Disabling a mode drops it from the dump.
+        vt.feed_str("\x1b[?1000l");
+        assert!(!vt.dump().contains("\x1b[?1000h"));
+
+        // And the dump round-trips into an equivalent terminal.
+        let mut vt2 = Vt::new(20, 5);
+        vt2.feed_str(&vt.dump());
+        assert_vts_eq(&vt, &vt2);
+    }
+
+    #[test]
     fn dump_with_file() {
         if let Ok((w, h, input, step)) = setup_dump_with_file() {
             let mut vt1 = Vt::new(w, h);

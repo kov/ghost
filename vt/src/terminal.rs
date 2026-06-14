@@ -14,6 +14,7 @@ use crate::parser::{
 use crate::pen::{Intensity, Pen};
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::mem;
 
 #[derive(Debug)]
@@ -40,6 +41,9 @@ pub struct Terminal {
     alternate_saved_ctx: SavedCtx,
     dirty_lines: DirtyLines,
     xtwinops: bool,
+    /// Enabled non-display modes (mouse/focus/paste). Tracked but not rendered;
+    /// re-emitted on dump so they survive a reattach.
+    tracked_modes: BTreeSet<DecMode>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -119,6 +123,7 @@ impl Terminal {
             alternate_saved_ctx: SavedCtx::default(),
             dirty_lines,
             xtwinops: false,
+            tracked_modes: BTreeSet::new(),
         }
     }
 
@@ -615,6 +620,7 @@ impl Terminal {
         self.saved_ctx = SavedCtx::default();
         self.alternate_saved_ctx = SavedCtx::default();
         self.dirty_lines = DirtyLines::new(self.rows);
+        self.tracked_modes.clear();
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -691,6 +697,7 @@ impl Terminal {
         assert_eq!(self.bottom_margin, other.bottom_margin);
         assert_eq!(self.saved_ctx, other.saved_ctx);
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
+        assert_eq!(self.tracked_modes, other.tracked_modes);
 
         assert_eq!(
             self.primary_buffer().view().collect::<Vec<_>>(),
@@ -1280,6 +1287,12 @@ impl Terminal {
                     self.switch_to_alternate_buffer();
                     self.reflow();
                 }
+
+                // Non-display modes: just remember they are on.
+                m if m.is_non_display() => {
+                    self.tracked_modes.insert(m);
+                }
+                _ => unreachable!(),
             }
         }
     }
@@ -1320,6 +1333,12 @@ impl Terminal {
                     self.restore_cursor();
                     self.reflow();
                 }
+
+                // Non-display modes: just remember they are off.
+                m if m.is_non_display() => {
+                    self.tracked_modes.remove(&m);
+                }
+                _ => unreachable!(),
             }
         }
     }
@@ -1592,6 +1611,13 @@ impl Terminal {
 
         if self.cursor_keys_mode == CursorKeysMode::Application {
             funs.push(Function::Decset(DecModes::one(DecMode::CursorKeys)));
+        }
+
+        // 15. re-enable non-display modes (mouse / focus / paste). Order is
+        // deterministic (BTreeSet by discriminant) and these don't move the
+        // cursor or touch the grid, so they are safe to emit last.
+        for &mode in &self.tracked_modes {
+            funs.push(Function::Decset(DecModes::one(mode)));
         }
 
         funs

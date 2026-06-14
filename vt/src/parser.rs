@@ -102,16 +102,41 @@ pub enum CtcOp {
     ClearAll,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub enum DecMode {
-    CursorKeys = 1,                   // DECCKM
-    Origin = 6,                       // DECOM
-    AutoWrap = 7,                     // DECAWM
-    TextCursorEnable = 25,            // DECTCEM
+    CursorKeys = 1,        // DECCKM
+    Origin = 6,            // DECOM
+    AutoWrap = 7,          // DECAWM
+    TextCursorEnable = 25, // DECTCEM
+    // Non-display modes: tracked but not rendered, so a state dump can restore
+    // them on reattach. They affect what the terminal *sends*, not the grid.
+    MouseReportX11 = 1000,            // button press/release
+    MouseReportButton = 1002,         // button-event tracking (drag)
+    MouseReportAny = 1003,            // any-event tracking (all motion)
+    FocusReport = 1004,               // focus in/out events
+    MouseSgr = 1006,                  // SGR extended coordinate encoding
     AltScreenBuffer = 1047,           // xterm
     SaveCursor = 1048,                // xterm
     SaveCursorAltScreenBuffer = 1049, // xterm
+    BracketedPaste = 2004,            // wrap pastes in ESC[200~ / ESC[201~
+}
+
+impl DecMode {
+    /// Whether this is a non-display mode — tracked and re-emitted on dump, but
+    /// with no effect on the rendered grid.
+    pub(crate) fn is_non_display(self) -> bool {
+        use DecMode::*;
+        matches!(
+            self,
+            MouseReportX11
+                | MouseReportButton
+                | MouseReportAny
+                | FocusReport
+                | MouseSgr
+                | BracketedPaste
+        )
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -1010,9 +1035,15 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    MouseReportX11 => 1000,
+                    MouseReportButton => 1002,
+                    MouseReportAny => 1003,
+                    FocusReport => 1004,
+                    MouseSgr => 1006,
                     AltScreenBuffer => 1047,
                     SaveCursor => 1048,
                     SaveCursorAltScreenBuffer => 1049,
+                    BracketedPaste => 2004,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1031,9 +1062,15 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    MouseReportX11 => 1000,
+                    MouseReportButton => 1002,
+                    MouseReportAny => 1003,
+                    FocusReport => 1004,
+                    MouseSgr => 1006,
                     AltScreenBuffer => 1047,
                     SaveCursor => 1048,
                     SaveCursorAltScreenBuffer => 1049,
+                    BracketedPaste => 2004,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1488,9 +1525,15 @@ fn dec_mode(param: &Param) -> Option<DecMode> {
         7 => Some(AutoWrap),
         25 => Some(TextCursorEnable),
         47 => Some(AltScreenBuffer), // legacy variant of 1047
+        1000 => Some(MouseReportX11),
+        1002 => Some(MouseReportButton),
+        1003 => Some(MouseReportAny),
+        1004 => Some(FocusReport),
+        1006 => Some(MouseSgr),
         1047 => Some(AltScreenBuffer),
         1048 => Some(SaveCursor),
         1049 => Some(SaveCursorAltScreenBuffer),
+        2004 => Some(BracketedPaste),
         _ => None,
     }
 }
@@ -1891,6 +1934,21 @@ mod tests {
         assert_eq!(parser.feed('\u{1a}'), None);
         assert_eq!(parser.state, State::Ground);
         assert_eq!(parser.feed('D'), Some(Print('D')));
+    }
+
+    #[test]
+    fn parse_non_display_modes() {
+        use DecMode::*;
+        assert_eq!(parse("\x1b[?1000h"), [Decset(dec_modes([MouseReportX11]))]);
+        assert_eq!(
+            parse("\x1b[?1002h"),
+            [Decset(dec_modes([MouseReportButton]))]
+        );
+        assert_eq!(parse("\x1b[?1003h"), [Decset(dec_modes([MouseReportAny]))]);
+        assert_eq!(parse("\x1b[?1004h"), [Decset(dec_modes([FocusReport]))]);
+        assert_eq!(parse("\x1b[?1006h"), [Decset(dec_modes([MouseSgr]))]);
+        assert_eq!(parse("\x1b[?2004h"), [Decset(dec_modes([BracketedPaste]))]);
+        assert_eq!(parse("\x1b[?1000l"), [Decrst(dec_modes([MouseReportX11]))]);
     }
 
     #[test]

@@ -205,6 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn resync_restores_mouse_and_paste_modes() {
+        // An app (vim/htop-style) enables mouse tracking, SGR coordinates, and
+        // bracketed paste. After a detach/reattach these must be restored, or
+        // mouse and paste stop working in the reattached terminal.
+        let mut s = Screen::new(80, 24, 100);
+        s.feed(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+        let seq = s.resync();
+        let text = String::from_utf8_lossy(&seq);
+        for mode in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h", "\x1b[?2004h"] {
+            assert!(text.contains(mode), "resync missing {mode:?}");
+        }
+    }
+
+    #[test]
     fn reconstructs_from_checkpoint_and_bound() {
         use crate::record::{Recorder, read_bytes, truncate_before_latest_checkpoint};
 
