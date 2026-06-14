@@ -112,6 +112,26 @@ impl Attached {
         self.vt.lock().unwrap().text()
     }
 
+    /// The cursor's current position as `(row, col)`, both 0-based.
+    fn cursor(&self) -> (usize, usize) {
+        let c = self.vt.lock().unwrap().cursor();
+        (c.row, c.col)
+    }
+
+    /// Wait until `pred` holds, or time out.
+    fn wait_until(&self, timeout: Duration, mut pred: impl FnMut(&Self) -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Wait until the visible screen satisfies `pred`, or time out.
     fn wait_for_screen(&self, timeout: Duration, mut pred: impl FnMut(&[String]) -> bool) -> bool {
         let start = Instant::now();
@@ -406,5 +426,57 @@ fn reattach_replays_scrollback() {
         term2.wait_for_screen(Duration::from_secs(5), screen_contains("FIRST-LINE-MARKER")),
         "reattach did not replay scrollback; got: {:?}",
         term2.screen()
+    );
+}
+
+#[test]
+fn resync_uses_the_attaching_clients_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-size";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Default 80-wide session: print 50 X's with no newline (cursor ends at
+    // column 50, comfortably within 80 columns), then idle.
+    let fifty_x = "X".repeat(50);
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf '{fifty_x}'; exec cat"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // Attach at 40 columns — narrower than the session. If the host repaints at
+    // the client's size, the 50 X's wrap at column 40 and the cursor settles at
+    // column 10 on the second visual row's worth of cells; if it repaints at the
+    // stale 80-column size, the absolute cursor move clamps to the last column
+    // (39). The wrapped text reads the same either way, so we check the cursor
+    // column. (avt keeps the cursor on row 0 across reflow, so only the column
+    // distinguishes the two.)
+    let term = Attached::new(xdg, name, 40, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("XXXXXXXXXX")),
+        "session content never replayed; got: {:?}",
+        term.screen()
+    );
+    assert!(
+        term.wait_until(Duration::from_secs(5), |t| t.cursor() == (0, 10)),
+        "resync was not laid out at the client's width (cursor at {:?}, expected (0, 10)); screen: {:?}",
+        term.cursor(),
+        term.screen()
     );
 }

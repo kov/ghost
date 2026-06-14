@@ -42,6 +42,11 @@ struct Client {
     reader: FrameReader,
     /// Output queued for the client but not yet written (backpressure buffer).
     outbuf: Vec<u8>,
+    /// Whether the initial repaint has been sent. The first thing a client
+    /// sends is its size; we hold back live output and the resync until then,
+    /// so the repaint is laid out at the client's real geometry and the client
+    /// never sees pre-resync bytes.
+    resynced: bool,
 }
 
 impl Client {
@@ -51,6 +56,7 @@ impl Client {
             stream,
             reader: FrameReader::new(),
             outbuf: Vec::new(),
+            resynced: false,
         })
     }
 
@@ -166,7 +172,11 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
                     screen.feed(&ptybuf[..n]);
-                    if let Some(c) = &mut client {
+                    // Live output only flows once the client has been resynced;
+                    // anything before that is already captured in the resync.
+                    if let Some(c) = &mut client
+                        && c.resynced
+                    {
                         c.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
                     }
                 }
@@ -177,14 +187,13 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
             }
         }
 
-        // New connection: the latest attach takes over and is repainted to the
-        // current screen state before any live bytes follow.
+        // New connection: the latest attach takes over. The repaint is deferred
+        // until the client reports its size (its first message), so it is laid
+        // out at the right geometry.
         if listener_re.contains(PollFlags::IN)
             && let Ok((stream, _)) = listener.accept()
         {
-            let mut c = Client::new(stream)?;
-            c.queue(&ServerMsg::Output(screen.resync()));
-            client = Some(c);
+            client = Some(Client::new(stream)?);
         }
 
         // Client -> host (input and control messages).
@@ -204,6 +213,12 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
                                     let _ = pty.resize(Size::new(rows, cols));
                                     screen.resize(cols, rows);
+                                    // The first resize completes the attach
+                                    // handshake: repaint at the now-known size.
+                                    if !c.resynced {
+                                        c.queue(&ServerMsg::Output(screen.resync()));
+                                        c.resynced = true;
+                                    }
                                 }
                                 Ok(Some(ClientMsg::Detach)) => {
                                     drop_client = true;
