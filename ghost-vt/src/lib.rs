@@ -17,6 +17,7 @@ pub mod paths;
 pub mod protocol;
 pub mod pty;
 pub mod record;
+pub mod screen;
 pub mod server;
 pub mod session;
 mod signals;

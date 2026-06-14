@@ -12,6 +12,7 @@
 
 use crate::paths;
 use crate::protocol::{ClientMsg, FrameReader, ServerMsg, encode};
+use crate::screen::{DEFAULT_SCROLLBACK, Screen};
 use nix::sys::signal::Signal;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, open};
@@ -121,6 +122,10 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
 
     let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
 
+    // Authoritative screen state, fed every byte the child writes so a late
+    // attach can be repainted to the current state.
+    let mut screen = Screen::new(cols, rows, DEFAULT_SCROLLBACK);
+
     let mut client: Option<Client> = None;
     let mut ptybuf = [0u8; 8192];
 
@@ -153,12 +158,14 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
         };
         drop(fds);
 
-        // PTY output -> attached client (discarded if nobody is attached;
-        // bounded scrollback replay on attach comes with a later milestone).
+        // PTY output -> authoritative screen state, and live to the attached
+        // client (if any). State is always tracked so the next attach can be
+        // repainted even after a period with nobody attached.
         if pty_re.intersects(PollFlags::IN | PollFlags::HUP) {
             match (&pty).read(&mut ptybuf) {
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
+                    screen.feed(&ptybuf[..n]);
                     if let Some(c) = &mut client {
                         c.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
                     }
@@ -170,11 +177,14 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
             }
         }
 
-        // New connection: the latest attach takes over.
+        // New connection: the latest attach takes over and is repainted to the
+        // current screen state before any live bytes follow.
         if listener_re.contains(PollFlags::IN)
             && let Ok((stream, _)) = listener.accept()
         {
-            client = Some(Client::new(stream)?);
+            let mut c = Client::new(stream)?;
+            c.queue(&ServerMsg::Output(screen.resync()));
+            client = Some(c);
         }
 
         // Client -> host (input and control messages).
@@ -193,6 +203,7 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                                 }
                                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
                                     let _ = pty.resize(Size::new(rows, cols));
+                                    screen.resize(cols, rows);
                                 }
                                 Ok(Some(ClientMsg::Detach)) => {
                                     drop_client = true;

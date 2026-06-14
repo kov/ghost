@@ -299,3 +299,58 @@ fn resize_propagates_to_session_child() {
         term.screen()
     );
 }
+
+#[test]
+fn reattach_replays_screen_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-replay";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The session prints a marker exactly once, then keeps running (`cat`).
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "echo PERSISTENT-MARKER; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // First attach sees the marker live.
+    let mut term = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("PERSISTENT-MARKER")),
+        "marker never appeared on first attach; got: {:?}",
+        term.screen()
+    );
+
+    // Detach and reconnect. The marker was printed once, long ago, so it can
+    // only reappear if the host replays its authoritative screen state on
+    // attach — the live stream never repeats it.
+    term.send(b"\x1cd");
+    assert!(
+        term.wait_exit(Duration::from_secs(5)),
+        "client did not exit after detach"
+    );
+    drop(term);
+
+    let term2 = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term2.wait_for_screen(Duration::from_secs(5), screen_contains("PERSISTENT-MARKER")),
+        "reattach did not replay screen state; got: {:?}",
+        term2.screen()
+    );
+}
