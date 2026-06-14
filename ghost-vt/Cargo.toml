@@ -6,5 +6,6 @@ license.workspace = true
 description = "Run a terminal in the background and reattach without losing scrollback, mouse, or keybindings."
 
 [dependencies]
-# The vendored avt fork (workspace member `vt/`, upstream package name `avt`)
-# is wired in once it has been brought in via `git subtree`.
+# The vendored avt fork: workspace member `vt/`, upstream package name `avt`,
+# referred to locally as `vt`. Kept structurally close to upstream for rebasing.
+vt = { package = "avt", path = "../vt" }

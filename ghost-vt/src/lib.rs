@@ -18,3 +18,7 @@ pub mod record;
 pub mod server;
 pub mod session;
 pub mod transport;
+
+/// The vendored virtual-terminal engine — a fork of asciinema's `avt` — used as
+/// the authoritative server-side screen and scrollback state.
+pub use vt::Vt;
