@@ -173,6 +173,15 @@ fn attach_streams_session_output() {
 }
 
 impl Attached {
+    /// Resize the underlying terminal, as a windowing system would when the
+    /// user resizes the window. Mirrors the change into our `vt` so the parsed
+    /// screen matches a real terminal, and delivers SIGWINCH to the attached
+    /// client (the foreground process of this PTY).
+    fn resize(&self, cols: u16, rows: u16) {
+        self.pty.resize(Size::new(rows, cols)).expect("resize pty");
+        self.vt.lock().unwrap().resize(cols as usize, rows as usize);
+    }
+
     /// Wait for the client process to exit, returning whether it did in time.
     fn wait_exit(&mut self, timeout: Duration) -> bool {
         let start = Instant::now();
@@ -239,5 +248,54 @@ fn detach_keeps_session_alive_then_reattach() {
         term2.wait_for_screen(Duration::from_secs(5), screen_contains("second-marker")),
         "reattached session did not echo; got: {:?}",
         term2.screen()
+    );
+}
+
+#[test]
+fn resize_propagates_to_session_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-resize";
+    let _guard = KillOnDrop { xdg, name };
+
+    // A child that continuously reports its terminal size (`stty size` prints
+    // "rows cols"). After the host resizes its PTY the new dimensions show up
+    // on the next iteration — no dependence on signal-delivery timing.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "while :; do stty size; sleep 0.2; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let term = Attached::new(xdg, name, 80, 24);
+    // The child first reports the initial 24x80 size.
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("24 80")),
+        "initial size never reported; got: {:?}",
+        term.screen()
+    );
+
+    // Resizing the terminal must reach the child through the
+    // client -> host -> PTY resize path.
+    term.resize(100, 30);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("30 100")),
+        "resized size never reached the child; got: {:?}",
+        term.screen()
     );
 }
