@@ -13,6 +13,7 @@
 
 pub mod client;
 pub mod keys;
+pub mod paths;
 pub mod protocol;
 pub mod pty;
 pub mod record;
