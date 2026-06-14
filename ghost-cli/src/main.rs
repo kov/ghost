@@ -45,6 +45,13 @@ enum Command {
         /// Name of the session to kill.
         name: String,
     },
+    /// Export a session's recording as an asciicast (asciinema) stream.
+    Export {
+        /// Name of the recorded session.
+        name: String,
+        /// Output file; writes to stdout if omitted.
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -93,6 +100,23 @@ fn main() {
             Ok(false) => fail(&format!("no such session '{name}'")),
             Err(e) => fail(&e.to_string()),
         },
+        Command::Export { name, output } => {
+            if let Err(e) = export(&name, output.as_deref()) {
+                fail(&e.to_string());
+            }
+        }
+    }
+}
+
+fn export(name: &str, output: Option<&std::path::Path>) -> std::io::Result<()> {
+    use ghost_vt::{paths, record};
+    let path = paths::recording_path(name);
+    let rec = record::read(&path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("no recording for session '{name}': {e}"))
+    })?;
+    match output {
+        Some(p) => record::write_asciicast(&rec, &mut std::fs::File::create(p)?),
+        None => record::write_asciicast(&rec, &mut std::io::stdout().lock()),
     }
 }
 

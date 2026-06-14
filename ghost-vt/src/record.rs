@@ -435,6 +435,42 @@ pub fn truncate_before_latest_checkpoint(bytes: &[u8]) -> Option<Vec<u8>> {
     truncate_to_fit(bytes, 0)
 }
 
+/// Write the recording as an [asciicast v2] stream (the asciinema format), so
+/// it plays with `asciinema play`. The header line is the geometry; each event
+/// line is `[seconds, "o"|"r", data]` with times normalized so the first event
+/// is at 0. A bounded recording begins with a checkpoint, which is emitted as
+/// the initial paint; mid-stream checkpoints are redundant with the output that
+/// produced them and are skipped.
+///
+/// [asciicast v2]: https://docs.asciinema.org/manual/asciicast/v2/
+pub fn write_asciicast<W: Write>(rec: &Recording, out: &mut W) -> io::Result<()> {
+    let (width, height) = match rec.items.first() {
+        Some(Item::Checkpoint { cols, rows, .. }) => (*cols, *rows),
+        _ => (rec.header.cols, rec.header.rows),
+    };
+    let header = serde_json::json!({ "version": 2, "width": width, "height": height });
+    writeln!(out, "{header}")?;
+
+    let mut offset: Option<u64> = None;
+    for (i, item) in rec.items.iter().enumerate() {
+        let (t_ms, kind, data) = match item {
+            Item::Output { t_ms, data } => (*t_ms, "o", String::from_utf8_lossy(data).into_owned()),
+            Item::Resize { t_ms, cols, rows } => (*t_ms, "r", format!("{cols}x{rows}")),
+            // A leading checkpoint reconstructs the starting screen; emit its
+            // dump as the first output. Mid-stream ones add nothing playable.
+            Item::Checkpoint { t_ms, dump, .. } if i == 0 => {
+                (*t_ms, "o", String::from_utf8_lossy(dump).into_owned())
+            }
+            Item::Checkpoint { .. } => continue,
+        };
+        let off = *offset.get_or_insert(t_ms);
+        let secs = t_ms.saturating_sub(off) as f64 / 1000.0;
+        let line = serde_json::to_string(&(secs, kind, data)).map_err(io::Error::other)?;
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -634,5 +670,106 @@ mod tests {
     fn rejects_bad_magic() {
         let err = read_bytes(b"not a recording at all").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn asciicast(rec: &Recording) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let mut buf = Vec::new();
+        write_asciicast(rec, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let mut lines = text.lines();
+        let header = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let events = lines.map(|l| serde_json::from_str(l).unwrap()).collect();
+        (header, events)
+    }
+
+    #[test]
+    fn exports_asciicast_v2() {
+        let rec = Recording {
+            header: Header {
+                cols: 80,
+                rows: 24,
+                started_unix_ms: 0,
+                command: vec![],
+            },
+            items: vec![
+                Item::Output {
+                    t_ms: 0,
+                    data: b"hi\r\n".to_vec(),
+                },
+                Item::Resize {
+                    t_ms: 100,
+                    cols: 100,
+                    rows: 30,
+                },
+                // Mid-stream checkpoint: must be skipped on export.
+                Item::Checkpoint {
+                    t_ms: 150,
+                    cols: 100,
+                    rows: 30,
+                    dump: b"X".to_vec(),
+                },
+                Item::Output {
+                    t_ms: 200,
+                    data: b"bye".to_vec(),
+                },
+            ],
+        };
+        let (header, evs) = asciicast(&rec);
+        assert_eq!(header["version"], 2);
+        assert_eq!(header["width"], 80);
+        assert_eq!(header["height"], 24);
+        assert_eq!(evs.len(), 3, "mid-stream checkpoint should be skipped");
+        assert_eq!(
+            (evs[0][1].as_str(), evs[0][2].as_str()),
+            (Some("o"), Some("hi\r\n"))
+        );
+        assert_eq!(
+            (evs[1][1].as_str(), evs[1][2].as_str()),
+            (Some("r"), Some("100x30"))
+        );
+        assert_eq!(
+            (evs[2][1].as_str(), evs[2][2].as_str()),
+            (Some("o"), Some("bye"))
+        );
+        // Times are normalized to the first event and monotonic.
+        assert_eq!(evs[0][0].as_f64(), Some(0.0));
+        assert!((evs[2][0].as_f64().unwrap() - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exports_leading_checkpoint_as_initial_paint() {
+        let rec = Recording {
+            header: Header {
+                cols: 80,
+                rows: 24,
+                started_unix_ms: 0,
+                command: vec![],
+            },
+            items: vec![
+                Item::Checkpoint {
+                    t_ms: 5000,
+                    cols: 120,
+                    rows: 40,
+                    dump: b"STATE".to_vec(),
+                },
+                Item::Output {
+                    t_ms: 5200,
+                    data: b"more".to_vec(),
+                },
+            ],
+        };
+        let (header, evs) = asciicast(&rec);
+        // Geometry comes from the leading checkpoint.
+        assert_eq!(header["width"], 120);
+        assert_eq!(header["height"], 40);
+        assert_eq!(evs.len(), 2);
+        // The leading checkpoint dump is the initial paint, at normalized t=0.
+        assert_eq!(evs[0][0].as_f64(), Some(0.0));
+        assert_eq!(
+            (evs[0][1].as_str(), evs[0][2].as_str()),
+            (Some("o"), Some("STATE"))
+        );
+        assert!((evs[1][0].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert_eq!(evs[1][2].as_str(), Some("more"));
     }
 }

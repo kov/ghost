@@ -436,6 +436,7 @@ dependencies = [
  "ghost-vt",
  "pty-process",
  "rustix",
+ "serde_json",
  "tempfile",
 ]
 
@@ -450,6 +451,7 @@ dependencies = [
  "pty-process",
  "rustix",
  "serde",
+ "serde_json",
  "zstd",
 ]
 

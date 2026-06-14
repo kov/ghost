@@ -192,3 +192,64 @@ fn recording_size_is_bounded() {
         "bounded recording lost its checkpoints"
     );
 }
+
+#[test]
+fn export_produces_valid_asciicast() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-export";
+
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("XDG_DATA_HOME", data.path())
+        .args(["new", name, "--", "sh", "-c", "printf 'HELLO-CAST\\n'"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Wait for the session to finish so the recording is finalized.
+    assert!(
+        wait_until(Duration::from_secs(10), || !ls(run.path(), data.path())
+            .contains(name)),
+        "session did not finish"
+    );
+
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("XDG_DATA_HOME", data.path())
+        .args(["export", name])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost export` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cast = String::from_utf8(out.stdout).unwrap();
+    let mut lines = cast.lines();
+
+    // First line is a valid asciicast v2 header.
+    let header: serde_json::Value = serde_json::from_str(lines.next().expect("header")).unwrap();
+    assert_eq!(header["version"], 2);
+    assert_eq!(header["width"], 80);
+    assert_eq!(header["height"], 24);
+
+    // Every remaining line is a valid [time, type, data] event, and the output
+    // is present.
+    let mut saw_marker = false;
+    for line in lines {
+        let ev: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(ev[0].is_number(), "event time not a number: {line}");
+        assert!(ev[1].is_string(), "event type not a string: {line}");
+        if ev[1] == "o" && ev[2].as_str().is_some_and(|s| s.contains("HELLO-CAST")) {
+            saw_marker = true;
+        }
+    }
+    assert!(
+        saw_marker,
+        "exported asciicast missing the output; got:\n{cast}"
+    );
+}
