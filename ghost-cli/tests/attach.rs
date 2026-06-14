@@ -354,3 +354,57 @@ fn reattach_replays_screen_state() {
         term2.screen()
     );
 }
+
+#[test]
+fn reattach_replays_scrollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-scrollback";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Print a distinctive first line, then enough lines to push it well past
+    // the 24-row viewport into scrollback, then idle.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "echo FIRST-LINE-MARKER; for i in $(seq 1 50); do echo line-$i; done; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // First attach: wait for the last line so we know all output was produced.
+    let mut term = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("line-50")),
+        "session output never appeared; got: {:?}",
+        term.screen()
+    );
+    term.send(b"\x1cd");
+    assert!(
+        term.wait_exit(Duration::from_secs(5)),
+        "client did not detach"
+    );
+    drop(term);
+
+    // The first line scrolled off the viewport long ago; it can only reappear
+    // if the host replays bounded scrollback on attach.
+    let term2 = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term2.wait_for_screen(Duration::from_secs(5), screen_contains("FIRST-LINE-MARKER")),
+        "reattach did not replay scrollback; got: {:?}",
+        term2.screen()
+    );
+}

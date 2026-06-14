@@ -324,6 +324,16 @@ impl Buffer {
         self.lines.iter()
     }
 
+    /// Number of scrollback lines retained above the viewport.
+    pub fn scrollback_len(&self) -> usize {
+        self.view_offset()
+    }
+
+    /// Total number of lines held: scrollback plus the viewport.
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     fn view_offset(&self) -> usize {
         self.lines.len() - self.rows
     }

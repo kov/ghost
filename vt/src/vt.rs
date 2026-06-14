@@ -79,6 +79,18 @@ impl Vt {
 
         seq
     }
+
+    /// Like [`dump`](Self::dump), but also replays the retained scrollback above
+    /// the viewport, so a terminal fed this sequence regains the scrolled-off
+    /// history in its own scrollback.
+    pub fn dump_with_scrollback(&self) -> String {
+        let funs = self.terminal.dump_with_scrollback();
+        let mut seq = parser::dump(&funs);
+
+        seq.push_str(&self.parser.dump());
+
+        seq
+    }
 }
 
 pub struct Builder {

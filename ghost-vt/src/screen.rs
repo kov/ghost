@@ -77,11 +77,12 @@ impl Screen {
     }
 
     /// A byte sequence that, sent to a real terminal, clears it and repaints the
-    /// current screen state. (Clears the visible screen only, preserving the
-    /// client terminal's own scrollback.)
+    /// current screen state plus the session's bounded scrollback. Clears the
+    /// visible screen only (not the client terminal's own scrollback); the
+    /// replayed history scrolls in above the viewport.
     pub fn resync(&self) -> Vec<u8> {
         let mut seq = String::from("\x1b[2J\x1b[H");
-        seq.push_str(&self.vt.dump());
+        seq.push_str(&self.vt.dump_with_scrollback());
         seq.into_bytes()
     }
 }
@@ -126,5 +127,23 @@ mod tests {
         let mut replay = Vt::builder().size(20, 4).build();
         replay.feed_str(&String::from_utf8(seq).unwrap());
         assert!(replay.text().iter().any(|l| l.contains("marker-line")));
+    }
+
+    #[test]
+    fn resync_includes_scrolled_off_lines() {
+        // A 4-row screen; print more lines than fit so the first scrolls off.
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..12 {
+            s.feed(format!("row-{i}\r\n").as_bytes());
+        }
+        let seq = s.resync();
+        // Replay into a terminal that keeps scrollback: the first row, long
+        // gone from the viewport, must still be recoverable.
+        let mut replay = Vt::builder().size(20, 4).scrollback_limit(100).build();
+        replay.feed_str(&String::from_utf8(seq).unwrap());
+        assert!(
+            replay.lines().any(|l| l.text().contains("row-0")),
+            "scrolled-off line not replayed"
+        );
     }
 }

@@ -1325,6 +1325,17 @@ impl Terminal {
     }
 
     pub fn dump(&self) -> Vec<Function> {
+        self.dump_inner(false)
+    }
+
+    /// Like [`dump`](Self::dump), but the primary buffer's retained scrollback
+    /// is emitted above the viewport, so a terminal replaying the sequence
+    /// regains the scrolled-off history in its own scrollback.
+    pub fn dump_with_scrollback(&self) -> Vec<Function> {
+        self.dump_inner(true)
+    }
+
+    fn dump_inner(&self, include_scrollback: bool) -> Vec<Function> {
         let (primary_ctx, alternate_ctx): (&SavedCtx, &SavedCtx) = match self.active_buffer_type {
             BufferType::Primary => (&self.saved_ctx, &self.alternate_saved_ctx),
             BufferType::Alternate => (&self.alternate_saved_ctx, &self.saved_ctx),
@@ -1333,7 +1344,7 @@ impl Terminal {
         // 1. dump primary screen buffer
 
         let mut funs = Vec::new();
-        dump_buffer(self.primary_buffer(), &mut funs);
+        dump_buffer_lines(self.primary_buffer(), include_scrollback, &mut funs);
 
         // 2. setup tab stops
 
@@ -1588,10 +1599,26 @@ impl Terminal {
 }
 
 fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
+    dump_buffer_lines(buffer, false, funs);
+}
+
+/// Dump a buffer's lines as a redraw sequence. With `include_scrollback`, the
+/// retained scrollback above the viewport is emitted first (each line followed
+/// by CR/LF) so it scrolls into the target terminal's own scrollback; otherwise
+/// only the viewport is emitted. Pen state is tracked continuously across both
+/// regions, and trailing blank lines are trimmed.
+fn dump_buffer_lines(buffer: &Buffer, include_scrollback: bool, funs: &mut Vec<Function>) {
+    let skip = if include_scrollback {
+        0
+    } else {
+        buffer.scrollback_len()
+    };
+    let total = buffer.line_count() - skip;
+
     let mut cutoff = 0;
     let mut wrapped = false;
 
-    for (i, line) in buffer.view().enumerate() {
+    for (i, line) in buffer.lines().skip(skip).enumerate() {
         if wrapped || line.wrapped || !line.is_blank() {
             cutoff = i + 1;
         }
@@ -1599,10 +1626,10 @@ fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
         wrapped = line.wrapped;
     }
 
-    let last = buffer.rows - 1;
+    let last = total - 1;
     let mut pen = Pen::default();
 
-    for (i, line) in buffer.view().take(cutoff).enumerate() {
+    for (i, line) in buffer.lines().skip(skip).take(cutoff).enumerate() {
         for cells in line.chunks(|c1, c2| c1.pen() != c2.pen()) {
             if cells[0].pen() != &pen {
                 if let Some(sgr) = to_sgr_diff(&pen, cells[0].pen()) {
