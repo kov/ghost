@@ -33,6 +33,8 @@ pub struct SpawnOpts {
     pub record: Option<std::path::PathBuf>,
     /// Bound on retained scrollback lines for resync on attach.
     pub scrollback: usize,
+    /// Cap on the recording's on-disk size, or `None` for unbounded.
+    pub max_recording_bytes: Option<usize>,
 }
 
 /// Write a recording checkpoint once this many bytes of output have been
@@ -143,10 +145,16 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
 
     // Optional durable recording. Best-effort: if it cannot be created, the
     // session still runs (just unrecorded).
-    let mut recorder = opts
-        .record
-        .as_ref()
-        .and_then(|path| crate::record::FileRecorder::create(path, cols, rows, &opts.command).ok());
+    let mut recorder = opts.record.as_ref().and_then(|path| {
+        crate::record::FileRecorder::create(
+            path,
+            cols,
+            rows,
+            &opts.command,
+            opts.max_recording_bytes,
+        )
+        .ok()
+    });
     let mut bytes_since_checkpoint = 0usize;
 
     let mut client: Option<Client> = None;

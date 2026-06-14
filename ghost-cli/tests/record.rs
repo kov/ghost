@@ -30,6 +30,16 @@ fn recording_path(data_home: &Path, name: &str) -> PathBuf {
         .join(format!("{name}.ghostrec"))
 }
 
+fn ls(run: &Path, data: &Path) -> String {
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run)
+        .env("XDG_DATA_HOME", data)
+        .arg("ls")
+        .output()
+        .expect("run `ghost ls`");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 #[test]
 fn session_output_is_recorded() {
     let run = tempfile::tempdir().unwrap();
@@ -128,5 +138,57 @@ fn long_session_writes_checkpoints() {
         }),
         "recording lacked a checkpoint or did not reconstruct to completion at {}",
         path.display()
+    );
+}
+
+#[test]
+fn recording_size_is_bounded() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-bounded";
+
+    // Emit 2 MB of incompressible output with a 256 KiB cap. Unbounded, the
+    // recording would be ~2 MB; bounded, old history is dropped at checkpoints.
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("XDG_DATA_HOME", data.path())
+        .args([
+            "new",
+            name,
+            "--max-recording-size",
+            "262144",
+            "--",
+            "sh",
+            "-c",
+            "head -c 2000000 /dev/urandom",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The session exits on its own; wait until it is no longer listed, so the
+    // recording is finalized.
+    assert!(
+        wait_until(Duration::from_secs(15), || !ls(run.path(), data.path())
+            .contains(name)),
+        "session did not finish"
+    );
+
+    let path = recording_path(data.path(), name);
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len <= 1_000_000,
+        "recording not bounded: {len} bytes for a 256 KiB cap"
+    );
+    // It is still a valid recording with at least one checkpoint after the
+    // compaction rewrites.
+    let rec = record::read(&path).unwrap();
+    assert!(
+        rec.checkpoint_count() >= 1,
+        "bounded recording lost its checkpoints"
     );
 }

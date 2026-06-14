@@ -42,8 +42,9 @@ const ZSTD_LEVEL: i32 = 3;
 /// Flush a frame once this many bytes of output have accumulated.
 const FLUSH_THRESHOLD: usize = 64 * 1024;
 
-/// A `Recorder` writing to a buffered file — the host's concrete recorder type.
-pub type FileRecorder = Recorder<BufWriter<File>>;
+/// Default cap on a recording's on-disk size. When exceeded, the oldest
+/// pre-checkpoint history is dropped (see [`FileRecorder`]).
+pub const DEFAULT_MAX_RECORDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Recording metadata, written once at the start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,14 +110,79 @@ pub struct Recorder<W: Write> {
     pending_bytes: usize,
 }
 
+/// A recording on disk whose size is kept bounded. It appends like any
+/// [`Recorder`], but after each checkpoint, if the file has grown past its cap,
+/// it compacts: the oldest history (everything before a checkpoint) is dropped,
+/// keeping the most recent state that fits. Because a checkpoint is a complete
+/// state, this loses nothing reconstructable about the retained window.
+pub struct FileRecorder {
+    inner: Recorder<BufWriter<File>>,
+    path: std::path::PathBuf,
+    /// Cap on the file's size, or `None` for an unbounded recording.
+    max_bytes: Option<usize>,
+}
+
 impl FileRecorder {
     /// Create a recording at `path`, creating parent directories as needed.
-    pub fn create(path: &Path, cols: u16, rows: u16, command: &[String]) -> io::Result<Self> {
+    /// `max_bytes` caps the file's size (`None` = unbounded).
+    pub fn create(
+        path: &Path,
+        cols: u16,
+        rows: u16,
+        command: &[String],
+        max_bytes: Option<usize>,
+    ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let writer = BufWriter::new(File::create(path)?);
-        Recorder::new(writer, cols, rows, command)
+        Ok(FileRecorder {
+            inner: Recorder::new(writer, cols, rows, command)?,
+            path: path.to_path_buf(),
+            max_bytes,
+        })
+    }
+
+    /// Record a chunk of terminal output.
+    pub fn output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.output(bytes)
+    }
+
+    /// Record a window-size change.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.inner.resize(cols, rows)
+    }
+
+    /// Write a checkpoint, then compact the file if it has grown past the cap.
+    pub fn checkpoint(&mut self, cols: u16, rows: u16, dump: &[u8]) -> io::Result<()> {
+        self.inner.checkpoint(cols, rows, dump)?;
+        self.compact_if_needed()
+    }
+
+    fn compact_if_needed(&mut self) -> io::Result<()> {
+        let Some(max) = self.max_bytes else {
+            return Ok(());
+        };
+        // The checkpoint just written is on disk only after a flush.
+        self.inner.flush()?;
+        if std::fs::metadata(&self.path)?.len() as usize <= max {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&self.path)?;
+        // Keep the most recent history that fits in half the cap, so the file
+        // grows back toward the cap before the next (infrequent) rewrite.
+        let Some(bounded) = truncate_to_fit(&bytes, max / 2) else {
+            return Ok(());
+        };
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, &bounded)?;
+        std::fs::rename(&tmp, &self.path)?;
+        // Continue appending to the freshly rewritten file.
+        let file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+        self.inner.writer = BufWriter::new(file);
+        Ok(())
     }
 }
 
@@ -317,12 +383,14 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
     Ok(Recording { header, items })
 }
 
-/// Produce a smaller recording that starts at the most recent checkpoint:
-/// the header followed by the latest checkpoint frame and everything after it.
-/// This is the safe way to bound a recording's size — a checkpoint is a
-/// complete state, so dropping the frames before it loses no reconstructable
-/// information. Returns `None` if there is no checkpoint to cut at.
-pub fn truncate_before_latest_checkpoint(bytes: &[u8]) -> Option<Vec<u8>> {
+/// Produce a smaller recording retaining the most recent history that fits in
+/// `target_bytes` of frames, cut at a checkpoint boundary: the header followed
+/// by the earliest checkpoint whose suffix fits, and everything after it. A
+/// checkpoint is a complete state, so this loses nothing reconstructable about
+/// the retained window. If no checkpoint's suffix fits, the latest checkpoint
+/// (smallest suffix) is kept as a best effort. Returns `None` if there is no
+/// checkpoint to cut at.
+pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
     if bytes.len() < MAGIC.len() + 1 || &bytes[..MAGIC.len()] != MAGIC {
         return None;
     }
@@ -331,7 +399,8 @@ pub fn truncate_before_latest_checkpoint(bytes: &[u8]) -> Option<Vec<u8>> {
     take(bytes, &mut pos, hlen)?;
     let frames_start = pos;
 
-    let mut last_checkpoint: Option<usize> = None;
+    // Offsets of every checkpoint frame, earliest first.
+    let mut checkpoints = Vec::new();
     while pos < bytes.len() {
         let frame_start = pos;
         let kind = bytes[pos];
@@ -339,16 +408,31 @@ pub fn truncate_before_latest_checkpoint(bytes: &[u8]) -> Option<Vec<u8>> {
         let clen = read_u32(bytes, &mut next)?;
         take(bytes, &mut next, clen)?;
         if kind == FRAME_CHECKPOINT {
-            last_checkpoint = Some(frame_start);
+            checkpoints.push(frame_start);
         }
         pos = next;
     }
 
-    let cut = last_checkpoint?;
-    let mut out = Vec::with_capacity(frames_start + (bytes.len() - cut));
+    let len = bytes.len();
+    // Suffix length shrinks as the cut moves later, so the earliest checkpoint
+    // whose suffix fits retains the most history; fall back to the latest.
+    let cut = checkpoints
+        .iter()
+        .copied()
+        .find(|&o| len - o <= target_bytes)
+        .or_else(|| checkpoints.last().copied())?;
+
+    let mut out = Vec::with_capacity(frames_start + (len - cut));
     out.extend_from_slice(&bytes[..frames_start]);
     out.extend_from_slice(&bytes[cut..]);
     Some(out)
+}
+
+/// Bound a recording to only its most recent checkpoint onward — the smallest
+/// self-contained recording. Equivalent to [`truncate_to_fit`] with a target
+/// of zero. Returns `None` if there is no checkpoint to cut at.
+pub fn truncate_before_latest_checkpoint(bytes: &[u8]) -> Option<Vec<u8>> {
+    truncate_to_fit(bytes, 0)
 }
 
 fn now_unix_ms() -> u64 {
@@ -481,6 +565,42 @@ mod tests {
             Some(Item::Checkpoint { .. })
         ));
         assert_eq!(bounded.output_bytes(), b"after");
+    }
+
+    #[test]
+    fn truncate_to_fit_keeps_a_recent_checkpoint_window() {
+        // Five checkpoints, each preceded by a distinct output segment.
+        let buf = record_to_buf(|rec| {
+            for seg in 0..5 {
+                rec.output(format!("seg{seg}-payload\r\n").as_bytes())
+                    .unwrap();
+                rec.checkpoint(20, 5, format!("DUMP{seg}").as_bytes())
+                    .unwrap();
+            }
+        });
+        let full = read_bytes(&buf).unwrap();
+        assert_eq!(full.checkpoint_count(), 5);
+
+        let dump_of = |r: &Recording| match &r.items[r.latest_checkpoint().unwrap()] {
+            Item::Checkpoint { dump, .. } => dump.clone(),
+            _ => unreachable!(),
+        };
+
+        // A target that fits only the most recent part drops early checkpoints
+        // but keeps the latest one and stays within the budget.
+        let target = buf.len() / 3;
+        let bounded_bytes = truncate_to_fit(&buf, target).unwrap();
+        assert!(bounded_bytes.len() < buf.len());
+        let bounded = read_bytes(&bounded_bytes).unwrap();
+        assert!(matches!(
+            bounded.items.first(),
+            Some(Item::Checkpoint { .. })
+        ));
+        assert!(bounded.checkpoint_count() >= 1);
+        assert!(bounded.checkpoint_count() < full.checkpoint_count());
+        // The retained window ends at the same latest checkpoint.
+        assert_eq!(dump_of(&bounded), dump_of(&full));
+        assert_eq!(dump_of(&full), b"DUMP4");
     }
 
     #[test]

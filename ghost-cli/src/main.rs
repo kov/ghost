@@ -25,6 +25,10 @@ enum Command {
         /// Scrollback lines retained for replay on attach.
         #[arg(long, default_value_t = ghost_vt::screen::DEFAULT_SCROLLBACK)]
         scrollback: usize,
+        /// Cap on the recording's on-disk size, in bytes (oldest history is
+        /// dropped past this).
+        #[arg(long, default_value_t = ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES)]
+        max_recording_size: usize,
         /// Command to run instead of $SHELL (everything after `--`).
         #[arg(last = true)]
         command: Vec<String>,
@@ -50,6 +54,7 @@ fn main() {
             name,
             no_record,
             scrollback,
+            max_recording_size,
             command,
         } => {
             let name = name.unwrap_or_else(default_name);
@@ -60,6 +65,7 @@ fn main() {
                 size: (80, 24),
                 record,
                 scrollback,
+                max_recording_bytes: Some(max_recording_size),
             };
             match server::spawn(opts) {
                 Ok(()) => println!("started session '{name}'"),
