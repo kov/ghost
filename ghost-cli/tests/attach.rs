@@ -21,6 +21,11 @@ const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 fn ghost(xdg: &Path) -> Command {
     let mut c = Command::new(GHOST);
     c.env("XDG_RUNTIME_DIR", xdg);
+    // Isolate recordings too: sessions record by default, so without this the
+    // suite writes .ghostrec files into the real `$XDG_DATA_HOME`. Reusing the
+    // same temp root is fine — sockets and recordings live under distinct
+    // subpaths.
+    c.env("XDG_DATA_HOME", xdg);
     c
 }
 
@@ -79,6 +84,7 @@ impl Attached {
             .arg("attach")
             .arg(name)
             .env("XDG_RUNTIME_DIR", xdg)
+            .env("XDG_DATA_HOME", xdg)
             .spawn(pts)
             .expect("spawn ghost attach");
 
