@@ -1,21 +1,24 @@
 //! The session host: a synchronous `poll()` loop over the PTY master, the
-//! listening socket, attached client connections, and signals (via `signalfd`).
+//! listening socket, the attached client connection, and signals (via
+//! `signalfd`).
 //!
 //! Single-threaded and lock-free by construction — one owner of the terminal
-//! state and the recorder. No async runtime: the fd count is small and fixed,
-//! and a plain poll loop keeps backtraces and profiling honest.
+//! and the client connection. No async runtime: the fd count is small and
+//! fixed, and a plain poll loop keeps backtraces and profiling honest.
 //!
 //! [`spawn`] daemonizes (classic double-fork) so the host outlives the launching
 //! command and has no controlling terminal of its own; it just shuffles bytes
-//! between the child's PTY and attached clients.
+//! between the child's PTY and the attached client.
 
 use crate::paths;
+use crate::protocol::{ClientMsg, FrameReader, ServerMsg, encode};
+use nix::sys::signal::Signal;
 use pty_process::Size;
-use pty_process::blocking::Command as PtyCommand;
+use pty_process::blocking::{Command as PtyCommand, open};
 use rustix::event::{PollFd, PollFlags, poll};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 /// Options for starting a session.
 pub struct SpawnOpts {
@@ -30,6 +33,44 @@ pub struct SpawnOpts {
 enum Fork {
     Parent,
     Daemon,
+}
+
+/// A single attached client connection.
+struct Client {
+    stream: UnixStream,
+    reader: FrameReader,
+    /// Output queued for the client but not yet written (backpressure buffer).
+    outbuf: Vec<u8>,
+}
+
+impl Client {
+    fn new(stream: UnixStream) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Client {
+            stream,
+            reader: FrameReader::new(),
+            outbuf: Vec::new(),
+        })
+    }
+
+    fn queue(&mut self, msg: &ServerMsg) {
+        self.outbuf.extend_from_slice(&encode(msg));
+    }
+
+    /// Write as much of the pending output as the socket will accept.
+    fn flush(&mut self) -> io::Result<()> {
+        while !self.outbuf.is_empty() {
+            match self.stream.write(&self.outbuf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.outbuf.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Start a session in the background.
@@ -68,8 +109,7 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
     std::fs::write(paths::pid_path(&opts.name), std::process::id().to_string())?;
     listener.set_nonblocking(true)?;
 
-    // Open the PTY and spawn the child under it.
-    let (pty, pts) = pty_process::blocking::open().map_err(io::Error::other)?;
+    let (pty, pts) = open().map_err(io::Error::other)?;
     let (cols, rows) = opts.size;
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
@@ -79,49 +119,150 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
         .spawn(pts)
         .map_err(io::Error::other)?;
 
-    // Keep the PTY master open for the child's lifetime. Draining its output and
-    // forwarding it to attached clients arrives with the attach milestone; for
-    // now the host only manages the session's lifecycle.
-    let _pty = pty;
+    let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
 
-    let sfd = signals::make()?;
+    let mut client: Option<Client> = None;
+    let mut ptybuf = [0u8; 8192];
 
     loop {
-        let mut fds = [
+        // Build the poll set (client slot only when one is attached).
+        let mut fds = vec![
+            PollFd::new(&pty, PollFlags::IN),
             PollFd::new(listener, PollFlags::IN),
             PollFd::new(&sfd, PollFlags::IN),
         ];
+        if let Some(c) = &client {
+            let mut flags = PollFlags::IN;
+            if !c.outbuf.is_empty() {
+                flags |= PollFlags::OUT;
+            }
+            fds.push(PollFd::new(&c.stream, flags));
+        }
         match poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
         }
+        let pty_re = fds[0].revents();
+        let listener_re = fds[1].revents();
+        let sig_re = fds[2].revents();
+        let client_re = if client.is_some() {
+            fds[3].revents()
+        } else {
+            PollFlags::empty()
+        };
+        drop(fds);
 
-        if fds[0].revents().contains(PollFlags::IN) {
-            // Attach is not implemented yet; accept and drop so the backlog
-            // never stalls and `ghost ls`-style probes still see a live socket.
-            if let Ok((stream, _)) = listener.accept() {
-                drop(stream);
+        // PTY output -> attached client (discarded if nobody is attached;
+        // bounded scrollback replay on attach comes with a later milestone).
+        if pty_re.intersects(PollFlags::IN | PollFlags::HUP) {
+            match (&pty).read(&mut ptybuf) {
+                Ok(0) => return child_exited(&mut child, &mut client),
+                Ok(n) => {
+                    if let Some(c) = &mut client {
+                        c.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                // EIO on the master means the child closed the slave (exited).
+                Err(_) => return child_exited(&mut child, &mut client),
             }
         }
 
-        if fds[1].revents().contains(PollFlags::IN) {
-            for signo in signals::drain(&sfd)? {
+        // New connection: the latest attach takes over.
+        if listener_re.contains(PollFlags::IN)
+            && let Ok((stream, _)) = listener.accept()
+        {
+            client = Some(Client::new(stream)?);
+        }
+
+        // Client -> host (input and control messages).
+        if client_re.intersects(PollFlags::IN | PollFlags::HUP) {
+            let mut drop_client = false;
+            if let Some(c) = &mut client {
+                let mut buf = [0u8; 4096];
+                match c.stream.read(&mut buf) {
+                    Ok(0) => drop_client = true,
+                    Ok(n) => {
+                        c.reader.push(&buf[..n]);
+                        loop {
+                            match c.reader.next_msg::<ClientMsg>() {
+                                Ok(Some(ClientMsg::Input(bytes))) => {
+                                    (&pty).write_all(&bytes)?;
+                                }
+                                Ok(Some(ClientMsg::Resize { cols, rows })) => {
+                                    let _ = pty.resize(Size::new(rows, cols));
+                                }
+                                Ok(Some(ClientMsg::Detach)) => {
+                                    drop_client = true;
+                                    break;
+                                }
+                                Ok(Some(ClientMsg::Kill)) => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    return Ok(0);
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    drop_client = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => drop_client = true,
+                }
+            }
+            if drop_client {
+                client = None;
+            }
+        }
+
+        // Push queued output to the client.
+        if let Some(c) = &mut client
+            && c.flush().is_err()
+        {
+            client = None;
+        }
+
+        // Signals.
+        if sig_re.contains(PollFlags::IN) {
+            for signo in crate::signals::drain(&sfd)? {
                 match signo {
                     libc::SIGCHLD => {
                         if let Ok(Some(status)) = child.try_wait() {
-                            return Ok(status.code().unwrap_or(0));
+                            let code = status.code().unwrap_or(0);
+                            notify_exit(&mut client, code);
+                            return Ok(code);
                         }
                     }
                     libc::SIGTERM | libc::SIGINT => {
                         let _ = child.kill();
                         let _ = child.wait();
+                        notify_exit(&mut client, 0);
                         return Ok(0);
                     }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+/// Reap the child after the PTY signalled EOF and tell the client.
+fn child_exited(child: &mut std::process::Child, client: &mut Option<Client>) -> io::Result<i32> {
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(0);
+    notify_exit(client, code);
+    Ok(code)
+}
+
+/// Best-effort notification to the client that the session ended.
+fn notify_exit(client: &mut Option<Client>, code: i32) {
+    if let Some(c) = client {
+        let _ = c.flush();
+        let _ = c.stream.write_all(&encode(&ServerMsg::Exited(code)));
     }
 }
 
@@ -167,35 +308,4 @@ unsafe fn daemonize() -> io::Result<Fork> {
         }
     }
     Ok(Fork::Daemon)
-}
-
-/// Signal handling for the host's poll loop via `signalfd`.
-mod signals {
-    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
-    use nix::sys::signalfd::{SfdFlags, SignalFd};
-    use std::io;
-
-    /// Block SIGCHLD/SIGTERM/SIGINT and return a `signalfd` that surfaces them
-    /// in the poll loop.
-    pub fn make() -> io::Result<SignalFd> {
-        let mut mask = SigSet::empty();
-        mask.add(Signal::SIGCHLD);
-        mask.add(Signal::SIGTERM);
-        mask.add(Signal::SIGINT);
-        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).map_err(nix_io)?;
-        SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC).map_err(nix_io)
-    }
-
-    /// Drain all pending signals, returning their signal numbers.
-    pub fn drain(sfd: &SignalFd) -> io::Result<Vec<i32>> {
-        let mut signos = Vec::new();
-        while let Some(info) = sfd.read_signal().map_err(nix_io)? {
-            signos.push(info.ssi_signo as i32);
-        }
-        Ok(signos)
-    }
-
-    fn nix_io(e: nix::Error) -> io::Error {
-        io::Error::from_raw_os_error(e as i32)
-    }
 }

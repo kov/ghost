@@ -1,6 +1,7 @@
 //! `ghost` — reference CLI for the `ghost-vt` engine.
 
 use clap::{Parser, Subcommand};
+use ghost_vt::client;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
 
@@ -59,7 +60,14 @@ fn main() {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Command::Attach { .. } => unimplemented!("ghost attach"),
+        Command::Attach { name } => {
+            let Some(name) = name else {
+                fail("specify a session to attach to (see `ghost ls`)");
+            };
+            if let Err(e) = client::attach(&name) {
+                fail(&e.to_string());
+            }
+        }
         Command::Kill { name } => match session::kill_session(&name) {
             Ok(true) => println!("killed session '{name}'"),
             Ok(false) => fail(&format!("no such session '{name}'")),

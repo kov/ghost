@@ -19,6 +19,7 @@ pub mod pty;
 pub mod record;
 pub mod server;
 pub mod session;
+mod signals;
 pub mod transport;
 
 /// The vendored virtual-terminal engine — a fork of asciinema's `avt` — used as
