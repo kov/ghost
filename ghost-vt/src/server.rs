@@ -29,6 +29,8 @@ pub struct SpawnOpts {
     pub command: Vec<String>,
     /// Initial terminal size as `(cols, rows)`.
     pub size: (u16, u16),
+    /// Where to record the session, or `None` to not record.
+    pub record: Option<std::path::PathBuf>,
 }
 
 enum Fork {
@@ -132,6 +134,13 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
     // attach can be repainted to the current state.
     let mut screen = Screen::new(cols, rows, DEFAULT_SCROLLBACK);
 
+    // Optional durable recording. Best-effort: if it cannot be created, the
+    // session still runs (just unrecorded).
+    let mut recorder = opts
+        .record
+        .as_ref()
+        .and_then(|path| crate::record::FileRecorder::create(path, cols, rows, &opts.command).ok());
+
     let mut client: Option<Client> = None;
     let mut ptybuf = [0u8; 8192];
 
@@ -172,6 +181,9 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
                     screen.feed(&ptybuf[..n]);
+                    if let Some(r) = &mut recorder {
+                        let _ = r.output(&ptybuf[..n]);
+                    }
                     // Live output only flows once the client has been resynced;
                     // anything before that is already captured in the resync.
                     if let Some(c) = &mut client
@@ -213,6 +225,9 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
                                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
                                     let _ = pty.resize(Size::new(rows, cols));
                                     screen.resize(cols, rows);
+                                    if let Some(r) = &mut recorder {
+                                        let _ = r.resize(cols, rows);
+                                    }
                                     // The first resize completes the attach
                                     // handshake: repaint at the now-known size.
                                     if !c.resynced {

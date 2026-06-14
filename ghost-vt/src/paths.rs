@@ -34,3 +34,25 @@ pub fn socket_path(name: &str) -> PathBuf {
 pub fn pid_path(name: &str) -> PathBuf {
     runtime_dir().join(format!("{name}.pid"))
 }
+
+/// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
+/// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
+/// holds recordings, which are archival.
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".local").join("share")
+        });
+    base.join("ghost")
+}
+
+/// Path of the recording for the named session.
+pub fn recording_path(name: &str) -> PathBuf {
+    data_dir()
+        .join("recordings")
+        .join(format!("{name}.ghostrec"))
+}

@@ -15,3 +15,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 # The vendored avt fork: workspace member `vt/`, upstream package name `avt`,
 # referred to locally as `vt`. Kept structurally close to upstream for rebasing.
 vt = { package = "avt", path = "../vt" }
+zstd = "0.13.3"

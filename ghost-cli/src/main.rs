@@ -19,6 +19,9 @@ enum Command {
     New {
         /// Name for the session.
         name: Option<String>,
+        /// Do not record this session (recording is on by default).
+        #[arg(long)]
+        no_record: bool,
         /// Command to run instead of $SHELL (everything after `--`).
         #[arg(last = true)]
         command: Vec<String>,
@@ -40,12 +43,18 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::New { name, command } => {
+        Command::New {
+            name,
+            no_record,
+            command,
+        } => {
             let name = name.unwrap_or_else(default_name);
+            let record = (!no_record).then(|| ghost_vt::paths::recording_path(&name));
             let opts = SpawnOpts {
                 name: name.clone(),
                 command,
                 size: (80, 24),
+                record,
             };
             match server::spawn(opts) {
                 Ok(()) => println!("started session '{name}'"),
