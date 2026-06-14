@@ -2,10 +2,12 @@
 # Pre-commit checks for ghost. To enable in this clone:
 #   git config core.hooksPath .githooks
 #
-# We are strict on our own crates (ghost-vt, ghost-cli) but lenient on the
-# vendored avt fork in vt/ (package `avt`): formatting it would create needless
-# diffs against upstream and complicate rebases. So fmt skips vt/ via
-# rustfmt.toml's `ignore`, and clippy excludes the `avt` package here.
+# Formatting covers the whole workspace, including the vendored avt fork in vt/
+# (avt is fmt-clean upstream). Clippy is strict (-D warnings) on our crates
+# across all targets, and on avt's LIBRARY only — the part we actually modify.
+# avt's benches/tests are not linted: upstream runs no clippy and a bench trips
+# a newer lint, so linting them would only cause rebase churn. avt's own gate is
+# `cargo test`, run separately / in CI.
 
 cargo fmt --all -- --check || {
     echo "cargo fmt found issues; run 'cargo fmt --all' to fix" >&2
@@ -14,5 +16,10 @@ cargo fmt --all -- --check || {
 
 cargo clippy --workspace --exclude avt --all-targets -- -D warnings || {
     echo "cargo clippy found issues" >&2
+    exit 1
+}
+
+cargo clippy -p avt --lib -- -D warnings || {
+    echo "cargo clippy found issues in vt/ (avt lib)" >&2
     exit 1
 }
