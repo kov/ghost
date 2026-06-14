@@ -44,6 +44,9 @@ pub struct Terminal {
     /// Enabled non-display modes (mouse/focus/paste). Tracked but not rendered;
     /// re-emitted on dump so they survive a reattach.
     tracked_modes: BTreeSet<DecMode>,
+    /// Current window title (OSC 0/2). Tracked but not rendered; re-emitted on
+    /// dump so it survives a reattach.
+    title: String,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -124,6 +127,7 @@ impl Terminal {
             dirty_lines,
             xtwinops: false,
             tracked_modes: BTreeSet::new(),
+            title: String::new(),
         }
     }
 
@@ -301,6 +305,10 @@ impl Terminal {
 
             Sd(n) => {
                 self.sd(n);
+            }
+
+            SetTitle(title) => {
+                self.title = title;
             }
 
             Sgr(params) => {
@@ -621,6 +629,7 @@ impl Terminal {
         self.alternate_saved_ctx = SavedCtx::default();
         self.dirty_lines = DirtyLines::new(self.rows);
         self.tracked_modes.clear();
+        self.title.clear();
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -698,6 +707,7 @@ impl Terminal {
         assert_eq!(self.saved_ctx, other.saved_ctx);
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
         assert_eq!(self.tracked_modes, other.tracked_modes);
+        assert_eq!(self.title, other.title);
 
         assert_eq!(
             self.primary_buffer().view().collect::<Vec<_>>(),
@@ -1618,6 +1628,11 @@ impl Terminal {
         // cursor or touch the grid, so they are safe to emit last.
         for &mode in &self.tracked_modes {
             funs.push(Function::Decset(DecModes::one(mode)));
+        }
+
+        // 16. restore the window title (OSC 0/2).
+        if !self.title.is_empty() {
+            funs.push(Function::SetTitle(self.title.clone()));
         }
 
         funs

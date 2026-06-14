@@ -270,6 +270,28 @@ mod tests {
     }
 
     #[test]
+    fn dump_restores_window_title() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]2;my session\x07");
+        let dump = vt.dump();
+        assert!(
+            dump.contains("\x1b]2;my session\x07"),
+            "dump missing title: {dump:?}"
+        );
+
+        // The dump round-trips into an equivalent terminal.
+        let mut vt2 = Vt::new(20, 5);
+        vt2.feed_str(&vt.dump());
+        assert_vts_eq(&vt, &vt2);
+
+        // A later title replaces the earlier one.
+        vt.feed_str("\x1b]0;renamed\x07");
+        let dump = vt.dump();
+        assert!(dump.contains("\x1b]2;renamed\x07"));
+        assert!(!dump.contains("my session"));
+    }
+
+    #[test]
     fn dump_with_file() {
         if let Ok((w, h, input, step)) = setup_dump_with_file() {
             let mut vt1 = Vt::new(w, h);

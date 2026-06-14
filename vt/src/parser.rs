@@ -13,6 +13,10 @@ pub struct Parser {
     params: [Param; PARAMS_LEN],
     cur_param: usize,
     intermediate: Option<char>,
+    /// Accumulates the body of the current OSC string (between OSC start and
+    /// the terminator). Only OSC 0/2 (window title) is acted upon; other OSCs
+    /// are collected then discarded.
+    osc: String,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -77,6 +81,7 @@ pub enum Function {
     Scorc,
     Scosc,
     Sd(u16),
+    SetTitle(String),
     Sgr(SgrOps),
     Si,
     Sm(AnsiModes),
@@ -451,6 +456,14 @@ impl Parser {
                 self.param(input);
             }
 
+            (OscString, '\u{1b}') => {
+                // ESC terminates the OSC string (ST is ESC \); dispatch before
+                // re-entering Escape so the following byte is parsed normally.
+                self.state = Escape;
+                self.clear();
+                return self.osc_dispatch();
+            }
+
             (_, '\u{1b}') => {
                 self.state = Escape;
                 self.clear();
@@ -518,11 +531,13 @@ impl Parser {
 
             (Escape, '\u{5d}') => {
                 self.state = OscString;
+                self.osc.clear();
             }
 
             (OscString, '\u{07}') => {
                 // 0x07 is xterm non-ANSI variant of transition to ground
                 self.state = Ground;
+                return self.osc_dispatch();
             }
 
             (_, '\u{18}')
@@ -599,12 +614,19 @@ impl Parser {
                 self.state = SosPmApcString;
             }
 
+            (OscString, '\u{9c}') => {
+                // C1 ST terminates the OSC string.
+                self.state = Ground;
+                return self.osc_dispatch();
+            }
+
             (_, '\u{9c}') => {
                 self.state = Ground;
             }
 
             (_, '\u{9d}') => {
                 self.state = OscString;
+                self.osc.clear();
             }
 
             (_, '\u{90}') => {
@@ -855,7 +877,24 @@ impl Parser {
 
     fn put(&mut self, _input: char) {}
 
-    fn osc_put(&mut self, _input: char) {}
+    fn osc_put(&mut self, input: char) {
+        self.osc.push(input);
+    }
+
+    /// Interpret a completed OSC string. Only OSC 0 (icon name + title) and
+    /// OSC 2 (title) are recognised — both set the window title; everything
+    /// else is ignored.
+    fn osc_dispatch(&self) -> Option<Function> {
+        let (ps, rest) = match self.osc.split_once(';') {
+            Some(parts) => parts,
+            None => (self.osc.as_str(), ""),
+        };
+
+        match ps {
+            "0" | "2" => Some(Function::SetTitle(rest.to_string())),
+            _ => None,
+        }
+    }
 
     pub(crate) fn dump(&self) -> String {
         use State::*;
@@ -1153,6 +1192,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Scorc => push_csi(seq, None, &[], 'u'),
         Scosc => push_csi(seq, None, &[], 's'),
         Sd(n) => push_csi(seq, None, &[n.to_string()], 'T'),
+        SetTitle(title) => {
+            seq.push_str("\u{1b}]2;");
+            seq.push_str(title);
+            seq.push('\u{07}');
+        }
 
         Sgr(ops) => {
             if ops.is_empty() {
@@ -1949,6 +1993,35 @@ mod tests {
         assert_eq!(parse("\x1b[?1006h"), [Decset(dec_modes([MouseSgr]))]);
         assert_eq!(parse("\x1b[?2004h"), [Decset(dec_modes([BracketedPaste]))]);
         assert_eq!(parse("\x1b[?1000l"), [Decrst(dec_modes([MouseReportX11]))]);
+    }
+
+    #[test]
+    fn parse_osc_title() {
+        // OSC 0 (icon + title) and OSC 2 (title) both set the window title,
+        // terminated by BEL, C1 ST, or ESC \.
+        assert_eq!(
+            parse("\x1b]0;my title\x07"),
+            [SetTitle("my title".to_string())]
+        );
+        assert_eq!(
+            parse("\x1b]2;my title\x07"),
+            [SetTitle("my title".to_string())]
+        );
+        assert_eq!(
+            parse("\x1b]2;via st\x1b\\"),
+            [SetTitle("via st".to_string())]
+        );
+        assert_eq!(
+            parse("\u{9d}2;via c1\u{9c}"),
+            [SetTitle("via c1".to_string())]
+        );
+        // A title may contain ';' — only the first separator is the code.
+        assert_eq!(parse("\x1b]2;a;b;c\x07"), [SetTitle("a;b;c".to_string())]);
+        // An empty title clears it.
+        assert_eq!(parse("\x1b]2;\x07"), [SetTitle(String::new())]);
+        // Other OSC codes (e.g. OSC 1 icon name, OSC 52 clipboard) are ignored.
+        assert_eq!(parse("\x1b]1;icon\x07"), []);
+        assert_eq!(parse("\x1b]52;c;Zm9v\x07"), []);
     }
 
     #[test]

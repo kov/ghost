@@ -219,6 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn resync_restores_window_title() {
+        // An app sets the window title (OSC 2). After a detach/reattach the
+        // title must be restored, or the reattached terminal keeps a stale or
+        // default title.
+        let mut s = Screen::new(80, 24, 100);
+        s.feed(b"\x1b]2;ghost session\x07");
+        let seq = s.resync();
+        let text = String::from_utf8_lossy(&seq);
+        assert!(
+            text.contains("\x1b]2;ghost session\x07"),
+            "resync missing title: {text:?}"
+        );
+    }
+
+    #[test]
     fn reconstructs_from_checkpoint_and_bound() {
         use crate::record::{Recorder, read_bytes, truncate_before_latest_checkpoint};
 
