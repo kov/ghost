@@ -111,19 +111,28 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
 
+    // Capture the caller's working directory before daemonize() chdir's to `/`,
+    // so the session's child starts where `ghost new` was invoked (like dtach),
+    // not at the daemon's `/`.
+    let launch_dir = std::env::current_dir().ok();
+
     match unsafe { daemonize()? } {
         Fork::Parent => return Ok(()),
         Fork::Daemon => {}
     }
 
     // We are now the long-lived host; there is no caller to return errors to.
-    let result = host_main(&listener, &opts);
+    let result = host_main(&listener, &opts, launch_dir.as_deref());
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&pidf);
     std::process::exit(result.unwrap_or(1));
 }
 
-fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
+fn host_main(
+    listener: &UnixListener,
+    opts: &SpawnOpts,
+    launch_dir: Option<&std::path::Path>,
+) -> io::Result<i32> {
     std::fs::write(paths::pid_path(&opts.name), std::process::id().to_string())?;
     listener.set_nonblocking(true)?;
 
@@ -132,10 +141,11 @@ fn host_main(listener: &UnixListener, opts: &SpawnOpts) -> io::Result<i32> {
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
     let (prog, args) = split_command(&opts.command);
-    let mut child = PtyCommand::new(&prog)
-        .args(&args)
-        .spawn(pts)
-        .map_err(io::Error::other)?;
+    let mut cmd = PtyCommand::new(&prog).args(&args);
+    if let Some(dir) = launch_dir {
+        cmd = cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn(pts).map_err(io::Error::other)?;
 
     let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
 

@@ -430,6 +430,44 @@ fn reattach_replays_scrollback() {
 }
 
 #[test]
+fn session_starts_in_launch_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    // A distinct directory to launch the session from; the session's shell
+    // should start here, the way tmux/dtach/screen inherit the launch cwd —
+    // not in `/` (where the daemon itself chdir's for daemon hygiene).
+    let workdir = tempfile::tempdir().unwrap();
+    let expected = workdir.path().canonicalize().unwrap();
+    let name = "attach-cwd";
+    let _guard = KillOnDrop { xdg, name };
+
+    // `pwd -P` prints the physical cwd once (replayed from screen state on
+    // attach), then the session idles on `cat`.
+    let out = ghost(xdg)
+        .current_dir(workdir.path())
+        .args(["new", name, "--", "sh", "-c", "pwd -P; exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let term = Attached::new(xdg, name, 80, 24);
+    let needle = expected.to_str().unwrap().to_owned();
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains(&needle)),
+        "session did not start in the launch directory ({needle:?}); got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
 fn resync_uses_the_attaching_clients_size() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
