@@ -12,6 +12,7 @@
 //! front-end.
 
 pub mod client;
+pub mod keys;
 pub mod protocol;
 pub mod pty;
 pub mod record;
