@@ -106,14 +106,22 @@ fn long_session_writes_checkpoints() {
     let data = tempfile::tempdir().unwrap();
     let name = "rec-checkpoints";
 
-    // Emit far more than the host's checkpoint interval, then a sentinel, then
-    // exit. The sentinel lets us know the whole recording has been flushed
-    // before we inspect it (the file is written concurrently as the session
-    // runs, and a mid-write read would be incomplete).
+    // Emit several MB — comfortably more than the host's (default-cap)
+    // checkpoint interval — then a sentinel, then exit. The sentinel lets us
+    // know the whole recording has been flushed before we inspect it (the file
+    // is written concurrently as the session runs, and a mid-write read would be
+    // incomplete).
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["new", name, "--", "sh", "-c", "seq 1 60000; echo DONE-CHK"])
+        .args([
+            "new",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "seq 1 1000000; echo DONE-CHK",
+        ])
         .output()
         .unwrap();
     assert!(

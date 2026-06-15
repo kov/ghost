@@ -6,3 +6,9 @@ members = ["vt", "ghost-vt", "ghost-cli"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+# Optimized build that keeps symbols, for profiling with perf/valgrind.
+# Select with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true

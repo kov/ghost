@@ -37,10 +37,33 @@ pub struct SpawnOpts {
     pub max_recording_bytes: Option<usize>,
 }
 
-/// Write a recording checkpoint once this many bytes of output have been
-/// recorded since the last one. Bounds replay cost and gives a safe cut point
-/// for bounding the recording's size.
-const CHECKPOINT_INTERVAL_BYTES: usize = 128 * 1024;
+/// Lower bound on the checkpoint interval. Small recording caps need frequent
+/// checkpoints to be enforceable (see [`checkpoint_interval`]); this also caps
+/// how far the file can overshoot a small cap.
+const MIN_CHECKPOINT_INTERVAL_BYTES: usize = 128 * 1024;
+/// Upper bound on the checkpoint interval. Past this, spacing checkpoints out
+/// further saves little CPU but lengthens replay-from-checkpoint.
+const MAX_CHECKPOINT_INTERVAL_BYTES: usize = 2 * 1024 * 1024;
+
+/// How many bytes of output to emit between recording checkpoints.
+///
+/// A checkpoint serializes and zstd-compresses the *entire* emulator state, so
+/// under high-throughput output (a big `find`, `cat` of a large file) frequent
+/// checkpoints dominate the host's CPU — re-compressing roughly as many bytes as
+/// the output stream itself. Spacing them out cuts that cost sharply.
+///
+/// The interval can't simply be large, though: between checkpoints the recording
+/// has no safe cut point, so it can overshoot its size cap by up to one interval
+/// before compaction runs. We therefore scale the interval to the cap (a small
+/// fraction of it) and clamp it — large caps get rare, cheap checkpoints; small
+/// caps keep them frequent enough to stay enforceable. An unbounded recording
+/// never compacts, so only replay cost matters and we use the maximum.
+fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
+    match max_bytes {
+        Some(max) => (max / 32).clamp(MIN_CHECKPOINT_INTERVAL_BYTES, MAX_CHECKPOINT_INTERVAL_BYTES),
+        None => MAX_CHECKPOINT_INTERVAL_BYTES,
+    }
+}
 
 enum Fork {
     Parent,
@@ -166,6 +189,7 @@ fn host_main(
         .ok()
     });
     let mut bytes_since_checkpoint = 0usize;
+    let checkpoint_interval = checkpoint_interval(opts.max_recording_bytes);
 
     let mut client: Option<Client> = None;
     let mut ptybuf = [0u8; 8192];
@@ -210,7 +234,7 @@ fn host_main(
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
-                        if bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES {
+                        if bytes_since_checkpoint >= checkpoint_interval {
                             let (c, rws) = screen.dimensions();
                             let _ = r.checkpoint(c, rws, &screen.dump());
                             bytes_since_checkpoint = 0;
@@ -380,4 +404,45 @@ unsafe fn daemonize() -> io::Result<Fork> {
         }
     }
     Ok(Fork::Daemon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::DEFAULT_MAX_RECORDING_BYTES;
+
+    #[test]
+    fn checkpoint_interval_scales_with_cap_and_clamps() {
+        // The default cap yields the maximum interval (rare, cheap checkpoints).
+        assert_eq!(
+            checkpoint_interval(Some(DEFAULT_MAX_RECORDING_BYTES)),
+            MAX_CHECKPOINT_INTERVAL_BYTES
+        );
+        // An unbounded recording never compacts, so it also uses the maximum.
+        assert_eq!(checkpoint_interval(None), MAX_CHECKPOINT_INTERVAL_BYTES);
+
+        // A tiny cap clamps up to the minimum so checkpoints stay frequent
+        // enough to keep the cap enforceable.
+        assert_eq!(
+            checkpoint_interval(Some(256 * 1024)),
+            MIN_CHECKPOINT_INTERVAL_BYTES
+        );
+        assert_eq!(checkpoint_interval(Some(0)), MIN_CHECKPOINT_INTERVAL_BYTES);
+
+        // A mid-range cap scales linearly (1/32 of the cap) between the bounds.
+        assert_eq!(checkpoint_interval(Some(32 * 1024 * 1024)), 1024 * 1024);
+
+        // The interval is always a small fraction of the cap (bounding overshoot)
+        // except where the minimum floor lifts it, and never exceeds the cap.
+        for &mb in &[1usize, 4, 8, 16, 32, 64, 128, 512] {
+            let cap = mb * 1024 * 1024;
+            let interval = checkpoint_interval(Some(cap));
+            assert!(interval >= MIN_CHECKPOINT_INTERVAL_BYTES);
+            assert!(interval <= MAX_CHECKPOINT_INTERVAL_BYTES);
+            assert!(
+                interval <= cap,
+                "interval {interval} exceeds cap {cap}, cap unenforceable"
+            );
+        }
+    }
 }
