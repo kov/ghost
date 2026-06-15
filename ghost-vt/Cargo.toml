@@ -17,3 +17,6 @@ serde_json = "1.0.150"
 # referred to locally as `vt`. Kept structurally close to upstream for rebasing.
 vt = { package = "avt", path = "../vt" }
 zstd = "0.13.3"
+
+[dev-dependencies]
+tempfile = "3"

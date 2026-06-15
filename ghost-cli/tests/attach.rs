@@ -20,13 +20,19 @@ const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 
 fn ghost(xdg: &Path) -> Command {
     let mut c = Command::new(GHOST);
-    c.env("XDG_RUNTIME_DIR", xdg);
-    // Isolate recordings too: sessions record by default, so without this the
-    // suite writes .ghostrec files into the real `$XDG_DATA_HOME`. Reusing the
-    // same temp root is fine — sockets and recordings live under distinct
-    // subpaths.
-    c.env("XDG_DATA_HOME", xdg);
+    set_xdg(&mut c, xdg);
     c
+}
+
+/// Point a command's XDG dirs at isolated subdirectories of the test's tempdir.
+/// Runtime and data must be *distinct* roots, as they are in production: a
+/// session is now a directory under the runtime root, and `ghost ls` treats
+/// every directory there as a session — so the recordings directory must not
+/// share that root. (Recording is on by default, so this also keeps the suite
+/// from writing into the real `$XDG_DATA_HOME`.)
+fn set_xdg(c: &mut Command, xdg: &Path) {
+    c.env("XDG_RUNTIME_DIR", xdg.join("run"));
+    c.env("XDG_DATA_HOME", xdg.join("data"));
 }
 
 fn ls(xdg: &Path) -> String {
@@ -97,8 +103,8 @@ impl Attached {
         }
         let child = PtyCommand::new(GHOST)
             .args(args)
-            .env("XDG_RUNTIME_DIR", xdg)
-            .env("XDG_DATA_HOME", xdg)
+            .env("XDG_RUNTIME_DIR", xdg.join("run"))
+            .env("XDG_DATA_HOME", xdg.join("data"))
             .spawn(pts)
             .expect("spawn ghost");
 
@@ -624,6 +630,143 @@ fn resync_uses_the_attaching_clients_size() {
         term.wait_until(Duration::from_secs(5), |t| t.cursor() == (0, 10)),
         "resync was not laid out at the client's width (cursor at {:?}, expected (0, 10)); screen: {:?}",
         term.cursor(),
+        term.screen()
+    );
+}
+
+#[test]
+fn cli_rename_changes_session_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "rename-old";
+    let new = "rename-fresh";
+    // Kill under whichever name the session ends up holding.
+    let _g_old = KillOnDrop { xdg, name: old };
+    let _g_new = KillOnDrop { xdg, name: new };
+
+    let out = ghost(xdg)
+        .args(["new", old, "-d", "--", "sh", "-c", "echo HItag; exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(old)),
+        "session not listed under old name"
+    );
+
+    let out = ghost(xdg).args(["rename", old, new]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `ls` now shows the new name and not the old one.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let l = ls(xdg);
+            l.contains(new) && !l.contains(old)
+        }),
+        "rename not reflected in `ls`: {}",
+        ls(xdg)
+    );
+
+    // The renamed session is still alive: attaching by the new name replays the
+    // output it produced before the rename.
+    let term = Attached::new(xdg, new, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("HItag")),
+        "renamed session not reachable; got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
+fn cli_rename_does_not_disturb_attached_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "busy-old";
+    let new = "busy-fresh";
+    let _g_old = KillOnDrop { xdg, name: old };
+    let _g_new = KillOnDrop { xdg, name: new };
+
+    // Auto-attach to a live session.
+    let term = Attached::new_session(xdg, old, &["sh", "-c", "echo READYtag; exec cat"], 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("READYtag")),
+        "session not attached; got: {:?}",
+        term.screen()
+    );
+
+    // Rename from outside, via the CLI, while the client stays attached.
+    let out = ghost(xdg).args(["rename", old, new]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(new)),
+        "rename not reflected in `ls`: {}",
+        ls(xdg)
+    );
+
+    // The control connection must NOT have bumped the attached client: it is
+    // still live and interactive, so typed input still echoes back.
+    term.send(b"still-here\n");
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("still-here")),
+        "attached client was disturbed by the rename; got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
+fn rename_prompt_renames_attached_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "prompt-old";
+    let new = "prompt-fresh";
+    let _g_old = KillOnDrop { xdg, name: old };
+    let _g_new = KillOnDrop { xdg, name: new };
+
+    let term = Attached::new_session(xdg, old, &["sh", "-c", "echo READYtag; exec cat"], 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("READYtag")),
+        "session not attached; got: {:?}",
+        term.screen()
+    );
+
+    // Open the rename prompt with the default trigger: Ctrl-\ then 'r'.
+    term.send(b"\x1cr");
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("rename session to")),
+        "rename prompt did not appear; got: {:?}",
+        term.screen()
+    );
+
+    // Type the new name and confirm with Enter.
+    term.send(new.as_bytes());
+    term.send(b"\r");
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let l = ls(xdg);
+            l.contains(new) && !l.contains(old)
+        }),
+        "prompt rename not reflected in `ls`: {}",
+        ls(xdg)
+    );
+
+    // Session survives the rename and stays interactive under the new name.
+    term.send(b"post-rename\n");
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("post-rename")),
+        "session not interactive after prompt rename; got: {:?}",
         term.screen()
     );
 }

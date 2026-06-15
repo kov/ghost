@@ -39,6 +39,7 @@ ghost new -d [NAME]            # start in the background without attaching
 ghost ls                       # list live sessions (name + pid)
 ghost attach NAME              # attach to a session
 ghost kill NAME                # kill a session and its process
+ghost rename OLD NEW           # rename a running session
 ghost export NAME [FILE]       # export the recording as an asciicast (v2)
 ```
 
@@ -57,6 +58,7 @@ except the detach/kill trigger, a tmux-style prefix (`Ctrl-\` by default):
 | --------------- | ----------------------------------- |
 | `Ctrl-\` `d`    | detach (session keeps running)      |
 | `Ctrl-\` `k`    | kill the session                    |
+| `Ctrl-\` `r`    | rename (prompts for the new name; `Esc` cancels) |
 | `Ctrl-\` `Ctrl-\` | send a literal `Ctrl-\` through   |
 
 `ghost new` options: `--no-record` (recording is on by default),
@@ -82,8 +84,9 @@ macOS (no `signalfd`/`kqueue` split).
 
 ### Storage
 
-- Sockets + pidfiles: `$XDG_RUNTIME_DIR/ghost/<name>.sock` / `.pid` (ephemeral —
-  wiped on reboot, which doubles as stale-socket cleanup).
+- Per-session runtime dir: `$XDG_RUNTIME_DIR/ghost/<name>/` holding `sock` and
+  `pid` (ephemeral — wiped on reboot, which doubles as stale-socket cleanup).
+  Grouping them in one directory makes renaming a single atomic `rename(2)`.
 - Recordings: `$XDG_DATA_HOME/ghost/recordings/<name>.ghostrec` (falls back to
   `~/.local/share/ghost/…`; archival, survives reboot). A framed, per-frame-zstd
   asciicast with periodic checkpoints; `ghost export` turns it into a standard

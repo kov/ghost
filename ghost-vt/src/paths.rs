@@ -1,13 +1,15 @@
 //! Filesystem locations for sessions.
 //!
-//! Per-session sockets and pidfiles live under `$XDG_RUNTIME_DIR/ghost`
-//! (falling back to `/tmp/ghost-<uid>` when the variable is unset). That
-//! directory is ephemeral by design — wiped on reboot — which doubles as
-//! free stale-socket cleanup, since a session never outlives its host's kernel.
+//! Each session owns a directory `$XDG_RUNTIME_DIR/ghost/<name>/` holding its
+//! `sock` and `pid` (the base falls back to `/tmp/ghost-<uid>` when the variable
+//! is unset). That tree is ephemeral by design — wiped on reboot — which doubles
+//! as free stale-socket cleanup, since a session never outlives its host's
+//! kernel. Grouping the per-session files in one directory also makes renaming a
+//! session a single atomic `rename(2)` of that directory.
 
 use std::path::PathBuf;
 
-/// The directory holding per-session sockets and pidfiles.
+/// The directory holding the per-session subdirectories.
 pub fn runtime_dir() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -18,21 +20,26 @@ pub fn runtime_dir() -> PathBuf {
     base.join("ghost")
 }
 
-/// Create the runtime directory if needed and return it.
-pub fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
-    let dir = runtime_dir();
+/// The directory holding one session's `sock` and `pid`.
+pub fn session_dir(name: &str) -> PathBuf {
+    runtime_dir().join(name)
+}
+
+/// Create the session's directory (and the runtime root) if needed; return it.
+pub fn ensure_session_dir(name: &str) -> std::io::Result<PathBuf> {
+    let dir = session_dir(name);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// Path of the control socket for the named session.
 pub fn socket_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.sock"))
+    session_dir(name).join("sock")
 }
 
 /// Path of the pidfile for the named session.
 pub fn pid_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.pid"))
+    session_dir(name).join("pid")
 }
 
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to

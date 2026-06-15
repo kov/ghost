@@ -153,6 +153,19 @@ impl FileRecorder {
         self.inner.resize(cols, rows)
     }
 
+    /// Move the recording to `new_path`, keeping the open writer valid. The
+    /// underlying file descriptor is unaffected by the rename, so buffered and
+    /// future writes continue to land in the same (now-renamed) file; only the
+    /// path used for later compaction is updated.
+    pub fn rename(&mut self, new_path: &Path) -> io::Result<()> {
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&self.path, new_path)?;
+        self.path = new_path.to_path_buf();
+        Ok(())
+    }
+
     /// Write a checkpoint, then compact the file if it has grown past the cap.
     pub fn checkpoint(&mut self, cols: u16, rows: u16, dump: &[u8]) -> io::Result<()> {
         self.inner.checkpoint(cols, rows, dump)?;
@@ -670,6 +683,26 @@ mod tests {
     fn rejects_bad_magic() {
         let err = read_bytes(b"not a recording at all").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn file_recorder_rename_moves_file_and_keeps_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.ghostrec");
+        let new = dir.path().join("new.ghostrec");
+
+        {
+            let mut rec = FileRecorder::create(&old, 80, 24, &[], None).unwrap();
+            rec.output(b"before-rename ").unwrap();
+            rec.rename(&new).unwrap();
+            rec.output(b"after-rename").unwrap();
+            // Drop flushes the buffered frame to the (renamed) file.
+        }
+
+        assert!(!old.exists(), "old recording path should be gone");
+        assert!(new.exists(), "recording should be at the new path");
+        let rec = read(&new).unwrap();
+        assert_eq!(rec.output_bytes(), b"before-rename after-rename");
     }
 
     fn asciicast(rec: &Recording) -> (serde_json::Value, Vec<serde_json::Value>) {

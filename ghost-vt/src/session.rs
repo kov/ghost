@@ -24,11 +24,12 @@ pub fn list() -> io::Result<Vec<SessionInfo>> {
         Err(e) => return Err(e),
     };
     for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+        let entry = entry?;
+        // Each session is a directory `<runtime>/<name>/` holding sock + pid.
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         match read_pid(&name) {
@@ -38,6 +39,20 @@ pub fn list() -> io::Result<Vec<SessionInfo>> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Whether `name` is usable as a session name. A name becomes a directory and a
+/// socket filename, so it must be a single, safe path component: non-empty, not
+/// over-long, no separators or `.`/`..`, and restricted to an unambiguous set of
+/// characters.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Kill the named session's host (and thereby its child). Returns `false` if no
@@ -79,6 +94,30 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 fn prune(name: &str) {
-    let _ = std::fs::remove_file(paths::socket_path(name));
-    let _ = std::fs::remove_file(paths::pid_path(name));
+    // The whole session directory (sock + pid) goes at once.
+    let _ = std::fs::remove_dir_all(paths::session_dir(name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_name_accepts_safe_names_and_rejects_unsafe() {
+        for ok in ["work", "ghost-1234", "my_session.2", "a", &"x".repeat(64)] {
+            assert!(valid_name(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",              // empty
+            ".",             // current dir
+            "..",            // parent dir
+            "a/b",           // path separator
+            "with space",    // whitespace
+            "tab\t",         // control char
+            "emoji😀",       // non-ascii
+            &"x".repeat(65), // too long
+        ] {
+            assert!(!valid_name(bad), "{bad:?} should be rejected");
+        }
+    }
 }

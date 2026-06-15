@@ -8,6 +8,7 @@
 //! After the prefix:
 //! - `d` → [`Action::Detach`]
 //! - `k` → [`Action::Kill`]
+//! - `r` → [`Action::Rename`] (the client then prompts for the new name)
 //! - the prefix again → one *literal* prefix byte is forwarded
 //! - anything else → the prefix is swallowed and the key is forwarded
 //!
@@ -19,6 +20,8 @@ pub const DEFAULT_PREFIX: u8 = 0x1c;
 pub const DETACH_KEY: u8 = b'd';
 /// Key that, after the prefix, kills the session.
 pub const KILL_KEY: u8 = b'k';
+/// Key that, after the prefix, begins renaming the session.
+pub const RENAME_KEY: u8 = b'r';
 
 /// What the client should do with a span of input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +32,8 @@ pub enum Action {
     Detach,
     /// Kill the session and its child.
     Kill,
+    /// Begin renaming the session (the client collects the new name).
+    Rename,
 }
 
 /// Stateful scanner turning a raw input stream into [`Action`]s.
@@ -64,6 +69,9 @@ impl Detacher {
                 } else if b == KILL_KEY {
                     flush(&mut pending, &mut actions);
                     actions.push(Action::Kill);
+                } else if b == RENAME_KEY {
+                    flush(&mut pending, &mut actions);
+                    actions.push(Action::Rename);
                 } else if b == self.prefix {
                     pending.push(self.prefix); // doubled prefix -> one literal
                 } else {
@@ -113,6 +121,11 @@ mod tests {
     #[test]
     fn prefix_then_kill() {
         assert_eq!(d().feed(&[P, b'k']), vec![Action::Kill]);
+    }
+
+    #[test]
+    fn prefix_then_rename() {
+        assert_eq!(d().feed(&[P, b'r']), vec![Action::Rename]);
     }
 
     #[test]

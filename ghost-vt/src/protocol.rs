@@ -24,6 +24,13 @@ pub enum ClientMsg {
     Detach,
     /// Kill: terminate the session and its child.
     Kill,
+    /// Rename the session to this name. The host renames its socket, pidfile,
+    /// and recording, then replies with [`ServerMsg::RenameResult`].
+    Rename(String),
+    /// Ask the host to repaint the screen (re-send the current state). Used by
+    /// the client to heal its display after drawing a transient overlay such as
+    /// the rename prompt.
+    Repaint,
 }
 
 /// Messages sent from the session host to an attach client.
@@ -33,6 +40,9 @@ pub enum ServerMsg {
     Output(Vec<u8>),
     /// The child process exited with this status code.
     Exited(i32),
+    /// Result of a [`ClientMsg::Rename`]: `ok` true on success, otherwise
+    /// `message` explains why it was refused.
+    RenameResult { ok: bool, message: String },
 }
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
@@ -104,6 +114,8 @@ mod tests {
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
             ClientMsg::Kill,
+            ClientMsg::Rename("new-name".to_string()),
+            ClientMsg::Repaint,
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));
@@ -119,6 +131,10 @@ mod tests {
             ServerMsg::Output(b"world".to_vec()),
             ServerMsg::Exited(0),
             ServerMsg::Exited(137),
+            ServerMsg::RenameResult {
+                ok: true,
+                message: "ok".to_string(),
+            },
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));

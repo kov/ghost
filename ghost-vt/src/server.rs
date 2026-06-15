@@ -65,6 +65,10 @@ fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
     }
 }
 
+/// Cap on connections awaiting classification, bounding memory against a peer
+/// that connects but never sends its first message.
+const MAX_PENDING: usize = 8;
+
 enum Fork {
     Parent,
     Daemon,
@@ -120,16 +124,18 @@ impl Client {
 /// In the host process this function does not return — it runs the session and
 /// exits the process when the session ends.
 pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
-    paths::ensure_runtime_dir()?;
-    let sock = paths::socket_path(&opts.name);
-    let pidf = paths::pid_path(&opts.name);
-
+    // Check for a live session of this name first. `session::list` also prunes
+    // dead sessions' directories, so a stale `<name>/` left by a crashed host is
+    // cleared here — and crucially this runs before we create our own directory,
+    // which has no pidfile yet and would otherwise be pruned as "dead".
     if crate::session::list()?.iter().any(|s| s.name == opts.name) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("session '{}' already exists", opts.name),
         ));
     }
+    paths::ensure_session_dir(&opts.name)?;
+    let sock = paths::socket_path(&opts.name);
     // Clear any stale socket left by a dead host, then claim the name.
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
@@ -145,9 +151,11 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     }
 
     // We are now the long-lived host; there is no caller to return errors to.
-    let result = host_main(&listener, &opts, launch_dir.as_deref());
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(&pidf);
+    // `current_name` may change under us if the session is renamed, so the
+    // host reports the final name and we clean up its directory by that.
+    let mut current_name = opts.name.clone();
+    let result = host_main(&listener, &opts, launch_dir.as_deref(), &mut current_name);
+    let _ = std::fs::remove_dir_all(paths::session_dir(&current_name));
     std::process::exit(result.unwrap_or(1));
 }
 
@@ -155,8 +163,12 @@ fn host_main(
     listener: &UnixListener,
     opts: &SpawnOpts,
     launch_dir: Option<&std::path::Path>,
+    current_name: &mut String,
 ) -> io::Result<i32> {
-    std::fs::write(paths::pid_path(&opts.name), std::process::id().to_string())?;
+    std::fs::write(
+        paths::pid_path(current_name),
+        std::process::id().to_string(),
+    )?;
     listener.set_nonblocking(true)?;
 
     let (pty, pts) = open().map_err(io::Error::other)?;
@@ -191,22 +203,38 @@ fn host_main(
     let mut bytes_since_checkpoint = 0usize;
     let checkpoint_interval = checkpoint_interval(opts.max_recording_bytes);
 
+    // The attached display client, plus connections that have not yet
+    // identified themselves. A new connection only becomes the display client
+    // (taking over from any current one) once it sends a Resize — the attach
+    // handshake. A control connection (e.g. `ghost rename`) sends a Rename
+    // first and is serviced without disturbing the attached client.
     let mut client: Option<Client> = None;
+    let mut pending: Vec<Client> = Vec::new();
     let mut ptybuf = [0u8; 8192];
 
     loop {
-        // Build the poll set (client slot only when one is attached).
+        // Build the poll set: fixed fds first, then the display client (if any),
+        // then the pending connections.
         let mut fds = vec![
             PollFd::new(&pty, PollFlags::IN),
             PollFd::new(listener, PollFlags::IN),
             PollFd::new(&sfd, PollFlags::IN),
         ];
-        if let Some(c) = &client {
+        let client_idx = client.as_ref().map(|c| {
             let mut flags = PollFlags::IN;
             if !c.outbuf.is_empty() {
                 flags |= PollFlags::OUT;
             }
             fds.push(PollFd::new(&c.stream, flags));
+            fds.len() - 1
+        });
+        let pending_start = fds.len();
+        for p in &pending {
+            let mut flags = PollFlags::IN;
+            if !p.outbuf.is_empty() {
+                flags |= PollFlags::OUT;
+            }
+            fds.push(PollFd::new(&p.stream, flags));
         }
         match poll(&mut fds, None) {
             Ok(_) => {}
@@ -216,11 +244,12 @@ fn host_main(
         let pty_re = fds[0].revents();
         let listener_re = fds[1].revents();
         let sig_re = fds[2].revents();
-        let client_re = if client.is_some() {
-            fds[3].revents()
-        } else {
-            PollFlags::empty()
-        };
+        let client_re = client_idx
+            .map(|i| fds[i].revents())
+            .unwrap_or_else(PollFlags::empty);
+        let pending_re: Vec<PollFlags> = (0..pending.len())
+            .map(|i| fds[pending_start + i].revents())
+            .collect();
         drop(fds);
 
         // PTY output -> authoritative screen state, and live to the attached
@@ -255,66 +284,99 @@ fn host_main(
             }
         }
 
-        // New connection: the latest attach takes over. The repaint is deferred
-        // until the client reports its size (its first message), so it is laid
-        // out at the right geometry.
-        if listener_re.contains(PollFlags::IN)
-            && let Ok((stream, _)) = listener.accept()
-        {
-            client = Some(Client::new(stream)?);
+        // New connections wait in the pending pool until their first message
+        // classifies them (attach vs. control). Drain the whole accept backlog.
+        if listener_re.contains(PollFlags::IN) {
+            while let Ok((stream, _)) = listener.accept() {
+                if pending.len() < MAX_PENDING {
+                    pending.push(Client::new(stream)?);
+                }
+                // Otherwise drop it: too many half-open connections.
+            }
         }
 
-        // Client -> host (input and control messages).
+        // Display client -> host. Read once, then process every buffered message
+        // (so a Resize batched with input is fully handled, not just the first).
         if client_re.intersects(PollFlags::IN | PollFlags::HUP) {
-            let mut drop_client = false;
+            let mut disposition = Disposition::Keep;
             if let Some(c) = &mut client {
                 let mut buf = [0u8; 4096];
                 match c.stream.read(&mut buf) {
-                    Ok(0) => drop_client = true,
+                    Ok(0) => disposition = Disposition::Drop,
                     Ok(n) => {
                         c.reader.push(&buf[..n]);
-                        loop {
-                            match c.reader.next_msg::<ClientMsg>() {
-                                Ok(Some(ClientMsg::Input(bytes))) => {
-                                    (&pty).write_all(&bytes)?;
-                                }
-                                Ok(Some(ClientMsg::Resize { cols, rows })) => {
-                                    let _ = pty.resize(Size::new(rows, cols));
-                                    screen.resize(cols, rows);
-                                    if let Some(r) = &mut recorder {
-                                        let _ = r.resize(cols, rows);
-                                    }
-                                    // The first resize completes the attach
-                                    // handshake: repaint at the now-known size.
-                                    if !c.resynced {
-                                        c.queue(&ServerMsg::Output(screen.resync()));
-                                        c.resynced = true;
-                                    }
-                                }
-                                Ok(Some(ClientMsg::Detach)) => {
-                                    drop_client = true;
-                                    break;
-                                }
-                                Ok(Some(ClientMsg::Kill)) => {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    return Ok(0);
-                                }
-                                Ok(None) => break,
-                                Err(_) => {
-                                    drop_client = true;
-                                    break;
-                                }
-                            }
-                        }
+                        disposition = handle_client_messages(
+                            c,
+                            &pty,
+                            &mut screen,
+                            &mut recorder,
+                            current_name,
+                        )?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => drop_client = true,
+                    Err(_) => disposition = Disposition::Drop,
                 }
             }
-            if drop_client {
-                client = None;
+            match disposition {
+                Disposition::Keep => {}
+                Disposition::Drop => client = None,
+                Disposition::Kill => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(0);
+                }
             }
+        }
+
+        // Service pending connections through the same handler. A connection
+        // that completes the attach handshake (a Resize, which sets `resynced`)
+        // is promoted to the display client, taking over from any current one. A
+        // control-only connection (e.g. `ghost rename`, which sends a Rename and
+        // never resyncs) is serviced and kept until it disconnects, leaving any
+        // attached client undisturbed.
+        if !pending.is_empty() {
+            let mut still_pending = Vec::new();
+            for (i, mut p) in std::mem::take(&mut pending).into_iter().enumerate() {
+                let re = pending_re.get(i).copied().unwrap_or_else(PollFlags::empty);
+                if !re.intersects(PollFlags::IN | PollFlags::HUP) {
+                    let _ = p.flush();
+                    still_pending.push(p);
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let disposition = match p.stream.read(&mut buf) {
+                    Ok(0) => Disposition::Drop,
+                    Ok(n) => {
+                        p.reader.push(&buf[..n]);
+                        handle_client_messages(
+                            &mut p,
+                            &pty,
+                            &mut screen,
+                            &mut recorder,
+                            current_name,
+                        )?
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Disposition::Keep,
+                    Err(_) => Disposition::Drop,
+                };
+                match disposition {
+                    Disposition::Kill => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(0);
+                    }
+                    Disposition::Drop => {} // drop p
+                    Disposition::Keep => {
+                        let _ = p.flush();
+                        if p.resynced {
+                            client = Some(p); // attach handshake done -> display client
+                        } else {
+                            still_pending.push(p); // control / not yet identified
+                        }
+                    }
+                }
+            }
+            pending = still_pending;
         }
 
         // Push queued output to the client.
@@ -345,6 +407,106 @@ fn host_main(
             }
         }
     }
+}
+
+/// How the caller should treat a connection after processing its messages.
+enum Disposition {
+    /// Keep the connection.
+    Keep,
+    /// Drop the connection (it detached, closed, or errored).
+    Drop,
+    /// Kill the whole session.
+    Kill,
+}
+
+/// Process every complete message buffered on `c`: write input to the PTY, apply
+/// resizes, handle renames and repaints. A Resize sets `c.resynced` (and queues
+/// the repaint), which is how the caller knows the connection is an attach client
+/// rather than a control-only one. Returns how the connection should be treated.
+fn handle_client_messages(
+    c: &mut Client,
+    pty: &pty_process::blocking::Pty,
+    screen: &mut Screen,
+    recorder: &mut Option<crate::record::FileRecorder>,
+    current_name: &mut String,
+) -> io::Result<Disposition> {
+    loop {
+        match c.reader.next_msg::<ClientMsg>() {
+            Ok(Some(ClientMsg::Input(bytes))) => {
+                let mut w: &pty_process::blocking::Pty = pty;
+                w.write_all(&bytes)?;
+            }
+            Ok(Some(ClientMsg::Resize { cols, rows })) => {
+                let _ = pty.resize(Size::new(rows, cols));
+                screen.resize(cols, rows);
+                if let Some(r) = recorder {
+                    let _ = r.resize(cols, rows);
+                }
+                // First resize completes the attach handshake: repaint at size.
+                if !c.resynced {
+                    c.queue(&ServerMsg::Output(screen.resync()));
+                    c.resynced = true;
+                }
+            }
+            Ok(Some(ClientMsg::Detach)) => return Ok(Disposition::Drop),
+            Ok(Some(ClientMsg::Kill)) => return Ok(Disposition::Kill),
+            Ok(Some(ClientMsg::Rename(new))) => {
+                let (ok, message) = match rename_session(current_name, &new, recorder) {
+                    Ok(()) => (true, current_name.clone()),
+                    Err(e) => (false, e),
+                };
+                c.queue(&ServerMsg::RenameResult { ok, message });
+            }
+            Ok(Some(ClientMsg::Repaint)) => {
+                if c.resynced {
+                    c.queue(&ServerMsg::Output(screen.resync()));
+                }
+            }
+            Ok(None) => return Ok(Disposition::Keep),
+            Err(_) => return Ok(Disposition::Drop),
+        }
+    }
+}
+
+/// Rename the running session: move its runtime directory (sock + pid together,
+/// atomically) and its recording, updating `current_name` so cleanup targets the
+/// right directory. Returns a human-readable error if the new name is invalid or
+/// already taken.
+fn rename_session(
+    current_name: &mut String,
+    new_name: &str,
+    recorder: &mut Option<crate::record::FileRecorder>,
+) -> Result<(), String> {
+    if current_name.as_str() == new_name {
+        return Ok(()); // no-op
+    }
+    if !crate::session::valid_name(new_name) {
+        return Err(format!(
+            "'{new_name}' is not a valid session name (letters, digits, '-', '_', '.')"
+        ));
+    }
+    // Refuse to clobber a live session. `list` also prunes dead sessions, so a
+    // stale directory for `new_name` is cleared and the rename can proceed.
+    match crate::session::list() {
+        Ok(sessions) if sessions.iter().any(|s| s.name == new_name) => {
+            return Err(format!("a session named '{new_name}' already exists"));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("could not check existing sessions: {e}")),
+    }
+    let new_dir = paths::session_dir(new_name);
+    // Defensive: clear any leftover empty directory so the rename target is free.
+    let _ = std::fs::remove_dir_all(&new_dir);
+    std::fs::rename(paths::session_dir(current_name), &new_dir)
+        .map_err(|e| format!("could not move session directory: {e}"))?;
+    // The directory move is authoritative — the session is now `new_name`.
+    *current_name = new_name.to_string();
+    // Move the recording too. Best effort: the session itself is already renamed,
+    // and discovery never depends on the recording.
+    if let Some(r) = recorder {
+        let _ = r.rename(&paths::recording_path(new_name));
+    }
+    Ok(())
 }
 
 /// Reap the child after the PTY signalled EOF and tell the client.

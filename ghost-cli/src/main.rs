@@ -48,6 +48,13 @@ enum Command {
         /// Name of the session to kill.
         name: String,
     },
+    /// Rename a running session.
+    Rename {
+        /// Current session name.
+        old: String,
+        /// New session name.
+        new: String,
+    },
     /// Export a session's recording as an asciicast (asciinema) stream.
     Export {
         /// Name of the recorded session.
@@ -110,6 +117,10 @@ fn main() {
         Command::Kill { name } => match session::kill_session(&name) {
             Ok(true) => println!("killed session '{name}'"),
             Ok(false) => fail(&format!("no such session '{name}'")),
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::Rename { old, new } => match client::rename(&old, &new) {
+            Ok(()) => println!("renamed '{old}' to '{new}'"),
             Err(e) => fail(&e.to_string()),
         },
         Command::Export { name, output } => {
