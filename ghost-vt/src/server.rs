@@ -1,6 +1,6 @@
 //! The session host: a synchronous `poll()` loop over the PTY master, the
-//! listening socket, the attached client connection, and signals (via
-//! `signalfd`).
+//! listening socket, the attached client connection, and signals (via the
+//! self-pipe in [`crate::signals`]).
 //!
 //! Single-threaded and lock-free by construction — one owner of the terminal
 //! and the client connection. No async runtime: the fd count is small and

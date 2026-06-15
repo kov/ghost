@@ -75,6 +75,11 @@ attaching client's size. After that it streams live bytes verbatim.
 Sessions survive *disconnection*, never a *reboot of the machine running the
 session* (a PTY child cannot outlive its kernel).
 
+The host and client are single `poll()` loops. Signals are folded into them via
+a self-pipe — an installed handler writes each delivered signal's number to a
+pipe whose read end sits in the poll set — so the same code runs on Linux and
+macOS (no `signalfd`/`kqueue` split).
+
 ### Storage
 
 - Sockets + pidfiles: `$XDG_RUNTIME_DIR/ghost/<name>.sock` / `.pid` (ephemeral —
@@ -90,8 +95,6 @@ session* (a PTY child cannot outlive its kernel).
   yet).
 - **No built-in `ghost play`** — use `ghost export` + `asciinema play`.
 - **`TERM` is inherited** from the `ghost new` environment; it is not normalized.
-- **Linux only** for now (signalfd); a macOS/BSD port would use a self-pipe or
-  kqueue.
 
 ## Development
 
