@@ -36,14 +36,14 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// List background sessions.
+    /// List running sessions.
     Ls,
-    /// Attach to a background session.
+    /// Attach to a session.
     Attach {
         /// Name of the session to attach to.
         name: Option<String>,
     },
-    /// Kill a background session and its process.
+    /// Kill a session and its process.
     Kill {
         /// Name of the session to kill.
         name: String,
