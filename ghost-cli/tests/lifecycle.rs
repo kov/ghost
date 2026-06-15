@@ -52,7 +52,7 @@ fn session_lifecycle_new_ls_kill() {
     let _guard = Cleanup { xdg, name };
 
     let out = ghost(xdg)
-        .args(["new", name, "--", "sleep", "600"])
+        .args(["new", name, "-d", "--", "sleep", "600"])
         .output()
         .unwrap();
     assert!(

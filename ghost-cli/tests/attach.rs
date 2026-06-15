@@ -68,7 +68,22 @@ struct Attached {
 }
 
 impl Attached {
+    /// Drive `ghost attach <name>` over a PTY.
     fn new(xdg: &Path, name: &str, cols: u16, rows: u16) -> Self {
+        Self::spawn(xdg, &["attach", name], cols, rows)
+    }
+
+    /// Drive `ghost new <name> -- <command…>` over a PTY, exercising the default
+    /// auto-attach: `new` starts the session and attaches us to it in one step.
+    fn new_session(xdg: &Path, name: &str, command: &[&str], cols: u16, rows: u16) -> Self {
+        let mut args = vec!["new", name, "--"];
+        args.extend_from_slice(command);
+        Self::spawn(xdg, &args, cols, rows)
+    }
+
+    /// Run `ghost <args…>` as the foreground process of a fresh PTY, feeding
+    /// everything it prints into a `vt` we can inspect.
+    fn spawn(xdg: &Path, args: &[&str], cols: u16, rows: u16) -> Self {
         let (pty, pts) = open().expect("open pty");
         pty.resize(Size::new(rows, cols)).expect("resize pty");
         // Disable the slave's line-discipline echo so the test measures the
@@ -81,12 +96,11 @@ impl Attached {
             tcsetattr(&pts, OptionalActions::Now, &t).expect("tcsetattr pts");
         }
         let child = PtyCommand::new(GHOST)
-            .arg("attach")
-            .arg(name)
+            .args(args)
             .env("XDG_RUNTIME_DIR", xdg)
             .env("XDG_DATA_HOME", xdg)
             .spawn(pts)
-            .expect("spawn ghost attach");
+            .expect("spawn ghost");
 
         let pty = Arc::new(pty);
         let vt = Arc::new(Mutex::new(Vt::new(cols as usize, rows as usize)));
@@ -172,7 +186,7 @@ fn attach_streams_session_output() {
     let _guard = KillOnDrop { xdg, name };
 
     let out = ghost(xdg)
-        .args(["new", name, "--", "cat"])
+        .args(["new", name, "-d", "--", "cat"])
         .output()
         .unwrap();
     assert!(
@@ -232,7 +246,7 @@ fn detach_keeps_session_alive_then_reattach() {
     let _guard = KillOnDrop { xdg, name };
 
     let out = ghost(xdg)
-        .args(["new", name, "--", "cat"])
+        .args(["new", name, "-d", "--", "cat"])
         .output()
         .unwrap();
     assert!(
@@ -291,6 +305,7 @@ fn resize_propagates_to_session_child() {
         .args([
             "new",
             name,
+            "-d",
             "--",
             "sh",
             "-c",
@@ -338,6 +353,7 @@ fn reattach_replays_screen_state() {
         .args([
             "new",
             name,
+            "-d",
             "--",
             "sh",
             "-c",
@@ -394,6 +410,7 @@ fn reattach_replays_scrollback() {
         .args([
             "new",
             name,
+            "-d",
             "--",
             "sh",
             "-c",
@@ -451,7 +468,7 @@ fn session_starts_in_launch_directory() {
     // attach), then the session idles on `cat`.
     let out = ghost(xdg)
         .current_dir(workdir.path())
-        .args(["new", name, "--", "sh", "-c", "pwd -P; exec cat"])
+        .args(["new", name, "-d", "--", "sh", "-c", "pwd -P; exec cat"])
         .output()
         .unwrap();
     assert!(
@@ -474,6 +491,91 @@ fn session_starts_in_launch_directory() {
 }
 
 #[test]
+fn new_auto_attaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "new-autoattach";
+    let _guard = KillOnDrop { xdg, name };
+
+    // `ghost new` with no `-d` should attach us straight to the new session:
+    // the marker the command prints appears with no separate `ghost attach`.
+    let term = Attached::new_session(
+        xdg,
+        name,
+        &["sh", "-c", "echo AUTO-ATTACH-MARKER; exec cat"],
+        80,
+        24,
+    );
+    assert!(
+        term.wait_for_screen(
+            Duration::from_secs(5),
+            screen_contains("AUTO-ATTACH-MARKER")
+        ),
+        "auto-attach did not show session output; got: {:?}",
+        term.screen()
+    );
+
+    // It is a real backgrounded session (listed by `ls`) and a live pipe: typed
+    // input echoes back through `cat`.
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "auto-attached session was not listed"
+    );
+    term.send(b"live-input\n");
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("live-input")),
+        "auto-attached session did not echo input; got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
+fn new_detached_does_not_attach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "new-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // `-d` keeps the old behaviour: return immediately with a confirmation and
+    // leave the session running in the background, unattached.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo DETACHED; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("started session"),
+        "expected a confirmation message; got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "detached session was not listed"
+    );
+
+    // Attaching afterwards works and replays the output the session produced
+    // while nobody was attached.
+    let term = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("DETACHED")),
+        "could not attach to the detached session; got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
 fn resync_uses_the_attaching_clients_size() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
@@ -487,6 +589,7 @@ fn resync_uses_the_attaching_clients_size() {
         .args([
             "new",
             name,
+            "-d",
             "--",
             "sh",
             "-c",

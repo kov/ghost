@@ -15,10 +15,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a new background session (runs $SHELL, or a command given after `--`).
+    /// Start a new session and attach to it (runs $SHELL, or a command given after `--`).
     New {
         /// Name for the session.
         name: Option<String>,
+        /// Start the session in the background without attaching to it.
+        #[arg(short = 'd', long)]
+        detached: bool,
         /// Do not record this session (recording is on by default).
         #[arg(long)]
         no_record: bool,
@@ -59,6 +62,7 @@ fn main() {
     match cli.command {
         Command::New {
             name,
+            detached,
             no_record,
             scrollback,
             max_recording_size,
@@ -74,9 +78,17 @@ fn main() {
                 scrollback,
                 max_recording_bytes: Some(max_recording_size),
             };
-            match server::spawn(opts) {
-                Ok(()) => println!("started session '{name}'"),
-                Err(e) => fail(&e.to_string()),
+            // `spawn` forks the session off and returns here in the launching
+            // process. By default we then attach to it (the common case: start a
+            // session and start using it); `-d` leaves it running in the
+            // background, like the underlying daemon model.
+            if let Err(e) = server::spawn(opts) {
+                fail(&e.to_string());
+            }
+            if detached {
+                println!("started session '{name}'");
+            } else if let Err(e) = client::attach(&name) {
+                fail(&format!("session '{name}' started but attach failed: {e}"));
             }
         }
         Command::Ls => match session::list() {

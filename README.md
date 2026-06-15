@@ -33,17 +33,20 @@ cargo build --release          # binary at target/release/ghost
 ## Usage
 
 ```sh
-ghost new [NAME]               # start a detached session running $SHELL
+ghost new [NAME]               # start a session running $SHELL and attach to it
 ghost new NAME -- CMD ARGS…    # …or run a specific command
+ghost new -d [NAME]            # start in the background without attaching
 ghost ls                       # list live sessions (name + pid)
 ghost attach NAME              # attach to a session
 ghost kill NAME                # kill a session and its process
 ghost export NAME [FILE]       # export the recording as an asciicast (v2)
 ```
 
-`ghost new` returns immediately; it does **not** attach you. Run `ghost attach`
-afterwards. A session starts in the directory you launched it from, and runs at
-80×24 until the first client attaches (then it adopts the client's size).
+`ghost new` starts the session and attaches to it, like `tmux`/`screen`. Pass
+`-d`/`--detached` to leave it running in the background instead (then `ghost
+attach` when you want it). A session starts in the directory you launched it
+from, and runs at 80×24 until the first client attaches (then it adopts the
+client's size).
 
 ### While attached
 

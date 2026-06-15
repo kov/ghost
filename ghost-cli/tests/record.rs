@@ -51,7 +51,7 @@ fn session_output_is_recorded() {
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["new", name, "--", "sh", "-c", "echo RECORDED-MARKER"])
+        .args(["new", name, "-d", "--", "sh", "-c", "echo RECORDED-MARKER"])
         .output()
         .unwrap();
     assert!(
@@ -81,7 +81,16 @@ fn no_record_flag_skips_recording() {
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["new", name, "--no-record", "--", "sh", "-c", "echo NOPE"])
+        .args([
+            "new",
+            name,
+            "-d",
+            "--no-record",
+            "--",
+            "sh",
+            "-c",
+            "echo NOPE",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -117,6 +126,7 @@ fn long_session_writes_checkpoints() {
         .args([
             "new",
             name,
+            "-d",
             "--",
             "sh",
             "-c",
@@ -163,6 +173,7 @@ fn recording_size_is_bounded() {
         .args([
             "new",
             name,
+            "-d",
             "--max-recording-size",
             "262144",
             "--",
@@ -210,7 +221,15 @@ fn export_produces_valid_asciicast() {
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["new", name, "--", "sh", "-c", "printf 'HELLO-CAST\\n'"])
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "printf 'HELLO-CAST\\n'",
+        ])
         .output()
         .unwrap();
     assert!(
