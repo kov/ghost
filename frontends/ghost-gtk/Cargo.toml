@@ -11,11 +11,19 @@ path = "src/main.rs"
 
 [dependencies]
 ghost-vt = { path = "../../ghost-vt" }
-gtk4 = "0.11"
+# v4_12 gates FontDialogButton (4.10, Preferences font picker) and
+# CssProvider::load_from_string (4.12, window transparency); system GTK is 4.22.
+gtk4 = { version = "0.11", features = ["v4_12"] }
 # v1_5 gates adw::ToolbarView/OverlaySplitView (1.4) and AlertDialog (1.5);
 # system libadwaita is 1.9.
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 vte4 = "0.10"
+# User settings live in a hand-editable TOML file (see src/settings.rs).
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Detached from the ghost workspace on purpose: the core (vt / ghost-vt /
 # ghost-cli) must build, test, and lint without GTK/VTE/libadwaita system libs,

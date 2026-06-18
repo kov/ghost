@@ -70,6 +70,21 @@ pub fn data_dir() -> PathBuf {
     base.join("ghost")
 }
 
+/// The durable config directory (`$XDG_CONFIG_HOME/ghost`, falling back to
+/// `~/.config/ghost`). Holds user-editable settings (e.g. the GUI frontend's
+/// `gtk.toml`); the core/CLI do not require anything here.
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".config")
+        });
+    base.join("ghost")
+}
+
 /// Path of the recording for the named session.
 pub fn recording_path(name: &str) -> PathBuf {
     data_dir()

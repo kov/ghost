@@ -18,9 +18,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk4::glib;
-use gtk4::{EventControllerKey, PropagationPhase, gdk};
+use gtk4::{EventControllerKey, PropagationPhase, gdk, gio, pango};
 use vte4::prelude::*;
 use vte4::{Format, Terminal};
+
+mod settings;
+
+use settings::Settings;
 
 use ghost_vt::client::Session;
 use ghost_vt::server::{self, SpawnOpts};
@@ -30,6 +34,11 @@ use ghost_vt::{paths, record, screen};
 const APP_ID: &str = "dev.ghost.Terminal";
 /// Stack page shown when no session is open.
 const EMPTY_PAGE: &str = "__empty__";
+/// Approximate header-bar height and window padding, added to the grid pixels so
+/// the configured columns×rows roughly fit on first show (VTE then derives the
+/// real grid from the actual allocation).
+const HEADER_BAR_PX: i32 = 47;
+const WINDOW_PAD_PX: i32 = 16;
 
 /// A session currently open in this window: its terminal widget and the headless
 /// client behind an `Option` so closing it can drop (detach) the client while the
@@ -55,6 +64,9 @@ struct Ui {
     open: Rc<RefCell<HashMap<String, OpenSession>>>,
     current: Rc<RefCell<Option<String>>>,
     counter: Rc<Cell<u32>>,
+    /// Live settings (font, scheme, transparency, persisted zoom), shared so
+    /// signal closures can read and update them.
+    settings: Rc<RefCell<Settings>>,
     /// Last rendered sidebar signature, so periodic refreshes only rebuild the
     /// list when something actually changed.
     last_sig: Rc<RefCell<Vec<RowSig>>>,
@@ -71,6 +83,9 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_window(app: &adw::Application) {
+    let cfg = Settings::load();
+    install_css();
+
     // Sidebar: a fleet list under a header with a New button.
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
@@ -88,6 +103,10 @@ fn build_window(app: &adw::Application) {
     let sidebar = adw::ToolbarView::new();
     sidebar.add_top_bar(&sidebar_header);
     sidebar.set_content(Some(&scroller));
+    // Raised top bars get an opaque, libadwaita-managed background (with a proper
+    // `:backdrop` variant) so the chrome stays solid over a transparent window —
+    // even when unfocused. A flat bar would inherit the window's transparency.
+    sidebar.set_top_bar_style(adw::ToolbarStyle::Raised);
 
     // Content: a stack of terminals, plus an empty-state page.
     let stack = gtk4::Stack::new();
@@ -102,6 +121,7 @@ fn build_window(app: &adw::Application) {
         .description("Pick a session from the sidebar, or start a new one.")
         .child(&empty_new)
         .build();
+    empty.add_css_class("ghost-empty");
     stack.add_named(&empty, Some(EMPTY_PAGE));
 
     let sidebar_toggle = gtk4::ToggleButton::new();
@@ -111,9 +131,18 @@ fn build_window(app: &adw::Application) {
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&content_title));
     content_header.pack_start(&sidebar_toggle);
+    let menu = gio::Menu::new();
+    menu.append(Some("Preferences"), Some("win.preferences"));
+    let menu_button = gtk4::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("Main menu")
+        .build();
+    content_header.pack_end(&menu_button);
     let content = adw::ToolbarView::new();
     content.add_top_bar(&content_header);
     content.set_content(Some(&stack));
+    content.set_top_bar_style(adw::ToolbarStyle::Raised);
 
     // Always-overlay split: the sidebar floats over (and dims) the terminal —
     // "pops above" — rather than permanently splitting. The toggle shows/hides it.
@@ -130,13 +159,19 @@ fn build_window(app: &adw::Application) {
     // Initial sidebar visibility is decided by the first `refresh()` below
     // (open iff there are existing sessions to pick) — see `show_empty`.
 
+    // Seed the window to roughly the configured columns×rows. The cell estimate
+    // is approximate; VTE derives the real grid from the actual allocation.
+    let (cell_w, cell_h) = estimate_cell(cfg.font.size * cfg.zoom.scale);
+    let (grid_w, grid_h) =
+        settings::window_pixels(cfg.window.columns, cfg.window.rows, cell_w, cell_h);
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("ghost")
-        .default_width(1000)
-        .default_height(640)
+        .default_width(grid_w + WINDOW_PAD_PX)
+        .default_height(grid_h + HEADER_BAR_PX + WINDOW_PAD_PX)
         .content(&split)
         .build();
+    update_window_chrome(&window, cfg.window.transparency);
 
     let ui = Ui {
         window: window.clone(),
@@ -148,7 +183,9 @@ fn build_window(app: &adw::Application) {
         current: Rc::new(RefCell::new(None)),
         counter: Rc::new(Cell::new(0)),
         last_sig: Rc::new(RefCell::new(Vec::new())),
+        settings: Rc::new(RefCell::new(cfg)),
     };
+    install_actions(&ui, app);
 
     {
         let ui = ui.clone();
@@ -186,6 +223,7 @@ impl Ui {
             // Non-blocking reads: the drain timer polls, never blocking the UI.
             let _ = session.set_read_timeout(Some(Duration::from_millis(1)));
             let terminal = Terminal::new();
+            settings::apply(&self.settings.borrow(), &terminal);
             install_clipboard_keys(&terminal);
             let session = Rc::new(RefCell::new(Some(session)));
             {
@@ -464,6 +502,182 @@ impl Ui {
         let ui = self.clone();
         glib::idle_add_local_once(move || ui.refresh());
     }
+
+    /// Step the persisted zoom (font-scale) and re-apply it everywhere.
+    fn zoom(&self, step: fn(f64) -> f64) {
+        {
+            let mut s = self.settings.borrow_mut();
+            s.zoom.scale = step(s.zoom.scale);
+        }
+        self.apply_settings_to_all();
+        self.save_settings();
+    }
+
+    /// Reset zoom to 1.0.
+    fn zoom_reset(&self) {
+        self.settings.borrow_mut().zoom.scale = 1.0;
+        self.apply_settings_to_all();
+        self.save_settings();
+    }
+
+    /// Re-apply the current settings to every open terminal and the window.
+    fn apply_settings_to_all(&self) {
+        let s = self.settings.borrow();
+        for open in self.open.borrow().values() {
+            settings::apply(&s, &open.terminal);
+        }
+        update_window_chrome(&self.window, s.window.transparency);
+    }
+
+    /// Persist settings; a write failure is logged, never fatal.
+    fn save_settings(&self) {
+        if let Err(e) = self.settings.borrow().save() {
+            eprintln!("ghost-gtk: could not save settings: {e}");
+        }
+    }
+
+    /// The Preferences dialog. Every row live-applies to all open terminals and
+    /// saves; column/row changes only affect the next launch. Built from
+    /// `adw::PreferencesGroup`s in a plain box (not an `AdwPreferencesPage`) so
+    /// the dialog sizes to its content instead of scrolling.
+    fn show_preferences(&self) {
+        let dialog = adw::Dialog::builder()
+            .title("Preferences")
+            .content_width(440)
+            .build();
+        let header = adw::HeaderBar::new();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(18)
+            .margin_top(12)
+            .margin_bottom(18)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+
+        // --- Appearance: color scheme + transparency ---
+        let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+
+        let names: Vec<&str> = settings::SCHEMES.iter().map(|s| s.name).collect();
+        let scheme_row = adw::ComboRow::builder().title("Color scheme").build();
+        scheme_row.set_model(Some(&gtk4::StringList::new(&names)));
+        let current = self.settings.borrow().colors.scheme.clone();
+        let cur_idx = settings::SCHEMES
+            .iter()
+            .position(|s| s.id == current)
+            .unwrap_or(0) as u32;
+        scheme_row.set_selected(cur_idx);
+        {
+            let ui = self.clone();
+            scheme_row.connect_selected_notify(move |row| {
+                if let Some(s) = settings::SCHEMES.get(row.selected() as usize) {
+                    ui.settings.borrow_mut().colors.scheme = s.id.to_string();
+                    ui.apply_settings_to_all();
+                    ui.save_settings();
+                }
+            });
+        }
+        appearance.add(&scheme_row);
+
+        let trans_init =
+            settings::transparency_to_slider(self.settings.borrow().window.transparency) * 100.0;
+        let trans_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 100.0, 1.0);
+        trans_scale.set_hexpand(true);
+        trans_scale.set_draw_value(true);
+        trans_scale.set_value_pos(gtk4::PositionType::Right);
+        trans_scale.set_width_request(200);
+        trans_scale.set_value(trans_init);
+        let trans_row = adw::ActionRow::builder().title("Transparency").build();
+        trans_row.add_suffix(&trans_scale);
+        {
+            let ui = self.clone();
+            trans_scale.connect_value_changed(move |scale| {
+                ui.settings.borrow_mut().window.transparency =
+                    settings::slider_to_transparency(scale.value() / 100.0);
+                ui.apply_settings_to_all();
+                ui.save_settings();
+            });
+        }
+        appearance.add(&trans_row);
+        content.append(&appearance);
+
+        // --- Font ---
+        let font_group = adw::PreferencesGroup::builder().title("Font").build();
+        let font_row = adw::ActionRow::builder().title("Family and size").build();
+        let font_btn = gtk4::FontDialogButton::new(Some(gtk4::FontDialog::new()));
+        font_btn.set_valign(gtk4::Align::Center);
+        {
+            let s = self.settings.borrow();
+            let mut desc = pango::FontDescription::new();
+            if !s.font.family.is_empty() {
+                desc.set_family(&s.font.family);
+            }
+            desc.set_size((s.font.size * pango::SCALE as f64).round() as i32);
+            font_btn.set_font_desc(&desc);
+        }
+        {
+            let ui = self.clone();
+            font_btn.connect_font_desc_notify(move |btn| {
+                let Some(desc) = btn.font_desc() else { return };
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    if let Some(family) = desc.family() {
+                        s.font.family = family.to_string();
+                    }
+                    if desc.size() > 0 {
+                        s.font.size = desc.size() as f64 / pango::SCALE as f64;
+                    }
+                }
+                ui.apply_settings_to_all();
+                ui.save_settings();
+            });
+        }
+        font_row.add_suffix(&font_btn);
+        font_row.set_activatable_widget(Some(&font_btn));
+        font_group.add(&font_row);
+        content.append(&font_group);
+
+        // --- Window: default grid size (next launch) ---
+        let win_group = adw::PreferencesGroup::builder()
+            .title("Window")
+            .description("Default size for new windows (applied on next launch)")
+            .build();
+        let cols_init = f64::from(self.settings.borrow().window.columns);
+        let cols_adj = gtk4::Adjustment::new(cols_init, 20.0, 500.0, 1.0, 10.0, 0.0);
+        let cols_row = adw::SpinRow::builder()
+            .title("Columns")
+            .adjustment(&cols_adj)
+            .build();
+        {
+            let ui = self.clone();
+            cols_row.connect_value_notify(move |row| {
+                ui.settings.borrow_mut().window.columns = row.value() as u16;
+                ui.save_settings();
+            });
+        }
+        let rows_init = f64::from(self.settings.borrow().window.rows);
+        let rows_adj = gtk4::Adjustment::new(rows_init, 5.0, 300.0, 1.0, 10.0, 0.0);
+        let rows_row = adw::SpinRow::builder()
+            .title("Rows")
+            .adjustment(&rows_adj)
+            .build();
+        {
+            let ui = self.clone();
+            rows_row.connect_value_notify(move |row| {
+                ui.settings.borrow_mut().window.rows = row.value() as u16;
+                ui.save_settings();
+            });
+        }
+        win_group.add(&cols_row);
+        win_group.add(&rows_row);
+        content.append(&win_group);
+
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+    }
 }
 
 /// What to show as a session's primary label: its terminal title, else the
@@ -502,6 +716,87 @@ fn relative_time(created_at: Option<i64>) -> String {
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
     }
+}
+
+/// Install window actions (preferences, zoom in/out/reset) with their
+/// accelerators. `<Primary>` resolves to Ctrl on Linux and Cmd on macOS, so one
+/// binding covers both platforms.
+fn install_actions(ui: &Ui, app: &adw::Application) {
+    type Handler = Box<dyn Fn(&Ui)>;
+    let actions: [(&str, Handler); 4] = [
+        ("preferences", Box::new(Ui::show_preferences)),
+        ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
+        ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
+        ("zoom-reset", Box::new(Ui::zoom_reset)),
+    ];
+    for (name, handler) in actions {
+        let action = gio::SimpleAction::new(name, None);
+        let handler_ui = ui.clone();
+        action.connect_activate(move |_, _| handler(&handler_ui));
+        ui.window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.preferences", &["<Primary>comma"]);
+    app.set_accels_for_action(
+        "win.zoom-in",
+        &["<Primary>plus", "<Primary>equal", "<Primary>KP_Add"],
+    );
+    app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
+    app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
+}
+
+/// Rough pixels per character cell for a point size (≈96 dpi, typical monospace
+/// aspect and line height). Only seeds the initial window size; not exact.
+fn estimate_cell(size_pt: f64) -> (i32, i32) {
+    let h = (size_pt * (96.0 / 72.0) * 1.2).round().max(1.0) as i32;
+    let w = (h as f64 * 0.55).round().max(1.0) as i32;
+    (w, h)
+}
+
+thread_local! {
+    /// One shared provider whose CSS we rewrite to drop the window's background
+    /// (and keep the empty page opaque), gated by the `ghost-transparent` class.
+    /// Kept here (not a local) so [`update_window_chrome`] can rewrite it.
+    static TRANSPARENCY_CSS: gtk4::CssProvider = gtk4::CssProvider::new();
+}
+
+/// Register the transparency CSS provider on the display once.
+fn install_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        TRANSPARENCY_CSS.with(|provider| {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
+    });
+}
+
+/// Rewrite the transparency CSS for the current `transparency`. When it's > 0 the
+/// window's own background is dropped so a terminal's background alpha (see
+/// [`settings::apply`]) reveals the desktop behind it. Only the terminal area goes
+/// see-through: the header bars stay solid via their raised toolbar style (set in
+/// [`build_window`], libadwaita-managed in both focus states) and the empty-state
+/// page keeps its own opaque background.
+fn update_window_chrome(window: &adw::ApplicationWindow, transparency: f64) {
+    const TRANSPARENT_CSS: &str = "\
+        window.ghost-transparent { background-color: transparent; }\n\
+        window.ghost-transparent .ghost-empty,\n\
+        window.ghost-transparent .ghost-empty:backdrop { background-color: @window_bg_color; }\n";
+    TRANSPARENCY_CSS.with(|provider| {
+        if transparency > 0.0 {
+            provider.load_from_string(TRANSPARENT_CSS);
+            window.add_css_class("ghost-transparent");
+        } else {
+            provider.load_from_string("");
+            window.remove_css_class("ghost-transparent");
+        }
+    });
 }
 
 /// Copy/paste shortcuts VTE doesn't bind itself: Alt+C/V (consistent across mac
