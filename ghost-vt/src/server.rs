@@ -11,17 +11,24 @@
 //! between the child's PTY and the attached client.
 
 use crate::paths;
-use crate::protocol::{ClientMsg, FrameReader, ServerMsg, encode};
+use crate::protocol::{ClientMsg, ServerMsg};
 use crate::screen::Screen;
+use crate::transport::Conn;
 use nix::sys::signal::Signal;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, open};
 use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::{FlockOperation, flock};
+use serde::{Deserialize, Serialize};
+use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Options for starting a session.
+#[derive(Serialize, Deserialize)]
 pub struct SpawnOpts {
     /// Session name (used for the socket and pidfile).
     pub name: String,
@@ -35,6 +42,12 @@ pub struct SpawnOpts {
     pub scrollback: usize,
     /// Cap on the recording's on-disk size, or `None` for unbounded.
     pub max_recording_bytes: Option<usize>,
+    /// Defer spawning the child until the first attach handshake, instead of at
+    /// session start. A session that will be attached to (the CLI's default
+    /// `ghost new`, and every GUI session) sets this so the child's startup
+    /// terminal queries reach a real display client; a plain detached session
+    /// (`ghost new -d`) leaves it `false` and starts the child eagerly.
+    pub start_on_attach: bool,
 }
 
 /// Lower bound on the checkpoint interval. Small recording caps need frequent
@@ -69,17 +82,15 @@ fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
 /// that connects but never sends its first message.
 const MAX_PENDING: usize = 8;
 
-enum Fork {
-    Parent,
-    Daemon,
-}
+/// The hidden argv marker that selects host mode: `ghost __host <fd> <blob>`.
+/// Not a documented subcommand — an internal handoff used by [`spawn`]'s re-exec
+/// and recognized by [`run_host_if_invoked`].
+const HOST_ARG: &str = "__host";
 
-/// A single attached client connection.
+/// A single attached client connection: the framed [`Conn`] plus a little
+/// attach state.
 struct Client {
-    stream: UnixStream,
-    reader: FrameReader,
-    /// Output queued for the client but not yet written (backpressure buffer).
-    outbuf: Vec<u8>,
+    conn: Conn,
     /// Whether the initial repaint has been sent. The first thing a client
     /// sends is its size; we hold back live output and the resync until then,
     /// so the repaint is laid out at the client's real geometry and the client
@@ -89,74 +100,209 @@ struct Client {
 
 impl Client {
     fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_nonblocking(true)?;
+        let conn = Conn::new(stream);
+        conn.set_nonblocking(true)?;
         Ok(Client {
-            stream,
-            reader: FrameReader::new(),
-            outbuf: Vec::new(),
+            conn,
             resynced: false,
         })
     }
 
     fn queue(&mut self, msg: &ServerMsg) {
-        self.outbuf.extend_from_slice(&encode(msg));
+        self.conn.queue(msg);
     }
 
     /// Write as much of the pending output as the socket will accept.
     fn flush(&mut self) -> io::Result<()> {
-        while !self.outbuf.is_empty() {
-            match self.stream.write(&self.outbuf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    self.outbuf.drain(..n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.conn.flush()
     }
+}
+
+/// The host's startup state, serialized onto argv across the re-exec.
+#[derive(Serialize, Deserialize)]
+struct HostArgs {
+    opts: SpawnOpts,
+    /// The directory the session was launched from, applied to the child (like
+    /// dtach) since the daemon itself `chdir`s to `/`.
+    launch_dir: Option<std::path::PathBuf>,
 }
 
 /// Start a session in the background.
 ///
-/// Returns `Ok(())` in the calling process once the host has been forked off.
-/// In the host process this function does not return — it runs the session and
-/// exits the process when the session ends.
+/// Returns `Ok(())` in the calling process once the host has been forked off and
+/// re-exec'd. The host runs in that separate, re-exec'd process — never in the
+/// caller — so this is safe to call even from a multithreaded process such as a
+/// GUI front-end.
 pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
-    // Check for a live session of this name first. `session::list` also prunes
-    // dead sessions' directories, so a stale `<name>/` left by a crashed host is
-    // cleared here — and crucially this runs before we create our own directory,
-    // which has no pidfile yet and would otherwise be pruned as "dead".
-    if crate::session::list()?.iter().any(|s| s.name == opts.name) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("session '{}' already exists", opts.name),
-        ));
-    }
     paths::ensure_session_dir(&opts.name)?;
+
+    // Acquire the session's lifetime lock. Held by the host across the fork+exec
+    // and for its whole life (the kernel releases it on exit or crash), this lock
+    // is the single source of truth for liveness: `session::list` prunes a
+    // directory exactly when its lock is free. Taking it here also *is* the atomic
+    // "already exists" check — a live host of this name still holds it. We create
+    // it before binding the socket so a session is never observable without it.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths::lock_path(&opts.name))?;
+    match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session '{}' already exists", opts.name),
+            ));
+        }
+        Err(e) => return Err(io::Error::from(e)),
+    }
+
     let sock = paths::socket_path(&opts.name);
     // Clear any stale socket left by a dead host, then claim the name.
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
 
-    // Capture the caller's working directory before daemonize() chdir's to `/`,
-    // so the session's child starts where `ghost new` was invoked (like dtach),
-    // not at the daemon's `/`.
-    let launch_dir = std::env::current_dir().ok();
+    // The host runs in a re-exec'd process (see `run_host_if_invoked`) so it gets
+    // a fresh, single-threaded address space — what makes spawning safe from a
+    // multithreaded process, and what sheds any inherited heap/fds. We hand it its
+    // state on argv: the bound listener fd and the held lock fd (both kept open
+    // across the exec by clearing CLOEXEC) and the serialized spawn options.
+    // Everything that allocates — capturing the cwd, serialization, building the
+    // argv `CString`s — happens here in the parent, *before* the fork, so the path
+    // from fork to `execv` touches only async-signal-safe syscalls.
+    clear_cloexec(&listener)?;
+    clear_cloexec(&lock)?;
+    let listener_fd = listener.as_raw_fd();
+    let lock_fd = lock.as_raw_fd();
 
-    match unsafe { daemonize()? } {
-        Fork::Parent => return Ok(()),
-        Fork::Daemon => {}
+    let host_args = HostArgs {
+        launch_dir: std::env::current_dir().ok(),
+        opts,
+    };
+    let blob = encode_host_args(&host_args);
+
+    let exe = std::env::current_exe()?;
+    let exe_c = CString::new(exe.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
+    let argv_owned = [
+        exe_c.clone(),
+        CString::new(HOST_ARG).expect("HOST_ARG has no NUL"),
+        CString::new(listener_fd.to_string()).expect("fd digits have no NUL"),
+        CString::new(lock_fd.to_string()).expect("fd digits have no NUL"),
+        CString::new(blob).expect("hex blob has no NUL"),
+    ];
+    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // Daemonize and exec the host. Returns here only in the original process; the
+    // daemonized grandchild execs `exe_c` and never returns. `argv_owned`,
+    // `listener`, and `lock` must outlive the call (the forked child reads them up
+    // to the exec); they drop here in the parent. The parent dropping its `lock`
+    // copy does not release the flock — the host's inherited copy keeps it held.
+    unsafe { daemonize_and_exec(&exe_c, &argv) }
+}
+
+/// If this process was re-exec'd as a session host (`__host <fd> <blob>` on
+/// argv), run the host to completion and exit; otherwise return so normal
+/// startup continues. Any binary that links `ghost-vt` and may [`spawn`]
+/// sessions must call this first thing in `main()`.
+pub fn run_host_if_invoked() {
+    let mut args = std::env::args_os();
+    let _argv0 = args.next();
+    if args.next().as_deref() != Some(HOST_ARG.as_ref()) {
+        return;
     }
+    std::process::exit(run_host(args.next(), args.next(), args.next()));
+}
 
-    // We are now the long-lived host; there is no caller to return errors to.
-    // `current_name` may change under us if the session is renamed, so the
-    // host reports the final name and we clean up its directory by that.
+/// The host-mode body: reclaim the passed listener, liveness lock, and spawn
+/// options, run the session loop, clean up its directory, and return the exit
+/// code.
+fn run_host(
+    listener_arg: Option<std::ffi::OsString>,
+    lock_arg: Option<std::ffi::OsString>,
+    blob: Option<std::ffi::OsString>,
+) -> i32 {
+    let parsed = (|| -> Option<(RawFd, RawFd, HostArgs)> {
+        let listener_fd: RawFd = listener_arg?.to_str()?.parse().ok()?;
+        let lock_fd: RawFd = lock_arg?.to_str()?.parse().ok()?;
+        Some((listener_fd, lock_fd, decode_host_args(blob?.to_str()?)?))
+    })();
+    let Some((listener_fd, lock_fd, host_args)) = parsed else {
+        return 127; // malformed __host handoff — an internal bug
+    };
+    // Hold the inherited liveness lock for our whole life. The parent took the
+    // flock before forking and it survived the exec; keeping this fd open keeps
+    // the lock held, and the kernel frees it when we exit or crash — which is how
+    // `session::list` knows we are gone.
+    // SAFETY: a fd the parent passed us with CLOEXEC cleared; we own it now.
+    let _lock = unsafe { OwnedFd::from_raw_fd(lock_fd) };
+    // SAFETY: the listening socket the parent bound and passed with CLOEXEC cleared.
+    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
+    let HostArgs { opts, launch_dir } = host_args;
+    // `current_name` may change under us if the session is renamed, so the host
+    // reports the final name and cleans up its directory by that.
     let mut current_name = opts.name.clone();
     let result = host_main(&listener, &opts, launch_dir.as_deref(), &mut current_name);
     let _ = std::fs::remove_dir_all(paths::session_dir(&current_name));
-    std::process::exit(result.unwrap_or(1));
+    result.unwrap_or(1)
+}
+
+/// Clear `FD_CLOEXEC` so a descriptor survives `execv` into the host process.
+fn clear_cloexec(fd: &impl AsRawFd) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: plain fcntl on a fd we own.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFD);
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Serialize the host's startup state to a NUL-free, argv-safe hex string.
+fn encode_host_args(args: &HostArgs) -> String {
+    let bytes = postcard::to_allocvec(args).expect("postcard encoding cannot fail");
+    to_hex(&bytes)
+}
+
+/// Inverse of [`encode_host_args`]; `None` if the blob is malformed.
+fn decode_host_args(hex: &str) -> Option<HostArgs> {
+    postcard::from_bytes(&from_hex(hex)?).ok()
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
+        .collect()
 }
 
 fn host_main(
@@ -175,18 +321,38 @@ fn host_main(
     let (cols, rows) = opts.size;
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
-    let (prog, args) = split_command(&opts.command);
-    let mut cmd = PtyCommand::new(&prog).args(&args);
-    if let Some(dir) = launch_dir {
-        cmd = cmd.current_dir(dir);
+
+    // The child is started eagerly for a plain detached session, or deferred
+    // until the first attach handshake (see `SpawnOpts::start_on_attach`). While
+    // deferred we hold the slave (`pts`) so the PTY master never sees EOF and the
+    // poll loop just idles until a client attaches.
+    let mut pts = Some(pts);
+    let mut child: Option<std::process::Child> = None;
+    if !opts.start_on_attach {
+        child = Some(spawn_child(
+            &opts.command,
+            launch_dir,
+            pts.take().expect("slave present before first spawn"),
+        )?);
     }
-    let mut child = cmd.spawn(pts).map_err(io::Error::other)?;
 
     let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
 
     // Authoritative screen state, fed every byte the child writes so a late
     // attach can be repainted to the current state.
     let mut screen = Screen::new(cols, rows, opts.scrollback);
+
+    // Descriptive metadata for discovery (the GUI sidebar). Created time and
+    // command are fixed; the title is refreshed below whenever it changes.
+    let mut meta = crate::meta::Meta {
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        command: opts.command.clone(),
+        title: String::new(),
+    };
+    let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
     // Optional durable recording. Best-effort: if it cannot be created, the
     // session still runs (just unrecorded).
@@ -222,19 +388,19 @@ fn host_main(
         ];
         let client_idx = client.as_ref().map(|c| {
             let mut flags = PollFlags::IN;
-            if !c.outbuf.is_empty() {
+            if c.conn.wants_write() {
                 flags |= PollFlags::OUT;
             }
-            fds.push(PollFd::new(&c.stream, flags));
+            fds.push(PollFd::from_borrowed_fd(c.conn.as_fd(), flags));
             fds.len() - 1
         });
         let pending_start = fds.len();
         for p in &pending {
             let mut flags = PollFlags::IN;
-            if !p.outbuf.is_empty() {
+            if p.conn.wants_write() {
                 flags |= PollFlags::OUT;
             }
-            fds.push(PollFd::new(&p.stream, flags));
+            fds.push(PollFd::from_borrowed_fd(p.conn.as_fd(), flags));
         }
         match poll(&mut fds, None) {
             Ok(_) => {}
@@ -260,6 +426,12 @@ fn host_main(
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
                     screen.feed(&ptybuf[..n]);
+                    // Refresh the discoverable title when the child changes it
+                    // (coalesced — only an actual change rewrites the meta file).
+                    if screen.title() != meta.title {
+                        meta.title = screen.title().to_string();
+                        let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
+                    }
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
@@ -300,20 +472,18 @@ fn host_main(
         if client_re.intersects(PollFlags::IN | PollFlags::HUP) {
             let mut disposition = Disposition::Keep;
             if let Some(c) = &mut client {
-                let mut buf = [0u8; 4096];
-                match c.stream.read(&mut buf) {
-                    Ok(0) => disposition = Disposition::Drop,
-                    Ok(n) => {
-                        c.reader.push(&buf[..n]);
+                match c.conn.recv::<ClientMsg>() {
+                    Ok(None) => disposition = Disposition::Drop,
+                    Ok(Some(msgs)) => {
                         disposition = handle_client_messages(
                             c,
+                            msgs,
                             &pty,
                             &mut screen,
                             &mut recorder,
                             current_name,
                         )?;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => disposition = Disposition::Drop,
                 }
             }
@@ -321,8 +491,7 @@ fn host_main(
                 Disposition::Keep => {}
                 Disposition::Drop => client = None,
                 Disposition::Kill => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_child(&mut child);
                     return Ok(0);
                 }
             }
@@ -343,26 +512,21 @@ fn host_main(
                     still_pending.push(p);
                     continue;
                 }
-                let mut buf = [0u8; 4096];
-                let disposition = match p.stream.read(&mut buf) {
-                    Ok(0) => Disposition::Drop,
-                    Ok(n) => {
-                        p.reader.push(&buf[..n]);
-                        handle_client_messages(
-                            &mut p,
-                            &pty,
-                            &mut screen,
-                            &mut recorder,
-                            current_name,
-                        )?
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Disposition::Keep,
+                let disposition = match p.conn.recv::<ClientMsg>() {
+                    Ok(None) => Disposition::Drop,
+                    Ok(Some(msgs)) => handle_client_messages(
+                        &mut p,
+                        msgs,
+                        &pty,
+                        &mut screen,
+                        &mut recorder,
+                        current_name,
+                    )?,
                     Err(_) => Disposition::Drop,
                 };
                 match disposition {
                     Disposition::Kill => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_child(&mut child);
                         return Ok(0);
                     }
                     Disposition::Drop => {} // drop p
@@ -377,6 +541,19 @@ fn host_main(
                 }
             }
             pending = still_pending;
+        }
+
+        // Deferred start: the first client to complete the attach handshake
+        // (which sets `resynced`) brings the child to life, so its startup
+        // queries are emitted with a display client already attached to answer
+        // them. Eager sessions already have a child, so this never fires.
+        if child.is_none() && client.as_ref().is_some_and(|c| c.resynced) {
+            child = Some(spawn_child(
+                &opts.command,
+                launch_dir,
+                pts.take()
+                    .expect("slave present until the deferred child spawns"),
+            )?);
         }
 
         // Push queued output to the client.
@@ -397,8 +574,7 @@ fn host_main(
                     // is reaped there via `child_exited`.
                     libc::SIGCHLD => {}
                     libc::SIGTERM | libc::SIGINT => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_child(&mut child);
                         notify_exit(&mut client, 0);
                         return Ok(0);
                     }
@@ -419,24 +595,25 @@ enum Disposition {
     Kill,
 }
 
-/// Process every complete message buffered on `c`: write input to the PTY, apply
+/// Process a batch of decoded client messages: write input to the PTY, apply
 /// resizes, handle renames and repaints. A Resize sets `c.resynced` (and queues
 /// the repaint), which is how the caller knows the connection is an attach client
 /// rather than a control-only one. Returns how the connection should be treated.
 fn handle_client_messages(
     c: &mut Client,
+    msgs: Vec<ClientMsg>,
     pty: &pty_process::blocking::Pty,
     screen: &mut Screen,
     recorder: &mut Option<crate::record::FileRecorder>,
     current_name: &mut String,
 ) -> io::Result<Disposition> {
-    loop {
-        match c.reader.next_msg::<ClientMsg>() {
-            Ok(Some(ClientMsg::Input(bytes))) => {
+    for msg in msgs {
+        match msg {
+            ClientMsg::Input(bytes) => {
                 let mut w: &pty_process::blocking::Pty = pty;
                 w.write_all(&bytes)?;
             }
-            Ok(Some(ClientMsg::Resize { cols, rows })) => {
+            ClientMsg::Resize { cols, rows } => {
                 let _ = pty.resize(Size::new(rows, cols));
                 screen.resize(cols, rows);
                 if let Some(r) = recorder {
@@ -448,24 +625,23 @@ fn handle_client_messages(
                     c.resynced = true;
                 }
             }
-            Ok(Some(ClientMsg::Detach)) => return Ok(Disposition::Drop),
-            Ok(Some(ClientMsg::Kill)) => return Ok(Disposition::Kill),
-            Ok(Some(ClientMsg::Rename(new))) => {
+            ClientMsg::Detach => return Ok(Disposition::Drop),
+            ClientMsg::Kill => return Ok(Disposition::Kill),
+            ClientMsg::Rename(new) => {
                 let (ok, message) = match rename_session(current_name, &new, recorder) {
                     Ok(()) => (true, current_name.clone()),
                     Err(e) => (false, e),
                 };
                 c.queue(&ServerMsg::RenameResult { ok, message });
             }
-            Ok(Some(ClientMsg::Repaint)) => {
+            ClientMsg::Repaint => {
                 if c.resynced {
                     c.queue(&ServerMsg::Output(screen.resync()));
                 }
             }
-            Ok(None) => return Ok(Disposition::Keep),
-            Err(_) => return Ok(Disposition::Drop),
         }
     }
+    Ok(Disposition::Keep)
 }
 
 /// Rename the running session: move its runtime directory (sock + pid together,
@@ -509,18 +685,50 @@ fn rename_session(
     Ok(())
 }
 
-/// Reap the child after the PTY signalled EOF and tell the client.
-fn child_exited(child: &mut std::process::Child, client: &mut Option<Client>) -> io::Result<i32> {
-    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(0);
+/// Reap the child after the PTY signalled EOF and tell the client. The child is
+/// always present here — EOF can only follow a spawn — but it is threaded as an
+/// `Option` because the session may not have spawned its child yet.
+fn child_exited(
+    child: &mut Option<std::process::Child>,
+    client: &mut Option<Client>,
+) -> io::Result<i32> {
+    let code = child
+        .as_mut()
+        .and_then(|c| c.wait().ok())
+        .and_then(|s| s.code())
+        .unwrap_or(0);
     notify_exit(client, code);
     Ok(code)
+}
+
+/// Build and spawn the session's child on the given PTY slave, honoring the
+/// launch directory. Shared by eager start and deferred (first-attach) start.
+fn spawn_child(
+    command: &[String],
+    launch_dir: Option<&std::path::Path>,
+    pts: pty_process::blocking::Pts,
+) -> io::Result<std::process::Child> {
+    let (prog, args) = split_command(command);
+    let mut cmd = PtyCommand::new(&prog).args(&args);
+    if let Some(dir) = launch_dir {
+        cmd = cmd.current_dir(dir);
+    }
+    cmd.spawn(pts).map_err(io::Error::other)
+}
+
+/// Kill and reap the child if one has been spawned; a no-op for a deferred
+/// session whose child never started.
+fn kill_child(child: &mut Option<std::process::Child>) {
+    if let Some(c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
 }
 
 /// Best-effort notification to the client that the session ended.
 fn notify_exit(client: &mut Option<Client>, code: i32) {
     if let Some(c) = client {
-        let _ = c.flush();
-        let _ = c.stream.write_all(&encode(&ServerMsg::Exited(code)));
+        let _ = c.conn.send(&ServerMsg::Exited(code));
     }
 }
 
@@ -534,38 +742,51 @@ fn split_command(command: &[String]) -> (String, Vec<String>) {
     }
 }
 
-/// Classic double-fork daemonization. Returns [`Fork::Parent`] in the original
-/// process and [`Fork::Daemon`] in the detached grandchild.
-unsafe fn daemonize() -> io::Result<Fork> {
+/// Classic double-fork daemonization, then `execv` the host.
+///
+/// Returns `Ok(())` only in the original process. The daemonized grandchild
+/// execs `exe` with `argv` and never returns; on any failure it `_exit`s. From
+/// the first fork to the exec only async-signal-safe syscalls run — no
+/// allocation, no env access — so this is safe to call from a multithreaded
+/// process (where a fork that ran arbitrary code could deadlock on an inherited
+/// lock). All the argv setup is done by the caller before the fork.
+///
+/// # Safety
+/// `argv` must be NUL-terminated and its pointers (and `exe`) must stay valid for
+/// the duration of the call.
+unsafe fn daemonize_and_exec(exe: &CStr, argv: &[*const libc::c_char]) -> io::Result<()> {
     match unsafe { libc::fork() } {
         -1 => return Err(io::Error::last_os_error()),
         0 => {}
-        _ => return Ok(Fork::Parent),
+        _ => return Ok(()), // original process
     }
-    // New session: detach from the controlling terminal.
-    rustix::process::setsid().map_err(io::Error::from)?;
-    // Second fork: ensure we are not a session leader, so we can never reacquire
-    // a controlling terminal.
-    match unsafe { libc::fork() } {
-        -1 => return Err(io::Error::last_os_error()),
-        0 => {}
-        _ => std::process::exit(0),
-    }
-    let _ = std::env::set_current_dir("/");
-    unsafe { libc::umask(0) };
-    if let Ok(devnull) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-    {
-        let nfd = devnull.as_raw_fd();
-        unsafe {
+    // --- async-signal-safe only, from here until execv (or _exit) ---
+    unsafe {
+        // New session: detach from the controlling terminal.
+        if libc::setsid() == -1 {
+            libc::_exit(127);
+        }
+        // Second fork: never a session leader, so we can't reacquire a terminal.
+        match libc::fork() {
+            -1 => libc::_exit(127),
+            0 => {}
+            _ => libc::_exit(0),
+        }
+        libc::chdir(c"/".as_ptr());
+        libc::umask(0);
+        let nfd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if nfd >= 0 {
             libc::dup2(nfd, 0);
             libc::dup2(nfd, 1);
             libc::dup2(nfd, 2);
+            if nfd > 2 {
+                libc::close(nfd);
+            }
         }
+        // Replace this image with the host. Only returns on failure.
+        libc::execv(exe.as_ptr(), argv.as_ptr());
+        libc::_exit(127);
     }
-    Ok(Fork::Daemon)
 }
 
 #[cfg(test)]

@@ -42,6 +42,19 @@ pub fn pid_path(name: &str) -> PathBuf {
     session_dir(name).join("pid")
 }
 
+/// Path of the liveness lock for the named session. The host holds an exclusive
+/// `flock` on this file for its whole life; session discovery reads liveness from
+/// whether the lock can be taken (see [`crate::session::list`]).
+pub fn lock_path(name: &str) -> PathBuf {
+    session_dir(name).join("lock")
+}
+
+/// Path of the metadata file for the named session (creation time, command, and
+/// live title), written by the host and read by discovery for the GUI sidebar.
+pub fn meta_path(name: &str) -> PathBuf {
+    session_dir(name).join("meta")
+}
+
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
 /// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
 /// holds recordings, which are archival.

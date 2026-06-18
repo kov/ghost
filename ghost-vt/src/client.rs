@@ -6,38 +6,187 @@
 //! literal). Everything else — including mouse reports and bracketed paste —
 //! passes straight through, so the host terminal's native scrollback and mouse
 //! keep working.
+//!
+//! The transport itself — connect, framed send, drained receive — is factored
+//! into [`Client`], a headless attach connection that a GUI front-end drives the
+//! same way (`send` a [`ClientMsg`], `recv_ready` to drain [`ServerMsg`]s) while
+//! rendering elsewhere. The terminal pipe below is one consumer of it.
 
 use crate::keys::{Action, Detacher};
 use crate::paths;
-use crate::protocol::{ClientMsg, FrameReader, ServerMsg, encode};
+use crate::protocol::{ClientMsg, ServerMsg};
 use crate::signals;
+use crate::transport::Conn;
 use nix::sys::signal::Signal;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
-use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::Duration;
+
+/// A programmatic attach connection to a session host — the engine behind the
+/// terminal [`attach`] client and any GUI front-end.
+///
+/// A thin protocol-typed wrapper over a [`Conn`]: [`send`](Client::send) a
+/// [`ClientMsg`], drain [`ServerMsg`]s with [`recv_ready`](Client::recv_ready)
+/// when the socket has data, and watch [`as_fd`](Client::as_fd) in a poll/event
+/// loop. The stream is blocking; reads happen only when bytes are waiting (poll
+/// readable, or set a read timeout).
+pub struct Client {
+    conn: Conn,
+}
+
+impl Client {
+    /// Connect to the named session, resolving its socket via the XDG paths.
+    pub fn connect(name: &str) -> io::Result<Self> {
+        Self::connect_path(&paths::socket_path(name)).map_err(|e| {
+            io::Error::new(e.kind(), format!("cannot attach to session '{name}': {e}"))
+        })
+    }
+
+    /// Connect to a session whose control socket is at `sock`.
+    pub fn connect_path(sock: &Path) -> io::Result<Self> {
+        Ok(Client {
+            conn: Conn::connect(sock)?,
+        })
+    }
+
+    /// The connection's file descriptor, for a poll/epoll/GLib main-loop watch.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.conn.as_fd()
+    }
+
+    /// Send a message to the host.
+    pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
+        self.conn.send(msg)
+    }
+
+    /// Read once from the socket and return every [`ServerMsg`] that completed;
+    /// `Ok(None)` on clean EOF. See [`Conn::recv`].
+    pub fn recv_ready(&mut self) -> io::Result<Option<Vec<ServerMsg>>> {
+        self.conn.recv()
+    }
+
+    /// Bound how long a [`recv_ready`](Client::recv_ready) read waits for data;
+    /// `None` restores blocking until readable.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.conn.set_read_timeout(timeout)
+    }
+}
+
+/// Ready output drained from a [`Session`] by [`pump`](Session::pump).
+#[derive(Debug, Default)]
+pub struct Pump {
+    /// Child output bytes to render, in arrival order.
+    pub output: Vec<u8>,
+    /// `true` once the session has ended — the child exited or the host closed
+    /// the connection. No further output will arrive.
+    pub ended: bool,
+}
+
+/// An attached session for an event-loop front-end (a GUI): attach and
+/// handshake, [`pump`](Session::pump) ready output as bytes, send input and
+/// resizes, and **detach by dropping** (the connection closes, the session keeps
+/// running and can be reattached).
+///
+/// A thin, protocol-typed layer over [`Client`] so view code never touches
+/// [`ClientMsg`]/[`ServerMsg`]; the byte stream it yields is fed straight to a
+/// terminal widget. Watch [`as_fd`](Session::as_fd) for readiness, or set a read
+/// timeout, then [`pump`](Session::pump).
+pub struct Session {
+    name: String,
+    client: Client,
+}
+
+impl Session {
+    /// Attach to the named session (resolved via the XDG paths) and complete the
+    /// handshake at `cols`x`rows` — the first [`ClientMsg::Resize`], which starts
+    /// a deferred child and turns on live output.
+    pub fn attach(name: &str, cols: u16, rows: u16) -> io::Result<Session> {
+        Self::from_client(Client::connect(name)?, name, cols, rows)
+    }
+
+    /// Attach to a session whose control socket is at `sock`, labelling it
+    /// `name`. Like [`attach`](Session::attach) but without name-based path
+    /// resolution, so it ignores the process environment.
+    pub fn attach_path(sock: &Path, name: &str, cols: u16, rows: u16) -> io::Result<Session> {
+        Self::from_client(Client::connect_path(sock)?, name, cols, rows)
+    }
+
+    fn from_client(mut client: Client, name: &str, cols: u16, rows: u16) -> io::Result<Session> {
+        client.send(&ClientMsg::Resize { cols, rows })?;
+        Ok(Session {
+            name: name.to_string(),
+            client,
+        })
+    }
+
+    /// The session's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The connection's file descriptor, for a poll/epoll/GLib readiness watch.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.client.as_fd()
+    }
+
+    /// Bound how long a [`pump`](Session::pump) read waits for data; `None`
+    /// blocks until readable.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.client.set_read_timeout(timeout)
+    }
+
+    /// Send user input (keystrokes, mouse reports, paste, query replies) to the
+    /// session's child.
+    pub fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.client.send(&ClientMsg::Input(bytes.to_vec()))
+    }
+
+    /// Tell the session the display was resized.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.client.send(&ClientMsg::Resize { cols, rows })
+    }
+
+    /// Drain whatever output is ready now, flattening protocol messages into
+    /// bytes plus an end-of-session flag. Non-blocking when [`as_fd`](Session::as_fd)
+    /// polls readable or a read timeout is set; see [`Client::recv_ready`].
+    pub fn pump(&mut self) -> io::Result<Pump> {
+        let mut pump = Pump::default();
+        match self.client.recv_ready()? {
+            None => pump.ended = true,
+            Some(msgs) => {
+                for msg in msgs {
+                    match msg {
+                        ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
+                        ServerMsg::Exited(_code) => pump.ended = true,
+                        ServerMsg::RenameResult { .. } => {}
+                    }
+                }
+            }
+        }
+        Ok(pump)
+    }
+}
 
 /// Attach to the named session, returning when the user detaches or the session
 /// ends.
 pub fn attach(name: &str) -> io::Result<()> {
-    let sock = paths::socket_path(name);
-    let mut stream = UnixStream::connect(&sock)
-        .map_err(|e| io::Error::new(e.kind(), format!("cannot attach to session '{name}': {e}")))?;
+    let mut client = Client::connect(name)?;
 
     let stdin = rustix::stdio::stdin();
 
     // Raw mode, restored on return via the guard's Drop.
     let _raw = RawMode::enable(stdin)?;
 
-    // Sync the session to our current size immediately.
-    send_resize(&mut stream, stdin)?;
+    // Sync the session to our current size immediately. The first resize is also
+    // the attach handshake that promotes us to the host's display client.
+    send_resize(&mut client, stdin)?;
 
     let sfd = signals::make(&[Signal::SIGWINCH])?;
     let mut detacher = Detacher::with_default_prefix();
-    let mut reader = FrameReader::new();
     let mut in_buf = [0u8; 4096];
-    let mut sock_buf = [0u8; 8192];
     // Some(_) while the rename prompt is on screen; input then feeds the prompt
     // rather than the session, and live output is suppressed until it closes.
     let mut prompt: Option<RenamePrompt> = None;
@@ -46,7 +195,7 @@ pub fn attach(name: &str) -> io::Result<()> {
         let (stdin_re, sock_re, sig_re) = {
             let mut fds = [
                 PollFd::from_borrowed_fd(stdin, PollFlags::IN),
-                PollFd::new(&stream, PollFlags::IN),
+                PollFd::from_borrowed_fd(client.as_fd(), PollFlags::IN),
                 PollFd::new(&sfd, PollFlags::IN),
             ];
             match poll(&mut fds, None) {
@@ -64,7 +213,7 @@ pub fn attach(name: &str) -> io::Result<()> {
                 break;
             }
             if prompt.is_some() {
-                prompt_input(&in_buf[..n], &mut prompt, &mut stream, stdin)?;
+                prompt_input(&in_buf[..n], &mut prompt, &mut client, stdin)?;
             } else {
                 for action in detacher.feed(&in_buf[..n]) {
                     match action {
@@ -72,9 +221,9 @@ pub fn attach(name: &str) -> io::Result<()> {
                             // A prefix-r mid-batch opens the prompt; route any
                             // bytes typed after it on this same read to it.
                             if prompt.is_some() {
-                                prompt_input(&bytes, &mut prompt, &mut stream, stdin)?;
+                                prompt_input(&bytes, &mut prompt, &mut client, stdin)?;
                             } else {
-                                stream.write_all(&encode(&ClientMsg::Input(bytes)))?;
+                                client.send(&ClientMsg::Input(bytes))?;
                             }
                         }
                         Action::Detach => {
@@ -82,7 +231,7 @@ pub fn attach(name: &str) -> io::Result<()> {
                             return Ok(());
                         }
                         Action::Kill => {
-                            let _ = stream.write_all(&encode(&ClientMsg::Kill));
+                            let _ = client.send(&ClientMsg::Kill);
                             eprint!("\r\n[ghost: killed session]\r\n");
                             return Ok(());
                         }
@@ -96,13 +245,11 @@ pub fn attach(name: &str) -> io::Result<()> {
 
         // host -> stdout
         if sock_re.intersects(PollFlags::IN | PollFlags::HUP) {
-            let n = stream.read(&mut sock_buf)?;
-            if n == 0 {
+            let Some(msgs) = client.recv_ready()? else {
                 eprint!("\r\n[ghost: session closed]\r\n");
                 return Ok(());
-            }
-            reader.push(&sock_buf[..n]);
-            while let Some(msg) = reader.next_msg::<ServerMsg>()? {
+            };
+            for msg in msgs {
                 match msg {
                     ServerMsg::Output(bytes) => {
                         // While the prompt overlay is up, drop live output; the
@@ -119,7 +266,7 @@ pub fn attach(name: &str) -> io::Result<()> {
                         return Ok(());
                     }
                     ServerMsg::RenameResult { ok, message } => {
-                        rename_result(ok, &message, &mut prompt, &mut stream, stdin)?;
+                        rename_result(ok, &message, &mut prompt, &mut client, stdin)?;
                     }
                 }
             }
@@ -128,7 +275,7 @@ pub fn attach(name: &str) -> io::Result<()> {
         // terminal resize -> host
         if sig_re.contains(PollFlags::IN) {
             signals::drain(&sfd)?;
-            send_resize(&mut stream, stdin)?;
+            send_resize(&mut client, stdin)?;
         }
     }
     Ok(())
@@ -139,29 +286,28 @@ pub fn attach(name: &str) -> io::Result<()> {
 /// verdict. Sends no resize, so the host treats it as a control connection and
 /// does not disturb any attached client.
 pub fn rename(old: &str, new: &str) -> io::Result<()> {
-    let sock = paths::socket_path(old);
-    let mut stream = UnixStream::connect(&sock)
+    let mut conn = Conn::connect(&paths::socket_path(old))
         .map_err(|e| io::Error::new(e.kind(), format!("cannot reach session '{old}': {e}")))?;
-    stream.write_all(&encode(&ClientMsg::Rename(new.to_string())))?;
+    conn.send(&ClientMsg::Rename(new.to_string()))?;
 
-    let mut reader = FrameReader::new();
-    let mut buf = [0u8; 4096];
     loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "session closed before replying",
-            ));
-        }
-        reader.push(&buf[..n]);
-        while let Some(msg) = reader.next_msg::<ServerMsg>()? {
-            if let ServerMsg::RenameResult { ok, message } = msg {
-                return if ok {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(message))
-                };
+        match conn.recv::<ServerMsg>()? {
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "session closed before replying",
+                ));
+            }
+            Some(msgs) => {
+                for msg in msgs {
+                    if let ServerMsg::RenameResult { ok, message } = msg {
+                        return if ok {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other(message))
+                        };
+                    }
+                }
             }
         }
     }
@@ -193,7 +339,7 @@ fn start_prompt(prompt: &mut Option<RenamePrompt>, fd: BorrowedFd<'_>) -> io::Re
 fn prompt_input(
     bytes: &[u8],
     prompt: &mut Option<RenamePrompt>,
-    stream: &mut UnixStream,
+    client: &mut Client,
     fd: BorrowedFd<'_>,
 ) -> io::Result<()> {
     if prompt.as_ref().is_none_or(|p| p.awaiting) {
@@ -207,7 +353,7 @@ fn prompt_input(
                 if name.is_empty() {
                     continue;
                 }
-                stream.write_all(&encode(&ClientMsg::Rename(name)))?;
+                client.send(&ClientMsg::Rename(name))?;
                 prompt.as_mut().unwrap().awaiting = true;
                 break;
             }
@@ -217,7 +363,7 @@ fn prompt_input(
                 out.write_all(b"\x1b8")?;
                 out.flush()?;
                 *prompt = None;
-                stream.write_all(&encode(&ClientMsg::Repaint))?;
+                client.send(&ClientMsg::Repaint)?;
                 return Ok(());
             }
             0x7f | 0x08 => {
@@ -239,7 +385,7 @@ fn rename_result(
     ok: bool,
     message: &str,
     prompt: &mut Option<RenamePrompt>,
-    stream: &mut UnixStream,
+    client: &mut Client,
     fd: BorrowedFd<'_>,
 ) -> io::Result<()> {
     if prompt.is_none() {
@@ -250,7 +396,7 @@ fn rename_result(
         let mut out = io::stdout().lock();
         out.write_all(b"\x1b8")?; // restore cursor
         out.flush()?;
-        stream.write_all(&encode(&ClientMsg::Repaint))?; // repaint over the prompt
+        client.send(&ClientMsg::Repaint)?; // repaint over the prompt
     } else {
         // Refused: re-enable editing and show why, so the user can fix the name.
         if let Some(p) = prompt.as_mut() {
@@ -289,12 +435,12 @@ fn term_size(fd: BorrowedFd<'_>) -> (u16, u16) {
         .unwrap_or((80, 24))
 }
 
-fn send_resize(stream: &mut UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
+fn send_resize(client: &mut Client, fd: BorrowedFd<'_>) -> io::Result<()> {
     if let Ok(ws) = tcgetwinsize(fd) {
-        stream.write_all(&encode(&ClientMsg::Resize {
+        client.send(&ClientMsg::Resize {
             cols: ws.ws_col,
             rows: ws.ws_row,
-        }))?;
+        })?;
     }
     Ok(())
 }

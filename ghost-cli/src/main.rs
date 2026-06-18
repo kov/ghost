@@ -22,6 +22,12 @@ enum Command {
         /// Start the session in the background without attaching to it.
         #[arg(short = 'd', long)]
         detached: bool,
+        /// Create the session *deferred but unattached*: its child starts on the
+        /// first attach rather than now. An implementation detail used by GUI
+        /// front-ends (which create a session, then attach to it), hidden from
+        /// help. Without it, `-d` starts the child eagerly.
+        #[arg(long, hide = true)]
+        defer: bool,
         /// Do not record this session (recording is on by default).
         #[arg(long)]
         no_record: bool,
@@ -65,11 +71,16 @@ enum Command {
 }
 
 fn main() {
+    // If we were re-exec'd as a session host, become it and never return here.
+    // Must run before clap, which would reject the internal `__host` argv.
+    server::run_host_if_invoked();
+
     let cli = Cli::parse();
     match cli.command {
         Command::New {
             name,
             detached,
+            defer,
             no_record,
             scrollback,
             max_recording_size,
@@ -84,6 +95,9 @@ fn main() {
                 record,
                 scrollback,
                 max_recording_bytes: Some(max_recording_size),
+                // Attached sessions (the default, and `--defer`) start their
+                // child on the attach handshake; a plain `-d` starts it now.
+                start_on_attach: !detached || defer,
             };
             // `spawn` forks the session off and returns here in the launching
             // process. By default we then attach to it (the common case: start a
@@ -101,7 +115,11 @@ fn main() {
         Command::Ls => match session::list() {
             Ok(sessions) => {
                 for s in sessions {
-                    println!("{}\t(pid {})", s.name, s.pid);
+                    if s.title.is_empty() {
+                        println!("{}\t(pid {})", s.name, s.pid);
+                    } else {
+                        println!("{}\t(pid {})\t{}", s.name, s.pid, s.title);
+                    }
                 }
             }
             Err(e) => fail(&e.to_string()),

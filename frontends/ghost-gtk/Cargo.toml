@@ -1,0 +1,23 @@
+[package]
+name = "ghost-gtk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Native GTK/libadwaita terminal frontend for ghost."
+
+[[bin]]
+name = "ghost-gtk"
+path = "src/main.rs"
+
+[dependencies]
+ghost-vt = { path = "../../ghost-vt" }
+gtk4 = "0.11"
+# v1_5 gates adw::ToolbarView/OverlaySplitView (1.4) and AlertDialog (1.5);
+# system libadwaita is 1.9.
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+vte4 = "0.10"
+
+# Detached from the ghost workspace on purpose: the core (vt / ghost-vt /
+# ghost-cli) must build, test, and lint without GTK/VTE/libadwaita system libs,
+# so this GUI frontend stands alone (built/linted with its own cargo commands).
+[workspace]

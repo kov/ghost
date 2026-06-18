@@ -668,6 +668,10 @@ impl Terminal {
         self.cursor_keys_mode == CursorKeysMode::Application
     }
 
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     #[cfg(test)]
     pub fn verify(&self) {
         assert!(self.cursor.row < self.rows);

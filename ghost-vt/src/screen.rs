@@ -142,6 +142,11 @@ impl Screen {
     pub fn text(&self) -> Vec<String> {
         self.vt.text()
     }
+
+    /// The terminal's window title (OSC 0/2), empty if none has been set.
+    pub fn title(&self) -> &str {
+        self.vt.title()
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,10 @@ impl Vt {
         self.terminal.text()
     }
 
+    pub fn title(&self) -> &str {
+        self.terminal.title()
+    }
+
     pub fn cursor(&self) -> Cursor {
         self.terminal.cursor()
     }
