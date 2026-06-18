@@ -20,4 +20,7 @@ vte4 = "0.10"
 # Detached from the ghost workspace on purpose: the core (vt / ghost-vt /
 # ghost-cli) must build, test, and lint without GTK/VTE/libadwaita system libs,
 # so this GUI frontend stands alone (built/linted with its own cargo commands).
+# `xtask` (the macOS `.app` packager) is a std-only member of this side
+# workspace — it never pulls GTK into the core workspace.
 [workspace]
+members = ["xtask"]

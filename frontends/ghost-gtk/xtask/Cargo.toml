@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Build/packaging tasks for ghost-gtk (macOS .app bundling)."
+
+# std-only on purpose: keeps this off the GTK dependency tree.
+[dependencies]

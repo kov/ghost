@@ -1,0 +1,3 @@
+# `cargo xtask <cmd>` runs the packaging tool in ./xtask.
+[alias]
+xtask = "run --package xtask --"
