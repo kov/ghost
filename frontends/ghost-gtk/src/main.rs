@@ -148,6 +148,21 @@ fn home_launch_dir(
     }
 }
 
+/// An accelerator built from the platform's primary command modifier plus `key`,
+/// optionally with Shift. On macOS that modifier is Command — which GTK names
+/// `<Meta>`; GTK's own `<Primary>` resolves to *Control* there, not Command, so
+/// these user-facing shortcuts name the modifier explicitly. Elsewhere it stays
+/// `<Primary>` (Control on Linux/X11/Wayland).
+fn primary_accel(key: &str, shift: bool) -> String {
+    let cmd = if cfg!(target_os = "macos") {
+        "<Meta>"
+    } else {
+        "<Primary>"
+    };
+    let shift = if shift { "<Shift>" } else { "" };
+    format!("{cmd}{shift}{key}")
+}
+
 fn main() -> glib::ExitCode {
     // If `server::spawn` re-exec'd us as a session host, become it and never
     // return here — before any GTK init.
@@ -171,8 +186,8 @@ fn main() -> glib::ExitCode {
 }
 
 /// App-wide actions, registered once at startup. `new-window` opens another
-/// terminal window (Ctrl/Cmd-N); each window also registers its own window-scoped
-/// actions in [`install_actions`]. `<Primary>` is Ctrl on Linux, Cmd on macOS.
+/// terminal window (Cmd-N on macOS, Ctrl-N on Linux — see [`primary_accel`]); each
+/// window also registers its own window-scoped actions in [`install_actions`].
 fn install_app_actions(app: &adw::Application) {
     let new_window = gio::SimpleAction::new("new-window", None);
     {
@@ -180,7 +195,7 @@ fn install_app_actions(app: &adw::Application) {
         new_window.connect_activate(move |_, _| build_window(&app));
     }
     app.add_action(&new_window);
-    app.set_accels_for_action("app.new-window", &["<Primary>n"]);
+    app.set_accels_for_action("app.new-window", &[&primary_accel("n", false)]);
 }
 
 fn build_window(app: &adw::Application) {
@@ -1051,14 +1066,16 @@ fn install_group_headers(list: &gtk4::ListBox, groups: Vec<Group>) {
     });
 }
 
-/// Install window actions (preferences, zoom in/out/reset) with their
-/// accelerators. `<Primary>` resolves to Ctrl on Linux and Cmd on macOS, so one
-/// binding covers both platforms.
+/// Install window actions (preferences, zoom, new/close, tab switching) with
+/// their accelerators. GTK's `<Primary>` is Control on both Linux *and* macOS, so
+/// the user-facing command shortcuts go through [`primary_accel`] to get Command
+/// on macOS; the rest keep `<Primary>` (still Control everywhere).
 fn install_actions(ui: &Ui, app: &adw::Application) {
     type Handler = Box<dyn Fn(&Ui)>;
-    let actions: [(&str, Handler); 8] = [
+    let actions: [(&str, Handler); 9] = [
         ("preferences", Box::new(Ui::show_preferences)),
         ("new-session", Box::new(Ui::new_session)),
+        ("close-window", Box::new(|ui| ui.window.close())),
         ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
         ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
         ("zoom-reset", Box::new(Ui::zoom_reset)),
@@ -1081,8 +1098,10 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
     app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
     app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
     app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
-    // New session — Ctrl+T on Linux, Cmd+T on macOS (the conventional new-tab key).
-    app.set_accels_for_action("win.new-session", &["<Primary>t"]);
+    // New session — Cmd+T on macOS, Ctrl+T on Linux (the conventional new-tab key).
+    app.set_accels_for_action("win.new-session", &[&primary_accel("t", false)]);
+    // Close the window — Cmd+Shift+W on macOS, Ctrl+Shift+W on Linux.
+    app.set_accels_for_action("win.close-window", &[&primary_accel("w", true)]);
     // Cycle attached terminals. Accelerators (not a key controller) get first
     // shot in the global capture phase, ahead of GTK's Tab focus-traversal.
     // Literal Control, not Primary — Cmd+Tab is the macOS app switcher. Shift+Tab
@@ -1283,6 +1302,22 @@ mod tests {
             command: vec![],
             attached,
         }
+    }
+
+    #[test]
+    fn primary_accel_is_command_on_macos_not_control() {
+        use super::primary_accel;
+        if cfg!(target_os = "macos") {
+            // macOS: Command (⌘), which GTK names <Meta> — not <Primary>/<Control>.
+            assert_eq!(primary_accel("n", false), "<Meta>n");
+            assert_eq!(primary_accel("t", false), "<Meta>t");
+            assert_eq!(primary_accel("w", true), "<Meta><Shift>w");
+        } else {
+            assert_eq!(primary_accel("n", false), "<Primary>n");
+            assert_eq!(primary_accel("w", true), "<Primary><Shift>w");
+        }
+        // The whole point: never Control for these on macOS.
+        assert!(!primary_accel("n", false).contains("<Control>"));
     }
 
     #[test]
