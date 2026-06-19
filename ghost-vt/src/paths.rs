@@ -55,6 +55,14 @@ pub fn meta_path(name: &str) -> PathBuf {
     session_dir(name).join("meta")
 }
 
+/// Path of the attach marker for the named session. The host keeps this file
+/// present exactly while a display client is attached; its presence is how
+/// discovery reports [`crate::session::SessionInfo::attached`] so a front-end can
+/// tell "open elsewhere" from "detached".
+pub fn attached_path(name: &str) -> PathBuf {
+    session_dir(name).join("attached")
+}
+
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
 /// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
 /// holds recordings, which are archival.

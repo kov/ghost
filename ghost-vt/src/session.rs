@@ -24,6 +24,10 @@ pub struct SessionInfo {
     pub title: String,
     /// The command the session runs (empty means the user's `$SHELL`).
     pub command: Vec<String>,
+    /// Whether a display client is currently attached to the session, read from
+    /// the host's `attached` marker file. Lets a front-end separate sessions held
+    /// elsewhere from genuinely detached ones.
+    pub attached: bool,
 }
 
 /// Liveness of a session directory, read from its lock file.
@@ -72,6 +76,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     created_at: Some(meta.created_at).filter(|&t| t != 0),
                     title: meta.title,
                     command: meta.command,
+                    attached: path.join("attached").exists(),
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -217,6 +222,36 @@ mod tests {
         // Hold the lock fds until the assertions are done.
         drop(live_lock);
         drop(starting_lock);
+    }
+
+    #[test]
+    fn list_in_reports_attached_state_from_marker_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A fully-up session (lock held + pid written) so it is listable.
+        let mk_live = |name: &str| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let lock = std::fs::File::create(d.join("lock")).unwrap();
+            flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+            std::fs::write(d.join("pid"), std::process::id().to_string()).unwrap();
+            (d, lock)
+        };
+
+        // Presence of the `attached` marker is the whole signal: the host writes
+        // it while a display client is attached and removes it on detach.
+        let (attached, attached_lock) = mk_live("attached");
+        std::fs::write(attached.join("attached"), "").unwrap();
+        let (_detached, detached_lock) = mk_live("detached");
+
+        let sessions = list_in(root).unwrap();
+        let by_name = |n: &str| sessions.iter().find(|s| s.name == n).unwrap();
+        assert!(by_name("attached").attached, "marker present -> attached");
+        assert!(!by_name("detached").attached, "no marker -> detached");
+
+        // Hold the lock fds until the assertions are done.
+        drop(attached_lock);
+        drop(detached_lock);
     }
 
     #[test]

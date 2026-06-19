@@ -376,6 +376,10 @@ fn host_main(
     // first and is serviced without disturbing the attached client.
     let mut client: Option<Client> = None;
     let mut pending: Vec<Client> = Vec::new();
+    // Mirrors whether a display client is attached into the `attached` marker
+    // file, so discovery can report it. Tracked here to touch the filesystem only
+    // on the attach/detach transitions, not every loop turn.
+    let mut attached_marked = false;
     let mut ptybuf = [0u8; 8192];
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
@@ -582,6 +586,15 @@ fn host_main(
             client = None;
         }
 
+        // Reconcile the attach marker with the display client's presence. All the
+        // ways `client` can change this turn (handshake takeover, detach, drop,
+        // flush error) have run by now, so a single check here covers them.
+        let now_attached = client.as_ref().is_some_and(|c| c.resynced);
+        if now_attached != attached_marked {
+            set_attached_marker(current_name, now_attached);
+            attached_marked = now_attached;
+        }
+
         // Signals.
         if sig_re.contains(PollFlags::IN) {
             for signo in crate::signals::drain(&sfd)? {
@@ -661,6 +674,19 @@ fn handle_client_messages(
         }
     }
     Ok(Disposition::Keep)
+}
+
+/// Create or remove the session's `attached` marker. Best-effort: the marker is
+/// advisory (discovery falls back to "detached" if it is missing), and a host
+/// that exits without clearing it leaves it inside a directory that the next
+/// `list` prunes wholesale, so a stale marker is never read for a live session.
+fn set_attached_marker(name: &str, attached: bool) {
+    let path = paths::attached_path(name);
+    if attached {
+        let _ = std::fs::File::create(&path);
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Rename the running session: move its runtime directory (sock + pid together,

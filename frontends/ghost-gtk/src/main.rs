@@ -14,6 +14,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
@@ -48,9 +49,66 @@ struct OpenSession {
     terminal: Terminal,
 }
 
-/// One sidebar row reduced to what's visible: `(name, title, open-here, current)`.
-/// The list is rebuilt only when the vector of these changes.
-type RowSig = (String, String, bool, bool);
+/// One sidebar row reduced to what's visible: `(name, title, group, current)`.
+/// The list is rebuilt only when the vector of these changes — including when a
+/// session moves between groups (e.g. another window takes it over).
+type RowSig = (String, String, Group, bool);
+
+/// The process-wide source of session names. Every window mints from the same
+/// counter, so two windows in this single-instance app can never collide on
+/// `ghost-<pid>-<n>`.
+static NEXT_SESSION: AtomicU32 = AtomicU32::new(0);
+
+/// A fresh, process-unique name for a newly created session.
+fn next_session_name() -> String {
+    let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    format!("ghost-{}-{n}", std::process::id())
+}
+
+/// Which sidebar section a session belongs to, from this window's vantage point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Attached to (open in) this window.
+    Here,
+    /// Attached to a different window or client.
+    Elsewhere,
+    /// Not attached anywhere — free to open here.
+    Detached,
+}
+
+impl Group {
+    /// Sort key giving the section order: here, then detached (free to open
+    /// here), then sessions held elsewhere.
+    fn order(self) -> u8 {
+        match self {
+            Group::Here => 0,
+            Group::Detached => 1,
+            Group::Elsewhere => 2,
+        }
+    }
+
+    /// The header shown above the group's first row.
+    fn header(self) -> &'static str {
+        match self {
+            Group::Here => "This window",
+            Group::Elsewhere => "Open elsewhere",
+            Group::Detached => "Detached",
+        }
+    }
+}
+
+/// Classify a session for this window: open here takes precedence (we are its
+/// attached client), otherwise the host's attach marker separates a session held
+/// in another window/client from a genuinely detached one.
+fn group_of(open_here: bool, info: &SessionInfo) -> Group {
+    if open_here {
+        Group::Here
+    } else if info.attached {
+        Group::Elsewhere
+    } else {
+        Group::Detached
+    }
+}
 
 /// Shared window state. Cheap to clone (widgets are ref-counted, the rest is
 /// `Rc`), so it's handed to every signal closure.
@@ -63,7 +121,6 @@ struct Ui {
     content_title: adw::WindowTitle,
     open: Rc<RefCell<HashMap<String, OpenSession>>>,
     current: Rc<RefCell<Option<String>>>,
-    counter: Rc<Cell<u32>>,
     /// Live settings (font, scheme, transparency, persisted zoom), shared so
     /// signal closures can read and update them.
     settings: Rc<RefCell<Settings>>,
@@ -81,8 +138,22 @@ fn main() -> glib::ExitCode {
     server::run_host_if_invoked();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(install_app_actions);
     app.connect_activate(build_window);
     app.run()
+}
+
+/// App-wide actions, registered once at startup. `new-window` opens another
+/// terminal window (Ctrl/Cmd-N); each window also registers its own window-scoped
+/// actions in [`install_actions`]. `<Primary>` is Ctrl on Linux, Cmd on macOS.
+fn install_app_actions(app: &adw::Application) {
+    let new_window = gio::SimpleAction::new("new-window", None);
+    {
+        let app = app.clone();
+        new_window.connect_activate(move |_, _| build_window(&app));
+    }
+    app.add_action(&new_window);
+    app.set_accels_for_action("app.new-window", &["<Primary>n"]);
 }
 
 fn build_window(app: &adw::Application) {
@@ -135,6 +206,7 @@ fn build_window(app: &adw::Application) {
     content_header.set_title_widget(Some(&content_title));
     content_header.pack_start(&sidebar_toggle);
     let menu = gio::Menu::new();
+    menu.append(Some("New Window"), Some("app.new-window"));
     menu.append(Some("Preferences"), Some("win.preferences"));
     let menu_button = gtk4::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -184,7 +256,6 @@ fn build_window(app: &adw::Application) {
         content_title,
         open: Rc::new(RefCell::new(HashMap::new())),
         current: Rc::new(RefCell::new(None)),
-        counter: Rc::new(Cell::new(0)),
         last_sig: Rc::new(RefCell::new(Vec::new())),
         settings: Rc::new(RefCell::new(cfg)),
         prefs_window: Rc::new(RefCell::new(None)),
@@ -208,6 +279,16 @@ fn build_window(app: &adw::Application) {
         glib::timeout_add_local(Duration::from_secs(2), move || {
             ui.refresh();
             glib::ControlFlow::Continue
+        });
+    }
+    // Closing this window detaches its sessions (they keep running and can be
+    // reopened here or in another window) instead of leaving their drain timers
+    // holding the clients attached for the rest of the process's life.
+    {
+        let ui = ui.clone();
+        window.connect_close_request(move |_| {
+            ui.detach_all();
+            glib::Propagation::Proceed
         });
     }
     window.present();
@@ -335,9 +416,7 @@ impl Ui {
 
     /// Create a brand-new session (deferred start) and open it.
     fn new_session(&self) {
-        let n = self.counter.get();
-        self.counter.set(n + 1);
-        let name = format!("ghost-{}-{n}", std::process::id());
+        let name = next_session_name();
         let opts = SpawnOpts {
             name: name.clone(),
             command: vec![], // the user's $SHELL
@@ -352,6 +431,15 @@ impl Ui {
             return;
         }
         self.open_session(&name);
+    }
+
+    /// Detach every session open in this window: drop each client (set its cell to
+    /// `None`) so the drain timer sharing the cell stops on its next tick and the
+    /// host clears its attach marker. The sessions keep running, reattachable.
+    fn detach_all(&self) {
+        for (_name, open) in self.open.borrow_mut().drain() {
+            *open.session.borrow_mut() = None;
+        }
     }
 
     /// Ask before killing — a kill ends the program and can't be undone.
@@ -471,22 +559,31 @@ impl Ui {
     /// Rebuild the sidebar from the live fleet, but only when it actually changed
     /// (so the 2s tick is usually a no-op and never steals the selection).
     fn refresh(&self) {
-        let sessions = session::list().unwrap_or_default();
+        let mut sessions = session::list().unwrap_or_default();
         let current = self.current.borrow().clone();
-        let sig: Vec<RowSig> = {
+        // Order by group (this window, then elsewhere, then detached). The sort is
+        // stable and `list` already returns name-sorted, so rows stay alphabetical
+        // within each group. `groups` is aligned to `sessions` for the headers.
+        let groups: Vec<Group> = {
             let open = self.open.borrow();
+            sessions.sort_by_key(|s| group_of(open.contains_key(&s.name), s).order());
             sessions
                 .iter()
-                .map(|s| {
-                    (
-                        s.name.clone(),
-                        display_title(s),
-                        open.contains_key(&s.name),
-                        current.as_deref() == Some(s.name.as_str()),
-                    )
-                })
+                .map(|s| group_of(open.contains_key(&s.name), s))
                 .collect()
         };
+        let sig: Vec<RowSig> = sessions
+            .iter()
+            .zip(&groups)
+            .map(|(s, &g)| {
+                (
+                    s.name.clone(),
+                    display_title(s),
+                    g,
+                    current.as_deref() == Some(s.name.as_str()),
+                )
+            })
+            .collect();
         if *self.last_sig.borrow() == sig {
             return;
         }
@@ -503,6 +600,7 @@ impl Ui {
             }
             self.list.append(&row);
         }
+        install_group_headers(&self.list, groups);
         if let Some(row) = current_row {
             self.list.select_row(Some(&row));
         }
@@ -511,8 +609,10 @@ impl Ui {
         }
     }
 
-    /// Build one sidebar row: title (terminal title) over `name · created`, an
-    /// "open here" dot, and a kill button.
+    /// Build one sidebar row: title (terminal title) over `name · created`, a dot
+    /// marking the session shown in this window, and a kill button. The group it
+    /// sits under (see [`install_group_headers`]) says whether it is open here,
+    /// elsewhere, or detached.
     fn make_row(&self, s: &SessionInfo) -> adw::ActionRow {
         let row = adw::ActionRow::builder()
             .title(display_title(s))
@@ -522,7 +622,7 @@ impl Ui {
         // Terminal titles are arbitrary text, not Pango markup.
         row.set_use_markup(false);
 
-        if self.open.borrow().contains_key(&s.name) {
+        if self.current.borrow().as_deref() == Some(s.name.as_str()) {
             let dot = gtk4::Image::from_icon_name("media-record-symbolic");
             dot.add_css_class("accent");
             row.add_prefix(&dot);
@@ -891,6 +991,38 @@ fn relative_time(created_at: Option<i64>) -> String {
     }
 }
 
+/// Give the list libadwaita-style section headers, derived from each row's group.
+/// Called after every rebuild with `groups` aligned to the rows' order, so each
+/// header sits above the first row of its contiguous group.
+fn install_group_headers(list: &gtk4::ListBox, groups: Vec<Group>) {
+    list.set_header_func(move |row, _before| {
+        let idx = row.index();
+        if idx < 0 {
+            return;
+        }
+        let idx = idx as usize;
+        let Some(&group) = groups.get(idx) else {
+            return;
+        };
+        let starts_group = idx == 0 || groups.get(idx - 1) != Some(&group);
+        if !starts_group {
+            row.set_header(None::<&gtk4::Widget>);
+            return;
+        }
+        let label = gtk4::Label::builder()
+            .label(group.header())
+            .xalign(0.0)
+            .margin_top(12)
+            .margin_bottom(4)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        label.add_css_class("dim-label");
+        label.add_css_class("caption-heading");
+        row.set_header(Some(&label));
+    });
+}
+
 /// Install window actions (preferences, zoom in/out/reset) with their
 /// accelerators. `<Primary>` resolves to Ctrl on Linux and Cmd on macOS, so one
 /// binding covers both platforms.
@@ -1043,10 +1175,48 @@ fn install_clipboard_keys(term: &Terminal) {
 
 #[cfg(test)]
 mod tests {
-    use super::cycle_target;
+    use super::{Group, cycle_target, group_of, next_session_name};
+    use ghost_vt::session::SessionInfo;
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn info(name: &str, attached: bool) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            pid: 1,
+            created_at: None,
+            title: String::new(),
+            command: vec![],
+            attached,
+        }
+    }
+
+    #[test]
+    fn group_of_separates_here_elsewhere_and_detached() {
+        // Open in this window wins regardless of the host marker (we are the
+        // attached client).
+        assert_eq!(group_of(true, &info("s", false)), Group::Here);
+        assert_eq!(group_of(true, &info("s", true)), Group::Here);
+        // Not open here: the marker tells "elsewhere" from "detached".
+        assert_eq!(group_of(false, &info("s", true)), Group::Elsewhere);
+        assert_eq!(group_of(false, &info("s", false)), Group::Detached);
+    }
+
+    #[test]
+    fn group_order_is_here_then_detached_then_elsewhere() {
+        // Detached (free to open here) ranks above sessions held elsewhere.
+        assert!(Group::Here.order() < Group::Detached.order());
+        assert!(Group::Detached.order() < Group::Elsewhere.order());
+    }
+
+    #[test]
+    fn session_names_are_unique_per_call() {
+        let a = next_session_name();
+        let b = next_session_name();
+        assert_ne!(a, b, "two windows must not mint the same session name");
+        assert!(a.starts_with("ghost-"));
     }
 
     #[test]
