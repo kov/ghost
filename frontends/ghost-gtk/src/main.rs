@@ -310,6 +310,7 @@ impl Ui {
             let terminal = Terminal::new();
             settings::apply(&self.settings.borrow(), &terminal);
             install_clipboard_keys(&terminal);
+            install_window_move_drag(&terminal);
             let session = Rc::new(RefCell::new(Some(session)));
             {
                 // commit -> session input (keys, mouse, paste, query replies).
@@ -1146,6 +1147,68 @@ fn cycle_target(names: &[String], current: Option<&str>, forward: bool) -> Optio
     Some(names[next].clone())
 }
 
+/// Whether a button press on the terminal should start a window move rather than
+/// reach VTE. macOS moves a window from anywhere on it with Control-Command-drag;
+/// VTE would instead read Control-drag as block (rectangular) selection and
+/// swallow the gesture. We reserve the press for a move only when both Control
+/// and Command are held on the primary button — plain Control-drag stays VTE's
+/// block selection. The Command (⌘) key maps to `META_MASK` on the GDK macOS
+/// backend; on other backends that bit is effectively never set, so this is inert
+/// off macOS.
+fn is_window_move_drag(button: u32, mods: gdk::ModifierType) -> bool {
+    button == gdk::BUTTON_PRIMARY
+        && mods.contains(gdk::ModifierType::CONTROL_MASK)
+        && mods.contains(gdk::ModifierType::META_MASK)
+}
+
+/// Make Control-Command-drag move the window from anywhere on the terminal,
+/// matching how macOS drags windows. VTE claims Control-drag for block selection,
+/// so intercept the press in the capture phase (ahead of VTE): claim the sequence
+/// to deny VTE, then start a real toplevel move. Mirrors GtkWindowHandle's
+/// drag-to-move, including the widget→surface coordinate translation `begin_move`
+/// expects.
+fn install_window_move_drag(term: &Terminal) {
+    let click = gtk4::GestureClick::new();
+    click.set_button(gdk::BUTTON_PRIMARY);
+    click.set_propagation_phase(PropagationPhase::Capture);
+    let term_move = term.clone();
+    click.connect_pressed(move |gesture, _n_press, x, y| {
+        if !is_window_move_drag(gesture.current_button(), gesture.current_event_state()) {
+            return;
+        }
+        // Take the sequence so VTE never starts a selection from this press.
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        let Some(native) = term_move.native() else {
+            return;
+        };
+        let Some(surface) = native.surface() else {
+            return;
+        };
+        let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
+            return;
+        };
+        let Some(device) = gesture.device() else {
+            return;
+        };
+        // begin_move wants surface-relative coordinates: translate the widget-local
+        // press point into the native, then offset by the native's surface transform.
+        let Some(p) =
+            term_move.compute_point(&native, &gtk4::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        let (tx, ty) = native.surface_transform();
+        toplevel.begin_move(
+            &device,
+            gesture.current_button() as i32,
+            f64::from(p.x()) + tx,
+            f64::from(p.y()) + ty,
+            gesture.current_event_time(),
+        );
+    });
+    term.add_controller(click);
+}
+
 /// Copy/paste shortcuts VTE doesn't bind itself: Alt+C/V (consistent across mac
 /// and linux) and Ctrl-Shift-C/V. Capture phase + Stop so Alt+v is a paste, not
 /// a Meta-v keystroke sent to the session.
@@ -1175,8 +1238,10 @@ fn install_clipboard_keys(term: &Terminal) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, cycle_target, group_of, next_session_name};
+    use super::{Group, cycle_target, group_of, is_window_move_drag, next_session_name};
     use ghost_vt::session::SessionInfo;
+    use gtk4::gdk;
+    use gtk4::gdk::ModifierType as M;
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1191,6 +1256,34 @@ mod tests {
             command: vec![],
             attached,
         }
+    }
+
+    #[test]
+    fn control_command_primary_drag_is_a_window_move() {
+        // The macOS gesture: primary button with both Control and Command held
+        // (⌘ → META on the GDK macOS backend) moves the window.
+        assert!(is_window_move_drag(
+            gdk::BUTTON_PRIMARY,
+            M::CONTROL_MASK | M::META_MASK
+        ));
+        // Extra modifiers (e.g. Shift) along for the ride still count.
+        assert!(is_window_move_drag(
+            gdk::BUTTON_PRIMARY,
+            M::CONTROL_MASK | M::META_MASK | M::SHIFT_MASK
+        ));
+    }
+
+    #[test]
+    fn other_drags_are_left_to_vte() {
+        // Plain Control-drag stays VTE's block (rectangular) selection.
+        assert!(!is_window_move_drag(gdk::BUTTON_PRIMARY, M::CONTROL_MASK));
+        // Command alone is not the move gesture.
+        assert!(!is_window_move_drag(gdk::BUTTON_PRIMARY, M::META_MASK));
+        // Neither is a non-primary button, even with the right modifiers.
+        assert!(!is_window_move_drag(
+            gdk::BUTTON_SECONDARY,
+            M::CONTROL_MASK | M::META_MASK
+        ));
     }
 
     #[test]
