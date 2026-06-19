@@ -503,6 +503,28 @@ impl Ui {
         glib::idle_add_local_once(move || ui.refresh());
     }
 
+    /// Attached (open-here) session names in fleet-list order, so cycling follows
+    /// the order shown in the sidebar.
+    fn attached_in_list_order(&self) -> Vec<String> {
+        let open = self.open.borrow();
+        session::list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .filter(|n| open.contains_key(n))
+            .collect()
+    }
+
+    /// Switch to the next (`forward`) or previous attached terminal, wrapping.
+    fn switch_terminal(&self, forward: bool) {
+        let names = self.attached_in_list_order();
+        let current = self.current.borrow().clone();
+        if let Some(target) = cycle_target(&names, current.as_deref(), forward) {
+            self.show(&target);
+            self.schedule_refresh();
+        }
+    }
+
     /// Step the persisted zoom (font-scale) and re-apply it everywhere.
     fn zoom(&self, step: fn(f64) -> f64) {
         {
@@ -723,11 +745,13 @@ fn relative_time(created_at: Option<i64>) -> String {
 /// binding covers both platforms.
 fn install_actions(ui: &Ui, app: &adw::Application) {
     type Handler = Box<dyn Fn(&Ui)>;
-    let actions: [(&str, Handler); 4] = [
+    let actions: [(&str, Handler); 6] = [
         ("preferences", Box::new(Ui::show_preferences)),
         ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
         ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
         ("zoom-reset", Box::new(Ui::zoom_reset)),
+        ("next-tab", Box::new(|ui| ui.switch_terminal(true))),
+        ("previous-tab", Box::new(|ui| ui.switch_terminal(false))),
     ];
     for (name, handler) in actions {
         let action = gio::SimpleAction::new(name, None);
@@ -743,6 +767,21 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
     );
     app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
     app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
+    // Cycle attached terminals. Accelerators (not a key controller) get first
+    // shot in the global capture phase, ahead of GTK's Tab focus-traversal.
+    // Literal Control, not Primary — Cmd+Tab is the macOS app switcher. Shift+Tab
+    // arrives as the ISO_Left_Tab keysym, so bind both forms; Ctrl+Page_Up/Down is
+    // the conventional terminal binding (and a fallback where Ctrl+Tab is grabbed
+    // by the compositor).
+    app.set_accels_for_action("win.next-tab", &["<Control>Tab", "<Control>Page_Down"]);
+    app.set_accels_for_action(
+        "win.previous-tab",
+        &[
+            "<Control><Shift>Tab",
+            "<Control>ISO_Left_Tab",
+            "<Control>Page_Up",
+        ],
+    );
 }
 
 /// Rough pixels per character cell for a point size (≈96 dpi, typical monospace
@@ -799,6 +838,26 @@ fn update_window_chrome(window: &adw::ApplicationWindow, transparency: f64) {
     });
 }
 
+/// The session to switch to when cycling the attached terminals: the next entry
+/// in `names` when `forward`, else the previous, wrapping around either end.
+/// `current` is the visible session. Returns `None` when there's nothing to
+/// switch to (fewer than two attached). An unknown/missing `current` starts from
+/// the first entry.
+fn cycle_target(names: &[String], current: Option<&str>, forward: bool) -> Option<String> {
+    if names.len() < 2 {
+        return None;
+    }
+    let idx = current
+        .and_then(|c| names.iter().position(|n| n == c))
+        .unwrap_or(0);
+    let next = if forward {
+        (idx + 1) % names.len()
+    } else {
+        (idx + names.len() - 1) % names.len()
+    };
+    Some(names[next].clone())
+}
+
 /// Copy/paste shortcuts VTE doesn't bind itself: Alt+C/V (consistent across mac
 /// and linux) and Ctrl-Shift-C/V. Capture phase + Stop so Alt+v is a paste, not
 /// a Meta-v keystroke sent to the session.
@@ -824,4 +883,41 @@ fn install_clipboard_keys(term: &Terminal) {
         glib::Propagation::Proceed
     });
     term.add_controller(keys);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle_target;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cycles_forward_wrapping_past_the_last() {
+        let n = names(&["a", "b", "c"]);
+        assert_eq!(cycle_target(&n, Some("a"), true).as_deref(), Some("b"));
+        assert_eq!(cycle_target(&n, Some("b"), true).as_deref(), Some("c"));
+        assert_eq!(cycle_target(&n, Some("c"), true).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cycles_backward_wrapping_before_the_first() {
+        let n = names(&["a", "b", "c"]);
+        assert_eq!(cycle_target(&n, Some("a"), false).as_deref(), Some("c"));
+        assert_eq!(cycle_target(&n, Some("c"), false).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn nothing_to_switch_to_below_two() {
+        assert_eq!(cycle_target(&names(&[]), None, true), None);
+        assert_eq!(cycle_target(&names(&["only"]), Some("only"), true), None);
+    }
+
+    #[test]
+    fn unknown_or_missing_current_starts_from_the_first() {
+        let n = names(&["a", "b"]);
+        assert_eq!(cycle_target(&n, Some("gone"), true).as_deref(), Some("b"));
+        assert_eq!(cycle_target(&n, None, true).as_deref(), Some("b"));
+    }
 }
