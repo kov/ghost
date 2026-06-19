@@ -132,10 +132,37 @@ struct Ui {
     prefs_window: Rc<RefCell<Option<adw::Window>>>,
 }
 
+/// Where a GUI-launched session should start. `server::spawn` captures the
+/// process's working directory for the child, but a bundled launch (launchd on
+/// macOS, a desktop file on Linux) starts us at `/` — so sessions would open in
+/// `/`. In that case (or with no cwd at all) fall back to `home`; a real working
+/// directory, e.g. when launched from a terminal, is kept. Returns the directory
+/// to switch to, or `None` to leave the cwd as-is.
+fn home_launch_dir(
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    match cwd {
+        Some(c) if c != std::path::Path::new("/") => None,
+        _ => home.map(std::path::Path::to_path_buf),
+    }
+}
+
 fn main() -> glib::ExitCode {
     // If `server::spawn` re-exec'd us as a session host, become it and never
     // return here — before any GTK init.
     server::run_host_if_invoked();
+
+    // A bundled launch lands us at `/`; point new sessions at the user's home
+    // instead. `server::spawn` reads our cwd when it starts each session's child.
+    if let Some(dir) = home_launch_dir(
+        std::env::current_dir().ok().as_deref(),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    ) {
+        let _ = std::env::set_current_dir(dir);
+    }
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(install_app_actions);
@@ -1256,6 +1283,28 @@ mod tests {
             command: vec![],
             attached,
         }
+    }
+
+    #[test]
+    fn gui_launch_falls_back_to_home_only_without_a_real_cwd() {
+        use super::home_launch_dir;
+        use std::path::{Path, PathBuf};
+
+        let home = Path::new("/Users/kov");
+        // Bundled launch (launchd/Finder) starts us at `/`: fall back to home.
+        assert_eq!(
+            home_launch_dir(Some(Path::new("/")), Some(home)),
+            Some(PathBuf::from("/Users/kov"))
+        );
+        // No cwd at all: also fall back to home.
+        assert_eq!(home_launch_dir(None, Some(home)), Some(PathBuf::from(home)));
+        // A real working directory (e.g. launched from a terminal) is kept as-is.
+        assert_eq!(
+            home_launch_dir(Some(Path::new("/Users/kov/Projects/ghost")), Some(home)),
+            None
+        );
+        // Nothing to fall back to: leave cwd untouched rather than guess.
+        assert_eq!(home_launch_dir(Some(Path::new("/")), None), None);
     }
 
     #[test]
