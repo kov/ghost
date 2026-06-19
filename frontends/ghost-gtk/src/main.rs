@@ -217,7 +217,7 @@ impl Ui {
     /// Attach to (or, if already open, just switch to) a session and show it.
     fn open_session(&self, name: &str) {
         if !self.open.borrow().contains_key(name) {
-            let session = match Session::attach(name, 80, 24) {
+            let session = match Session::attach_deferred(name) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("ghost-gtk: cannot attach to '{name}': {e}");
@@ -570,21 +570,27 @@ impl Ui {
     /// timer (glib 0.22 has no unix-fd source). Stops itself when the session is
     /// gone (closed/detached) or ends, removing it from the view on end.
     fn drive(&self, name: &str, terminal: &Terminal, session: &Rc<RefCell<Option<Session>>>) {
-        let last_size = Rc::new(Cell::new((80i64, 24i64)));
+        // (0,0) so the first *allocated* size is always sent — including as the
+        // attach handshake (see below), since we attach deferred.
+        let last_size = Rc::new(Cell::new((0i64, 0i64)));
         let ui = self.clone();
         let name = name.to_string();
         let terminal = terminal.clone();
         let session = session.clone();
 
         glib::timeout_add_local(Duration::from_millis(8), move || {
-            // Grid resize -> Resize, correcting the provisional handshake size.
             let size = (terminal.column_count(), terminal.row_count());
             {
                 let mut guard = session.borrow_mut();
                 let Some(s) = guard.as_mut() else {
                     return glib::ControlFlow::Break; // closed: stop
                 };
-                if size != last_size.get() && size.0 > 0 && size.1 > 0 {
+                // Only once the widget has a real allocation are the column/row
+                // counts the true grid; before that VTE reports its construction
+                // default (80x24). Since we attach deferred, the first resize sent
+                // here is the handshake — gating on a real allocation makes the
+                // host lay its repaint out at the real window size, not a guess.
+                if terminal.width() > 0 && terminal.height() > 0 && size != last_size.get() {
                     last_size.set(size);
                     let _ = s.resize(size.0 as u16, size.1 as u16);
                 }

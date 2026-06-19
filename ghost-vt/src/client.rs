@@ -122,6 +122,27 @@ impl Session {
         })
     }
 
+    /// Attach *without* completing the handshake: unlike [`attach`](Session::attach)
+    /// no initial size is sent, so the host holds output (and any deferred child)
+    /// until the caller sends the first [`resize`](Session::resize). A client that
+    /// only learns its real display size once its widget is laid out (the GUI) uses
+    /// this so the repaint is generated at that real size, not a provisional one.
+    pub fn attach_deferred(name: &str) -> io::Result<Session> {
+        Ok(Session {
+            name: name.to_string(),
+            client: Client::connect(name)?,
+        })
+    }
+
+    /// [`attach_deferred`](Session::attach_deferred) for a socket at an explicit
+    /// path, mirroring [`attach_path`](Session::attach_path).
+    pub fn attach_deferred_path(sock: &Path, name: &str) -> io::Result<Session> {
+        Ok(Session {
+            name: name.to_string(),
+            client: Client::connect_path(sock)?,
+        })
+    }
+
     /// The session's name.
     pub fn name(&self) -> &str {
         &self.name

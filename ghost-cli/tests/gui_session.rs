@@ -124,6 +124,57 @@ fn attach_pumps_output_then_detach_keeps_session_alive() {
     assert!(acc.contains("again"), "reattach did not echo; got {acc:?}");
 }
 
+/// A deferred attach sends no handshake of its own: the host holds all output
+/// until the client's first resize. The GUI relies on this so the repaint is laid
+/// out at the widget's real size (sent as that first resize once it's allocated),
+/// not a provisional size guessed before layout — which would leave a reattached
+/// session garbled (a stale-size repaint the app never corrects until it redraws).
+#[test]
+fn deferred_attach_holds_output_until_first_resize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "gui-deferred";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Eager child (`cat` runs now), but the *attach* is deferred.
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let mut s = Session::attach_deferred_path(&sock(xdg, name), name).expect("deferred attach");
+    s.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+
+    // Input still reaches `cat` (it echoes into the host's screen state), but with
+    // no handshake yet the host must deliver nothing back to us.
+    s.send_input(b"PRELUDE\n").unwrap();
+    let (early, ended) = pump_for(&mut s, "PRELUDE", Duration::from_millis(500));
+    assert!(!ended, "session ended unexpectedly; got {early:?}");
+    assert!(
+        early.is_empty(),
+        "deferred attach delivered output before the first resize: {early:?}"
+    );
+
+    // The first resize is the handshake: the repaint now arrives, carrying the
+    // state accumulated while unattached.
+    s.resize(80, 24).unwrap();
+    let (acc, _) = pump_for(&mut s, "PRELUDE", Duration::from_secs(5));
+    assert!(
+        acc.contains("PRELUDE"),
+        "repaint after the first resize did not carry prior state; got {acc:?}"
+    );
+}
+
 #[test]
 fn pump_reports_end_when_child_exits() {
     let tmp = tempfile::tempdir().unwrap();
