@@ -755,6 +755,14 @@ fn spawn_child(
 ) -> io::Result<std::process::Child> {
     let (prog, args) = split_command(command);
     let mut cmd = PtyCommand::new(&prog).args(&args);
+    // The child talks to ghost's own `vt`/avt emulator, not the user's outer
+    // terminal — and a session may be launched from a GUI app (launchd, GTK)
+    // whose environment carries no usable `TERM`. Set them ourselves to match the
+    // emulator's capabilities so tools don't fall back to "not fully functional".
+    // avt is an xterm-style emulator with 256-color and 24-bit RGB SGR support.
+    cmd = cmd
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor");
     if let Some(dir) = launch_dir {
         cmd = cmd.current_dir(dir);
     }
