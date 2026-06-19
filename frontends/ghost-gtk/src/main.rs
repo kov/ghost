@@ -26,7 +26,7 @@ mod settings;
 
 use settings::Settings;
 
-use ghost_vt::client::Session;
+use ghost_vt::client::{self, Session};
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session::{self, SessionInfo};
 use ghost_vt::{paths, record, screen};
@@ -381,6 +381,71 @@ impl Ui {
         self.close_session(name);
     }
 
+    /// Prompt for a new name (F2). Enter or the Rename button confirms.
+    fn show_rename(&self, name: &str) {
+        let entry = gtk4::Entry::new();
+        entry.set_text(name);
+        let dialog = adw::AlertDialog::new(Some("Rename session"), None);
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("rename", "Rename");
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        {
+            let ui = self.clone();
+            let old = name.to_string();
+            let entry = entry.clone();
+            dialog.connect_response(Some("rename"), move |_, _| {
+                ui.rename(&old, entry.text().trim());
+            });
+        }
+        {
+            // Enter in the field confirms. Closing fires the "cancel" close
+            // response, which the scoped handler above ignores — so no double run.
+            let ui = self.clone();
+            let old = name.to_string();
+            let dialog = dialog.clone();
+            entry.connect_activate(move |entry| {
+                let new = entry.text();
+                dialog.close();
+                ui.rename(&old, new.trim());
+            });
+        }
+        dialog.present(Some(&self.window));
+        entry.grab_focus();
+    }
+
+    /// Rename a session via the host, then reconcile the view. A no-op for an
+    /// empty or unchanged name. An open session is re-attached under the new name
+    /// (the live connection survives the rename, but its name-keyed bookkeeping
+    /// would otherwise go stale).
+    fn rename(&self, old: &str, new: &str) {
+        if new.is_empty() || new == old {
+            return;
+        }
+        match client::rename(old, new) {
+            Ok(()) => {
+                if self.open.borrow().contains_key(old) {
+                    self.close_session(old);
+                    self.open_session(new);
+                } else {
+                    self.schedule_refresh();
+                }
+            }
+            Err(e) => self.show_error("Could not rename session", &e.to_string()),
+        }
+    }
+
+    /// A simple one-button error dialog.
+    fn show_error(&self, heading: &str, body: &str) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_response("ok", "OK");
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("ok");
+        dialog.present(Some(&self.window));
+    }
+
     /// Remove a session from this window — detach (drop the client) and drop its
     /// terminal — without killing it. If it was visible, fall back to another
     /// open session or the empty state.
@@ -474,6 +539,25 @@ impl Ui {
             let ui = self.clone();
             let name = s.name.clone();
             row.connect_activated(move |_| ui.open_session(&name));
+        }
+        // While a row is focused (e.g. after F9 + arrows): F2 renames, Delete
+        // removes. Other keys proceed so list navigation and Enter still work.
+        {
+            let ui = self.clone();
+            let name = s.name.clone();
+            let keys = EventControllerKey::new();
+            keys.connect_key_pressed(move |_, keyval, _, _| match keyval {
+                gdk::Key::F2 => {
+                    ui.show_rename(&name);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Delete => {
+                    ui.confirm_kill(&name);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            });
+            row.add_controller(keys);
         }
         row
     }
@@ -785,8 +869,9 @@ fn relative_time(created_at: Option<i64>) -> String {
 /// binding covers both platforms.
 fn install_actions(ui: &Ui, app: &adw::Application) {
     type Handler = Box<dyn Fn(&Ui)>;
-    let actions: [(&str, Handler); 7] = [
+    let actions: [(&str, Handler); 8] = [
         ("preferences", Box::new(Ui::show_preferences)),
+        ("new-session", Box::new(Ui::new_session)),
         ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
         ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
         ("zoom-reset", Box::new(Ui::zoom_reset)),
@@ -809,6 +894,8 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
     app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
     app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
     app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+    // New session — Ctrl+T on Linux, Cmd+T on macOS (the conventional new-tab key).
+    app.set_accels_for_action("win.new-session", &["<Primary>t"]);
     // Cycle attached terminals. Accelerators (not a key controller) get first
     // shot in the global capture phase, ahead of GTK's Tab focus-traversal.
     // Literal Control, not Primary — Cmd+Tab is the macOS app switcher. Shift+Tab
