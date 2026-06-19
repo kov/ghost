@@ -268,11 +268,51 @@ impl Ui {
             .unwrap_or_else(|| name.to_string());
         self.content_title.set_title(&title);
         self.content_title.set_subtitle(name);
-        if let Some(o) = self.open.borrow().get(name) {
-            o.terminal.grab_focus();
-        }
-        // Reveal the terminal: dismiss the overlay sidebar.
+        // Reveal the terminal: dismiss the overlay sidebar, then focus the
+        // terminal (deferred — see `focus_current_terminal`).
         self.split.set_show_sidebar(false);
+        self.focus_current_terminal();
+    }
+
+    /// Focus the current session's terminal, deferred to idle so it lands AFTER
+    /// the overlay sidebar's own focus handling on collapse — done inline it would
+    /// be overridden, leaving focus on the sidebar toggle button.
+    fn focus_current_terminal(&self) {
+        let ui = self.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(name) = ui.current.borrow().clone()
+                && let Some(o) = ui.open.borrow().get(&name)
+            {
+                o.terminal.grab_focus();
+            }
+        });
+    }
+
+    /// Toggle the overlay sidebar (F9). Opening focuses the session list for
+    /// keyboard navigation; closing returns focus to the current terminal.
+    fn toggle_sidebar(&self) {
+        let show = !self.split.shows_sidebar();
+        self.split.set_show_sidebar(show);
+        if show {
+            self.focus_sidebar_list();
+        } else {
+            self.focus_current_terminal();
+        }
+    }
+
+    /// Focus the sidebar's session list for keyboard navigation (F9 → arrows →
+    /// Enter). Deferred to idle so it lands after the reveal maps the list, and it
+    /// targets the selected (or first) row so the arrow keys have a cursor to move
+    /// from and Enter activates a session.
+    fn focus_sidebar_list(&self) {
+        let list = self.list.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(row) = list.selected_row().or_else(|| list.row_at_index(0)) {
+                row.grab_focus();
+            } else {
+                list.grab_focus();
+            }
+        });
     }
 
     /// Show the empty-state page (no session open). Reveal the sidebar so an
@@ -745,11 +785,12 @@ fn relative_time(created_at: Option<i64>) -> String {
 /// binding covers both platforms.
 fn install_actions(ui: &Ui, app: &adw::Application) {
     type Handler = Box<dyn Fn(&Ui)>;
-    let actions: [(&str, Handler); 6] = [
+    let actions: [(&str, Handler); 7] = [
         ("preferences", Box::new(Ui::show_preferences)),
         ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
         ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
         ("zoom-reset", Box::new(Ui::zoom_reset)),
+        ("toggle-sidebar", Box::new(Ui::toggle_sidebar)),
         ("next-tab", Box::new(|ui| ui.switch_terminal(true))),
         ("previous-tab", Box::new(|ui| ui.switch_terminal(false))),
     ];
@@ -767,6 +808,7 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
     );
     app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
     app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
+    app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
     // Cycle attached terminals. Accelerators (not a key controller) get first
     // shot in the global capture phase, ahead of GTK's Tab focus-traversal.
     // Literal Control, not Primary — Cmd+Tab is the macOS app switcher. Shift+Tab
