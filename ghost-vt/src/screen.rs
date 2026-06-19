@@ -121,6 +121,16 @@ impl Screen {
         (self.cols, self.rows)
     }
 
+    /// Cursor position as 1-based `(col, row)` — the form a cursor-position
+    /// report (CPR) carries. `avt` tracks the cursor 0-based.
+    pub fn cursor(&self) -> (u16, u16) {
+        let c = self.vt.cursor();
+        (
+            (c.col as u16).saturating_add(1),
+            (c.row as u16).saturating_add(1),
+        )
+    }
+
     /// The emulator state as an extended dump (scrollback + viewport + modes).
     /// Feeding these bytes to a fresh terminal reconstructs the state; this is
     /// what a recording checkpoint stores.

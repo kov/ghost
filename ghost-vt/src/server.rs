@@ -377,6 +377,9 @@ fn host_main(
     let mut client: Option<Client> = None;
     let mut pending: Vec<Client> = Vec::new();
     let mut ptybuf = [0u8; 8192];
+    // Spots the child's terminal queries so the host can answer them while no
+    // client is attached to do so (kept fed every chunk to track split sequences).
+    let mut queries = crate::query::QueryScanner::new();
 
     loop {
         // Build the poll set: fixed fds first, then the display client (if any),
@@ -426,6 +429,22 @@ fn host_main(
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
                     screen.feed(&ptybuf[..n]);
+                    // Answer the child's terminal queries while detached. When a
+                    // client is attached it answers them itself (the query is
+                    // forwarded as live output below), so the host stays out of
+                    // the way to avoid a doubled reply. The scanner is always fed,
+                    // attached or not, so split sequences stay tracked.
+                    let asked = queries.scan(&ptybuf[..n]);
+                    if client.is_none() && !asked.is_empty() {
+                        let cursor = screen.cursor();
+                        let size = screen.dimensions();
+                        let mut reply = Vec::new();
+                        for q in asked {
+                            reply.extend_from_slice(&q.reply(cursor, size));
+                        }
+                        let mut w: &pty_process::blocking::Pty = &pty;
+                        let _ = w.write_all(&reply);
+                    }
                     // Refresh the discoverable title when the child changes it
                     // (coalesced — only an actual change rewrites the meta file).
                     if screen.title() != meta.title {
