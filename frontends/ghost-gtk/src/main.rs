@@ -70,6 +70,9 @@ struct Ui {
     /// Last rendered sidebar signature, so periodic refreshes only rebuild the
     /// list when something actually changed.
     last_sig: Rc<RefCell<Vec<RowSig>>>,
+    /// The (non-modal) preferences window while it's open, so re-triggering the
+    /// shortcut focuses the existing one instead of stacking duplicates.
+    prefs_window: Rc<RefCell<Option<adw::Window>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -184,6 +187,7 @@ fn build_window(app: &adw::Application) {
         counter: Rc::new(Cell::new(0)),
         last_sig: Rc::new(RefCell::new(Vec::new())),
         settings: Rc::new(RefCell::new(cfg)),
+        prefs_window: Rc::new(RefCell::new(None)),
     };
     install_actions(&ui, app);
 
@@ -687,10 +691,13 @@ impl Ui {
     /// `adw::PreferencesGroup`s in a plain box (not an `AdwPreferencesPage`) so
     /// the dialog sizes to its content instead of scrolling.
     fn show_preferences(&self) {
-        let dialog = adw::Dialog::builder()
-            .title("Preferences")
-            .content_width(440)
-            .build();
+        // A non-modal window (not adw::Dialog): a dialog dims the parent, which
+        // ruins the live preview of transparency and color scheme. Reuse the
+        // window if it's already open rather than stacking duplicates.
+        if let Some(existing) = self.prefs_window.borrow().clone() {
+            existing.present();
+            return;
+        }
         let header = adw::HeaderBar::new();
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
@@ -821,8 +828,22 @@ impl Ui {
         content.append(&win_group);
 
         toolbar.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar));
-        dialog.present(Some(&self.window));
+
+        let window = adw::Window::new();
+        window.set_title(Some("Preferences"));
+        window.set_transient_for(Some(&self.window));
+        window.set_modal(false);
+        window.set_default_size(440, -1);
+        window.set_content(Some(&toolbar));
+        self.prefs_window.replace(Some(window.clone()));
+        {
+            let ui = self.clone();
+            window.connect_close_request(move |_| {
+                ui.prefs_window.replace(None);
+                glib::Propagation::Proceed
+            });
+        }
+        window.present();
     }
 }
 
