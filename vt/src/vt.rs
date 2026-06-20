@@ -67,6 +67,12 @@ impl Vt {
         self.terminal.title()
     }
 
+    /// How many times the terminal bell (BEL) has rung since creation. A host can
+    /// poll this after feeding to detect a ring even with nobody attached.
+    pub fn bell_count(&self) -> u64 {
+        self.terminal.bell_count()
+    }
+
     pub fn cursor(&self) -> Cursor {
         self.terminal.cursor()
     }

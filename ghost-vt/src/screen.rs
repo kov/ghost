@@ -157,6 +157,13 @@ impl Screen {
     pub fn title(&self) -> &str {
         self.vt.title()
     }
+
+    /// How many times the child has rung the terminal bell (BEL) since the
+    /// session started. The host polls this after feeding to detect a ring even
+    /// when no client is attached.
+    pub fn bell_count(&self) -> u64 {
+        self.vt.bell_count()
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +238,17 @@ mod tests {
         for mode in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h", "\x1b[?2004h"] {
             assert!(text.contains(mode), "resync missing {mode:?}");
         }
+    }
+
+    #[test]
+    fn counts_ground_bell_but_ignores_osc_terminator_bell() {
+        let mut s = Screen::new(20, 4, 100);
+        assert_eq!(s.bell_count(), 0);
+        s.feed(b"\x07");
+        assert_eq!(s.bell_count(), 1, "a lone BEL rings the bell");
+        // A BEL that terminates an OSC (title) sequence is not a bell.
+        s.feed(b"\x1b]2;title\x07");
+        assert_eq!(s.bell_count(), 1, "OSC-terminator BEL must not count");
     }
 
     #[test]

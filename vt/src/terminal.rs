@@ -47,6 +47,9 @@ pub struct Terminal {
     /// Current window title (OSC 0/2). Tracked but not rendered; re-emitted on
     /// dump so it survives a reattach.
     title: String,
+    /// Number of BEL (0x07) controls executed. Ephemeral (never dumped); lets a
+    /// host detect that the terminal rang the bell.
+    bell_count: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -128,11 +131,17 @@ impl Terminal {
             xtwinops: false,
             tracked_modes: BTreeSet::new(),
             title: String::new(),
+            bell_count: 0,
         }
     }
 
     pub fn size(&self) -> (usize, usize) {
         (self.cols, self.rows)
+    }
+
+    /// How many times the terminal bell (BEL) has rung since creation.
+    pub fn bell_count(&self) -> u64 {
+        self.bell_count
     }
 
     pub fn active_buffer_type(&self) -> BufferType {
@@ -143,6 +152,10 @@ impl Terminal {
         use Function::*;
 
         match fun {
+            Bell => {
+                self.bell_count += 1;
+            }
+
             Bs => {
                 self.bs();
             }

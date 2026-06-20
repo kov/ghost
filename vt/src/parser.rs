@@ -40,6 +40,9 @@ pub enum State {
 
 #[derive(Debug, PartialEq)]
 pub enum Function {
+    /// BEL (0x07) seen in the ground state: ring the terminal bell. Ephemeral —
+    /// not part of the screen state, so it never appears in a state dump.
+    Bell,
     Bs,
     Cbt(u16),
     Cha(u16),
@@ -680,6 +683,7 @@ impl Parser {
         use Function::*;
 
         match input {
+            '\u{07}' => Some(Bell),
             '\u{08}' => Some(Bs),
             '\u{09}' => Some(Ht),
             '\u{0a}' => Some(Lf),
@@ -1038,6 +1042,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
     use XtwinopsOp::*;
 
     match fun {
+        Bell => seq.push('\u{07}'),
         Bs => seq.push('\u{08}'),
         Cbt(n) => push_csi(seq, None, &[n.to_string()], 'Z'),
         Cha(n) => push_csi(seq, None, &[n.to_string()], 'G'),
@@ -1795,11 +1800,21 @@ mod tests {
 
     #[test]
     fn parse_c0() {
+        assert_eq!(parse("\x07"), [Bell]);
         assert_eq!(parse("\x08"), [Bs]);
         assert_eq!(parse("\x0a"), [Lf]);
         assert_eq!(parse("\x0d"), [Cr]);
         assert_eq!(parse("\x0e"), [So]);
         assert_eq!(parse("\x0f"), [Si]);
+    }
+
+    #[test]
+    fn bel_rings_only_in_ground_state_not_as_osc_terminator() {
+        // A lone BEL is a bell.
+        assert_eq!(parse("\x07"), [Bell]);
+        // A BEL terminating an OSC string is a string terminator, not a bell: it
+        // must yield the OSC's function (here a title set) and no Bell.
+        assert_eq!(parse("\x1b]2;hi\x07"), [SetTitle("hi".to_string())]);
     }
 
     #[test]

@@ -380,6 +380,9 @@ fn host_main(
     // file, so discovery can report it. Tracked here to touch the filesystem only
     // on the attach/detach transitions, not every loop turn.
     let mut attached_marked = false;
+    // Bell count last reflected into the marker, so a fresh ring is spotted by a
+    // change rather than re-touching the filesystem every loop turn.
+    let mut last_bell_count = 0u64;
     let mut ptybuf = [0u8; 8192];
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
@@ -433,6 +436,18 @@ fn host_main(
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
                     screen.feed(&ptybuf[..n]);
+                    // A ground-state BEL that rings while nobody is attached is an
+                    // unseen notification: mark it so a front-end can highlight the
+                    // session. Bells seen while a client is attached are witnessed
+                    // live, so they need no marker (it would only clear on the next
+                    // attach anyway).
+                    let bells = screen.bell_count();
+                    if bells != last_bell_count {
+                        last_bell_count = bells;
+                        if !client.as_ref().is_some_and(|c| c.resynced) {
+                            set_bell_marker(current_name, true);
+                        }
+                    }
                     // Answer the child's terminal queries while detached. When a
                     // client is attached it answers them itself (the query is
                     // forwarded as live output below), so the host stays out of
@@ -592,6 +607,11 @@ fn host_main(
         let now_attached = client.as_ref().is_some_and(|c| c.resynced);
         if now_attached != attached_marked {
             set_attached_marker(current_name, now_attached);
+            if now_attached {
+                // Attaching is "switching to" the session: any unseen-bell
+                // notification is now seen, so clear its marker.
+                set_bell_marker(current_name, false);
+            }
             attached_marked = now_attached;
         }
 
@@ -683,6 +703,18 @@ fn handle_client_messages(
 fn set_attached_marker(name: &str, attached: bool) {
     let path = paths::attached_path(name);
     if attached {
+        let _ = std::fs::File::create(&path);
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Create or remove the session's `bell` marker, mirroring [`set_attached_marker`].
+/// Best-effort and advisory: a host that exits without clearing it leaves it in a
+/// directory the next `list` prunes wholesale, so it is never read for a dead one.
+fn set_bell_marker(name: &str, rung: bool) {
+    let path = paths::bell_path(name);
+    if rung {
         let _ = std::fs::File::create(&path);
     } else {
         let _ = std::fs::remove_file(&path);

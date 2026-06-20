@@ -63,6 +63,15 @@ pub fn attached_path(name: &str) -> PathBuf {
     session_dir(name).join("attached")
 }
 
+/// Path of the bell marker for the named session. The host creates this file when
+/// the child rings the terminal bell (BEL) while no display client is attached,
+/// and removes it when a client attaches; its presence is how discovery reports
+/// [`crate::session::SessionInfo::bell`] so a front-end can highlight a session
+/// with an unseen notification.
+pub fn bell_path(name: &str) -> PathBuf {
+    session_dir(name).join("bell")
+}
+
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
 /// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
 /// holds recordings, which are archival.

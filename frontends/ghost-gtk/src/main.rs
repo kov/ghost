@@ -1598,6 +1598,7 @@ mod tests {
             title: String::new(),
             command: vec![],
             attached,
+            bell: false,
         }
     }
 

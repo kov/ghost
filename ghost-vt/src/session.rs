@@ -28,6 +28,10 @@ pub struct SessionInfo {
     /// the host's `attached` marker file. Lets a front-end separate sessions held
     /// elsewhere from genuinely detached ones.
     pub attached: bool,
+    /// Whether the session rang the terminal bell while unattached and has not
+    /// been switched to since, read from the host's `bell` marker file. Lets a
+    /// front-end highlight a session with an unseen notification.
+    pub bell: bool,
 }
 
 /// Liveness of a session directory, read from its lock file.
@@ -77,6 +81,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     title: meta.title,
                     command: meta.command,
                     attached: path.join("attached").exists(),
+                    bell: path.join("bell").exists(),
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -252,6 +257,35 @@ mod tests {
         // Hold the lock fds until the assertions are done.
         drop(attached_lock);
         drop(detached_lock);
+    }
+
+    #[test]
+    fn list_in_reports_bell_state_from_marker_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk_live = |name: &str| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let lock = std::fs::File::create(d.join("lock")).unwrap();
+            flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+            std::fs::write(d.join("pid"), std::process::id().to_string()).unwrap();
+            (d, lock)
+        };
+
+        // Presence of the `bell` marker is the whole signal: the host writes it
+        // when the child rings the bell unattached and removes it on attach.
+        let (rang, rang_lock) = mk_live("rang");
+        std::fs::write(rang.join("bell"), "").unwrap();
+        let (_quiet, quiet_lock) = mk_live("quiet");
+
+        let sessions = list_in(root).unwrap();
+        let by_name = |n: &str| sessions.iter().find(|s| s.name == n).unwrap();
+        assert!(by_name("rang").bell, "marker present -> bell");
+        assert!(!by_name("quiet").bell, "no marker -> no bell");
+
+        // Hold the lock fds until the assertions are done.
+        drop(rang_lock);
+        drop(quiet_lock);
     }
 
     #[test]
