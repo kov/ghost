@@ -199,6 +199,11 @@ fn install_app_actions(app: &adw::Application) {
 }
 
 fn build_window(app: &adw::Application) {
+    // macOS Dock-icon menu (right-click → New Window). Idempotent; needs GTK's
+    // NSApp delegate to exist, which it does by the time we build a window.
+    #[cfg(target_os = "macos")]
+    dock::install();
+
     let cfg = Settings::load();
     install_css();
 
@@ -1369,6 +1374,117 @@ fn install_meta_keys(term: &Terminal, session: &Rc<RefCell<Option<Session>>>) {
         glib::Propagation::Stop
     });
     term.add_controller(keys);
+}
+
+/// macOS Dock-icon menu integration.
+///
+/// GTK4 dropped the old `gtk-mac-integration` Dock-menu API and exposes no
+/// replacement — macOS only offers a custom Dock menu through the
+/// `applicationDockMenu:` method on the `NSApplication` delegate, which GTK owns.
+/// So we inject that method (and the action it invokes) into GTK's delegate class
+/// at runtime, leaving the rest of the delegate untouched. The single "New
+/// Window" item activates the existing `app.new-window` GAction, so it shares the
+/// exact code path as the menu's New Window and ⌘N.
+#[cfg(target_os = "macos")]
+mod dock {
+    use std::ffi::CStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use gtk4::gio;
+    use gtk4::gio::prelude::*;
+    use objc2::ffi::class_addMethod;
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::{class, msg_send, sel};
+
+    /// Returns the Dock menu AppKit asks for: one "New Window" item targeting the
+    /// delegate's injected `ghostNewWindow:`. Returned autoreleased, per the
+    /// `applicationDockMenu:` contract.
+    unsafe extern "C" fn application_dock_menu(
+        this: *mut AnyObject,
+        _cmd: Sel,
+        _app: *mut AnyObject,
+    ) -> *mut AnyObject {
+        unsafe {
+            let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: ns_string("New Window"),
+                action: sel!(ghostNewWindow:),
+                keyEquivalent: ns_string(""),
+            ];
+            let _: () = msg_send![item, setTarget: this];
+            let _: () = msg_send![menu, addItem: item];
+            let _: () = msg_send![item, release];
+            // `autorelease` returns the receiver; objc2 verifies the encoding, so
+            // it must be typed as an object, not `()`.
+            let menu: *mut AnyObject = msg_send![menu, autorelease];
+            menu
+        }
+    }
+
+    /// The Dock item's action: activate `app.new-window` on the running
+    /// GApplication, exactly as the in-app menu and ⌘N do.
+    unsafe extern "C" fn ghost_new_window(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+    ) {
+        if let Some(app) = gio::Application::default() {
+            app.activate_action("new-window", None);
+        }
+    }
+
+    /// An autoreleased `NSString` from `s`.
+    unsafe fn ns_string(s: &str) -> *mut AnyObject {
+        let c = std::ffi::CString::new(s).unwrap_or_default();
+        unsafe { msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()] }
+    }
+
+    unsafe fn add_method(cls: *mut AnyClass, sel: Sel, imp: Imp, types: &CStr) {
+        // Fails only when the method already exists (e.g. we ran twice) — fine.
+        unsafe {
+            let _ = class_addMethod(cls, sel, imp, types.as_ptr());
+        }
+    }
+
+    /// Inject the Dock-menu method into GTK's `NSApp` delegate. Retries on each
+    /// call until the delegate exists, then no-ops.
+    pub fn install() {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let delegate: *mut AnyObject = msg_send![app, delegate];
+            if delegate.is_null() {
+                return;
+            }
+            let cls: *mut AnyClass = msg_send![delegate, class];
+            add_method(
+                cls,
+                sel!(applicationDockMenu:),
+                std::mem::transmute::<
+                    unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut AnyObject,
+                    Imp,
+                >(application_dock_menu),
+                c"@@:@",
+            );
+            add_method(
+                cls,
+                sel!(ghostNewWindow:),
+                std::mem::transmute::<unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject), Imp>(
+                    ghost_new_window,
+                ),
+                c"v@:@",
+            );
+            DONE.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
