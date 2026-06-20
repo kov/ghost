@@ -1,11 +1,13 @@
 //! `ghost-gtk` — a simple native terminal on top of ghost.
 //!
-//! Sidebar-primary layout: an overlay sidebar lists the whole ghost session
-//! *fleet* (every session, not just ones open here), and the content area shows
-//! one session's terminal at a time. Picking a row attaches/shows that session;
-//! the trash button kills it (with confirmation); ＋ starts a new one. Each open
-//! session is a feed-only VTE widget driven by the headless [`Session`] client;
-//! closing the window detaches them all (they keep running, reattachable).
+//! A full-window "fleet" overlay slides down from the top (F9, or the bell button
+//! in the header) and lists the whole ghost session *fleet* (every session, not
+//! just ones open here); the content area shows one session's terminal at a time.
+//! Picking a row attaches/shows that session; the trash button kills it (with
+//! confirmation); ＋ starts a new one. The header bell button lights when a
+//! session has rung the terminal bell unseen. Each open session is a feed-only VTE
+//! widget driven by the headless [`Session`] client; closing the window detaches
+//! them all (they keep running, reattachable).
 //!
 //! Sessions are created in-process — `server::spawn` re-execs itself into the
 //! host, so spawning is safe from this multithreaded GTK process — and the child
@@ -115,7 +117,12 @@ fn group_of(open_here: bool, info: &SessionInfo) -> Group {
 #[derive(Clone)]
 struct Ui {
     window: adw::ApplicationWindow,
-    split: adw::OverlaySplitView,
+    /// The full-window fleet overlay (slides down from the top); replaces the old
+    /// side panel. Toggled by F9 and the header bell button.
+    revealer: gtk4::Revealer,
+    /// Header button that toggles the fleet overlay and lights (`.has-bell`) when
+    /// a session has an unseen terminal bell.
+    bell_button: gtk4::ToggleButton,
     stack: gtk4::Stack,
     list: gtk4::ListBox,
     content_title: adw::WindowTitle,
@@ -244,7 +251,9 @@ fn build_window(app: &adw::Application) {
     let cfg = Settings::load();
     install_css();
 
-    // Sidebar: a fleet list under a header with a New button.
+    // Fleet panel: the session list under a header with a New button. Shown as a
+    // full-window overlay that slides down from the top (see the revealer below),
+    // not a side panel. (Phase 2 swaps the list for a live grid.)
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -255,16 +264,19 @@ fn build_window(app: &adw::Application) {
         .build();
     let new_button = gtk4::Button::from_icon_name("list-add-symbolic");
     new_button.set_tooltip_text(Some("New session"));
-    let sidebar_header = adw::HeaderBar::new();
-    sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Sessions", "")));
-    sidebar_header.pack_start(&new_button);
-    let sidebar = adw::ToolbarView::new();
-    sidebar.add_top_bar(&sidebar_header);
-    sidebar.set_content(Some(&scroller));
+    let fleet_header = adw::HeaderBar::new();
+    fleet_header.set_title_widget(Some(&adw::WindowTitle::new("Sessions", "")));
+    fleet_header.pack_start(&new_button);
+    let fleet_panel = adw::ToolbarView::new();
+    fleet_panel.add_top_bar(&fleet_header);
+    fleet_panel.set_content(Some(&scroller));
     // Raised top bars get an opaque, libadwaita-managed background (with a proper
     // `:backdrop` variant) so the chrome stays solid over a transparent window —
     // even when unfocused. A flat bar would inherit the window's transparency.
-    sidebar.set_top_bar_style(adw::ToolbarStyle::Raised);
+    fleet_panel.set_top_bar_style(adw::ToolbarStyle::Raised);
+    // Opaque panel background so the revealed overlay fully covers the terminal
+    // beneath it even when the window is transparent (see `install_css`).
+    fleet_panel.add_css_class("ghost-fleet-panel");
 
     // Content: a stack of terminals, plus an empty-state page.
     let stack = gtk4::Stack::new();
@@ -276,19 +288,22 @@ fn build_window(app: &adw::Application) {
     let empty = adw::StatusPage::builder()
         .icon_name("utilities-terminal-symbolic")
         .title("No session open")
-        .description("Pick a session from the sidebar, or start a new one.")
+        .description("Pick a session from the fleet view, or start a new one.")
         .child(&empty_new)
         .build();
     empty.add_css_class("ghost-empty");
     stack.add_named(&empty, Some(EMPTY_PAGE));
 
-    let sidebar_toggle = gtk4::ToggleButton::new();
-    sidebar_toggle.set_icon_name("sidebar-show-symbolic");
-    sidebar_toggle.set_tooltip_text(Some("Show sessions"));
+    // Bell button (right side): toggles the fleet overlay and doubles as the
+    // notification indicator — it lights (`.has-bell`) when some session has rung
+    // the terminal bell unseen (see `update_bell_indicator`). `alarm-symbolic` is
+    // Adwaita's bell glyph.
+    let bell_button = gtk4::ToggleButton::new();
+    bell_button.set_icon_name("alarm-symbolic");
+    bell_button.set_tooltip_text(Some("Show sessions"));
     let content_title = adw::WindowTitle::new("ghost", "");
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&content_title));
-    content_header.pack_start(&sidebar_toggle);
     let menu = gio::Menu::new();
     menu.append(Some("New Window"), Some("app.new-window"));
     menu.append(Some("Preferences"), Some("win.preferences"));
@@ -298,33 +313,42 @@ fn build_window(app: &adw::Application) {
         .tooltip_text("Main menu")
         .build();
     content_header.pack_end(&menu_button);
+    content_header.pack_end(&bell_button);
     let content = adw::ToolbarView::new();
     content.add_top_bar(&content_header);
     content.set_content(Some(&stack));
     content.set_top_bar_style(adw::ToolbarStyle::Raised);
 
-    // Always-overlay split: the sidebar floats over (and dims) the terminal —
-    // "pops above" — rather than permanently splitting. The toggle shows/hides it.
-    //
-    // We want the sidebar to be a quarter of the window. When collapsed (always,
-    // here) libadwaita ignores `sidebar-width-fraction` and sizes the sidebar to
-    // `max-sidebar-width` — so there's no percentage knob; we drive that max to
-    // 25% of the live window width ourselves (in px, see `sync_sidebar_width`),
-    // with `SIDEBAR_MIN_PX` as a floor on narrow windows.
-    let split = adw::OverlaySplitView::builder()
-        .sidebar(&sidebar)
-        .content(&content)
-        .collapsed(true)
-        .sidebar_width_unit(adw::LengthUnit::Px)
-        .min_sidebar_width(SIDEBAR_MIN_PX)
+    // The fleet panel is a full-window overlay that animates down from the top over
+    // the terminal, rather than a side panel. A GtkRevealer (SlideDown) holds it; a
+    // GtkOverlay stacks it above the content. Collapsed, the revealer is 0×0 and
+    // passes input through to the terminal; revealed, it fills and covers the
+    // window.
+    let revealer = gtk4::Revealer::builder()
+        .child(&fleet_panel)
+        .transition_type(gtk4::RevealerTransitionType::SlideDown)
+        .transition_duration(250)
+        .reveal_child(false)
+        // Anchored to the top and sized (via the panel's height request, set after
+        // the window exists) to fill the window — NOT valign=Fill. A GtkRevealer
+        // animates the size it *requests*; an always-filled overlay child has no
+        // size to animate on dismiss, so it would slide down but snap shut instead
+        // of sliding back up.
+        .halign(gtk4::Align::Fill)
+        .valign(gtk4::Align::Start)
+        .hexpand(true)
         .build();
-    sidebar_toggle
-        .bind_property("active", &split, "show-sidebar")
+    // The bell button drives the reveal (and reflects it, so F9 keeps it in sync).
+    bell_button
+        .bind_property("active", &revealer, "reveal-child")
         .bidirectional()
         .sync_create()
         .build();
-    // Initial sidebar visibility is decided by the first `refresh()` below
-    // (open iff there are existing sessions to pick) — see `show_empty`.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&content));
+    overlay.add_overlay(&revealer);
+    // Initial fleet visibility is decided by the first `refresh()` below (revealed
+    // iff there are existing sessions to pick) — see `show_empty`.
 
     // Seed the window to roughly the configured columns×rows. The cell estimate
     // is approximate; VTE derives the real grid from the actual allocation.
@@ -336,13 +360,14 @@ fn build_window(app: &adw::Application) {
         .title("ghost")
         .default_width(grid_w + WINDOW_PAD_PX)
         .default_height(grid_h + HEADER_BAR_PX + WINDOW_PAD_PX)
-        .content(&split)
+        .content(&overlay)
         .build();
     update_window_chrome(&window, cfg.window.transparency);
 
     let ui = Ui {
         window: window.clone(),
-        split,
+        revealer,
+        bell_button,
         stack,
         list,
         content_title,
@@ -383,29 +408,19 @@ fn build_window(app: &adw::Application) {
             glib::Propagation::Proceed
         });
     }
-    // Keep the overlay sidebar at a quarter of the window as it resizes, plus an
-    // initial pass for the starting size.
+    // Size the fleet panel to the window so the top-sheet revealer slides it fully
+    // in and back out: with the panel anchored to the top (valign=Start), the size
+    // the revealer animates tracks the window via this height request. default-height
+    // follows live resizes, as the old sidebar-width tracking relied on.
     {
-        let split = ui.split.clone();
-        window.connect_default_width_notify(move |w| {
-            sync_sidebar_width(&split, w.default_width());
+        let panel = fleet_panel.clone();
+        window.connect_default_height_notify(move |w| {
+            panel.set_height_request(w.default_height());
         });
     }
-    sync_sidebar_width(&ui.split, window.default_width());
+    fleet_panel.set_height_request(window.default_height());
 
     window.present();
-}
-
-/// Floor for the overlay sidebar width (px), so it stays usable on narrow windows
-/// where a literal quarter would be too thin.
-const SIDEBAR_MIN_PX: f64 = 180.0;
-
-/// Size the always-collapsed overlay sidebar to a quarter of `width` (px), never
-/// below [`SIDEBAR_MIN_PX`]. Collapsed views take their width from
-/// `max-sidebar-width`, so that's the knob we drive.
-fn sync_sidebar_width(split: &adw::OverlaySplitView, width: i32) {
-    let quarter = 0.25 * f64::from(width);
-    split.set_max_sidebar_width(quarter.max(SIDEBAR_MIN_PX));
 }
 
 impl Ui {
@@ -469,15 +484,15 @@ impl Ui {
             .unwrap_or_else(|| name.to_string());
         self.content_title.set_title(&title);
         self.content_title.set_subtitle(name);
-        // Reveal the terminal: dismiss the overlay sidebar, then focus the
-        // terminal (deferred — see `focus_current_terminal`).
-        self.split.set_show_sidebar(false);
+        // Reveal the terminal: dismiss the fleet overlay, then focus the terminal
+        // (deferred — see `focus_current_terminal`).
+        self.revealer.set_reveal_child(false);
         self.focus_current_terminal();
     }
 
-    /// Focus the current session's terminal, deferred to idle so it lands AFTER
-    /// the overlay sidebar's own focus handling on collapse — done inline it would
-    /// be overridden, leaving focus on the sidebar toggle button.
+    /// Focus the current session's terminal, deferred to idle so it lands after
+    /// the fleet overlay finishes hiding — done inline, focus handling during the
+    /// unreveal could steal it back.
     fn focus_current_terminal(&self) {
         let ui = self.clone();
         glib::idle_add_local_once(move || {
@@ -489,23 +504,23 @@ impl Ui {
         });
     }
 
-    /// Toggle the overlay sidebar (F9). Opening focuses the session list for
-    /// keyboard navigation; closing returns focus to the current terminal.
-    fn toggle_sidebar(&self) {
-        let show = !self.split.shows_sidebar();
-        self.split.set_show_sidebar(show);
+    /// Toggle the fleet overlay (F9). Opening focuses the session list for keyboard
+    /// navigation; closing returns focus to the current terminal.
+    fn toggle_fleet(&self) {
+        let show = !self.revealer.reveals_child();
+        self.revealer.set_reveal_child(show);
         if show {
-            self.focus_sidebar_list();
+            self.focus_fleet_list();
         } else {
             self.focus_current_terminal();
         }
     }
 
-    /// Focus the sidebar's session list for keyboard navigation (F9 → arrows →
+    /// Focus the fleet's session list for keyboard navigation (F9 → arrows →
     /// Enter). Deferred to idle so it lands after the reveal maps the list, and it
     /// targets the selected (or first) row so the arrow keys have a cursor to move
     /// from and Enter activates a session.
-    fn focus_sidebar_list(&self) {
+    fn focus_fleet_list(&self) {
         let list = self.list.clone();
         glib::idle_add_local_once(move || {
             if let Some(row) = list.selected_row().or_else(|| list.row_at_index(0)) {
@@ -516,18 +531,18 @@ impl Ui {
         });
     }
 
-    /// Show the empty-state page (no session open). Reveal the sidebar so an
-    /// existing session can be picked — but only when the fleet is non-empty.
-    /// With no sessions at all, the (empty) sidebar would just cover the
-    /// empty-state "New session" button, so leave it dismissed and let that
-    /// button be the call to action.
+    /// Show the empty-state page (no session open). Reveal the fleet overlay so an
+    /// existing session can be picked — but only when the fleet is non-empty. With
+    /// no sessions at all, the (empty) overlay would just cover the empty-state
+    /// "New session" button, so leave it dismissed and let that button be the call
+    /// to action.
     fn show_empty(&self) {
         self.stack.set_visible_child_name(EMPTY_PAGE);
         *self.current.borrow_mut() = None;
         self.content_title.set_title("ghost");
         self.content_title.set_subtitle("");
         let has_sessions = session::list().is_ok_and(|s| !s.is_empty());
-        self.split.set_show_sidebar(has_sessions);
+        self.revealer.set_reveal_child(has_sessions);
     }
 
     /// Create a brand-new session (deferred start) and open it.
@@ -676,6 +691,9 @@ impl Ui {
     /// (so the 2s tick is usually a no-op and never steals the selection).
     fn refresh(&self) {
         let mut sessions = session::list().unwrap_or_default();
+        // The bell indicator follows the live fleet every tick, independent of the
+        // row-rebuild short-circuit below (a pure bell change need not redraw rows).
+        self.update_bell_indicator(&sessions);
         let current = self.current.borrow().clone();
         // Order by group (this window, then elsewhere, then detached). The sort is
         // stable and `list` already returns name-sorted, so rows stay alphabetical
@@ -725,7 +743,20 @@ impl Ui {
         }
     }
 
-    /// Build one sidebar row: title (terminal title) over `name · created`, a dot
+    /// Light the header bell button when some session has an unseen terminal bell,
+    /// so the notification is visible without opening the fleet overlay.
+    fn update_bell_indicator(&self, sessions: &[SessionInfo]) {
+        if fleet_has_unseen_bell(sessions) {
+            self.bell_button.add_css_class("has-bell");
+            self.bell_button
+                .set_tooltip_text(Some("Sessions — a terminal rang the bell"));
+        } else {
+            self.bell_button.remove_css_class("has-bell");
+            self.bell_button.set_tooltip_text(Some("Show sessions"));
+        }
+    }
+
+    /// Build one fleet row: title (terminal title) over `name · created`, a dot
     /// marking the session shown in this window, and a kill button. The group it
     /// sits under (see [`install_group_headers`]) says whether it is open here,
     /// elsewhere, or detached.
@@ -1152,7 +1183,7 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
         ("zoom-in", Box::new(|ui| ui.zoom(settings::zoom_in))),
         ("zoom-out", Box::new(|ui| ui.zoom(settings::zoom_out))),
         ("zoom-reset", Box::new(Ui::zoom_reset)),
-        ("toggle-sidebar", Box::new(Ui::toggle_sidebar)),
+        ("toggle-fleet", Box::new(Ui::toggle_fleet)),
         ("next-tab", Box::new(|ui| ui.switch_terminal(true))),
         ("previous-tab", Box::new(|ui| ui.switch_terminal(false))),
     ];
@@ -1170,7 +1201,7 @@ fn install_actions(ui: &Ui, app: &adw::Application) {
     );
     app.set_accels_for_action("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]);
     app.set_accels_for_action("win.zoom-reset", &["<Primary>0"]);
-    app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+    app.set_accels_for_action("win.toggle-fleet", &["F9"]);
     // New session — Cmd+T on macOS, Ctrl+T on Linux (the conventional new-tab key).
     app.set_accels_for_action("win.new-session", &[&primary_accel("t", false)]);
     // Close the window — Cmd+Shift+W on macOS, Ctrl+Shift+W on Linux.
@@ -1221,6 +1252,19 @@ fn install_css() {
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
         });
+        // Static (never-rewritten) rules: the fleet overlay's opaque background and
+        // the bell button's unseen-bell tint. Kept on a separate provider from the
+        // transparency one, whose contents are swapped at runtime.
+        let static_css = gtk4::CssProvider::new();
+        static_css.load_from_string(
+            ".ghost-fleet-panel { background-color: @window_bg_color; }\n\
+             button.has-bell { color: @accent_color; }\n",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &static_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     });
 }
 
@@ -1244,6 +1288,12 @@ fn update_window_chrome(window: &adw::ApplicationWindow, transparency: f64) {
             window.remove_css_class("ghost-transparent");
         }
     });
+}
+
+/// Whether any session in the fleet has an unseen terminal bell — the signal that
+/// lights the header bell button.
+fn fleet_has_unseen_bell(sessions: &[SessionInfo]) -> bool {
+    sessions.iter().any(|s| s.bell)
 }
 
 /// The index to move to when cycling `count` items: the one after `current` when
@@ -1600,6 +1650,22 @@ mod tests {
             attached,
             bell: false,
         }
+    }
+
+    #[test]
+    fn fleet_has_unseen_bell_is_true_iff_some_session_rang() {
+        use super::fleet_has_unseen_bell;
+        assert!(!fleet_has_unseen_bell(&[]), "empty fleet has no bell");
+        assert!(
+            !fleet_has_unseen_bell(&[info("a", false), info("b", true)]),
+            "no session rang -> no bell"
+        );
+        let mut rang = info("c", false);
+        rang.bell = true;
+        assert!(
+            fleet_has_unseen_bell(&[info("a", false), rang]),
+            "one session rang -> bell"
+        );
     }
 
     #[test]
