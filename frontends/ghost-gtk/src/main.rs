@@ -196,6 +196,17 @@ fn install_app_actions(app: &adw::Application) {
     }
     app.add_action(&new_window);
     app.set_accels_for_action("app.new-window", &[&primary_accel("n", false)]);
+
+    // Quit. The standard macOS app-menu Quit item targets `app.quit`; without
+    // the action registered the item (and Cmd-Q) is disabled. Cmd-Q on macOS,
+    // Ctrl-Q on Linux.
+    let quit = gio::SimpleAction::new("quit", None);
+    {
+        let app = app.clone();
+        quit.connect_activate(move |_, _| app.quit());
+    }
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &[&primary_accel("q", false)]);
 }
 
 fn build_window(app: &adw::Application) {
