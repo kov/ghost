@@ -217,12 +217,20 @@ fn install_app_actions(app: &adw::Application) {
         action.connect_activate(move |_, _| cycle_app_windows(&app_cb, forward));
         app.add_action(&action);
     }
+    // The backtick key reports `grave` on most layouts but `dead_grave` where it's
+    // a dead key (e.g. Brazilian/ABNT) — bind both. Likewise the shifted forms for
+    // the backward cycle.
     #[cfg(target_os = "macos")]
     {
-        app.set_accels_for_action("app.next-window", &["<Meta>grave"]);
+        app.set_accels_for_action("app.next-window", &["<Meta>grave", "<Meta>dead_grave"]);
         app.set_accels_for_action(
             "app.previous-window",
-            &["<Meta>asciitilde", "<Meta><Shift>grave"],
+            &[
+                "<Meta>asciitilde",
+                "<Meta>dead_tilde",
+                "<Meta><Shift>grave",
+                "<Meta><Shift>dead_grave",
+            ],
         );
     }
 }
