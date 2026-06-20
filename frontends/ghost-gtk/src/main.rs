@@ -279,10 +279,18 @@ fn build_window(app: &adw::Application) {
 
     // Always-overlay split: the sidebar floats over (and dims) the terminal —
     // "pops above" — rather than permanently splitting. The toggle shows/hides it.
+    //
+    // We want the sidebar to be a quarter of the window. When collapsed (always,
+    // here) libadwaita ignores `sidebar-width-fraction` and sizes the sidebar to
+    // `max-sidebar-width` — so there's no percentage knob; we drive that max to
+    // 25% of the live window width ourselves (in px, see `sync_sidebar_width`),
+    // with `SIDEBAR_MIN_PX` as a floor on narrow windows.
     let split = adw::OverlaySplitView::builder()
         .sidebar(&sidebar)
         .content(&content)
         .collapsed(true)
+        .sidebar_width_unit(adw::LengthUnit::Px)
+        .min_sidebar_width(SIDEBAR_MIN_PX)
         .build();
     sidebar_toggle
         .bind_property("active", &split, "show-sidebar")
@@ -349,7 +357,29 @@ fn build_window(app: &adw::Application) {
             glib::Propagation::Proceed
         });
     }
+    // Keep the overlay sidebar at a quarter of the window as it resizes, plus an
+    // initial pass for the starting size.
+    {
+        let split = ui.split.clone();
+        window.connect_default_width_notify(move |w| {
+            sync_sidebar_width(&split, w.default_width());
+        });
+    }
+    sync_sidebar_width(&ui.split, window.default_width());
+
     window.present();
+}
+
+/// Floor for the overlay sidebar width (px), so it stays usable on narrow windows
+/// where a literal quarter would be too thin.
+const SIDEBAR_MIN_PX: f64 = 180.0;
+
+/// Size the always-collapsed overlay sidebar to a quarter of `width` (px), never
+/// below [`SIDEBAR_MIN_PX`]. Collapsed views take their width from
+/// `max-sidebar-width`, so that's the knob we drive.
+fn sync_sidebar_width(split: &adw::OverlaySplitView, width: i32) {
+    let quarter = 0.25 * f64::from(width);
+    split.set_max_sidebar_width(quarter.max(SIDEBAR_MIN_PX));
 }
 
 impl Ui {
