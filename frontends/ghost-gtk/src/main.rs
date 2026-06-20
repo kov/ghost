@@ -207,6 +207,24 @@ fn install_app_actions(app: &adw::Application) {
     }
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &[&primary_accel("q", false)]);
+
+    // Cycle terminal windows. macOS convention: Cmd-` forward, Cmd-Shift-`
+    // (a tilde) backward. Bound on macOS only — elsewhere window cycling is the
+    // window manager's job.
+    for (name, forward) in [("next-window", true), ("previous-window", false)] {
+        let action = gio::SimpleAction::new(name, None);
+        let app_cb = app.clone();
+        action.connect_activate(move |_, _| cycle_app_windows(&app_cb, forward));
+        app.add_action(&action);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app.set_accels_for_action("app.next-window", &["<Meta>grave"]);
+        app.set_accels_for_action(
+            "app.previous-window",
+            &["<Meta>asciitilde", "<Meta><Shift>grave"],
+        );
+    }
 }
 
 fn build_window(app: &adw::Application) {
@@ -1220,24 +1238,46 @@ fn update_window_chrome(window: &adw::ApplicationWindow, transparency: f64) {
     });
 }
 
+/// The index to move to when cycling `count` items: the one after `current` when
+/// `forward`, else before, wrapping around either end. Returns `None` when there
+/// are fewer than two items. A missing `current` starts from the first.
+fn cycle_index(count: usize, current: Option<usize>, forward: bool) -> Option<usize> {
+    if count < 2 {
+        return None;
+    }
+    let idx = current.unwrap_or(0);
+    Some(if forward {
+        (idx + 1) % count
+    } else {
+        (idx + count - 1) % count
+    })
+}
+
 /// The session to switch to when cycling the attached terminals: the next entry
 /// in `names` when `forward`, else the previous, wrapping around either end.
 /// `current` is the visible session. Returns `None` when there's nothing to
 /// switch to (fewer than two attached). An unknown/missing `current` starts from
 /// the first entry.
 fn cycle_target(names: &[String], current: Option<&str>, forward: bool) -> Option<String> {
-    if names.len() < 2 {
-        return None;
+    let current = current.and_then(|c| names.iter().position(|n| n == c));
+    cycle_index(names.len(), current, forward).map(|i| names[i].clone())
+}
+
+/// Raise the next (or previous) terminal window, wrapping around — the macOS
+/// Cmd-` "cycle windows" gesture. Only the main terminal windows take part; the
+/// preferences window (an `adw::Window`, not `ApplicationWindow`) is skipped.
+fn cycle_app_windows(app: &adw::Application, forward: bool) {
+    let windows: Vec<gtk4::Window> = app
+        .windows()
+        .into_iter()
+        .filter(|w| w.is::<adw::ApplicationWindow>())
+        .collect();
+    let current = app
+        .active_window()
+        .and_then(|active| windows.iter().position(|w| *w == active));
+    if let Some(next) = cycle_index(windows.len(), current, forward) {
+        windows[next].present();
     }
-    let idx = current
-        .and_then(|c| names.iter().position(|n| n == c))
-        .unwrap_or(0);
-    let next = if forward {
-        (idx + 1) % names.len()
-    } else {
-        (idx + names.len() - 1) % names.len()
-    };
-    Some(names[next].clone())
 }
 
 /// Whether a button press on the terminal should start a window move rather than
@@ -1531,8 +1571,8 @@ mod dock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardAction, Group, clipboard_action, cycle_target, group_of, is_window_move_drag,
-        meta_input_bytes, next_session_name,
+        ClipboardAction, Group, clipboard_action, cycle_index, cycle_target, group_of,
+        is_window_move_drag, meta_input_bytes, next_session_name,
     };
     use ghost_vt::session::SessionInfo;
     use gtk4::gdk;
@@ -1738,5 +1778,17 @@ mod tests {
         let n = names(&["a", "b"]);
         assert_eq!(cycle_target(&n, Some("gone"), true).as_deref(), Some("b"));
         assert_eq!(cycle_target(&n, None, true).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn cycle_index_wraps_both_ways_and_needs_two() {
+        // Forward and backward wrap around (used for both tabs and windows).
+        assert_eq!(cycle_index(3, Some(2), true), Some(0));
+        assert_eq!(cycle_index(3, Some(0), false), Some(2));
+        // A missing current starts from the first (so forward lands on index 1).
+        assert_eq!(cycle_index(3, None, true), Some(1));
+        // Fewer than two: nothing to cycle to.
+        assert_eq!(cycle_index(1, Some(0), true), None);
+        assert_eq!(cycle_index(0, None, true), None);
     }
 }
