@@ -354,6 +354,7 @@ impl Ui {
             install_clipboard_keys(&terminal);
             install_window_move_drag(&terminal);
             let session = Rc::new(RefCell::new(Some(session)));
+            install_meta_keys(&terminal, &session);
             {
                 // commit -> session input (keys, mouse, paste, query replies).
                 let session = session.clone();
@@ -1255,36 +1256,127 @@ fn install_window_move_drag(term: &Terminal) {
     term.add_controller(click);
 }
 
-/// Copy/paste shortcuts VTE doesn't bind itself: Alt+C/V (consistent across mac
-/// and linux) and Ctrl-Shift-C/V. Capture phase + Stop so Alt+v is a paste, not
-/// a Meta-v keystroke sent to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardAction {
+    Copy,
+    Paste,
+}
+
+/// The clipboard action a key chord triggers, or `None` if it isn't one. The
+/// shortcuts VTE doesn't bind itself: Ctrl-Shift-C/V everywhere, plus the
+/// platform's primary clipboard modifier — Command on macOS (⌘ → `META_MASK` on
+/// the GDK macOS backend, like the window-move gesture) and Alt elsewhere. On
+/// macOS Option is *Meta* (see [`meta_input_bytes`]), not a clipboard key.
+fn clipboard_action(keyval: gdk::Key, state: gdk::ModifierType) -> Option<ClipboardAction> {
+    let ctrl_shift = state.contains(gdk::ModifierType::CONTROL_MASK)
+        && state.contains(gdk::ModifierType::SHIFT_MASK);
+    let primary = if cfg!(target_os = "macos") {
+        state.contains(gdk::ModifierType::META_MASK)
+    } else {
+        state.contains(gdk::ModifierType::ALT_MASK)
+    };
+    if !(ctrl_shift || primary) {
+        return None;
+    }
+    if keyval == gdk::Key::c || keyval == gdk::Key::C {
+        return Some(ClipboardAction::Copy);
+    }
+    if keyval == gdk::Key::v || keyval == gdk::Key::V {
+        return Some(ClipboardAction::Paste);
+    }
+    None
+}
+
+/// The bytes an Option/Alt-modified key sends to the session when we treat Option
+/// as Meta, or `None` to let the key reach VTE untouched.
+///
+/// macOS' GDK backend delivers Option as a bare Alt modifier without the
+/// ESC-prefix a terminal needs, so we synthesize it. The nav/edit keys get their
+/// conventional sequences on every platform — `Option+←/→` word-motion (`M-b` /
+/// `M-f`) and `Option+Backspace/Delete` word-kill (`M-BS` ESC DEL / `M-d`; on the
+/// Mac "delete" is Backspace and forward-delete arrives as `Delete`). On macOS
+/// every other `Option+<printable>` also becomes `ESC <char>`, so the whole
+/// readline Meta family (`M-.`, `M-u`, `M-y`, …) works from one rule instead of a
+/// per-binding list; this is what "Use Option as Meta key" does in Terminal.app,
+/// at the cost of typing Option special characters. Elsewhere VTE already
+/// ESC-prefixes Alt itself, so only the nav keys are remapped.
+fn meta_input_bytes(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
+    if !state.contains(gdk::ModifierType::ALT_MASK) {
+        return None;
+    }
+    let nav: Option<&[u8]> = if keyval == gdk::Key::Left {
+        Some(b"\x1bb")
+    } else if keyval == gdk::Key::Right {
+        Some(b"\x1bf")
+    } else if keyval == gdk::Key::BackSpace {
+        Some(b"\x1b\x7f")
+    } else if keyval == gdk::Key::Delete {
+        Some(b"\x1bd")
+    } else {
+        None
+    };
+    if let Some(seq) = nav {
+        return Some(seq.to_vec());
+    }
+    // Generic Option-as-Meta for printables — macOS only (elsewhere VTE does it),
+    // and never when Control is also held (that's a distinct chord for VTE).
+    if cfg!(target_os = "macos")
+        && !state.contains(gdk::ModifierType::CONTROL_MASK)
+        && let Some(ch) = keyval.to_unicode()
+        && !ch.is_control()
+    {
+        let mut buf = vec![0x1b];
+        let mut tmp = [0u8; 4];
+        buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+        return Some(buf);
+    }
+    None
+}
+
+/// Copy/paste shortcuts VTE doesn't bind itself (see [`clipboard_action`]).
+/// Capture phase + Stop so Alt+v is a paste, not a Meta-v keystroke sent to the
+/// session.
 fn install_clipboard_keys(term: &Terminal) {
     let keys = EventControllerKey::new();
     keys.set_propagation_phase(PropagationPhase::Capture);
     let term_keys = term.clone();
     keys.connect_key_pressed(move |_ctrl, keyval, _code, state| {
-        let alt = state.contains(gdk::ModifierType::ALT_MASK);
-        let ctrl_shift = state.contains(gdk::ModifierType::CONTROL_MASK)
-            && state.contains(gdk::ModifierType::SHIFT_MASK);
-        if !(alt || ctrl_shift) {
+        match clipboard_action(keyval, state) {
+            Some(ClipboardAction::Copy) => term_keys.copy_clipboard_format(Format::Text),
+            Some(ClipboardAction::Paste) => term_keys.paste_clipboard(),
+            None => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    term.add_controller(keys);
+}
+
+/// Option-as-Meta key handling (see [`meta_input_bytes`]). The terminal is
+/// feed-only, so we send the escape sequence to the session ourselves; capture
+/// phase + Stop keeps VTE from turning Option into a composed character or a bare
+/// Meta keystroke.
+fn install_meta_keys(term: &Terminal, session: &Rc<RefCell<Option<Session>>>) {
+    let keys = EventControllerKey::new();
+    keys.set_propagation_phase(PropagationPhase::Capture);
+    let session = session.clone();
+    keys.connect_key_pressed(move |_ctrl, keyval, _code, state| {
+        let Some(bytes) = meta_input_bytes(keyval, state) else {
             return glib::Propagation::Proceed;
+        };
+        if let Some(s) = session.borrow_mut().as_mut() {
+            let _ = s.send_input(&bytes);
         }
-        if keyval == gdk::Key::c || keyval == gdk::Key::C {
-            term_keys.copy_clipboard_format(Format::Text);
-            return glib::Propagation::Stop;
-        }
-        if keyval == gdk::Key::v || keyval == gdk::Key::V {
-            term_keys.paste_clipboard();
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
+        glib::Propagation::Stop
     });
     term.add_controller(keys);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, cycle_target, group_of, is_window_move_drag, next_session_name};
+    use super::{
+        ClipboardAction, Group, clipboard_action, cycle_target, group_of, is_window_move_drag,
+        meta_input_bytes, next_session_name,
+    };
     use ghost_vt::session::SessionInfo;
     use gtk4::gdk;
     use gtk4::gdk::ModifierType as M;
@@ -1318,6 +1410,73 @@ mod tests {
         }
         // The whole point: never Control for these on macOS.
         assert!(!primary_accel("n", false).contains("<Control>"));
+    }
+
+    #[test]
+    fn clipboard_shortcuts_match_platform_modifier() {
+        // Ctrl-Shift-C/V copy & paste on every platform.
+        assert_eq!(
+            clipboard_action(gdk::Key::C, M::CONTROL_MASK | M::SHIFT_MASK),
+            Some(ClipboardAction::Copy)
+        );
+        assert_eq!(
+            clipboard_action(gdk::Key::v, M::CONTROL_MASK | M::SHIFT_MASK),
+            Some(ClipboardAction::Paste)
+        );
+        // Bare Ctrl+C is not a copy — it must reach the session as ^C.
+        assert_eq!(clipboard_action(gdk::Key::c, M::CONTROL_MASK), None);
+        // Plain c with no modifier is just typing.
+        assert_eq!(clipboard_action(gdk::Key::c, M::empty()), None);
+
+        // The primary clipboard modifier is Command on macOS (Option is Meta
+        // there, not a clipboard key) and Alt elsewhere.
+        let cmd_c = clipboard_action(gdk::Key::c, M::META_MASK);
+        let alt_c = clipboard_action(gdk::Key::c, M::ALT_MASK);
+        if cfg!(target_os = "macos") {
+            assert_eq!(cmd_c, Some(ClipboardAction::Copy));
+            assert_eq!(alt_c, None);
+        } else {
+            assert_eq!(alt_c, Some(ClipboardAction::Copy));
+            assert_eq!(cmd_c, None);
+        }
+    }
+
+    #[test]
+    fn option_nav_keys_send_readline_word_sequences() {
+        // Word motion (M-b/M-f) and word kill (M-BS/M-d) — on every platform.
+        assert_eq!(
+            meta_input_bytes(gdk::Key::Left, M::ALT_MASK).as_deref(),
+            Some(b"\x1bb".as_slice())
+        );
+        assert_eq!(
+            meta_input_bytes(gdk::Key::Right, M::ALT_MASK).as_deref(),
+            Some(b"\x1bf".as_slice())
+        );
+        assert_eq!(
+            meta_input_bytes(gdk::Key::BackSpace, M::ALT_MASK).as_deref(),
+            Some(b"\x1b\x7f".as_slice())
+        );
+        assert_eq!(
+            meta_input_bytes(gdk::Key::Delete, M::ALT_MASK).as_deref(),
+            Some(b"\x1bd".as_slice())
+        );
+        // Without Option/Alt they're ordinary keys — let VTE handle them.
+        assert_eq!(meta_input_bytes(gdk::Key::Left, M::empty()), None);
+        assert_eq!(meta_input_bytes(gdk::Key::BackSpace, M::empty()), None);
+    }
+
+    #[test]
+    fn option_letter_is_meta_on_macos_only() {
+        // The whole readline Meta family flows from one rule: Option+b -> ESC b
+        // (M-b). On macOS only — elsewhere VTE ESC-prefixes Alt itself.
+        let got = meta_input_bytes(gdk::Key::b, M::ALT_MASK);
+        if cfg!(target_os = "macos") {
+            assert_eq!(got.as_deref(), Some(b"\x1bb".as_slice()));
+        } else {
+            assert_eq!(got, None);
+        }
+        // Plain b is always just typing.
+        assert_eq!(meta_input_bytes(gdk::Key::b, M::empty()), None);
     }
 
     #[test]
