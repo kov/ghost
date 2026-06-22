@@ -681,6 +681,11 @@ impl Terminal {
         self.cursor_keys_mode == CursorKeysMode::Application
     }
 
+    /// Whether a tracked non-display mode (mouse/focus/paste) is enabled.
+    pub(crate) fn mode_enabled(&self, mode: DecMode) -> bool {
+        self.tracked_modes.contains(&mode)
+    }
+
     pub fn title(&self) -> &str {
         &self.title
     }

@@ -1,6 +1,21 @@
 use crate::line::Line;
-use crate::parser::{self, Parser};
+use crate::parser::{self, DecMode, Parser};
 use crate::terminal::{Cursor, Terminal};
+
+/// The active mouse-reporting protocol (DEC private modes 1000/1002/1003),
+/// which governs whether — and for which events — a frontend should send mouse
+/// reports to the child. Independent of the coordinate encoding ([`Vt::mouse_sgr`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// No mouse reporting (the default).
+    Off,
+    /// 1000 (X11): button press and release only.
+    Press,
+    /// 1002: press/release plus motion while a button is held (drag).
+    ButtonDrag,
+    /// 1003: press/release plus all pointer motion.
+    AnyMotion,
+}
 
 #[derive(Debug)]
 pub struct Vt {
@@ -79,6 +94,35 @@ impl Vt {
 
     pub fn cursor_key_app_mode(&self) -> bool {
         self.terminal.cursor_keys_app_mode()
+    }
+
+    /// The active mouse-reporting protocol (DEC modes 1000/1002/1003). When more
+    /// than one is somehow enabled, the most permissive wins.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        if self.terminal.mode_enabled(DecMode::MouseReportAny) {
+            MouseProtocol::AnyMotion
+        } else if self.terminal.mode_enabled(DecMode::MouseReportButton) {
+            MouseProtocol::ButtonDrag
+        } else if self.terminal.mode_enabled(DecMode::MouseReportX11) {
+            MouseProtocol::Press
+        } else {
+            MouseProtocol::Off
+        }
+    }
+
+    /// Whether SGR extended mouse coordinates (DEC mode 1006) are enabled.
+    pub fn mouse_sgr(&self) -> bool {
+        self.terminal.mode_enabled(DecMode::MouseSgr)
+    }
+
+    /// Whether focus in/out reporting (DEC mode 1004) is enabled.
+    pub fn focus_report(&self) -> bool {
+        self.terminal.mode_enabled(DecMode::FocusReport)
+    }
+
+    /// Whether bracketed paste (DEC mode 2004) is enabled.
+    pub fn bracketed_paste(&self) -> bool {
+        self.terminal.mode_enabled(DecMode::BracketedPaste)
     }
 
     pub fn dump(&self) -> String {
@@ -257,6 +301,38 @@ mod tests {
         vt2.feed_str(&vt1.dump());
 
         assert_vts_eq(&vt1, &vt2);
+    }
+
+    #[test]
+    fn exposes_input_relevant_modes() {
+        use super::MouseProtocol;
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
+        assert!(!vt.mouse_sgr());
+        assert!(!vt.focus_report());
+        assert!(!vt.bracketed_paste());
+
+        // An app turns on X11 mouse, SGR coords, focus, and bracketed paste.
+        vt.feed_str("\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
+        assert!(vt.mouse_sgr());
+        assert!(vt.focus_report());
+        assert!(vt.bracketed_paste());
+
+        // Any-motion (1003) wins over X11 (1000); button-event (1002) sits between.
+        vt.feed_str("\x1b[?1003h");
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::AnyMotion);
+        vt.feed_str("\x1b[?1003l");
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
+        vt.feed_str("\x1b[?1002h");
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::ButtonDrag);
+
+        // Everything off again.
+        vt.feed_str("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l");
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
+        assert!(!vt.mouse_sgr());
+        assert!(!vt.focus_report());
+        assert!(!vt.bracketed_paste());
     }
 
     #[test]
