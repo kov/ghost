@@ -13,7 +13,7 @@ use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 use winit::keyboard::{Key, ModifiersState};
 
-use crate::encode;
+use crate::{encode, mouse};
 
 /// Outcome of draining pending session output.
 pub struct Pumped {
@@ -69,6 +69,41 @@ impl SessionView {
             self.session.send_input(&bytes)?;
         }
         Ok(())
+    }
+
+    /// Report a mouse event to the child, gated on its active mouse mode.
+    /// `col`/`row` are 1-based cells; `held` says a button is currently down.
+    pub fn mouse(
+        &mut self,
+        kind: mouse::Kind,
+        button: Option<mouse::Button>,
+        held: bool,
+        col: u16,
+        row: u16,
+        mods: ModifiersState,
+    ) -> io::Result<()> {
+        let proto = self.screen.vt().mouse_protocol();
+        let sgr = self.screen.vt().mouse_sgr();
+        if let Some(bytes) = mouse::encode(proto, sgr, kind, button, held, col, row, mods) {
+            self.session.send_input(&bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Report a focus change if the child enabled focus reporting (DEC 1004).
+    pub fn focus(&mut self, focused: bool) -> io::Result<()> {
+        if self.screen.vt().focus_report() {
+            let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            self.session.send_input(seq)?;
+        }
+        Ok(())
+    }
+
+    /// Send pasted text, wrapping it in bracketed-paste markers when the child
+    /// enabled DEC mode 2004 so it can tell a paste from typing.
+    pub fn paste(&mut self, text: &str) -> io::Result<()> {
+        let bytes = bracket_paste(text.as_bytes(), self.screen.vt().bracketed_paste());
+        self.session.send_input(&bytes)
     }
 
     /// Tell the host the grid changed (no-op if unchanged or degenerate).
@@ -129,9 +164,29 @@ pub fn query_replies(
     out
 }
 
+/// Wrap pasted bytes in bracketed-paste markers (`ESC[200~` … `ESC[201~`) when
+/// the terminal enabled DEC mode 2004; otherwise pass them through unchanged.
+/// Pure, so the paste wiring is unit-testable.
+pub fn bracket_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(text);
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_wraps_only_when_enabled() {
+        assert_eq!(bracket_paste(b"hi", false), b"hi");
+        assert_eq!(bracket_paste(b"hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
+    }
 
     #[test]
     fn answers_cursor_position_query() {

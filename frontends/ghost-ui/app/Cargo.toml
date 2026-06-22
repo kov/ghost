@@ -15,10 +15,12 @@ ghost-renderer = { path = "../renderer" }
 ghost-render = { path = "../../../ghost-render" }
 ghost-shaper = { path = "../shaper" }
 ghost-vt = { path = "../../../ghost-vt" }
+ghost-term = { path = "../../../ghost-term" }
 winit = "0.30"
 wgpu = "29"
 pollster = "0.4"
 png = "0.18"
+arboard = { version = "3.6", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tempfile = "3"

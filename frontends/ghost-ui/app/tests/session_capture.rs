@@ -48,3 +48,31 @@ fn captures_a_real_session_to_a_png() {
         .count();
     assert!(lit > 50, "rendered image looks blank ({lit} lit pixels)");
 }
+
+#[test]
+fn feeds_input_and_sees_it_echoed() {
+    // Drive the input path end to end: the binary attaches to a `cat` session,
+    // sends bytes via SessionView::send_input, and `cat` (plus the PTY echo)
+    // round-trips them onto the screen.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("run");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let png = tmp.path().join("out.png");
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("GHOST_CAPTURE", &png)
+        .env("GHOST_CMD", "cat")
+        .env("GHOST_FEED", "ROUNDTRIP-42\r");
+    if Path::new(LAVAPIPE).exists() {
+        cmd.env("VK_ICD_FILENAMES", LAVAPIPE);
+    }
+    let out = cmd.output().expect("run ghost-ui");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success(), "ghost-ui capture failed:\n{stderr}");
+    assert!(
+        stderr.contains("ROUNDTRIP-42"),
+        "fed input was not echoed onto the screen:\n{stderr}"
+    );
+}
