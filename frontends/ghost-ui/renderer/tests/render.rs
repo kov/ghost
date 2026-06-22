@@ -35,21 +35,58 @@ fn px(img: &Rendered, x: u32, y: u32) -> [u8; 4] {
     ]
 }
 
+/// Count pixels in a cell-column band [x0, x1) over the full row height that
+/// satisfy `pred`, plus the total scanned.
+fn band<F: Fn([u8; 4]) -> bool>(img: &Rendered, x0: u32, x1: u32, pred: F) -> (usize, usize) {
+    let mut hits = 0;
+    let mut total = 0;
+    for x in x0..x1 {
+        for y in 0..18 {
+            total += 1;
+            if pred(px(img, x, y)) {
+                hits += 1;
+            }
+        }
+    }
+    (hits, total)
+}
+
+fn strong_red(p: [u8; 4]) -> bool {
+    p[0] > 90 && p[1] < 60 && p[2] < 60
+}
+fn strong_blue(p: [u8; 4]) -> bool {
+    p[2] > 100 && p[0] < 60 && p[1] < 60
+}
+
 #[test]
 fn renders_ligature_line_to_image() {
-    let mut vt = Vt::new(40, 3);
-    // != && => -> are all Fira Code ligatures.
-    vt.feed_str("fn ok() { a != b && c => d } // -> go");
-
-    let frame = layout_frame(&vt, METRICS);
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    // The headline claim: Fira Code substitutes "!=" into a single ligature
+    // glyph rather than rendering '!' then '='. Prove it at the shaper level so
+    // the pixels below are actually drawing a ligature.
+    let shaped: Vec<u16> = ghost_shaper::shape(font, "!=", 15.0)
+        .iter()
+        .map(|g| g.id)
+        .collect();
+    let naive = vec![
+        ghost_shaper::glyph_id(font, '!'),
+        ghost_shaper::glyph_id(font, '='),
+    ];
+    assert_ne!(
+        shaped, naive,
+        "Fira Code should substitute != into a ligature"
+    );
+
+    let mut vt = Vt::new(40, 3);
+    vt.feed_str("fn ok() { a != b && c => d } // -> go");
+    let frame = layout_frame(&vt, METRICS);
     let img = render_frame(&frame, font, 15.0, Theme::default());
 
     assert_eq!(img.width, 360, "40 cols * 9px advance");
     assert_eq!(img.height, 54, "3 rows * 18px line height");
     assert_eq!(img.rgba.len() as u32, img.width * img.height * 4);
 
-    // Something legible was drawn: many pixels differ from the dark theme bg.
     let bg = [16i32, 16, 18];
     let lit = img
         .rgba
@@ -71,9 +108,10 @@ fn renders_ligature_line_to_image() {
 
 #[test]
 fn resolves_ansi_colors_and_backgrounds() {
-    // "AB" in ANSI red fg, then a blank, then "CD" on an ANSI blue background.
+    // Hide the cursor (?25l) so a cursor block can't perturb the sampled bands,
+    // then: "AB" red fg, a blank, "CD" on a blue background.
     let mut vt = Vt::new(40, 1);
-    vt.feed_str("\x1b[31mAB\x1b[0m \x1b[44mCD\x1b[0m");
+    vt.feed_str("\x1b[?25l\x1b[31mAB\x1b[0m \x1b[44mCD\x1b[0m");
 
     let frame = layout_frame(&vt, METRICS);
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
@@ -81,19 +119,45 @@ fn resolves_ansi_colors_and_backgrounds() {
     let path = write_png("ghost_color_sample.png", &img);
     eprintln!("WROTE PNG: {}", path.display());
 
-    // Red foreground glyphs (cols 0..1 -> x in 0..18). ANSI red is ~[128,0,0];
-    // glyph strokes should show a clearly red pixel.
-    let red = (0..18)
-        .flat_map(|x| (0..18).map(move |y| (x, y)))
-        .map(|(x, y)| px(&img, x, y))
-        .any(|p| p[0] > 90 && p[1] < 50 && p[2] < 50);
-    assert!(red, "expected red foreground pixels in cols 0..1");
+    // Red foreground (cols 0..1 -> x 0..18): strokes over the dark bg, so red
+    // pixels are present but it is NOT a solid fill.
+    let (red_hits, red_total) = band(&img, 0, 18, strong_red);
+    assert!(red_hits > 15, "expected red fg strokes, got {red_hits}");
+    assert!(
+        red_hits * 2 < red_total,
+        "red fg should be strokes, not a fill ({red_hits}/{red_total})"
+    );
 
-    // Blue background cells (cols 3..4 -> x in 27..45). ANSI blue bg is
-    // ~[0,0,128]; the filled background rect should show clearly blue pixels.
-    let blue = (27..45)
-        .flat_map(|x| (0..18).map(move |y| (x, y)))
-        .map(|(x, y)| px(&img, x, y))
-        .any(|p| p[2] > 100 && p[0] < 60 && p[1] < 60);
-    assert!(blue, "expected blue background pixels in cols 3..4");
+    // Blue background (cols 3..4 -> x 27..45): a filled rect, so most pixels are
+    // strongly blue even with light glyphs on top.
+    let (blue_hits, blue_total) = band(&img, 27, 45, strong_blue);
+    assert!(
+        blue_hits * 2 > blue_total,
+        "blue bg cell should be mostly filled ({blue_hits}/{blue_total})"
+    );
+
+    // The blank column between them (col 2 -> x 18..27) must carry no color:
+    // catches fg/bg bleed into neighbouring cells.
+    let (red_bleed, _) = band(&img, 18, 27, strong_red);
+    let (blue_bleed, _) = band(&img, 18, 27, strong_blue);
+    assert_eq!(red_bleed, 0, "red bled into the blank column");
+    assert_eq!(blue_bleed, 0, "blue bled into the blank column");
+}
+
+#[test]
+fn draws_block_cursor_at_prompt_position() {
+    // After "hi" the cursor sits on a trailing blank cell (col 2) — the usual
+    // prompt position. The block cursor must still be drawn there.
+    let mut vt = Vt::new(10, 1);
+    vt.feed_str("hi");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let img = render_frame(&frame, font, 15.0, Theme::default());
+
+    // The cursor block fills col 2 (x 18..27) in the (light) foreground color.
+    let (light, total) = band(&img, 18, 27, |p| p[0] > 180 && p[1] > 180 && p[2] > 180);
+    assert!(
+        light * 2 > total,
+        "cursor block should fill the cell at col 2 ({light}/{total})"
+    );
 }

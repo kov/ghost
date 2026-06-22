@@ -580,6 +580,7 @@ dependencies = [
  "ghost-term",
  "png",
  "pollster",
+ "unicode-width",
  "wgpu",
 ]
 

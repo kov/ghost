@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use ghost_render::{Frame, Style};
 use ghost_shaper::FontRef;
 use ghost_term::Color;
+use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
 
 /// An RGBA8 image read back from the GPU, tightly packed (`width * 4` per row).
@@ -264,6 +265,19 @@ fn run_colors(style: &Style, theme: Theme) -> ([f32; 4], Option<[f32; 4]>) {
         }
     }
     (to_rgba(fg), paint_bg.then(|| to_rgba(bg)))
+}
+
+/// Map each char's byte offset in a run's text to its starting cell column
+/// within the run, so a shaped glyph (keyed by cluster byte offset) can be
+/// snapped to the grid. Wide characters advance the column by two.
+fn cell_starts(text: &str) -> HashMap<u32, usize> {
+    let mut map = HashMap::new();
+    let mut col = 0usize;
+    for (byte, ch) in text.char_indices() {
+        map.insert(byte as u32, col);
+        col += UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+    }
+    map
 }
 
 // ---- GPU plumbing -------------------------------------------------------
@@ -653,8 +667,11 @@ impl Renderer {
                 let x = run.start_col as f32 * metrics.advance;
                 let w = run.width_cols as f32 * metrics.advance;
 
-                // The cursor cell renders as a block in the foreground color with
-                // its glyph inverted to the background color.
+                // Reverse-video block cursor: fill the cell with the displayed
+                // foreground and draw its glyph in the displayed background.
+                // `fg`/`bg_opt` are already post-inverse and post-faint, so on an
+                // inverse or faint cell the cursor reflects that — the standard
+                // xterm behaviour where the cursor reverses whatever is shown.
                 let (block, glyph_color) = if is_cursor {
                     (Some(fg), bg_opt.unwrap_or(to_rgba(self.theme.bg)))
                 } else {
@@ -668,9 +685,14 @@ impl Renderer {
                     });
                 }
 
-                let mut pen = x;
+                // Place each shaped glyph at its cluster's CELL origin, not by
+                // accumulating font advance — a terminal is a fixed grid, so a
+                // ligature spans its cells naturally and a wide char occupies two
+                // columns regardless of the font's reported advance.
+                let starts = cell_starts(&run.text);
                 for g in ghost_shaper::shape(font, &run.text, size_px) {
-                    let advance = g.advance;
+                    let cell = starts.get(&g.cluster).copied().unwrap_or(0);
+                    let pen = (run.start_col + cell) as f32 * metrics.advance;
                     if let Some(slot) = self.ensure_glyph(font, g.id, size_px) {
                         glyphs.push(Instance {
                             rect: [
@@ -683,7 +705,6 @@ impl Renderer {
                             color: glyph_color,
                         });
                     }
-                    pen += advance;
                 }
             }
         }
@@ -791,4 +812,35 @@ impl Renderer {
 /// Convenience: render a single frame offscreen on a fresh headless renderer.
 pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, theme: Theme) -> Rendered {
     Renderer::headless(theme).render_offscreen(frame, font, size_px)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_to_rgb_matches_xterm() {
+        assert_eq!(index_to_rgb(1), [0x80, 0x00, 0x00]); // ANSI red
+        assert_eq!(index_to_rgb(9), [0xff, 0x00, 0x00]); // bright red
+        assert_eq!(index_to_rgb(16), [0, 0, 0]); // cube origin
+        assert_eq!(index_to_rgb(196), [0xff, 0, 0]); // cube pure red (5,0,0)
+        assert_eq!(index_to_rgb(231), [0xff, 0xff, 0xff]); // cube white
+        assert_eq!(index_to_rgb(232), [8, 8, 8]); // grayscale start
+        assert_eq!(index_to_rgb(255), [238, 238, 238]); // grayscale end
+    }
+
+    #[test]
+    fn cell_starts_snaps_glyphs_to_the_grid() {
+        // ASCII: one cell per char.
+        let m = cell_starts("ab");
+        assert_eq!(m.get(&0), Some(&0));
+        assert_eq!(m.get(&1), Some(&1));
+
+        // Wide char occupies two columns: 'a'@b0->col0, '世'@b1(3 bytes)->col1,
+        // 'b'@b4->col3 (skips the wide char's second column).
+        let m = cell_starts("a世b");
+        assert_eq!(m.get(&0), Some(&0));
+        assert_eq!(m.get(&1), Some(&1));
+        assert_eq!(m.get(&4), Some(&3));
+    }
 }

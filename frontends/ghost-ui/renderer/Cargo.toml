@@ -15,6 +15,10 @@ ghost-term = { path = "../../../ghost-term" }
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+# Must match ghost-term's version exactly: the renderer recomputes per-char cell
+# widths to place glyphs on the grid, and that must agree with the emulator's
+# own wide-cell decisions or glyphs desync from the cells.
+unicode-width = "0.1.13"
 
 [dev-dependencies]
 # png lets a test dump what it drew for eyeballing.

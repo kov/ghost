@@ -204,6 +204,9 @@ struct App {
     gfx: Option<Graphics>,
     screen: Screen,
     capture: Option<PathBuf>,
+    /// Failed surface-frame acquisitions, so capture mode can give up instead
+    /// of waiting forever if the compositor never presents.
+    attempts: u32,
 }
 
 impl App {
@@ -225,6 +228,7 @@ impl App {
             gfx: None,
             screen,
             capture,
+            attempts: 0,
         }
     }
 
@@ -239,15 +243,33 @@ impl App {
 
         let surface_tex = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gfx.surface.configure(&gfx.device, &gfx.config);
-                return;
+                gfx.window.request_redraw();
+                None
             }
             other => {
                 eprintln!("surface frame unavailable: {other:?}");
-                return;
+                gfx.window.request_redraw();
+                None
             }
+        };
+        let Some(surface_tex) = surface_tex else {
+            // No frame this round; under ControlFlow::Wait we already asked for a
+            // redraw. In capture mode, bound the retries so a never-presenting
+            // compositor fails fast instead of hanging.
+            if capture.is_some() {
+                self.attempts += 1;
+                if self.attempts > 600 {
+                    eprintln!(
+                        "gave up acquiring a surface frame after {} tries",
+                        self.attempts
+                    );
+                    event_loop.exit();
+                }
+            }
+            return;
         };
         let view = surface_tex
             .texture
