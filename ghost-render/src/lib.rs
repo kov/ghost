@@ -116,10 +116,15 @@ pub fn layout_row(line: &Line, cursor_col: Option<usize>) -> RowLayout {
     let cells = line.cells();
     // Trailing default cells (blank space, default pen) draw nothing; stop at
     // the last cell that has something to show.
-    let end = cells
+    let mut end = cells
         .iter()
         .rposition(|c| !c.is_default())
         .map_or(0, |i| i + 1);
+    // ...but a visible cursor on a trailing blank (the usual prompt position)
+    // must still produce a run so the renderer can draw the cursor block there.
+    if let Some(cc) = cursor_col {
+        end = end.max(cc + 1).min(cells.len());
+    }
 
     let mut runs: Vec<Run> = Vec::new();
     let mut cur: Option<Run> = None;
@@ -279,6 +284,24 @@ mod tests {
         assert_eq!(row.runs[1].start_col, 1);
         assert_eq!(row.runs[2].text, "c");
         assert_eq!(row.runs[2].start_col, 2);
+    }
+
+    #[test]
+    fn visible_cursor_on_trailing_blank_is_a_run() {
+        // After "hi" the cursor sits on col 2 — a trailing blank (default) cell,
+        // the usual shell-prompt position. It must still become its own run so a
+        // renderer can draw the cursor block there, even though the trailing-cell
+        // trim would otherwise drop it.
+        let v = feed(10, 1, "hi");
+        let cur = v.cursor();
+        assert_eq!((cur.col, cur.row), (2, 0));
+        let row = layout_row(row0(&v), Some(cur.col));
+        let cursor_run = row.runs.iter().find(|r| r.start_col == 2);
+        assert!(
+            cursor_run.is_some_and(|r| r.width_cols == 1),
+            "cursor cell at col 2 should be its own 1-wide run, got {:?}",
+            row.runs
+        );
     }
 
     #[test]
