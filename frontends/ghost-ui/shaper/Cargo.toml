@@ -1,0 +1,17 @@
+[package]
+name = "ghost-shaper"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shapes ghost-render runs into positioned glyphs and rasterizes them (swash)."
+publish = false
+
+[dependencies]
+# The pure layout model: we shape its `Run`s into glyphs.
+ghost-render = { path = "../../../ghost-render" }
+# Pure-Rust OpenType shaping (applies ligatures) + deterministic outline raster.
+swash = "0.2"
+
+# The tests bundle Fira Code (tests/assets/FiraCode-Regular.ttf, SIL OFL-1.1 —
+# see the LICENSE file alongside it) as a fixed, ligature-bearing fixture so
+# glyph goldens are reproducible without depending on system fonts.
