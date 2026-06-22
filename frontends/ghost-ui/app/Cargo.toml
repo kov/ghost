@@ -1,0 +1,21 @@
+[package]
+name = "ghost-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ghost's windowed GPU terminal frontend (winit + wgpu + ghost-renderer)."
+publish = false
+
+[[bin]]
+name = "ghost-ui"
+path = "src/main.rs"
+
+[dependencies]
+ghost-renderer = { path = "../renderer" }
+ghost-render = { path = "../../../ghost-render" }
+ghost-shaper = { path = "../shaper" }
+ghost-vt = { path = "../../../ghost-vt" }
+winit = "0.30"
+wgpu = "29"
+pollster = "0.4"
+png = "0.18"

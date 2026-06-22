@@ -1,8 +1,11 @@
-//! Offscreen GPU renderer (wgpu) for `ghost-render` frames.
+//! GPU renderer (wgpu) for `ghost-render` frames.
 //!
-//! This slice establishes the headless path: a device on a software adapter
-//! (lavapipe), render-to-texture, and pixel readback — the foundation for
-//! deterministic, windowless golden tests. Glyph rendering layers on next.
+//! A persistent [`Renderer`] owns the device, pipeline, glyph atlas and glyph
+//! cache, and can draw a laid-out [`Frame`] either to an offscreen target (for
+//! deterministic, windowless golden tests on a software adapter) or into a
+//! window surface view. Cell backgrounds, the block cursor, and full ANSI/256
+//! color resolution are handled here; glyph shaping (with ligatures) comes from
+//! `ghost-shaper`.
 
 use std::collections::HashMap;
 
@@ -18,7 +21,8 @@ pub struct Rendered {
     pub rgba: Vec<u8>,
 }
 
-/// A headless GPU context.
+/// A GPU context: device + queue. Build it headless ([`Gpu::headless`], a
+/// software adapter for reproducible tests) or wrap a windowed device directly.
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -48,7 +52,12 @@ impl Gpu {
 /// colors we wrote — important for deterministic golden comparisons.
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-fn offscreen_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+fn offscreen_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ghost-renderer offscreen"),
         size: wgpu::Extent3d {
@@ -59,7 +68,7 @@ fn offscreen_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Tex
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
@@ -128,7 +137,7 @@ fn read_back(gpu: &Gpu, texture: &wgpu::Texture, width: u32, height: u32) -> Vec
 /// of the headless device + render + readback path.
 pub fn render_solid(width: u32, height: u32, color: [f64; 4]) -> Rendered {
     let gpu = Gpu::headless();
-    let texture = offscreen_target(&gpu.device, width, height);
+    let texture = offscreen_target(&gpu.device, width, height, FORMAT);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut encoder = gpu
@@ -165,17 +174,110 @@ pub fn render_solid(width: u32, height: u32, color: [f64; 4]) -> Rendered {
     }
 }
 
-// ---- glyph rendering ----------------------------------------------------
+// ---- color resolution ---------------------------------------------------
 
-/// Instanced textured quad: one per visible glyph.
+/// Renderer color theme: the RGB used for cells whose pen leaves fg/bg unset.
+#[derive(Clone, Copy, Debug)]
+pub struct Theme {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            fg: [0xd8, 0xdb, 0xe0],
+            bg: [0x10, 0x10, 0x12],
+        }
+    }
+}
+
+/// Standard xterm 16-color base palette (indices 0..=15).
+#[rustfmt::skip]
+const ANSI_16: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], [0x80, 0x00, 0x00], [0x00, 0x80, 0x00], [0x80, 0x80, 0x00],
+    [0x00, 0x00, 0x80], [0x80, 0x00, 0x80], [0x00, 0x80, 0x80], [0xc0, 0xc0, 0xc0],
+    [0x80, 0x80, 0x80], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
+    [0x00, 0x00, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
+];
+
+/// The six channel levels of the 6x6x6 color cube (indices 16..=231).
+const CUBE_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Resolve an xterm 256-color index to RGB.
+fn index_to_rgb(i: u8) -> [u8; 3] {
+    match i {
+        0..=15 => ANSI_16[i as usize],
+        16..=231 => {
+            let i = i - 16;
+            [
+                CUBE_STEPS[(i / 36) as usize],
+                CUBE_STEPS[((i / 6) % 6) as usize],
+                CUBE_STEPS[(i % 6) as usize],
+            ]
+        }
+        232..=255 => {
+            let v = 8 + 10 * (i - 232);
+            [v, v, v]
+        }
+    }
+}
+
+/// Bold brightens the 8 base ANSI colors to their bright variants (xterm-ish).
+fn maybe_brighten(c: Option<Color>, bold: bool) -> Option<Color> {
+    match (bold, c) {
+        (true, Some(Color::Indexed(i))) if i < 8 => Some(Color::Indexed(i + 8)),
+        _ => c,
+    }
+}
+
+fn resolve(c: Option<Color>, default: [u8; 3]) -> [u8; 3] {
+    match c {
+        None => default,
+        Some(Color::Indexed(i)) => index_to_rgb(i),
+        Some(Color::RGB(c)) => [c.r, c.g, c.b],
+    }
+}
+
+fn to_rgba(c: [u8; 3]) -> [f32; 4] {
+    [
+        f32::from(c[0]) / 255.0,
+        f32::from(c[1]) / 255.0,
+        f32::from(c[2]) / 255.0,
+        1.0,
+    ]
+}
+
+/// Resolve a run's style to a foreground color and an optional background-rect
+/// color. The background is `Some` only when it differs from the cleared theme
+/// background (an explicit bg, or `inverse`), so default cells paint no rect.
+fn run_colors(style: &Style, theme: Theme) -> ([f32; 4], Option<[f32; 4]>) {
+    let mut fg = resolve(maybe_brighten(style.fg, style.bold), theme.fg);
+    let mut bg = resolve(style.bg, theme.bg);
+    let paint_bg = style.bg.is_some() || style.inverse;
+    if style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if style.faint {
+        for i in 0..3 {
+            fg[i] = ((u16::from(fg[i]) + u16::from(bg[i])) / 2) as u8;
+        }
+    }
+    (to_rgba(fg), paint_bg.then(|| to_rgba(bg)))
+}
+
+// ---- GPU plumbing -------------------------------------------------------
+
+/// Instanced textured quad: one per cell background and per visible glyph.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Instance {
     /// Screen rect in pixels: x, y, width, height (origin top-left).
     rect: [f32; 4],
-    /// Atlas UV rect: u0, v0, u1, v1.
+    /// Atlas UV rect: u0, v0, u1, v1. Background rects point at the reserved
+    /// opaque texel so they fill solid.
     uv: [f32; 4],
-    /// Foreground color, straight alpha.
+    /// Color, straight alpha.
     color: [f32; 4],
 }
 
@@ -226,20 +328,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Resolve a run's foreground to an RGBA color. Indexed/default colors map to a
-/// light foreground for now; full palette resolution comes with theming.
-fn resolve_fg(style: &Style) -> [f32; 4] {
-    match style.fg {
-        Some(Color::RGB(c)) => [
-            f32::from(c.r) / 255.0,
-            f32::from(c.g) / 255.0,
-            f32::from(c.b) / 255.0,
-            1.0,
-        ],
-        _ => [0.85, 0.86, 0.88, 1.0],
-    }
-}
-
 /// A glyph's slot in the atlas plus its pen-relative placement.
 #[derive(Clone, Copy)]
 struct Slot {
@@ -251,323 +339,456 @@ struct Slot {
     top: i32,
 }
 
-const ATLAS_W: u32 = 1024;
+const ATLAS_DIM: u32 = 2048;
+/// UV of the reserved opaque texel at (0,0); background/cursor rects sample it.
+const OPAQUE_UV: [f32; 4] = [
+    0.5 / ATLAS_DIM as f32,
+    0.5 / ATLAS_DIM as f32,
+    0.5 / ATLAS_DIM as f32,
+    0.5 / ATLAS_DIM as f32,
+];
 
-/// Render a laid-out [`Frame`]'s glyphs to an offscreen image: shape each run
-/// (ligatures applied), rasterize glyphs into an atlas, and draw one textured
-/// quad per glyph. Background is cleared to `bg`.
-pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, bg: [f64; 4]) -> Rendered {
-    let metrics = frame.metrics;
-    let width = (frame.cols as f32 * metrics.advance).ceil().max(1.0) as u32;
-    let height = (frame.rows as f32 * metrics.line_height).ceil().max(1.0) as u32;
-    // A reasonable baseline within the cell until real font ascent is wired in.
-    let baseline = metrics.line_height * 0.8;
+/// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
+/// built once and reused across frames.
+pub struct Renderer {
+    gpu: Gpu,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+    atlas: wgpu::Texture,
+    theme: Theme,
+    /// Color-attachment format the pipeline targets (offscreen vs surface).
+    format: wgpu::TextureFormat,
+    /// glyph cache keyed by (glyph id, font size bits); `None` = no bitmap.
+    cache: HashMap<(u16, u32), Option<Slot>>,
+    // shelf-packing cursor into the atlas.
+    pack_x: u32,
+    pack_y: u32,
+    shelf: u32,
+    // per-frame instance buffer.
+    instances: Option<wgpu::Buffer>,
+    instance_count: u32,
+}
 
-    // 1. Walk the frame, shape each run, and record each glyph's pen position.
-    struct Placed {
-        x: f32,
-        baseline_y: f32,
-        id: u16,
-        color: [f32; 4],
-    }
-    let mut placed: Vec<Placed> = Vec::new();
-    for (row, layout) in frame.rows_layout.iter().enumerate() {
-        let baseline_y = row as f32 * metrics.line_height + baseline;
-        for run in &layout.runs {
-            let color = resolve_fg(&run.style);
-            let mut pen = run.start_col as f32 * metrics.advance;
-            for g in ghost_shaper::shape(font, &run.text, size_px) {
-                placed.push(Placed {
-                    x: pen,
-                    baseline_y,
-                    id: g.id,
-                    color,
-                });
-                pen += g.advance;
-            }
-        }
-    }
-
-    // 2. Rasterize each distinct glyph once and shelf-pack it into the atlas.
-    let mut slots: HashMap<u16, Option<Slot>> = HashMap::new();
-    let mut to_blit: Vec<(Slot, ghost_shaper::GlyphBitmap)> = Vec::new();
-    let (mut cx, mut cy, mut shelf) = (0u32, 0u32, 0u32);
-    for p in &placed {
-        if slots.contains_key(&p.id) {
-            continue;
-        }
-        match ghost_shaper::rasterize(font, p.id, size_px) {
-            Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
-                if cx + bmp.width > ATLAS_W {
-                    cx = 0;
-                    cy += shelf;
-                    shelf = 0;
-                }
-                let slot = Slot {
-                    ax: cx,
-                    ay: cy,
-                    w: bmp.width,
-                    h: bmp.height,
-                    left: bmp.left,
-                    top: bmp.top,
-                };
-                slots.insert(p.id, Some(slot));
-                cx += bmp.width + 1;
-                shelf = shelf.max(bmp.height);
-                to_blit.push((slot, bmp));
-            }
-            _ => {
-                slots.insert(p.id, None);
-            }
-        }
-    }
-    let atlas_h = (cy + shelf).max(1);
-    let mut atlas = vec![0u8; (ATLAS_W * atlas_h) as usize];
-    for (slot, bmp) in &to_blit {
-        for row in 0..bmp.height {
-            let src = (row * bmp.width) as usize;
-            let dst = ((slot.ay + row) * ATLAS_W + slot.ax) as usize;
-            atlas[dst..dst + bmp.width as usize]
-                .copy_from_slice(&bmp.coverage[src..src + bmp.width as usize]);
-        }
+impl Renderer {
+    /// Build a headless renderer (software adapter) for offscreen rendering and
+    /// golden tests.
+    pub fn headless(theme: Theme) -> Self {
+        Self::new(Gpu::headless(), theme, FORMAT)
     }
 
-    // 3. Build one instance per placed glyph that has an atlas slot.
-    let mut instances: Vec<Instance> = Vec::new();
-    for p in &placed {
-        let Some(Some(slot)) = slots.get(&p.id) else {
-            continue;
-        };
-        instances.push(Instance {
-            rect: [
-                p.x + slot.left as f32,
-                p.baseline_y - slot.top as f32,
-                slot.w as f32,
-                slot.h as f32,
-            ],
-            uv: [
-                slot.ax as f32 / ATLAS_W as f32,
-                slot.ay as f32 / atlas_h as f32,
-                (slot.ax + slot.w) as f32 / ATLAS_W as f32,
-                (slot.ay + slot.h) as f32 / atlas_h as f32,
-            ],
-            color: p.color,
+    /// Build a renderer on an existing device/queue (e.g. a windowed device).
+    /// `format` is the color-attachment format the pipeline must target — the
+    /// offscreen [`FORMAT`] for tests, or a window surface's format.
+    pub fn new(gpu: Gpu, theme: Theme, format: wgpu::TextureFormat) -> Self {
+        let atlas = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("glyph atlas"),
+            size: wgpu::Extent3d {
+                width: ATLAS_DIM,
+                height: ATLAS_DIM,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
-    }
-
-    // 4. GPU: upload the atlas, build the pipeline, draw, read back.
-    let gpu = Gpu::headless();
-    let target = offscreen_target(&gpu.device, width, height);
-    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let atlas_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("glyph atlas"),
-        size: wgpu::Extent3d {
-            width: ATLAS_W,
-            height: atlas_h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &atlas_tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &atlas,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(ATLAS_W),
-            rows_per_image: Some(atlas_h),
-        },
-        wgpu::Extent3d {
-            width: ATLAS_W,
-            height: atlas_h,
-            depth_or_array_layers: 1,
-        },
-    );
-    let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("glyph sampler"),
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
-
-    let uniforms = Uniforms {
-        viewport: [width as f32, height as f32],
-        _pad: [0.0, 0.0],
-    };
-    let uniform_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Reserve the (0,0) texel as fully opaque so background/cursor rects can
+        // sample a coverage of 1.0 and fill solid through the same pipeline.
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("glyph sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-    let instance_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("instances"),
-            contents: bytemuck::cast_slice(&instances),
-            usage: wgpu::BufferUsages::VERTEX,
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-    let bind_layout = gpu
-        .device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("glyph bind layout"),
+        let bind_layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("glyph bind layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glyph bind group"),
+            layout: &bind_layout,
             entries: &[
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    resource: uniform_buf.as_entire_binding(),
                 },
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
                 },
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
         });
-    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("glyph bind group"),
-        layout: &bind_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&atlas_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
 
-    let shader = gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("glyph shader"),
-            source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
-        });
-    let pipeline_layout = gpu
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("glyph pipeline layout"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-    const ATTRS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
-    let pipeline = gpu
-        .device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glyph pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &ATTRS,
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("glyphs"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: bg[0],
-                        g: bg[1],
-                        b: bg[2],
-                        a: bg[3],
-                    }),
-                    store: wgpu::StoreOp::Store,
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("glyph shader"),
+                source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
+            });
+        let pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("glyph pipeline layout"),
+                bind_group_layouts: &[Some(&bind_layout)],
+                immediate_size: 0,
+            });
+        const ATTRS: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+        let pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("glyph pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &ATTRS,
+                    }],
                 },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if !instances.is_empty() {
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.set_vertex_buffer(0, instance_buf.slice(..));
-            pass.draw(0..6, 0..instances.len() as u32);
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        Renderer {
+            gpu,
+            pipeline,
+            bind_group,
+            uniform_buf,
+            atlas,
+            theme,
+            format,
+            cache: HashMap::new(),
+            pack_x: 1,
+            pack_y: 0,
+            shelf: 1,
+            instances: None,
+            instance_count: 0,
         }
     }
-    gpu.queue.submit([encoder.finish()]);
 
-    let rgba = read_back(&gpu, &target, width, height);
-    Rendered {
-        width,
-        height,
-        rgba,
+    /// The pixel dimensions a frame renders to at its cell metrics.
+    pub fn frame_size(frame: &Frame) -> (u32, u32) {
+        let w = (frame.cols as f32 * frame.metrics.advance).ceil().max(1.0) as u32;
+        let h = (frame.rows as f32 * frame.metrics.line_height)
+            .ceil()
+            .max(1.0) as u32;
+        (w, h)
     }
+
+    /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
+    fn ensure_glyph(&mut self, font: FontRef, id: u16, size_px: f32) -> Option<Slot> {
+        let key = (id, size_px.to_bits());
+        if let Some(slot) = self.cache.get(&key) {
+            return *slot;
+        }
+        let resolved = match ghost_shaper::rasterize(font, id, size_px) {
+            Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
+                if self.pack_x + bmp.width + 1 > ATLAS_DIM {
+                    self.pack_x = 1;
+                    self.pack_y += self.shelf + 1;
+                    self.shelf = 0;
+                }
+                if self.pack_y + bmp.height > ATLAS_DIM {
+                    None // atlas full; skip drawing this glyph
+                } else {
+                    let slot = Slot {
+                        ax: self.pack_x,
+                        ay: self.pack_y,
+                        w: bmp.width,
+                        h: bmp.height,
+                        left: bmp.left,
+                        top: bmp.top,
+                    };
+                    self.gpu.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.atlas,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: slot.ax,
+                                y: slot.ay,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &bmp.coverage,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bmp.width),
+                            rows_per_image: Some(bmp.height),
+                        },
+                        wgpu::Extent3d {
+                            width: bmp.width,
+                            height: bmp.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.pack_x += bmp.width + 1;
+                    self.shelf = self.shelf.max(bmp.height);
+                    Some(slot)
+                }
+            }
+            _ => None,
+        };
+        self.cache.insert(key, resolved);
+        resolved
+    }
+
+    fn slot_uv(slot: &Slot) -> [f32; 4] {
+        let dim = ATLAS_DIM as f32;
+        [
+            slot.ax as f32 / dim,
+            slot.ay as f32 / dim,
+            (slot.ax + slot.w) as f32 / dim,
+            (slot.ay + slot.h) as f32 / dim,
+        ]
+    }
+
+    /// Build the per-frame instance list: cell backgrounds + cursor block first,
+    /// then glyph quads on top.
+    fn build_instances(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Vec<Instance> {
+        let metrics = frame.metrics;
+        let baseline = metrics.line_height * 0.8;
+        let cursor = frame.cursor;
+
+        let mut backgrounds: Vec<Instance> = Vec::new();
+        let mut glyphs: Vec<Instance> = Vec::new();
+
+        for (row, layout) in frame.rows_layout.iter().enumerate() {
+            let row_y = row as f32 * metrics.line_height;
+            let baseline_y = row_y + baseline;
+            for run in &layout.runs {
+                let is_cursor = cursor.is_some_and(|c| c.row == row && c.col == run.start_col);
+                let (fg, bg_opt) = run_colors(&run.style, self.theme);
+                let x = run.start_col as f32 * metrics.advance;
+                let w = run.width_cols as f32 * metrics.advance;
+
+                // The cursor cell renders as a block in the foreground color with
+                // its glyph inverted to the background color.
+                let (block, glyph_color) = if is_cursor {
+                    (Some(fg), bg_opt.unwrap_or(to_rgba(self.theme.bg)))
+                } else {
+                    (bg_opt, fg)
+                };
+                if let Some(color) = block {
+                    backgrounds.push(Instance {
+                        rect: [x, row_y, w, metrics.line_height],
+                        uv: OPAQUE_UV,
+                        color,
+                    });
+                }
+
+                let mut pen = x;
+                for g in ghost_shaper::shape(font, &run.text, size_px) {
+                    let advance = g.advance;
+                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px) {
+                        glyphs.push(Instance {
+                            rect: [
+                                pen + slot.left as f32,
+                                baseline_y - slot.top as f32,
+                                slot.w as f32,
+                                slot.h as f32,
+                            ],
+                            uv: Self::slot_uv(&slot),
+                            color: glyph_color,
+                        });
+                    }
+                    pen += advance;
+                }
+            }
+        }
+
+        backgrounds.extend(glyphs);
+        backgrounds
+    }
+
+    /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
+    /// viewport uniform.
+    fn prepare(&mut self, frame: &Frame, font: FontRef, size_px: f32, vw: u32, vh: u32) {
+        let instances = self.build_instances(frame, font, size_px);
+        self.instance_count = instances.len() as u32;
+        self.instances = Some(self.gpu.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("instances"),
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+        let uniforms = Uniforms {
+            viewport: [vw as f32, vh as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Record a clear-and-draw pass into `view`, returning the command buffer.
+    fn encode(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(self.theme.bg[0]) / 255.0,
+                            g: f64::from(self.theme.bg[1]) / 255.0,
+                            b: f64::from(self.theme.bg[2]) / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(buf) = &self.instances
+                && self.instance_count > 0
+            {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..self.instance_count);
+            }
+        }
+        encoder.finish()
+    }
+
+    /// Render a frame into a window surface's texture view. The caller owns
+    /// acquiring/presenting the surface texture.
+    pub fn render_to_view(
+        &mut self,
+        view: &wgpu::TextureView,
+        vw: u32,
+        vh: u32,
+        frame: &Frame,
+        font: FontRef,
+        size_px: f32,
+    ) {
+        self.prepare(frame, font, size_px, vw, vh);
+        let cb = self.encode(view);
+        self.gpu.queue.submit([cb]);
+    }
+
+    /// Render a frame to an offscreen target and read the pixels back.
+    pub fn render_offscreen(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Rendered {
+        let (w, h) = Self::frame_size(frame);
+        self.prepare(frame, font, size_px, w, h);
+        let target = offscreen_target(&self.gpu.device, w, h, self.format);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let cb = self.encode(&view);
+        self.gpu.queue.submit([cb]);
+        let rgba = read_back(&self.gpu, &target, w, h);
+        Rendered {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+}
+
+/// Convenience: render a single frame offscreen on a fresh headless renderer.
+pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, theme: Theme) -> Rendered {
+    Renderer::headless(theme).render_offscreen(frame, font, size_px)
 }
