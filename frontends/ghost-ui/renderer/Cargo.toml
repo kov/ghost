@@ -1,0 +1,21 @@
+[package]
+name = "ghost-renderer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Offscreen/windowed GPU renderer for ghost-render frames (wgpu)."
+publish = false
+
+[dependencies]
+ghost-render = { path = "../../../ghost-render" }
+ghost-shaper = { path = "../shaper" }
+# The terminal core: we resolve cell colors (ghost_term::Color) and, in tests,
+# drive a real Vt through the whole stack.
+ghost-term = { path = "../../../ghost-term" }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# png lets a test dump what it drew for eyeballing.
+png = "0.18"
