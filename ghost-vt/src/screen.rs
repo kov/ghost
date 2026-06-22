@@ -121,6 +121,13 @@ impl Screen {
         (self.cols, self.rows)
     }
 
+    /// Borrow the underlying emulator core for read-only consumers such as a
+    /// renderer's layout pass (`ghost_render::layout_frame`), which needs the
+    /// live styled grid and cursor rather than a text/CPR snapshot.
+    pub fn vt(&self) -> &Vt {
+        &self.vt
+    }
+
     /// Cursor position as 1-based `(col, row)` — the form a cursor-position
     /// report (CPR) carries. `avt` tracks the cursor 0-based.
     pub fn cursor(&self) -> (u16, u16) {
@@ -238,6 +245,17 @@ mod tests {
         for mode in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h", "\x1b[?2004h"] {
             assert!(text.contains(mode), "resync missing {mode:?}");
         }
+    }
+
+    #[test]
+    fn vt_accessor_exposes_live_emulator() {
+        // A renderer lays out the live grid via `screen.vt()` -> the borrowed
+        // emulator must reflect what's been fed and report the right size.
+        let mut s = Screen::new(20, 4, 100);
+        s.feed(b"live-grid");
+        let vt = s.vt();
+        assert_eq!(vt.size(), (20, 4));
+        assert!(vt.text()[0].starts_with("live-grid"));
     }
 
     #[test]
