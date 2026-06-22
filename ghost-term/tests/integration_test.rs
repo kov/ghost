@@ -1,4 +1,4 @@
-use avt::Vt;
+use ghost_term::Vt;
 use rand::RngCore;
 
 #[test]

@@ -1,0 +1,11 @@
+[package]
+name = "ghost-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure layout model mapping a vt terminal grid to a drawable frame (no GPU, no fonts)."
+
+[dependencies]
+# ghost's owned terminal-emulator core (forked from avt): the source of the
+# styled cell grid this crate lays out. See ../ghost-term.
+ghost-term = { path = "../ghost-term" }

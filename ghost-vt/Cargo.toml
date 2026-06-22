@@ -13,9 +13,8 @@ pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["event", "termios", "process", "fs", "stdio", "pipe"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# The vendored avt fork: workspace member `vt/`, upstream package name `avt`,
-# referred to locally as `vt`. Kept structurally close to upstream for rebasing.
-vt = { package = "avt", path = "../vt" }
+# ghost's owned terminal-emulator core (forked from asciinema's avt; Apache-2.0).
+ghost-term = { path = "../ghost-term" }
 zstd = "0.13.3"
 
 [dev-dependencies]

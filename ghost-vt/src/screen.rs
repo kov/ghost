@@ -12,7 +12,7 @@
 //! U+FFFD, matching `String::from_utf8_lossy`).
 
 use crate::record::{Item, Recording};
-use vt::Vt;
+use ghost_term::Vt;
 
 /// Default bound on retained scrollback lines. Keeps host memory bounded; the
 /// viewport itself is always reconstructable regardless of this limit.

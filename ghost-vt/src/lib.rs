@@ -25,6 +25,6 @@ pub mod session;
 mod signals;
 pub mod transport;
 
-/// The vendored virtual-terminal engine — a fork of asciinema's `avt` — used as
-/// the authoritative server-side screen and scrollback state.
-pub use vt::Vt;
+/// ghost's terminal-emulator core (`ghost-term`, forked from asciinema's `avt`),
+/// used as the authoritative server-side screen and scrollback state.
+pub use ghost_term::Vt;

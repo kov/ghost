@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["vt", "ghost-vt", "ghost-cli"]
+members = ["ghost-term", "ghost-vt", "ghost-render", "ghost-cli"]
 
 [workspace.package]
 version = "0.1.0"

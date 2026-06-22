@@ -1,0 +1,42 @@
+[package]
+# ghost's owned terminal-emulator core. Forked from asciinema's `avt`
+# (https://github.com/asciinema/avt) — see README.md and LICENSE. We no longer
+# track upstream; we diverge as the terminal needs. License STAYS Apache-2.0
+# (avt is Apache-2.0; we cannot relicense it) — do NOT switch this crate to the
+# workspace's `MIT OR Apache-2.0`. Original-author attribution is preserved.
+name = "ghost-term"
+version = "0.18.0"
+edition = "2021"
+authors = [
+    "Marcin Kulik <m@ku1ik.com>",
+    "Gustavo Noronha Silva <gustavo@noronhe.dev.br>",
+]
+repository = "https://github.com/asciinema/avt"
+description = "ghost's terminal-emulator core — a fork of asciinema's avt (Apache-2.0)."
+license = "Apache-2.0"
+
+# MSRV
+rust-version = "1.82.0"
+
+[dependencies]
+rgb = "0.8.33"
+unicode-width = "0.1.13"
+
+[dev-dependencies]
+rand = "0.7"
+proptest = "=1.9.0"
+tempfile = "=3.24.0"
+criterion = "0.3"
+pretty_assertions = "1.0"
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "vt"
+harness = false
+
+[[bench]]
+name = "charset"
+harness = false

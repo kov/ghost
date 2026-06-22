@@ -16,12 +16,19 @@ timeout (`wait_until`), never fixed sleeps. XDG dirs are redirected to a tempdir
 (`set_xdg`) so the suite never touches real sessions or recordings. Reuse those
 helpers.
 
-## `vt/` is a vendored fork — treat it as upstream
+## `ghost-term` — our owned terminal core (forked from avt)
 
-`vt/` is a fork of asciinema's `avt` (package name `avt`, used here as the dep
-`vt`). Keep changes **minimal and structurally close to upstream** so rebases
-stay cheap; don't refactor or restyle it. Anything worth upstreaming goes in the
-contribution tracker (see memory) before it drifts.
+`ghost-term/` began as a fork of asciinema's `avt`; it is now **ours**. Diverge
+freely where it makes ghost's terminal better (cursor shape, hyperlinks,
+bytes-feed, damage tracking, …) — it is no longer kept rebase-close to upstream;
+cherry-pick upstream fixes by hand when worthwhile.
+
+**License/attribution — do not break.** avt is Apache-2.0 and we cannot
+relicense it to MIT, so `ghost-term` keeps `license = "Apache-2.0"` (NOT the
+workspace's `MIT OR Apache-2.0`). Keep the `LICENSE` file, the Marcin Kulik /
+asciinema attribution, and the fork notice (README + crate docs) recording our
+changes (Apache-2.0 §4(b)). The rest of the workspace stays `MIT OR Apache-2.0`
+and depends on it — a normal mixed-license tree.
 
 ## Lint & format gates
 
@@ -30,10 +37,9 @@ contribution tracker (see memory) before it drifts.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude avt --all-targets -- -D warnings
-cargo clippy -p avt --lib -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Clippy is `-D warnings`. The split is intentional: lint our crates fully, but
-avt only as a **library** — its benches/tests trip newer lints upstream ignores,
-and linting them just causes rebase churn. Don't "fix" those.
+Clippy is `-D warnings` across the whole workspace, `ghost-term` included — we
+own it, so its lints get fixed like any of our code (a scoped `#[allow]` with a
+reason only where a lint is genuinely noise).

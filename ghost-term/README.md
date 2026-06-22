@@ -1,3 +1,14 @@
+# ghost-term
+
+**This crate is a fork of [asciinema's `avt`](https://github.com/asciinema/avt)**
+(© Marcin Kulik), used as ghost's owned terminal-emulator core. It is licensed
+under **Apache-2.0** (see `LICENSE`), has been **modified** by the ghost authors,
+and diverges from upstream avt — it is no longer kept rebase-compatible. This
+notice records that the files have been changed (Apache-2.0 §4(b)). The original
+upstream README follows.
+
+---
+
 # avt - asciinema virtual terminal
 
 [![Test](https://github.com/asciinema/avt/actions/workflows/test.yml/badge.svg)](https://github.com/asciinema/avt/actions/workflows/test.yml)

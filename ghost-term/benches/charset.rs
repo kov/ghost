@@ -1,5 +1,5 @@
-use avt::Charset;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use ghost_term::Charset;
 use std::fs;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
