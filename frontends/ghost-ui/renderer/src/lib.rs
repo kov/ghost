@@ -847,6 +847,32 @@ impl Renderer {
                         });
                     }
                 }
+
+                // Underline / strikethrough: solid rules in the text color,
+                // spanning the run, drawn with the glyphs so they sit on top of
+                // the cell background. Thickness scales with the (physical) cell.
+                if run.style.underline || run.style.strikethrough {
+                    let thickness = (metrics.line_height / 14.0).max(1.0);
+                    let line = |y: f32| {
+                        solid(
+                            RectPx {
+                                x,
+                                y,
+                                w,
+                                h: thickness,
+                            },
+                            glyph_color,
+                        )
+                    };
+                    if run.style.underline {
+                        let y =
+                            (baseline_y + thickness).min(row_y + metrics.line_height - thickness);
+                        glyphs.push(line(y));
+                    }
+                    if run.style.strikethrough {
+                        glyphs.push(line(row_y + metrics.line_height * 0.5 - thickness * 0.5));
+                    }
+                }
             }
         }
 
@@ -1209,6 +1235,40 @@ mod tests {
 
     fn is_red(p: [u8; 4]) -> bool {
         p[0] > 0x60 && p[1] < 0x20 && p[2] < 0x20
+    }
+
+    fn render_text(s: &str) -> Rendered {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let f = frame(20, 2, s);
+        Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX)
+    }
+
+    #[test]
+    fn underline_draws_a_red_line_below_the_glyph() {
+        // Red 'E' with and without SGR 4. Below the baseline (~14.4 at an 18px
+        // line) the glyph has no ink, so any red there is the underline.
+        let plain = render_text("\x1b[31mE");
+        let under = render_text("\x1b[4;31mE");
+        let lower_red = |img: &Rendered| (0..9).any(|x| (15..18).any(|y| is_red(px(img, x, y))));
+        assert!(
+            !lower_red(&plain),
+            "plain E paints no ink below its baseline"
+        );
+        assert!(
+            lower_red(&under),
+            "SGR 4 paints a red underline below the glyph"
+        );
+    }
+
+    #[test]
+    fn strikethrough_draws_a_red_line_through_mid_cell() {
+        // A leading red SPACE (kept from trimming by the following 'X'); the
+        // space has no glyph ink, so mid-cell red is the strikethrough rule.
+        let plain = render_text("\x1b[31m X");
+        let strike = render_text("\x1b[9;31m X");
+        let mid_red = |img: &Rendered| (0..9).any(|x| (8..11).any(|y| is_red(px(img, x, y))));
+        assert!(!mid_red(&plain), "a plain space cell has no mid-cell ink");
+        assert!(mid_red(&strike), "SGR 9 paints a red rule through the cell");
     }
 
     #[test]
