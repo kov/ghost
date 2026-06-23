@@ -186,6 +186,9 @@ pub struct Theme {
     pub bg: [u8; 3],
     /// Selection highlight tint, drawn translucently over cell backgrounds.
     pub selection: [u8; 3],
+    /// The 16 base ANSI colors (indices 0..=15). Color schemes replace these;
+    /// the 256-color cube and grayscale ramp (16..=255) stay standard.
+    pub palette: [[u8; 3]; 16],
 }
 
 impl Default for Theme {
@@ -194,6 +197,19 @@ impl Default for Theme {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
             selection: [0x3a, 0x53, 0x7a],
+            palette: ANSI_16,
+        }
+    }
+}
+
+impl Theme {
+    /// Resolve an xterm 256-color index, honoring this theme's palette for the
+    /// 16 base colors (the cube and grayscale ramp are scheme-independent).
+    fn ansi(&self, i: u8) -> [u8; 3] {
+        if (i as usize) < 16 {
+            self.palette[i as usize]
+        } else {
+            index_to_rgb(i)
         }
     }
 }
@@ -240,10 +256,10 @@ fn maybe_brighten(c: Option<Color>, bold: bool) -> Option<Color> {
     }
 }
 
-fn resolve(c: Option<Color>, default: [u8; 3]) -> [u8; 3] {
+fn resolve(c: Option<Color>, default: [u8; 3], theme: &Theme) -> [u8; 3] {
     match c {
         None => default,
-        Some(Color::Indexed(i)) => index_to_rgb(i),
+        Some(Color::Indexed(i)) => theme.ansi(i),
         Some(Color::RGB(c)) => [c.r, c.g, c.b],
     }
 }
@@ -261,8 +277,8 @@ fn to_rgba(c: [u8; 3]) -> [f32; 4] {
 /// color. The background is `Some` only when it differs from the cleared theme
 /// background (an explicit bg, or `inverse`), so default cells paint no rect.
 fn run_colors(style: &Style, theme: Theme) -> ([f32; 4], Option<[f32; 4]>) {
-    let mut fg = resolve(maybe_brighten(style.fg, style.bold), theme.fg);
-    let mut bg = resolve(style.bg, theme.bg);
+    let mut fg = resolve(maybe_brighten(style.fg, style.bold), theme.fg, &theme);
+    let mut bg = resolve(style.bg, theme.bg, &theme);
     let paint_bg = style.bg.is_some() || style.inverse;
     if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
@@ -1440,6 +1456,22 @@ mod tests {
             px(&img, 2, 2),
             [0x10, 0x10, 0x12, 255],
             "outside the rect is the clear background"
+        );
+    }
+
+    #[test]
+    fn theme_palette_recolors_ansi_indices() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // Leading spaces (kept by the trailing 'X') with ANSI bg index 4 (blue).
+        let f = frame(10, 1, "\x1b[44m  X");
+        let mut theme = Theme::default();
+        theme.palette[4] = [0x00, 0xff, 0x00]; // remap "blue" to green
+        let img = Renderer::headless(theme).render_offscreen(&f, font, SIZE_PX);
+        // The background of the first cell now paints the palette's green.
+        let p = px(&img, 2, 9);
+        assert!(
+            p[1] > 0x80 && p[2] < 0x40,
+            "ANSI index 4 must resolve through the theme palette, got {p:?}"
         );
     }
 
