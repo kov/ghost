@@ -117,6 +117,13 @@ impl Vt {
         self.terminal.cursor_keys_app_mode()
     }
 
+    /// xterm modifyOtherKeys level (0 off, 1, 2) the app negotiated via
+    /// `CSI > 4 ; Pv m`. The frontend key encoder reads this to disambiguate
+    /// keys (e.g. Ctrl+I from Tab) as `CSI 27 ; mod ; code ~`.
+    pub fn modify_other_keys(&self) -> u8 {
+        self.terminal.modify_other_keys()
+    }
+
     /// The active mouse-reporting protocol (DEC modes 1000/1002/1003). When more
     /// than one is somehow enabled, the most permissive wins.
     pub fn mouse_protocol(&self) -> MouseProtocol {

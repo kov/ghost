@@ -75,6 +75,10 @@ pub enum Function {
     Ich(u16),
     Il(u16),
     Lf,
+    /// xterm modifyOtherKeys level (XTMODKEYS resource 4): `CSI > 4 ; Pv m`.
+    /// 0 = off, 1 = report keys lacking an unambiguous legacy byte, 2 = also
+    /// report the well-known C0 keys (Ctrl+letter, Tab, Enter, Esc, …).
+    ModifyOtherKeys(u8),
     Nel,
     Print(char),
     Rep(u16),
@@ -875,6 +879,20 @@ impl Parser {
                 ps[..=self.cur_param].iter().filter_map(dec_mode),
             ))),
 
+            // XTMODKEYS: `CSI > Pp ; Pv m`. We track only modifyOtherKeys
+            // (Pp == 4); the other resources (modifyCursorKeys, …) are ignored.
+            // The reset form `CSI > 4 m` omits Pv, which defaults to 0 (off).
+            // Pv is 0/1/2; clamp anything higher to the most aggressive level
+            // rather than truncating to u8 (256 would wrap to 0 = off).
+            (Some('>'), 'm') if ps[0].as_u16() == 4 => {
+                let level = match ps[1].as_u16() {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                Some(ModifyOtherKeys(level))
+            }
+
             _ => None,
         }
     }
@@ -1174,6 +1192,9 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Ich(n) => push_csi(seq, None, &[n.to_string()], '@'),
         Il(n) => push_csi(seq, None, &[n.to_string()], 'L'),
         Lf => seq.push('\n'),
+        ModifyOtherKeys(level) => {
+            push_csi(seq, Some('>'), &["4".to_owned(), level.to_string()], 'm')
+        }
         Nel => push_esc(seq, None, 'E'),
         Print(ch) => seq.push(*ch),
         Rep(n) => push_csi(seq, None, &[n.to_string()], 'b'),
@@ -2011,6 +2032,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_modify_other_keys() {
+        // XTMODKEYS resource 4: set levels 1 and 2.
+        assert_eq!(parse("\x1b[>4;1m"), [ModifyOtherKeys(1)]);
+        assert_eq!(parse("\x1b[>4;2m"), [ModifyOtherKeys(2)]);
+        // Explicit off, and the no-Pv reset form (Pv defaults to 0).
+        assert_eq!(parse("\x1b[>4;0m"), [ModifyOtherKeys(0)]);
+        assert_eq!(parse("\x1b[>4m"), [ModifyOtherKeys(0)]);
+        // Other XTMODKEYS resources (Pp != 4) are not tracked.
+        assert_eq!(parse("\x1b[>1;2m"), []);
+        assert_eq!(parse("\x1b[>2;2m"), []);
+    }
+
+    #[test]
     fn parse_osc_title() {
         // OSC 0 (icon + title) and OSC 2 (title) both set the window title,
         // terminated by BEL, C1 ST, or ESC \.
@@ -2266,6 +2300,9 @@ mod tests {
             Ich(16),
             Il(16),
             Lf,
+            ModifyOtherKeys(0),
+            ModifyOtherKeys(1),
+            ModifyOtherKeys(2),
             Nel,
             Print('A'),
             Print('日'),

@@ -35,6 +35,9 @@ pub struct Terminal {
     auto_wrap_mode: bool,
     new_line_mode: bool,
     cursor_keys_mode: CursorKeysMode,
+    /// xterm modifyOtherKeys level (XTMODKEYS resource 4): 0 off, 1, 2. Drives
+    /// the frontend key encoder; re-emitted on dump so it survives a reattach.
+    modify_other_keys: u8,
     top_margin: usize,
     bottom_margin: usize,
     saved_ctx: SavedCtx,
@@ -123,6 +126,7 @@ impl Terminal {
             auto_wrap_mode: true,
             new_line_mode: false,
             cursor_keys_mode: CursorKeysMode::Normal,
+            modify_other_keys: 0,
             top_margin: 0,
             bottom_margin: (rows - 1),
             saved_ctx: SavedCtx::default(),
@@ -282,6 +286,10 @@ impl Terminal {
 
             Lf => {
                 self.lf();
+            }
+
+            ModifyOtherKeys(level) => {
+                self.modify_other_keys = level;
             }
 
             Nel => {
@@ -636,6 +644,7 @@ impl Terminal {
         self.auto_wrap_mode = true;
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
+        self.modify_other_keys = 0;
         self.top_margin = 0;
         self.bottom_margin = self.rows - 1;
         self.saved_ctx = SavedCtx::default();
@@ -697,6 +706,11 @@ impl Terminal {
         self.cursor_keys_mode == CursorKeysMode::Application
     }
 
+    /// xterm modifyOtherKeys level (0 off, 1, 2) — see [`Function::ModifyOtherKeys`].
+    pub fn modify_other_keys(&self) -> u8 {
+        self.modify_other_keys
+    }
+
     /// Whether a tracked non-display mode (mouse/focus/paste) is enabled.
     pub(crate) fn mode_enabled(&self, mode: DecMode) -> bool {
         self.tracked_modes.contains(&mode)
@@ -740,6 +754,7 @@ impl Terminal {
         assert_eq!(self.auto_wrap_mode, other.auto_wrap_mode);
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
+        assert_eq!(self.modify_other_keys, other.modify_other_keys);
         assert_eq!(self.top_margin, other.top_margin);
         assert_eq!(self.bottom_margin, other.bottom_margin);
         assert_eq!(self.saved_ctx, other.saved_ctx);
@@ -1659,6 +1674,12 @@ impl Terminal {
 
         if self.cursor_keys_mode == CursorKeysMode::Application {
             funs.push(Function::Decset(DecModes::one(DecMode::CursorKeys)));
+        }
+
+        // re-arm modifyOtherKeys so a reattached client encodes keys the way the
+        // app negotiated before this client connected.
+        if self.modify_other_keys != 0 {
+            funs.push(Function::ModifyOtherKeys(self.modify_other_keys));
         }
 
         // 15. re-enable non-display modes (mouse / focus / paste). Order is
@@ -3277,6 +3298,26 @@ mod tests {
 
         term.execute(Decrst(dec_modes([DecMode::CursorKeys])));
         assert!(!term.cursor_keys_app_mode());
+    }
+
+    #[test]
+    fn execute_modify_other_keys() {
+        let mut term = Terminal::new((4, 2), None);
+        assert_eq!(term.modify_other_keys(), 0);
+
+        term.execute(Function::ModifyOtherKeys(2));
+        assert_eq!(term.modify_other_keys(), 2);
+
+        // RIS clears it; the live app must re-negotiate after a hard reset.
+        term.execute(Function::Ris);
+        assert_eq!(term.modify_other_keys(), 0);
+
+        // It survives a state dump (re-emitted so a reattach stays in sync).
+        term.execute(Function::ModifyOtherKeys(2));
+        assert!(
+            term.dump().contains(&Function::ModifyOtherKeys(2)),
+            "modifyOtherKeys must be re-emitted on dump"
+        );
     }
 
     #[test]

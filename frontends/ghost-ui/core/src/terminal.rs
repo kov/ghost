@@ -388,7 +388,8 @@ impl TerminalModel {
             Some(Shortcut::NewSession) => vec![Cmd::SpawnSession],
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
-                match encode::encode(key, mods, app_cursor) {
+                let modify_other_keys = self.screen.vt().modify_other_keys();
+                match encode::encode(key, mods, app_cursor, modify_other_keys) {
                     // Typing returns to the live bottom, then sends the keystroke.
                     Some(bytes) => {
                         let mut cmds = self.snap_to_bottom();
@@ -1316,6 +1317,29 @@ mod tests {
         assert_eq!(
             key(&mut m, Key::Char("c".into()), Mods::CTRL),
             vec![sent("alpha", b"\x03")]
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_is_negotiated_through_the_terminal() {
+        let mut m = model();
+        // Without negotiation, Ctrl+I is the legacy Tab byte.
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x09")]
+        );
+        // The app enables modifyOtherKeys level 2 (XTMODKEYS) on its PTY...
+        feed(&mut m, b"\x1b[>4;2m");
+        // ...so Ctrl+I now reports as CSI 27;5;105~, distinct from a real Tab.
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x1b[27;5;105~")]
+        );
+        // Reset (CSI > 4 m) returns to the legacy encoding.
+        feed(&mut m, b"\x1b[>4m");
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x09")]
         );
     }
 
