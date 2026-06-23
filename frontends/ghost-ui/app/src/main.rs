@@ -63,10 +63,13 @@ fn main() {
     }
 }
 
-/// Grid cell count for a surface of `w`×`h` pixels at our cell metrics.
-fn grid_from_pixels(w: u32, h: u32) -> (u16, u16) {
-    let cols = (w as f32 / METRICS.advance).floor().max(1.0) as u16;
-    let rows = (h as f32 / METRICS.line_height).floor().max(1.0) as u16;
+/// Grid cell count for a surface of `w`×`h` physical pixels at `scale` (cells
+/// are the base metrics scaled by the device factor, matching the model).
+fn grid_from_pixels(w: u32, h: u32, scale: f32) -> (u16, u16) {
+    let advance = METRICS.advance * scale;
+    let line_height = METRICS.line_height * scale;
+    let cols = (w as f32 / advance).floor().max(1.0) as u16;
+    let rows = (h as f32 / line_height).floor().max(1.0) as u16;
     (cols, rows)
 }
 
@@ -373,8 +376,11 @@ impl Graphics {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // Rasterize glyphs at the physical pixel size; the model lays the grid
+        // out at the matching scaled metrics, so the two stay in lockstep.
+        let font_px = SIZE_PX * self.window.scale_factor() as f32;
         self.renderer
-            .render_scene_to_view(&target, scene, font, SIZE_PX);
+            .render_scene_to_view(&target, scene, font, font_px);
         self.window.pre_present_notify();
         frame_tex.present();
     }
@@ -504,7 +510,8 @@ impl ApplicationHandler for App {
             return;
         }
         let gfx = Graphics::new(event_loop);
-        let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height);
+        let scale = gfx.window.scale_factor();
+        let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
         match attach(&self.name, cols, rows) {
             Ok(session) => {
                 self.sessions.insert(self.name.clone(), session);
@@ -521,16 +528,18 @@ impl ApplicationHandler for App {
             METRICS,
             (gfx.config.width, gfx.config.height),
         ));
-        gfx.window.request_redraw();
         let (w, h) = (gfx.config.width, gfx.config.height);
         self.gfx = Some(gfx);
-        // Sync the model's viewport to the real surface size; it drives both the
-        // NDC mapping and the scissor clamp, so they must match the attachment.
+        // Sync the model's viewport to the real surface size *and* device scale
+        // before the first paint — this drives the NDC mapping, the scissor
+        // clamp, and the cell metrics, and its `Cmd::Redraw` requests that paint.
+        // (No earlier `request_redraw`: it would race a frame at the default 1x
+        // scale against glyphs the renderer rasterizes at `SIZE_PX * scale`.)
         self.dispatch(
             UiEvent::Resize {
                 w_px: w,
                 h_px: h,
-                scale: 1.0,
+                scale,
             },
             event_loop,
         );
@@ -590,6 +599,28 @@ impl ApplicationHandler for App {
                     },
                     event_loop,
                 );
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // The display's DPI changed (e.g. the window moved to another
+                // monitor). Reconfigure the surface to the window's *actual* new
+                // physical size and re-derive the grid at the new scale, so a
+                // redraw arriving before the (usual) following Resized still
+                // renders with matching metrics rather than the stale config size.
+                let size = self.gfx.as_mut().map(|g| {
+                    let s = g.window.inner_size();
+                    g.resize(s.width, s.height);
+                    (s.width, s.height)
+                });
+                if let Some((w, h)) = size {
+                    self.dispatch(
+                        UiEvent::Resize {
+                            w_px: w.max(1),
+                            h_px: h.max(1),
+                            scale: scale_factor,
+                        },
+                        event_loop,
+                    );
+                }
             }
             WindowEvent::RedrawRequested => {
                 if let (Some(g), Some(r)) = (self.gfx.as_mut(), self.root.as_ref()) {

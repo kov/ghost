@@ -21,6 +21,8 @@ pub struct RootModel {
     mode: Mode,
     metrics: CellMetrics,
     size_px: (u32, u32),
+    /// Device scale factor, tracked so a fleet toggle preserves HiDPI sizing.
+    scale: f32,
     /// Sessions this window owns, for fleet grouping (this-window vs elsewhere).
     mine: HashSet<SessionId>,
 }
@@ -38,6 +40,7 @@ impl RootModel {
             mode: Mode::Single(Box::new(model)),
             metrics,
             size_px,
+            scale: 1.0,
             mine,
         }
     }
@@ -56,8 +59,11 @@ impl RootModel {
         {
             return self.toggle();
         }
-        if let UiEvent::Resize { w_px, h_px, .. } = &ev {
+        if let UiEvent::Resize { w_px, h_px, scale } = &ev {
             self.size_px = (*w_px, *h_px);
+            if *scale > 0.0 {
+                self.scale = *scale as f32;
+            }
         }
         match &mut self.mode {
             Mode::Single(m) => m.update(ev),
@@ -93,13 +99,18 @@ impl RootModel {
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, cmds) = match current {
             Mode::Single(m) => {
-                let (fleet, mut cmds) =
-                    FleetModel::adopting(*m, self.metrics, self.size_px, self.mine.clone());
+                let (fleet, mut cmds) = FleetModel::adopting(
+                    *m,
+                    self.metrics,
+                    self.size_px,
+                    self.scale,
+                    self.mine.clone(),
+                );
                 cmds.insert(0, Cmd::ListSessions); // populate the grid
                 (Mode::Fleet(Box::new(fleet)), cmds)
             }
             Mode::Fleet(f) => {
-                let (model, mut cmds) = f.into_single(self.size_px);
+                let (model, mut cmds) = f.into_single(self.size_px, self.scale);
                 cmds.push(Cmd::Redraw);
                 (Mode::Single(Box::new(model)), cmds)
             }
@@ -211,6 +222,32 @@ mod tests {
                 bytes: b"z".to_vec()
             }]
         );
+    }
+
+    #[test]
+    fn fleet_toggle_preserves_device_scale() {
+        use crate::SceneItem;
+        let mut r = root();
+        // HiDPI: a 2x surface. Cells double, so the grid halves and the rendered
+        // frame carries the physical metrics.
+        r.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 2.0,
+        });
+        // Round-trip through the fleet overview.
+        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        assert!(!r.is_fleet());
+        match r.view().terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => {
+                assert_eq!(
+                    frame.metrics.advance, 18.0,
+                    "single view still renders at 2x"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

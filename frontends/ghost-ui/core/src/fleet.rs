@@ -79,7 +79,10 @@ fn attachable(group: Group) -> bool {
 pub struct FleetModel {
     tiles: Vec<Tile>,
     focused: Option<SessionId>,
+    /// Base (1x) cell metrics; physical metrics are these scaled by `scale`.
     metrics: CellMetrics,
+    /// Device scale factor, propagated to every tile so previews track HiDPI.
+    scale: f32,
     size_px: (u32, u32),
     mine: HashSet<SessionId>,
     next_handle: u64,
@@ -132,9 +135,18 @@ impl FleetModel {
             tiles: Vec::new(),
             focused: None,
             metrics,
+            scale: 1.0,
             size_px,
             mine,
             next_handle: 0,
+        }
+    }
+
+    /// Physical cell metrics: the base metrics scaled by the device scale factor.
+    fn effective_metrics(&self) -> CellMetrics {
+        CellMetrics {
+            advance: self.metrics.advance * self.scale,
+            line_height: self.metrics.line_height * self.scale,
         }
     }
 
@@ -144,9 +156,11 @@ impl FleetModel {
         primary: TerminalModel,
         metrics: CellMetrics,
         size_px: (u32, u32),
+        scale: f32,
         mine: HashSet<SessionId>,
     ) -> (Self, Vec<Cmd>) {
         let mut f = FleetModel::new(metrics, size_px, mine);
+        f.scale = scale;
         let id = primary.session().to_string();
         let group = group_for(&f.mine, &id, true);
         f.focused = Some(id.clone());
@@ -201,7 +215,7 @@ impl FleetModel {
     /// identity), falling back to the focused tile, then any tile — never a
     /// foreign session we merely previewed, so the single view always returns to
     /// what the window actually drives.
-    pub fn into_single(self, size_px: (u32, u32)) -> (TerminalModel, Vec<Cmd>) {
+    pub fn into_single(self, size_px: (u32, u32), scale: f32) -> (TerminalModel, Vec<Cmd>) {
         let metrics = self.metrics;
         let keep = self
             .tiles
@@ -228,7 +242,7 @@ impl FleetModel {
         cmds.append(&mut model.update(UiEvent::Resize {
             w_px: size_px.0.max(1),
             h_px: size_px.1.max(1),
-            scale: 1.0,
+            scale: scale as f64,
         }));
         (model, cmds)
     }
@@ -239,8 +253,11 @@ impl FleetModel {
         match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, bytes, ended),
-            UiEvent::Resize { w_px, h_px, .. } => {
+            UiEvent::Resize { w_px, h_px, scale } => {
                 self.size_px = (w_px, h_px);
+                if scale > 0.0 {
+                    self.scale = scale as f32;
+                }
                 self.relayout()
             }
             UiEvent::Key {
@@ -335,13 +352,14 @@ impl FleetModel {
     /// whether to also redraw), so an idle re-layout produces nothing.
     fn relayout(&mut self) -> Vec<Cmd> {
         let placements = self.layout();
+        let scale = f64::from(self.scale);
         let mut cmds = Vec::new();
         for (_, id, rect) in placements {
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) {
                 for c in tile.model.update(UiEvent::Resize {
                     w_px: rect.w.max(1.0) as u32,
                     h_px: rect.h.max(1.0) as u32,
-                    scale: 1.0,
+                    scale,
                 }) {
                     // The tile model emits Resize only when its grid changed; its
                     // Redraw is subsumed by the caller's own redraw decision.
@@ -448,7 +466,7 @@ impl FleetModel {
                 continue;
             };
             let focused = self.focused.as_deref() == Some(id.as_str());
-            let frame = layout_frame(tile.model.screen().vt(), self.metrics);
+            let frame = layout_frame(tile.model.screen().vt(), self.effective_metrics());
             items.push(SceneItem::Terminal {
                 id: SceneId::Tile(handle),
                 rect,
@@ -750,7 +768,7 @@ mod tests {
         // The window owns "alpha"; the fleet also previews a foreign "beta".
         let mine = HashSet::from(["alpha".to_string()]);
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
-        let (mut f, _) = FleetModel::adopting(primary, METRICS, SIZE, mine);
+        let (mut f, _) = FleetModel::adopting(primary, METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(vec![info("alpha"), info("beta")]));
         // Move focus onto the foreign tile.
         f.update(UiEvent::Key {
@@ -760,7 +778,7 @@ mod tests {
         });
         assert_eq!(f.focused(), Some("beta"));
         // Toggling back returns the OWNED session, and detaches the foreign one.
-        let (model, cmds) = f.into_single(SIZE);
+        let (model, cmds) = f.into_single(SIZE, 1.0);
         assert_eq!(model.session(), "alpha", "keeps the window's own session");
         assert!(cmds.contains(&Cmd::Detach("beta".into())));
     }

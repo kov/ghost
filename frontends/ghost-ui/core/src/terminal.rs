@@ -59,7 +59,12 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
 /// One terminal view's reducer state.
 pub struct TerminalModel {
     session: SessionId,
+    /// Base (logical, 1x) cell metrics; physical metrics are these scaled by
+    /// [`scale`](Self::scale).
     metrics: CellMetrics,
+    /// Device scale factor (physical px per logical px) from the last resize, so
+    /// glyphs and the grid track HiDPI displays. 1.0 until the shell reports one.
+    scale: f32,
     size_px: (u32, u32),
     screen: Screen,
     scanner: QueryScanner,
@@ -88,6 +93,7 @@ impl TerminalModel {
         TerminalModel {
             session,
             metrics,
+            scale: 1.0,
             size_px,
             screen: Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK),
             scanner: QueryScanner::new(),
@@ -134,7 +140,7 @@ impl TerminalModel {
                 wheel_dy,
             } => self.pointer(phase, button, pos, mods, wheel_dy),
             UiEvent::Focus(focused) => self.focus(focused),
-            UiEvent::Resize { w_px, h_px, .. } => self.resize(w_px, h_px),
+            UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
             // A lone terminal ignores enumeration and the clock (no animation yet).
@@ -142,9 +148,22 @@ impl TerminalModel {
         }
     }
 
+    /// Physical cell metrics: the logical metrics scaled by the device scale
+    /// factor, so layout and hit-testing match what the renderer rasterizes.
+    fn effective_metrics(&self) -> CellMetrics {
+        CellMetrics {
+            advance: self.metrics.advance * self.scale,
+            line_height: self.metrics.line_height * self.scale,
+        }
+    }
+
     /// Render the current state to a single full-window terminal scene.
     pub fn view(&self) -> Scene {
-        let frame = layout_frame_at(self.screen.vt(), self.metrics, self.scroll_offset);
+        let frame = layout_frame_at(
+            self.screen.vt(),
+            self.effective_metrics(),
+            self.scroll_offset,
+        );
         let rect = RectPx {
             x: 0.0,
             y: 0.0,
@@ -311,11 +330,19 @@ impl TerminalModel {
         }
     }
 
-    fn resize(&mut self, w_px: u32, h_px: u32) -> Vec<Cmd> {
+    fn resize(&mut self, w_px: u32, h_px: u32, scale: f32) -> Vec<Cmd> {
         self.size_px = (w_px, h_px);
-        let cols = (w_px as f32 / self.metrics.advance).floor().max(1.0) as u16;
-        let rows = (h_px as f32 / self.metrics.line_height).floor().max(1.0) as u16;
+        // A non-positive scale (never sent by winit) would break the grid math;
+        // ignore it and keep the last good value, as the Fleet/Root models do.
+        if scale > 0.0 {
+            self.scale = scale;
+        }
+        let m = self.effective_metrics();
+        let cols = (w_px as f32 / m.advance).floor().max(1.0) as u16;
+        let rows = (h_px as f32 / m.line_height).floor().max(1.0) as u16;
         if (cols, rows) == (self.cols, self.rows) {
+            // Grid unchanged, but a scale change still needs a repaint at the new
+            // (physical) glyph size.
             return vec![Cmd::Redraw];
         }
         self.cols = cols;
@@ -392,13 +419,12 @@ impl TerminalModel {
         self.mouse_active() && !mods.shift
     }
 
-    /// 1-based `(col, row)` cell under a pointer position.
+    /// 1-based `(col, row)` cell under a pointer position. Pointer coordinates
+    /// are physical pixels, so they divide by the physical (scaled) metrics.
     fn point_to_cell(&self, pos: PointPx) -> (u16, u16) {
-        let col = (pos.x / f64::from(self.metrics.advance)).floor().max(0.0) as u16 + 1;
-        let row = (pos.y / f64::from(self.metrics.line_height))
-            .floor()
-            .max(0.0) as u16
-            + 1;
+        let m = self.effective_metrics();
+        let col = (pos.x / f64::from(m.advance)).floor().max(0.0) as u16 + 1;
+        let row = (pos.y / f64::from(m.line_height)).floor().max(0.0) as u16 + 1;
         (col, row)
     }
 
@@ -810,6 +836,55 @@ mod tests {
             ]
         );
         assert!(m.selection().is_none());
+    }
+
+    #[test]
+    fn resize_applies_device_scale_to_metrics_and_grid() {
+        let mut m = model(); // base metrics advance 9, line_height 18
+        // A 2x HiDPI surface 720x432 physical px: cells are 18x36 px, so the grid
+        // is half of the 1x 80x24 — 40 cols x 12 rows — and the rendered frame
+        // carries the scaled (physical) metrics so glyphs rasterize crisp.
+        let cmds = m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 2.0,
+        });
+        assert!(cmds.contains(&Cmd::Resize {
+            session: "alpha".to_string(),
+            cols: 40,
+            rows: 12
+        }));
+        match m.view().terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => {
+                assert_eq!(frame.metrics.advance, 18.0);
+                assert_eq!(frame.metrics.line_height, 36.0);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn resize_ignores_non_positive_scale_and_keeps_last_good() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 2.0,
+        });
+        // A bogus scale (winit never sends one) must not corrupt the grid: keep 2x.
+        let cmds = m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 0.0,
+        });
+        // Grid unchanged at 2x (40x12), so no Resize — only a Redraw.
+        assert_eq!(cmds, vec![Cmd::Redraw]);
+        match m.view().terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => {
+                assert_eq!(frame.metrics.advance, 18.0, "scale held at 2x, not reset");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
