@@ -125,3 +125,52 @@ fn applies_color_scheme_from_config() {
         "expected the solarized-dark background, only {solar}/{total} pixels matched"
     );
 }
+
+#[test]
+fn applies_window_opacity_from_config() {
+    // A ui.toml setting [window] opacity makes the default background translucent:
+    // the captured PNG's blank area carries ~half alpha, not a solid 255. Proves
+    // config -> Theme.bg_alpha -> the premultiplied clear, end to end.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("run");
+    let cfg = tmp.path().join("config");
+    std::fs::create_dir_all(&xdg).unwrap();
+    std::fs::create_dir_all(cfg.join("ghost")).unwrap();
+    std::fs::write(
+        cfg.join("ghost").join("ui.toml"),
+        "[window]\nopacity = 0.5\n",
+    )
+    .unwrap();
+    let png = tmp.path().join("out.png");
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .env("GHOST_CAPTURE", &png)
+        .env("GHOST_CMD", "printf 'hi\\n'");
+    if Path::new(LAVAPIPE).exists() {
+        cmd.env("VK_ICD_FILENAMES", LAVAPIPE);
+    }
+    let out = cmd.output().expect("run ghost-ui");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ghost-ui capture failed:\n{stderr}");
+
+    let bytes = std::fs::read(&png).expect("png written");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+    reader.next_frame(&mut buf).expect("png frame");
+    let total = buf.len() / 4;
+    // The mostly-blank screen is the default background (#101012) at 0.5 opacity.
+    // Most pixels must carry alpha ~128 (half of 255), AND straight (not
+    // premultiplied) RGB ~16 — a premultiplied PNG would store ~8 and composite
+    // too dark in any viewer.
+    let translucent_bg = buf
+        .chunks_exact(4)
+        .filter(|p| (12..=20).contains(&p[0]) && (110..=145).contains(&p[3]))
+        .count();
+    assert!(
+        translucent_bg > total / 2,
+        "expected a half-transparent, straight-alpha background, only {translucent_bg}/{total} matched"
+    );
+}

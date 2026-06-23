@@ -1,10 +1,11 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
-//! from `$XDG_CONFIG_HOME/ghost/ui.toml`. Currently it selects a color scheme.
+//! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
+//! a persisted font zoom (`[zoom]`), and the background opacity (`[window]`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
 //! is pure and unit-tested. Scheme ids match ghost-gtk's so the two frontends can
 //! eventually share a config. Unknown sections/fields are ignored, so a file that
-//! also carries (not-yet-read) `[font]`/`[window]` settings still loads.
+//! also carries (not-yet-read) `[font]` settings still loads.
 
 use ghost_renderer::Theme;
 use serde::Deserialize;
@@ -104,6 +105,7 @@ fn scheme_by_id(id: &str) -> Option<&'static Scheme> {
 pub struct UiConfig {
     colors: Colors,
     zoom: Zoom,
+    window: Window,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -126,6 +128,20 @@ impl Default for Zoom {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Window {
+    /// Background opacity, 0.0..=1.0 (clamped on apply). Only the default
+    /// background goes translucent; SGR-coloured cells stay opaque. 1.0 = solid.
+    opacity: f32,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Window { opacity: 1.0 }
+    }
+}
+
 impl UiConfig {
     /// Load `$XDG_CONFIG_HOME/ghost/ui.toml`. A missing file yields defaults; a
     /// malformed one is logged and ignored (never fatal).
@@ -145,9 +161,9 @@ impl UiConfig {
     }
 
     /// The renderer theme this config selects. An absent or unknown scheme keeps
-    /// the renderer's default theme.
+    /// the renderer's default theme; `[window] opacity` rides on top of either.
     pub fn theme(&self) -> Theme {
-        match self.colors.scheme.as_deref() {
+        let mut theme = match self.colors.scheme.as_deref() {
             None => Theme::default(),
             Some(id) => match scheme_by_id(id) {
                 Some(s) => Theme {
@@ -161,7 +177,15 @@ impl UiConfig {
                     Theme::default()
                 }
             },
-        }
+        };
+        // f32::clamp passes NaN through, and a non-finite alpha would poison the
+        // GPU clear, so a non-finite opacity falls back to fully opaque.
+        theme.bg_alpha = if self.window.opacity.is_finite() {
+            self.window.opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        theme
     }
 
     /// The persisted font zoom (raw; the model clamps it to its bounds). 1.0
@@ -205,6 +229,42 @@ mod tests {
         assert_eq!(c.zoom(), 1.5);
         // A present [zoom] table without scale still defaults to 1.0.
         assert_eq!(UiConfig::parse("[zoom]\n").unwrap().zoom(), 1.0);
+    }
+
+    #[test]
+    fn window_opacity_parses_clamps_and_defaults_to_one() {
+        // Default, empty, and a present-but-empty [window] table are all opaque.
+        assert_eq!(UiConfig::default().theme().bg_alpha, 1.0);
+        assert_eq!(UiConfig::parse("").unwrap().theme().bg_alpha, 1.0);
+        assert_eq!(UiConfig::parse("[window]\n").unwrap().theme().bg_alpha, 1.0);
+        // A set value flows to the theme's clear alpha.
+        let c = UiConfig::parse("[window]\nopacity = 0.5\n").unwrap();
+        assert_eq!(c.theme().bg_alpha, 0.5);
+        // Out-of-range opacity clamps into 0.0..=1.0.
+        assert_eq!(
+            UiConfig::parse("[window]\nopacity = 2.0\n")
+                .unwrap()
+                .theme()
+                .bg_alpha,
+            1.0
+        );
+        assert_eq!(
+            UiConfig::parse("[window]\nopacity = -1.0\n")
+                .unwrap()
+                .theme()
+                .bg_alpha,
+            0.0
+        );
+        // Opacity is independent of the chosen colour scheme.
+        let c = UiConfig::parse("[colors]\nscheme = \"tango-dark\"\n\n[window]\nopacity = 0.5\n")
+            .unwrap();
+        assert_eq!(c.theme().bg, [0x2e, 0x34, 0x36]);
+        assert_eq!(c.theme().bg_alpha, 0.5);
+        // A non-finite opacity (valid TOML, and f32::clamp passes NaN through)
+        // must not poison the clear: fall back to fully opaque.
+        let c = UiConfig::parse("[window]\nopacity = nan\n").unwrap();
+        assert!(c.theme().bg_alpha.is_finite());
+        assert_eq!(c.theme().bg_alpha, 1.0);
     }
 
     #[test]

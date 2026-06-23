@@ -84,12 +84,26 @@ fn map_button(b: MouseButton) -> Option<PointerButton> {
 }
 
 fn write_png(path: &Path, img: &Rendered) {
+    // The renderer outputs premultiplied alpha, but PNG's RGBA is straight, so
+    // un-premultiply (divide RGB by alpha). This is identity for opaque pixels
+    // (alpha 255), leaving fully-opaque captures byte-for-byte unchanged.
+    let mut straight = Vec::with_capacity(img.rgba.len());
+    for p in img.rgba.chunks_exact(4) {
+        let a = p[3];
+        if a == 0 || a == 255 {
+            straight.extend_from_slice(p);
+        } else {
+            let un = |c: u8| (u16::from(c) * 255 / u16::from(a)).min(255) as u8;
+            straight.extend_from_slice(&[un(p[0]), un(p[1]), un(p[2]), a]);
+        }
+    }
+
     let file = std::fs::File::create(path).expect("create png");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width, img.height);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     let mut writer = enc.write_header().expect("png header");
-    writer.write_image_data(&img.rgba).expect("png data");
+    writer.write_image_data(&straight).expect("png data");
 }
 
 /// Attach (deferred) to a named session and complete the handshake at
@@ -277,6 +291,27 @@ fn interactive() {
     event_loop.run_app(&mut app).expect("run app");
 }
 
+/// Pick a surface alpha mode. Our pipeline emits premultiplied alpha, so for a
+/// translucent window we want `PreMultiplied` (and `Inherit`/`Auto`, which defer
+/// to a premultiplied compositor); `PostMultiplied` would expect straight alpha
+/// and wash the colours, so it is never chosen. A capability list always has at
+/// least one entry, and an opaque window just takes the first (usually Opaque).
+fn choose_alpha_mode(
+    modes: &[wgpu::CompositeAlphaMode],
+    want_transparent: bool,
+) -> wgpu::CompositeAlphaMode {
+    use wgpu::CompositeAlphaMode::{Auto, Inherit, PreMultiplied};
+    if want_transparent {
+        for preferred in [PreMultiplied, Inherit, Auto] {
+            if modes.contains(&preferred) {
+                return preferred;
+            }
+        }
+        eprintln!("ghost-ui: no premultiplied alpha mode; window will stay opaque");
+    }
+    modes[0]
+}
+
 /// Per-window GPU state, valid only once the window (and surface) exist.
 struct Graphics {
     window: Arc<Window>,
@@ -292,9 +327,13 @@ impl Graphics {
             u32::from(COLS) * METRICS.advance as u32,
             u32::from(ROWS) * METRICS.line_height as u32,
         );
+        // Request a transparent window only when the theme is translucent, so an
+        // opaque setup never pays the compositor's alpha-blending cost.
+        let want_transparent = theme.bg_alpha < 1.0;
         let attrs = Window::default_attributes()
             .with_title("ghost")
-            .with_inner_size(size);
+            .with_inner_size(size)
+            .with_transparent(want_transparent);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
 
@@ -329,7 +368,7 @@ impl Graphics {
             height: win.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: choose_alpha_mode(&caps.alpha_modes, want_transparent),
             view_formats: vec![],
         };
         surface.configure(&device, &config);
@@ -973,5 +1012,25 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_alpha_mode;
+    use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
+
+    #[test]
+    fn alpha_mode_prefers_premultiplied_when_transparent() {
+        // The compositor offers premultiplied: take it.
+        assert_eq!(
+            choose_alpha_mode(&[Opaque, PreMultiplied], true),
+            PreMultiplied
+        );
+        // Only straight (post) alpha is offered — it would wash our premultiplied
+        // output, so we decline and stay opaque (the first mode) instead.
+        assert_eq!(choose_alpha_mode(&[Opaque, PostMultiplied], true), Opaque);
+        // An opaque window ignores transparency entirely.
+        assert_eq!(choose_alpha_mode(&[Opaque, PreMultiplied], false), Opaque);
     }
 }

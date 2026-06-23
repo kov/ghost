@@ -190,6 +190,10 @@ pub struct Theme {
     /// The 16 base ANSI colors (indices 0..=15). Color schemes replace these;
     /// the 256-color cube and grayscale ramp (16..=255) stay standard.
     pub palette: [[u8; 3]; 16],
+    /// Opacity of the default background (the window clear), 0.0..=1.0. Cells
+    /// with an explicit SGR background stay opaque; only the default-bg areas
+    /// (where no quad is drawn) become translucent. 1.0 is fully opaque.
+    pub bg_alpha: f32,
 }
 
 impl Default for Theme {
@@ -199,6 +203,7 @@ impl Default for Theme {
             bg: [0x10, 0x10, 0x12],
             selection: [0x3a, 0x53, 0x7a],
             palette: ANSI_16,
+            bg_alpha: 1.0,
         }
     }
 }
@@ -363,7 +368,11 @@ fn vs(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let a = textureSample(atlas, samp, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * a);
+    // Premultiplied output: the surface alpha modes our windows use (and Wayland
+    // / macOS natively) expect colour already scaled by coverage. At full opacity
+    // this is identity, so opaque rendering is unchanged.
+    let cov = in.color.a * a;
+    return vec4<f32>(in.color.rgb * cov, cov);
 }
 "#;
 
@@ -648,18 +657,9 @@ impl Renderer {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::SrcAlpha,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
+                        // Premultiplied "over": the fragment shader already
+                        // scales colour by alpha, so the source factor is One.
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -981,10 +981,11 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.theme.bg[0]) / 255.0,
-                            g: f64::from(self.theme.bg[1]) / 255.0,
-                            b: f64::from(self.theme.bg[2]) / 255.0,
-                            a: 1.0,
+                            // Premultiplied clear: RGB scaled by the bg opacity.
+                            r: f64::from(self.theme.bg[0]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            g: f64::from(self.theme.bg[1]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            b: f64::from(self.theme.bg[2]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            a: f64::from(self.theme.bg_alpha),
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1188,10 +1189,11 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.theme.bg[0]) / 255.0,
-                            g: f64::from(self.theme.bg[1]) / 255.0,
-                            b: f64::from(self.theme.bg[2]) / 255.0,
-                            a: 1.0,
+                            // Premultiplied clear: RGB scaled by the bg opacity.
+                            r: f64::from(self.theme.bg[0]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            g: f64::from(self.theme.bg[1]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            b: f64::from(self.theme.bg[2]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            a: f64::from(self.theme.bg_alpha),
                         }),
                         store: wgpu::StoreOp::Store,
                     },

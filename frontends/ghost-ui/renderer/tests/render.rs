@@ -262,3 +262,35 @@ fn draws_bar_cursor_along_the_cell_leading_edge() {
     );
     assert_eq!(body, 0, "bar cursor must not fill the cell body ({body})");
 }
+
+#[test]
+fn translucent_theme_makes_default_background_see_through() {
+    // Hide the cursor, then print "A" on a blue background (col 0). With a
+    // half-opaque theme, the default-background area (no quad, just the clear)
+    // must read translucent, while the explicitly-coloured cell stays opaque —
+    // the standard terminal-transparency behaviour.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let theme = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+    let img = render_frame(&frame, font, 15.0, theme);
+
+    // A blank far-right cell (col 10, x ~94) carries only the clear: ~half alpha.
+    let blank = px(&img, 94, 9);
+    assert!(
+        (100..=160).contains(&(blank[3] as u32)),
+        "default background should be ~half transparent, got alpha {}",
+        blank[3]
+    );
+    // The blue-background cell (col 0) stays fully opaque.
+    let colored = px(&img, 4, 9);
+    assert_eq!(
+        colored[3], 255,
+        "an SGR background must stay opaque, got alpha {}",
+        colored[3]
+    );
+}
