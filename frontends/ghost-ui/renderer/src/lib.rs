@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use ghost_render::{Frame, Style};
+use ghost_render::{Frame, Selection, Style};
 use ghost_shaper::FontRef;
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
@@ -182,6 +182,8 @@ pub fn render_solid(width: u32, height: u32, color: [f64; 4]) -> Rendered {
 pub struct Theme {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
+    /// Selection highlight tint, drawn translucently over cell backgrounds.
+    pub selection: [u8; 3],
 }
 
 impl Default for Theme {
@@ -189,9 +191,13 @@ impl Default for Theme {
         Theme {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
+            selection: [0x3a, 0x53, 0x7a],
         }
     }
 }
+
+/// Alpha of the selection tint — translucent so text stays readable beneath it.
+const SELECTION_ALPHA: f32 = 0.45;
 
 /// Standard xterm 16-color base palette (indices 0..=15).
 #[rustfmt::skip]
@@ -382,6 +388,8 @@ pub struct Renderer {
     // per-frame instance buffer.
     instances: Option<wgpu::Buffer>,
     instance_count: u32,
+    /// Current text selection to highlight, in viewport cell coordinates.
+    selection: Option<Selection>,
 }
 
 impl Renderer {
@@ -568,7 +576,13 @@ impl Renderer {
             shelf: 1,
             instances: None,
             instance_count: 0,
+            selection: None,
         }
+    }
+
+    /// Set (or clear) the text selection to highlight on subsequent frames.
+    pub fn set_selection(&mut self, selection: Option<Selection>) {
+        self.selection = selection;
     }
 
     /// The pixel dimensions a frame renders to at its cell metrics.
@@ -656,7 +670,35 @@ impl Renderer {
         let cursor = frame.cursor;
 
         let mut backgrounds: Vec<Instance> = Vec::new();
+        let mut selection_rects: Vec<Instance> = Vec::new();
         let mut glyphs: Vec<Instance> = Vec::new();
+
+        // Selection highlight: one translucent rect per selected row, computed
+        // straight from cell geometry (trimmed trailing blanks carry no run, so
+        // it can't be derived from runs). Drawn over backgrounds, under glyphs.
+        if let Some(sel) = self.selection {
+            let [r, g, b] = self.theme.selection;
+            let color = [
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                SELECTION_ALPHA,
+            ];
+            for row in 0..frame.rows_layout.len() {
+                if let Some((c0, c1)) = sel.row_span(row, frame.cols) {
+                    selection_rects.push(Instance {
+                        rect: [
+                            c0 as f32 * metrics.advance,
+                            row as f32 * metrics.line_height,
+                            (c1 - c0) as f32 * metrics.advance,
+                            metrics.line_height,
+                        ],
+                        uv: OPAQUE_UV,
+                        color,
+                    });
+                }
+            }
+        }
 
         for (row, layout) in frame.rows_layout.iter().enumerate() {
             let row_y = row as f32 * metrics.line_height;
@@ -709,7 +751,8 @@ impl Renderer {
             }
         }
 
-        backgrounds.extend(glyphs);
+        backgrounds.extend(selection_rects); // tint over cell backgrounds
+        backgrounds.extend(glyphs); // glyphs stay crisp on top
         backgrounds
     }
 

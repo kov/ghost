@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_render::{CellMetrics, layout_frame};
+use ghost_render::{CellMetrics, Selection, layout_frame};
 use ghost_renderer::{Gpu, Rendered, Renderer, Theme};
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
@@ -232,8 +232,11 @@ fn interactive() {
         view: None,
         mods: ModifiersState::empty(),
         name,
-        cursor_cell: (1, 1),
+        cursor_cell: None,
         held: None,
+        gesture_report: false,
+        sel_anchor: None,
+        selection: None,
         clipboard: None,
     };
     event_loop.run_app(&mut app).expect("run app");
@@ -320,7 +323,8 @@ impl Graphics {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, view: &SessionView) {
+    fn render(&mut self, view: &SessionView, selection: Option<Selection>) {
+        self.renderer.set_selection(selection);
         let frame_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -353,11 +357,18 @@ struct App {
     view: Option<SessionView>,
     mods: ModifiersState,
     name: String,
-    /// Last 1-based cell the pointer was over (for clicks/wheel without a fresh move).
-    cursor_cell: (u16, u16),
+    /// Last 1-based cell the pointer was over (`None` until the first move).
+    cursor_cell: Option<(u16, u16)>,
     /// The button currently held down, if any (distinguishes drag from hover).
     held: Option<mouse::Button>,
-    /// Lazily-opened system clipboard for paste.
+    /// Whether the in-progress press..release gesture is forwarded to the child
+    /// (latched at press so a mid-gesture Shift/mode flip can't split it).
+    gesture_report: bool,
+    /// Where a local text selection was anchored (0-based cell), while dragging.
+    sel_anchor: Option<(usize, usize)>,
+    /// The current local text selection, if any.
+    selection: Option<Selection>,
+    /// Lazily-opened system clipboard for copy/paste.
     clipboard: Option<arboard::Clipboard>,
 }
 
@@ -372,6 +383,56 @@ impl App {
             && let Ok(text) = cb.get_text()
         {
             let _ = v.paste(&text);
+        }
+    }
+
+    /// Copy the current selection's text to the system clipboard (best-effort).
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        let text = match self.view.as_ref() {
+            Some(v) => session_view::selection_text(v.screen(), sel),
+            None => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+    }
+
+    /// Whether a drag should be forwarded to the child as a mouse report (the
+    /// child grabbed the mouse) rather than driving local selection. Shift forces
+    /// local selection even when the child is listening, as xterm does.
+    fn report_to_app(&self) -> bool {
+        self.view.as_ref().is_some_and(|v| v.mouse_active()) && !self.mods.shift_key()
+    }
+
+    /// The 0-based `(row, col)` cell under the pointer, clamped to the grid.
+    fn pointer_cell0(&self) -> (usize, usize) {
+        let (col1, row1) = self.cursor_cell.unwrap_or((1, 1));
+        let (row0, col0) = (
+            row1.saturating_sub(1) as usize,
+            col1.saturating_sub(1) as usize,
+        );
+        match &self.view {
+            Some(v) => {
+                let (cols, rows) = v.screen().dimensions();
+                (
+                    row0.min((rows as usize).saturating_sub(1)),
+                    col0.min((cols as usize).saturating_sub(1)),
+                )
+            }
+            None => (row0, col0),
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(g) = &self.gfx {
+            g.window.request_redraw();
         }
     }
 }
@@ -400,10 +461,18 @@ impl ApplicationHandler for App {
         if let Some(view) = self.view.as_mut() {
             match view.drain(64) {
                 Ok(p) => {
-                    if p.dirty
-                        && let Some(g) = &self.gfx
-                    {
-                        g.window.request_redraw();
+                    if p.dirty {
+                        // Child output moved/repainted the viewport, so a
+                        // viewport-relative selection no longer maps to what the
+                        // user picked — drop it (xterm/VTE clear-on-output). Skip
+                        // while a drag is live so output mid-gesture can't cancel it.
+                        if self.held.is_none() {
+                            self.selection = None;
+                            self.sel_anchor = None;
+                        }
+                        if let Some(g) = &self.gfx {
+                            g.window.request_redraw();
+                        }
                     }
                     if p.ended {
                         event_loop.exit();
@@ -433,13 +502,17 @@ impl ApplicationHandler for App {
                 if let Some(v) = self.view.as_mut() {
                     let _ = v.resize(cols, rows);
                 }
+                // Reflow invalidates cell coordinates; drop any stale selection.
+                self.selection = None;
+                self.sel_anchor = None;
                 if let Some(g) = &self.gfx {
                     g.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
+                let sel = self.selection;
                 if let (Some(g), Some(v)) = (self.gfx.as_mut(), self.view.as_ref()) {
-                    g.render(v);
+                    g.render(v, sel);
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
@@ -449,9 +522,7 @@ impl ApplicationHandler for App {
                 }
                 match classify_shortcut(&event.logical_key, self.mods) {
                     Some(Shortcut::Paste) => self.paste_from_clipboard(),
-                    // Copy needs a selection model (not built yet); swallow it so
-                    // Ctrl+Shift+C doesn't reach the shell as ^C (SIGINT).
-                    Some(Shortcut::Copy) => {}
+                    Some(Shortcut::Copy) => self.copy_selection(),
                     None => {
                         if let Some(v) = self.view.as_mut() {
                             let _ = v.key(&event.logical_key, self.mods);
@@ -471,52 +542,103 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cell = point_to_cell(position.x, position.y);
-                if cell != self.cursor_cell {
-                    self.cursor_cell = cell;
-                    let held = self.held;
-                    if let Some(v) = self.view.as_mut() {
-                        let _ = v.mouse(
-                            mouse::Kind::Motion,
-                            held,
-                            held.is_some(),
-                            cell.0,
-                            cell.1,
-                            self.mods,
-                        );
+                if self.cursor_cell != Some(cell) {
+                    self.cursor_cell = Some(cell);
+                    if let Some(b) = self.held {
+                        // A drag is in progress: route it the way the press did,
+                        // so flipping Shift / mouse-mode mid-gesture can't split it.
+                        if self.gesture_report {
+                            if let Some(v) = self.view.as_mut() {
+                                let _ = v.mouse(
+                                    mouse::Kind::Motion,
+                                    Some(b),
+                                    true,
+                                    cell.0,
+                                    cell.1,
+                                    self.mods,
+                                );
+                            }
+                        } else if b == mouse::Button::Left
+                            && let Some(anchor) = self.sel_anchor
+                        {
+                            self.selection = Some(Selection::new(anchor, self.pointer_cell0()));
+                            self.request_redraw();
+                        }
+                    } else if self.report_to_app() {
+                        // Buttonless hover motion — only any-motion tracking wants it.
+                        if let Some(v) = self.view.as_mut() {
+                            let _ = v.mouse(
+                                mouse::Kind::Motion,
+                                None,
+                                false,
+                                cell.0,
+                                cell.1,
+                                self.mods,
+                            );
+                        }
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(b) = map_button(button) {
-                    let pressed = state == ElementState::Pressed;
-                    self.held = if pressed { Some(b) } else { None };
-                    let (col, row) = self.cursor_cell;
-                    let kind = if pressed {
-                        mouse::Kind::Press
+                    if state == ElementState::Pressed {
+                        self.held = Some(b);
+                        // Latch the routing for the whole press..release gesture.
+                        self.gesture_report = self.report_to_app();
+                        if self.gesture_report {
+                            let (col, row) = self.cursor_cell.unwrap_or((1, 1));
+                            if let Some(v) = self.view.as_mut() {
+                                let _ =
+                                    v.mouse(mouse::Kind::Press, Some(b), true, col, row, self.mods);
+                            }
+                            // A plain forwarded left-click still dismisses a stale
+                            // local highlight the child can't clear itself.
+                            if b == mouse::Button::Left && self.selection.take().is_some() {
+                                self.request_redraw();
+                            }
+                        } else if b == mouse::Button::Left {
+                            // Begin a local selection; clear any previous highlight.
+                            // Only anchor once the pointer position is known.
+                            self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
+                            self.selection = None;
+                            self.request_redraw();
+                        }
                     } else {
-                        mouse::Kind::Release
-                    };
-                    let held = self.held.is_some();
-                    if let Some(v) = self.view.as_mut() {
-                        let _ = v.mouse(kind, Some(b), held, col, row, self.mods);
+                        if self.gesture_report {
+                            let (col, row) = self.cursor_cell.unwrap_or((1, 1));
+                            if let Some(v) = self.view.as_mut() {
+                                let _ = v.mouse(
+                                    mouse::Kind::Release,
+                                    Some(b),
+                                    false,
+                                    col,
+                                    row,
+                                    self.mods,
+                                );
+                            }
+                        }
+                        self.held = None;
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y,
-                };
-                if dy != 0.0 {
-                    let b = if dy > 0.0 {
-                        mouse::Button::WheelUp
-                    } else {
-                        mouse::Button::WheelDown
+                // Only forwarded to the child; there's no local scrollback view yet.
+                if self.report_to_app() {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        MouseScrollDelta::PixelDelta(p) => p.y,
                     };
-                    let (col, row) = self.cursor_cell;
-                    let held = self.held.is_some();
-                    if let Some(v) = self.view.as_mut() {
-                        let _ = v.mouse(mouse::Kind::Press, Some(b), held, col, row, self.mods);
+                    if dy != 0.0 {
+                        let b = if dy > 0.0 {
+                            mouse::Button::WheelUp
+                        } else {
+                            mouse::Button::WheelDown
+                        };
+                        let (col, row) = self.cursor_cell.unwrap_or((1, 1));
+                        let held = self.held.is_some();
+                        if let Some(v) = self.view.as_mut() {
+                            let _ = v.mouse(mouse::Kind::Press, Some(b), held, col, row, self.mods);
+                        }
                     }
                 }
             }

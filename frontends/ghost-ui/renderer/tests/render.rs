@@ -3,8 +3,8 @@
 //! `ghost-shaper`, and draw it on the GPU — asserting on the read-back pixels
 //! and dumping PNGs to eyeball. Runs headless on lavapipe.
 
-use ghost_render::{CellMetrics, layout_frame};
-use ghost_renderer::{Rendered, Theme, render_frame};
+use ghost_render::{CellMetrics, Selection, layout_frame};
+use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
 
 const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
@@ -142,6 +142,37 @@ fn resolves_ansi_colors_and_backgrounds() {
     let (blue_bleed, _) = band(&img, 18, 27, strong_blue);
     assert_eq!(red_bleed, 0, "red bled into the blank column");
     assert_eq!(blue_bleed, 0, "blue bled into the blank column");
+}
+
+#[test]
+fn highlights_a_selection_band() {
+    // Hide the cursor, print "hello world", and select "hello" (cols 0..=4).
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25lhello world");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    let mut renderer = Renderer::headless(Theme::default());
+    renderer.set_selection(Some(Selection::new((0, 0), (0, 4))));
+    let img = renderer.render_offscreen(&frame, font, 15.0);
+    let path = write_png("ghost_selection_sample.png", &img);
+    eprintln!("WROTE PNG: {}", path.display());
+
+    // The selection tint is bluish and well above the near-neutral background;
+    // glyphs drawn on top read as light gray (blue ~= red), so this predicate
+    // catches the tint fill but not the glyphs or the bg.
+    let tinted = |p: [u8; 4]| p[2] > 45 && i32::from(p[2]) > i32::from(p[0]) + 8;
+
+    // Selected cells 0..=4 (x 0..45) are mostly filled with the tint.
+    let (hits, total) = band(&img, 0, 45, tinted);
+    assert!(
+        hits * 2 > total,
+        "selected band should be mostly tinted ({hits}/{total})"
+    );
+
+    // "world" (cols 6..=10, x 54..99) is outside the selection — no tint.
+    let (bleed, _) = band(&img, 54, 99, tinted);
+    assert_eq!(bleed, 0, "selection tint bled past its range ({bleed})");
 }
 
 #[test]

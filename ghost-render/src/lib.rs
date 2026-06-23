@@ -96,6 +96,52 @@ pub struct CursorLayout {
     pub row: usize,
 }
 
+/// A normalized linear text selection over the viewport grid, in 0-based
+/// `(row, col)` cell coordinates (matching [`CursorLayout`]). `start` is the
+/// earlier cell in reading order; both endpoints are inclusive.
+///
+/// This is a pure layout fact — the renderer turns it into highlight rectangles
+/// and a copy consumer turns it into text — so it lives here, with the other
+/// cell-coordinate types, and is exhaustively testable without a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    /// Earlier endpoint in reading order, `(row, col)`, inclusive.
+    pub start: (usize, usize),
+    /// Later endpoint in reading order, `(row, col)`, inclusive.
+    pub end: (usize, usize),
+}
+
+impl Selection {
+    /// Build a normalized selection from an anchor and the active cell, given in
+    /// either order; both are `(row, col)` and inclusive.
+    pub fn new(anchor: (usize, usize), active: (usize, usize)) -> Self {
+        let (start, end) = if anchor <= active {
+            (anchor, active)
+        } else {
+            (active, anchor)
+        };
+        Selection { start, end }
+    }
+
+    /// The half-open column interval `[c0, c1)` selected on `row`, or `None` if
+    /// the row lies outside the selection. `cols` is the grid width: the first
+    /// and interior rows of a multi-row selection extend to end-of-line.
+    pub fn row_span(&self, row: usize, cols: usize) -> Option<(usize, usize)> {
+        if row < self.start.0 || row > self.end.0 {
+            return None;
+        }
+        let c0 = if row == self.start.0 { self.start.1 } else { 0 };
+        let c1 = if row == self.end.0 {
+            self.end.1 + 1
+        } else {
+            cols
+        };
+        let c0 = c0.min(cols);
+        let c1 = c1.min(cols);
+        (c0 < c1).then_some((c0, c1))
+    }
+}
+
 /// A full frame ready to draw: the laid-out viewport plus the cursor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
@@ -202,6 +248,32 @@ pub fn layout_frame(vt: &Vt, metrics: CellMetrics) -> Frame {
 mod tests {
     use super::*;
     use ghost_term::Vt;
+
+    #[test]
+    fn selection_row_span_covers_linear_range() {
+        // Single row, inclusive columns [2, 5] -> half-open [2, 6).
+        let s = Selection::new((0, 2), (0, 5));
+        assert_eq!(s.row_span(0, 80), Some((2, 6)));
+        assert_eq!(s.row_span(1, 80), None);
+
+        // Endpoints given in either order normalize the same.
+        assert_eq!(Selection::new((0, 5), (0, 2)).row_span(0, 80), Some((2, 6)));
+
+        // Multi-row: first row runs to EOL, interior rows are full, the last row
+        // runs from column 0 to its (inclusive) endpoint.
+        let s = Selection::new((1, 3), (3, 4));
+        assert_eq!(s.row_span(0, 10), None);
+        assert_eq!(s.row_span(1, 10), Some((3, 10)));
+        assert_eq!(s.row_span(2, 10), Some((0, 10)));
+        assert_eq!(s.row_span(3, 10), Some((0, 5)));
+        assert_eq!(s.row_span(4, 10), None);
+
+        // Columns are clamped to the grid width.
+        assert_eq!(
+            Selection::new((0, 0), (0, 50)).row_span(0, 10),
+            Some((0, 10))
+        );
+    }
 
     const M: CellMetrics = CellMetrics {
         advance: 8.0,

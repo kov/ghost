@@ -8,6 +8,8 @@
 use std::io;
 use std::time::Duration;
 
+use ghost_render::Selection;
+use ghost_term::MouseProtocol;
 use ghost_vt::client::Session;
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
@@ -88,6 +90,12 @@ impl SessionView {
             self.session.send_input(&bytes)?;
         }
         Ok(())
+    }
+
+    /// Whether the child has grabbed the mouse (any reporting mode is on), so
+    /// the frontend should forward reports rather than select text locally.
+    pub fn mouse_active(&self) -> bool {
+        self.screen.vt().mouse_protocol() != MouseProtocol::Off
     }
 
     /// Report a focus change if the child enabled focus reporting (DEC 1004).
@@ -178,9 +186,84 @@ pub fn bracket_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// Extract the text covered by `sel` from `screen`, one trimmed line per row
+/// joined by newlines. Pure (takes a `&Screen`), so it is unit-testable without
+/// a live session. Wide-cell tail placeholders are dropped; columns and the row
+/// range are clamped to what each line actually holds.
+pub fn selection_text(screen: &Screen, sel: Selection) -> String {
+    let (cols, rows) = screen.dimensions();
+    let (cols, rows) = (cols as usize, rows as usize);
+    let mut lines: Vec<String> = Vec::new();
+    for row in sel.start.0..=sel.end.0 {
+        if row >= rows {
+            break;
+        }
+        let text = match sel.row_span(row, cols) {
+            Some((c0, c1)) => {
+                let line = screen.vt().line(row);
+                let len = line.len();
+                line.cells()[c0.min(len)..c1.min(len)]
+                    .iter()
+                    .filter(|cell| cell.width() != 0) // skip wide-cell tail halves
+                    .map(|cell| cell.char())
+                    .collect::<String>()
+            }
+            None => String::new(),
+        };
+        // First/interior rows were synthetically extended to end-of-line, so drop
+        // their padding; the terminating row ends at the user's chosen column, so
+        // its trailing spaces are selected content and must be kept (WYSIWYG copy).
+        let text = if row == sel.end.0 {
+            text
+        } else {
+            text.trim_end().to_string()
+        };
+        lines.push(text);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_text_extracts_rows() {
+        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
+        screen.feed(b"hello world");
+        assert_eq!(
+            selection_text(&screen, Selection::new((0, 0), (0, 4))),
+            "hello"
+        );
+
+        // Multi-row: first row to EOL (trimmed), last row to its endpoint.
+        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
+        screen.feed(b"ab\r\ncd");
+        assert_eq!(
+            selection_text(&screen, Selection::new((0, 0), (1, 1))),
+            "ab\ncd"
+        );
+    }
+
+    #[test]
+    fn selection_text_keeps_terminating_row_trailing_spaces() {
+        // Trailing spaces inside the span on the terminating row are selected
+        // content (the highlight shows them), so copy must preserve them.
+        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
+        screen.feed(b"a  b");
+        assert_eq!(
+            selection_text(&screen, Selection::new((0, 0), (0, 2))),
+            "a  "
+        );
+
+        // First row's end-of-line padding is dropped; last row's spaces survive.
+        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
+        screen.feed(b"hi\r\nx  y");
+        assert_eq!(
+            selection_text(&screen, Selection::new((0, 0), (1, 2))),
+            "hi\nx  "
+        );
+    }
 
     #[test]
     fn bracketed_paste_wraps_only_when_enabled() {
