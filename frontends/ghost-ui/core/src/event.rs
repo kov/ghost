@@ -76,6 +76,10 @@ pub enum UiEvent {
     },
     /// Reply to `Cmd::ListSessions`.
     SessionList(Vec<SessionInfo>),
+    /// The shell has attached `SessionId` for this window (reply to
+    /// `Cmd::SpawnSession` / `Cmd::TakeOver`): switch to its single view and
+    /// take ownership. The window adopts the fleet tile's screen if it has one.
+    AdoptSession(SessionId),
     /// Injected monotonic clock pulse, milliseconds since the shell started.
     /// The sole time source — the core never reads a wall-clock.
     Tick {

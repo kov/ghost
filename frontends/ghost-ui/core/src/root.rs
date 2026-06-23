@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 
 use crate::input::{Key, Mods};
+use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, UiEvent};
 
 enum Mode {
@@ -25,6 +26,9 @@ pub struct RootModel {
     scale: f32,
     /// Sessions this window owns, for fleet grouping (this-window vs elsewhere).
     mine: HashSet<SessionId>,
+    /// The session the single view shows / a fleet toggle returns to. `None` for
+    /// a freshly-opened fleet window that hasn't adopted a session yet.
+    primary: Option<SessionId>,
 }
 
 /// Ctrl+Shift+E toggles the fleet overview.
@@ -35,14 +39,30 @@ fn is_fleet_toggle(key: &Key, mods: Mods) -> bool {
 impl RootModel {
     /// Start in the single-terminal view around `model`.
     pub fn single(model: TerminalModel, metrics: CellMetrics, size_px: (u32, u32)) -> Self {
-        let mine = HashSet::from([model.session().to_string()]);
+        let id = model.session().to_string();
         RootModel {
             mode: Mode::Single(Box::new(model)),
             metrics,
             size_px,
             scale: 1.0,
-            mine,
+            mine: HashSet::from([id.clone()]),
+            primary: Some(id),
         }
+    }
+
+    /// Start in the fleet overview owning no session — a freshly-opened window.
+    /// The returned commands enumerate existing sessions to populate the grid
+    /// (the reconcile reply re-arms the periodic refresh).
+    pub fn fleet(metrics: CellMetrics, size_px: (u32, u32), scale: f32) -> (Self, Vec<Cmd>) {
+        let root = RootModel {
+            mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px, HashSet::new()))),
+            metrics,
+            size_px,
+            scale,
+            mine: HashSet::new(),
+            primary: None,
+        };
+        (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
 
     pub fn is_fleet(&self) -> bool {
@@ -55,9 +75,23 @@ impl RootModel {
             mods,
             pressed: true,
         } = &ev
-            && is_fleet_toggle(key, *mods)
         {
-            return self.toggle();
+            if is_fleet_toggle(key, *mods) {
+                return self.toggle();
+            }
+            // Window/app-level shortcuts are handled above the active view so
+            // they work in either mode, even when the fleet has no focused tile.
+            match classify_shortcut(key, *mods) {
+                Some(Shortcut::Quit) => return vec![Cmd::Quit],
+                Some(Shortcut::NewWindow) => return vec![Cmd::NewWindow],
+                Some(Shortcut::CloseWindow) => return vec![Cmd::CloseWindow],
+                Some(Shortcut::NewSession) => return vec![Cmd::SpawnSession],
+                _ => {} // Copy/Paste/Zoom are per-terminal: delegate below.
+            }
+        }
+        if let UiEvent::AdoptSession(id) = &ev {
+            let id = id.clone();
+            return self.adopt(id);
         }
         if let UiEvent::Resize { w_px, h_px, scale } = &ev {
             self.size_px = (*w_px, *h_px);
@@ -69,6 +103,44 @@ impl RootModel {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         }
+    }
+
+    /// Switch to the single view of `id` (the shell has just attached it) and
+    /// take ownership. From the fleet, the existing tile's screen is preserved;
+    /// otherwise (or from another single session) a fresh terminal is created and
+    /// the previously-shown session is detached — it keeps running and reappears
+    /// in the fleet.
+    fn adopt(&mut self, id: SessionId) -> Vec<Cmd> {
+        let placeholder = Mode::Single(Box::new(TerminalModel::new(
+            String::new(),
+            1,
+            1,
+            self.metrics,
+        )));
+        let current = std::mem::replace(&mut self.mode, placeholder);
+        let (model, mut cmds) = match current {
+            Mode::Fleet(f) => f.into_single_adopting(id.clone(), self.size_px, self.scale),
+            Mode::Single(m) => {
+                let old = m.session().to_string();
+                if old == id {
+                    (*m, Vec::new())
+                } else {
+                    let mut model = TerminalModel::new(id.clone(), 1, 1, self.metrics);
+                    let mut cmds = model.update(UiEvent::Resize {
+                        w_px: self.size_px.0.max(1),
+                        h_px: self.size_px.1.max(1),
+                        scale: self.scale as f64,
+                    });
+                    cmds.push(Cmd::Detach(old));
+                    (model, cmds)
+                }
+            }
+        };
+        self.mode = Mode::Single(Box::new(model));
+        self.mine = HashSet::from([id.clone()]);
+        self.primary = Some(id);
+        cmds.push(Cmd::Redraw);
+        cmds
     }
 
     pub fn view(&self) -> Scene {
@@ -128,8 +200,14 @@ impl RootModel {
                 (Mode::Fleet(Box::new(fleet)), cmds)
             }
             Mode::Fleet(f) => {
-                let (model, mut cmds) = f.into_single(self.size_px, self.scale);
+                let (model, mut cmds) =
+                    f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 cmds.push(Cmd::Redraw);
+                // The extracted session is what this window now drives; record it
+                // so ownership is well-defined even for a fleet-started window.
+                let id = model.session().to_string();
+                self.mine = HashSet::from([id.clone()]);
+                self.primary = Some(id);
                 (Mode::Single(Box::new(model)), cmds)
             }
         };
@@ -280,5 +358,130 @@ mod tests {
             key(&mut r, Key::Char("e".into()), Mods::NONE).as_slice(),
             [Cmd::SendInput { .. }]
         ));
+    }
+
+    use ghost_vt::session::SessionInfo;
+    fn info(name: &str, attached: bool) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            pid: 1,
+            created_at: None,
+            title: name.to_string(),
+            command: vec![],
+            attached,
+            bell: false,
+        }
+    }
+
+    #[test]
+    fn window_and_session_shortcuts_are_intercepted_above_the_view() {
+        for chord in [Mods::SUPER, Mods::CTRL | Mods::SHIFT] {
+            let mut r = root();
+            assert_eq!(
+                key(&mut r, Key::Char("n".into()), chord),
+                vec![Cmd::NewWindow]
+            );
+            assert_eq!(
+                key(&mut r, Key::Char("w".into()), chord),
+                vec![Cmd::CloseWindow]
+            );
+            assert_eq!(
+                key(&mut r, Key::Char("t".into()), chord),
+                vec![Cmd::SpawnSession]
+            );
+        }
+        // They also fire in the fleet overview, which may have no focused tile to
+        // forward keys to — so they can't be left to the per-terminal path.
+        let (mut f, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        assert!(f.is_fleet());
+        assert_eq!(
+            key(&mut f, Key::Char("n".into()), Mods::SUPER),
+            vec![Cmd::NewWindow]
+        );
+        assert_eq!(
+            key(&mut f, Key::Char("t".into()), Mods::SUPER),
+            vec![Cmd::SpawnSession]
+        );
+        // Bare Ctrl+N (no Shift) is NOT a shortcut: it must reach the child.
+        let mut r = root();
+        assert!(matches!(
+            key(&mut r, Key::Char("n".into()), Mods::CTRL).as_slice(),
+            [Cmd::SendInput { .. }]
+        ));
+    }
+
+    #[test]
+    fn fleet_constructor_starts_in_the_overview_and_enumerates() {
+        let (r, cmds) = RootModel::fleet(METRICS, SIZE, 1.0);
+        assert!(r.is_fleet());
+        assert!(
+            cmds.contains(&Cmd::ListSessions),
+            "a fresh fleet window enumerates sessions: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn adopt_from_fleet_drops_into_that_sessions_single_view() {
+        let mut r = root(); // owns alpha
+        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> fleet
+        r.update(UiEvent::SessionList(vec![
+            info("alpha", true),
+            info("beta", false),
+        ]));
+        // What the shell sends after attaching a double-clicked / spawned session.
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(!r.is_fleet(), "adopting leaves the overview");
+        assert!(cmds.contains(&Cmd::Redraw));
+        // Input now routes to the adopted session.
+        assert_eq!(
+            r.update(UiEvent::Text("z".into())),
+            vec![Cmd::SendInput {
+                session: "beta".into(),
+                bytes: b"z".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn adopt_of_a_freshly_spawned_session_makes_a_new_terminal_and_detaches_previews() {
+        let mut r = root(); // owns alpha
+        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> fleet
+        r.update(UiEvent::SessionList(vec![
+            info("alpha", true),
+            info("beta", false),
+        ]));
+        // Adopt a session that is NOT a tile yet (just spawned by the shell).
+        let cmds = r.update(UiEvent::AdoptSession("gamma".into()));
+        assert!(!r.is_fleet());
+        // The previewed tiles are dropped; the new session gets a fresh terminal.
+        assert!(
+            cmds.contains(&Cmd::Detach("beta".into())),
+            "previews detach: {cmds:?}"
+        );
+        assert_eq!(
+            r.update(UiEvent::Text("z".into())),
+            vec![Cmd::SendInput {
+                session: "gamma".into(),
+                bytes: b"z".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn adopt_from_single_view_detaches_the_previous_session() {
+        let mut r = root(); // single view of alpha
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(!r.is_fleet());
+        assert!(
+            cmds.contains(&Cmd::Detach("alpha".into())),
+            "the previously-shown session detaches (keeps running): {cmds:?}"
+        );
+        assert_eq!(
+            r.update(UiEvent::Text("z".into())),
+            vec![Cmd::SendInput {
+                session: "beta".into(),
+                bytes: b"z".to_vec()
+            }]
+        );
     }
 }

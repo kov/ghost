@@ -222,18 +222,34 @@ impl FleetModel {
     /// foreign session we merely previewed, so the single view always returns to
     /// what the window actually drives.
     pub fn into_single(self, size_px: (u32, u32), scale: f32) -> (TerminalModel, Vec<Cmd>) {
+        self.into_single_keeping(None, size_px, scale)
+    }
+
+    /// Like [`into_single`](Self::into_single) but, when `target` names a present
+    /// tile, keeps *that* session (a take-over of a specific tile). Otherwise it
+    /// falls back to the owned session, then the focused tile, then any tile.
+    pub fn into_single_keeping(
+        self,
+        target: Option<SessionId>,
+        size_px: (u32, u32),
+        scale: f32,
+    ) -> (TerminalModel, Vec<Cmd>) {
         let metrics = self.metrics;
-        let keep = self
-            .tiles
-            .iter()
-            .find(|t| self.mine.contains(&t.id))
+        let keep = target
+            .filter(|id| self.tiles.iter().any(|t| &t.id == id))
+            .or_else(|| {
+                self.tiles
+                    .iter()
+                    .find(|t| self.mine.contains(&t.id))
+                    .map(|t| t.id.clone())
+            })
             .or_else(|| {
                 self.tiles
                     .iter()
                     .find(|t| Some(&t.id) == self.focused.as_ref())
+                    .map(|t| t.id.clone())
             })
-            .or_else(|| self.tiles.first())
-            .map(|t| t.id.clone());
+            .or_else(|| self.tiles.first().map(|t| t.id.clone()));
         let mut kept = None;
         let mut cmds = Vec::new();
         for tile in self.tiles {
@@ -245,6 +261,37 @@ impl FleetModel {
         }
         let mut model =
             kept.unwrap_or_else(|| TerminalModel::new(keep.unwrap_or_default(), 1, 1, metrics));
+        cmds.append(&mut model.update(UiEvent::Resize {
+            w_px: size_px.0.max(1),
+            h_px: size_px.1.max(1),
+            scale: scale as f64,
+        }));
+        (model, cmds)
+    }
+
+    /// Leave the overview showing `id` *specifically* — a spawn or take-over.
+    /// Keeps `id`'s tile if it has one (preserving its screen); otherwise builds
+    /// a fresh terminal for it (the just-spawned session has no tile yet). Either
+    /// way every other previewed tile is detached. Unlike
+    /// [`into_single_keeping`](Self::into_single_keeping) there is no fallback to
+    /// a different session: the caller asked for `id`.
+    pub fn into_single_adopting(
+        self,
+        id: SessionId,
+        size_px: (u32, u32),
+        scale: f32,
+    ) -> (TerminalModel, Vec<Cmd>) {
+        let metrics = self.metrics;
+        let mut kept = None;
+        let mut cmds = Vec::new();
+        for tile in self.tiles {
+            if tile.id == id {
+                kept = Some(tile.model);
+            } else {
+                cmds.push(Cmd::Detach(tile.id));
+            }
+        }
+        let mut model = kept.unwrap_or_else(|| TerminalModel::new(id, 1, 1, metrics));
         cmds.append(&mut model.update(UiEvent::Resize {
             w_px: size_px.0.max(1),
             h_px: size_px.1.max(1),
@@ -278,7 +325,9 @@ impl FleetModel {
             UiEvent::Key { pressed: false, .. } => Vec::new(),
             // Re-enumerate on the scheduled refresh tick.
             UiEvent::Tick { .. } => vec![Cmd::ListSessions],
-            UiEvent::Pointer { phase, pos, .. } => self.pointer(phase, pos),
+            UiEvent::Pointer {
+                phase, pos, clicks, ..
+            } => self.pointer(phase, pos, clicks),
             // Everything else (text, non-nav keys, focus, paste replies) goes to
             // the focused tile's terminal.
             other => self.forward_to_focused(other),
@@ -450,20 +499,25 @@ impl FleetModel {
         }
     }
 
-    fn pointer(&mut self, phase: PointerPhase, pos: PointPx) -> Vec<Cmd> {
+    fn pointer(&mut self, phase: PointerPhase, pos: PointPx, clicks: u8) -> Vec<Cmd> {
         if phase != PointerPhase::Press {
-            return Vec::new(); // the overview only reacts to clicks (focus)
+            return Vec::new(); // the overview only reacts to clicks (focus / open)
         }
         let hit = self
             .layout()
             .into_iter()
             .find(|(_, _, r)| r.contains(pos.x as f32, pos.y as f32));
-        match hit {
-            Some((_, id, _)) => {
-                self.set_focus(id);
-                vec![Cmd::Redraw]
-            }
-            None => Vec::new(),
+        let Some((_, id, _)) = hit else {
+            return Vec::new();
+        };
+        self.set_focus(id.clone());
+        // A double-click opens the tile: take it over into this window's single
+        // view. A session live in another window (`Elsewhere`) is left alone —
+        // taking it over would steal its display client (no observer-attach yet).
+        if clicks >= 2 && self.group_of(&id) != Some(Group::Elsewhere) {
+            vec![Cmd::TakeOver(id), Cmd::Redraw]
+        } else {
+            vec![Cmd::Redraw]
         }
     }
 
@@ -744,6 +798,61 @@ mod tests {
         });
         assert_eq!(m.focused(), Some("b"));
         assert_eq!(cmds, vec![Cmd::Redraw]);
+    }
+
+    /// Press at the centre of `id`'s tile with the given click count.
+    fn press(m: &mut FleetModel, id: &str, clicks: u8) -> Vec<Cmd> {
+        let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
+        m.update(UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(crate::PointerButton::Left),
+            pos: PointPx {
+                x: (rect.x + rect.w / 2.0) as f64,
+                y: (rect.y + rect.h / 2.0) as f64,
+            },
+            mods: crate::Mods::NONE,
+            wheel_dy: 0.0,
+            clicks,
+        })
+    }
+
+    #[test]
+    fn double_click_takes_over_a_detached_tile() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]); // both detached → take-over-able
+        let cmds = press(&mut m, "b", 2);
+        assert!(
+            cmds.contains(&Cmd::TakeOver("b".into())),
+            "double-click opens (takes over) the tile: {cmds:?}"
+        );
+        assert_eq!(m.focused(), Some("b"));
+    }
+
+    #[test]
+    fn single_click_focuses_without_taking_over() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let cmds = press(&mut m, "b", 1);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "a single click only focuses: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn double_click_leaves_a_session_live_elsewhere_alone() {
+        let mut m = fleet();
+        // Attached but not ours = Elsewhere; taking it over would steal its
+        // display client, which we don't do without observer-attach.
+        let mut a = info("a");
+        a.attached = true;
+        m.update(UiEvent::SessionList(vec![a]));
+        assert_eq!(m.group_of("a"), Some(Group::Elsewhere));
+        let cmds = press(&mut m, "a", 2);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "must not steal an Elsewhere session: {cmds:?}"
+        );
     }
 
     #[test]

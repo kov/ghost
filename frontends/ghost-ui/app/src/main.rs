@@ -269,10 +269,10 @@ fn interactive() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         windows: HashMap::new(),
-        sessions: HashMap::new(),
         clipboard: None,
         start: Instant::now(),
         initial_name: name,
+        next_session_seq: 0,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -388,8 +388,10 @@ impl Graphics {
 struct WindowState {
     gfx: Graphics,
     root: RootModel,
-    /// This window's primary session — the one its model was created around.
-    name: String,
+    /// This window's own session clients (the single-view session plus any fleet
+    /// previews). Dropping the window drops these, which detaches every session
+    /// it held — the "close = detach" default, with no shared-pool bookkeeping.
+    sessions: HashMap<String, Session>,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
     /// so we cache it for button/wheel events).
@@ -427,15 +429,12 @@ impl WindowState {
     }
 }
 
-/// The thin imperative shell: owns the world (live windows, the shared session
-/// pool, the clipboard, the clock), holds the pure models, and shuttles
-/// `UiEvent`s in and `Cmd`s out.
+/// The thin imperative shell: owns the world (live windows, the clipboard, the
+/// clock), holds the pure models, and shuttles `UiEvent`s in and `Cmd`s out.
+/// Each window owns its own session clients (see [`WindowState::sessions`]).
 struct App {
-    /// Live windows by id; each owns its GPU surface and pure model.
+    /// Live windows by id; each owns its GPU surface, pure model, and sessions.
     windows: HashMap<WindowId, WindowState>,
-    /// Attached sessions by id, shared across windows (every window can
-    /// enumerate them); attachment to a view is per-window via the models.
-    sessions: HashMap<String, Session>,
     /// Lazily-opened system clipboard for copy/paste (shared).
     clipboard: Option<arboard::Clipboard>,
     /// Start of the monotonic clock injected into models via `Tick`.
@@ -443,6 +442,8 @@ struct App {
     /// Session name for the first window, set at construction and consumed by
     /// the first `resumed`.
     initial_name: String,
+    /// Per-process counter making spawned session names unique.
+    next_session_seq: u64,
 }
 
 impl App {
@@ -459,7 +460,9 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
-                    if let Some(s) = self.sessions.get_mut(&session) {
+                    if let Some(w) = self.windows.get_mut(&wid)
+                        && let Some(s) = w.sessions.get_mut(&session)
+                    {
                         let _ = s.send_input(&bytes);
                     }
                 }
@@ -468,7 +471,9 @@ impl App {
                     cols,
                     rows,
                 } => {
-                    if let Some(s) = self.sessions.get_mut(&session) {
+                    if let Some(w) = self.windows.get_mut(&wid)
+                        && let Some(s) = w.sessions.get_mut(&session)
+                    {
                         let _ = s.resize(cols, rows);
                     }
                 }
@@ -487,24 +492,53 @@ impl App {
                     self.dispatch(wid, UiEvent::SessionList(infos), event_loop);
                 }
                 Cmd::Attach(id) => {
-                    if !self.sessions.contains_key(&id)
+                    if let Some(w) = self.windows.get_mut(&wid)
+                        && !w.sessions.contains_key(&id)
                         && let Ok(s) = attach(&id, COLS, ROWS)
                     {
-                        self.sessions.insert(id, s);
+                        w.sessions.insert(id, s);
                     }
                 }
                 Cmd::Detach(id) => {
-                    // Never drop a session that is some window's own primary.
-                    let owned = self.windows.values().any(|w| w.name == id);
-                    if !owned {
-                        self.sessions.remove(&id);
+                    // Drop this window's client for the session (it keeps running
+                    // under its host); other windows' clients are unaffected.
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.sessions.remove(&id);
                     }
                 }
                 Cmd::Spawn { name, command } => {
                     spawn_session(&name, command);
                     // Best-effort attach; a later reconcile re-attaches if it lost the race.
-                    if let Ok(s) = attach(&name, COLS, ROWS) {
-                        self.sessions.insert(name, s);
+                    if let Some(w) = self.windows.get_mut(&wid)
+                        && let Ok(s) = attach(&name, COLS, ROWS)
+                    {
+                        w.sessions.insert(name, s);
+                    }
+                }
+                Cmd::NewWindow => self.open_fleet_window(event_loop),
+                Cmd::CloseWindow => {
+                    self.close_window(wid);
+                    if self.windows.is_empty() {
+                        event_loop.exit();
+                    }
+                }
+                Cmd::SpawnSession => {
+                    let name = self.unique_session_name();
+                    spawn_session(&name, vec![]);
+                    if self.attach_into(wid, &name) {
+                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    }
+                }
+                Cmd::TakeOver(id) => {
+                    // The fleet already attached take-over-able tiles; attach now
+                    // only if this window has no client yet (never an `Elsewhere`
+                    // session — the fleet won't emit `TakeOver` for one).
+                    let held = self
+                        .windows
+                        .get(&wid)
+                        .is_some_and(|w| w.sessions.contains_key(&id));
+                    if held || self.attach_into(wid, &id) {
+                        self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
                 Cmd::Redraw => {
@@ -580,18 +614,75 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
-    /// Remove a window. When the last window goes, detach every session (drop
-    /// the clients; the hosts keep the sessions running for reattach next
-    /// launch) — the "close = detach" default. Detaching only a *non-last*
-    /// window's own sessions waits for the per-window ownership map (see
-    /// ghost-vt/docs/session-coordination.md).
+    /// A fresh, process-unique session name for a spawned session.
+    fn unique_session_name(&mut self) -> String {
+        let seq = self.next_session_seq;
+        self.next_session_seq += 1;
+        format!("ghost-ui-{}-{}", std::process::id(), seq)
+    }
+
+    /// Attach window `wid`'s own client to `name` (no-op if it already holds one).
+    /// Returns whether the window now has a client for it.
+    fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
+        let Some(w) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        if w.sessions.contains_key(name) {
+            return true;
+        }
+        match attach(name, COLS, ROWS) {
+            Ok(s) => {
+                w.sessions.insert(name.to_string(), s);
+                true
+            }
+            Err(e) => {
+                eprintln!("could not attach to session '{name}': {e}");
+                false
+            }
+        }
+    }
+
+    /// Open a new window in the fleet overview (owning no session yet). The user
+    /// spawns or takes over a session from there.
+    fn open_fleet_window(&mut self, event_loop: &ActiveEventLoop) {
+        let cfg = config::UiConfig::load();
+        let gfx = Graphics::new(event_loop, cfg.theme());
+        let wid = gfx.window.id();
+        let scale = gfx.window.scale_factor();
+        let (w, h) = (gfx.config.width, gfx.config.height);
+        let (root, init) = RootModel::fleet(METRICS, (w, h), scale as f32);
+        self.windows.insert(
+            wid,
+            WindowState {
+                gfx,
+                root,
+                sessions: HashMap::new(),
+                mods: ModifiersState::empty(),
+                pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                next_tick: None,
+                last_click: None,
+                click_count: 0,
+            },
+        );
+        // Size the model to the surface, then run the fleet's initial enumeration.
+        self.dispatch(
+            wid,
+            UiEvent::Resize {
+                w_px: w,
+                h_px: h,
+                scale,
+            },
+            event_loop,
+        );
+        self.exec(wid, init, event_loop);
+        self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
+    }
+
+    /// Remove a window; dropping its [`WindowState`] drops its session clients,
+    /// which detaches them (the hosts keep the sessions running for reattach) —
+    /// the "close = detach" default.
     fn close_window(&mut self, wid: WindowId) {
-        if self.windows.remove(&wid).is_none() {
-            return;
-        }
-        if self.windows.is_empty() {
-            self.sessions.clear();
-        }
+        self.windows.remove(&wid);
     }
 }
 
@@ -606,25 +697,25 @@ impl ApplicationHandler for App {
         let scale = gfx.window.scale_factor();
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
         let name = self.initial_name.clone();
-        match attach(&name, cols, rows) {
-            Ok(session) => {
-                self.sessions.insert(name.clone(), session);
-            }
+        let session = match attach(&name, cols, rows) {
+            Ok(session) => session,
             Err(e) => {
                 eprintln!("could not attach to session '{name}': {e}");
                 event_loop.exit();
                 return;
             }
-        }
+        };
         let model = TerminalModel::new(name.clone(), cols, rows, METRICS);
         let root = RootModel::single(model, METRICS, (gfx.config.width, gfx.config.height));
         let (w, h) = (gfx.config.width, gfx.config.height);
+        let mut sessions = HashMap::new();
+        sessions.insert(name, session);
         self.windows.insert(
             wid,
             WindowState {
                 gfx,
                 root,
-                name,
+                sessions,
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -653,33 +744,28 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Pump every shared session, then route each session's output to every
-        // window (a window whose model isn't showing that id simply ignores it).
-        let mut pumped: Vec<(String, Vec<u8>, bool)> = Vec::new();
-        for (name, s) in self.sessions.iter_mut() {
-            let (bytes, ended) = pump(s, 32);
-            if !bytes.is_empty() || ended {
-                pumped.push((name.clone(), bytes, ended));
+        // Pump each window's own session clients and route the output back to
+        // that window (a window only holds clients for sessions it's showing).
+        let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
+        for (wid, w) in self.windows.iter_mut() {
+            let mut dead = Vec::new();
+            for (name, s) in w.sessions.iter_mut() {
+                let (bytes, ended) = pump(s, 32);
+                if !bytes.is_empty() || ended {
+                    pumped.push((*wid, name.clone(), bytes, ended));
+                }
+                if ended {
+                    dead.push(name.clone());
+                }
+            }
+            // Drop dead clients before dispatch so a stale query-reply is ignored;
+            // whether the window itself ends is decided below via `root.ended()`.
+            for name in dead {
+                w.sessions.remove(&name);
             }
         }
-        for (name, bytes, ended) in pumped {
-            // Drop a dead session before dispatch so a stale query-reply to it
-            // is simply ignored; which windows end is decided below.
-            if ended {
-                self.sessions.remove(&name);
-            }
-            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
-            for wid in wids {
-                self.dispatch(
-                    wid,
-                    UiEvent::SessionData {
-                        name: name.clone(),
-                        bytes: bytes.clone(),
-                        ended,
-                    },
-                    event_loop,
-                );
-            }
+        for (wid, name, bytes, ended) in pumped {
+            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, event_loop);
         }
         // Fire any per-window ticks that are now due.
         let now = Instant::now();
@@ -716,8 +802,8 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                // Close = detach: drop this window (and, if it was the last, its
-                // session connections — the hosts keep the sessions running).
+                // Close = detach: dropping the window drops its session clients
+                // (the hosts keep the sessions running). Exit with the last one.
                 self.close_window(id);
                 if self.windows.is_empty() {
                     event_loop.exit();

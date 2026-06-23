@@ -66,6 +66,12 @@ pub enum Shortcut {
     ZoomOut,
     ZoomReset,
     Quit,
+    /// Open a new window (Cmd+N / Ctrl+Shift+N).
+    NewWindow,
+    /// Close this window (Cmd+W / Ctrl+Shift+W).
+    CloseWindow,
+    /// Spawn a fresh session in this window (Cmd+T / Ctrl+Shift+T).
+    NewSession,
 }
 
 /// Classify a pressed key as a frontend shortcut, if it is one. The primary
@@ -84,6 +90,11 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
             // Cmd+Q (macOS) / Ctrl+Shift+Q (elsewhere) quits — never bare Ctrl+Q,
             // which must stay XOFF flow control.
             Key::Char(s) if s.eq_ignore_ascii_case("q") => return Some(Shortcut::Quit),
+            // Window/session management, same Cmd / Ctrl+Shift gating: new window,
+            // close window, new session. Bare Ctrl+N/W/T stay terminal input.
+            Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
+            Key::Char(s) if s.eq_ignore_ascii_case("w") => return Some(Shortcut::CloseWindow),
+            Key::Char(s) if s.eq_ignore_ascii_case("t") => return Some(Shortcut::NewSession),
             _ => {}
         }
     }
@@ -200,8 +211,9 @@ impl TerminalModel {
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
-            // A lone terminal ignores enumeration and the clock (no animation yet).
-            UiEvent::SessionList(_) | UiEvent::Tick { .. } => Vec::new(),
+            // A lone terminal ignores enumeration and the clock (no animation
+            // yet), and never sees `AdoptSession` — `RootModel` handles it.
+            UiEvent::SessionList(_) | UiEvent::Tick { .. } | UiEvent::AdoptSession(_) => Vec::new(),
         }
     }
 
@@ -368,6 +380,12 @@ impl TerminalModel {
             Some(Shortcut::ZoomOut) => self.apply_zoom(step_zoom(self.zoom, -ZOOM_STEP)),
             Some(Shortcut::ZoomReset) => self.apply_zoom(1.0),
             Some(Shortcut::Quit) => vec![Cmd::Quit],
+            // Window/session management is window-level; `RootModel` intercepts
+            // these before delegation, so these arms are the safety net that
+            // keeps the chords from ever leaking to the child as input.
+            Some(Shortcut::NewWindow) => vec![Cmd::NewWindow],
+            Some(Shortcut::CloseWindow) => vec![Cmd::CloseWindow],
+            Some(Shortcut::NewSession) => vec![Cmd::SpawnSession],
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 match encode::encode(key, mods, app_cursor) {

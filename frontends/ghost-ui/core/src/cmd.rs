@@ -41,6 +41,20 @@ pub enum Cmd {
         name: SessionId,
         command: Vec<String>,
     },
+    /// Open a new window. The shell creates it in the fleet overview (it starts
+    /// owning no session); the user spawns or takes one over from there.
+    NewWindow,
+    /// Close the window this command came from. The shell detaches the window's
+    /// sessions (they keep running) — the "close = detach" default.
+    CloseWindow,
+    /// Spawn a fresh session and adopt it into this window: the shell picks the
+    /// name, spawns + attaches it, then replies `UiEvent::AdoptSession` so the
+    /// window switches to its single view.
+    SpawnSession,
+    /// Take over an existing session into this window: the shell attaches it
+    /// (stealing the display if another window held it) and replies
+    /// `UiEvent::AdoptSession` so the window switches to its single view.
+    TakeOver(SessionId),
     /// Repaint the window.
     Redraw,
     /// Set the window title.
