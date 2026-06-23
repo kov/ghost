@@ -176,7 +176,8 @@ impl TerminalModel {
                 pos,
                 mods,
                 wheel_dy,
-            } => self.pointer(phase, button, pos, mods, wheel_dy),
+                clicks,
+            } => self.pointer(phase, button, pos, mods, wheel_dy, clicks),
             UiEvent::Focus(focused) => self.focus(focused),
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
@@ -545,6 +546,43 @@ impl TerminalModel {
         )
     }
 
+    /// The word under viewport cell `(row, col)` — a maximal run of word cells —
+    /// as an inclusive selection, or `None` on a blank/non-word cell. Reads the
+    /// scrolled-back view by cell (not `screen.text()`, whose char indices don't
+    /// line up with cell columns once a wide character is present).
+    fn word_at(&self, row: usize, col: usize) -> Option<Selection> {
+        let window: Vec<&Line> = self.screen.vt().view_at(self.scroll_offset).collect();
+        let cells = window.get(row)?.cells();
+        // A word cell is one holding a word character, or the (zero-width) tail
+        // of a wide character, which continues whatever head precedes it.
+        let word = |i: usize| {
+            cells
+                .get(i)
+                .is_some_and(|c| is_word_char(c.char()) || c.width() == 0)
+        };
+        if !word(col) {
+            return None;
+        }
+        let mut start = col;
+        while start > 0 && word(start - 1) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < cells.len() && word(end + 1) {
+            end += 1;
+        }
+        Some(Selection::new((row, start), (row, end)))
+    }
+
+    /// The line at viewport `row`: column 0 through its last non-blank cell (the
+    /// whole row when blank), as an inclusive selection.
+    fn line_at(&self, row: usize) -> Option<Selection> {
+        let window: Vec<&Line> = self.screen.vt().view_at(self.scroll_offset).collect();
+        let cells = window.get(row)?.cells();
+        let last = cells.iter().rposition(|c| !c.is_default()).unwrap_or(0);
+        Some(Selection::new((row, 0), (row, last)))
+    }
+
     fn mouse_report(
         &self,
         kind: mouse::Kind,
@@ -568,6 +606,7 @@ impl TerminalModel {
         pos: PointPx,
         mods: Mods,
         wheel_dy: f64,
+        clicks: u8,
     ) -> Vec<Cmd> {
         match phase {
             PointerPhase::Motion => {
@@ -608,9 +647,21 @@ impl TerminalModel {
                     }
                     cmds
                 } else if b == mouse::Button::Left {
-                    // Begin a local selection (only anchor once the pointer is known).
-                    self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
-                    self.selection = None;
+                    if clicks >= 2 && self.cursor_cell.is_some() {
+                        // Double-click selects the word, triple-click the line.
+                        // It's a one-shot selection, not a drag anchor.
+                        let (row, col) = self.pointer_cell0();
+                        self.sel_anchor = None;
+                        self.selection = if clicks == 2 {
+                            self.word_at(row, col)
+                        } else {
+                            self.line_at(row)
+                        };
+                    } else {
+                        // Begin a drag selection (anchor once the pointer is known).
+                        self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
+                        self.selection = None;
+                    }
                     vec![Cmd::Redraw]
                 } else {
                     Vec::new()
@@ -664,6 +715,12 @@ fn map_button(b: PointerButton) -> mouse::Button {
         PointerButton::Middle => mouse::Button::Middle,
         PointerButton::Right => mouse::Button::Right,
     }
+}
+
+/// Whether `c` is part of a word for double-click selection: alphanumerics and
+/// underscore (so identifiers select whole, stopping at spaces and punctuation).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 // ---- pure protocol helpers (shared with the shell) ----
@@ -768,6 +825,19 @@ mod tests {
             pos: PointPx { x, y },
             mods: Mods::NONE,
             wheel_dy: 0.0,
+            clicks: 1,
+        }
+    }
+
+    /// A left-button press carrying a click count (for word/line selection).
+    fn press_n(x: f64, y: f64, clicks: u8) -> UiEvent {
+        UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(PointerButton::Left),
+            pos: PointPx { x, y },
+            mods: Mods::NONE,
+            wheel_dy: 0.0,
+            clicks,
         }
     }
 
@@ -787,6 +857,7 @@ mod tests {
             pos: PointPx { x: 1.0, y: 1.0 },
             mods: Mods::NONE,
             wheel_dy: dy,
+            clicks: 1,
         }
     }
 
@@ -963,6 +1034,57 @@ mod tests {
         }
         key(&mut m, Key::Named(NamedKey::Home), Mods::SHIFT); // into history
         assert!(m.ime_cursor_area().is_none());
+    }
+
+    #[test]
+    fn double_click_selects_the_word() {
+        let mut m = model();
+        feed(&mut m, b"foo bar_baz qux");
+        // Hover over 'r' in "bar_baz" (0-based col 6), then double-click.
+        m.update(ptr(PointerPhase::Motion, None, 55.0, 1.0));
+        m.update(press_n(55.0, 1.0, 2));
+        // "bar_baz" spans cols 4..=10 (underscore is a word char).
+        assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 10))));
+    }
+
+    #[test]
+    fn triple_click_selects_the_line() {
+        let mut m = model();
+        feed(&mut m, b"hello world");
+        m.update(ptr(PointerPhase::Motion, None, 9.0, 1.0)); // col 1, row 0
+        m.update(press_n(9.0, 1.0, 3));
+        // Whole line: col 0 through the last non-blank ('d' at col 10).
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (0, 10))));
+    }
+
+    #[test]
+    fn double_click_word_after_a_wide_char_uses_cell_columns() {
+        let mut m = model();
+        // 世 occupies cells 0-1, 'a'=2, space=3, 'b'=4, 'c'=5. A char-index view
+        // would mis-map; cell-indexed selection must land on "bc" at cols 4..=5.
+        feed(&mut m, "世a bc".as_bytes());
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 4.0 + 1.0, 1.0)); // col 4 = 'b'
+        m.update(press_n(9.0 * 4.0 + 1.0, 1.0, 2));
+        assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 5))));
+    }
+
+    #[test]
+    fn double_click_on_blank_selects_nothing() {
+        let mut m = model();
+        feed(&mut m, b"hi");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 40.0, 1.0)); // col 40, blank
+        m.update(press_n(9.0 * 40.0, 1.0, 2));
+        assert_eq!(m.selection(), None);
+    }
+
+    #[test]
+    fn single_click_still_starts_a_drag_not_a_word() {
+        let mut m = model();
+        feed(&mut m, b"foo bar");
+        m.update(ptr(PointerPhase::Motion, None, 9.0, 1.0));
+        m.update(press_n(9.0, 1.0, 1));
+        // A plain click anchors a drag and shows no selection yet.
+        assert_eq!(m.selection(), None);
     }
 
     #[test]

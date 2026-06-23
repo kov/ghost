@@ -671,6 +671,7 @@ mod tests {
             },
             mods: crate::Mods::NONE,
             wheel_dy: 0.0,
+            clicks: 1,
         });
         assert_eq!(m.focused(), Some("b"));
         assert_eq!(cmds, vec![Cmd::Redraw]);

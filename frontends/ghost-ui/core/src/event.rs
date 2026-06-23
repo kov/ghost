@@ -53,6 +53,9 @@ pub enum UiEvent {
         pos: PointPx,
         mods: Mods,
         wheel_dy: f64,
+        /// Click count for a `Press` (1 = single, 2 = double, 3 = triple); 1 for
+        /// other phases. Drives word/line selection.
+        clicks: u8,
     },
     Focus(bool),
     Resize {

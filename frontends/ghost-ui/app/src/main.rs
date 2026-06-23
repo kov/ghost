@@ -275,6 +275,8 @@ fn interactive() {
         clipboard: None,
         start: Instant::now(),
         next_tick: None,
+        last_click: None,
+        click_count: 0,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -403,6 +405,10 @@ struct App {
     start: Instant,
     /// When the next scheduled `Tick` is due, if any.
     next_tick: Option<Instant>,
+    /// Most recent left/middle/right press (time, button, pos) for detecting
+    /// double/triple clicks, and the running click count.
+    last_click: Option<(Instant, PointerButton, PointPx)>,
+    click_count: u8,
 }
 
 impl App {
@@ -499,6 +505,29 @@ impl App {
 
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Click count for a press of `button` at the current pointer position: a
+    /// repeat of the same button within 400ms and a few pixels increments the
+    /// count (double-, triple-click), otherwise it resets to 1.
+    fn count_click(&mut self, button: PointerButton) -> u8 {
+        const WINDOW: Duration = Duration::from_millis(400);
+        const SLOP: f64 = 4.0;
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((t, b, p))
+                if b == button
+                    && now.duration_since(t) < WINDOW
+                    && (p.x - self.pointer_pos.x).abs() < SLOP
+                    && (p.y - self.pointer_pos.y).abs() < SLOP =>
+            {
+                self.click_count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.click_count = count;
+        self.last_click = Some((now, button, self.pointer_pos));
+        count
     }
 }
 
@@ -672,17 +701,20 @@ impl ApplicationHandler for App {
                         pos: self.pointer_pos,
                         mods,
                         wheel_dy: 0.0,
+                        clicks: 1,
                     },
                     event_loop,
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(b) = map_button(button) {
-                    let phase = if state == ElementState::Pressed {
+                    let pressed = state == ElementState::Pressed;
+                    let phase = if pressed {
                         PointerPhase::Press
                     } else {
                         PointerPhase::Release
                     };
+                    let clicks = if pressed { self.count_click(b) } else { 1 };
                     let mods = from_winit::mods(self.mods);
                     self.dispatch(
                         UiEvent::Pointer {
@@ -691,6 +723,7 @@ impl ApplicationHandler for App {
                             pos: self.pointer_pos,
                             mods,
                             wheel_dy: 0.0,
+                            clicks,
                         },
                         event_loop,
                     );
@@ -709,6 +742,7 @@ impl ApplicationHandler for App {
                         pos: self.pointer_pos,
                         mods,
                         wheel_dy: dy,
+                        clicks: 1,
                     },
                     event_loop,
                 );
