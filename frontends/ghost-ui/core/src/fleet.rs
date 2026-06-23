@@ -313,7 +313,9 @@ impl FleetModel {
                 }
                 self.relayout()
             }
-            UiEvent::Key { key, mods, kind } if kind.is_down() && nav(&key, mods).is_some() => {
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && nav(&key, mods).is_some() => {
                 let (delta, wrap) = nav(&key, mods).unwrap();
                 self.move_focus(delta, wrap);
                 vec![Cmd::Redraw]
@@ -625,6 +627,7 @@ mod tests {
             key: k,
             mods: crate::Mods::NONE,
             kind: KeyEventKind::Press,
+            alts: None,
         })
     }
 
@@ -931,6 +934,7 @@ mod tests {
             key: Key::Named(NamedKey::Tab),
             mods: crate::Mods::SHIFT,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         assert_eq!(m.focused(), Some("a"));
         assert_eq!(cmds, vec![Cmd::Redraw]); // focus only, never SendInput
@@ -939,6 +943,7 @@ mod tests {
             key: Key::Named(NamedKey::Tab),
             mods: crate::Mods::SHIFT,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         assert_eq!(m.focused(), Some("c"));
     }
@@ -972,6 +977,7 @@ mod tests {
             key: Key::Named(NamedKey::ArrowRight),
             mods: crate::Mods::NONE,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         assert_eq!(f.focused(), Some("beta"));
         // Toggling back returns the OWNED session, and detaches the foreign one.

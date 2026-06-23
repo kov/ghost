@@ -70,7 +70,9 @@ impl RootModel {
     }
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        if let UiEvent::Key { key, mods, kind } = &ev
+        if let UiEvent::Key {
+            key, mods, kind, ..
+        } = &ev
             && kind.is_down()
         {
             if is_fleet_toggle(key, *mods) {
@@ -234,6 +236,7 @@ mod tests {
             key: k,
             mods,
             kind: KeyEventKind::Press,
+            alts: None,
         })
     }
 
@@ -305,6 +308,7 @@ mod tests {
             key: Key::Named(NamedKey::ArrowRight),
             mods: Mods::NONE,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> single
         assert!(!r.is_fleet());

@@ -22,6 +22,19 @@ impl KeyEventKind {
     }
 }
 
+/// The codepoints the kitty report-alternate-keys flag (4) wants for a text key,
+/// beyond the key itself. `base` is the key with no modifiers applied — the
+/// canonical unicode-key-code; `shifted` is what Shift produces (when it differs
+/// from `base`); `base_layout` is the key at this physical position on the
+/// standard US (PC-101) layout (when it differs from `base`). The shell fills
+/// this from the platform; the pure core only reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyAlternates {
+    pub base: char,
+    pub shifted: Option<char>,
+    pub base_layout: Option<char>,
+}
+
 /// Keyboard modifier state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Mods {

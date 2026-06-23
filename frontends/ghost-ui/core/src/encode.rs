@@ -8,11 +8,12 @@
 //! (cursor-key application mode) switches unmodified cursor keys from CSI to
 //! SS3, matching what apps like vim expect.
 
-use crate::input::{Key, KeyEventKind, Mods, NamedKey};
+use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 
 /// kitty keyboard progressive-enhancement flag bits (`Vt::kitty_keyboard_flags`).
 const KITTY_DISAMBIGUATE: u8 = 0b00001;
 const KITTY_REPORT_EVENT_TYPES: u8 = 0b00010;
+const KITTY_REPORT_ALTERNATE_KEYS: u8 = 0b00100;
 const KITTY_REPORT_ALL_KEYS: u8 = 0b01000;
 /// Flags whose presence routes a key through the kitty `CSI u` encoder rather
 /// than the legacy / modifyOtherKeys schemes. (4 = report-alternate-keys and
@@ -33,12 +34,13 @@ pub fn encode(
     modify_other_keys: u8,
     kitty_flags: u8,
     kind: KeyEventKind,
+    alts: Option<KeyAlternates>,
 ) -> Option<Vec<u8>> {
     // The kitty keyboard protocol, when negotiated, replaces both older schemes
     // for every key (it produces the legacy bytes itself for the keys it leaves
     // alone, e.g. plain text and bare Enter/Tab/Backspace).
     if kitty_flags & KITTY_BASE_FLAGS != 0 {
-        return kitty_encode(key, mods, kitty_flags, kind);
+        return kitty_encode(key, mods, kitty_flags, kind, alts);
     }
     // Repeats fold into a press for the legacy schemes (auto-repeat re-sends the
     // byte); releases produce nothing.
@@ -59,16 +61,23 @@ pub fn encode(
 }
 
 /// kitty keyboard protocol encoder (the `CSI u` / progressive-enhancement
-/// scheme). Implements the *disambiguate* flag (1) — and the key-selection of
+/// scheme). Implements *disambiguate* (1) — and the key-selection of
 /// *report-all-keys* (8) — in their base form: `CSI code[;mods] u` for text /
 /// control keys, the legacy-shaped `CSI [1;mods]<letter>` and `CSI num[;mods]~`
-/// forms for navigation / function keys. The event-type, alternate-key and
-/// associated-text sub-fields (flags 2/4/16) are layered on in later steps.
+/// forms for navigation / function keys; the *report-event-types* (2) and
+/// *report-alternate-keys* (4) sub-fields layer onto those. Associated text
+/// (flag 16) is layered on in a later step.
 ///
 /// Returns the bytes for the key (including the plain legacy byte for keys the
 /// active flags leave alone) or `None` for keys that emit nothing (dead /
 /// unidentified / unknown).
-fn kitty_encode(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<Vec<u8>> {
+fn kitty_encode(
+    key: &Key,
+    mods: Mods,
+    flags: u8,
+    kind: KeyEventKind,
+    alts: Option<KeyAlternates>,
+) -> Option<Vec<u8>> {
     let force_all = flags & KITTY_REPORT_ALL_KEYS != 0;
     // A modifier other than a lone Shift makes a text key "not text" (and so
     // disambiguated); Shift alone keeps producing its shifted glyph.
@@ -79,10 +88,16 @@ fn kitty_encode(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<
     let event = event_subfield(flags, kind);
     match key {
         Key::Char(s) => {
-            if (force_all || nonshift_mod)
-                && let Some(code) = base_codepoint(s)
-            {
-                csi_u_or_suppressed(code, mods, event, kind)
+            // unicode-key-code: the platform's true unshifted codepoint when we
+            // have it (also corrects the base for shifted-symbol+ctrl combos),
+            // else the lower-cased glyph.
+            let code = alts
+                .map(|a| a.base as u32)
+                .or_else(|| base_codepoint(s))
+                .filter(|_| force_all || nonshift_mod);
+            if let Some(code) = code {
+                let field = kitty_key_field(code, alts, flags);
+                csi_u_field_or_suppressed(field, mods, event, kind)
             } else if matches!(kind, KeyEventKind::Release) {
                 // A text key has no escape-code form here, so its release is not
                 // reported (only flag 8 promotes text keys to escape codes).
@@ -95,6 +110,24 @@ fn kitty_encode(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<
         Key::Named(named) => kitty_encode_named(*named, mods, force_all, nonshift_mod, event, kind),
         // Key::Dead / Key::Unidentified: nothing on their own.
         _ => None,
+    }
+}
+
+/// The kitty key-code field: the unicode-key-code, plus the `:shifted[:base]`
+/// alternate-key sub-fields when report-alternate-keys (flag 4) is on and the
+/// platform supplied them. A present base-layout with no shifted key keeps the
+/// empty middle slot (`code::base`).
+fn kitty_key_field(base: u32, alts: Option<KeyAlternates>, flags: u8) -> String {
+    if flags & KITTY_REPORT_ALTERNATE_KEYS == 0 {
+        return base.to_string();
+    }
+    let shifted = alts.and_then(|a| a.shifted).map(|c| c as u32);
+    let base_layout = alts.and_then(|a| a.base_layout).map(|c| c as u32);
+    match (shifted, base_layout) {
+        (None, None) => base.to_string(),
+        (Some(s), None) => format!("{base}:{s}"),
+        (None, Some(b)) => format!("{base}::{b}"),
+        (Some(s), Some(b)) => format!("{base}:{s}:{b}"),
     }
 }
 
@@ -112,10 +145,22 @@ fn event_subfield(flags: u8, kind: KeyEventKind) -> Option<u8> {
     }
 }
 
-/// Emit the `CSI u` form, unless this is a release that isn't being reported
-/// (releases require the event-types flag), in which case nothing is sent.
+/// Emit the `CSI u` form for a plain (no alternate-key sub-fields) key-code,
+/// unless this is a release that isn't being reported (releases require the
+/// event-types flag), in which case nothing is sent.
 fn csi_u_or_suppressed(
     code: u32,
+    mods: Mods,
+    event: Option<u8>,
+    kind: KeyEventKind,
+) -> Option<Vec<u8>> {
+    csi_u_field_or_suppressed(code.to_string(), mods, event, kind)
+}
+
+/// As [`csi_u_or_suppressed`], but for a pre-built key-code field that may carry
+/// the `:shifted:base` alternate-key sub-fields.
+fn csi_u_field_or_suppressed(
+    key_field: String,
     mods: Mods,
     event: Option<u8>,
     kind: KeyEventKind,
@@ -123,7 +168,7 @@ fn csi_u_or_suppressed(
     if matches!(kind, KeyEventKind::Release) && event.is_none() {
         None
     } else {
-        Some(csi_u(code, mods, event))
+        Some(csi_u_field(key_field, mods, event))
     }
 }
 
@@ -230,9 +275,10 @@ fn mods_field(mods: Mods, event: Option<u8>) -> String {
     }
 }
 
-/// `CSI <code>[;<mods>[:<event>]] u`.
-fn csi_u(code: u32, mods: Mods, event: Option<u8>) -> Vec<u8> {
-    format!("\x1b[{code}{}u", mods_field(mods, event)).into_bytes()
+/// `CSI <key-field>[;<mods>[:<event>]] u`, where `key-field` is the unicode
+/// key-code possibly followed by the `:shifted:base` alternate-key sub-fields.
+fn csi_u_field(key_field: String, mods: Mods, event: Option<u8>) -> Vec<u8> {
+    format!("\x1b[{key_field}{}u", mods_field(mods, event)).into_bytes()
 }
 
 /// `CSI <final>` bare, `CSI 1<field><final>` when the field is present (the
@@ -471,7 +517,7 @@ fn encode_csi(csi: Csi, mods: Mods, app_cursor: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::input::{Key, KeyEventKind, Mods, NamedKey};
+    use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 
     /// Legacy / modifyOtherKeys tests run with kitty off; this 4-arg wrapper keeps
     /// them readable (the real `super::encode` takes the kitty flags + event kind).
@@ -483,17 +529,23 @@ mod tests {
             modify_other_keys,
             0,
             KeyEventKind::Press,
+            None,
         )
     }
 
     /// kitty-path encode of a key press: legacy + modifyOtherKeys off, kitty on.
     fn kitty(key: &Key, mods: Mods, flags: u8) -> Option<Vec<u8>> {
-        super::encode(key, mods, false, 0, flags, KeyEventKind::Press)
+        super::encode(key, mods, false, 0, flags, KeyEventKind::Press, None)
     }
 
     /// kitty-path encode of a specific event kind (for the report-event-types flag).
     fn kitty_ev(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<Vec<u8>> {
-        super::encode(key, mods, false, 0, flags, kind)
+        super::encode(key, mods, false, 0, flags, kind, None)
+    }
+
+    /// kitty-path encode of a press carrying alternate-key info (for flag 4).
+    fn kitty_alt(key: &Key, mods: Mods, flags: u8, alts: KeyAlternates) -> Option<Vec<u8>> {
+        super::encode(key, mods, false, 0, flags, KeyEventKind::Press, Some(alts))
     }
 
     fn ch(s: &str) -> Key {
@@ -875,7 +927,8 @@ mod tests {
                 true,
                 0,
                 F1_DISAMBIGUATE,
-                KeyEventKind::Press
+                KeyEventKind::Press,
+                None
             ),
             Some(b"\x1b[A".to_vec()),
             "app-cursor mode does not switch the kitty path to SS3"
@@ -1003,6 +1056,87 @@ mod tests {
                 KeyEventKind::Release
             ),
             None
+        );
+    }
+
+    // ---- kitty keyboard protocol: report alternate keys (flag 4) ----
+
+    const F1_F4: u8 = 1 | 4; // disambiguate + report-alternate-keys
+
+    #[test]
+    fn kitty_alternate_keys_report_the_shifted_and_base_layout_codepoints() {
+        // Ctrl+Shift+a on a US layout: base 97, shifted 65 (Shift differs), no
+        // base-layout (US == base). mods = ctrl+shift -> 6.
+        let a = KeyAlternates {
+            base: 'a',
+            shifted: Some('A'),
+            base_layout: None,
+        };
+        assert_eq!(
+            kitty_alt(&ch("A"), Mods::CTRL | Mods::SHIFT, F1_F4, a),
+            Some(b"\x1b[97:65;6u".to_vec())
+        );
+        // A non-US layout: physical Q produces Cyrillic ј (base 1112), and the
+        // base-layout key is 'q' (113). Ctrl only -> mods 5; the empty shifted
+        // slot is kept: code::base.
+        let cyr = KeyAlternates {
+            base: 'ј',
+            shifted: None,
+            base_layout: Some('q'),
+        };
+        assert_eq!(
+            kitty_alt(&ch("ј"), Mods::CTRL, F1_F4, cyr),
+            format!("\x1b[{}::113;5u", 'ј' as u32).into_bytes().into()
+        );
+        // Both alternates at once (Ctrl+Shift on that key): code:shifted:base.
+        let cyr_both = KeyAlternates {
+            base: 'ј',
+            shifted: Some('Ј'),
+            base_layout: Some('q'),
+        };
+        assert_eq!(
+            kitty_alt(&ch("Ј"), Mods::CTRL | Mods::SHIFT, F1_F4, cyr_both),
+            format!("\x1b[{}:{}:113;6u", 'ј' as u32, 'Ј' as u32)
+                .into_bytes()
+                .into()
+        );
+    }
+
+    #[test]
+    fn kitty_alternate_keys_only_appear_under_flag_4_but_base_is_always_corrected() {
+        // The platform's true base corrects the unicode-key-code even without
+        // flag 4: Ctrl+Shift+2 is key '2' (50), not the shifted glyph '@' (64).
+        let two = KeyAlternates {
+            base: '2',
+            shifted: Some('@'),
+            base_layout: None,
+        };
+        assert_eq!(
+            kitty_alt(&ch("@"), Mods::CTRL | Mods::SHIFT, F1_DISAMBIGUATE, two),
+            Some(b"\x1b[50;6u".to_vec()),
+            "flag 1 alone uses the corrected base but emits no alternate sub-fields"
+        );
+        assert_eq!(
+            kitty_alt(&ch("@"), Mods::CTRL | Mods::SHIFT, F1_F4, two),
+            Some(b"\x1b[50:64;6u".to_vec()),
+            "flag 4 adds the shifted alternate"
+        );
+        // A lone Shift+a is still plain text under flags 1|4 (not escape-code
+        // eligible), so the alternates do not surface.
+        let a = KeyAlternates {
+            base: 'a',
+            shifted: Some('A'),
+            base_layout: None,
+        };
+        assert_eq!(
+            kitty_alt(&ch("A"), Mods::SHIFT, F1_F4, a),
+            Some(b"A".to_vec())
+        );
+        // Under report-all (flag 8) that same Shift+a becomes an escape code and
+        // carries its shifted alternate. mods = shift -> 2.
+        assert_eq!(
+            kitty_alt(&ch("A"), Mods::SHIFT, 8 | 4, a),
+            Some(b"\x1b[97:65;2u".to_vec())
         );
     }
 }

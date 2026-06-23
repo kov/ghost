@@ -915,12 +915,22 @@ impl ApplicationHandler for App {
                 };
                 let key = from_winit::key(&event.logical_key);
                 let mods = from_winit::mods(mods_state);
+                let alts = from_winit::alternates(&event, mods_state);
                 let kind = match event.state {
                     ElementState::Pressed if event.repeat => KeyEventKind::Repeat,
                     ElementState::Pressed => KeyEventKind::Press,
                     ElementState::Released => KeyEventKind::Release,
                 };
-                self.dispatch(id, UiEvent::Key { key, mods, kind }, event_loop);
+                self.dispatch(
+                    id,
+                    UiEvent::Key {
+                        key,
+                        mods,
+                        kind,
+                        alts,
+                    },
+                    event_loop,
+                );
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.dispatch(id, UiEvent::Text(text), event_loop);

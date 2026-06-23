@@ -18,7 +18,7 @@ use ghost_term::{Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 
-use crate::input::{Key, KeyEventKind, Mods, NamedKey};
+use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, SessionId, UiEvent, encode, mouse,
 };
@@ -195,7 +195,12 @@ impl TerminalModel {
     /// Apply an event, returning the effects to perform.
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         match ev {
-            UiEvent::Key { key, mods, kind } => self.key(&key, mods, kind),
+            UiEvent::Key {
+                key,
+                mods,
+                kind,
+                alts,
+            } => self.key(&key, mods, kind, alts),
             UiEvent::Text(s) => self.text(&s),
             UiEvent::Preedit(s) => self.set_preedit(s),
             UiEvent::SetZoom(z) => self.apply_zoom(z.clamp(ZOOM_MIN, ZOOM_MAX)),
@@ -344,7 +349,13 @@ impl TerminalModel {
         }
     }
 
-    fn key(&mut self, key: &Key, mods: Mods, kind: KeyEventKind) -> Vec<Cmd> {
+    fn key(
+        &mut self,
+        key: &Key,
+        mods: Mods,
+        kind: KeyEventKind,
+        alts: Option<KeyAlternates>,
+    ) -> Vec<Cmd> {
         // While an IME composition is active the keystrokes belong to the IME
         // (which delivers its result via `Preedit`/`Text`); sending them to the
         // child as well would double-type. Releases that land while composing are
@@ -364,8 +375,15 @@ impl TerminalModel {
             let app_cursor = self.screen.vt().cursor_key_app_mode();
             let modify_other_keys = self.screen.vt().modify_other_keys();
             let kitty_flags = self.screen.vt().kitty_keyboard_flags();
-            return match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags, kind)
-            {
+            return match encode::encode(
+                key,
+                mods,
+                app_cursor,
+                modify_other_keys,
+                kitty_flags,
+                kind,
+                alts,
+            ) {
                 Some(bytes) => self.send(bytes),
                 None => Vec::new(),
             };
@@ -406,7 +424,15 @@ impl TerminalModel {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 let modify_other_keys = self.screen.vt().modify_other_keys();
                 let kitty_flags = self.screen.vt().kitty_keyboard_flags();
-                match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags, kind) {
+                match encode::encode(
+                    key,
+                    mods,
+                    app_cursor,
+                    modify_other_keys,
+                    kitty_flags,
+                    kind,
+                    alts,
+                ) {
                     // Typing returns to the live bottom, then sends the keystroke.
                     Some(bytes) => {
                         let mut cmds = self.snap_to_bottom();
@@ -921,11 +947,17 @@ mod tests {
             key: k,
             mods,
             kind: KeyEventKind::Press,
+            alts: None,
         })
     }
 
     fn key_kind(m: &mut TerminalModel, k: Key, mods: Mods, kind: KeyEventKind) -> Vec<Cmd> {
-        m.update(UiEvent::Key { key: k, mods, kind })
+        m.update(UiEvent::Key {
+            key: k,
+            mods,
+            kind,
+            alts: None,
+        })
     }
 
     fn feed(m: &mut TerminalModel, bytes: &[u8]) {
@@ -1017,7 +1049,8 @@ mod tests {
             m.update(UiEvent::Key {
                 key: Key::Char("x".into()),
                 mods: Mods::NONE,
-                kind: KeyEventKind::Release
+                kind: KeyEventKind::Release,
+                alts: None
             }),
             vec![]
         );
@@ -1906,6 +1939,7 @@ mod tests {
             key: Key::Named(NamedKey::PageUp),
             mods: Mods::SHIFT,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         m.update(ptr(
             PointerPhase::Release,
@@ -1963,6 +1997,7 @@ mod tests {
             key: Key::Named(NamedKey::PageUp),
             mods: Mods::SHIFT,
             kind: KeyEventKind::Press,
+            alts: None,
         });
         assert!(cmds.contains(&Cmd::Redraw));
         assert!(

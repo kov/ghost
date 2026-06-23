@@ -5,7 +5,7 @@
 //! against the layout it produced, so hit-testing stays pure and testable.
 
 use crate::SessionId;
-use crate::input::{Key, KeyEventKind, Mods};
+use crate::input::{Key, KeyAlternates, KeyEventKind, Mods};
 use ghost_vt::session::SessionInfo;
 
 /// A pointer position in physical pixels (origin top-left).
@@ -35,11 +35,14 @@ pub enum PointerPhase {
 /// clock — so `update` never touches the world directly.
 #[derive(Clone, Debug)]
 pub enum UiEvent {
-    /// A key transition: a press, an auto-repeat, or a release.
+    /// A key transition: a press, an auto-repeat, or a release. `alts` carries the
+    /// platform's alternate codepoints (for the kitty report-alternate-keys flag);
+    /// it is `None` when unavailable or for non-text keys.
     Key {
         key: Key,
         mods: Mods,
         kind: KeyEventKind,
+        alts: Option<KeyAlternates>,
     },
     /// Committed text (IME commit, or text the shell pasted in).
     Text(String),
