@@ -113,6 +113,8 @@ pub struct TerminalModel {
     /// In-progress IME composition string; non-empty means composing, during
     /// which raw key input is suppressed.
     preedit: String,
+    /// Last window title pushed to the shell, to emit `SetTitle` only on change.
+    last_title: String,
     ended: bool,
 }
 
@@ -139,6 +141,7 @@ impl TerminalModel {
             selection: None,
             scroll_offset: 0,
             preedit: String::new(),
+            last_title: String::new(),
             ended: false,
         }
     }
@@ -494,6 +497,11 @@ impl TerminalModel {
             if self.held.is_none() && self.scroll_offset == 0 {
                 self.selection = None;
                 self.sel_anchor = None;
+            }
+            // Reflect an OSC 0/2 window-title change to the shell, once per change.
+            if self.screen.title() != self.last_title.as_str() {
+                self.last_title = self.screen.title().to_string();
+                cmds.push(Cmd::SetTitle(self.last_title.clone()));
             }
             cmds.push(Cmd::Redraw);
         }
@@ -1191,6 +1199,27 @@ mod tests {
         // cursor after "hi" is col 3, row 1 -> CSI 1;3 R, plus a redraw.
         assert_eq!(cmds, vec![sent("alpha", b"\x1b[1;3R"), Cmd::Redraw]);
         assert!(m.screen().text()[0].starts_with("hi"));
+    }
+
+    #[test]
+    fn osc_title_change_emits_set_title() {
+        let mut m = model();
+        let feed_cmds = |m: &mut TerminalModel, b: &[u8]| {
+            m.update(UiEvent::SessionData {
+                name: "alpha".to_string(),
+                bytes: b.to_vec(),
+                ended: false,
+            })
+        };
+        // OSC 2 sets the window title -> the model asks the shell to apply it.
+        let cmds = feed_cmds(&mut m, b"\x1b]2;my-prog\x07");
+        assert!(cmds.contains(&Cmd::SetTitle("my-prog".to_string())));
+        // Plain output with the same title doesn't re-emit.
+        let cmds = feed_cmds(&mut m, b"x");
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))));
+        // A different title emits again.
+        let cmds = feed_cmds(&mut m, b"\x1b]2;other\x07");
+        assert!(cmds.contains(&Cmd::SetTitle("other".to_string())));
     }
 
     #[test]

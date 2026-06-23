@@ -407,7 +407,11 @@ impl FleetModel {
                 tile.activity = tile.activity.saturating_add(1);
             }
         }
-        cmds
+        // The overview doesn't drive the window title; a tile changing its OSC
+        // title must not retitle the window out from under the single view.
+        cmds.into_iter()
+            .filter(|c| !matches!(c, Cmd::SetTitle(_)))
+            .collect()
     }
 
     fn move_focus(&mut self, delta: i32, wrap: bool) {
@@ -609,6 +613,18 @@ mod tests {
         data(&mut m, "a", b"hello");
         assert!(m.tile_text("a").unwrap()[0].starts_with("hello"));
         assert!(m.tile_text("b").unwrap()[0].trim().is_empty());
+    }
+
+    #[test]
+    fn tile_title_change_does_not_retitle_the_window() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // A tile setting its OSC title must not drive the overview window title.
+        let cmds = data(&mut m, "a", b"\x1b]2;tile-a\x07");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
+            "the fleet overview does not retitle the window for a tile"
+        );
     }
 
     #[test]
