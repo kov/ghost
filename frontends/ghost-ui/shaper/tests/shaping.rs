@@ -52,7 +52,7 @@ fn plain_text_is_not_substituted() {
 #[test]
 fn rasterize_is_deterministic() {
     let a = glyph_id(font(), 'A');
-    let bmp = rasterize(font(), a, 32.0).expect("'A' has an outline");
+    let bmp = rasterize(font(), a, 32.0, false).expect("'A' has an outline");
     let sum: u64 = bmp.coverage.iter().map(|&b| u64::from(b)).sum();
     eprintln!(
         "RASTER A@32 => {}x{} left={} top={} len={} sum={}",
@@ -74,3 +74,24 @@ fn rasterize_is_deterministic() {
 // 32px, hint-free. swash produces these bit-for-bit on any platform.
 const GOLDEN_WH: (u32, u32) = (20, 23);
 const GOLDEN_SUM: u64 = 36031;
+
+#[test]
+fn faux_italic_shears_the_glyph() {
+    // The synthetic oblique transform shears x by y (x' = x + y·tanθ). Two things
+    // are then true for *any* glyph: the vertical extent is untouched (so the
+    // bitmap height is identical), and ink above the baseline slides sideways (so
+    // the coverage differs from the upright glyph). The bbox *width* is not a
+    // reliable probe — shearing a glyph that already has diagonal strokes can
+    // narrow it — so we don't assert on it.
+    let a = glyph_id(font(), 'A');
+    let roman = rasterize(font(), a, 32.0, false).expect("'A' has an outline");
+    let italic = rasterize(font(), a, 32.0, true).expect("italic 'A' has an outline");
+    assert_eq!(
+        italic.height, roman.height,
+        "a horizontal shear leaves height unchanged"
+    );
+    assert_ne!(
+        italic.coverage, roman.coverage,
+        "the shear must move ink, so the raster differs from the upright glyph"
+    );
+}

@@ -486,8 +486,8 @@ pub struct Renderer {
     theme: Theme,
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
-    /// glyph cache keyed by (glyph id, font size bits); `None` = no bitmap.
-    cache: HashMap<(u16, u32), Option<Slot>>,
+    /// glyph cache keyed by (glyph id, font size bits, italic); `None` = no bitmap.
+    cache: HashMap<(u16, u32, bool), Option<Slot>>,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -702,12 +702,12 @@ impl Renderer {
     }
 
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
-    fn ensure_glyph(&mut self, font: FontRef, id: u16, size_px: f32) -> Option<Slot> {
-        let key = (id, size_px.to_bits());
+    fn ensure_glyph(&mut self, font: FontRef, id: u16, size_px: f32, italic: bool) -> Option<Slot> {
+        let key = (id, size_px.to_bits(), italic);
         if let Some(slot) = self.cache.get(&key) {
             return *slot;
         }
-        let resolved = match ghost_shaper::rasterize(font, id, size_px) {
+        let resolved = match ghost_shaper::rasterize(font, id, size_px, italic) {
             Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
                 if self.pack_x + bmp.width + 1 > ATLAS_DIM {
                     self.pack_x = 1;
@@ -850,7 +850,7 @@ impl Renderer {
                 for g in ghost_shaper::shape(font, &run.text, size_px) {
                     let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
-                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px) {
+                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px, run.style.italic) {
                         glyphs.push(Instance {
                             rect: [
                                 pen + slot.left as f32,
@@ -1082,7 +1082,7 @@ impl Renderer {
             for g in ghost_shaper::shape(font, &run.text, size_px) {
                 let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
-                if let Some(slot) = self.ensure_glyph(font, g.id, size_px) {
+                if let Some(slot) = self.ensure_glyph(font, g.id, size_px, run.style.italic) {
                     out.push(Instance {
                         rect: [
                             pen + slot.left as f32,
@@ -1285,6 +1285,19 @@ mod tests {
         let mid_red = |img: &Rendered| (0..9).any(|x| (8..11).any(|y| is_red(px(img, x, y))));
         assert!(!mid_red(&plain), "a plain space cell has no mid-cell ink");
         assert!(mid_red(&strike), "SGR 9 paints a red rule through the cell");
+    }
+
+    #[test]
+    fn italic_renders_a_sheared_glyph() {
+        // SGR 3 must route the cell through the faux-oblique raster: the same
+        // letter renders to different pixels upright vs italic. 'W' has plenty of
+        // off-baseline ink, so the shear is unmistakable.
+        let roman = render_text("W");
+        let italic = render_text("\x1b[3mW");
+        assert_ne!(
+            roman.rgba, italic.rgba,
+            "an italic cell must render a sheared glyph, not the upright one"
+        );
     }
 
     #[test]

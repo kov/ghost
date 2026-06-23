@@ -14,7 +14,7 @@
 use ghost_render::Run;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::shape::ShapeContext;
-use swash::zeno::Format;
+use swash::zeno::{Angle, Format, Transform};
 
 pub use swash::FontRef;
 
@@ -80,15 +80,29 @@ pub fn shape_run(font: FontRef, run: &Run, size_px: f32) -> Vec<ShapedGlyph> {
     shape(font, &run.text, size_px)
 }
 
+/// Synthetic-oblique shear for faux italics, applied to the glyph outline when a
+/// dedicated italic face isn't available. ~14° leans the top to the right, the
+/// usual range for synthesized italics.
+const FAUX_ITALIC_DEGREES: f32 = 14.0;
+
 /// Rasterize a glyph to an alpha-coverage bitmap with hinting **off**, so the
 /// output is bit-identical across platforms — the basis for deterministic
-/// glyph goldens. Returns `None` for a glyph with no outline (e.g. a space).
-pub fn rasterize(font: FontRef, glyph: u16, size_px: f32) -> Option<GlyphBitmap> {
+/// glyph goldens. With `italic`, a synthetic oblique shear is applied to the
+/// outline (faux italics, since we ship a single regular face). Returns `None`
+/// for a glyph with no outline (e.g. a space).
+pub fn rasterize(font: FontRef, glyph: u16, size_px: f32, italic: bool) -> Option<GlyphBitmap> {
     let mut ctx = ScaleContext::new();
     let mut scaler = ctx.builder(font).size(size_px).hint(false).build();
-    let image = Render::new(&[Source::Outline])
-        .format(Format::Alpha)
-        .render(&mut scaler, glyph)?;
+    let mut render = Render::new(&[Source::Outline]);
+    render.format(Format::Alpha);
+    if italic {
+        // x' = x + y·tan(θ): outline points above the baseline shift right.
+        render.transform(Some(Transform::skew(
+            Angle::from_degrees(FAUX_ITALIC_DEGREES),
+            Angle::ZERO,
+        )));
+    }
+    let image = render.render(&mut scaler, glyph)?;
     Some(GlyphBitmap {
         left: image.placement.left,
         top: image.placement.top,
