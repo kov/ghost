@@ -13,6 +13,11 @@ pub(crate) struct Buffer {
     pub rows: usize,
     scrollback_limit: Option<usize>,
     trim_needed: bool,
+    /// Lines evicted from the front by scrollback trimming, accumulated over the
+    /// buffer's life. Added to `scrollback_len()` it gives a monotonic count of
+    /// lines that have ever scrolled off the top — which (unlike the capped
+    /// scrollback length) lets a viewer pin its position across a trimming feed.
+    evicted: usize,
 }
 
 pub(crate) enum EraseMode {
@@ -58,6 +63,7 @@ impl Buffer {
             rows,
             scrollback_limit,
             trim_needed: false,
+            evicted: 0,
         }
     }
 
@@ -320,6 +326,17 @@ impl Buffer {
         self.lines.iter().skip(self.view_offset())
     }
 
+    /// The `rows`-tall viewport scrolled `offset` lines up into scrollback.
+    /// `offset` 0 is the live viewport (identical to [`view`](Self::view));
+    /// larger offsets are clamped to [`scrollback_len`](Self::scrollback_len).
+    pub fn view_at(&self, offset: usize) -> impl Iterator<Item = &Line> {
+        let offset = offset.min(self.scrollback_len());
+        self.lines
+            .iter()
+            .skip(self.view_offset() - offset)
+            .take(self.rows)
+    }
+
     pub fn lines(&self) -> impl Iterator<Item = &Line> {
         self.lines.iter()
     }
@@ -332,6 +349,14 @@ impl Buffer {
     /// Total number of lines held: scrollback plus the viewport.
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Monotonic count of lines that have ever scrolled off the top of the
+    /// viewport into history, including ones since trimmed away. Grows by the
+    /// gross lines pushed each feed even once scrollback is capped, so a viewer
+    /// can keep its scroll position pinned to fixed content.
+    pub fn lines_scrolled_off(&self) -> usize {
+        self.scrollback_len() + self.evicted
     }
 
     fn view_offset(&self) -> usize {
@@ -366,12 +391,13 @@ impl Buffer {
     }
 
     fn trim_scrollback(&mut self) -> Option<impl Iterator<Item = Line> + '_> {
-        if let Some(limit) = &self.scrollback_limit {
+        if let Some(limit) = self.scrollback_limit {
             let line_count = self.lines.len();
             let scrollback_size = line_count - self.rows;
 
-            if scrollback_size > *limit {
+            if scrollback_size > limit {
                 let excess = scrollback_size - limit;
+                self.evicted += excess;
                 return Some(self.lines.drain(..excess));
             }
         }

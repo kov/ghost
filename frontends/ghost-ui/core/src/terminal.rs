@@ -13,15 +13,28 @@
 //! and child output arrives as `UiEvent::SessionData`. The pure protocol helpers
 //! (`query_replies`, `bracket_paste`, `selection_text`) live here too.
 
-use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, Selection, layout_frame};
-use ghost_term::MouseProtocol;
+use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, Selection, layout_frame_at};
+use ghost_term::{Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 
-use crate::input::{Key, Mods};
+use crate::input::{Key, Mods, NamedKey};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, SessionId, UiEvent, encode, mouse,
 };
+
+/// Lines moved per mouse-wheel notch when scrolling local scrollback.
+const SCROLL_LINES: i64 = 3;
+
+/// A local-viewport scroll requested by a Shift+navigation key.
+enum Scroll {
+    /// Move by N lines (positive = up, into history).
+    By(i64),
+    /// Jump to the oldest retained line.
+    Top,
+    /// Jump back to the live bottom.
+    Bottom,
+}
 
 /// A frontend-handled key combo (Super+key, or Ctrl+Shift+key) intercepted
 /// before encoding so it drives the app, not the child.
@@ -61,6 +74,8 @@ pub struct TerminalModel {
     /// Selection anchor while dragging, 0-based `(row, col)`.
     sel_anchor: Option<(usize, usize)>,
     selection: Option<Selection>,
+    /// Lines scrolled up into history; 0 = pinned to the live bottom.
+    scroll_offset: usize,
     ended: bool,
 }
 
@@ -83,6 +98,7 @@ impl TerminalModel {
             gesture_report: false,
             sel_anchor: None,
             selection: None,
+            scroll_offset: 0,
             ended: false,
         }
     }
@@ -128,7 +144,7 @@ impl TerminalModel {
 
     /// Render the current state to a single full-window terminal scene.
     pub fn view(&self) -> Scene {
-        let frame = layout_frame(self.screen.vt(), self.metrics);
+        let frame = layout_frame_at(self.screen.vt(), self.metrics, self.scroll_offset);
         let rect = RectPx {
             x: 0.0,
             y: 0.0,
@@ -156,9 +172,77 @@ impl TerminalModel {
         }]
     }
 
+    /// The maximum scroll-up offset (retained scrollback lines).
+    fn max_scroll(&self) -> usize {
+        self.screen.vt().scrollback_len()
+    }
+
+    /// Clamp `offset` to the retained history and apply it; returns whether the
+    /// view actually moved.
+    fn set_scroll(&mut self, offset: usize) -> bool {
+        let offset = offset.min(self.max_scroll());
+        let changed = offset != self.scroll_offset;
+        self.scroll_offset = offset;
+        changed
+    }
+
+    /// Scroll by `delta` lines (positive = up, into history). `Redraw` if moved.
+    fn scroll_by(&mut self, delta: i64) -> Vec<Cmd> {
+        let target = (self.scroll_offset as i64 + delta).max(0) as usize;
+        if self.set_scroll(target) {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Jump back to the live bottom; `Redraw` if it moved.
+    fn snap_to_bottom(&mut self) -> Vec<Cmd> {
+        if self.set_scroll(0) {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A Shift+navigation key that scrolls the local viewport, if it is one.
+    /// Plain (unshifted) keys are left for the child, matching xterm.
+    fn scroll_key(&self, key: &Key, mods: Mods) -> Option<Scroll> {
+        if !mods.shift || mods.ctrl || mods.alt || mods.sup {
+            return None;
+        }
+        let page = i64::from(self.rows.saturating_sub(1)).max(1);
+        match key {
+            Key::Named(NamedKey::PageUp) => Some(Scroll::By(page)),
+            Key::Named(NamedKey::PageDown) => Some(Scroll::By(-page)),
+            Key::Named(NamedKey::Home) => Some(Scroll::Top),
+            Key::Named(NamedKey::End) => Some(Scroll::Bottom),
+            _ => None,
+        }
+    }
+
     fn key(&mut self, key: &Key, mods: Mods, pressed: bool) -> Vec<Cmd> {
         if !pressed {
             return Vec::new();
+        }
+        if let Some(scroll) = self.scroll_key(key, mods) {
+            // Don't move the viewport out from under an in-progress drag: the
+            // selection is window-relative, so scrolling would retarget it.
+            if self.held.is_some() {
+                return Vec::new();
+            }
+            return match scroll {
+                Scroll::By(d) => self.scroll_by(d),
+                Scroll::Top => {
+                    let top = self.max_scroll();
+                    if self.set_scroll(top) {
+                        vec![Cmd::Redraw]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Scroll::Bottom => self.snap_to_bottom(),
+            };
         }
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
@@ -166,27 +250,36 @@ impl TerminalModel {
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 match encode::encode(key, mods, app_cursor) {
-                    Some(bytes) => self.send(bytes),
+                    // Typing returns to the live bottom, then sends the keystroke.
+                    Some(bytes) => {
+                        let mut cmds = self.snap_to_bottom();
+                        cmds.extend(self.send(bytes));
+                        cmds
+                    }
                     None => Vec::new(),
                 }
             }
         }
     }
 
-    fn text(&self, s: &str) -> Vec<Cmd> {
+    fn text(&mut self, s: &str) -> Vec<Cmd> {
         if s.is_empty() {
             Vec::new()
         } else {
-            self.send(s.as_bytes().to_vec())
+            let mut cmds = self.snap_to_bottom();
+            cmds.extend(self.send(s.as_bytes().to_vec()));
+            cmds
         }
     }
 
     /// Paste reply from the shell: wrap with bracketed-paste markers if enabled.
-    fn paste(&self, text: Option<String>) -> Vec<Cmd> {
+    fn paste(&mut self, text: Option<String>) -> Vec<Cmd> {
         match text {
             Some(s) => {
                 let bytes = bracket_paste(s.as_bytes(), self.screen.vt().bracketed_paste());
-                self.send(bytes)
+                let mut cmds = self.snap_to_bottom();
+                cmds.extend(self.send(bytes));
+                cmds
             }
             None => Vec::new(),
         }
@@ -195,7 +288,7 @@ impl TerminalModel {
     fn copy(&self) -> Vec<Cmd> {
         match self.selection {
             Some(sel) => {
-                let text = selection_text(&self.screen, sel);
+                let text = selection_text(&self.screen, sel, self.scroll_offset);
                 if text.is_empty() {
                     Vec::new()
                 } else {
@@ -228,9 +321,11 @@ impl TerminalModel {
         self.cols = cols;
         self.rows = rows;
         self.screen.resize(cols, rows);
-        // Reflow invalidates cell coordinates; drop any stale selection.
+        // Reflow invalidates cell coordinates and the history view; drop any
+        // stale selection and return to the live bottom.
         self.selection = None;
         self.sel_anchor = None;
+        self.scroll_offset = 0;
         vec![
             Cmd::Resize {
                 session: self.session.clone(),
@@ -247,7 +342,17 @@ impl TerminalModel {
         }
         let mut cmds = Vec::new();
         if !bytes.is_empty() {
+            let before = self.screen.vt().lines_scrolled_off();
             self.screen.feed(bytes);
+            // Keep a scrolled-up view pinned to its content: advance the offset by
+            // the GROSS lines that scrolled off the top this feed. That count
+            // survives scrollback trimming (unlike the net scrollback_len delta,
+            // which reads zero once the cap is hit), clamped to retained history.
+            // At the bottom (offset 0) we just follow the live output.
+            if self.scroll_offset > 0 {
+                let pushed = self.screen.vt().lines_scrolled_off().saturating_sub(before);
+                self.scroll_offset = (self.scroll_offset + pushed).min(self.max_scroll());
+            }
             let cursor = self.screen.cursor();
             let size = self.screen.dimensions();
             let replies = query_replies(&mut self.scanner, bytes, cursor, size);
@@ -257,9 +362,11 @@ impl TerminalModel {
                     bytes: replies,
                 });
             }
-            // Output moved the viewport; a viewport-relative selection no longer
-            // maps to what the user picked, so drop it — unless a drag is live.
-            if self.held.is_none() {
+            // At the live bottom, new output replaces the viewport, so a
+            // viewport-relative selection no longer maps — drop it (unless a drag
+            // is live). While scrolled back, stay-put keeps the same content on
+            // screen, so the selection stays valid and is preserved.
+            if self.held.is_none() && self.scroll_offset == 0 {
                 self.selection = None;
                 self.sel_anchor = None;
             }
@@ -389,16 +496,31 @@ impl TerminalModel {
                 cmds
             }
             PointerPhase::Wheel => {
-                if !self.report_to_app(mods) || wheel_dy == 0.0 {
+                if wheel_dy == 0.0 {
                     return Vec::new();
                 }
-                let b = if wheel_dy > 0.0 {
-                    mouse::Button::WheelUp
+                if self.report_to_app(mods) {
+                    // The child grabbed the mouse: report the wheel as a button.
+                    let b = if wheel_dy > 0.0 {
+                        mouse::Button::WheelUp
+                    } else {
+                        mouse::Button::WheelDown
+                    };
+                    let cell = self.cursor_cell.unwrap_or((1, 1));
+                    self.mouse_report(mouse::Kind::Press, Some(b), self.held.is_some(), cell, mods)
+                } else if self.held.is_some() {
+                    // A drag is in progress: don't scroll the viewport out from
+                    // under the (window-relative) selection.
+                    Vec::new()
                 } else {
-                    mouse::Button::WheelDown
-                };
-                let cell = self.cursor_cell.unwrap_or((1, 1));
-                self.mouse_report(mouse::Kind::Press, Some(b), self.held.is_some(), cell, mods)
+                    // Otherwise scroll local scrollback (up = into history).
+                    let delta = if wheel_dy > 0.0 {
+                        SCROLL_LINES
+                    } else {
+                        -SCROLL_LINES
+                    };
+                    self.scroll_by(delta)
+                }
             }
         }
     }
@@ -441,20 +563,23 @@ pub fn bracket_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
     out
 }
 
-/// Extract the text covered by `sel` from `screen`, one line per row joined by
-/// newlines. Wide-cell tail placeholders are dropped; the terminating row keeps
-/// its trailing spaces (selected content) while earlier rows are trimmed.
-pub fn selection_text(screen: &Screen, sel: Selection) -> String {
-    let (cols, rows) = screen.dimensions();
-    let (cols, rows) = (cols as usize, rows as usize);
+/// Extract the text covered by `sel` from `screen`'s viewport scrolled
+/// `scroll_offset` lines into history (0 = live), one line per row joined by
+/// newlines. Selection rows are relative to the *visible* window, so copying
+/// while scrolled back yields the history the user sees, not the live viewport.
+/// Wide-cell tail placeholders are dropped; the terminating row keeps its
+/// trailing spaces (selected content) while earlier rows are trimmed.
+pub fn selection_text(screen: &Screen, sel: Selection, scroll_offset: usize) -> String {
+    let (cols, _rows) = screen.dimensions();
+    let cols = cols as usize;
+    let window: Vec<&Line> = screen.vt().view_at(scroll_offset).collect();
     let mut lines: Vec<String> = Vec::new();
     for row in sel.start.0..=sel.end.0 {
-        if row >= rows {
+        let Some(line) = window.get(row) else {
             break;
-        }
+        };
         let text = match sel.row_span(row, cols) {
             Some((c0, c1)) => {
-                let line = screen.vt().line(row);
                 let len = line.len();
                 line.cells()[c0.min(len)..c1.min(len)]
                     .iter()
@@ -477,6 +602,7 @@ pub fn selection_text(screen: &Screen, sel: Selection) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::NamedKey;
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -517,6 +643,45 @@ mod tests {
         Cmd::SendInput {
             session: session.to_string(),
             bytes: bytes.to_vec(),
+        }
+    }
+
+    /// A wheel event with vertical delta `dy` (positive = scroll up / into
+    /// history), mouse reporting off.
+    fn wheel(dy: f64) -> UiEvent {
+        UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 1.0, y: 1.0 },
+            mods: Mods::NONE,
+            wheel_dy: dy,
+        }
+    }
+
+    /// Feed `n` lines "L0".."L{n-1}" (no trailing newline).
+    fn feed_lines(m: &mut TerminalModel, n: usize) {
+        let mut s = String::new();
+        for i in 0..n {
+            if i > 0 {
+                s.push_str("\r\n");
+            }
+            s.push_str(&format!("L{i}"));
+        }
+        feed(m, s.as_bytes());
+    }
+
+    /// The text of the first run of the top rendered row (what the user sees at
+    /// the top of the terminal, honoring any scrollback offset).
+    fn top_row_text(m: &TerminalModel) -> String {
+        let scene = m.view();
+        match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => frame
+                .rows_layout
+                .first()
+                .and_then(|r| r.runs.first())
+                .map(|run| run.text.clone())
+                .unwrap_or_default(),
+            _ => unreachable!(),
         }
     }
 
@@ -748,6 +913,210 @@ mod tests {
         }
     }
 
+    // ---- scrollback ----
+
+    #[test]
+    fn wheel_scrolls_back_into_history() {
+        let mut m = model(); // 80x24
+        feed_lines(&mut m, 100); // viewport L76..L99
+        assert_eq!(top_row_text(&m), "L76", "starts at the live bottom");
+        let cmds = m.update(wheel(1.0)); // one notch up
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "local scroll never sends to the child"
+        );
+        assert_eq!(top_row_text(&m), "L73", "scrolled up one notch (3 lines)");
+    }
+
+    #[test]
+    fn wheel_down_returns_to_live_and_clamps_at_bottom() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel(1.0)); // up -> L73
+        m.update(wheel(-1.0)); // down -> L76 (live)
+        assert_eq!(top_row_text(&m), "L76");
+        // Already at the bottom: scrolling further down does nothing.
+        let cmds = m.update(wheel(-1.0));
+        assert_eq!(top_row_text(&m), "L76");
+        assert!(!cmds.contains(&Cmd::Redraw), "no-op scroll emits no redraw");
+    }
+
+    #[test]
+    fn scroll_clamps_at_the_oldest_line() {
+        let mut m = model();
+        feed_lines(&mut m, 100); // scrollback = 76 lines
+        for _ in 0..100 {
+            m.update(wheel(1.0)); // scroll far past the top
+        }
+        assert_eq!(top_row_text(&m), "L0", "clamps at the oldest retained line");
+    }
+
+    #[test]
+    fn typing_snaps_to_the_bottom() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel(1.0));
+        assert_eq!(top_row_text(&m), "L73");
+        let cmds = key(&mut m, Key::Char("x".into()), Mods::NONE);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "the keystroke still reaches the child"
+        );
+        assert_eq!(top_row_text(&m), "L76", "typing jumps back to live output");
+    }
+
+    #[test]
+    fn output_keeps_the_scroll_position_stable() {
+        let mut m = model();
+        feed_lines(&mut m, 100); // top live L76, scrollback 76
+        m.update(wheel(1.0)); // offset 3 -> top L73
+        assert_eq!(top_row_text(&m), "L73");
+        // New output arrives while scrolled; the viewed line stays put.
+        feed(&mut m, b"\r\nL100\r\nL101");
+        assert_eq!(top_row_text(&m), "L73");
+    }
+
+    #[test]
+    fn output_keeps_scroll_position_stable_at_the_scrollback_cap() {
+        // Saturate scrollback past DEFAULT_SCROLLBACK so every new line trims an
+        // old one — the case where a naive scrollback_len delta reads zero growth.
+        let mut m = model();
+        feed_lines(&mut m, 1100);
+        for _ in 0..10 {
+            m.update(wheel(1.0)); // scroll ~30 lines up, away from both ends
+        }
+        let pinned = top_row_text(&m);
+        // More output arrives; the viewed line must stay put even at the cap.
+        feed(&mut m, b"\r\nX0\r\nX1\r\nX2\r\nX3\r\nX4");
+        assert_eq!(
+            top_row_text(&m),
+            pinned,
+            "view stays pinned to its history line even while scrollback trims"
+        );
+    }
+
+    #[test]
+    fn scrolling_is_suppressed_during_an_active_drag() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel(1.0)); // top row "L73"
+        // Begin a left-drag selecting "L73".
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            18.0,
+            1.0,
+        ));
+        // A wheel mid-drag must not move the viewport out from under the selection.
+        assert!(
+            !m.update(wheel(1.0)).contains(&Cmd::Redraw),
+            "wheel is ignored while a drag is held"
+        );
+        // Shift+PageUp mid-drag is likewise ignored.
+        m.update(UiEvent::Key {
+            key: Key::Named(NamedKey::PageUp),
+            mods: Mods::SHIFT,
+            pressed: true,
+        });
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            18.0,
+            1.0,
+        ));
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
+            vec![Cmd::WriteClipboard("L73".to_string())],
+            "copy reads exactly the dragged line, not a scrolled-away one"
+        );
+    }
+
+    #[test]
+    fn scrolled_selection_survives_background_output() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel(1.0)); // top row "L73"
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            18.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            18.0,
+            1.0,
+        ));
+        assert!(m.selection().is_some());
+        // Background output keeps the line pinned (stay-put) AND keeps the
+        // selection, since its content is still on screen.
+        feed(&mut m, b"\r\nL100\r\nL101");
+        assert_eq!(top_row_text(&m), "L73");
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
+            vec![Cmd::WriteClipboard("L73".to_string())]
+        );
+    }
+
+    #[test]
+    fn shift_pageup_scrolls_a_page_without_sending_input() {
+        let mut m = model(); // 24 rows -> page = 23 lines
+        feed_lines(&mut m, 100);
+        let cmds = m.update(UiEvent::Key {
+            key: Key::Named(NamedKey::PageUp),
+            mods: Mods::SHIFT,
+            pressed: true,
+        });
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "Shift+PageUp scrolls locally, not into the child"
+        );
+        assert_eq!(top_row_text(&m), "L53", "scrolled up one page (23 lines)");
+    }
+
+    #[test]
+    fn copy_reads_text_from_scrolled_history() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel(1.0)); // top row is now "L73"
+        // Select columns 0..=2 of the top (historical) row.
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            18.0,
+            1.0,
+        ));
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
+            vec![Cmd::WriteClipboard("L73".to_string())],
+            "copy reads the visible history, not the live viewport"
+        );
+    }
+
     // ---- moved pure-helper tests ----
 
     #[test]
@@ -770,7 +1139,7 @@ mod tests {
         let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
         screen.feed(b"hello world");
         assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 4))),
+            selection_text(&screen, Selection::new((0, 0), (0, 4)), 0),
             "hello"
         );
 
@@ -778,7 +1147,7 @@ mod tests {
         screen.feed(b"a  b");
         // Trailing spaces on the terminating row are kept (WYSIWYG copy).
         assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 2))),
+            selection_text(&screen, Selection::new((0, 0), (0, 2)), 0),
             "a  "
         );
     }

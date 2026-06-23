@@ -66,6 +66,27 @@ impl Vt {
         self.terminal.view()
     }
 
+    /// The viewport scrolled `offset` lines up into scrollback. `offset` 0 is
+    /// the live viewport (identical to [`view`](Self::view)); it is clamped to
+    /// [`scrollback_len`](Self::scrollback_len).
+    pub fn view_at(&self, offset: usize) -> impl Iterator<Item = &Line> {
+        self.terminal.view_at(offset)
+    }
+
+    /// Number of scrollback lines retained above the viewport — the maximum
+    /// scroll-up offset. 0 means the viewport already sits at the bottom.
+    pub fn scrollback_len(&self) -> usize {
+        self.terminal.scrollback_len()
+    }
+
+    /// Monotonic count of lines that have ever scrolled off the top of the
+    /// viewport into history (including ones since trimmed). Grows by the gross
+    /// lines pushed each feed even at the scrollback cap, so a frontend can pin a
+    /// scrolled-back view to fixed content across output.
+    pub fn lines_scrolled_off(&self) -> usize {
+        self.terminal.lines_scrolled_off()
+    }
+
     pub fn lines(&self) -> impl Iterator<Item = &Line> {
         self.terminal.lines()
     }
@@ -252,6 +273,36 @@ mod tests {
 
         assert_eq!(scrollback, vec!["aa".to_owned()]);
         assert_eq!(vt.text(), vec!["bb".to_owned(), "cc".to_owned()]);
+    }
+
+    #[test]
+    fn view_at_scrolls_into_scrollback() {
+        let mut vt = Vt::builder().size(2, 2).build();
+        vt.feed_str("aa\r\nbb\r\ncc"); // scrollback ["aa"], view ["bb","cc"]
+        assert_eq!(vt.scrollback_len(), 1);
+        // offset 0 is the live viewport.
+        let live: Vec<String> = vt.view_at(0).map(|l| l.text()).collect();
+        assert_eq!(live, vec!["bb".to_string(), "cc".to_string()]);
+        // offset 1 brings the scrollback line onto the top row.
+        let up: Vec<String> = vt.view_at(1).map(|l| l.text()).collect();
+        assert_eq!(up, vec!["aa".to_string(), "bb".to_string()]);
+        // Offsets past the retained history clamp to the oldest window.
+        let clamped: Vec<String> = vt.view_at(99).map(|l| l.text()).collect();
+        assert_eq!(clamped, up);
+    }
+
+    #[test]
+    fn lines_scrolled_off_is_monotonic_across_trimming() {
+        // 2 rows + a 3-line scrollback cap: at most 5 lines are ever retained.
+        let mut vt = Vt::builder().size(2, 2).scrollback_limit(3).build();
+        vt.feed_str("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng"); // 7 lines a..g
+        assert_eq!(vt.scrollback_len(), 3, "scrollback is capped");
+        // a..e (5 lines) have scrolled off the top, though only 3 are retained.
+        assert_eq!(vt.lines_scrolled_off(), 5);
+        // Further output keeps the count climbing even though the length is pinned.
+        vt.feed_str("\r\nh\r\ni");
+        assert_eq!(vt.scrollback_len(), 3);
+        assert_eq!(vt.lines_scrolled_off(), 7);
     }
 
     #[test]

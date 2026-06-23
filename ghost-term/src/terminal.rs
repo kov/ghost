@@ -665,6 +665,22 @@ impl Terminal {
         self.buffer.view()
     }
 
+    /// The viewport scrolled `offset` lines up into scrollback (0 = live).
+    pub fn view_at(&self, offset: usize) -> impl Iterator<Item = &Line> {
+        self.buffer.view_at(offset)
+    }
+
+    /// Number of scrollback lines retained above the active viewport.
+    pub fn scrollback_len(&self) -> usize {
+        self.buffer.scrollback_len()
+    }
+
+    /// Monotonic count of lines that have scrolled off the active viewport's top
+    /// into history (including since-trimmed ones).
+    pub fn lines_scrolled_off(&self) -> usize {
+        self.buffer.lines_scrolled_off()
+    }
+
     pub fn lines(&self) -> impl Iterator<Item = &Line> {
         self.buffer.lines()
     }

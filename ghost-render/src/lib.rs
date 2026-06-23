@@ -217,17 +217,29 @@ pub fn layout_row(line: &Line, cursor_col: Option<usize>) -> RowLayout {
     RowLayout { runs }
 }
 
-/// Lay out the visible viewport of `vt` into a [`Frame`].
+/// Lay out the visible (live) viewport of `vt` into a [`Frame`].
 pub fn layout_frame(vt: &Vt, metrics: CellMetrics) -> Frame {
+    layout_frame_at(vt, metrics, 0)
+}
+
+/// Lay out the viewport of `vt` scrolled `scroll_offset` lines up into
+/// scrollback. `scroll_offset` 0 yields the live viewport (identical to
+/// [`layout_frame`]); larger offsets are clamped to the retained history.
+///
+/// While scrolled into history (`offset > 0`) the live cursor is *not* drawn:
+/// the view shows past output, not the edit point, so a cursor block there would
+/// be misleading (and the historical row keeps its full run grouping).
+pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> Frame {
     let (cols, rows) = vt.size();
+    let offset = scroll_offset.min(vt.scrollback_len());
     let cursor = vt.cursor();
-    let cursor_layout = cursor.visible.then_some(CursorLayout {
+    let cursor_layout = (offset == 0 && cursor.visible).then_some(CursorLayout {
         col: cursor.col,
         row: cursor.row,
     });
 
     let rows_layout = vt
-        .view()
+        .view_at(offset)
         .enumerate()
         .map(|(row, line)| {
             let cursor_col = match cursor_layout {
@@ -387,6 +399,24 @@ mod tests {
         assert_eq!(f.rows_layout.len(), 5);
         assert_eq!(f.rows_layout[0].runs[0].text, "hi");
         assert_eq!(f.cursor, Some(CursorLayout { col: 2, row: 0 }));
+    }
+
+    #[test]
+    fn layout_frame_at_shows_scrollback_and_hides_the_cursor() {
+        // 2x2 terminal fed 3 lines, so "aa" lands in scrollback.
+        let v = feed(2, 2, "aa\r\nbb\r\ncc");
+        // Offset 0 is the live viewport, with a visible cursor — and identical
+        // to the plain layout_frame.
+        let live = layout_frame_at(&v, M, 0);
+        assert_eq!(live.rows_layout[0].runs[0].text, "bb");
+        assert!(live.cursor.is_some());
+        assert_eq!(live, layout_frame(&v, M));
+        // Scrolling up one line brings "aa" to the top and hides the cursor.
+        let up = layout_frame_at(&v, M, 1);
+        assert_eq!(up.rows_layout[0].runs[0].text, "aa");
+        assert_eq!(up.cursor, None, "no live cursor while viewing history");
+        // Offsets past the history clamp.
+        assert_eq!(layout_frame_at(&v, M, 99), up);
     }
 
     #[test]
