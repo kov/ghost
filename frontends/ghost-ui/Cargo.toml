@@ -4,4 +4,4 @@
 # the root crates (ghost-render, ghost-term) by path.
 [workspace]
 resolver = "3"
-members = ["shaper", "renderer", "app"]
+members = ["core", "shaper", "renderer", "app"]

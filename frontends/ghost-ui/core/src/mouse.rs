@@ -6,8 +6,8 @@
 //! be reported (e.g. motion while only press/release tracking is on). The
 //! caller owns pixel->cell conversion and button-held state.
 
+use crate::input::Mods;
 use ghost_term::MouseProtocol;
-use winit::keyboard::ModifiersState;
 
 /// A mouse button, or a wheel notch (which xterm models as buttons 4/5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,10 +39,8 @@ fn base_code(b: Button) -> u32 {
 }
 
 /// xterm modifier bits: Shift=4, Meta/Alt=8, Control=16.
-fn mod_flags(m: ModifiersState) -> u32 {
-    (if m.shift_key() { 4 } else { 0 })
-        + (if m.alt_key() { 8 } else { 0 })
-        + (if m.control_key() { 16 } else { 0 })
+fn mod_flags(m: Mods) -> u32 {
+    (if m.shift { 4 } else { 0 }) + (if m.alt { 8 } else { 0 }) + (if m.ctrl { 16 } else { 0 })
 }
 
 /// Encode a mouse event, or `None` if the active protocol suppresses it.
@@ -60,7 +58,7 @@ pub fn encode(
     held: bool,
     col: u16,
     row: u16,
-    mods: ModifiersState,
+    mods: Mods,
 ) -> Option<Vec<u8>> {
     if proto == MouseProtocol::Off {
         return None;
@@ -105,8 +103,8 @@ mod tests {
     use super::*;
     use ghost_term::MouseProtocol::*;
 
-    fn none() -> ModifiersState {
-        ModifiersState::empty()
+    fn none() -> Mods {
+        Mods::NONE
     }
 
     #[test]
@@ -145,7 +143,7 @@ mod tests {
             true,
             1,
             1,
-            ModifiersState::CONTROL,
+            Mods::CTRL,
         );
         assert_eq!(ctrl.unwrap(), b"\x1b[<16;1;1M");
         let wheel = encode(

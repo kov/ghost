@@ -1,0 +1,10 @@
+[package]
+name = "ghost-ui-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ghost's pure UI core: input/effect/scene model, no winit or GPU."
+publish = false
+
+[dependencies]
+ghost-term = { path = "../../../ghost-term" }

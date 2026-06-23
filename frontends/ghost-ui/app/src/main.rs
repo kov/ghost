@@ -13,8 +13,7 @@
 //!   `$GHOST_CMD`), drive it to completion, render the result offscreen, write a
 //!   PNG, and exit. Deterministic verification with no display.
 
-mod encode;
-mod mouse;
+mod from_winit;
 mod session_view;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use ghost_render::{CellMetrics, Selection, layout_frame};
 use ghost_renderer::{Gpu, Rendered, Renderer, Theme};
+use ghost_ui_core::mouse;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
@@ -524,8 +524,10 @@ impl ApplicationHandler for App {
                     Some(Shortcut::Paste) => self.paste_from_clipboard(),
                     Some(Shortcut::Copy) => self.copy_selection(),
                     None => {
+                        let key = from_winit::key(&event.logical_key);
+                        let mods = from_winit::mods(self.mods);
                         if let Some(v) = self.view.as_mut() {
-                            let _ = v.key(&event.logical_key, self.mods);
+                            let _ = v.key(&key, mods);
                         }
                     }
                 }
@@ -555,7 +557,7 @@ impl ApplicationHandler for App {
                                     true,
                                     cell.0,
                                     cell.1,
-                                    self.mods,
+                                    from_winit::mods(self.mods),
                                 );
                             }
                         } else if b == mouse::Button::Left
@@ -573,7 +575,7 @@ impl ApplicationHandler for App {
                                 false,
                                 cell.0,
                                 cell.1,
-                                self.mods,
+                                from_winit::mods(self.mods),
                             );
                         }
                     }
@@ -588,8 +590,14 @@ impl ApplicationHandler for App {
                         if self.gesture_report {
                             let (col, row) = self.cursor_cell.unwrap_or((1, 1));
                             if let Some(v) = self.view.as_mut() {
-                                let _ =
-                                    v.mouse(mouse::Kind::Press, Some(b), true, col, row, self.mods);
+                                let _ = v.mouse(
+                                    mouse::Kind::Press,
+                                    Some(b),
+                                    true,
+                                    col,
+                                    row,
+                                    from_winit::mods(self.mods),
+                                );
                             }
                             // A plain forwarded left-click still dismisses a stale
                             // local highlight the child can't clear itself.
@@ -613,7 +621,7 @@ impl ApplicationHandler for App {
                                     false,
                                     col,
                                     row,
-                                    self.mods,
+                                    from_winit::mods(self.mods),
                                 );
                             }
                         }
@@ -637,7 +645,14 @@ impl ApplicationHandler for App {
                         let (col, row) = self.cursor_cell.unwrap_or((1, 1));
                         let held = self.held.is_some();
                         if let Some(v) = self.view.as_mut() {
-                            let _ = v.mouse(mouse::Kind::Press, Some(b), held, col, row, self.mods);
+                            let _ = v.mouse(
+                                mouse::Kind::Press,
+                                Some(b),
+                                held,
+                                col,
+                                row,
+                                from_winit::mods(self.mods),
+                            );
                         }
                     }
                 }

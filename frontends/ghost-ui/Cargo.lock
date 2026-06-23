@@ -669,12 +669,20 @@ dependencies = [
  "ghost-renderer",
  "ghost-shaper",
  "ghost-term",
+ "ghost-ui-core",
  "ghost-vt",
  "png",
  "pollster",
  "tempfile",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "ghost-ui-core"
+version = "0.1.0"
+dependencies = [
+ "ghost-term",
 ]
 
 [[package]]

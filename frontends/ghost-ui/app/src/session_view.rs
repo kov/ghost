@@ -10,12 +10,11 @@ use std::time::Duration;
 
 use ghost_render::Selection;
 use ghost_term::MouseProtocol;
+use ghost_ui_core::input::{Key, Mods};
+use ghost_ui_core::{encode, mouse};
 use ghost_vt::client::Session;
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
-use winit::keyboard::{Key, ModifiersState};
-
-use crate::{encode, mouse};
 
 /// Outcome of draining pending session output.
 pub struct Pumped {
@@ -65,7 +64,7 @@ impl SessionView {
     }
 
     /// Encode a pressed key (honoring DECCKM) and send it to the child.
-    pub fn key(&mut self, key: &Key, mods: ModifiersState) -> io::Result<()> {
+    pub fn key(&mut self, key: &Key, mods: Mods) -> io::Result<()> {
         let app_cursor = self.screen.vt().cursor_key_app_mode();
         if let Some(bytes) = encode::encode(key, mods, app_cursor) {
             self.session.send_input(&bytes)?;
@@ -82,7 +81,7 @@ impl SessionView {
         held: bool,
         col: u16,
         row: u16,
-        mods: ModifiersState,
+        mods: Mods,
     ) -> io::Result<()> {
         let proto = self.screen.vt().mouse_protocol();
         let sgr = self.screen.vt().mouse_sgr();

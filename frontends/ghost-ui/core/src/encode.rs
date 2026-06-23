@@ -1,24 +1,24 @@
 //! Pure key -> terminal-bytes encoder (legacy / xterm-default scheme).
 //!
-//! Promoted from the winit IME spike. Given a winit logical key + modifier
-//! state (and the terminal's cursor-key mode), produce the bytes ghost sends
-//! down the PTY. The scheme is classic xterm "legacy": printable text verbatim,
-//! C0 control bytes for Ctrl+letter, an ESC prefix for Alt (`metaSendsEscape`),
-//! and CSI/SS3 sequences for navigation/function keys with the usual `1;<mod>`
-//! modifier parameter. DECCKM (cursor-key application mode) switches unmodified
-//! cursor keys from CSI to SS3, matching what apps like vim expect.
+//! Given a logical key + modifier state (and the terminal's cursor-key mode),
+//! produce the bytes ghost sends down the PTY. The scheme is classic xterm
+//! "legacy": printable text verbatim, C0 control bytes for Ctrl+letter, an ESC
+//! prefix for Alt (`metaSendsEscape`), and CSI/SS3 sequences for navigation/
+//! function keys with the usual `1;<mod>` modifier parameter. DECCKM
+//! (cursor-key application mode) switches unmodified cursor keys from CSI to
+//! SS3, matching what apps like vim expect.
 
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use crate::input::{Key, Mods, NamedKey};
 
 /// Encode a *pressed* key into the bytes a terminal would transmit, or `None`
 /// when the key produces nothing on its own: modifiers in isolation, dead keys
 /// (left to IME), and unidentified keys. `app_cursor` is the terminal's DECCKM
 /// state (`Vt::cursor_key_app_mode`).
-pub fn encode(key: &Key, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
+pub fn encode(key: &Key, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
     match key {
         Key::Named(named) => encode_named(*named, mods, app_cursor),
-        Key::Character(s) => Some(encode_char(s, mods.control_key(), mods.alt_key())),
-        // Key::Dead(_) / Key::Unidentified(_): nothing on their own.
+        Key::Char(s) => Some(encode_char(s, mods.ctrl, mods.alt)),
+        // Key::Dead / Key::Unidentified: nothing on their own.
         _ => None,
     }
 }
@@ -64,19 +64,19 @@ fn ctrl_byte(s: &str) -> Option<u8> {
 }
 
 /// Encode the named (non-text) keys: the C0 keys plus the CSI/SS3 family.
-fn encode_named(key: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
+fn encode_named(key: NamedKey, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
     use NamedKey::*;
 
     // The spacebar may arrive as a named key on some platforms; route it
     // through the text encoder so Ctrl+Space -> NUL and Alt+Space -> ESC SP.
     if key == Space {
-        return Some(encode_char(" ", mods.control_key(), mods.alt_key()));
+        return Some(encode_char(" ", mods.ctrl, mods.alt));
     }
 
     // Plain C0 keys. Alt still prefixes ESC (e.g. Alt+Enter).
     let simple: Option<&[u8]> = match key {
         Enter => Some(b"\r"),
-        Tab if mods.shift_key() => Some(b"\x1b[Z"),
+        Tab if mods.shift => Some(b"\x1b[Z"),
         Tab => Some(b"\t"),
         Backspace => Some(b"\x7f"),
         Escape => Some(b"\x1b"),
@@ -84,7 +84,7 @@ fn encode_named(key: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option
     };
     if let Some(bytes) = simple {
         let mut out = Vec::new();
-        if mods.alt_key() {
+        if mods.alt {
             out.push(0x1b);
         }
         out.extend_from_slice(bytes);
@@ -135,14 +135,11 @@ fn named_csi(key: NamedKey) -> Option<Csi> {
 }
 
 /// The xterm modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4) + Super(8).
-fn modifier_param(mods: ModifiersState) -> u32 {
-    1 + (mods.shift_key() as u32)
-        + 2 * (mods.alt_key() as u32)
-        + 4 * (mods.control_key() as u32)
-        + 8 * (mods.super_key() as u32)
+fn modifier_param(mods: Mods) -> u32 {
+    1 + (mods.shift as u32) + 2 * (mods.alt as u32) + 4 * (mods.ctrl as u32) + 8 * (mods.sup as u32)
 }
 
-fn encode_csi(csi: Csi, mods: ModifiersState, app_cursor: bool) -> Vec<u8> {
+fn encode_csi(csi: Csi, mods: Mods, app_cursor: bool) -> Vec<u8> {
     let m = modifier_param(mods);
     let modified = m != 1;
     match csi {
@@ -180,25 +177,22 @@ fn encode_csi(csi: Csi, mods: ModifiersState, app_cursor: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::keyboard::{Key, ModifiersState, NamedKey};
+    use crate::input::{Key, Mods, NamedKey};
 
     fn ch(s: &str) -> Key {
-        Key::Character(s.into())
+        Key::Char(s.into())
     }
     fn named(k: NamedKey) -> Key {
         Key::Named(k)
     }
-    fn none() -> ModifiersState {
-        ModifiersState::empty()
+    fn none() -> Mods {
+        Mods::NONE
     }
 
     #[test]
     fn plain_text_is_verbatim() {
         assert_eq!(encode(&ch("a"), none(), false), Some(b"a".to_vec()));
-        assert_eq!(
-            encode(&ch("A"), ModifiersState::SHIFT, false),
-            Some(b"A".to_vec())
-        );
+        assert_eq!(encode(&ch("A"), Mods::SHIFT, false), Some(b"A".to_vec()));
     }
 
     #[test]
@@ -211,64 +205,35 @@ mod tests {
 
     #[test]
     fn ctrl_letters_map_to_c0() {
+        assert_eq!(encode(&ch("a"), Mods::CTRL, false), Some(vec![0x01]));
+        assert_eq!(encode(&ch("c"), Mods::CTRL, false), Some(vec![0x03]));
         assert_eq!(
-            encode(&ch("a"), ModifiersState::CONTROL, false),
-            Some(vec![0x01])
-        );
-        assert_eq!(
-            encode(&ch("c"), ModifiersState::CONTROL, false),
-            Some(vec![0x03])
-        );
-        assert_eq!(
-            encode(
-                &ch("C"),
-                ModifiersState::CONTROL | ModifiersState::SHIFT,
-                false
-            ),
+            encode(&ch("C"), Mods::CTRL | Mods::SHIFT, false),
             Some(vec![0x03])
         );
     }
 
     #[test]
     fn ctrl_symbols() {
-        assert_eq!(
-            encode(&ch("["), ModifiersState::CONTROL, false),
-            Some(vec![0x1b])
-        );
-        assert_eq!(
-            encode(&ch("\\"), ModifiersState::CONTROL, false),
-            Some(vec![0x1c])
-        );
-        assert_eq!(
-            encode(&ch("_"), ModifiersState::CONTROL, false),
-            Some(vec![0x1f])
-        );
+        assert_eq!(encode(&ch("["), Mods::CTRL, false), Some(vec![0x1b]));
+        assert_eq!(encode(&ch("\\"), Mods::CTRL, false), Some(vec![0x1c]));
+        assert_eq!(encode(&ch("_"), Mods::CTRL, false), Some(vec![0x1f]));
     }
 
     #[test]
     fn ctrl_space_is_nul_either_shape() {
+        assert_eq!(encode(&ch(" "), Mods::CTRL, false), Some(vec![0x00]));
         assert_eq!(
-            encode(&ch(" "), ModifiersState::CONTROL, false),
-            Some(vec![0x00])
-        );
-        assert_eq!(
-            encode(&named(NamedKey::Space), ModifiersState::CONTROL, false),
+            encode(&named(NamedKey::Space), Mods::CTRL, false),
             Some(vec![0x00])
         );
     }
 
     #[test]
     fn alt_prefixes_with_escape() {
+        assert_eq!(encode(&ch("a"), Mods::ALT, false), Some(vec![0x1b, b'a']));
         assert_eq!(
-            encode(&ch("a"), ModifiersState::ALT, false),
-            Some(vec![0x1b, b'a'])
-        );
-        assert_eq!(
-            encode(
-                &ch("a"),
-                ModifiersState::ALT | ModifiersState::CONTROL,
-                false
-            ),
+            encode(&ch("a"), Mods::ALT | Mods::CTRL, false),
             Some(vec![0x1b, 0x01])
         );
     }
@@ -284,7 +249,7 @@ mod tests {
             Some(b"\t".to_vec())
         );
         assert_eq!(
-            encode(&named(NamedKey::Tab), ModifiersState::SHIFT, false),
+            encode(&named(NamedKey::Tab), Mods::SHIFT, false),
             Some(b"\x1b[Z".to_vec())
         );
         assert_eq!(
@@ -296,7 +261,7 @@ mod tests {
             Some(vec![0x1b])
         );
         assert_eq!(
-            encode(&named(NamedKey::Enter), ModifiersState::ALT, false),
+            encode(&named(NamedKey::Enter), Mods::ALT, false),
             Some(vec![0x1b, b'\r'])
         );
     }
@@ -308,15 +273,11 @@ mod tests {
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            encode(&named(NamedKey::ArrowRight), ModifiersState::CONTROL, false),
+            encode(&named(NamedKey::ArrowRight), Mods::CTRL, false),
             Some(b"\x1b[1;5C".to_vec())
         );
         assert_eq!(
-            encode(
-                &named(NamedKey::ArrowLeft),
-                ModifiersState::SHIFT | ModifiersState::ALT,
-                false
-            ),
+            encode(&named(NamedKey::ArrowLeft), Mods::SHIFT | Mods::ALT, false),
             Some(b"\x1b[1;4D".to_vec())
         );
     }
@@ -334,7 +295,7 @@ mod tests {
         );
         // ...but a modifier forces the CSI `1;<mod>` form even in app mode.
         assert_eq!(
-            encode(&named(NamedKey::ArrowUp), ModifiersState::CONTROL, true),
+            encode(&named(NamedKey::ArrowUp), Mods::CTRL, true),
             Some(b"\x1b[1;5A".to_vec())
         );
     }
@@ -346,7 +307,7 @@ mod tests {
             Some(b"\x1bOP".to_vec())
         );
         assert_eq!(
-            encode(&named(NamedKey::F1), ModifiersState::CONTROL, false),
+            encode(&named(NamedKey::F1), Mods::CTRL, false),
             Some(b"\x1b[1;5P".to_vec())
         );
         assert_eq!(
@@ -374,14 +335,14 @@ mod tests {
             Some(b"\x1b[H".to_vec())
         );
         assert_eq!(
-            encode(&named(NamedKey::End), ModifiersState::CONTROL, false),
+            encode(&named(NamedKey::End), Mods::CTRL, false),
             Some(b"\x1b[1;5F".to_vec())
         );
     }
 
     #[test]
     fn dead_and_unidentified_yield_nothing() {
-        assert_eq!(encode(&Key::Dead(Some('`')), none(), false), None);
-        assert_eq!(encode(&Key::Dead(None), none(), false), None);
+        assert_eq!(encode(&Key::Dead, none(), false), None);
+        assert_eq!(encode(&Key::Unidentified, none(), false), None);
     }
 }
