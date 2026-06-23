@@ -103,6 +103,7 @@ fn scheme_by_id(id: &str) -> Option<&'static Scheme> {
 #[serde(default)]
 pub struct UiConfig {
     colors: Colors,
+    zoom: Zoom,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -110,6 +111,19 @@ pub struct UiConfig {
 struct Colors {
     /// Scheme id; absent (or unknown) keeps the renderer's built-in default.
     scheme: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Zoom {
+    /// Persisted font zoom; the model clamps it to its own bounds on apply.
+    scale: f64,
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Zoom { scale: 1.0 }
+    }
 }
 
 impl UiConfig {
@@ -149,6 +163,12 @@ impl UiConfig {
             },
         }
     }
+
+    /// The persisted font zoom (raw; the model clamps it to its bounds). 1.0
+    /// when unset.
+    pub fn zoom(&self) -> f32 {
+        self.zoom.scale as f32
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +195,16 @@ mod tests {
     fn unknown_scheme_falls_back_to_the_default() {
         let c = UiConfig::parse("[colors]\nscheme = \"nope\"\n").unwrap();
         assert_eq!(c.theme().bg, Theme::default().bg);
+    }
+
+    #[test]
+    fn zoom_scale_parses_and_defaults_to_one() {
+        assert_eq!(UiConfig::default().zoom(), 1.0);
+        assert_eq!(UiConfig::parse("").unwrap().zoom(), 1.0);
+        let c = UiConfig::parse("[zoom]\nscale = 1.5\n").unwrap();
+        assert_eq!(c.zoom(), 1.5);
+        // A present [zoom] table without scale still defaults to 1.0.
+        assert_eq!(UiConfig::parse("[zoom]\n").unwrap().zoom(), 1.0);
     }
 
     #[test]

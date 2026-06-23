@@ -47,6 +47,9 @@ pub enum UiEvent {
     /// While a non-empty preedit is active the terminal suppresses raw key input
     /// so the keystrokes driving composition aren't also sent to the child.
     Preedit(String),
+    /// Set the absolute font zoom (e.g. from persisted config); the model clamps
+    /// it to its bounds and re-grids. Relative steps come via `Key` shortcuts.
+    SetZoom(f32),
     Pointer {
         phase: PointerPhase,
         button: Option<PointerButton>,

@@ -170,6 +170,7 @@ impl TerminalModel {
             UiEvent::Key { key, mods, pressed } => self.key(&key, mods, pressed),
             UiEvent::Text(s) => self.text(&s),
             UiEvent::Preedit(s) => self.set_preedit(s),
+            UiEvent::SetZoom(z) => self.apply_zoom(z.clamp(ZOOM_MIN, ZOOM_MAX)),
             UiEvent::Pointer {
                 phase,
                 button,
@@ -1227,6 +1228,21 @@ mod tests {
             cmds.iter()
                 .any(|c| matches!(c, Cmd::Resize { cols, rows, .. } if *cols == 80 && *rows == 24))
         );
+    }
+
+    #[test]
+    fn set_zoom_applies_and_clamps_an_absolute_zoom() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        }); // 80x24 at base 9x18
+        m.update(UiEvent::SetZoom(2.0));
+        assert_eq!(frame_advance(&m), 18.0, "absolute 2x zoom doubles the cell");
+        // Out-of-range zoom is clamped to the model's bounds (max 3.0 -> 27px).
+        m.update(UiEvent::SetZoom(9.0));
+        assert_eq!(frame_advance(&m), 27.0, "clamped at ZOOM_MAX");
     }
 
     #[test]

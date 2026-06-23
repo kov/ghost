@@ -293,7 +293,7 @@ struct Graphics {
 }
 
 impl Graphics {
-    fn new(event_loop: &ActiveEventLoop) -> Self {
+    fn new(event_loop: &ActiveEventLoop, theme: ghost_renderer::Theme) -> Self {
         let size = PhysicalSize::new(
             u32::from(COLS) * METRICS.advance as u32,
             u32::from(ROWS) * METRICS.line_height as u32,
@@ -344,7 +344,7 @@ impl Graphics {
             device: device.clone(),
             queue,
         };
-        let renderer = Renderer::new(gpu, config::UiConfig::load().theme(), format);
+        let renderer = Renderer::new(gpu, theme, format);
 
         Graphics {
             window,
@@ -538,7 +538,8 @@ impl ApplicationHandler for App {
         if self.gfx.is_some() {
             return;
         }
-        let gfx = Graphics::new(event_loop);
+        let cfg = config::UiConfig::load();
+        let gfx = Graphics::new(event_loop, cfg.theme());
         let scale = gfx.window.scale_factor();
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
         match attach(&self.name, cols, rows) {
@@ -572,6 +573,9 @@ impl ApplicationHandler for App {
             },
             event_loop,
         );
+        // Apply the persisted zoom now that the viewport is known, so it re-grids
+        // against the real surface size (the model clamps to its bounds).
+        self.dispatch(UiEvent::SetZoom(cfg.zoom()), event_loop);
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
