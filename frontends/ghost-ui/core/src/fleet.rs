@@ -150,6 +150,12 @@ impl FleetModel {
         }
     }
 
+    /// Render scale for the overview — device scale only (tiles auto-size to the
+    /// grid, so the single view's user zoom doesn't apply here).
+    pub fn render_scale(&self) -> f32 {
+        self.scale
+    }
+
     /// Start a fleet that already holds `primary` as its focused tile, so its
     /// screen state survives a toggle from the single-terminal view.
     pub fn adopting(

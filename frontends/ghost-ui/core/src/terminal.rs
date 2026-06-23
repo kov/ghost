@@ -26,6 +26,17 @@ use crate::{
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
 const SCROLL_LINES: i64 = 3;
 
+/// User zoom (font-scale) bounds and step, matching ghost-gtk.
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 3.0;
+const ZOOM_STEP: f32 = 0.1;
+
+/// One zoom step from `scale` by `delta`, rounded to a clean tenth (so repeated
+/// steps don't drift) and clamped to [`ZOOM_MIN`]..=[`ZOOM_MAX`].
+fn step_zoom(scale: f32, delta: f32) -> f32 {
+    (((scale + delta) * 10.0).round() / 10.0).clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
 /// A local-viewport scroll requested by a Shift+navigation key.
 enum Scroll {
     /// Move by N lines (positive = up, into history).
@@ -36,22 +47,37 @@ enum Scroll {
     Bottom,
 }
 
-/// A frontend-handled key combo (Super+key, or Ctrl+Shift+key) intercepted
-/// before encoding so it drives the app, not the child.
+/// A frontend-handled key combo intercepted before encoding so it drives the
+/// app, not the child.
 pub enum Shortcut {
     Paste,
     Copy,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
-/// Classify a pressed key as a paste/copy shortcut, if it is one.
+/// Classify a pressed key as a frontend shortcut, if it is one. The primary
+/// modifier is Cmd on macOS and Ctrl elsewhere; copy/paste keep the stricter
+/// Cmd / Ctrl+Shift combo so a bare Ctrl+C still sends SIGINT, while zoom uses
+/// plain Cmd/Ctrl + `+`/`=`/`-`/`0` (matching ghost-gtk's `<Primary>` accels).
 pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
-    let combo = mods.sup || (mods.ctrl && mods.shift);
-    if !combo {
+    let primary = mods.sup || mods.ctrl;
+    if !primary {
         return None;
     }
+    if mods.sup || mods.shift {
+        match key {
+            Key::Char(s) if s.eq_ignore_ascii_case("v") => return Some(Shortcut::Paste),
+            Key::Char(s) if s.eq_ignore_ascii_case("c") => return Some(Shortcut::Copy),
+            _ => {}
+        }
+    }
     match key {
-        Key::Char(s) if s.eq_ignore_ascii_case("v") => Some(Shortcut::Paste),
-        Key::Char(s) if s.eq_ignore_ascii_case("c") => Some(Shortcut::Copy),
+        // '+' is usually Shift+'='; accept both so the combo works either way.
+        Key::Char(s) if s == "+" || s == "=" => Some(Shortcut::ZoomIn),
+        Key::Char(s) if s == "-" => Some(Shortcut::ZoomOut),
+        Key::Char(s) if s == "0" => Some(Shortcut::ZoomReset),
         _ => None,
     }
 }
@@ -65,6 +91,9 @@ pub struct TerminalModel {
     /// Device scale factor (physical px per logical px) from the last resize, so
     /// glyphs and the grid track HiDPI displays. 1.0 until the shell reports one.
     scale: f32,
+    /// User zoom (font-scale), driven by Cmd/Ctrl +/-/0. Multiplies the device
+    /// scale, so a HiDPI display and a zoom level compose.
+    zoom: f32,
     size_px: (u32, u32),
     screen: Screen,
     scanner: QueryScanner,
@@ -94,6 +123,7 @@ impl TerminalModel {
             session,
             metrics,
             scale: 1.0,
+            zoom: 1.0,
             size_px,
             screen: Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK),
             scanner: QueryScanner::new(),
@@ -148,13 +178,32 @@ impl TerminalModel {
         }
     }
 
-    /// Physical cell metrics: the logical metrics scaled by the device scale
-    /// factor, so layout and hit-testing match what the renderer rasterizes.
+    /// Combined render scale: device scale × user zoom. The shell multiplies the
+    /// base font size by this to rasterize glyphs at the same size the grid is
+    /// laid out for, keeping the two in lockstep.
+    pub fn render_scale(&self) -> f32 {
+        self.scale * self.zoom
+    }
+
+    /// Physical cell metrics: the logical metrics scaled by the combined render
+    /// scale, so layout and hit-testing match what the renderer rasterizes.
     fn effective_metrics(&self) -> CellMetrics {
+        let s = self.render_scale();
         CellMetrics {
-            advance: self.metrics.advance * self.scale,
-            line_height: self.metrics.line_height * self.scale,
+            advance: self.metrics.advance * s,
+            line_height: self.metrics.line_height * s,
         }
+    }
+
+    /// Set the user zoom and re-grid the child for it. A no-op (no commands)
+    /// when the level is unchanged, e.g. a step that clamps at a bound.
+    fn apply_zoom(&mut self, zoom: f32) -> Vec<Cmd> {
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return Vec::new();
+        }
+        self.zoom = zoom;
+        let (w, h) = self.size_px;
+        self.resize(w, h, self.scale)
     }
 
     /// Render the current state to a single full-window terminal scene.
@@ -266,6 +315,9 @@ impl TerminalModel {
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
             Some(Shortcut::Copy) => self.copy(),
+            Some(Shortcut::ZoomIn) => self.apply_zoom(step_zoom(self.zoom, ZOOM_STEP)),
+            Some(Shortcut::ZoomOut) => self.apply_zoom(step_zoom(self.zoom, -ZOOM_STEP)),
+            Some(Shortcut::ZoomReset) => self.apply_zoom(1.0),
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 match encode::encode(key, mods, app_cursor) {
@@ -773,6 +825,17 @@ mod tests {
     }
 
     #[test]
+    fn bare_ctrl_c_sends_sigint_not_copy() {
+        let mut m = model();
+        // Ctrl+C (no Shift) is NOT the copy shortcut — it must reach the child
+        // as 0x03 so programs still interrupt. (Copy is Ctrl+Shift+C / Cmd+C.)
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x03")]
+        );
+    }
+
+    #[test]
     fn output_clears_selection_when_not_dragging() {
         let mut m = model();
         feed(&mut m, b"hello world");
@@ -861,6 +924,72 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn frame_advance(m: &TerminalModel) -> f32 {
+        match m.view().terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => frame.metrics.advance,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn zoom_in_grows_cells_and_reset_restores() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        }); // 80x24 at base 9x18
+        assert_eq!(frame_advance(&m), 9.0);
+        // Ctrl + '+' : one 0.1 zoom step -> advance 9 * 1.1 = 9.9, so the grid shrinks.
+        let cmds = key(&mut m, Key::Char("+".into()), Mods::CTRL);
+        assert!(
+            (frame_advance(&m) - 9.9).abs() < 1e-4,
+            "one zoom-in step is 1.1x"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Resize { cols, rows, .. } if *cols < 80 && *rows < 24)),
+            "zoom re-grids the child"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "the zoom key is not forwarded to the child"
+        );
+        // Ctrl + '0' : reset to 1.0 -> back to 9.0 and the full 80x24 grid.
+        let cmds = key(&mut m, Key::Char("0".into()), Mods::CTRL);
+        assert_eq!(frame_advance(&m), 9.0);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Resize { cols, rows, .. } if *cols == 80 && *rows == 24))
+        );
+    }
+
+    #[test]
+    fn zoom_clamps_and_steps_on_clean_tenths() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        // Zoom out past the floor: clamps at 0.5x (advance 4.5).
+        for _ in 0..20 {
+            key(&mut m, Key::Char("-".into()), Mods::CTRL);
+        }
+        assert!(
+            (frame_advance(&m) - 4.5).abs() < 1e-4,
+            "clamped at ZOOM_MIN 0.5"
+        );
+        // Zoom in past the ceiling: clamps at 3.0x (advance 27.0).
+        for _ in 0..40 {
+            key(&mut m, Key::Char("=".into()), Mods::CTRL); // '=' is also zoom-in
+        }
+        assert!(
+            (frame_advance(&m) - 27.0).abs() < 1e-4,
+            "clamped at ZOOM_MAX 3.0"
+        );
     }
 
     #[test]

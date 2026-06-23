@@ -78,6 +78,15 @@ impl RootModel {
         }
     }
 
+    /// Combined render scale (device × zoom) of the active view, so the shell
+    /// rasterizes glyphs at the size the current scene was laid out for.
+    pub fn render_scale(&self) -> f32 {
+        match &self.mode {
+            Mode::Single(m) => m.render_scale(),
+            Mode::Fleet(f) => f.render_scale(),
+        }
+    }
+
     /// Whether the app should exit: the single view's child ended. A fleet tile
     /// ending never quits the app.
     pub fn ended(&self) -> bool {

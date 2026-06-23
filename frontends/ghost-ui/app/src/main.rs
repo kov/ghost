@@ -361,8 +361,9 @@ impl Graphics {
     }
 
     /// Draw a scene into the surface. `scene.size_px` must equal the surface
-    /// size (the model is kept in sync via `UiEvent::Resize`).
-    fn render(&mut self, scene: &Scene) {
+    /// size, and `font_px` the glyph size the scene was laid out for (the model
+    /// keeps both in sync via `UiEvent::Resize` and its render scale).
+    fn render(&mut self, scene: &Scene, font_px: f32) {
         let frame_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -376,9 +377,6 @@ impl Graphics {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-        // Rasterize glyphs at the physical pixel size; the model lays the grid
-        // out at the matching scaled metrics, so the two stay in lockstep.
-        let font_px = SIZE_PX * self.window.scale_factor() as f32;
         self.renderer
             .render_scene_to_view(&target, scene, font, font_px);
         self.window.pre_present_notify();
@@ -625,7 +623,10 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let (Some(g), Some(r)) = (self.gfx.as_mut(), self.root.as_ref()) {
                     let scene = r.view();
-                    g.render(&scene);
+                    // Rasterize at the model's render scale (device × zoom) so
+                    // glyph size matches the grid the scene was laid out for.
+                    let font_px = SIZE_PX * r.render_scale();
+                    g.render(&scene, font_px);
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
