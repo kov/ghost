@@ -1,32 +1,38 @@
 //! ghost's windowed GPU terminal frontend.
 //!
-//! A winit window backed by a wgpu surface that is a real ghost client: it
-//! attaches to a session, streams the child's output into a local
-//! `ghost_vt::screen::Screen`, draws it through `ghost-renderer`, and sends
-//! keystrokes / resizes back — the same protocol ghost-gtk speaks, rendered by
-//! our own GPU renderer instead of VTE.
+//! A winit window backed by a wgpu surface that is a real ghost client. The
+//! shell here is deliberately thin: it owns the I/O (the session socket, the
+//! clipboard, the clock, the window) and nothing else. All behavior lives in a
+//! pure [`TerminalModel`] (in `ghost-ui-core`): the shell translates each winit
+//! event into a [`UiEvent`], runs `model.update` to get a list of [`Cmd`]
+//! effects, executes them (socket writes, clipboard, redraw, …), and draws
+//! `model.view()`'s `Scene` through `ghost-renderer`. Reads round-trip as data
+//! (clipboard: `ReadClipboard` → `ClipboardText`; socket: pump → `SessionData`),
+//! so the model never touches the world and stays headlessly testable.
 //!
 //! Modes:
 //! - default: attach to `$GHOST_SESSION`, or spawn a fresh `$SHELL` session, and
 //!   run it interactively in a window.
 //! - `GHOST_CAPTURE=/path.png`: headless — spawn a session (a fixed banner, or
-//!   `$GHOST_CMD`), drive it to completion, render the result offscreen, write a
-//!   PNG, and exit. Deterministic verification with no display.
+//!   `$GHOST_CMD`), drive the same model with scripted events, render its
+//!   `view()` offscreen, write a PNG, and exit. The model/`Scene` path is the
+//!   single source of truth, so this is a binary-level test of the contract.
 
 mod from_winit;
-mod session_view;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_render::{CellMetrics, Selection, layout_frame};
 use ghost_renderer::{Gpu, Rendered, Renderer, Theme};
-use ghost_ui_core::mouse;
+use ghost_ui_core::{
+    CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, Scene, TerminalModel, UiEvent,
+};
+use ghost_vt::client::Session;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
-use session_view::SessionView;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -62,18 +68,11 @@ fn grid_from_pixels(w: u32, h: u32) -> (u16, u16) {
     (cols, rows)
 }
 
-/// The 1-based cell under a pointer at physical pixel `(x, y)`.
-fn point_to_cell(x: f64, y: f64) -> (u16, u16) {
-    let col = (x / METRICS.advance as f64).floor().max(0.0) as u16 + 1;
-    let row = (y / METRICS.line_height as f64).floor().max(0.0) as u16 + 1;
-    (col, row)
-}
-
-fn map_button(b: MouseButton) -> Option<mouse::Button> {
+fn map_button(b: MouseButton) -> Option<PointerButton> {
     match b {
-        MouseButton::Left => Some(mouse::Button::Left),
-        MouseButton::Middle => Some(mouse::Button::Middle),
-        MouseButton::Right => Some(mouse::Button::Right),
+        MouseButton::Left => Some(PointerButton::Left),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::Right => Some(PointerButton::Right),
         _ => None,
     }
 }
@@ -87,11 +86,21 @@ fn write_png(path: &Path, img: &Rendered) {
     writer.write_image_data(&img.rgba).expect("png data");
 }
 
-fn attach_retry(name: &str, cols: u16, rows: u16) -> SessionView {
+/// Attach (deferred) to a named session and complete the handshake at
+/// `cols`×`rows` — the first resize promotes us to the display client and
+/// spawns the deferred child.
+fn attach(name: &str, cols: u16, rows: u16) -> io::Result<Session> {
+    let mut s = Session::attach_deferred(name)?;
+    s.set_read_timeout(Some(Duration::from_millis(1)))?;
+    s.resize(cols, rows)?;
+    Ok(s)
+}
+
+fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {
     let start = Instant::now();
     loop {
-        match SessionView::attach(name, cols, rows) {
-            Ok(view) => return view,
+        match attach(name, cols, rows) {
+            Ok(s) => return s,
             Err(e) => {
                 if start.elapsed() > Duration::from_secs(5) {
                     panic!("could not attach to session '{name}': {e}");
@@ -102,7 +111,41 @@ fn attach_retry(name: &str, cols: u16, rows: u16) -> SessionView {
     }
 }
 
+/// Drain up to `max` pending reads off a session, returning the accumulated
+/// output and whether it ended.
+fn pump(session: &mut Session, max: usize) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::new();
+    for _ in 0..max {
+        match session.pump() {
+            Ok(p) => {
+                let empty = p.output.is_empty();
+                if !empty {
+                    bytes.extend_from_slice(&p.output);
+                }
+                if p.ended {
+                    return (bytes, true);
+                }
+                if empty {
+                    break;
+                }
+            }
+            Err(_) => return (bytes, true),
+        }
+    }
+    (bytes, false)
+}
+
 // ---- capture mode (headless) -------------------------------------------
+
+/// Execute the model's effects without a window: only `SendInput` matters
+/// headlessly (it writes the keystrokes/paste/query-replies back to the child).
+fn exec_headless(session: &mut Session, cmds: &[Cmd]) {
+    for cmd in cmds {
+        if let Cmd::SendInput { bytes, .. } = cmd {
+            let _ = session.send_input(bytes);
+        }
+    }
+}
 
 fn capture(path: PathBuf) {
     let name = format!("ghost-ui-cap-{}", std::process::id());
@@ -127,29 +170,38 @@ fn capture(path: PathBuf) {
     })
     .expect("spawn session");
 
-    let mut view = attach_retry(&name, COLS, ROWS);
+    let mut session = attach_retry(&name, COLS, ROWS);
+    let mut model = TerminalModel::new(name.clone(), COLS, ROWS, METRICS);
 
     // Optionally feed input first, to exercise the keystroke path (the child is
     // typically `cat`, which echoes it back through the PTY).
     if let Ok(feed) = std::env::var("GHOST_FEED") {
-        view.send_input(feed.as_bytes()).ok();
+        let cmds = model.update(UiEvent::Text(feed));
+        exec_headless(&mut session, &cmds);
     }
 
     // Drive until the child ends or output settles.
     let start = Instant::now();
     let mut last_change = Instant::now();
     loop {
-        let p = view.drain(64).unwrap_or(session_view::Pumped {
-            dirty: false,
-            ended: true,
-        });
-        if p.dirty {
-            last_change = Instant::now();
+        let (bytes, ended) = pump(&mut session, 64);
+        if !bytes.is_empty() || ended {
+            last_change = if bytes.is_empty() {
+                last_change
+            } else {
+                Instant::now()
+            };
+            let cmds = model.update(UiEvent::SessionData {
+                name: name.clone(),
+                bytes,
+                ended,
+            });
+            exec_headless(&mut session, &cmds);
         }
-        if p.ended {
+        if model.ended() {
             break;
         }
-        let has_text = view.screen().text().iter().any(|l| !l.trim().is_empty());
+        let has_text = model.screen().text().iter().any(|l| !l.trim().is_empty());
         if has_text && last_change.elapsed() > Duration::from_millis(250) {
             break;
         }
@@ -160,7 +212,7 @@ fn capture(path: PathBuf) {
     }
 
     eprintln!("--- captured screen ---");
-    for line in view.screen().text() {
+    for line in model.screen().text() {
         let t = line.trim_end();
         if !t.is_empty() {
             eprintln!("{t}");
@@ -168,8 +220,8 @@ fn capture(path: PathBuf) {
     }
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-    let frame = layout_frame(view.screen().vt(), METRICS);
-    let img = Renderer::headless(Theme::default()).render_offscreen(&frame, font, SIZE_PX);
+    let scene = model.view();
+    let img = Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
     write_png(&path, &img);
     eprintln!(
         "captured {}x{} to {}",
@@ -210,15 +262,14 @@ fn interactive() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         gfx: None,
-        view: None,
-        mods: ModifiersState::empty(),
+        session: None,
+        model: None,
         name,
-        cursor_cell: None,
-        held: None,
-        gesture_report: false,
-        sel_anchor: None,
-        selection: None,
+        mods: ModifiersState::empty(),
+        pointer_pos: PointPx { x: 0.0, y: 0.0 },
         clipboard: None,
+        start: Instant::now(),
+        next_tick: None,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -304,8 +355,9 @@ impl Graphics {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, view: &SessionView, selection: Option<Selection>) {
-        self.renderer.set_selection(selection);
+    /// Draw a scene into the surface. `scene.size_px` must equal the surface
+    /// size (the model is kept in sync via `UiEvent::Resize`).
+    fn render(&mut self, scene: &Scene) {
         let frame_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -319,64 +371,85 @@ impl Graphics {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-        let frame = layout_frame(view.screen().vt(), METRICS);
-        self.renderer.render_to_view(
-            &target,
-            self.config.width,
-            self.config.height,
-            &frame,
-            font,
-            SIZE_PX,
-        );
+        self.renderer
+            .render_scene_to_view(&target, scene, font, SIZE_PX);
         self.window.pre_present_notify();
         frame_tex.present();
     }
 }
 
+/// The thin imperative shell: owns the world, holds the pure model, and shuttles
+/// `UiEvent`s in and `Cmd`s out.
 struct App {
     gfx: Option<Graphics>,
-    view: Option<SessionView>,
-    mods: ModifiersState,
+    session: Option<Session>,
+    model: Option<TerminalModel>,
     name: String,
-    /// Last 1-based cell the pointer was over (`None` until the first move).
-    cursor_cell: Option<(u16, u16)>,
-    /// The button currently held down, if any (distinguishes drag from hover).
-    held: Option<mouse::Button>,
-    /// Whether the in-progress press..release gesture is forwarded to the child
-    /// (latched at press so a mid-gesture Shift/mode flip can't split it).
-    gesture_report: bool,
-    /// Where a local text selection was anchored (0-based cell), while dragging.
-    sel_anchor: Option<(usize, usize)>,
-    /// The current local text selection, if any.
-    selection: Option<Selection>,
+    mods: ModifiersState,
+    /// Last pointer position in physical pixels (winit reports it only on move,
+    /// so we cache it for button/wheel events).
+    pointer_pos: PointPx,
     /// Lazily-opened system clipboard for copy/paste.
     clipboard: Option<arboard::Clipboard>,
+    /// Start of the monotonic clock injected into the model via `Tick`.
+    start: Instant,
+    /// When the next scheduled `Tick` is due, if any.
+    next_tick: Option<Instant>,
 }
 
 impl App {
-    /// Read the system clipboard and paste it into the session (best-effort —
-    /// a clipboard that won't open or is empty is silently ignored).
-    fn paste_from_clipboard(&mut self) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        if let (Some(cb), Some(v)) = (self.clipboard.as_mut(), self.view.as_mut())
-            && let Ok(text) = cb.get_text()
-        {
-            let _ = v.paste(&text);
+    /// Feed an event to the model and execute the effects it returns.
+    fn dispatch(&mut self, ev: UiEvent, event_loop: &ActiveEventLoop) {
+        let cmds = match self.model.as_mut() {
+            Some(m) => m.update(ev),
+            None => return,
+        };
+        self.exec(cmds, event_loop);
+    }
+
+    fn exec(&mut self, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
+        for cmd in cmds {
+            match cmd {
+                Cmd::SendInput { bytes, .. } => {
+                    if let Some(s) = self.session.as_mut() {
+                        let _ = s.send_input(&bytes);
+                    }
+                }
+                Cmd::Resize { cols, rows, .. } => {
+                    if let Some(s) = self.session.as_mut() {
+                        let _ = s.resize(cols, rows);
+                    }
+                }
+                Cmd::ReadClipboard => {
+                    let text = self.read_clipboard();
+                    self.dispatch(UiEvent::ClipboardText(text), event_loop);
+                }
+                Cmd::WriteClipboard(text) => self.write_clipboard(text),
+                Cmd::Redraw => self.request_redraw(),
+                Cmd::SetTitle(t) => {
+                    if let Some(g) = &self.gfx {
+                        g.window.set_title(&t);
+                    }
+                }
+                Cmd::ScheduleTick { after_ms } => {
+                    self.next_tick = Some(Instant::now() + Duration::from_millis(after_ms));
+                }
+                Cmd::Quit => event_loop.exit(),
+                // Fleet-only effects; the single-terminal shell has no use for
+                // them (the fleet shell will).
+                Cmd::ListSessions | Cmd::Attach(_) | Cmd::Detach(_) | Cmd::Spawn { .. } => {}
+            }
         }
     }
 
-    /// Copy the current selection's text to the system clipboard (best-effort).
-    fn copy_selection(&mut self) {
-        let Some(sel) = self.selection else { return };
-        let text = match self.view.as_ref() {
-            Some(v) => ghost_ui_core::selection_text(v.screen(), sel),
-            None => return,
-        };
-        if text.is_empty() {
-            return;
+    fn read_clipboard(&mut self) -> Option<String> {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
         }
+        self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
+    }
+
+    fn write_clipboard(&mut self, text: String) {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
@@ -385,36 +458,14 @@ impl App {
         }
     }
 
-    /// Whether a drag should be forwarded to the child as a mouse report (the
-    /// child grabbed the mouse) rather than driving local selection. Shift forces
-    /// local selection even when the child is listening, as xterm does.
-    fn report_to_app(&self) -> bool {
-        self.view.as_ref().is_some_and(|v| v.mouse_active()) && !self.mods.shift_key()
-    }
-
-    /// The 0-based `(row, col)` cell under the pointer, clamped to the grid.
-    fn pointer_cell0(&self) -> (usize, usize) {
-        let (col1, row1) = self.cursor_cell.unwrap_or((1, 1));
-        let (row0, col0) = (
-            row1.saturating_sub(1) as usize,
-            col1.saturating_sub(1) as usize,
-        );
-        match &self.view {
-            Some(v) => {
-                let (cols, rows) = v.screen().dimensions();
-                (
-                    row0.min((rows as usize).saturating_sub(1)),
-                    col0.min((cols as usize).saturating_sub(1)),
-                )
-            }
-            None => (row0, col0),
-        }
-    }
-
     fn request_redraw(&self) {
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 }
 
@@ -425,46 +476,56 @@ impl ApplicationHandler for App {
         }
         let gfx = Graphics::new(event_loop);
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height);
-        match SessionView::attach(&self.name, cols, rows) {
-            Ok(view) => self.view = Some(view),
+        match attach(&self.name, cols, rows) {
+            Ok(session) => self.session = Some(session),
             Err(e) => {
                 eprintln!("could not attach to session '{}': {e}", self.name);
                 event_loop.exit();
                 return;
             }
         }
+        self.model = Some(TerminalModel::new(self.name.clone(), cols, rows, METRICS));
         gfx.window.request_redraw();
+        let (w, h) = (gfx.config.width, gfx.config.height);
         self.gfx = Some(gfx);
+        // Sync the model's viewport to the real surface size; it drives both the
+        // NDC mapping and the scissor clamp, so they must match the attachment.
+        self.dispatch(
+            UiEvent::Resize {
+                w_px: w,
+                h_px: h,
+                scale: 1.0,
+            },
+            event_loop,
+        );
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(view) = self.view.as_mut() {
-            match view.drain(64) {
-                Ok(p) => {
-                    if p.dirty {
-                        // Child output moved/repainted the viewport, so a
-                        // viewport-relative selection no longer maps to what the
-                        // user picked — drop it (xterm/VTE clear-on-output). Skip
-                        // while a drag is live so output mid-gesture can't cancel it.
-                        if self.held.is_none() {
-                            self.selection = None;
-                            self.sel_anchor = None;
-                        }
-                        if let Some(g) = &self.gfx {
-                            g.window.request_redraw();
-                        }
-                    }
-                    if p.ended {
-                        event_loop.exit();
-                        return;
-                    }
-                }
-                Err(_) => {
-                    event_loop.exit();
-                    return;
-                }
-            }
+        let (bytes, ended) = match self.session.as_mut() {
+            Some(s) => pump(s, 64),
+            None => (Vec::new(), false),
+        };
+        if !bytes.is_empty() || ended {
+            self.dispatch(
+                UiEvent::SessionData {
+                    name: self.name.clone(),
+                    bytes,
+                    ended,
+                },
+                event_loop,
+            );
+        }
+        if let Some(t) = self.next_tick
+            && Instant::now() >= t
+        {
+            self.next_tick = None;
+            let now_ms = self.now_ms();
+            self.dispatch(UiEvent::Tick { now_ms }, event_loop);
+        }
+        if self.model.as_ref().is_some_and(|m| m.ended()) {
+            event_loop.exit();
+            return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
@@ -472,171 +533,95 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.view = None; // drop the session connection (detach)
+                self.session = None; // drop the session connection (detach)
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.resize(size.width, size.height);
                 }
-                let (cols, rows) = grid_from_pixels(size.width.max(1), size.height.max(1));
-                if let Some(v) = self.view.as_mut() {
-                    let _ = v.resize(cols, rows);
-                }
-                // Reflow invalidates cell coordinates; drop any stale selection.
-                self.selection = None;
-                self.sel_anchor = None;
-                if let Some(g) = &self.gfx {
-                    g.window.request_redraw();
-                }
+                let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor());
+                self.dispatch(
+                    UiEvent::Resize {
+                        w_px: size.width.max(1),
+                        h_px: size.height.max(1),
+                        scale,
+                    },
+                    event_loop,
+                );
             }
             WindowEvent::RedrawRequested => {
-                let sel = self.selection;
-                if let (Some(g), Some(v)) = (self.gfx.as_mut(), self.view.as_ref()) {
-                    g.render(v, sel);
+                if let (Some(g), Some(m)) = (self.gfx.as_mut(), self.model.as_ref()) {
+                    let scene = m.view();
+                    g.render(&scene);
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
                 let key = from_winit::key(&event.logical_key);
                 let mods = from_winit::mods(self.mods);
-                match ghost_ui_core::classify_shortcut(&key, mods) {
-                    Some(ghost_ui_core::Shortcut::Paste) => self.paste_from_clipboard(),
-                    Some(ghost_ui_core::Shortcut::Copy) => self.copy_selection(),
-                    None => {
-                        if let Some(v) = self.view.as_mut() {
-                            let _ = v.key(&key, mods);
-                        }
-                    }
-                }
+                let pressed = event.state == ElementState::Pressed;
+                self.dispatch(UiEvent::Key { key, mods, pressed }, event_loop);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if let Some(v) = self.view.as_mut() {
-                    let _ = v.send_input(text.as_bytes());
-                }
+                self.dispatch(UiEvent::Text(text), event_loop);
             }
             WindowEvent::Focused(focused) => {
-                if let Some(v) = self.view.as_mut() {
-                    let _ = v.focus(focused);
-                }
+                self.dispatch(UiEvent::Focus(focused), event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let cell = point_to_cell(position.x, position.y);
-                if self.cursor_cell != Some(cell) {
-                    self.cursor_cell = Some(cell);
-                    if let Some(b) = self.held {
-                        // A drag is in progress: route it the way the press did,
-                        // so flipping Shift / mouse-mode mid-gesture can't split it.
-                        if self.gesture_report {
-                            if let Some(v) = self.view.as_mut() {
-                                let _ = v.mouse(
-                                    mouse::Kind::Motion,
-                                    Some(b),
-                                    true,
-                                    cell.0,
-                                    cell.1,
-                                    from_winit::mods(self.mods),
-                                );
-                            }
-                        } else if b == mouse::Button::Left
-                            && let Some(anchor) = self.sel_anchor
-                        {
-                            self.selection = Some(Selection::new(anchor, self.pointer_cell0()));
-                            self.request_redraw();
-                        }
-                    } else if self.report_to_app() {
-                        // Buttonless hover motion — only any-motion tracking wants it.
-                        if let Some(v) = self.view.as_mut() {
-                            let _ = v.mouse(
-                                mouse::Kind::Motion,
-                                None,
-                                false,
-                                cell.0,
-                                cell.1,
-                                from_winit::mods(self.mods),
-                            );
-                        }
-                    }
-                }
+                self.pointer_pos = PointPx {
+                    x: position.x,
+                    y: position.y,
+                };
+                let mods = from_winit::mods(self.mods);
+                self.dispatch(
+                    UiEvent::Pointer {
+                        phase: PointerPhase::Motion,
+                        button: None,
+                        pos: self.pointer_pos,
+                        mods,
+                        wheel_dy: 0.0,
+                    },
+                    event_loop,
+                );
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(b) = map_button(button) {
-                    if state == ElementState::Pressed {
-                        self.held = Some(b);
-                        // Latch the routing for the whole press..release gesture.
-                        self.gesture_report = self.report_to_app();
-                        if self.gesture_report {
-                            let (col, row) = self.cursor_cell.unwrap_or((1, 1));
-                            if let Some(v) = self.view.as_mut() {
-                                let _ = v.mouse(
-                                    mouse::Kind::Press,
-                                    Some(b),
-                                    true,
-                                    col,
-                                    row,
-                                    from_winit::mods(self.mods),
-                                );
-                            }
-                            // A plain forwarded left-click still dismisses a stale
-                            // local highlight the child can't clear itself.
-                            if b == mouse::Button::Left && self.selection.take().is_some() {
-                                self.request_redraw();
-                            }
-                        } else if b == mouse::Button::Left {
-                            // Begin a local selection; clear any previous highlight.
-                            // Only anchor once the pointer position is known.
-                            self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
-                            self.selection = None;
-                            self.request_redraw();
-                        }
+                    let phase = if state == ElementState::Pressed {
+                        PointerPhase::Press
                     } else {
-                        if self.gesture_report {
-                            let (col, row) = self.cursor_cell.unwrap_or((1, 1));
-                            if let Some(v) = self.view.as_mut() {
-                                let _ = v.mouse(
-                                    mouse::Kind::Release,
-                                    Some(b),
-                                    false,
-                                    col,
-                                    row,
-                                    from_winit::mods(self.mods),
-                                );
-                            }
-                        }
-                        self.held = None;
-                    }
+                        PointerPhase::Release
+                    };
+                    let mods = from_winit::mods(self.mods);
+                    self.dispatch(
+                        UiEvent::Pointer {
+                            phase,
+                            button: Some(b),
+                            pos: self.pointer_pos,
+                            mods,
+                            wheel_dy: 0.0,
+                        },
+                        event_loop,
+                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Only forwarded to the child; there's no local scrollback view yet.
-                if self.report_to_app() {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y as f64,
-                        MouseScrollDelta::PixelDelta(p) => p.y,
-                    };
-                    if dy != 0.0 {
-                        let b = if dy > 0.0 {
-                            mouse::Button::WheelUp
-                        } else {
-                            mouse::Button::WheelDown
-                        };
-                        let (col, row) = self.cursor_cell.unwrap_or((1, 1));
-                        let held = self.held.is_some();
-                        if let Some(v) = self.view.as_mut() {
-                            let _ = v.mouse(
-                                mouse::Kind::Press,
-                                Some(b),
-                                held,
-                                col,
-                                row,
-                                from_winit::mods(self.mods),
-                            );
-                        }
-                    }
-                }
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y,
+                };
+                let mods = from_winit::mods(self.mods);
+                self.dispatch(
+                    UiEvent::Pointer {
+                        phase: PointerPhase::Wheel,
+                        button: None,
+                        pos: self.pointer_pos,
+                        mods,
+                        wheel_dy: dy,
+                    },
+                    event_loop,
+                );
             }
             _ => {}
         }
