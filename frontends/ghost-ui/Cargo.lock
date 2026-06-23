@@ -682,7 +682,9 @@ dependencies = [
 name = "ghost-ui-core"
 version = "0.1.0"
 dependencies = [
+ "ghost-render",
  "ghost-term",
+ "ghost-vt",
 ]
 
 [[package]]

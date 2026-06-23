@@ -1,0 +1,49 @@
+//! `Cmd` — the effects the core returns as data. The shell is the sole
+//! interpreter: it performs the I/O and, for reads, feeds the answer back as a
+//! [`UiEvent`](crate::UiEvent). The core itself never touches sockets, the
+//! clipboard, or the clock — which is exactly what makes its behavior assertable
+//! by inspecting the returned `Vec<Cmd>`.
+//!
+//! Every variant is `Clone + PartialEq + Debug`, so a test asserts the precise
+//! effects of an event with `assert_eq!`.
+
+use crate::SessionId;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cmd {
+    /// Write already-encoded bytes to a session's PTY (keys/paste/mouse/replies).
+    SendInput {
+        session: SessionId,
+        bytes: Vec<u8>,
+    },
+    /// Resize a session's grid.
+    Resize {
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    /// Read the system clipboard; the shell replies `UiEvent::ClipboardText`.
+    ReadClipboard,
+    /// Write text to the system clipboard.
+    WriteClipboard(String),
+    /// Enumerate sessions; the shell replies `UiEvent::SessionList`.
+    ListSessions,
+    /// Open / close a session socket (e.g. for a fleet tile preview).
+    Attach(SessionId),
+    Detach(SessionId),
+    /// Spawn a new session (take-over / new window).
+    Spawn {
+        name: SessionId,
+        command: Vec<String>,
+    },
+    /// Repaint the window.
+    Redraw,
+    /// Set the window title.
+    SetTitle(String),
+    /// Ask for a future `UiEvent::Tick` after the given delay.
+    ScheduleTick {
+        after_ms: u64,
+    },
+    /// Exit the application.
+    Quit,
+}

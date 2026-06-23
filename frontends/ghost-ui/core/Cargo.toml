@@ -8,3 +8,5 @@ publish = false
 
 [dependencies]
 ghost-term = { path = "../../../ghost-term" }
+ghost-render = { path = "../../../ghost-render" }
+ghost-vt = { path = "../../../ghost-vt" }

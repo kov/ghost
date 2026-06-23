@@ -10,8 +10,23 @@
 //! encoders and their input alphabet live here. Later steps add the
 //! `update`/`view` reducer, the `Cmd` effect type, and the `Scene` model.
 
+pub mod cmd;
 pub mod encode;
+pub mod event;
 pub mod input;
 pub mod mouse;
 
+pub use cmd::Cmd;
+pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
 pub use input::{Key, Mods, NamedKey};
+
+/// A session's stable identity (its name). Focus and input routing key on this,
+/// never a list index — so reordering tiles can't silently retarget input.
+pub type SessionId = String;
+
+// The shared layout/scene vocabulary, re-exported so the app and shell import
+// it from one place (the core) rather than reaching into ghost-render directly.
+pub use ghost_render::{
+    BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Selection,
+    Style,
+};
