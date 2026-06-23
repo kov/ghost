@@ -268,17 +268,11 @@ fn interactive() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
-        gfx: None,
+        windows: HashMap::new(),
         sessions: HashMap::new(),
-        root: None,
-        name,
-        mods: ModifiersState::empty(),
-        pointer_pos: PointPx { x: 0.0, y: 0.0 },
         clipboard: None,
         start: Instant::now(),
-        next_tick: None,
-        last_click: None,
-        click_count: 0,
+        initial_name: name,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -388,24 +382,19 @@ impl Graphics {
     }
 }
 
-/// The thin imperative shell: owns the world, holds the pure model, and shuttles
-/// `UiEvent`s in and `Cmd`s out.
-struct App {
-    gfx: Option<Graphics>,
-    /// Attached sessions by id. One in single view; the whole fleet when the
-    /// overview is open.
-    sessions: HashMap<String, Session>,
-    root: Option<RootModel>,
+/// Per-window state: the GPU surface and pure model, plus the input bookkeeping
+/// that is inherently per-window (focus modifiers, pointer position, click
+/// detection, and the model's scheduled tick).
+struct WindowState {
+    gfx: Graphics,
+    root: RootModel,
+    /// This window's primary session — the one its model was created around.
     name: String,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
     /// so we cache it for button/wheel events).
     pointer_pos: PointPx,
-    /// Lazily-opened system clipboard for copy/paste.
-    clipboard: Option<arboard::Clipboard>,
-    /// Start of the monotonic clock injected into the model via `Tick`.
-    start: Instant,
-    /// When the next scheduled `Tick` is due, if any.
+    /// When this window's next scheduled `Tick` is due, if any.
     next_tick: Option<Instant>,
     /// Most recent left/middle/right press (time, button, pos) for detecting
     /// double/triple clicks, and the running click count.
@@ -413,17 +402,60 @@ struct App {
     click_count: u8,
 }
 
+impl WindowState {
+    /// Click count for a press of `button` at the current pointer position: a
+    /// repeat of the same button within 400ms and a few pixels increments the
+    /// count (double-, triple-click), otherwise it resets to 1.
+    fn count_click(&mut self, button: PointerButton) -> u8 {
+        const WINDOW: Duration = Duration::from_millis(400);
+        const SLOP: f64 = 4.0;
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((t, b, p))
+                if b == button
+                    && now.duration_since(t) < WINDOW
+                    && (p.x - self.pointer_pos.x).abs() < SLOP
+                    && (p.y - self.pointer_pos.y).abs() < SLOP =>
+            {
+                self.click_count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.click_count = count;
+        self.last_click = Some((now, button, self.pointer_pos));
+        count
+    }
+}
+
+/// The thin imperative shell: owns the world (live windows, the shared session
+/// pool, the clipboard, the clock), holds the pure models, and shuttles
+/// `UiEvent`s in and `Cmd`s out.
+struct App {
+    /// Live windows by id; each owns its GPU surface and pure model.
+    windows: HashMap<WindowId, WindowState>,
+    /// Attached sessions by id, shared across windows (every window can
+    /// enumerate them); attachment to a view is per-window via the models.
+    sessions: HashMap<String, Session>,
+    /// Lazily-opened system clipboard for copy/paste (shared).
+    clipboard: Option<arboard::Clipboard>,
+    /// Start of the monotonic clock injected into models via `Tick`.
+    start: Instant,
+    /// Session name for the first window, set at construction and consumed by
+    /// the first `resumed`.
+    initial_name: String,
+}
+
 impl App {
-    /// Feed an event to the model and execute the effects it returns.
-    fn dispatch(&mut self, ev: UiEvent, event_loop: &ActiveEventLoop) {
-        let cmds = match self.root.as_mut() {
-            Some(r) => r.update(ev),
+    /// Feed an event to window `wid`'s model and execute the effects it returns.
+    fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &ActiveEventLoop) {
+        let cmds = match self.windows.get_mut(&wid) {
+            Some(w) => w.root.update(ev),
             None => return,
         };
-        self.exec(cmds, event_loop);
+        self.exec(wid, cmds, event_loop);
     }
 
-    fn exec(&mut self, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
+    fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
@@ -442,17 +474,17 @@ impl App {
                 }
                 Cmd::ReadClipboard => {
                     let text = self.read_clipboard();
-                    self.dispatch(UiEvent::ClipboardText(text), event_loop);
+                    self.dispatch(wid, UiEvent::ClipboardText(text), event_loop);
                 }
                 Cmd::WriteClipboard(text) => self.write_clipboard(text),
                 Cmd::ReadPrimary => {
                     let text = self.read_primary();
-                    self.dispatch(UiEvent::ClipboardText(text), event_loop);
+                    self.dispatch(wid, UiEvent::ClipboardText(text), event_loop);
                 }
                 Cmd::WritePrimary(text) => self.write_primary(text),
                 Cmd::ListSessions => {
                     let infos = session::list().unwrap_or_default();
-                    self.dispatch(UiEvent::SessionList(infos), event_loop);
+                    self.dispatch(wid, UiEvent::SessionList(infos), event_loop);
                 }
                 Cmd::Attach(id) => {
                     if !self.sessions.contains_key(&id)
@@ -462,8 +494,9 @@ impl App {
                     }
                 }
                 Cmd::Detach(id) => {
-                    // Never drop the window's own session out from under us.
-                    if id != self.name {
+                    // Never drop a session that is some window's own primary.
+                    let owned = self.windows.values().any(|w| w.name == id);
+                    if !owned {
                         self.sessions.remove(&id);
                     }
                 }
@@ -474,14 +507,20 @@ impl App {
                         self.sessions.insert(name, s);
                     }
                 }
-                Cmd::Redraw => self.request_redraw(),
+                Cmd::Redraw => {
+                    if let Some(w) = self.windows.get(&wid) {
+                        w.gfx.window.request_redraw();
+                    }
+                }
                 Cmd::SetTitle(t) => {
-                    if let Some(g) = &self.gfx {
-                        g.window.set_title(&t);
+                    if let Some(w) = self.windows.get(&wid) {
+                        w.gfx.window.set_title(&t);
                     }
                 }
                 Cmd::ScheduleTick { after_ms } => {
-                    self.next_tick = Some(Instant::now() + Duration::from_millis(after_ms));
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.next_tick = Some(Instant::now() + Duration::from_millis(after_ms));
+                    }
                 }
                 Cmd::Quit => event_loop.exit(),
             }
@@ -537,73 +576,69 @@ impl App {
     #[cfg(not(target_os = "linux"))]
     fn write_primary(&mut self, _text: String) {}
 
-    fn request_redraw(&self) {
-        if let Some(g) = &self.gfx {
-            g.window.request_redraw();
-        }
-    }
-
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
 
-    /// Click count for a press of `button` at the current pointer position: a
-    /// repeat of the same button within 400ms and a few pixels increments the
-    /// count (double-, triple-click), otherwise it resets to 1.
-    fn count_click(&mut self, button: PointerButton) -> u8 {
-        const WINDOW: Duration = Duration::from_millis(400);
-        const SLOP: f64 = 4.0;
-        let now = Instant::now();
-        let count = match self.last_click {
-            Some((t, b, p))
-                if b == button
-                    && now.duration_since(t) < WINDOW
-                    && (p.x - self.pointer_pos.x).abs() < SLOP
-                    && (p.y - self.pointer_pos.y).abs() < SLOP =>
-            {
-                self.click_count.saturating_add(1)
-            }
-            _ => 1,
-        };
-        self.click_count = count;
-        self.last_click = Some((now, button, self.pointer_pos));
-        count
+    /// Remove a window. When the last window goes, detach every session (drop
+    /// the clients; the hosts keep the sessions running for reattach next
+    /// launch) — the "close = detach" default. Detaching only a *non-last*
+    /// window's own sessions waits for the per-window ownership map (see
+    /// ghost-vt/docs/session-coordination.md).
+    fn close_window(&mut self, wid: WindowId) {
+        if self.windows.remove(&wid).is_none() {
+            return;
+        }
+        if self.windows.is_empty() {
+            self.sessions.clear();
+        }
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gfx.is_some() {
+        if !self.windows.is_empty() {
             return;
         }
         let cfg = config::UiConfig::load();
         let gfx = Graphics::new(event_loop, cfg.theme());
+        let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
-        match attach(&self.name, cols, rows) {
+        let name = self.initial_name.clone();
+        match attach(&name, cols, rows) {
             Ok(session) => {
-                self.sessions.insert(self.name.clone(), session);
+                self.sessions.insert(name.clone(), session);
             }
             Err(e) => {
-                eprintln!("could not attach to session '{}': {e}", self.name);
+                eprintln!("could not attach to session '{name}': {e}");
                 event_loop.exit();
                 return;
             }
         }
-        let model = TerminalModel::new(self.name.clone(), cols, rows, METRICS);
-        self.root = Some(RootModel::single(
-            model,
-            METRICS,
-            (gfx.config.width, gfx.config.height),
-        ));
+        let model = TerminalModel::new(name.clone(), cols, rows, METRICS);
+        let root = RootModel::single(model, METRICS, (gfx.config.width, gfx.config.height));
         let (w, h) = (gfx.config.width, gfx.config.height);
-        self.gfx = Some(gfx);
+        self.windows.insert(
+            wid,
+            WindowState {
+                gfx,
+                root,
+                name,
+                mods: ModifiersState::empty(),
+                pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                next_tick: None,
+                last_click: None,
+                click_count: 0,
+            },
+        );
         // Sync the model's viewport to the real surface size *and* device scale
         // before the first paint — this drives the NDC mapping, the scissor
         // clamp, and the cell metrics, and its `Cmd::Redraw` requests that paint.
         // (No earlier `request_redraw`: it would race a frame at the default 1x
         // scale against glyphs the renderer rasterizes at `SIZE_PX * scale`.)
         self.dispatch(
+            wid,
             UiEvent::Resize {
                 w_px: w,
                 h_px: h,
@@ -613,13 +648,13 @@ impl ApplicationHandler for App {
         );
         // Apply the persisted zoom now that the viewport is known, so it re-grids
         // against the real surface size (the model clamps to its bounds).
-        self.dispatch(UiEvent::SetZoom(cfg.zoom()), event_loop);
+        self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Pump every attached session (one in single view, the whole fleet in
-        // overview), then route each session's output to the model by id.
+        // Pump every shared session, then route each session's output to every
+        // window (a window whose model isn't showing that id simply ignores it).
         let mut pumped: Vec<(String, Vec<u8>, bool)> = Vec::new();
         for (name, s) in self.sessions.iter_mut() {
             let (bytes, ended) = pump(s, 32);
@@ -628,41 +663,75 @@ impl ApplicationHandler for App {
             }
         }
         for (name, bytes, ended) in pumped {
-            // A dead session is dropped from the pump map regardless of whether
-            // it is the window's own; app-exit is decided separately below via
-            // RootModel::ended(). (Done before dispatch so a stale query-reply to
-            // it is simply ignored.)
+            // Drop a dead session before dispatch so a stale query-reply to it
+            // is simply ignored; which windows end is decided below.
             if ended {
                 self.sessions.remove(&name);
             }
-            self.dispatch(UiEvent::SessionData { name, bytes, ended }, event_loop);
+            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+            for wid in wids {
+                self.dispatch(
+                    wid,
+                    UiEvent::SessionData {
+                        name: name.clone(),
+                        bytes: bytes.clone(),
+                        ended,
+                    },
+                    event_loop,
+                );
+            }
         }
-        if let Some(t) = self.next_tick
-            && Instant::now() >= t
-        {
-            self.next_tick = None;
+        // Fire any per-window ticks that are now due.
+        let now = Instant::now();
+        let due: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.next_tick.is_some_and(|t| now >= t))
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in due {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.next_tick = None;
+            }
             let now_ms = self.now_ms();
-            self.dispatch(UiEvent::Tick { now_ms }, event_loop);
+            self.dispatch(wid, UiEvent::Tick { now_ms }, event_loop);
         }
-        if self.root.as_ref().is_some_and(|r| r.ended()) {
+        // Close any window whose model has ended; exit once the last is gone.
+        let ended: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.root.ended())
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in ended {
+            self.close_window(wid);
+        }
+        if self.windows.is_empty() {
             event_loop.exit();
             return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.sessions.clear(); // drop every session connection (detach)
-                event_loop.exit();
+                // Close = detach: drop this window (and, if it was the last, its
+                // session connections — the hosts keep the sessions running).
+                self.close_window(id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(size) => {
-                if let Some(g) = self.gfx.as_mut() {
-                    g.resize(size.width, size.height);
-                }
-                let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor());
+                let Some(scale) = self.windows.get_mut(&id).map(|w| {
+                    w.gfx.resize(size.width, size.height);
+                    w.gfx.window.scale_factor()
+                }) else {
+                    return;
+                };
                 self.dispatch(
+                    id,
                     UiEvent::Resize {
                         w_px: size.width.max(1),
                         h_px: size.height.max(1),
@@ -677,13 +746,14 @@ impl ApplicationHandler for App {
                 // physical size and re-derive the grid at the new scale, so a
                 // redraw arriving before the (usual) following Resized still
                 // renders with matching metrics rather than the stale config size.
-                let size = self.gfx.as_mut().map(|g| {
-                    let s = g.window.inner_size();
-                    g.resize(s.width, s.height);
+                let size = self.windows.get_mut(&id).map(|w| {
+                    let s = w.gfx.window.inner_size();
+                    w.gfx.resize(s.width, s.height);
                     (s.width, s.height)
                 });
                 if let Some((w, h)) = size {
                     self.dispatch(
+                        id,
                         UiEvent::Resize {
                             w_px: w.max(1),
                             h_px: h.max(1),
@@ -694,55 +764,67 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(g), Some(r)) = (self.gfx.as_mut(), self.root.as_ref()) {
-                    let scene = r.view();
+                if let Some(win) = self.windows.get_mut(&id) {
+                    let scene = win.root.view();
                     // Rasterize at the model's render scale (device × zoom) so
                     // glyph size matches the grid the scene was laid out for.
-                    let font_px = SIZE_PX * r.render_scale();
+                    let font_px = SIZE_PX * win.root.render_scale();
                     // Keep the IME candidate window pinned to the text cursor.
-                    if let Some(a) = r.ime_cursor_area() {
-                        g.window.set_ime_cursor_area(
+                    if let Some(a) = win.root.ime_cursor_area() {
+                        win.gfx.window.set_ime_cursor_area(
                             PhysicalPosition::new(a.x, a.y),
                             PhysicalSize::new(a.w, a.h),
                         );
                     }
-                    g.render(&scene, font_px);
+                    win.gfx.render(&scene, font_px);
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.mods = m.state();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                let Some(mods_state) = self.windows.get(&id).map(|w| w.mods) else {
+                    return;
+                };
                 let key = from_winit::key(&event.logical_key);
-                let mods = from_winit::mods(self.mods);
+                let mods = from_winit::mods(mods_state);
                 let pressed = event.state == ElementState::Pressed;
-                self.dispatch(UiEvent::Key { key, mods, pressed }, event_loop);
+                self.dispatch(id, UiEvent::Key { key, mods, pressed }, event_loop);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.dispatch(UiEvent::Text(text), event_loop);
+                self.dispatch(id, UiEvent::Text(text), event_loop);
             }
             WindowEvent::Ime(Ime::Preedit(text, _cursor)) => {
                 // Track the in-progress composition so the model suppresses the
                 // raw keystrokes driving it; an empty string ends it.
-                self.dispatch(UiEvent::Preedit(text), event_loop);
+                self.dispatch(id, UiEvent::Preedit(text), event_loop);
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 // Composition aborted (focus lost, IME toggled off): clear it.
-                self.dispatch(UiEvent::Preedit(String::new()), event_loop);
+                self.dispatch(id, UiEvent::Preedit(String::new()), event_loop);
             }
             WindowEvent::Ime(Ime::Enabled) => {}
             WindowEvent::Focused(focused) => {
-                self.dispatch(UiEvent::Focus(focused), event_loop);
+                self.dispatch(id, UiEvent::Focus(focused), event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer_pos = PointPx {
-                    x: position.x,
-                    y: position.y,
+                let Some((pos, mods)) = self.windows.get_mut(&id).map(|w| {
+                    w.pointer_pos = PointPx {
+                        x: position.x,
+                        y: position.y,
+                    };
+                    (w.pointer_pos, from_winit::mods(w.mods))
+                }) else {
+                    return;
                 };
-                let mods = from_winit::mods(self.mods);
                 self.dispatch(
+                    id,
                     UiEvent::Pointer {
                         phase: PointerPhase::Motion,
                         button: None,
-                        pos: self.pointer_pos,
+                        pos,
                         mods,
                         wheel_dy: 0.0,
                         clicks: 1,
@@ -758,13 +840,18 @@ impl ApplicationHandler for App {
                     } else {
                         PointerPhase::Release
                     };
-                    let clicks = if pressed { self.count_click(b) } else { 1 };
-                    let mods = from_winit::mods(self.mods);
+                    let Some((clicks, pos, mods)) = self.windows.get_mut(&id).map(|w| {
+                        let clicks = if pressed { w.count_click(b) } else { 1 };
+                        (clicks, w.pointer_pos, from_winit::mods(w.mods))
+                    }) else {
+                        return;
+                    };
                     self.dispatch(
+                        id,
                         UiEvent::Pointer {
                             phase,
                             button: Some(b),
-                            pos: self.pointer_pos,
+                            pos,
                             mods,
                             wheel_dy: 0.0,
                             clicks,
@@ -778,12 +865,19 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                let mods = from_winit::mods(self.mods);
+                let Some((pos, mods)) = self
+                    .windows
+                    .get(&id)
+                    .map(|w| (w.pointer_pos, from_winit::mods(w.mods)))
+                else {
+                    return;
+                };
                 self.dispatch(
+                    id,
                     UiEvent::Pointer {
                         phase: PointerPhase::Wheel,
                         button: None,
-                        pos: self.pointer_pos,
+                        pos,
                         mods,
                         wheel_dy: dy,
                         clicks: 1,
