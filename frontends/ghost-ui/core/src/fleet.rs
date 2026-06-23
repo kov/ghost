@@ -578,6 +578,10 @@ mod tests {
         })
     }
 
+    fn rects_overlap(a: &RectPx, b: &RectPx) -> bool {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
     #[test]
     fn reconcile_attaches_new_and_detaches_gone() {
         let mut m = fleet();
@@ -590,6 +594,71 @@ mod tests {
         let cmds = list(&mut m, &["a"]);
         assert!(cmds.contains(&Cmd::Detach("b".into())));
         assert_eq!(m.tile_count(), 1);
+    }
+
+    #[test]
+    fn view_lays_tiles_in_a_non_overlapping_grid_with_one_focus_border() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b", "c"]);
+        // Distinct content per tile, so each previews real routed output.
+        data(&mut m, "a", b"AAA");
+        data(&mut m, "b", b"BBB");
+        data(&mut m, "c", b"CCC");
+
+        let scene = m.view();
+        let items = &scene.layers[0].items;
+
+        // One Terminal preview per session.
+        let terminals: Vec<RectPx> = items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Terminal { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals.len(), 3, "one preview tile per session");
+
+        // Tiles tile the grid — no two overlap, and each fits the viewport.
+        for (i, a) in terminals.iter().enumerate() {
+            assert!(
+                a.x >= 0.0
+                    && a.y >= 0.0
+                    && a.x + a.w <= SIZE.0 as f32
+                    && a.y + a.h <= SIZE.1 as f32,
+                "tile {a:?} must fit the {SIZE:?} viewport"
+            );
+            for b in &terminals[i + 1..] {
+                assert!(
+                    !rects_overlap(a, b),
+                    "tiles must not overlap: {a:?} vs {b:?}"
+                );
+            }
+        }
+
+        // Exactly one tile is focused: the only one bordered and the only one not
+        // dimmed, and the border tracks that tile's rect.
+        let borders: Vec<RectPx> = items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Border { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(borders.len(), 1, "only the focused tile is bordered");
+        let undimmed: Vec<RectPx> = items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Terminal {
+                    rect, dim: false, ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(undimmed.len(), 1, "exactly one focused (undimmed) tile");
+        assert_eq!(
+            borders[0], undimmed[0],
+            "the border outlines the focused tile"
+        );
     }
 
     #[test]
