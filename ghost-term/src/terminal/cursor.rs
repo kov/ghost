@@ -1,8 +1,19 @@
+/// The cursor's drawn shape, set by DECSCUSR (`CSI Ps SP q`). Blinking is not
+/// modelled — the blinking and steady variants of each shape collapse to one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Cursor {
     pub col: usize,
     pub row: usize,
     pub visible: bool,
+    pub shape: CursorShape,
 }
 
 impl Default for Cursor {
@@ -11,6 +22,7 @@ impl Default for Cursor {
             col: 0,
             row: 0,
             visible: true,
+            shape: CursorShape::Block,
         }
     }
 }

@@ -11,6 +11,7 @@
 //! The only "font" input is [`CellMetrics`]: a monospace cell box. Pixel
 //! positions are pure arithmetic from it, so even geometry is unit-testable.
 
+pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
 
 pub mod scene;
@@ -92,11 +93,13 @@ pub struct RowLayout {
     pub runs: Vec<Run>,
 }
 
-/// Where the cursor sits, in cell coordinates (viewport-relative).
+/// Where the cursor sits, in cell coordinates (viewport-relative), and the
+/// shape to draw it as (DECSCUSR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorLayout {
     pub col: usize,
     pub row: usize,
+    pub shape: CursorShape,
 }
 
 /// A normalized linear text selection over the viewport grid, in 0-based
@@ -236,6 +239,7 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
     let cursor_layout = (offset == 0 && cursor.visible).then_some(CursorLayout {
         col: cursor.col,
         row: cursor.row,
+        shape: cursor.shape,
     });
 
     let rows_layout = vt
@@ -398,7 +402,33 @@ mod tests {
         assert_eq!((f.cols, f.rows), (20, 5));
         assert_eq!(f.rows_layout.len(), 5);
         assert_eq!(f.rows_layout[0].runs[0].text, "hi");
-        assert_eq!(f.cursor, Some(CursorLayout { col: 2, row: 0 }));
+        assert_eq!(
+            f.cursor,
+            Some(CursorLayout {
+                col: 2,
+                row: 0,
+                shape: CursorShape::Block,
+            })
+        );
+    }
+
+    #[test]
+    fn decscusr_sets_the_cursor_shape_on_the_frame() {
+        // The app switches to a bar cursor (DECSCUSR 6), e.g. vim insert mode.
+        let v = feed(20, 5, "hi\x1b[6 q");
+        let f = layout_frame(&v, M);
+        assert_eq!(f.cursor.unwrap().shape, CursorShape::Bar);
+        // An underline (4), then back to block (2).
+        let v = feed(20, 5, "hi\x1b[4 q");
+        assert_eq!(
+            layout_frame(&v, M).cursor.unwrap().shape,
+            CursorShape::Underline
+        );
+        let v = feed(20, 5, "hi\x1b[2 q");
+        assert_eq!(
+            layout_frame(&v, M).cursor.unwrap().shape,
+            CursorShape::Block
+        );
     }
 
     #[test]

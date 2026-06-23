@@ -88,6 +88,9 @@ pub enum Function {
     Scorc,
     Scosc,
     Sd(u16),
+    /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
+    /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
+    SetCursorStyle(u8),
     SetTitle(String),
     Sgr(SgrOps),
     Si,
@@ -893,6 +896,11 @@ impl Parser {
                 Some(ModifyOtherKeys(level))
             }
 
+            // DECSCUSR: `CSI Ps SP q` sets the cursor style (Ps 0..=6). Clamp to
+            // 255 rather than truncating, so an over-large Ps stays out of range
+            // (the terminal ignores it) instead of wrapping into a valid code.
+            (Some(' '), 'q') => Some(SetCursorStyle(ps[0].as_u16().min(255) as u8)),
+
             _ => None,
         }
     }
@@ -1218,6 +1226,16 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Scorc => push_csi(seq, None, &[], 'u'),
         Scosc => push_csi(seq, None, &[], 's'),
         Sd(n) => push_csi(seq, None, &[n.to_string()], 'T'),
+        SetCursorStyle(ps) => {
+            // DECSCUSR's space is an intermediate that follows the parameter
+            // (`CSI Ps SP q`), unlike the `?`/`>`/`!` private-marker prefixes
+            // push_csi emits, so build it by hand.
+            seq.push('\u{1b}');
+            seq.push('[');
+            seq.push_str(&ps.to_string());
+            seq.push(' ');
+            seq.push('q');
+        }
         SetTitle(title) => {
             seq.push_str("\u{1b}]2;");
             seq.push_str(title);
@@ -2082,9 +2100,23 @@ mod tests {
         assert_eq!(parse("\x1b[1?m"), []);
         assert_eq!(parse("\x1b[ 1H"), []);
         assert_eq!(parse("\x1b[ 1m"), []);
-        assert_eq!(parse("\x1b[1 q"), []);
         assert_eq!(parse("\x1b[38;2m"), [Sgr(sgr_ops([]))]);
         assert_eq!(parse("\x1b[48;5m"), [Sgr(sgr_ops([]))]);
+    }
+
+    #[test]
+    fn parse_cursor_style() {
+        // DECSCUSR `CSI Ps SP q`, Ps 0..=6.
+        assert_eq!(parse("\x1b[1 q"), [SetCursorStyle(1)]);
+        assert_eq!(parse("\x1b[4 q"), [SetCursorStyle(4)]);
+        assert_eq!(parse("\x1b[6 q"), [SetCursorStyle(6)]);
+        // Omitted Ps defaults to 0 (`CSI SP q`).
+        assert_eq!(parse("\x1b[ q"), [SetCursorStyle(0)]);
+        // Out-of-range Ps still parses; the terminal decides to ignore it.
+        assert_eq!(parse("\x1b[7 q"), [SetCursorStyle(7)]);
+        // An over-large Ps clamps to 255 rather than wrapping to 0, so it can't
+        // masquerade as a valid "block" request once it reaches the terminal.
+        assert_eq!(parse("\x1b[256 q"), [SetCursorStyle(255)]);
     }
 
     #[test]
@@ -2314,6 +2346,9 @@ mod tests {
             Scorc,
             Scosc,
             Sd(20),
+            SetCursorStyle(0),
+            SetCursorStyle(4),
+            SetCursorStyle(6),
             Sgr(sgr_ops([])),
             Sgr(sgr_ops([
                 Reset,

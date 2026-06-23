@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 
 use ghost_render::{
-    BadgeKind, CellMetrics, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection, Style,
+    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
+    Style,
 };
 use ghost_shaper::{FontRef, Synthesis};
 use ghost_term::Color;
@@ -825,7 +826,7 @@ impl Renderer {
             let row_y = row as f32 * metrics.line_height;
             let baseline_y = row_y + baseline;
             for run in &layout.runs {
-                let is_cursor = cursor.is_some_and(|c| c.row == row && c.col == run.start_col);
+                let cursor_here = cursor.filter(|c| c.row == row && c.col == run.start_col);
                 let (fg, bg_opt) = run_colors(&run.style, self.theme);
                 let x = run.start_col as f32 * metrics.advance;
                 let w = run.width_cols as f32 * metrics.advance;
@@ -835,7 +836,10 @@ impl Renderer {
                 // `fg`/`bg_opt` are already post-inverse and post-faint, so on an
                 // inverse or faint cell the cursor reflects that — the standard
                 // xterm behaviour where the cursor reverses whatever is shown.
-                let (block, glyph_color) = if is_cursor {
+                // Underline and bar cursors leave the glyph in its normal colour
+                // and instead get a thin rule drawn after the glyphs (below).
+                let block_cursor = matches!(cursor_here.map(|c| c.shape), Some(CursorShape::Block));
+                let (block, glyph_color) = if block_cursor {
                     (Some(fg), bg_opt.unwrap_or(to_rgba(self.theme.bg)))
                 } else {
                     (bg_opt, fg)
@@ -898,6 +902,38 @@ impl Renderer {
                     if run.style.strikethrough {
                         glyphs.push(line(row_y + metrics.line_height * 0.5 - thickness * 0.5));
                     }
+                }
+
+                // Underline / bar cursor: a solid rule in the foreground colour
+                // over the unmodified glyph (the block path above handles its own
+                // fill). Underline = a thick rule along the cell bottom; bar = a
+                // thin rule down the cell's leading edge.
+                match cursor_here.map(|c| c.shape) {
+                    Some(CursorShape::Underline) => {
+                        let thickness = (metrics.line_height / 8.0).max(2.0);
+                        glyphs.push(solid(
+                            RectPx {
+                                x,
+                                y: row_y + metrics.line_height - thickness,
+                                w,
+                                h: thickness,
+                            },
+                            fg,
+                        ));
+                    }
+                    Some(CursorShape::Bar) => {
+                        let width = (metrics.advance / 8.0).max(2.0);
+                        glyphs.push(solid(
+                            RectPx {
+                                x,
+                                y: row_y,
+                                w: width,
+                                h: metrics.line_height,
+                            },
+                            fg,
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }

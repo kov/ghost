@@ -21,4 +21,5 @@ pub use charset::Charset;
 pub use color::Color;
 pub use line::Line;
 pub use pen::Pen;
+pub use terminal::CursorShape;
 pub use vt::{MouseProtocol, Vt};

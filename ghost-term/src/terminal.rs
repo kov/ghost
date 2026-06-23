@@ -1,7 +1,7 @@
 mod cursor;
 mod dirty_lines;
 
-pub use self::cursor::Cursor;
+pub use self::cursor::{Cursor, CursorShape};
 use self::dirty_lines::DirtyLines;
 use crate::buffer::{Buffer, EraseMode};
 use crate::cell::{Cell, Occupancy};
@@ -326,6 +326,18 @@ impl Terminal {
 
             Sd(n) => {
                 self.sd(n);
+            }
+
+            SetCursorStyle(ps) => {
+                // DECSCUSR: 0/1/2 block, 3/4 underline, 5/6 bar (blink dropped).
+                // An out-of-range Ps leaves the shape unchanged, as xterm does
+                // (set_cursor_shape sets change = False) rather than resetting.
+                match ps {
+                    0..=2 => self.cursor.shape = CursorShape::Block,
+                    3 | 4 => self.cursor.shape = CursorShape::Underline,
+                    5 | 6 => self.cursor.shape = CursorShape::Bar,
+                    _ => {}
+                }
             }
 
             SetTitle(title) => {
@@ -1629,6 +1641,14 @@ impl Terminal {
             funs.push(Function::Decrst(DecModes::one(DecMode::TextCursorEnable)));
         }
 
+        // re-arm a non-default cursor shape (DECSCUSR) so a reattach matches.
+        // Emit the canonical steady code per shape (blink isn't modelled).
+        match self.cursor.shape {
+            CursorShape::Block => {}
+            CursorShape::Underline => funs.push(Function::SetCursorStyle(4)),
+            CursorShape::Bar => funs.push(Function::SetCursorStyle(6)),
+        }
+
         // Following 3 steps must happen after ALL prints as they alter print behaviour,
         // including the "move cursor past the right border one" above.
 
@@ -1926,7 +1946,7 @@ impl Default for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferType, Occupancy, Terminal};
+    use super::{BufferType, CursorShape, Occupancy, Terminal};
     use crate::charset::Charset;
     use crate::color::Color;
     use crate::line::Line;
@@ -3318,6 +3338,37 @@ mod tests {
             term.dump().contains(&Function::ModifyOtherKeys(2)),
             "modifyOtherKeys must be re-emitted on dump"
         );
+    }
+
+    #[test]
+    fn execute_cursor_style() {
+        let mut term = Terminal::new((4, 2), None);
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+
+        // DECSCUSR decoding: 3/4 underline, 5/6 bar, 0/1/2 block (blink dropped).
+        term.execute(Function::SetCursorStyle(4));
+        assert_eq!(term.cursor().shape, CursorShape::Underline);
+        term.execute(Function::SetCursorStyle(5));
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+        term.execute(Function::SetCursorStyle(2));
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+
+        // A non-default shape is re-emitted on dump; RIS resets to Block.
+        term.execute(Function::SetCursorStyle(6));
+        assert!(
+            term.dump().contains(&Function::SetCursorStyle(6)),
+            "cursor shape must be re-emitted on dump"
+        );
+
+        // Out-of-range Ps is a no-op: xterm leaves the shape unchanged rather
+        // than resetting it, so the bar survives a stray 7 or an over-large code.
+        term.execute(Function::SetCursorStyle(7));
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+        term.execute(Function::SetCursorStyle(255));
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+
+        term.execute(Function::Ris);
+        assert_eq!(term.cursor().shape, CursorShape::Block);
     }
 
     #[test]

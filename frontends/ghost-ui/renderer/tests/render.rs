@@ -192,3 +192,73 @@ fn draws_block_cursor_at_prompt_position() {
         "cursor block should fill the cell at col 2 ({light}/{total})"
     );
 }
+
+/// Pixels in a sub-rectangle [x0,x1)×[y0,y1) satisfying `pred`, plus the total.
+fn rect<F: Fn([u8; 4]) -> bool>(
+    img: &Rendered,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+    pred: F,
+) -> (usize, usize) {
+    let mut hits = 0;
+    let mut total = 0;
+    for x in x0..x1 {
+        for y in y0..y1 {
+            total += 1;
+            if pred(px(img, x, y)) {
+                hits += 1;
+            }
+        }
+    }
+    (hits, total)
+}
+
+fn light(p: [u8; 4]) -> bool {
+    p[0] > 180 && p[1] > 180 && p[2] > 180
+}
+
+#[test]
+fn draws_underline_cursor_along_the_cell_bottom() {
+    // DECSCUSR 4 (steady underline): a thin rule on the cell bottom, with the
+    // cell otherwise untouched (no block fill).
+    let mut vt = Vt::new(10, 1);
+    vt.feed_str("hi\x1b[4 q");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let img = render_frame(&frame, font, 15.0, Theme::default());
+
+    // The bottom of the cursor cell (col 2, x 18..27) is lit; the upper part is
+    // blank (no glyph, no block fill).
+    let (bottom, bt) = rect(&img, 18, 27, 16, 18, light);
+    let (top, _) = rect(&img, 18, 27, 1, 13, light);
+    assert!(
+        bottom * 2 > bt,
+        "underline cursor should light the cell bottom ({bottom}/{bt})"
+    );
+    assert_eq!(
+        top, 0,
+        "underline cursor must not fill the cell body ({top})"
+    );
+}
+
+#[test]
+fn draws_bar_cursor_along_the_cell_leading_edge() {
+    // DECSCUSR 6 (steady bar): a thin vertical rule at the cell's left edge.
+    let mut vt = Vt::new(10, 1);
+    vt.feed_str("hi\x1b[6 q");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let img = render_frame(&frame, font, 15.0, Theme::default());
+
+    // The leading edge of the cursor cell (col 2, x 18..) is lit top-to-bottom;
+    // the rest of the cell is blank.
+    let (edge, et) = rect(&img, 18, 20, 0, 18, light);
+    let (body, _) = rect(&img, 22, 27, 0, 18, light);
+    assert!(
+        edge * 2 > et,
+        "bar cursor should light the cell leading edge ({edge}/{et})"
+    );
+    assert_eq!(body, 0, "bar cursor must not fill the cell body ({body})");
+}
