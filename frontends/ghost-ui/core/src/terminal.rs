@@ -55,6 +55,7 @@ pub enum Shortcut {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    Quit,
 }
 
 /// Classify a pressed key as a frontend shortcut, if it is one. The primary
@@ -70,6 +71,9 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
         match key {
             Key::Char(s) if s.eq_ignore_ascii_case("v") => return Some(Shortcut::Paste),
             Key::Char(s) if s.eq_ignore_ascii_case("c") => return Some(Shortcut::Copy),
+            // Cmd+Q (macOS) / Ctrl+Shift+Q (elsewhere) quits — never bare Ctrl+Q,
+            // which must stay XOFF flow control.
+            Key::Char(s) if s.eq_ignore_ascii_case("q") => return Some(Shortcut::Quit),
             _ => {}
         }
     }
@@ -350,6 +354,7 @@ impl TerminalModel {
             Some(Shortcut::ZoomIn) => self.apply_zoom(step_zoom(self.zoom, ZOOM_STEP)),
             Some(Shortcut::ZoomOut) => self.apply_zoom(step_zoom(self.zoom, -ZOOM_STEP)),
             Some(Shortcut::ZoomReset) => self.apply_zoom(1.0),
+            Some(Shortcut::Quit) => vec![Cmd::Quit],
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 match encode::encode(key, mods, app_cursor) {
@@ -1177,6 +1182,27 @@ mod tests {
         assert_eq!(
             key(&mut m, Key::Char("c".into()), Mods::CTRL),
             vec![sent("alpha", b"\x03")]
+        );
+    }
+
+    #[test]
+    fn quit_shortcut_is_cmd_q_or_ctrl_shift_q_never_bare_ctrl_q() {
+        let mut m = model();
+        assert_eq!(
+            key(&mut m, Key::Char("q".into()), Mods::SUPER),
+            vec![Cmd::Quit],
+            "Cmd+Q quits"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("q".into()), Mods::CTRL | Mods::SHIFT),
+            vec![Cmd::Quit],
+            "Ctrl+Shift+Q quits"
+        );
+        // Bare Ctrl+Q must stay XOFF flow control (0x11), not quit.
+        assert_eq!(
+            key(&mut m, Key::Char("q".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x11")],
+            "bare Ctrl+Q is XOFF, not quit"
         );
     }
 
