@@ -15,6 +15,7 @@ const KITTY_DISAMBIGUATE: u8 = 0b00001;
 const KITTY_REPORT_EVENT_TYPES: u8 = 0b00010;
 const KITTY_REPORT_ALTERNATE_KEYS: u8 = 0b00100;
 const KITTY_REPORT_ALL_KEYS: u8 = 0b01000;
+const KITTY_REPORT_ASSOCIATED_TEXT: u8 = 0b10000;
 /// Flags whose presence routes a key through the kitty `CSI u` encoder rather
 /// than the legacy / modifyOtherKeys schemes. (4 = report-alternate-keys and
 /// 16 = report-associated-text are sub-field modifiers, not base modes.)
@@ -64,9 +65,9 @@ pub fn encode(
 /// scheme). Implements *disambiguate* (1) — and the key-selection of
 /// *report-all-keys* (8) — in their base form: `CSI code[;mods] u` for text /
 /// control keys, the legacy-shaped `CSI [1;mods]<letter>` and `CSI num[;mods]~`
-/// forms for navigation / function keys; the *report-event-types* (2) and
-/// *report-alternate-keys* (4) sub-fields layer onto those. Associated text
-/// (flag 16) is layered on in a later step.
+/// forms for navigation / function keys; the *report-event-types* (2),
+/// *report-alternate-keys* (4) and *report-associated-text* (16) sub-fields
+/// layer onto those.
 ///
 /// Returns the bytes for the key (including the plain legacy byte for keys the
 /// active flags leave alone) or `None` for keys that emit nothing (dead /
@@ -97,7 +98,9 @@ fn kitty_encode(
                 .filter(|_| force_all || nonshift_mod);
             if let Some(code) = code {
                 let field = kitty_key_field(code, alts, flags);
-                csi_u_field_or_suppressed(field, mods, event, kind)
+                // The glyph a `Char` carries *is* the text it produced.
+                let text = associated_text(flags, mods, kind, s);
+                csi_u_field_or_suppressed(field, mods, event, kind, text.as_deref())
             } else if matches!(kind, KeyEventKind::Release) {
                 // A text key has no escape-code form here, so its release is not
                 // reported (only flag 8 promotes text keys to escape codes).
@@ -107,10 +110,34 @@ fn kitty_encode(
                 Some(s.as_bytes().to_vec())
             }
         }
-        Key::Named(named) => kitty_encode_named(*named, mods, force_all, nonshift_mod, event, kind),
+        Key::Named(named) => {
+            kitty_encode_named(*named, mods, force_all, nonshift_mod, event, kind, flags)
+        }
         // Key::Dead / Key::Unidentified: nothing on their own.
         _ => None,
     }
+}
+
+/// The associated-text codepoints (colon-joined decimals) for report-associated-
+/// text (flag 16), or `None` when no text is reported: the flag is off, this is a
+/// release (which produces no text), a text-suppressing modifier (Ctrl/Alt/Super)
+/// is held, or `text` has no printable content. (Alt-graph text on layouts that
+/// surface it as Alt is the documented edge this conservative gate misses.)
+fn associated_text(flags: u8, mods: Mods, kind: KeyEventKind, text: &str) -> Option<String> {
+    if flags & KITTY_REPORT_ASSOCIATED_TEXT == 0
+        || matches!(kind, KeyEventKind::Release)
+        || mods.ctrl
+        || mods.alt
+        || mods.sup
+    {
+        return None;
+    }
+    let codes: Vec<String> = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| (c as u32).to_string())
+        .collect();
+    (!codes.is_empty()).then(|| codes.join(":"))
 }
 
 /// The kitty key-code field: the unicode-key-code, plus the `:shifted[:base]`
@@ -147,14 +174,16 @@ fn event_subfield(flags: u8, kind: KeyEventKind) -> Option<u8> {
 
 /// Emit the `CSI u` form for a plain (no alternate-key sub-fields) key-code,
 /// unless this is a release that isn't being reported (releases require the
-/// event-types flag), in which case nothing is sent.
+/// event-types flag), in which case nothing is sent. `text` is the associated-
+/// text codepoints (flag 16), appended as the third field.
 fn csi_u_or_suppressed(
     code: u32,
     mods: Mods,
     event: Option<u8>,
     kind: KeyEventKind,
+    text: Option<&str>,
 ) -> Option<Vec<u8>> {
-    csi_u_field_or_suppressed(code.to_string(), mods, event, kind)
+    csi_u_field_or_suppressed(code.to_string(), mods, event, kind, text)
 }
 
 /// As [`csi_u_or_suppressed`], but for a pre-built key-code field that may carry
@@ -164,11 +193,12 @@ fn csi_u_field_or_suppressed(
     mods: Mods,
     event: Option<u8>,
     kind: KeyEventKind,
+    text: Option<&str>,
 ) -> Option<Vec<u8>> {
     if matches!(kind, KeyEventKind::Release) && event.is_none() {
         None
     } else {
-        Some(csi_u_field(key_field, mods, event))
+        Some(csi_u_field(key_field, mods, event, text))
     }
 }
 
@@ -192,6 +222,7 @@ fn kitty_encode_named(
     nonshift_mod: bool,
     event: Option<u8>,
     kind: KeyEventKind,
+    flags: u8,
 ) -> Option<Vec<u8>> {
     use NamedKey::*;
     // For keys with no escape-code representation in the active flags, a release
@@ -204,8 +235,10 @@ fn kitty_encode_named(
         }
     };
     match key {
+        // Esc / Enter / Tab / Backspace produce control bytes, not text, so they
+        // carry no associated-text field even under flag 16.
         // Esc always disambiguates (a real Esc vs. the start of a sequence).
-        Escape => csi_u_or_suppressed(27, mods, event, kind),
+        Escape => csi_u_or_suppressed(27, mods, event, kind, None),
         // The legacy exceptions: bare Enter/Tab/Backspace keep their byte so a
         // shell stays usable; ANY modifier (incl. Shift — there is no legacy
         // form for, e.g., Shift+Tab under kitty) flips them to CSI u.
@@ -216,7 +249,7 @@ fn kitty_encode_named(
                 _ => 127,
             };
             if force_all || mods.shift || nonshift_mod {
-                csi_u_or_suppressed(code, mods, event, kind)
+                csi_u_or_suppressed(code, mods, event, kind, None)
             } else {
                 legacy_byte(match key {
                     Enter => b'\r',
@@ -229,7 +262,8 @@ fn kitty_encode_named(
         // non-Shift modifier disambiguates it (Ctrl+Space replaces legacy NUL).
         Space => {
             if force_all || nonshift_mod {
-                csi_u_or_suppressed(32, mods, event, kind)
+                let text = associated_text(flags, mods, kind, " ");
+                csi_u_or_suppressed(32, mods, event, kind, text.as_deref())
             } else {
                 legacy_byte(b' ')
             }
@@ -263,22 +297,40 @@ fn kitty_encode_named(
     }
 }
 
-/// The `;<mods>[:<event>]` field shared by every kitty CSI form. Omitted entirely
-/// when it would be the default (no modifiers, no event); but an event sub-field
-/// forces the modifier value to appear (as `;1`) so the colon has a host.
-fn mods_field(mods: Mods, event: Option<u8>) -> String {
+/// The `;<mods>[:<event>][;<text>]` tail shared by every kitty CSI form. The
+/// modifier group is omitted entirely when it would be the bare default (no
+/// modifiers, no event, no text). An event sub-field forces the modifier value to
+/// appear (as `;1`) so the colon has a host; a trailing text field with default
+/// modifiers leaves the modifier slot EMPTY (`;;<text>`, kitty's convention) — it
+/// does not force a literal `1`.
+fn csi_tail(mods: Mods, event: Option<u8>, text: Option<&str>) -> String {
     let m = modifier_param(mods);
-    match event {
-        Some(ev) => format!(";{m}:{ev}"),
-        None if m == 1 => String::new(),
-        None => format!(";{m}"),
+    // The modifier value is written only when it is non-default or carries an
+    // event; otherwise the slot stays empty (but a following text field still
+    // needs the separating `;`).
+    let mut tail = if m != 1 || event.is_some() {
+        let mut g = format!(";{m}");
+        if let Some(ev) = event {
+            g.push_str(&format!(":{ev}"));
+        }
+        g
+    } else if text.is_some() {
+        String::from(";")
+    } else {
+        String::new()
+    };
+    if let Some(t) = text {
+        tail.push(';');
+        tail.push_str(t);
     }
+    tail
 }
 
-/// `CSI <key-field>[;<mods>[:<event>]] u`, where `key-field` is the unicode
-/// key-code possibly followed by the `:shifted:base` alternate-key sub-fields.
-fn csi_u_field(key_field: String, mods: Mods, event: Option<u8>) -> Vec<u8> {
-    format!("\x1b[{key_field}{}u", mods_field(mods, event)).into_bytes()
+/// `CSI <key-field>[;<mods>[:<event>]][;<text>] u`, where `key-field` is the
+/// unicode key-code possibly followed by the `:shifted:base` alternate-key
+/// sub-fields and `text` is the associated-text codepoints.
+fn csi_u_field(key_field: String, mods: Mods, event: Option<u8>, text: Option<&str>) -> Vec<u8> {
+    format!("\x1b[{key_field}{}u", csi_tail(mods, event, text)).into_bytes()
 }
 
 /// `CSI <final>` bare, `CSI 1<field><final>` when the field is present (the
@@ -293,7 +345,8 @@ fn kitty_letter(
     if matches!(kind, KeyEventKind::Release) && event.is_none() {
         return None;
     }
-    let field = mods_field(mods, event);
+    // Navigation / function keys carry no associated text.
+    let field = csi_tail(mods, event, None);
     let mut out = if field.is_empty() {
         b"\x1b[".to_vec()
     } else {
@@ -308,7 +361,7 @@ fn kitty_tilde(num: u32, mods: Mods, event: Option<u8>, kind: KeyEventKind) -> O
     if matches!(kind, KeyEventKind::Release) && event.is_none() {
         return None;
     }
-    Some(format!("\x1b[{num}{}~", mods_field(mods, event)).into_bytes())
+    Some(format!("\x1b[{num}{}~", csi_tail(mods, event, None)).into_bytes())
 }
 
 /// modifyOtherKeys (xterm XTMODKEYS resource 4): when `level` is non-zero, keys
@@ -1138,5 +1191,61 @@ mod tests {
             kitty_alt(&ch("A"), Mods::SHIFT, 8 | 4, a),
             Some(b"\x1b[97:65;2u".to_vec())
         );
+    }
+
+    // ---- kitty keyboard protocol: report associated text (flag 16) ----
+
+    const F8_F16: u8 = 8 | 16; // report-all-keys + report-associated-text
+
+    #[test]
+    fn kitty_associated_text_adds_the_third_codepoint_field() {
+        // Plain 'a' under flags 8|16: code 97, an EMPTY default-modifier field
+        // (kitty's `CSI 0;;229u` convention), text 97.
+        assert_eq!(
+            kitty(&ch("a"), none(), F8_F16),
+            Some(b"\x1b[97;;97u".to_vec())
+        );
+        // Shift+a: code is the unshifted 97, mods 2, the produced text is 'A' (65).
+        assert_eq!(
+            kitty(&ch("A"), Mods::SHIFT, F8_F16),
+            Some(b"\x1b[97;2;65u".to_vec())
+        );
+        // Space carries its literal-space text (32); default mods stay empty.
+        assert_eq!(
+            kitty(&named(NamedKey::Space), none(), F8_F16),
+            Some(b"\x1b[32;;32u".to_vec())
+        );
+        // With alternate-keys (flag 4) too: code:shifted ; mods ; text.
+        let a = KeyAlternates {
+            base: 'a',
+            shifted: Some('A'),
+            base_layout: None,
+        };
+        assert_eq!(
+            kitty_alt(&ch("A"), Mods::SHIFT, 8 | 4 | 16, a),
+            Some(b"\x1b[97:65;2;65u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_associated_text_is_omitted_for_control_input() {
+        // Ctrl suppresses text (Ctrl+a is a command, not text input).
+        assert_eq!(
+            kitty(&ch("a"), Mods::CTRL, 1 | 16),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        // Enter/Tab/Backspace produce control bytes, so no text field even under 8|16.
+        assert_eq!(
+            kitty(&named(NamedKey::Enter), none(), F8_F16),
+            Some(b"\x1b[13u".to_vec())
+        );
+        // A release produces no text (only the press/repeat do).
+        assert_eq!(
+            kitty_ev(&ch("a"), none(), 8 | 2 | 16, KeyEventKind::Release),
+            Some(b"\x1b[97;1:3u".to_vec())
+        );
+        // Flag 16 alone does not promote plain text to an escape code (that needs
+        // flag 8); the key stays legacy text.
+        assert_eq!(kitty(&ch("a"), none(), 16), Some(b"a".to_vec()));
     }
 }
