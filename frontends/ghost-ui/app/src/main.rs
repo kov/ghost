@@ -20,6 +20,7 @@
 
 mod from_winit;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use ghost_renderer::{Gpu, Rendered, Renderer, Theme};
 use ghost_ui_core::{
-    CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, Scene, TerminalModel, UiEvent,
+    CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, RootModel, Scene, TerminalModel,
+    UiEvent,
 };
 use ghost_vt::client::Session;
 use ghost_vt::screen;
@@ -235,17 +237,17 @@ fn capture(path: PathBuf) {
 
 // ---- interactive mode (window) -----------------------------------------
 
-fn spawn_shell(name: &str) {
+fn spawn_session(name: &str, command: Vec<String>) {
     server::spawn(SpawnOpts {
         name: name.to_string(),
-        command: vec![], // empty => $SHELL
+        command, // empty => $SHELL
         size: (COLS, ROWS),
         record: None,
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: None,
         start_on_attach: true,
     })
-    .expect("spawn shell session");
+    .expect("spawn session");
 }
 
 fn interactive() {
@@ -253,7 +255,7 @@ fn interactive() {
         Ok(n) => n, // attach to an existing session
         Err(_) => {
             let n = format!("ghost-ui-{}", std::process::id());
-            spawn_shell(&n);
+            spawn_session(&n, vec![]);
             n
         }
     };
@@ -262,8 +264,8 @@ fn interactive() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         gfx: None,
-        session: None,
-        model: None,
+        sessions: HashMap::new(),
+        root: None,
         name,
         mods: ModifiersState::empty(),
         pointer_pos: PointPx { x: 0.0, y: 0.0 },
@@ -382,8 +384,10 @@ impl Graphics {
 /// `UiEvent`s in and `Cmd`s out.
 struct App {
     gfx: Option<Graphics>,
-    session: Option<Session>,
-    model: Option<TerminalModel>,
+    /// Attached sessions by id. One in single view; the whole fleet when the
+    /// overview is open.
+    sessions: HashMap<String, Session>,
+    root: Option<RootModel>,
     name: String,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
@@ -400,8 +404,8 @@ struct App {
 impl App {
     /// Feed an event to the model and execute the effects it returns.
     fn dispatch(&mut self, ev: UiEvent, event_loop: &ActiveEventLoop) {
-        let cmds = match self.model.as_mut() {
-            Some(m) => m.update(ev),
+        let cmds = match self.root.as_mut() {
+            Some(r) => r.update(ev),
             None => return,
         };
         self.exec(cmds, event_loop);
@@ -410,13 +414,17 @@ impl App {
     fn exec(&mut self, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
         for cmd in cmds {
             match cmd {
-                Cmd::SendInput { bytes, .. } => {
-                    if let Some(s) = self.session.as_mut() {
+                Cmd::SendInput { session, bytes } => {
+                    if let Some(s) = self.sessions.get_mut(&session) {
                         let _ = s.send_input(&bytes);
                     }
                 }
-                Cmd::Resize { cols, rows, .. } => {
-                    if let Some(s) = self.session.as_mut() {
+                Cmd::Resize {
+                    session,
+                    cols,
+                    rows,
+                } => {
+                    if let Some(s) = self.sessions.get_mut(&session) {
                         let _ = s.resize(cols, rows);
                     }
                 }
@@ -425,6 +433,30 @@ impl App {
                     self.dispatch(UiEvent::ClipboardText(text), event_loop);
                 }
                 Cmd::WriteClipboard(text) => self.write_clipboard(text),
+                Cmd::ListSessions => {
+                    let infos = session::list().unwrap_or_default();
+                    self.dispatch(UiEvent::SessionList(infos), event_loop);
+                }
+                Cmd::Attach(id) => {
+                    if !self.sessions.contains_key(&id)
+                        && let Ok(s) = attach(&id, COLS, ROWS)
+                    {
+                        self.sessions.insert(id, s);
+                    }
+                }
+                Cmd::Detach(id) => {
+                    // Never drop the window's own session out from under us.
+                    if id != self.name {
+                        self.sessions.remove(&id);
+                    }
+                }
+                Cmd::Spawn { name, command } => {
+                    spawn_session(&name, command);
+                    // Best-effort attach; a later reconcile re-attaches if it lost the race.
+                    if let Ok(s) = attach(&name, COLS, ROWS) {
+                        self.sessions.insert(name, s);
+                    }
+                }
                 Cmd::Redraw => self.request_redraw(),
                 Cmd::SetTitle(t) => {
                     if let Some(g) = &self.gfx {
@@ -435,9 +467,6 @@ impl App {
                     self.next_tick = Some(Instant::now() + Duration::from_millis(after_ms));
                 }
                 Cmd::Quit => event_loop.exit(),
-                // Fleet-only effects; the single-terminal shell has no use for
-                // them (the fleet shell will).
-                Cmd::ListSessions | Cmd::Attach(_) | Cmd::Detach(_) | Cmd::Spawn { .. } => {}
             }
         }
     }
@@ -477,14 +506,21 @@ impl ApplicationHandler for App {
         let gfx = Graphics::new(event_loop);
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height);
         match attach(&self.name, cols, rows) {
-            Ok(session) => self.session = Some(session),
+            Ok(session) => {
+                self.sessions.insert(self.name.clone(), session);
+            }
             Err(e) => {
                 eprintln!("could not attach to session '{}': {e}", self.name);
                 event_loop.exit();
                 return;
             }
         }
-        self.model = Some(TerminalModel::new(self.name.clone(), cols, rows, METRICS));
+        let model = TerminalModel::new(self.name.clone(), cols, rows, METRICS);
+        self.root = Some(RootModel::single(
+            model,
+            METRICS,
+            (gfx.config.width, gfx.config.height),
+        ));
         gfx.window.request_redraw();
         let (w, h) = (gfx.config.width, gfx.config.height);
         self.gfx = Some(gfx);
@@ -502,19 +538,24 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (bytes, ended) = match self.session.as_mut() {
-            Some(s) => pump(s, 64),
-            None => (Vec::new(), false),
-        };
-        if !bytes.is_empty() || ended {
-            self.dispatch(
-                UiEvent::SessionData {
-                    name: self.name.clone(),
-                    bytes,
-                    ended,
-                },
-                event_loop,
-            );
+        // Pump every attached session (one in single view, the whole fleet in
+        // overview), then route each session's output to the model by id.
+        let mut pumped: Vec<(String, Vec<u8>, bool)> = Vec::new();
+        for (name, s) in self.sessions.iter_mut() {
+            let (bytes, ended) = pump(s, 32);
+            if !bytes.is_empty() || ended {
+                pumped.push((name.clone(), bytes, ended));
+            }
+        }
+        for (name, bytes, ended) in pumped {
+            // A dead session is dropped from the pump map regardless of whether
+            // it is the window's own; app-exit is decided separately below via
+            // RootModel::ended(). (Done before dispatch so a stale query-reply to
+            // it is simply ignored.)
+            if ended {
+                self.sessions.remove(&name);
+            }
+            self.dispatch(UiEvent::SessionData { name, bytes, ended }, event_loop);
         }
         if let Some(t) = self.next_tick
             && Instant::now() >= t
@@ -523,7 +564,7 @@ impl ApplicationHandler for App {
             let now_ms = self.now_ms();
             self.dispatch(UiEvent::Tick { now_ms }, event_loop);
         }
-        if self.model.as_ref().is_some_and(|m| m.ended()) {
+        if self.root.as_ref().is_some_and(|r| r.ended()) {
             event_loop.exit();
             return;
         }
@@ -533,7 +574,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.session = None; // drop the session connection (detach)
+                self.sessions.clear(); // drop every session connection (detach)
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -551,8 +592,8 @@ impl ApplicationHandler for App {
                 );
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(g), Some(m)) = (self.gfx.as_mut(), self.model.as_ref()) {
-                    let scene = m.view();
+                if let (Some(g), Some(r)) = (self.gfx.as_mut(), self.root.as_ref()) {
+                    let scene = r.view();
                     g.render(&scene);
                 }
             }

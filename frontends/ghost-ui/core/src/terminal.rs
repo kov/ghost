@@ -91,6 +91,11 @@ impl TerminalModel {
         &self.screen
     }
 
+    /// The session id these effects target.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
     pub fn selection(&self) -> Option<Selection> {
         self.selection
     }
