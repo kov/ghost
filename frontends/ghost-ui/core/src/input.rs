@@ -3,6 +3,25 @@
 //! backend. The shell's `from_winit` adapter is the sole place real winit
 //! events are mapped onto these.
 
+/// The kind of a key event. Legacy / modifyOtherKeys encoding only acts on a
+/// key going down (`Press`/`Repeat`); the kitty keyboard protocol's
+/// report-event-types flag additionally reports `Repeat` and `Release`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEventKind {
+    Press,
+    Repeat,
+    Release,
+}
+
+impl KeyEventKind {
+    /// Whether the key is going (or staying) down — a press or an auto-repeat.
+    /// Shortcuts, local scrolling and IME suppression act on these, never on a
+    /// release.
+    pub fn is_down(self) -> bool {
+        !matches!(self, KeyEventKind::Release)
+    }
+}
+
 /// Keyboard modifier state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Mods {

@@ -22,7 +22,7 @@ pub mod terminal;
 pub use cmd::Cmd;
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
 pub use fleet::{FleetModel, Group};
-pub use input::{Key, Mods, NamedKey};
+pub use input::{Key, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{
     Shortcut, TerminalModel, bracket_paste, classify_shortcut, query_replies, selection_text,

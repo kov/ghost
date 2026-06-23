@@ -5,7 +5,7 @@
 //! against the layout it produced, so hit-testing stays pure and testable.
 
 use crate::SessionId;
-use crate::input::{Key, Mods};
+use crate::input::{Key, KeyEventKind, Mods};
 use ghost_vt::session::SessionInfo;
 
 /// A pointer position in physical pixels (origin top-left).
@@ -35,11 +35,11 @@ pub enum PointerPhase {
 /// clock — so `update` never touches the world directly.
 #[derive(Clone, Debug)]
 pub enum UiEvent {
-    /// A key transition. `pressed` is false on release.
+    /// A key transition: a press, an auto-repeat, or a release.
     Key {
         key: Key,
         mods: Mods,
-        pressed: bool,
+        kind: KeyEventKind,
     },
     /// Committed text (IME commit, or text the shell pasted in).
     Text(String),

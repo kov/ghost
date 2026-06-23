@@ -18,7 +18,7 @@ use ghost_term::{Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 
-use crate::input::{Key, Mods, NamedKey};
+use crate::input::{Key, KeyEventKind, Mods, NamedKey};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, SessionId, UiEvent, encode, mouse,
 };
@@ -195,7 +195,7 @@ impl TerminalModel {
     /// Apply an event, returning the effects to perform.
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         match ev {
-            UiEvent::Key { key, mods, pressed } => self.key(&key, mods, pressed),
+            UiEvent::Key { key, mods, kind } => self.key(&key, mods, kind),
             UiEvent::Text(s) => self.text(&s),
             UiEvent::Preedit(s) => self.set_preedit(s),
             UiEvent::SetZoom(z) => self.apply_zoom(z.clamp(ZOOM_MIN, ZOOM_MAX)),
@@ -344,15 +344,31 @@ impl TerminalModel {
         }
     }
 
-    fn key(&mut self, key: &Key, mods: Mods, pressed: bool) -> Vec<Cmd> {
-        if !pressed {
-            return Vec::new();
-        }
+    fn key(&mut self, key: &Key, mods: Mods, kind: KeyEventKind) -> Vec<Cmd> {
         // While an IME composition is active the keystrokes belong to the IME
         // (which delivers its result via `Preedit`/`Text`); sending them to the
-        // child as well would double-type.
+        // child as well would double-type. Releases that land while composing are
+        // swallowed here too. (A release arriving just after the commit clears the
+        // preedit can still slip through on backends that re-surface keyUp
+        // post-commit — a benign orphan `:3` under the kitty event-types flag, for
+        // the rare commit key that carries a modifier; a press-tracking fix waits
+        // for the broader IME work.)
         if !self.preedit.is_empty() {
             return Vec::new();
+        }
+        // A release never triggers shortcuts / scrolling / IME — it only matters
+        // to the kitty report-event-types flag, which the encoder handles (and
+        // returns nothing for when that flag is off or the key has no escape-code
+        // form). Auto-repeat (`Repeat`) otherwise behaves exactly like a press.
+        if matches!(kind, KeyEventKind::Release) {
+            let app_cursor = self.screen.vt().cursor_key_app_mode();
+            let modify_other_keys = self.screen.vt().modify_other_keys();
+            let kitty_flags = self.screen.vt().kitty_keyboard_flags();
+            return match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags, kind)
+            {
+                Some(bytes) => self.send(bytes),
+                None => Vec::new(),
+            };
         }
         if let Some(scroll) = self.scroll_key(key, mods) {
             // Don't move the viewport out from under an in-progress drag: the
@@ -390,7 +406,7 @@ impl TerminalModel {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 let modify_other_keys = self.screen.vt().modify_other_keys();
                 let kitty_flags = self.screen.vt().kitty_keyboard_flags();
-                match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags) {
+                match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags, kind) {
                     // Typing returns to the live bottom, then sends the keystroke.
                     Some(bytes) => {
                         let mut cmds = self.snap_to_bottom();
@@ -904,8 +920,12 @@ mod tests {
         m.update(UiEvent::Key {
             key: k,
             mods,
-            pressed: true,
+            kind: KeyEventKind::Press,
         })
+    }
+
+    fn key_kind(m: &mut TerminalModel, k: Key, mods: Mods, kind: KeyEventKind) -> Vec<Cmd> {
+        m.update(UiEvent::Key { key: k, mods, kind })
     }
 
     fn feed(m: &mut TerminalModel, bytes: &[u8]) {
@@ -997,7 +1017,7 @@ mod tests {
             m.update(UiEvent::Key {
                 key: Key::Char("x".into()),
                 mods: Mods::NONE,
-                pressed: false
+                kind: KeyEventKind::Release
             }),
             vec![]
         );
@@ -1386,6 +1406,52 @@ mod tests {
         assert!(
             cmds.contains(&sent("alpha", b"\x1b[?1u")),
             "the kitty query must report the negotiated flags, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_reports_repeat_and_release_only_under_the_event_types_flag() {
+        let mut m = model();
+        // Under flag 1 alone, a repeat re-presses and a release sends nothing.
+        feed(&mut m, b"\x1b[>1u");
+        assert_eq!(
+            key_kind(
+                &mut m,
+                Key::Char("i".into()),
+                Mods::CTRL,
+                KeyEventKind::Repeat
+            ),
+            vec![sent("alpha", b"\x1b[105;5u")]
+        );
+        assert_eq!(
+            key_kind(
+                &mut m,
+                Key::Char("i".into()),
+                Mods::CTRL,
+                KeyEventKind::Release
+            ),
+            vec![]
+        );
+        // The app upgrades to disambiguate + report-event-types (flags 1|2)...
+        feed(&mut m, b"\x1b[>3u");
+        // ...so repeats carry :2 and releases carry :3.
+        assert_eq!(
+            key_kind(
+                &mut m,
+                Key::Char("i".into()),
+                Mods::CTRL,
+                KeyEventKind::Repeat
+            ),
+            vec![sent("alpha", b"\x1b[105;5:2u")]
+        );
+        assert_eq!(
+            key_kind(
+                &mut m,
+                Key::Char("i".into()),
+                Mods::CTRL,
+                KeyEventKind::Release
+            ),
+            vec![sent("alpha", b"\x1b[105;5:3u")]
         );
     }
 
@@ -1839,7 +1905,7 @@ mod tests {
         m.update(UiEvent::Key {
             key: Key::Named(NamedKey::PageUp),
             mods: Mods::SHIFT,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         m.update(ptr(
             PointerPhase::Release,
@@ -1896,7 +1962,7 @@ mod tests {
         let cmds = m.update(UiEvent::Key {
             key: Key::Named(NamedKey::PageUp),
             mods: Mods::SHIFT,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         assert!(cmds.contains(&Cmd::Redraw));
         assert!(

@@ -313,16 +313,11 @@ impl FleetModel {
                 }
                 self.relayout()
             }
-            UiEvent::Key {
-                key,
-                mods,
-                pressed: true,
-            } if nav(&key, mods).is_some() => {
+            UiEvent::Key { key, mods, kind } if kind.is_down() && nav(&key, mods).is_some() => {
                 let (delta, wrap) = nav(&key, mods).unwrap();
                 self.move_focus(delta, wrap);
                 vec![Cmd::Redraw]
             }
-            UiEvent::Key { pressed: false, .. } => Vec::new(),
             // Re-enumerate on the scheduled refresh tick.
             UiEvent::Tick { .. } => vec![Cmd::ListSessions],
             UiEvent::Pointer {
@@ -586,6 +581,7 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::KeyEventKind;
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -628,7 +624,7 @@ mod tests {
         m.update(UiEvent::Key {
             key: k,
             mods: crate::Mods::NONE,
-            pressed: true,
+            kind: KeyEventKind::Press,
         })
     }
 
@@ -934,7 +930,7 @@ mod tests {
         let cmds = m.update(UiEvent::Key {
             key: Key::Named(NamedKey::Tab),
             mods: crate::Mods::SHIFT,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         assert_eq!(m.focused(), Some("a"));
         assert_eq!(cmds, vec![Cmd::Redraw]); // focus only, never SendInput
@@ -942,7 +938,7 @@ mod tests {
         m.update(UiEvent::Key {
             key: Key::Named(NamedKey::Tab),
             mods: crate::Mods::SHIFT,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         assert_eq!(m.focused(), Some("c"));
     }
@@ -975,7 +971,7 @@ mod tests {
         f.update(UiEvent::Key {
             key: Key::Named(NamedKey::ArrowRight),
             mods: crate::Mods::NONE,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         assert_eq!(f.focused(), Some("beta"));
         // Toggling back returns the OWNED session, and detaches the foreign one.

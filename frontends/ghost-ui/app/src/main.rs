@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use ghost_renderer::{Gpu, Rendered, Renderer};
 use ghost_ui_core::{
-    CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, RootModel, Scene, TerminalModel,
-    UiEvent,
+    CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
+    TerminalModel, UiEvent,
 };
 use ghost_vt::client::Session;
 use ghost_vt::screen;
@@ -915,8 +915,12 @@ impl ApplicationHandler for App {
                 };
                 let key = from_winit::key(&event.logical_key);
                 let mods = from_winit::mods(mods_state);
-                let pressed = event.state == ElementState::Pressed;
-                self.dispatch(id, UiEvent::Key { key, mods, pressed }, event_loop);
+                let kind = match event.state {
+                    ElementState::Pressed if event.repeat => KeyEventKind::Repeat,
+                    ElementState::Pressed => KeyEventKind::Press,
+                    ElementState::Released => KeyEventKind::Release,
+                };
+                self.dispatch(id, UiEvent::Key { key, mods, kind }, event_loop);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.dispatch(id, UiEvent::Text(text), event_loop);

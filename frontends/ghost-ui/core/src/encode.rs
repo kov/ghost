@@ -8,7 +8,7 @@
 //! (cursor-key application mode) switches unmodified cursor keys from CSI to
 //! SS3, matching what apps like vim expect.
 
-use crate::input::{Key, Mods, NamedKey};
+use crate::input::{Key, KeyEventKind, Mods, NamedKey};
 
 /// kitty keyboard progressive-enhancement flag bits (`Vt::kitty_keyboard_flags`).
 const KITTY_DISAMBIGUATE: u8 = 0b00001;
@@ -32,12 +32,18 @@ pub fn encode(
     app_cursor: bool,
     modify_other_keys: u8,
     kitty_flags: u8,
+    kind: KeyEventKind,
 ) -> Option<Vec<u8>> {
     // The kitty keyboard protocol, when negotiated, replaces both older schemes
     // for every key (it produces the legacy bytes itself for the keys it leaves
     // alone, e.g. plain text and bare Enter/Tab/Backspace).
     if kitty_flags & KITTY_BASE_FLAGS != 0 {
-        return kitty_encode(key, mods, kitty_flags);
+        return kitty_encode(key, mods, kitty_flags, kind);
+    }
+    // Repeats fold into a press for the legacy schemes (auto-repeat re-sends the
+    // byte); releases produce nothing.
+    if matches!(kind, KeyEventKind::Release) {
+        return None;
     }
     // When the app negotiated modifyOtherKeys, that scheme wins for the keys it
     // covers; everything else falls through to the legacy encoder below.
@@ -62,25 +68,62 @@ pub fn encode(
 /// Returns the bytes for the key (including the plain legacy byte for keys the
 /// active flags leave alone) or `None` for keys that emit nothing (dead /
 /// unidentified / unknown).
-fn kitty_encode(key: &Key, mods: Mods, flags: u8) -> Option<Vec<u8>> {
+fn kitty_encode(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<Vec<u8>> {
     let force_all = flags & KITTY_REPORT_ALL_KEYS != 0;
     // A modifier other than a lone Shift makes a text key "not text" (and so
     // disambiguated); Shift alone keeps producing its shifted glyph.
     let nonshift_mod = mods.ctrl || mods.alt || mods.sup;
+    // The event-type sub-field for keys emitted as escape codes: present only
+    // when report-event-types (flag 2) is on and the event is a repeat/release.
+    // When it is absent, a repeat folds into a press and a release is suppressed.
+    let event = event_subfield(flags, kind);
     match key {
         Key::Char(s) => {
             if (force_all || nonshift_mod)
                 && let Some(code) = base_codepoint(s)
             {
-                Some(csi_u(code, mods))
+                csi_u_or_suppressed(code, mods, event, kind)
+            } else if matches!(kind, KeyEventKind::Release) {
+                // A text key has no escape-code form here, so its release is not
+                // reported (only flag 8 promotes text keys to escape codes).
+                None
             } else {
                 // Plain / shifted / composed text stays verbatim (legacy).
                 Some(s.as_bytes().to_vec())
             }
         }
-        Key::Named(named) => kitty_encode_named(*named, mods, force_all, nonshift_mod),
+        Key::Named(named) => kitty_encode_named(*named, mods, force_all, nonshift_mod, event, kind),
         // Key::Dead / Key::Unidentified: nothing on their own.
         _ => None,
+    }
+}
+
+/// The `:event-type` value for a key reported as an escape code: `Some(2)` for a
+/// repeat, `Some(3)` for a release, `None` for a press or when event reporting is
+/// off. A `None` on a repeat means "encode as a plain press" (auto-repeat).
+fn event_subfield(flags: u8, kind: KeyEventKind) -> Option<u8> {
+    if flags & KITTY_REPORT_EVENT_TYPES == 0 {
+        return None;
+    }
+    match kind {
+        KeyEventKind::Press => None,
+        KeyEventKind::Repeat => Some(2),
+        KeyEventKind::Release => Some(3),
+    }
+}
+
+/// Emit the `CSI u` form, unless this is a release that isn't being reported
+/// (releases require the event-types flag), in which case nothing is sent.
+fn csi_u_or_suppressed(
+    code: u32,
+    mods: Mods,
+    event: Option<u8>,
+    kind: KeyEventKind,
+) -> Option<Vec<u8>> {
+    if matches!(kind, KeyEventKind::Release) && event.is_none() {
+        None
+    } else {
+        Some(csi_u(code, mods, event))
     }
 }
 
@@ -102,11 +145,22 @@ fn kitty_encode_named(
     mods: Mods,
     force_all: bool,
     nonshift_mod: bool,
+    event: Option<u8>,
+    kind: KeyEventKind,
 ) -> Option<Vec<u8>> {
     use NamedKey::*;
+    // For keys with no escape-code representation in the active flags, a release
+    // is never reported and a repeat re-sends the legacy byte.
+    let legacy_byte = |b: u8| {
+        if matches!(kind, KeyEventKind::Release) {
+            None
+        } else {
+            Some(vec![b])
+        }
+    };
     match key {
         // Esc always disambiguates (a real Esc vs. the start of a sequence).
-        Escape => Some(csi_u(27, mods)),
+        Escape => csi_u_or_suppressed(27, mods, event, kind),
         // The legacy exceptions: bare Enter/Tab/Backspace keep their byte so a
         // shell stays usable; ANY modifier (incl. Shift — there is no legacy
         // form for, e.g., Shift+Tab under kitty) flips them to CSI u.
@@ -117,84 +171,98 @@ fn kitty_encode_named(
                 _ => 127,
             };
             if force_all || mods.shift || nonshift_mod {
-                Some(csi_u(code, mods))
+                csi_u_or_suppressed(code, mods, event, kind)
             } else {
-                Some(vec![match key {
+                legacy_byte(match key {
                     Enter => b'\r',
                     Tab => b'\t',
                     _ => 0x7f,
-                }])
+                })
             }
         }
         // Space generates text: bare (or Shift+Space) stays a literal space; a
         // non-Shift modifier disambiguates it (Ctrl+Space replaces legacy NUL).
         Space => {
             if force_all || nonshift_mod {
-                Some(csi_u(32, mods))
+                csi_u_or_suppressed(32, mods, event, kind)
             } else {
-                Some(b" ".to_vec())
+                legacy_byte(b' ')
             }
         }
         // Navigation / cursor / F1-F4: the xterm letter form, CSI (never SS3)
         // under the kitty path. The leading `1;mods` appears only when modified.
-        ArrowUp => Some(kitty_letter(b'A', mods)),
-        ArrowDown => Some(kitty_letter(b'B', mods)),
-        ArrowRight => Some(kitty_letter(b'C', mods)),
-        ArrowLeft => Some(kitty_letter(b'D', mods)),
-        Home => Some(kitty_letter(b'H', mods)),
-        End => Some(kitty_letter(b'F', mods)),
-        F1 => Some(kitty_letter(b'P', mods)),
-        F2 => Some(kitty_letter(b'Q', mods)),
-        F4 => Some(kitty_letter(b'S', mods)),
+        ArrowUp => kitty_letter(b'A', mods, event, kind),
+        ArrowDown => kitty_letter(b'B', mods, event, kind),
+        ArrowRight => kitty_letter(b'C', mods, event, kind),
+        ArrowLeft => kitty_letter(b'D', mods, event, kind),
+        Home => kitty_letter(b'H', mods, event, kind),
+        End => kitty_letter(b'F', mods, event, kind),
+        F1 => kitty_letter(b'P', mods, event, kind),
+        F2 => kitty_letter(b'Q', mods, event, kind),
+        F4 => kitty_letter(b'S', mods, event, kind),
         // Tilde-form keys (F3 has no letter form; F5+ and the nav block).
-        F3 => Some(kitty_tilde(13, mods)),
-        Insert => Some(kitty_tilde(2, mods)),
-        Delete => Some(kitty_tilde(3, mods)),
-        PageUp => Some(kitty_tilde(5, mods)),
-        PageDown => Some(kitty_tilde(6, mods)),
-        F5 => Some(kitty_tilde(15, mods)),
-        F6 => Some(kitty_tilde(17, mods)),
-        F7 => Some(kitty_tilde(18, mods)),
-        F8 => Some(kitty_tilde(19, mods)),
-        F9 => Some(kitty_tilde(20, mods)),
-        F10 => Some(kitty_tilde(21, mods)),
-        F11 => Some(kitty_tilde(23, mods)),
-        F12 => Some(kitty_tilde(24, mods)),
+        F3 => kitty_tilde(13, mods, event, kind),
+        Insert => kitty_tilde(2, mods, event, kind),
+        Delete => kitty_tilde(3, mods, event, kind),
+        PageUp => kitty_tilde(5, mods, event, kind),
+        PageDown => kitty_tilde(6, mods, event, kind),
+        F5 => kitty_tilde(15, mods, event, kind),
+        F6 => kitty_tilde(17, mods, event, kind),
+        F7 => kitty_tilde(18, mods, event, kind),
+        F8 => kitty_tilde(19, mods, event, kind),
+        F9 => kitty_tilde(20, mods, event, kind),
+        F10 => kitty_tilde(21, mods, event, kind),
+        F11 => kitty_tilde(23, mods, event, kind),
+        F12 => kitty_tilde(24, mods, event, kind),
         Other => None,
     }
 }
 
-/// `CSI <code>[;<mods>] u` — the modifier field is omitted when it is the
-/// default (no modifiers).
-fn csi_u(code: u32, mods: Mods) -> Vec<u8> {
+/// The `;<mods>[:<event>]` field shared by every kitty CSI form. Omitted entirely
+/// when it would be the default (no modifiers, no event); but an event sub-field
+/// forces the modifier value to appear (as `;1`) so the colon has a host.
+fn mods_field(mods: Mods, event: Option<u8>) -> String {
     let m = modifier_param(mods);
-    if m == 1 {
-        format!("\x1b[{code}u").into_bytes()
-    } else {
-        format!("\x1b[{code};{m}u").into_bytes()
+    match event {
+        Some(ev) => format!(";{m}:{ev}"),
+        None if m == 1 => String::new(),
+        None => format!(";{m}"),
     }
 }
 
-/// `CSI <final>` unmodified, `CSI 1;<mods><final>` when modified (cursor / F1-F4).
-fn kitty_letter(final_byte: u8, mods: Mods) -> Vec<u8> {
-    let m = modifier_param(mods);
-    let mut out = if m == 1 {
+/// `CSI <code>[;<mods>[:<event>]] u`.
+fn csi_u(code: u32, mods: Mods, event: Option<u8>) -> Vec<u8> {
+    format!("\x1b[{code}{}u", mods_field(mods, event)).into_bytes()
+}
+
+/// `CSI <final>` bare, `CSI 1<field><final>` when the field is present (the
+/// leading `1` key-number rides with the modifier field). Cursor keys / F1-F4.
+/// Returns `None` for an unreported release.
+fn kitty_letter(
+    final_byte: u8,
+    mods: Mods,
+    event: Option<u8>,
+    kind: KeyEventKind,
+) -> Option<Vec<u8>> {
+    if matches!(kind, KeyEventKind::Release) && event.is_none() {
+        return None;
+    }
+    let field = mods_field(mods, event);
+    let mut out = if field.is_empty() {
         b"\x1b[".to_vec()
     } else {
-        format!("\x1b[1;{m}").into_bytes()
+        format!("\x1b[1{field}").into_bytes()
     };
     out.push(final_byte);
-    out
+    Some(out)
 }
 
-/// `CSI <num> ~` unmodified, `CSI <num>;<mods> ~` when modified.
-fn kitty_tilde(num: u32, mods: Mods) -> Vec<u8> {
-    let m = modifier_param(mods);
-    if m == 1 {
-        format!("\x1b[{num}~").into_bytes()
-    } else {
-        format!("\x1b[{num};{m}~").into_bytes()
+/// `CSI <num>[<field>] ~`. Returns `None` for an unreported release.
+fn kitty_tilde(num: u32, mods: Mods, event: Option<u8>, kind: KeyEventKind) -> Option<Vec<u8>> {
+    if matches!(kind, KeyEventKind::Release) && event.is_none() {
+        return None;
     }
+    Some(format!("\x1b[{num}{}~", mods_field(mods, event)).into_bytes())
 }
 
 /// modifyOtherKeys (xterm XTMODKEYS resource 4): when `level` is non-zero, keys
@@ -403,17 +471,29 @@ fn encode_csi(csi: Csi, mods: Mods, app_cursor: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::input::{Key, Mods, NamedKey};
+    use crate::input::{Key, KeyEventKind, Mods, NamedKey};
 
     /// Legacy / modifyOtherKeys tests run with kitty off; this 4-arg wrapper keeps
-    /// them readable (the real `super::encode` takes the kitty flags as a 5th arg).
+    /// them readable (the real `super::encode` takes the kitty flags + event kind).
     fn encode(key: &Key, mods: Mods, app_cursor: bool, modify_other_keys: u8) -> Option<Vec<u8>> {
-        super::encode(key, mods, app_cursor, modify_other_keys, 0)
+        super::encode(
+            key,
+            mods,
+            app_cursor,
+            modify_other_keys,
+            0,
+            KeyEventKind::Press,
+        )
     }
 
-    /// kitty-path encode: legacy + modifyOtherKeys off, kitty `flags` on.
+    /// kitty-path encode of a key press: legacy + modifyOtherKeys off, kitty on.
     fn kitty(key: &Key, mods: Mods, flags: u8) -> Option<Vec<u8>> {
-        super::encode(key, mods, false, 0, flags)
+        super::encode(key, mods, false, 0, flags, KeyEventKind::Press)
+    }
+
+    /// kitty-path encode of a specific event kind (for the report-event-types flag).
+    fn kitty_ev(key: &Key, mods: Mods, flags: u8, kind: KeyEventKind) -> Option<Vec<u8>> {
+        super::encode(key, mods, false, 0, flags, kind)
     }
 
     fn ch(s: &str) -> Key {
@@ -789,7 +869,14 @@ mod tests {
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            super::encode(&named(NamedKey::ArrowUp), none(), true, 0, F1_DISAMBIGUATE),
+            super::encode(
+                &named(NamedKey::ArrowUp),
+                none(),
+                true,
+                0,
+                F1_DISAMBIGUATE,
+                KeyEventKind::Press
+            ),
             Some(b"\x1b[A".to_vec()),
             "app-cursor mode does not switch the kitty path to SS3"
         );
@@ -837,6 +924,85 @@ mod tests {
         assert_eq!(
             kitty(&named(NamedKey::Tab), none(), ALL),
             Some(b"\x1b[9u".to_vec())
+        );
+    }
+
+    // ---- kitty keyboard protocol: report event types (flag 2) ----
+
+    const F1_F2: u8 = 1 | 2; // disambiguate + report-event-types
+
+    #[test]
+    fn kitty_event_types_mark_repeat_and_release_on_reported_keys() {
+        // A press is unchanged (event type 1 is the default, omitted).
+        assert_eq!(
+            kitty_ev(&ch("a"), Mods::CTRL, F1_F2, KeyEventKind::Press),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        // Repeat -> :2, Release -> :3, in the modifier field (forced present).
+        assert_eq!(
+            kitty_ev(&ch("a"), Mods::CTRL, F1_F2, KeyEventKind::Repeat),
+            Some(b"\x1b[97;5:2u".to_vec())
+        );
+        assert_eq!(
+            kitty_ev(&ch("a"), Mods::CTRL, F1_F2, KeyEventKind::Release),
+            Some(b"\x1b[97;5:3u".to_vec())
+        );
+        // A no-modifier release still carries the (default) ;1 so the colon binds.
+        assert_eq!(
+            kitty_ev(
+                &named(NamedKey::Escape),
+                none(),
+                F1_F2,
+                KeyEventKind::Release
+            ),
+            Some(b"\x1b[27;1:3u".to_vec())
+        );
+        // Nav keys carry the event in their letter/tilde forms too.
+        assert_eq!(
+            kitty_ev(
+                &named(NamedKey::ArrowUp),
+                none(),
+                F1_F2,
+                KeyEventKind::Release
+            ),
+            Some(b"\x1b[1;1:3A".to_vec())
+        );
+        assert_eq!(
+            kitty_ev(&named(NamedKey::F5), none(), F1_F2, KeyEventKind::Repeat),
+            Some(b"\x1b[15;1:2~".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_event_types_do_not_report_text_keys_or_releases_without_the_flag() {
+        // Under flag 1 alone, a release is never reported and a repeat re-presses.
+        assert_eq!(
+            kitty_ev(&ch("a"), Mods::CTRL, F1_DISAMBIGUATE, KeyEventKind::Release),
+            None
+        );
+        assert_eq!(
+            kitty_ev(&ch("a"), Mods::CTRL, F1_DISAMBIGUATE, KeyEventKind::Repeat),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        // Even with flag 2 on, a TEXT key (no escape-code form under flags 1|2) is
+        // not reported on release, and a repeat just re-sends its text.
+        assert_eq!(
+            kitty_ev(&ch("a"), none(), F1_F2, KeyEventKind::Release),
+            None
+        );
+        assert_eq!(
+            kitty_ev(&ch("a"), none(), F1_F2, KeyEventKind::Repeat),
+            Some(b"a".to_vec())
+        );
+        // Bare Enter is a legacy byte under flags 1|2, so its release isn't reported.
+        assert_eq!(
+            kitty_ev(
+                &named(NamedKey::Enter),
+                none(),
+                F1_F2,
+                KeyEventKind::Release
+            ),
+            None
         );
     }
 }

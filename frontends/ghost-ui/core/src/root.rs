@@ -70,11 +70,8 @@ impl RootModel {
     }
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        if let UiEvent::Key {
-            key,
-            mods,
-            pressed: true,
-        } = &ev
+        if let UiEvent::Key { key, mods, kind } = &ev
+            && kind.is_down()
         {
             if is_fleet_toggle(key, *mods) {
                 return self.toggle();
@@ -219,6 +216,7 @@ impl RootModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::KeyEventKind;
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -235,7 +233,7 @@ mod tests {
         r.update(UiEvent::Key {
             key: k,
             mods,
-            pressed: true,
+            kind: KeyEventKind::Press,
         })
     }
 
@@ -306,7 +304,7 @@ mod tests {
         r.update(UiEvent::Key {
             key: Key::Named(NamedKey::ArrowRight),
             mods: Mods::NONE,
-            pressed: true,
+            kind: KeyEventKind::Press,
         });
         key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> single
         assert!(!r.is_fleet());
