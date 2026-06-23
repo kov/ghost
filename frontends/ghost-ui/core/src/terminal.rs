@@ -110,6 +110,9 @@ pub struct TerminalModel {
     selection: Option<Selection>,
     /// Lines scrolled up into history; 0 = pinned to the live bottom.
     scroll_offset: usize,
+    /// In-progress IME composition string; non-empty means composing, during
+    /// which raw key input is suppressed.
+    preedit: String,
     ended: bool,
 }
 
@@ -135,6 +138,7 @@ impl TerminalModel {
             sel_anchor: None,
             selection: None,
             scroll_offset: 0,
+            preedit: String::new(),
             ended: false,
         }
     }
@@ -162,6 +166,7 @@ impl TerminalModel {
         match ev {
             UiEvent::Key { key, mods, pressed } => self.key(&key, mods, pressed),
             UiEvent::Text(s) => self.text(&s),
+            UiEvent::Preedit(s) => self.set_preedit(s),
             UiEvent::Pointer {
                 phase,
                 button,
@@ -193,6 +198,22 @@ impl TerminalModel {
             advance: self.metrics.advance * s,
             line_height: self.metrics.line_height * s,
         }
+    }
+
+    /// Physical-pixel rect of the text cursor, for positioning the IME candidate
+    /// window. `None` while scrolled into history (no live cursor is shown).
+    pub fn ime_cursor_area(&self) -> Option<RectPx> {
+        if self.scroll_offset != 0 {
+            return None;
+        }
+        let (col1, row1) = self.screen.cursor();
+        let m = self.effective_metrics();
+        Some(RectPx {
+            x: f32::from(col1.saturating_sub(1)) * m.advance,
+            y: f32::from(row1.saturating_sub(1)) * m.line_height,
+            w: m.advance,
+            h: m.line_height,
+        })
     }
 
     /// Set the user zoom and re-grid the child for it. A no-op (no commands)
@@ -293,6 +314,12 @@ impl TerminalModel {
         if !pressed {
             return Vec::new();
         }
+        // While an IME composition is active the keystrokes belong to the IME
+        // (which delivers its result via `Preedit`/`Text`); sending them to the
+        // child as well would double-type.
+        if !self.preedit.is_empty() {
+            return Vec::new();
+        }
         if let Some(scroll) = self.scroll_key(key, mods) {
             // Don't move the viewport out from under an in-progress drag: the
             // selection is window-relative, so scrolling would retarget it.
@@ -334,12 +361,26 @@ impl TerminalModel {
     }
 
     fn text(&mut self, s: &str) -> Vec<Cmd> {
+        // Committed text ends any composition.
+        self.preedit.clear();
         if s.is_empty() {
             Vec::new()
         } else {
             let mut cmds = self.snap_to_bottom();
             cmds.extend(self.send(s.as_bytes().to_vec()));
             cmds
+        }
+    }
+
+    /// Store the in-progress IME composition. Non-empty suppresses raw key input
+    /// (see [`key`](Self::key)); empty ends composition.
+    fn set_preedit(&mut self, text: String) -> Vec<Cmd> {
+        let changed = self.preedit != text;
+        self.preedit = text;
+        if changed {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
         }
     }
 
@@ -370,7 +411,12 @@ impl TerminalModel {
         }
     }
 
-    fn focus(&self, focused: bool) -> Vec<Cmd> {
+    fn focus(&mut self, focused: bool) -> Vec<Cmd> {
+        if !focused {
+            // Losing focus aborts any IME composition; clear it so we don't get
+            // stuck swallowing input should the platform omit `Ime::Disabled`.
+            self.preedit.clear();
+        }
         if self.screen.vt().focus_report() {
             self.send(if focused {
                 b"\x1b[I".to_vec()
@@ -822,6 +868,93 @@ mod tests {
             key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
             vec![Cmd::WriteClipboard("hello".to_string())]
         );
+    }
+
+    #[test]
+    fn key_input_is_suppressed_while_composing() {
+        let mut m = model();
+        // Composition starts: a non-empty preedit arrives (dead key / CJK).
+        m.update(UiEvent::Preedit("´".into()));
+        // The physical keystroke driving composition must NOT reach the child.
+        assert_eq!(key(&mut m, Key::Char("e".into()), Mods::NONE), vec![]);
+        // Committing sends the composed text and ends composition.
+        assert_eq!(
+            m.update(UiEvent::Text("é".into())),
+            vec![sent("alpha", "é".as_bytes())]
+        );
+        // After commit, normal keys flow again.
+        assert_eq!(
+            key(&mut m, Key::Char("x".into()), Mods::NONE),
+            vec![sent("alpha", b"x")]
+        );
+    }
+
+    #[test]
+    fn focus_loss_clears_stuck_composition() {
+        let mut m = model();
+        m.update(UiEvent::Preedit("ねこ".into()));
+        // Composing: the keystroke is swallowed.
+        assert_eq!(key(&mut m, Key::Char("a".into()), Mods::NONE), vec![]);
+        // The window loses focus mid-composition without an Ime::Disabled — the
+        // composition must still be aborted so input isn't swallowed forever.
+        m.update(UiEvent::Focus(false));
+        assert_eq!(
+            key(&mut m, Key::Char("a".into()), Mods::NONE),
+            vec![sent("alpha", b"a")]
+        );
+    }
+
+    #[test]
+    fn cancelled_preedit_restores_key_input() {
+        let mut m = model();
+        m.update(UiEvent::Preedit("か".into()));
+        assert_eq!(key(&mut m, Key::Char("a".into()), Mods::NONE), vec![]);
+        // Empty preedit = composition cancelled; raw keys flow again.
+        m.update(UiEvent::Preedit(String::new()));
+        assert_eq!(
+            key(&mut m, Key::Char("a".into()), Mods::NONE),
+            vec![sent("alpha", b"a")]
+        );
+    }
+
+    #[test]
+    fn ime_cursor_area_tracks_cursor_and_scale() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        }); // 80x24, base 9x18
+        // Fresh cursor at the top-left cell maps to the origin.
+        let a = m.ime_cursor_area().unwrap();
+        assert_eq!((a.x, a.y, a.w, a.h), (0.0, 0.0, 9.0, 18.0));
+        // Output advances the cursor: "abc" -> 0-based col 3 -> x = 3 * 9.
+        feed(&mut m, b"abc");
+        let a = m.ime_cursor_area().unwrap();
+        assert_eq!((a.x, a.y), (27.0, 0.0));
+        // At 2x device scale the area scales with the cell.
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 2.0,
+        });
+        let a = m.ime_cursor_area().unwrap();
+        assert_eq!((a.w, a.h), (18.0, 36.0));
+    }
+
+    #[test]
+    fn ime_cursor_area_none_while_scrolled_back() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        for _ in 0..40 {
+            feed(&mut m, b"line\r\n");
+        }
+        key(&mut m, Key::Named(NamedKey::Home), Mods::SHIFT); // into history
+        assert!(m.ime_cursor_area().is_none());
     }
 
     #[test]

@@ -43,6 +43,10 @@ pub enum UiEvent {
     },
     /// Committed text (IME commit, or text the shell pasted in).
     Text(String),
+    /// In-progress IME composition (the preedit string); empty ends/cancels it.
+    /// While a non-empty preedit is active the terminal suppresses raw key input
+    /// so the keystrokes driving composition aren't also sent to the child.
+    Preedit(String),
     Pointer {
         phase: PointerPhase,
         button: Option<PointerButton>,

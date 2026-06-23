@@ -87,6 +87,15 @@ impl RootModel {
         }
     }
 
+    /// Physical-pixel rect of the text cursor for the IME candidate window. Only
+    /// the single view has a well-defined caret; the fleet overview returns None.
+    pub fn ime_cursor_area(&self) -> Option<ghost_render::RectPx> {
+        match &self.mode {
+            Mode::Single(m) => m.ime_cursor_area(),
+            Mode::Fleet(_) => None,
+        }
+    }
+
     /// Whether the app should exit: the single view's child ended. A fleet tile
     /// ending never quits the app.
     pub fn ended(&self) -> bool {

@@ -36,7 +36,7 @@ use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
@@ -626,6 +626,13 @@ impl ApplicationHandler for App {
                     // Rasterize at the model's render scale (device × zoom) so
                     // glyph size matches the grid the scene was laid out for.
                     let font_px = SIZE_PX * r.render_scale();
+                    // Keep the IME candidate window pinned to the text cursor.
+                    if let Some(a) = r.ime_cursor_area() {
+                        g.window.set_ime_cursor_area(
+                            PhysicalPosition::new(a.x, a.y),
+                            PhysicalSize::new(a.w, a.h),
+                        );
+                    }
                     g.render(&scene, font_px);
                 }
             }
@@ -639,6 +646,16 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.dispatch(UiEvent::Text(text), event_loop);
             }
+            WindowEvent::Ime(Ime::Preedit(text, _cursor)) => {
+                // Track the in-progress composition so the model suppresses the
+                // raw keystrokes driving it; an empty string ends it.
+                self.dispatch(UiEvent::Preedit(text), event_loop);
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                // Composition aborted (focus lost, IME toggled off): clear it.
+                self.dispatch(UiEvent::Preedit(String::new()), event_loop);
+            }
+            WindowEvent::Ime(Ime::Enabled) => {}
             WindowEvent::Focused(focused) => {
                 self.dispatch(UiEvent::Focus(focused), event_loop);
             }
