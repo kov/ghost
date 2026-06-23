@@ -47,6 +47,7 @@ pub enum UiEvent {
         phase: PointerPhase,
         button: Option<PointerButton>,
         pos: PointPx,
+        mods: Mods,
         wheel_dy: f64,
     },
     Focus(bool),

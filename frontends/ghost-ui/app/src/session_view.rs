@@ -2,16 +2,17 @@
 //! `ghost_vt::screen::Screen`, answers the terminal queries the child emits
 //! (the role VTE plays for ghost-gtk), and sends keystrokes / resizes back.
 //!
-//! The render half lives elsewhere — a caller lays out `self.screen().vt()`
-//! with `ghost-render` and draws it. This module is the protocol plumbing.
+//! Transitional: this is the I/O wrapper the current shell still uses. Its pure
+//! protocol/encoding logic now lives in `ghost-ui-core` (and the pure
+//! `TerminalModel`); a later step folds this into the shell that drives
+//! `TerminalModel` directly, and this file goes away.
 
 use std::io;
 use std::time::Duration;
 
-use ghost_render::Selection;
 use ghost_term::MouseProtocol;
 use ghost_ui_core::input::{Key, Mods};
-use ghost_ui_core::{encode, mouse};
+use ghost_ui_core::{bracket_paste, encode, mouse, query_replies};
 use ghost_vt::client::Session;
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
@@ -152,142 +153,5 @@ impl SessionView {
             dirty,
             ended: false,
         })
-    }
-}
-
-/// Scan child output for terminal queries and build the reply bytes from the
-/// given 1-based `(col, row)` cursor and `(cols, rows)` size. Pure, so the query
-/// wiring is unit-testable without a live session.
-pub fn query_replies(
-    scanner: &mut QueryScanner,
-    output: &[u8],
-    cursor: (u16, u16),
-    size: (u16, u16),
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    for query in scanner.scan(output) {
-        out.extend_from_slice(&query.reply(cursor, size));
-    }
-    out
-}
-
-/// Wrap pasted bytes in bracketed-paste markers (`ESC[200~` … `ESC[201~`) when
-/// the terminal enabled DEC mode 2004; otherwise pass them through unchanged.
-/// Pure, so the paste wiring is unit-testable.
-pub fn bracket_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
-    if !bracketed {
-        return text.to_vec();
-    }
-    let mut out = Vec::with_capacity(text.len() + 12);
-    out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(text);
-    out.extend_from_slice(b"\x1b[201~");
-    out
-}
-
-/// Extract the text covered by `sel` from `screen`, one trimmed line per row
-/// joined by newlines. Pure (takes a `&Screen`), so it is unit-testable without
-/// a live session. Wide-cell tail placeholders are dropped; columns and the row
-/// range are clamped to what each line actually holds.
-pub fn selection_text(screen: &Screen, sel: Selection) -> String {
-    let (cols, rows) = screen.dimensions();
-    let (cols, rows) = (cols as usize, rows as usize);
-    let mut lines: Vec<String> = Vec::new();
-    for row in sel.start.0..=sel.end.0 {
-        if row >= rows {
-            break;
-        }
-        let text = match sel.row_span(row, cols) {
-            Some((c0, c1)) => {
-                let line = screen.vt().line(row);
-                let len = line.len();
-                line.cells()[c0.min(len)..c1.min(len)]
-                    .iter()
-                    .filter(|cell| cell.width() != 0) // skip wide-cell tail halves
-                    .map(|cell| cell.char())
-                    .collect::<String>()
-            }
-            None => String::new(),
-        };
-        // First/interior rows were synthetically extended to end-of-line, so drop
-        // their padding; the terminating row ends at the user's chosen column, so
-        // its trailing spaces are selected content and must be kept (WYSIWYG copy).
-        let text = if row == sel.end.0 {
-            text
-        } else {
-            text.trim_end().to_string()
-        };
-        lines.push(text);
-    }
-    lines.join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selection_text_extracts_rows() {
-        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
-        screen.feed(b"hello world");
-        assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 4))),
-            "hello"
-        );
-
-        // Multi-row: first row to EOL (trimmed), last row to its endpoint.
-        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
-        screen.feed(b"ab\r\ncd");
-        assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (1, 1))),
-            "ab\ncd"
-        );
-    }
-
-    #[test]
-    fn selection_text_keeps_terminating_row_trailing_spaces() {
-        // Trailing spaces inside the span on the terminating row are selected
-        // content (the highlight shows them), so copy must preserve them.
-        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
-        screen.feed(b"a  b");
-        assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 2))),
-            "a  "
-        );
-
-        // First row's end-of-line padding is dropped; last row's spaces survive.
-        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
-        screen.feed(b"hi\r\nx  y");
-        assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (1, 2))),
-            "hi\nx  "
-        );
-    }
-
-    #[test]
-    fn bracketed_paste_wraps_only_when_enabled() {
-        assert_eq!(bracket_paste(b"hi", false), b"hi");
-        assert_eq!(bracket_paste(b"hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
-    }
-
-    #[test]
-    fn answers_cursor_position_query() {
-        let mut s = QueryScanner::new();
-        // CSI 6 n with the cursor at col 3, row 5 -> CSI 5;3 R.
-        let reply = query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24));
-        assert_eq!(reply, b"\x1b[5;3R");
-    }
-
-    #[test]
-    fn answers_primary_device_attributes() {
-        let mut s = QueryScanner::new();
-        let reply = query_replies(&mut s, b"\x1b[c", (1, 1), (80, 24));
-        assert_eq!(reply, b"\x1b[?61;1;21;22;28c");
-    }
-
-    #[test]
-    fn plain_output_needs_no_reply() {
-        let mut s = QueryScanner::new();
-        assert!(query_replies(&mut s, b"hello world\r\n", (1, 1), (80, 24)).is_empty());
     }
 }

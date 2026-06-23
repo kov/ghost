@@ -15,10 +15,14 @@ pub mod encode;
 pub mod event;
 pub mod input;
 pub mod mouse;
+pub mod terminal;
 
 pub use cmd::Cmd;
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
 pub use input::{Key, Mods, NamedKey};
+pub use terminal::{
+    Shortcut, TerminalModel, bracket_paste, classify_shortcut, query_replies, selection_text,
+};
 
 /// A session's stable identity (its name). Focus and input routing key on this,
 /// never a list index — so reordering tiles can't silently retarget input.

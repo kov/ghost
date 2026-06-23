@@ -31,7 +31,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
 const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
@@ -74,25 +74,6 @@ fn map_button(b: MouseButton) -> Option<mouse::Button> {
         MouseButton::Left => Some(mouse::Button::Left),
         MouseButton::Middle => Some(mouse::Button::Middle),
         MouseButton::Right => Some(mouse::Button::Right),
-        _ => None,
-    }
-}
-
-/// A frontend-handled key combo (Super+key, or Ctrl+Shift+key) we intercept
-/// before encoding so it reaches the app, not the child.
-enum Shortcut {
-    Paste,
-    Copy,
-}
-
-fn classify_shortcut(key: &Key, mods: ModifiersState) -> Option<Shortcut> {
-    let combo = mods.super_key() || (mods.control_key() && mods.shift_key());
-    if !combo {
-        return None;
-    }
-    match key {
-        Key::Character(s) if s.eq_ignore_ascii_case("v") => Some(Shortcut::Paste),
-        Key::Character(s) if s.eq_ignore_ascii_case("c") => Some(Shortcut::Copy),
         _ => None,
     }
 }
@@ -390,7 +371,7 @@ impl App {
     fn copy_selection(&mut self) {
         let Some(sel) = self.selection else { return };
         let text = match self.view.as_ref() {
-            Some(v) => session_view::selection_text(v.screen(), sel),
+            Some(v) => ghost_ui_core::selection_text(v.screen(), sel),
             None => return,
         };
         if text.is_empty() {
@@ -520,12 +501,12 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                match classify_shortcut(&event.logical_key, self.mods) {
-                    Some(Shortcut::Paste) => self.paste_from_clipboard(),
-                    Some(Shortcut::Copy) => self.copy_selection(),
+                let key = from_winit::key(&event.logical_key);
+                let mods = from_winit::mods(self.mods);
+                match ghost_ui_core::classify_shortcut(&key, mods) {
+                    Some(ghost_ui_core::Shortcut::Paste) => self.paste_from_clipboard(),
+                    Some(ghost_ui_core::Shortcut::Copy) => self.copy_selection(),
                     None => {
-                        let key = from_winit::key(&event.logical_key);
-                        let mods = from_winit::mods(self.mods);
                         if let Some(v) = self.view.as_mut() {
                             let _ = v.key(&key, mods);
                         }
