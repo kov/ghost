@@ -17,6 +17,8 @@ ghost-render = { path = "../../../ghost-render" }
 ghost-shaper = { path = "../shaper" }
 ghost-vt = { path = "../../../ghost-vt" }
 ghost-term = { path = "../../../ghost-term" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 winit = "0.30"
 wgpu = "29"
 pollster = "0.4"

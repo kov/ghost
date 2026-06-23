@@ -19,6 +19,8 @@ fn captures_a_real_session_to_a_png() {
 
     let mut cmd = Command::new(BIN);
     cmd.env("XDG_RUNTIME_DIR", &xdg)
+        // Isolate config so the capture doesn't read the developer's ui.toml.
+        .env("XDG_CONFIG_HOME", tmp.path())
         .env("GHOST_CAPTURE", &png)
         .env("GHOST_CMD", "printf 'CAPTURE-MARKER-7\\n'");
     // Pin the software adapter so the offscreen render is reproducible headless.
@@ -61,6 +63,7 @@ fn feeds_input_and_sees_it_echoed() {
 
     let mut cmd = Command::new(BIN);
     cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("XDG_CONFIG_HOME", tmp.path())
         .env("GHOST_CAPTURE", &png)
         .env("GHOST_CMD", "cat")
         .env("GHOST_FEED", "ROUNDTRIP-42\r");
@@ -74,5 +77,51 @@ fn feeds_input_and_sees_it_echoed() {
     assert!(
         stderr.contains("ROUNDTRIP-42"),
         "fed input was not echoed onto the screen:\n{stderr}"
+    );
+}
+
+#[test]
+fn applies_color_scheme_from_config() {
+    // A ui.toml selecting solarized-dark must paint the rendered background with
+    // that scheme's bg (#002b36), proving config -> Theme -> renderer end to end.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("run");
+    let cfg = tmp.path().join("config");
+    std::fs::create_dir_all(&xdg).unwrap();
+    std::fs::create_dir_all(cfg.join("ghost")).unwrap();
+    std::fs::write(
+        cfg.join("ghost").join("ui.toml"),
+        "[colors]\nscheme = \"solarized-dark\"\n",
+    )
+    .unwrap();
+    let png = tmp.path().join("out.png");
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .env("GHOST_CAPTURE", &png)
+        .env("GHOST_CMD", "printf 'hi\\n'");
+    if Path::new(LAVAPIPE).exists() {
+        cmd.env("VK_ICD_FILENAMES", LAVAPIPE);
+    }
+    let out = cmd.output().expect("run ghost-ui");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ghost-ui capture failed:\n{stderr}");
+
+    let bytes = std::fs::read(&png).expect("png written");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+    reader.next_frame(&mut buf).expect("png frame");
+    // Solarized-dark background is #002b36 = [0,43,54]; most of the (mostly
+    // blank) screen should be exactly that, and never the default [16,16,18].
+    let solar = buf
+        .chunks_exact(4)
+        .filter(|p| p[0] < 12 && (40..56).contains(&p[1]) && (48..64).contains(&p[2]))
+        .count();
+    let total = buf.len() / 4;
+    assert!(
+        solar > total / 2,
+        "expected the solarized-dark background, only {solar}/{total} pixels matched"
     );
 }

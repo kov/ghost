@@ -18,6 +18,7 @@
 //!   `view()` offscreen, write a PNG, and exit. The model/`Scene` path is the
 //!   single source of truth, so this is a binary-level test of the contract.
 
+mod config;
 mod from_winit;
 
 use std::collections::HashMap;
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{Gpu, Rendered, Renderer, Theme};
+use ghost_renderer::{Gpu, Rendered, Renderer};
 use ghost_ui_core::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, RootModel, Scene, TerminalModel,
     UiEvent,
@@ -226,7 +227,8 @@ fn capture(path: PathBuf) {
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
     let scene = model.view();
-    let img = Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
+    let img = Renderer::headless(config::UiConfig::load().theme())
+        .render_offscreen_scene(&scene, font, SIZE_PX);
     write_png(&path, &img);
     eprintln!(
         "captured {}x{} to {}",
@@ -342,7 +344,7 @@ impl Graphics {
             device: device.clone(),
             queue,
         };
-        let renderer = Renderer::new(gpu, Theme::default(), format);
+        let renderer = Renderer::new(gpu, config::UiConfig::load().theme(), format);
 
         Graphics {
             window,
