@@ -16,12 +16,40 @@ pub fn mods(m: ModifiersState) -> Mods {
     }
 }
 
-pub fn key(k: &WKey) -> Key {
+pub fn key(k: &WKey, physical: PhysicalKey) -> Key {
     match k {
+        // Modifier keys are reported without a side in the logical key; the side
+        // lives in the physical key (the kitty protocol distinguishes them).
+        WKey::Named(WNamed::Shift) => Key::Named(modifier_side(physical, WNamed::Shift)),
+        WKey::Named(WNamed::Control) => Key::Named(modifier_side(physical, WNamed::Control)),
+        WKey::Named(WNamed::Alt) => Key::Named(modifier_side(physical, WNamed::Alt)),
+        WKey::Named(WNamed::Super) => Key::Named(modifier_side(physical, WNamed::Super)),
         WKey::Named(n) => Key::Named(named(*n)),
         WKey::Character(s) => Key::Char(s.to_string()),
         WKey::Dead(_) => Key::Dead,
         _ => Key::Unidentified,
+    }
+}
+
+/// Pick the left/right `NamedKey` for a modifier from its physical key; defaults
+/// to the left side when the physical position is unknown.
+fn modifier_side(physical: PhysicalKey, modifier: WNamed) -> NamedKey {
+    let right = matches!(
+        physical,
+        PhysicalKey::Code(
+            KeyCode::ShiftRight | KeyCode::ControlRight | KeyCode::AltRight | KeyCode::SuperRight
+        )
+    );
+    match (modifier, right) {
+        (WNamed::Shift, false) => NamedKey::ShiftLeft,
+        (WNamed::Shift, true) => NamedKey::ShiftRight,
+        (WNamed::Control, false) => NamedKey::ControlLeft,
+        (WNamed::Control, true) => NamedKey::ControlRight,
+        (WNamed::Alt, false) => NamedKey::AltLeft,
+        (WNamed::Alt, true) => NamedKey::AltRight,
+        (WNamed::Super, false) => NamedKey::SuperLeft,
+        (WNamed::Super, true) => NamedKey::SuperRight,
+        _ => NamedKey::Other,
     }
 }
 

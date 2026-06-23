@@ -913,7 +913,7 @@ impl ApplicationHandler for App {
                 let Some(mods_state) = self.windows.get(&id).map(|w| w.mods) else {
                     return;
                 };
-                let key = from_winit::key(&event.logical_key);
+                let key = from_winit::key(&event.logical_key, event.physical_key);
                 let mods = from_winit::mods(mods_state);
                 let alts = from_winit::alternates(&event, mods_state);
                 let kind = match event.state {

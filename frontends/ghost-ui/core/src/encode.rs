@@ -293,7 +293,34 @@ fn kitty_encode_named(
         F10 => kitty_tilde(21, mods, event, kind),
         F11 => kitty_tilde(23, mods, event, kind),
         F12 => kitty_tilde(24, mods, event, kind),
+        // Modifier keys are reported (as their PUA codepoints) only under
+        // report-all-keys (flag 8); they have no legacy representation otherwise.
+        ShiftLeft | ShiftRight | ControlLeft | ControlRight | AltLeft | AltRight | SuperLeft
+        | SuperRight => {
+            if force_all {
+                csi_u_or_suppressed(modifier_codepoint(key), mods, event, kind, None)
+            } else {
+                None
+            }
+        }
         Other => None,
+    }
+}
+
+/// The kitty functional-key PUA codepoint for a modifier key (left side
+/// 57441-57444, right side 57447-57450).
+fn modifier_codepoint(key: NamedKey) -> u32 {
+    use NamedKey::*;
+    match key {
+        ShiftLeft => 57441,
+        ControlLeft => 57442,
+        AltLeft => 57443,
+        SuperLeft => 57444,
+        ShiftRight => 57447,
+        ControlRight => 57448,
+        AltRight => 57449,
+        SuperRight => 57450,
+        _ => 0,
     }
 }
 
@@ -1247,5 +1274,52 @@ mod tests {
         // Flag 16 alone does not promote plain text to an escape code (that needs
         // flag 8); the key stays legacy text.
         assert_eq!(kitty(&ch("a"), none(), 16), Some(b"a".to_vec()));
+    }
+
+    // ---- kitty keyboard protocol: report-all-keys modifier reporting (flag 8) ----
+
+    const REPORT_ALL: u8 = 8; // report-all-keys
+
+    #[test]
+    fn kitty_reports_modifier_keys_only_under_report_all_keys() {
+        use NamedKey::*;
+        // Left Shift / Control / Alt / Super -> their PUA codepoints; right side
+        // uses the +6 codepoints.
+        assert_eq!(
+            kitty(&Key::Named(ShiftLeft), none(), REPORT_ALL),
+            Some(b"\x1b[57441u".to_vec())
+        );
+        assert_eq!(
+            kitty(&Key::Named(ControlLeft), none(), REPORT_ALL),
+            Some(b"\x1b[57442u".to_vec())
+        );
+        assert_eq!(
+            kitty(&Key::Named(SuperRight), none(), REPORT_ALL),
+            Some(b"\x1b[57450u".to_vec())
+        );
+        // The active modifier state still rides in the modifier field.
+        assert_eq!(
+            kitty(&Key::Named(ControlLeft), Mods::CTRL, REPORT_ALL),
+            Some(b"\x1b[57442;5u".to_vec())
+        );
+        // Without report-all-keys a lone modifier produces nothing, even under
+        // disambiguate.
+        assert_eq!(kitty(&Key::Named(ShiftLeft), none(), F1_DISAMBIGUATE), None);
+        assert_eq!(kitty(&Key::Named(AltRight), none(), 0), None);
+        // With event-types (flag 2) a modifier release reports too.
+        assert_eq!(
+            kitty_ev(&Key::Named(ShiftLeft), none(), 8 | 2, KeyEventKind::Release),
+            Some(b"\x1b[57441;1:3u".to_vec())
+        );
+        // ...but not without flag 2.
+        assert_eq!(
+            kitty_ev(
+                &Key::Named(ShiftLeft),
+                none(),
+                REPORT_ALL,
+                KeyEventKind::Release
+            ),
+            None
+        );
     }
 }

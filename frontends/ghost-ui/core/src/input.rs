@@ -132,6 +132,16 @@ pub enum NamedKey {
     F10,
     F11,
     F12,
+    /// Modifier keys, by side. They produce nothing in the legacy schemes; the
+    /// kitty report-all-keys flag (8) reports them as their PUA codepoints.
+    ShiftLeft,
+    ShiftRight,
+    ControlLeft,
+    ControlRight,
+    AltLeft,
+    AltRight,
+    SuperLeft,
+    SuperRight,
     /// A named key the core doesn't encode.
     Other,
 }
