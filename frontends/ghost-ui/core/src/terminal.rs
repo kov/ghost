@@ -664,12 +664,16 @@ impl TerminalModel {
                         self.selection = None;
                     }
                     vec![Cmd::Redraw]
+                } else if b == mouse::Button::Middle {
+                    // Middle-click pastes the primary selection (the reply comes
+                    // back as `ClipboardText`, like a normal paste).
+                    vec![Cmd::ReadPrimary]
                 } else {
                     Vec::new()
                 }
             }
             PointerPhase::Release => {
-                let cmds = match button.map(map_button) {
+                let mut cmds = match button.map(map_button) {
                     Some(b) if self.gesture_report => {
                         let cell = self.cursor_cell.unwrap_or((1, 1));
                         self.mouse_report(mouse::Kind::Release, Some(b), false, cell, mods)
@@ -677,6 +681,14 @@ impl TerminalModel {
                     _ => Vec::new(),
                 };
                 self.held = None;
+                // A finalized local selection becomes the primary selection, so a
+                // middle-click elsewhere pastes it (X11/Wayland convention).
+                if let Some(sel) = self.selection {
+                    let text = selection_text(&self.screen, sel, self.scroll_offset);
+                    if !text.is_empty() {
+                        cmds.push(Cmd::WritePrimary(text));
+                    }
+                }
                 cmds
             }
             PointerPhase::Wheel => {
@@ -947,6 +959,75 @@ mod tests {
         assert_eq!(
             key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
             vec![Cmd::WriteClipboard("hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn releasing_a_drag_selection_sets_the_primary_selection() {
+        let mut m = model();
+        feed(&mut m, b"hello world");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            40.0,
+            1.0,
+        ));
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            40.0,
+            1.0,
+        ));
+        assert!(
+            cmds.contains(&Cmd::WritePrimary("hello".to_string())),
+            "release should publish the selection to primary: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_release_publishes_no_primary() {
+        let mut m = model();
+        feed(&mut m, b"hi");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::WritePrimary(_))),
+            "a click with no selection must not touch primary: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn middle_click_pastes_the_primary_selection() {
+        let mut m = model();
+        feed(&mut m, b"text");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        assert_eq!(
+            m.update(ptr(
+                PointerPhase::Press,
+                Some(PointerButton::Middle),
+                1.0,
+                1.0
+            )),
+            vec![Cmd::ReadPrimary],
+            "middle-click requests a primary-selection paste"
         );
     }
 

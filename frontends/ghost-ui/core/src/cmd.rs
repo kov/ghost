@@ -26,6 +26,11 @@ pub enum Cmd {
     ReadClipboard,
     /// Write text to the system clipboard.
     WriteClipboard(String),
+    /// Read the primary selection (middle-click paste); the shell replies
+    /// `UiEvent::ClipboardText`. A no-op on platforms without a primary selection.
+    ReadPrimary,
+    /// Write text to the primary selection (set whenever text is selected).
+    WritePrimary(String),
     /// Enumerate sessions; the shell replies `UiEvent::SessionList`.
     ListSessions,
     /// Open / close a session socket (e.g. for a fleet tile preview).

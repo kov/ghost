@@ -445,6 +445,11 @@ impl App {
                     self.dispatch(UiEvent::ClipboardText(text), event_loop);
                 }
                 Cmd::WriteClipboard(text) => self.write_clipboard(text),
+                Cmd::ReadPrimary => {
+                    let text = self.read_primary();
+                    self.dispatch(UiEvent::ClipboardText(text), event_loop);
+                }
+                Cmd::WritePrimary(text) => self.write_primary(text),
                 Cmd::ListSessions => {
                     let infos = session::list().unwrap_or_default();
                     self.dispatch(UiEvent::SessionList(infos), event_loop);
@@ -498,6 +503,39 @@ impl App {
             let _ = cb.set_text(text);
         }
     }
+
+    /// Read the primary selection (middle-click paste). Only X11/Wayland have a
+    /// primary selection; elsewhere this is a no-op so middle-click does nothing.
+    #[cfg(target_os = "linux")]
+    fn read_primary(&mut self) -> Option<String> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        self.clipboard
+            .as_mut()
+            .and_then(|cb| cb.get().clipboard(LinuxClipboardKind::Primary).text().ok())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_primary(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Publish a selection to the primary selection. No-op off X11/Wayland.
+    #[cfg(target_os = "linux")]
+    fn write_primary(&mut self, text: String) {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn write_primary(&mut self, _text: String) {}
 
     fn request_redraw(&self) {
         if let Some(g) = &self.gfx {
