@@ -326,6 +326,10 @@ impl Terminal {
                 };
             }
 
+            // kitty graphics: the APC carrier is parsed here; decoding the
+            // command, the image store, and responses arrive in a later commit.
+            KittyGraphics(_payload) => {}
+
             Lf => {
                 self.lf();
             }

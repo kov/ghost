@@ -17,7 +17,18 @@ pub struct Parser {
     /// the terminator). Only OSC 0/2 (window title) is acted upon; other OSCs
     /// are collected then discarded.
     osc: String,
+    /// Accumulates the body of the current APC string (kitty graphics carrier).
+    /// Bounded by [`MAX_APC_LEN`]; once exceeded, `apc_overflow` latches and the
+    /// whole sequence is discarded on dispatch.
+    apc: String,
+    apc_overflow: bool,
 }
+
+/// Upper bound on a single APC string's accumulated length (a DoS guard). The
+/// kitty protocol chunks large transfers (~4 KiB of base64 per chunk), so a
+/// well-behaved client never approaches this; a non-chunked transfer above it is
+/// dropped rather than buffered unboundedly.
+pub(crate) const MAX_APC_LEN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum State {
@@ -36,6 +47,8 @@ pub enum State {
     DcsIgnore,
     OscString,
     SosPmApcString,
+    /// Inside an APC string (`ESC _ …`), accumulating the kitty graphics payload.
+    ApcString,
 }
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +96,11 @@ pub enum Function {
     /// kitty keyboard protocol — set the current flags (`CSI = flags ; mode u`):
     /// mode 1 = set exactly (default), 2 = set named bits, 3 = clear named bits.
     KittyKeyboardSet(u8, u8),
+    /// kitty graphics protocol — a graphics command carried in an APC string
+    /// (`ESC _ G <payload> ST`). The string is everything after the leading `G`
+    /// (control data, optionally `;` then a base64 payload). Parsed and applied
+    /// by the graphics engine; never part of a screen dump.
+    KittyGraphics(String),
     Lf,
     /// xterm modifyOtherKeys level (XTMODKEYS resource 4): `CSI > 4 ; Pv m`.
     /// 0 = off, 1 = report keys lacking an unambiguous legacy byte, 2 = also
@@ -483,6 +501,14 @@ impl Parser {
                 return self.osc_dispatch();
             }
 
+            (ApcString, '\u{1b}') => {
+                // ESC begins the ST (ESC \) that terminates the APC; dispatch
+                // before re-entering Escape so the trailing `\` parses normally.
+                self.state = Escape;
+                self.clear();
+                return self.apc_dispatch();
+            }
+
             (_, '\u{1b}') => {
                 self.state = Escape;
                 self.clear();
@@ -510,6 +536,18 @@ impl Parser {
             (OscString, '\u{20}'..='\u{7f}') => {
                 self.osc_put(input);
             }
+
+            // APC payload bytes (printable ASCII: base64 + key=value control data).
+            (ApcString, '\u{20}'..='\u{7e}') => {
+                self.apc_put(input);
+            }
+
+            // C0 controls and DEL inside an APC are ignored (CAN/SUB/ESC handled
+            // elsewhere); the payload is printable ASCII only.
+            (ApcString, '\u{00}'..='\u{17}')
+            | (ApcString, '\u{19}')
+            | (ApcString, '\u{1c}'..='\u{1f}')
+            | (ApcString, '\u{7f}') => {}
 
             (Escape, '\u{20}'..='\u{2f}') => {
                 self.state = EscapeIntermediate;
@@ -625,18 +663,33 @@ impl Parser {
                 return self.execute(input);
             }
 
-            (Escape, '\u{58}') | (Escape, '\u{5e}') | (Escape, '\u{5f}') => {
+            // SOS (ESC X) and PM (ESC ^) strings are collected then discarded.
+            (Escape, '\u{58}') | (Escape, '\u{5e}') => {
                 self.state = SosPmApcString;
             }
 
-            (_, '\u{98}') | (_, '\u{9e}') | (_, '\u{9f}') => {
+            (_, '\u{98}') | (_, '\u{9e}') => {
                 self.state = SosPmApcString;
+            }
+
+            // APC (ESC _ / C1 0x9f) carries the kitty graphics protocol; unlike
+            // SOS/PM it is accumulated so its payload can be acted upon.
+            (Escape, '\u{5f}') | (_, '\u{9f}') => {
+                self.state = ApcString;
+                self.apc.clear();
+                self.apc_overflow = false;
             }
 
             (OscString, '\u{9c}') => {
                 // C1 ST terminates the OSC string.
                 self.state = Ground;
                 return self.osc_dispatch();
+            }
+
+            (ApcString, '\u{9c}') => {
+                // C1 ST terminates the APC string.
+                self.state = Ground;
+                return self.apc_dispatch();
             }
 
             (_, '\u{9c}') => {
@@ -687,7 +740,7 @@ impl Parser {
             (Ground | Escape | EscapeIntermediate
             | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore
             | DcsEntry | DcsParam | DcsIntermediate | DcsPassthrough | DcsIgnore
-            | OscString | SosPmApcString, '\u{a0}'..='\u{10ffff}') => {
+            | OscString | SosPmApcString | ApcString, '\u{a0}'..='\u{10ffff}') => {
                 unreachable!()
             }
         }
@@ -936,6 +989,30 @@ impl Parser {
         self.osc.push(input);
     }
 
+    fn apc_put(&mut self, input: char) {
+        if self.apc_overflow {
+            return;
+        }
+        if self.apc.len() >= MAX_APC_LEN {
+            // Stop accumulating and latch; the sequence is dropped on dispatch.
+            self.apc_overflow = true;
+            return;
+        }
+        self.apc.push(input);
+    }
+
+    /// Interpret a completed APC string. Only the kitty graphics carrier (a
+    /// leading `G`) is recognised; the emitted [`Function::KittyGraphics`] holds
+    /// everything after that `G`. Oversized or non-graphics APCs yield nothing.
+    fn apc_dispatch(&self) -> Option<Function> {
+        if self.apc_overflow {
+            return None;
+        }
+        self.apc
+            .strip_prefix('G')
+            .map(|rest| Function::KittyGraphics(rest.to_string()))
+    }
+
     /// Interpret a completed OSC string. Only OSC 0 (icon name + title) and
     /// OSC 2 (title) are recognised — both set the window title; everything
     /// else is ignored.
@@ -1030,11 +1107,30 @@ impl Parser {
             }
 
             OscString => {
+                // Re-emit the introducer AND the accumulated body so a resumed
+                // parser reconstructs the same OSC (dump/resume must round-trip —
+                // see prop_dump_resume_equivalence).
                 seq.push('\u{9d}');
+                seq.push_str(&self.osc);
             }
 
             SosPmApcString => {
                 seq.push('\u{98}');
+            }
+
+            ApcString => {
+                // Likewise re-emit the introducer and the accumulated graphics
+                // payload so the resumed parser produces the identical
+                // KittyGraphics command.
+                seq.push('\u{9f}');
+                if self.apc_overflow {
+                    // The payload was already dropped (over the cap); emit a
+                    // non-`G` sentinel so the resumed parser's dispatch is also a
+                    // no-op, without re-emitting the megabytes we discarded.
+                    seq.push(' ');
+                } else {
+                    seq.push_str(&self.apc);
+                }
             }
         }
 
@@ -1226,6 +1322,9 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Il(n) => push_csi(seq, None, &[n.to_string()], 'L'),
         KittyKeyboardPush(flags) => push_csi(seq, Some('>'), &[flags.to_string()], 'u'),
         KittyKeyboardPop(n) => push_csi(seq, Some('<'), &[n.to_string()], 'u'),
+        // Graphics commands are transient (applied to the image store, not part
+        // of the cell grid); image state is re-emitted separately, not here.
+        KittyGraphics(_) => {}
         KittyKeyboardSet(flags, mode) => {
             push_csi(seq, Some('='), &[flags.to_string(), mode.to_string()], 'u')
         }
@@ -2111,6 +2210,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_kitty_graphics_apc() {
+        // `ESC _ G <control>;<payload> ST` carries a kitty graphics command; the
+        // emitted Function holds everything after the leading `G`. ST = ESC \.
+        assert_eq!(
+            parse("\x1b_Gi=31,a=q,s=1,v=1,f=24;AAAA\x1b\\"),
+            [KittyGraphics("i=31,a=q,s=1,v=1,f=24;AAAA".to_string())]
+        );
+        // The C1 APC introducer (0x9f) and C1 ST (0x9c) work too.
+        assert_eq!(
+            parse("\u{9f}Ga=q;AA\u{9c}"),
+            [KittyGraphics("a=q;AA".to_string())]
+        );
+        // A control-data-only command (no payload) is fine.
+        assert_eq!(
+            parse("\x1b_Ga=d,d=A\x1b\\"),
+            [KittyGraphics("a=d,d=A".to_string())]
+        );
+        // An APC that is not a graphics command (no leading `G`) is discarded.
+        assert_eq!(parse("\x1b_Zhello\x1b\\"), []);
+        // SOS and PM strings remain discarded — only APC carries graphics.
+        assert_eq!(parse("\x1bXsos data\x1b\\"), []);
+        assert_eq!(parse("\x1b^pm data\x1b\\"), []);
+        // An oversized payload is dropped (bounded accumulator), and the parser
+        // still returns to the ground state cleanly.
+        let huge = format!("\x1b_G{}\x1b\\", "A".repeat(super::MAX_APC_LEN + 16));
+        assert_eq!(parse(&huge), []);
+        let mut p = Parser::new();
+        feed(&mut p, &huge);
+        assert_eq!(p.state, State::Ground);
+    }
+
+    #[test]
     fn parse_osc_title() {
         // OSC 0 (icon + title) and OSC 2 (title) both set the window title,
         // terminated by BEL, C1 ST, or ESC \.
@@ -2304,7 +2435,35 @@ mod tests {
         assert_dump("\x1bPz", State::DcsPassthrough, "\u{90}\u{40}");
         assert_dump("\x1bP:", State::DcsIgnore, "\u{90}\u{3a}");
         assert_dump("\x1b]", State::OscString, "\u{9d}");
+        // OSC and APC re-emit their accumulated body so a mid-sequence checkpoint
+        // round-trips the eventual dispatch.
+        assert_dump("\x1b]0;hi", State::OscString, "\u{9d}0;hi");
         assert_dump("\x1bX", State::SosPmApcString, "\u{98}");
+        assert_dump("\x1b_", State::ApcString, "\u{9f}");
+        assert_dump("\x1b_Gf=24,a=q", State::ApcString, "\u{9f}Gf=24,a=q");
+    }
+
+    #[test]
+    fn apc_dump_resume_round_trips_the_graphics_command() {
+        // A checkpoint landing mid-APC must not lose the in-flight command: the
+        // resumed parser, fed the dump then the rest of the sequence, emits the
+        // same KittyGraphics as a parser that saw the whole stream uninterrupted.
+        let mut live = Parser::new();
+        feed(&mut live, "\x1b_Gi=1,a=q;AAAA"); // mid-APC, before the ST
+
+        let mut resumed = Parser::new();
+        feed(&mut resumed, &live.dump());
+        live.assert_eq(&resumed);
+
+        let suffix: Vec<char> = "\x1b\\".chars().collect();
+        assert_eq!(
+            emit(&mut live, &suffix),
+            [KittyGraphics("i=1,a=q;AAAA".to_string())]
+        );
+        assert_eq!(
+            emit(&mut resumed, &suffix),
+            [KittyGraphics("i=1,a=q;AAAA".to_string())]
+        );
     }
 
     #[test]
