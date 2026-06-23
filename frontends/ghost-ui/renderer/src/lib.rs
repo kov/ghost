@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use ghost_render::{
     BadgeKind, CellMetrics, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection, Style,
 };
-use ghost_shaper::FontRef;
+use ghost_shaper::{FontRef, Synthesis};
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
@@ -486,8 +486,8 @@ pub struct Renderer {
     theme: Theme,
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
-    /// glyph cache keyed by (glyph id, font size bits, italic); `None` = no bitmap.
-    cache: HashMap<(u16, u32, bool), Option<Slot>>,
+    /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
+    cache: HashMap<(u16, u32, Synthesis), Option<Slot>>,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -702,12 +702,18 @@ impl Renderer {
     }
 
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
-    fn ensure_glyph(&mut self, font: FontRef, id: u16, size_px: f32, italic: bool) -> Option<Slot> {
-        let key = (id, size_px.to_bits(), italic);
+    fn ensure_glyph(
+        &mut self,
+        font: FontRef,
+        id: u16,
+        size_px: f32,
+        synth: Synthesis,
+    ) -> Option<Slot> {
+        let key = (id, size_px.to_bits(), synth);
         if let Some(slot) = self.cache.get(&key) {
             return *slot;
         }
-        let resolved = match ghost_shaper::rasterize(font, id, size_px, italic) {
+        let resolved = match ghost_shaper::rasterize(font, id, size_px, synth) {
             Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
                 if self.pack_x + bmp.width + 1 > ATLAS_DIM {
                     self.pack_x = 1;
@@ -850,7 +856,11 @@ impl Renderer {
                 for g in ghost_shaper::shape(font, &run.text, size_px) {
                     let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
-                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px, run.style.italic) {
+                    let synth = Synthesis {
+                        italic: run.style.italic,
+                        bold: run.style.bold,
+                    };
+                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px, synth) {
                         glyphs.push(Instance {
                             rect: [
                                 pen + slot.left as f32,
@@ -1082,7 +1092,11 @@ impl Renderer {
             for g in ghost_shaper::shape(font, &run.text, size_px) {
                 let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
-                if let Some(slot) = self.ensure_glyph(font, g.id, size_px, run.style.italic) {
+                let synth = Synthesis {
+                    italic: run.style.italic,
+                    bold: run.style.bold,
+                };
+                if let Some(slot) = self.ensure_glyph(font, g.id, size_px, synth) {
                     out.push(Instance {
                         rect: [
                             pen + slot.left as f32,
@@ -1285,6 +1299,19 @@ mod tests {
         let mid_red = |img: &Rendered| (0..9).any(|x| (8..11).any(|y| is_red(px(img, x, y))));
         assert!(!mid_red(&plain), "a plain space cell has no mid-cell ink");
         assert!(mid_red(&strike), "SGR 9 paints a red rule through the cell");
+    }
+
+    #[test]
+    fn bold_renders_a_heavier_glyph() {
+        // SGR 1 must route the cell through the emboldened raster. With the
+        // default foreground (which the color-brighten path leaves untouched),
+        // any pixel difference proves the heavier strokes are actually drawn.
+        let roman = render_text("W");
+        let bold = render_text("\x1b[1mW");
+        assert_ne!(
+            roman.rgba, bold.rgba,
+            "a bold cell must render heavier strokes, not the regular glyph"
+        );
     }
 
     #[test]

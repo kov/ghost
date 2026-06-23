@@ -8,7 +8,7 @@
 //! `assets/FiraCode-LICENSE-OFL.txt`), a fixed ligature-bearing font so these
 //! never depend on whatever fonts a machine happens to have installed.
 
-use ghost_shaper::{FontRef, font_from_bytes, glyph_id, rasterize, shape};
+use ghost_shaper::{FontRef, Synthesis, font_from_bytes, glyph_id, rasterize, shape};
 
 const FIRA: &[u8] = include_bytes!("assets/FiraCode-Regular.ttf");
 
@@ -52,7 +52,7 @@ fn plain_text_is_not_substituted() {
 #[test]
 fn rasterize_is_deterministic() {
     let a = glyph_id(font(), 'A');
-    let bmp = rasterize(font(), a, 32.0, false).expect("'A' has an outline");
+    let bmp = rasterize(font(), a, 32.0, Synthesis::default()).expect("'A' has an outline");
     let sum: u64 = bmp.coverage.iter().map(|&b| u64::from(b)).sum();
     eprintln!(
         "RASTER A@32 => {}x{} left={} top={} len={} sum={}",
@@ -84,8 +84,17 @@ fn faux_italic_shears_the_glyph() {
     // reliable probe — shearing a glyph that already has diagonal strokes can
     // narrow it — so we don't assert on it.
     let a = glyph_id(font(), 'A');
-    let roman = rasterize(font(), a, 32.0, false).expect("'A' has an outline");
-    let italic = rasterize(font(), a, 32.0, true).expect("italic 'A' has an outline");
+    let roman = rasterize(font(), a, 32.0, Synthesis::default()).expect("'A' has an outline");
+    let italic = rasterize(
+        font(),
+        a,
+        32.0,
+        Synthesis {
+            italic: true,
+            bold: false,
+        },
+    )
+    .expect("italic 'A' has an outline");
     assert_eq!(
         italic.height, roman.height,
         "a horizontal shear leaves height unchanged"
@@ -93,5 +102,30 @@ fn faux_italic_shears_the_glyph() {
     assert_ne!(
         italic.coverage, roman.coverage,
         "the shear must move ink, so the raster differs from the upright glyph"
+    );
+}
+
+#[test]
+fn faux_bold_thickens_the_glyph() {
+    // Emboldening dilates the outline, so the bold raster covers strictly more
+    // ink (a higher total alpha) than the regular glyph at the same size.
+    let a = glyph_id(font(), 'A');
+    let roman = rasterize(font(), a, 32.0, Synthesis::default()).expect("'A' has an outline");
+    let bold = rasterize(
+        font(),
+        a,
+        32.0,
+        Synthesis {
+            italic: false,
+            bold: true,
+        },
+    )
+    .expect("bold 'A' has an outline");
+    let ink = |b: &ghost_shaper::GlyphBitmap| b.coverage.iter().map(|&p| u64::from(p)).sum::<u64>();
+    assert!(
+        ink(&bold) > ink(&roman),
+        "embolden must add ink: bold {} vs roman {}",
+        ink(&bold),
+        ink(&roman)
     );
 }

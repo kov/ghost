@@ -80,22 +80,39 @@ pub fn shape_run(font: FontRef, run: &Run, size_px: f32) -> Vec<ShapedGlyph> {
     shape(font, &run.text, size_px)
 }
 
-/// Synthetic-oblique shear for faux italics, applied to the glyph outline when a
-/// dedicated italic face isn't available. ~14° leans the top to the right, the
-/// usual range for synthesized italics.
+/// Synthetic face styling applied at raster time when we lack dedicated bold /
+/// italic faces (we ship a single regular face): an oblique shear for italics
+/// and outline dilation for bold. Doubles as a glyph-cache key discriminator.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Synthesis {
+    pub italic: bool,
+    pub bold: bool,
+}
+
+/// Synthetic-oblique shear for faux italics. ~14° leans the top to the right,
+/// the usual range for synthesized italics.
 const FAUX_ITALIC_DEGREES: f32 = 14.0;
 
+/// Faux-bold outline dilation, as a fraction of the em — the stroke grows by
+/// `size_px * this` in each direction, heavier ink without a bold face.
+const FAUX_BOLD_FACTOR: f32 = 0.04;
+
 /// Rasterize a glyph to an alpha-coverage bitmap with hinting **off**, so the
-/// output is bit-identical across platforms — the basis for deterministic
-/// glyph goldens. With `italic`, a synthetic oblique shear is applied to the
-/// outline (faux italics, since we ship a single regular face). Returns `None`
-/// for a glyph with no outline (e.g. a space).
-pub fn rasterize(font: FontRef, glyph: u16, size_px: f32, italic: bool) -> Option<GlyphBitmap> {
+/// output is bit-identical across platforms — the basis for deterministic glyph
+/// goldens. `synth` applies a synthetic oblique shear and/or outline dilation
+/// (faux italic / bold, since we ship a single regular face). Returns `None` for
+/// a glyph with no outline (e.g. a space).
+pub fn rasterize(font: FontRef, glyph: u16, size_px: f32, synth: Synthesis) -> Option<GlyphBitmap> {
     let mut ctx = ScaleContext::new();
     let mut scaler = ctx.builder(font).size(size_px).hint(false).build();
     let mut render = Render::new(&[Source::Outline]);
     render.format(Format::Alpha);
-    if italic {
+    if synth.bold {
+        // Dilate the outline so the strokes thicken (swash emboldens before it
+        // transforms, so this composes correctly with the italic shear).
+        render.embolden(size_px * FAUX_BOLD_FACTOR);
+    }
+    if synth.italic {
         // x' = x + y·tan(θ): outline points above the baseline shift right.
         render.transform(Some(Transform::skew(
             Angle::from_degrees(FAUX_ITALIC_DEGREES),
