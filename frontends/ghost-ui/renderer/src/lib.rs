@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 
-use ghost_render::{Frame, Selection, Style};
+use ghost_render::{
+    BadgeKind, CellMetrics, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection, Style,
+};
 use ghost_shaper::FontRef;
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
@@ -368,6 +370,95 @@ const OPAQUE_UV: [f32; 4] = [
     0.5 / ATLAS_DIM as f32,
 ];
 
+/// A contiguous run of instances and the scissor rect (`x, y, w, h`, framebuffer
+/// pixels) it must be clipped to when drawn.
+struct DrawGroup {
+    scissor: [u32; 4],
+    range: std::ops::Range<u32>,
+}
+
+/// Translate every instance's screen rect by `(dx, dy)`.
+fn translate(insts: &mut [Instance], dx: f32, dy: f32) {
+    for i in insts {
+        i.rect[0] += dx;
+        i.rect[1] += dy;
+    }
+}
+
+/// Darken instance colors (RGB only) for an unfocused/dimmed tile.
+fn dim_colors(insts: &mut [Instance]) {
+    const DIM: f32 = 0.55;
+    for i in insts {
+        for c in i.color.iter_mut().take(3) {
+            *c *= DIM;
+        }
+    }
+}
+
+/// A solid filled quad covering `rect`.
+fn solid(rect: RectPx, color: [f32; 4]) -> Instance {
+    Instance {
+        rect: [rect.x, rect.y, rect.w, rect.h],
+        uv: OPAQUE_UV,
+        color,
+    }
+}
+
+/// Push four thin solid quads outlining `rect`. Top/bottom span the full width;
+/// the left/right quads are inset to the interior height so the four quads never
+/// overlap — otherwise corners would be covered twice and blend darker for a
+/// translucent border color.
+fn push_border(out: &mut Vec<Instance>, rect: RectPx, color: [f32; 4], width: f32) {
+    let RectPx { x, y, w, h } = rect;
+    let inner_y = y + width;
+    let inner_h = (h - 2.0 * width).max(0.0);
+    out.push(solid(RectPx { x, y, w, h: width }, color)); // top
+    out.push(solid(
+        RectPx {
+            x,
+            y: y + h - width,
+            w,
+            h: width,
+        },
+        color,
+    )); // bottom
+    out.push(solid(
+        RectPx {
+            x,
+            y: inner_y,
+            w: width,
+            h: inner_h,
+        },
+        color,
+    )); // left
+    out.push(solid(
+        RectPx {
+            x: x + w - width,
+            y: inner_y,
+            w: width,
+            h: inner_h,
+        },
+        color,
+    )); // right
+}
+
+fn badge_color(kind: BadgeKind) -> [f32; 4] {
+    match kind {
+        BadgeKind::Bell => [0.95, 0.75, 0.20, 1.0],
+        BadgeKind::Activity => [0.30, 0.70, 0.95, 1.0],
+    }
+}
+
+/// Clamp a float rect to a framebuffer-pixel scissor `[x, y, w, h]` within
+/// `sw`×`sh`. The result always satisfies `x + w <= sw` and `y + h <= sh`.
+fn clamp_scissor(r: RectPx, sw: u32, sh: u32) -> [u32; 4] {
+    let x0 = (r.x.max(0.0).floor() as u32).min(sw);
+    let y0 = (r.y.max(0.0).floor() as u32).min(sh);
+    let x1 = ((r.x + r.w).max(0.0).ceil() as u32).min(sw);
+    let y1 = ((r.y + r.h).max(0.0).ceil() as u32).min(sh);
+    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+}
+
 /// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
 /// built once and reused across frames.
 pub struct Renderer {
@@ -663,8 +754,16 @@ impl Renderer {
     }
 
     /// Build the per-frame instance list: cell backgrounds + cursor block first,
-    /// then glyph quads on top.
-    fn build_instances(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Vec<Instance> {
+    /// then glyph quads on top. Coordinates are frame-local (origin `(0, 0)`);
+    /// the scene path translates them to the tile's rect. `selection` is passed
+    /// explicitly so each terminal in a scene carries its own.
+    fn build_instances(
+        &mut self,
+        frame: &Frame,
+        font: FontRef,
+        size_px: f32,
+        selection: Option<Selection>,
+    ) -> Vec<Instance> {
         let metrics = frame.metrics;
         let baseline = metrics.line_height * 0.8;
         let cursor = frame.cursor;
@@ -676,7 +775,7 @@ impl Renderer {
         // Selection highlight: one translucent rect per selected row, computed
         // straight from cell geometry (trimmed trailing blanks carry no run, so
         // it can't be derived from runs). Drawn over backgrounds, under glyphs.
-        if let Some(sel) = self.selection {
+        if let Some(sel) = selection {
             let [r, g, b] = self.theme.selection;
             let color = [
                 f32::from(r) / 255.0,
@@ -759,7 +858,7 @@ impl Renderer {
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
     fn prepare(&mut self, frame: &Frame, font: FontRef, size_px: f32, vw: u32, vh: u32) {
-        let instances = self.build_instances(frame, font, size_px);
+        let instances = self.build_instances(frame, font, size_px, self.selection);
         self.instance_count = instances.len() as u32;
         self.instances = Some(self.gpu.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -850,6 +949,228 @@ impl Renderer {
             rgba,
         }
     }
+
+    /// Build a scene's combined instance list plus the per-item draw groups
+    /// (each carrying the scissor rect it must be clipped to). Layers are walked
+    /// low `z` to high; items keep insertion order within a layer. A `Terminal`
+    /// reuses [`Self::build_instances`] translated to its rect and clipped to it
+    /// (without the clip, neighbouring tiles would bleed into each other).
+    fn build_scene(
+        &mut self,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+    ) -> (Vec<Instance>, Vec<DrawGroup>) {
+        let (sw, sh) = scene.size_px;
+        let mut all: Vec<Instance> = Vec::new();
+        let mut groups: Vec<DrawGroup> = Vec::new();
+        let mut order: Vec<&Layer> = scene.layers.iter().collect();
+        order.sort_by_key(|l| l.z); // stable: keeps insertion order within a z
+
+        for layer in order {
+            for item in &layer.items {
+                let start = all.len() as u32;
+                // Only terminals clip to their rect; chrome may legitimately draw
+                // anywhere (e.g. a border one pixel outside its content box).
+                let scissor = match item {
+                    SceneItem::Terminal { rect, .. } => clamp_scissor(*rect, sw, sh),
+                    _ => [0, 0, sw, sh],
+                };
+                match item {
+                    SceneItem::Terminal {
+                        rect,
+                        frame,
+                        selection,
+                        dim,
+                        ..
+                    } => {
+                        let mut insts = self.build_instances(frame, font, size_px, *selection);
+                        translate(&mut insts, rect.x, rect.y);
+                        if *dim {
+                            dim_colors(&mut insts);
+                        }
+                        all.extend(insts);
+                    }
+                    SceneItem::Rect { rect, color, .. } => all.push(solid(*rect, *color)),
+                    SceneItem::Border {
+                        rect, color, width, ..
+                    } => push_border(&mut all, *rect, *color, *width),
+                    SceneItem::Badge { rect, kind, .. } => {
+                        all.push(solid(*rect, badge_color(*kind)))
+                    }
+                    SceneItem::Text {
+                        rect,
+                        runs,
+                        metrics,
+                        color,
+                        ..
+                    } => {
+                        let t = self.text_instances(*rect, runs, *metrics, *color, font, size_px);
+                        all.extend(t);
+                    }
+                }
+                let end = all.len() as u32;
+                if end > start {
+                    groups.push(DrawGroup {
+                        scissor,
+                        range: start..end,
+                    });
+                }
+            }
+        }
+        (all, groups)
+    }
+
+    /// Glyph instances for a text item: its runs laid out as one line from
+    /// `rect`'s origin, all glyphs in the item's color (chrome labels ignore
+    /// per-run fg).
+    fn text_instances(
+        &mut self,
+        rect: RectPx,
+        runs: &[Run],
+        metrics: CellMetrics,
+        color: [f32; 4],
+        font: FontRef,
+        size_px: f32,
+    ) -> Vec<Instance> {
+        let baseline = rect.y + metrics.line_height * 0.8;
+        let mut out = Vec::new();
+        for run in runs {
+            let starts = cell_starts(&run.text);
+            for g in ghost_shaper::shape(font, &run.text, size_px) {
+                let cell = starts.get(&g.cluster).copied().unwrap_or(0);
+                let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
+                if let Some(slot) = self.ensure_glyph(font, g.id, size_px) {
+                    out.push(Instance {
+                        rect: [
+                            pen + slot.left as f32,
+                            baseline - slot.top as f32,
+                            slot.w as f32,
+                            slot.h as f32,
+                        ],
+                        uv: Self::slot_uv(&slot),
+                        color,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Upload a scene's instances and viewport uniform; return the draw groups.
+    fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<DrawGroup> {
+        let (instances, groups) = self.build_scene(scene, font, size_px);
+        self.instance_count = instances.len() as u32;
+        self.instances = Some(self.gpu.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("scene instances"),
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+        let (vw, vh) = scene.size_px;
+        let uniforms = Uniforms {
+            viewport: [vw as f32, vh as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        groups
+    }
+
+    /// Clear once, then draw each group under its own scissor rect.
+    fn encode_scene(&self, view: &wgpu::TextureView, groups: &[DrawGroup]) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scene"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(self.theme.bg[0]) / 255.0,
+                            g: f64::from(self.theme.bg[1]) / 255.0,
+                            b: f64::from(self.theme.bg[2]) / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // The `> 0` guard mirrors `encode`: an empty scene (e.g. a blank
+            // screen with a hidden cursor) produces no instances, and slicing a
+            // zero-size vertex buffer panics. The clear above still happens, so
+            // an empty scene reads back as the solid background — byte-identical
+            // to `render_offscreen` on the same empty frame.
+            if let Some(buf) = &self.instances
+                && self.instance_count > 0
+            {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                for g in groups {
+                    if g.scissor[2] == 0 || g.scissor[3] == 0 {
+                        continue; // fully off-screen tile: nothing to draw
+                    }
+                    pass.set_scissor_rect(g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]);
+                    pass.draw(0..6, g.range.clone());
+                }
+            }
+        }
+        encoder.finish()
+    }
+
+    /// Render a scene into a window surface's texture view. `scene.size_px` must
+    /// equal `view`'s dimensions: it drives both the NDC viewport and the
+    /// scissor clamp, so a mismatch (e.g. mid-resize) would scissor past the
+    /// attachment. The caller owns acquiring/presenting the surface texture.
+    pub fn render_scene_to_view(
+        &mut self,
+        view: &wgpu::TextureView,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+    ) {
+        let groups = self.prepare_scene(scene, font, size_px);
+        let cb = self.encode_scene(view, &groups);
+        self.gpu.queue.submit([cb]);
+    }
+
+    /// Render a scene to an offscreen target and read the pixels back. For a
+    /// single full-window `Terminal` this is byte-identical to
+    /// [`Self::render_offscreen`] (pinned by a golden test).
+    pub fn render_offscreen_scene(
+        &mut self,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+    ) -> Rendered {
+        let w = scene.size_px.0.max(1);
+        let h = scene.size_px.1.max(1);
+        let groups = self.prepare_scene(scene, font, size_px);
+        let target = offscreen_target(&self.gpu.device, w, h, self.format);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let cb = self.encode_scene(&view, &groups);
+        self.gpu.queue.submit([cb]);
+        let rgba = read_back(&self.gpu, &target, w, h);
+        Rendered {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
 }
 
 /// Convenience: render a single frame offscreen on a fresh headless renderer.
@@ -860,6 +1181,207 @@ pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, theme: Theme) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, layout_frame};
+    use ghost_term::Vt;
+
+    const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
+    const SIZE_PX: f32 = 15.0;
+    const TM: CellMetrics = CellMetrics {
+        advance: 9.0,
+        line_height: 18.0,
+    };
+
+    fn frame(cols: usize, rows: usize, s: &str) -> Frame {
+        let mut v = Vt::new(cols, rows);
+        v.feed_str(s);
+        layout_frame(&v, TM)
+    }
+
+    fn px(img: &Rendered, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * img.width + x) * 4) as usize;
+        [
+            img.rgba[i],
+            img.rgba[i + 1],
+            img.rgba[i + 2],
+            img.rgba[i + 3],
+        ]
+    }
+
+    fn is_red(p: [u8; 4]) -> bool {
+        p[0] > 0x60 && p[1] < 0x20 && p[2] < 0x20
+    }
+
+    #[test]
+    fn single_terminal_scene_matches_render_offscreen() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let f = frame(20, 3, "hello\r\nworld\x1b[1;7mX");
+        let (w, h) = Renderer::frame_size(&f);
+
+        let direct = Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX);
+
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            }],
+        };
+        let via_scene =
+            Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
+
+        assert_eq!(
+            (direct.width, direct.height),
+            (via_scene.width, via_scene.height)
+        );
+        assert_eq!(
+            direct.rgba, via_scene.rgba,
+            "a single full-window Terminal scene must be byte-identical to render_offscreen"
+        );
+    }
+
+    #[test]
+    fn scissor_clips_terminal_to_its_rect() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // A full red-background row ~180px wide.
+        let f = frame(20, 1, "\x1b[41mXXXXXXXXXXXXXXXXXXXX");
+        let mut r = Renderer::headless(Theme::default());
+        let scene = Scene {
+            size_px: (200, 40),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Terminal {
+                    id: SceneId::Tile(1),
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 50.0, // clip the 180px of content to the left 50px
+                        h: 40.0,
+                    },
+                    frame: f,
+                    selection: None,
+                    dim: false,
+                }],
+            }],
+        };
+        let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
+
+        let red_inside = (0..50).any(|x| (0..40).any(|y| is_red(px(&img, x, y))));
+        assert!(
+            red_inside,
+            "the tile must render its red background inside its rect"
+        );
+        let red_outside = (60..200).any(|x| (0..40).any(|y| is_red(px(&img, x, y))));
+        assert!(
+            !red_outside,
+            "red must not bleed past the tile's scissor rect (x >= 60)"
+        );
+    }
+
+    #[test]
+    fn empty_scene_does_not_panic_and_matches_render_offscreen() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // A blank screen with the cursor hidden: no runs, no cursor => zero
+        // instances. Slicing a zero-size vertex buffer used to panic here.
+        let f = frame(20, 3, "\x1b[?25l");
+        let (w, h) = Renderer::frame_size(&f);
+        let direct = Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX);
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            }],
+        };
+        let via_scene =
+            Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
+        assert_eq!(
+            direct.rgba, via_scene.rgba,
+            "empty scene == cleared background"
+        );
+    }
+
+    #[test]
+    fn translucent_border_corners_match_edges() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut r = Renderer::headless(Theme::default());
+        let scene = Scene {
+            size_px: (60, 60),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Border {
+                    id: SceneId::Tile(1),
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 60.0,
+                        h: 60.0,
+                    },
+                    color: [1.0, 0.0, 0.0, 0.5], // translucent red
+                    width: 6.0,
+                }],
+            }],
+        };
+        let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
+        // A corner pixel and a top-edge-midpoint pixel must blend identically:
+        // with overlapping quads the corner would be drawn (and darkened) twice.
+        assert_eq!(
+            px(&img, 1, 1),
+            px(&img, 30, 1),
+            "corner and edge must blend the same (no double-coverage)"
+        );
+    }
+
+    #[test]
+    fn scene_draws_a_solid_rect() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut r = Renderer::headless(Theme::default());
+        let scene = Scene {
+            size_px: (40, 40),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Rect {
+                    id: SceneId::Sidebar,
+                    rect: RectPx {
+                        x: 10.0,
+                        y: 10.0,
+                        w: 20.0,
+                        h: 20.0,
+                    },
+                    color: [0.0, 1.0, 0.0, 1.0], // opaque green
+                    radius: 0.0,
+                }],
+            }],
+        };
+        let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
+        assert_eq!(px(&img, 20, 20), [0, 255, 0, 255], "rect interior is green");
+        assert_eq!(
+            px(&img, 2, 2),
+            [0x10, 0x10, 0x12, 255],
+            "outside the rect is the clear background"
+        );
+    }
 
     #[test]
     fn index_to_rgb_matches_xterm() {
