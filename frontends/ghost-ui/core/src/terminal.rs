@@ -47,6 +47,16 @@ enum Scroll {
     Bottom,
 }
 
+/// Granularity of an in-progress selection drag, latched at press: a plain drag
+/// selects by cell; a double-click drag extends by whole words; a triple-click
+/// drag by whole lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectMode {
+    Char,
+    Word,
+    Line,
+}
+
 /// A frontend-handled key combo intercepted before encoding so it drives the
 /// app, not the child.
 pub enum Shortcut {
@@ -111,6 +121,8 @@ pub struct TerminalModel {
     gesture_report: bool,
     /// Selection anchor while dragging, 0-based `(row, col)`.
     sel_anchor: Option<(usize, usize)>,
+    /// Granularity of the active drag (cell / word / line), latched at press.
+    sel_mode: SelectMode,
     selection: Option<Selection>,
     /// Lines scrolled up into history; 0 = pinned to the live bottom.
     scroll_offset: usize,
@@ -142,6 +154,7 @@ impl TerminalModel {
             held: None,
             gesture_report: false,
             sel_anchor: None,
+            sel_mode: SelectMode::Char,
             selection: None,
             scroll_offset: 0,
             preedit: String::new(),
@@ -552,6 +565,44 @@ impl TerminalModel {
         )
     }
 
+    /// Extend a drag selection from `anchor` to `active` (both 0-based viewport
+    /// `(row, col)`) at the latched granularity: by cell, or growing to cover the
+    /// whole words / lines that contain both endpoints. On a blank cell (no word
+    /// or line) the endpoint degrades to that single cell.
+    fn extend_selection(
+        &self,
+        anchor: (usize, usize),
+        active: (usize, usize),
+    ) -> Option<Selection> {
+        match self.sel_mode {
+            SelectMode::Char => Some(Selection::new(anchor, active)),
+            SelectMode::Word => {
+                let a = self
+                    .word_at(anchor.0, anchor.1)
+                    .unwrap_or_else(|| Selection::new(anchor, anchor));
+                let b = self
+                    .word_at(active.0, active.1)
+                    .unwrap_or_else(|| Selection::new(active, active));
+                Some(Selection {
+                    start: a.start.min(b.start),
+                    end: a.end.max(b.end),
+                })
+            }
+            SelectMode::Line => {
+                let a = self
+                    .line_at(anchor.0)
+                    .unwrap_or_else(|| Selection::new(anchor, anchor));
+                let b = self
+                    .line_at(active.0)
+                    .unwrap_or_else(|| Selection::new(active, active));
+                Some(Selection {
+                    start: a.start.min(b.start),
+                    end: a.end.max(b.end),
+                })
+            }
+        }
+    }
+
     /// The word under viewport cell `(row, col)` — a maximal run of word cells —
     /// as an inclusive selection, or `None` on a blank/non-word cell. Reads the
     /// scrolled-back view by cell (not `screen.text()`, whose char indices don't
@@ -627,7 +678,7 @@ impl TerminalModel {
                     } else if b == mouse::Button::Left
                         && let Some(anchor) = self.sel_anchor
                     {
-                        self.selection = Some(Selection::new(anchor, self.pointer_cell0()));
+                        self.selection = self.extend_selection(anchor, self.pointer_cell0());
                         vec![Cmd::Redraw]
                     } else {
                         Vec::new()
@@ -654,17 +705,24 @@ impl TerminalModel {
                     cmds
                 } else if b == mouse::Button::Left {
                     if clicks >= 2 && self.cursor_cell.is_some() {
-                        // Double-click selects the word, triple-click the line.
-                        // It's a one-shot selection, not a drag anchor.
+                        // Double-click selects the word, triple-click the line, and
+                        // latches that granularity so a drag extends by it.
                         let (row, col) = self.pointer_cell0();
-                        self.sel_anchor = None;
+                        self.sel_anchor = Some((row, col));
+                        self.sel_mode = if clicks == 2 {
+                            SelectMode::Word
+                        } else {
+                            SelectMode::Line
+                        };
                         self.selection = if clicks == 2 {
                             self.word_at(row, col)
                         } else {
                             self.line_at(row)
                         };
                     } else {
-                        // Begin a drag selection (anchor once the pointer is known).
+                        // Begin a by-cell drag selection (anchor once the pointer
+                        // is known).
+                        self.sel_mode = SelectMode::Char;
                         self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
                         self.selection = None;
                     }
@@ -1172,6 +1230,64 @@ mod tests {
         m.update(press_n(9.0, 1.0, 1));
         // A plain click anchors a drag and shows no selection yet.
         assert_eq!(m.selection(), None);
+    }
+
+    #[test]
+    fn double_click_drag_extends_by_whole_words() {
+        let mut m = model();
+        feed(&mut m, b"foo bar baz"); // foo=0..=2, bar=4..=6, baz=8..=10
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0)); // col 0, in "foo"
+        m.update(press_n(1.0, 1.0, 2));
+        assert_eq!(
+            m.selection(),
+            Some(Selection::new((0, 0), (0, 2))),
+            "the double-click selects just the word"
+        );
+        // Drag into the MIDDLE of "baz" (col 9): the selection grows to the whole
+        // word, not merely to the cell under the pointer.
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            9.0 * 9.0 + 1.0,
+            1.0,
+        ));
+        assert_eq!(
+            m.selection(),
+            Some(Selection {
+                start: (0, 0),
+                end: (0, 10)
+            }),
+            "the drag extends by whole words, through the end of 'baz'"
+        );
+    }
+
+    #[test]
+    fn triple_click_drag_extends_by_whole_lines() {
+        let mut m = model();
+        feed(&mut m, b"line one\r\nline two"); // row 0 + row 1, each 0..=7
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0)); // row 0
+        m.update(press_n(1.0, 1.0, 3));
+        assert_eq!(
+            m.selection(),
+            Some(Selection::new((0, 0), (0, 7))),
+            "the triple-click selects just the first line"
+        );
+        // Drag down onto row 1 (line height 18): the selection covers both whole
+        // lines regardless of the column under the pointer.
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            30.0,
+            20.0,
+        ));
+        assert_eq!(
+            m.selection(),
+            Some(Selection {
+                start: (0, 0),
+                end: (1, 7)
+            }),
+            "the drag extends by whole lines, through the end of row 1"
+        );
     }
 
     #[test]
