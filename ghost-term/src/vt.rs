@@ -124,6 +124,13 @@ impl Vt {
         self.terminal.modify_other_keys()
     }
 
+    /// The active kitty keyboard progressive-enhancement flags (0 = legacy), as
+    /// negotiated via `CSI > flags u` / `CSI = flags ; mode u`. Supersedes
+    /// modifyOtherKeys; the frontend key encoder reads it to pick `CSI u` output.
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.terminal.kitty_keyboard_flags()
+    }
+
     /// The active mouse-reporting protocol (DEC modes 1000/1002/1003). When more
     /// than one is somehow enabled, the most permissive wins.
     pub fn mouse_protocol(&self) -> MouseProtocol {

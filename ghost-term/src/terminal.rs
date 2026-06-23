@@ -17,6 +17,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::mem;
 
+/// Upper bound on the kitty-keyboard push/pop stack depth (a DoS guard; the spec
+/// leaves the limit vendor-defined). Deeper nests just drop their oldest saved
+/// flag-set.
+const KITTY_KBD_STACK_MAX: usize = 32;
+
 #[derive(Debug)]
 pub struct Terminal {
     cols: usize,
@@ -38,6 +43,15 @@ pub struct Terminal {
     /// xterm modifyOtherKeys level (XTMODKEYS resource 4): 0 off, 1, 2. Drives
     /// the frontend key encoder; re-emitted on dump so it survives a reattach.
     modify_other_keys: u8,
+    /// kitty keyboard protocol — the currently-active progressive-enhancement
+    /// flags (supersedes modifyOtherKeys when non-zero). `kitty_kbd_stack` holds
+    /// the saved flag-sets a push/pop nest restores. Both re-emitted on dump.
+    /// The spec mandates independent stacks per screen, so the alternate screen's
+    /// flags/stack are parked here and swapped in on the alt-buffer transition.
+    kitty_kbd: u8,
+    kitty_kbd_stack: Vec<u8>,
+    alternate_kitty_kbd: u8,
+    alternate_kitty_kbd_stack: Vec<u8>,
     top_margin: usize,
     bottom_margin: usize,
     saved_ctx: SavedCtx,
@@ -127,6 +141,10 @@ impl Terminal {
             new_line_mode: false,
             cursor_keys_mode: CursorKeysMode::Normal,
             modify_other_keys: 0,
+            kitty_kbd: 0,
+            kitty_kbd_stack: Vec::new(),
+            alternate_kitty_kbd: 0,
+            alternate_kitty_kbd_stack: Vec::new(),
             top_margin: 0,
             bottom_margin: (rows - 1),
             saved_ctx: SavedCtx::default(),
@@ -282,6 +300,30 @@ impl Terminal {
 
             Il(n) => {
                 self.il(n);
+            }
+
+            KittyKeyboardPush(flags) => {
+                // Save the current flags, then make `flags` current. Bound the
+                // saved depth (drop the oldest) as a DoS guard — only pathologically
+                // deep nests lose history, and `current` stays correct.
+                if self.kitty_kbd_stack.len() >= KITTY_KBD_STACK_MAX {
+                    self.kitty_kbd_stack.remove(0);
+                }
+                self.kitty_kbd_stack.push(self.kitty_kbd);
+                self.kitty_kbd = flags;
+            }
+            KittyKeyboardPop(n) => {
+                // Restore from the stack; popping past empty resets to 0 (legacy).
+                for _ in 0..n {
+                    self.kitty_kbd = self.kitty_kbd_stack.pop().unwrap_or(0);
+                }
+            }
+            KittyKeyboardSet(flags, mode) => {
+                self.kitty_kbd = match mode {
+                    2 => self.kitty_kbd | flags,  // set the named bits
+                    3 => self.kitty_kbd & !flags, // clear the named bits
+                    _ => flags,                   // mode 1: set exactly
+                };
             }
 
             Lf => {
@@ -551,6 +593,7 @@ impl Terminal {
         if let BufferType::Primary = self.active_buffer_type {
             self.active_buffer_type = BufferType::Alternate;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
+            self.swap_kitty_kbd_screen_state();
             mem::swap(&mut self.buffer, &mut self.other_buffer);
             self.buffer = Buffer::new(self.cols, self.rows, Some(0), Some(&self.pen));
             self.dirty_lines.extend(0..self.rows);
@@ -561,9 +604,21 @@ impl Terminal {
         if let BufferType::Alternate = self.active_buffer_type {
             self.active_buffer_type = BufferType::Primary;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
+            self.swap_kitty_kbd_screen_state();
             mem::swap(&mut self.buffer, &mut self.other_buffer);
             self.dirty_lines.extend(0..self.rows);
         }
+    }
+
+    /// Park the active kitty keyboard flags/stack and bring in the other screen's
+    /// — the kitty protocol requires the main and alternate screens to keep
+    /// independent keyboard-mode stacks.
+    fn swap_kitty_kbd_screen_state(&mut self) {
+        mem::swap(&mut self.kitty_kbd, &mut self.alternate_kitty_kbd);
+        mem::swap(
+            &mut self.kitty_kbd_stack,
+            &mut self.alternate_kitty_kbd_stack,
+        );
     }
 
     // resizing
@@ -657,6 +712,10 @@ impl Terminal {
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
         self.modify_other_keys = 0;
+        self.kitty_kbd = 0;
+        self.kitty_kbd_stack.clear();
+        self.alternate_kitty_kbd = 0;
+        self.alternate_kitty_kbd_stack.clear();
         self.top_margin = 0;
         self.bottom_margin = self.rows - 1;
         self.saved_ctx = SavedCtx::default();
@@ -723,6 +782,12 @@ impl Terminal {
         self.modify_other_keys
     }
 
+    /// The active kitty keyboard progressive-enhancement flags (0 = legacy).
+    /// Supersedes modifyOtherKeys when non-zero — see [`Function::KittyKeyboardSet`].
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.kitty_kbd
+    }
+
     /// Whether a tracked non-display mode (mouse/focus/paste) is enabled.
     pub(crate) fn mode_enabled(&self, mode: DecMode) -> bool {
         self.tracked_modes.contains(&mode)
@@ -767,6 +832,9 @@ impl Terminal {
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
         assert_eq!(self.modify_other_keys, other.modify_other_keys);
+        // Only the resolved current flags survive a dump/resync — the push/pop
+        // stack is the app's transient state and is deliberately not re-emitted.
+        assert_eq!(self.kitty_kbd, other.kitty_kbd);
         assert_eq!(self.top_margin, other.top_margin);
         assert_eq!(self.bottom_margin, other.bottom_margin);
         assert_eq!(self.saved_ctx, other.saved_ctx);
@@ -1700,6 +1768,13 @@ impl Terminal {
         // app negotiated before this client connected.
         if self.modify_other_keys != 0 {
             funs.push(Function::ModifyOtherKeys(self.modify_other_keys));
+        }
+
+        // re-arm the kitty keyboard flags. A reattaching client starts with an
+        // empty stack, so re-emit the resolved current flags via the set form
+        // (idempotent) rather than replaying the app's push/pop history.
+        if self.kitty_kbd != 0 {
+            funs.push(Function::KittyKeyboardSet(self.kitty_kbd, 1));
         }
 
         // 15. re-enable non-display modes (mouse / focus / paste). Order is
@@ -3338,6 +3413,65 @@ mod tests {
             term.dump().contains(&Function::ModifyOtherKeys(2)),
             "modifyOtherKeys must be re-emitted on dump"
         );
+    }
+
+    #[test]
+    fn execute_kitty_keyboard() {
+        let mut term = Terminal::new((4, 2), None);
+        assert_eq!(term.kitty_keyboard_flags(), 0);
+
+        // Push makes the flags current; a nested push then pop restores them.
+        term.execute(Function::KittyKeyboardPush(1));
+        assert_eq!(term.kitty_keyboard_flags(), 1);
+        term.execute(Function::KittyKeyboardPush(9));
+        assert_eq!(term.kitty_keyboard_flags(), 9);
+        term.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(term.kitty_keyboard_flags(), 1);
+
+        // Set modes: 2 ORs bits in, 3 clears bits, 1 sets exactly.
+        term.execute(Function::KittyKeyboardSet(4, 2));
+        assert_eq!(term.kitty_keyboard_flags(), 5); // 1 | 4
+        term.execute(Function::KittyKeyboardSet(1, 3));
+        assert_eq!(term.kitty_keyboard_flags(), 4); // 5 & !1
+        term.execute(Function::KittyKeyboardSet(3, 1));
+        assert_eq!(term.kitty_keyboard_flags(), 3);
+
+        // Popping past the bottom of the stack resets to legacy (0).
+        term.execute(Function::KittyKeyboardPop(9));
+        assert_eq!(term.kitty_keyboard_flags(), 0);
+
+        // The resolved current flags are re-emitted on dump (as the set form);
+        // RIS clears them.
+        term.execute(Function::KittyKeyboardPush(5));
+        assert!(
+            term.dump().contains(&Function::KittyKeyboardSet(5, 1)),
+            "kitty keyboard flags must be re-emitted on dump"
+        );
+        term.execute(Function::Ris);
+        assert_eq!(term.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_keyboard_flags_are_per_screen() {
+        let mut term = Terminal::new((4, 2), None);
+        // Primary screen negotiates disambiguate.
+        term.execute(Function::KittyKeyboardSet(1, 1));
+        assert_eq!(term.kitty_keyboard_flags(), 1);
+
+        // Entering the alternate screen (DECSET 1049) starts with its own,
+        // independent (empty) keyboard stack — the spec mandates separate stacks.
+        term.execute(Function::Decset(DecModes::one(
+            DecMode::SaveCursorAltScreenBuffer,
+        )));
+        assert_eq!(term.kitty_keyboard_flags(), 0);
+        term.execute(Function::KittyKeyboardPush(9));
+        assert_eq!(term.kitty_keyboard_flags(), 9);
+
+        // Returning to the primary screen restores its flags — no leak either way.
+        term.execute(Function::Decrst(DecModes::one(
+            DecMode::SaveCursorAltScreenBuffer,
+        )));
+        assert_eq!(term.kitty_keyboard_flags(), 1);
     }
 
     #[test]

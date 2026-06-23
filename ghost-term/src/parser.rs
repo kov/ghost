@@ -74,6 +74,15 @@ pub enum Function {
     Hts,
     Ich(u16),
     Il(u16),
+    /// kitty keyboard protocol — push the current flags and make `flags` current
+    /// (`CSI > flags u`, flags default 0).
+    KittyKeyboardPush(u8),
+    /// kitty keyboard protocol — pop `n` saved flag-sets, restoring the exposed
+    /// one (`CSI < n u`, n default 1; popping past empty resets to 0).
+    KittyKeyboardPop(u16),
+    /// kitty keyboard protocol — set the current flags (`CSI = flags ; mode u`):
+    /// mode 1 = set exactly (default), 2 = set named bits, 3 = clear named bits.
+    KittyKeyboardSet(u8, u8),
     Lf,
     /// xterm modifyOtherKeys level (XTMODKEYS resource 4): `CSI > 4 ; Pv m`.
     /// 0 = off, 1 = report keys lacking an unambiguous legacy byte, 2 = also
@@ -901,6 +910,22 @@ impl Parser {
             // (the terminal ignores it) instead of wrapping into a valid code.
             (Some(' '), 'q') => Some(SetCursorStyle(ps[0].as_u16().min(255) as u8)),
 
+            // kitty keyboard protocol negotiation. The marker disambiguates the
+            // three forms; `CSI u` with no marker stays SCO restore-cursor above,
+            // and the `CSI ? u` query (no state change) falls through — it is
+            // answered by the query scanner, not tracked here.
+            (Some('>'), 'u') => Some(KittyKeyboardPush(ps[0].as_u16().min(255) as u8)),
+            (Some('<'), 'u') => Some(KittyKeyboardPop(ps[0].as_u16().max(1))),
+            (Some('='), 'u') => {
+                let flags = ps[0].as_u16().min(255) as u8;
+                let mode = match ps[1].as_u16() {
+                    2 => 2,
+                    3 => 3,
+                    _ => 1,
+                };
+                Some(KittyKeyboardSet(flags, mode))
+            }
+
             _ => None,
         }
     }
@@ -1199,6 +1224,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Hts => push_esc(seq, None, 'H'),
         Ich(n) => push_csi(seq, None, &[n.to_string()], '@'),
         Il(n) => push_csi(seq, None, &[n.to_string()], 'L'),
+        KittyKeyboardPush(flags) => push_csi(seq, Some('>'), &[flags.to_string()], 'u'),
+        KittyKeyboardPop(n) => push_csi(seq, Some('<'), &[n.to_string()], 'u'),
+        KittyKeyboardSet(flags, mode) => {
+            push_csi(seq, Some('='), &[flags.to_string(), mode.to_string()], 'u')
+        }
         Lf => seq.push('\n'),
         ModifyOtherKeys(level) => {
             push_csi(seq, Some('>'), &["4".to_owned(), level.to_string()], 'm')
@@ -2063,6 +2093,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_kitty_keyboard() {
+        // Push flags (flags default 0 when omitted).
+        assert_eq!(parse("\x1b[>1u"), [KittyKeyboardPush(1)]);
+        assert_eq!(parse("\x1b[>u"), [KittyKeyboardPush(0)]);
+        // Pop n entries (n defaults to 1; an explicit 0 is also treated as 1).
+        assert_eq!(parse("\x1b[<3u"), [KittyKeyboardPop(3)]);
+        assert_eq!(parse("\x1b[<u"), [KittyKeyboardPop(1)]);
+        // Set flags with a mode (mode defaults to 1 = set-exact).
+        assert_eq!(parse("\x1b[=5;3u"), [KittyKeyboardSet(5, 3)]);
+        assert_eq!(parse("\x1b[=5u"), [KittyKeyboardSet(5, 1)]);
+        // The query (CSI ? u) changes no state — it is answered by the query
+        // scanner, not turned into a Function here.
+        assert_eq!(parse("\x1b[?u"), []);
+        // A bare CSI u is still SCO restore-cursor, not a kitty sequence.
+        assert_eq!(parse("\x1b[u"), [Scorc]);
+    }
+
+    #[test]
     fn parse_osc_title() {
         // OSC 0 (icon + title) and OSC 2 (title) both set the window title,
         // terminated by BEL, C1 ST, or ESC \.
@@ -2331,6 +2379,12 @@ mod tests {
             Hts,
             Ich(16),
             Il(16),
+            KittyKeyboardPush(0),
+            KittyKeyboardPush(15),
+            KittyKeyboardPop(1),
+            KittyKeyboardPop(3),
+            KittyKeyboardSet(5, 1),
+            KittyKeyboardSet(9, 3),
             Lf,
             ModifyOtherKeys(0),
             ModifyOtherKeys(1),

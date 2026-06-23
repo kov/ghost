@@ -128,6 +128,12 @@ impl Screen {
         &self.vt
     }
 
+    /// The active kitty keyboard flags — the host answers a `CSI ? u` query with
+    /// these while detached (mirroring how it answers DA/cursor/size queries).
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.vt.kitty_keyboard_flags()
+    }
+
     /// Cursor position as 1-based `(col, row)` — the form a cursor-position
     /// report (CPR) carries. `avt` tracks the cursor 0-based.
     pub fn cursor(&self) -> (u16, u16) {

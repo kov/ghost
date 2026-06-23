@@ -31,17 +31,22 @@ pub enum Query {
     SecondaryDeviceAttributes,
     /// `CSI 18 t` — report text-area size in characters. Reply: `CSI 8 ; rows ; cols t`.
     TextAreaSize,
+    /// `CSI ? u` — kitty keyboard protocol flags query. Reply: `CSI ? flags u`
+    /// with the terminal's current progressive-enhancement flags. Answering it
+    /// (before the DA reply) is how an app detects kitty-keyboard support.
+    KittyKeyboardFlags,
 }
 
 impl Query {
     /// The reply bytes to write back to the child's PTY. `cursor` is the 1-based
-    /// `(col, row)` cursor position and `size` is `(cols, rows)`.
+    /// `(col, row)` cursor position, `size` is `(cols, rows)`, and `kitty_flags`
+    /// is the current kitty-keyboard flags (only the kitty query uses it).
     ///
     /// The device-attribute strings mirror VTE's non-test replies: DA1 reports a
     /// VT100-level (61) terminal with 132-column mode (1), horizontal scrolling
     /// (21), colour (22) and rectangular editing (28); DA2 reports the same level
     /// with VTE's version encoding as the firmware field.
-    pub fn reply(&self, cursor: (u16, u16), size: (u16, u16)) -> Vec<u8> {
+    pub fn reply(&self, cursor: (u16, u16), size: (u16, u16), kitty_flags: u8) -> Vec<u8> {
         let (col, row) = cursor;
         let (cols, rows) = size;
         match self {
@@ -50,6 +55,7 @@ impl Query {
             Query::PrimaryDeviceAttributes => b"\x1b[?61;1;21;22;28c".to_vec(),
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
+            Query::KittyKeyboardFlags => format!("\x1b[?{kitty_flags}u").into_bytes(),
         }
     }
 }
@@ -192,6 +198,12 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
             b"18" => Some(Query::TextAreaSize),
             _ => None,
         },
+        // kitty keyboard flags query: `CSI ? u`. A bare `CSI u` (empty params) is
+        // SCO restore-cursor, not a query, so only the `?`-marked form matches.
+        b'u' => match params {
+            b"?" => Some(Query::KittyKeyboardFlags),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -213,6 +225,7 @@ mod tests {
         assert_eq!(scan_all(b"\x1b[>c"), [Query::SecondaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[>0c"), [Query::SecondaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[18t"), [Query::TextAreaSize]);
+        assert_eq!(scan_all(b"\x1b[?u"), [Query::KittyKeyboardFlags]);
     }
 
     #[test]
@@ -222,6 +235,7 @@ mod tests {
         assert!(scan_all(b"\x1b[8;24;80t").is_empty()); // a resize op, not a query
         assert!(scan_all(b"\x1b[?6n").is_empty()); // DEC-private DSR, left alone
         assert!(scan_all(b"\x1b[>q").is_empty()); // XTVERSION (not answered yet)
+        assert!(scan_all(b"\x1b[u").is_empty()); // bare CSI u is SCO restore-cursor
     }
 
     #[test]
@@ -257,21 +271,30 @@ mod tests {
     #[test]
     fn reply_strings_match_vte() {
         assert_eq!(
-            Query::CursorPosition.reply((5, 3), (80, 24)),
+            Query::CursorPosition.reply((5, 3), (80, 24), 0),
             b"\x1b[3;5R" // row;col, 1-based
         );
-        assert_eq!(Query::DeviceStatus.reply((1, 1), (80, 24)), b"\x1b[0n");
+        assert_eq!(Query::DeviceStatus.reply((1, 1), (80, 24), 0), b"\x1b[0n");
         assert_eq!(
-            Query::PrimaryDeviceAttributes.reply((1, 1), (80, 24)),
+            Query::PrimaryDeviceAttributes.reply((1, 1), (80, 24), 0),
             b"\x1b[?61;1;21;22;28c"
         );
         assert_eq!(
-            Query::SecondaryDeviceAttributes.reply((1, 1), (80, 24)),
+            Query::SecondaryDeviceAttributes.reply((1, 1), (80, 24), 0),
             b"\x1b[>61;8400;1c"
         );
         assert_eq!(
-            Query::TextAreaSize.reply((1, 1), (80, 24)),
+            Query::TextAreaSize.reply((1, 1), (80, 24), 0),
             b"\x1b[8;24;80t" // rows;cols
+        );
+        // The kitty query reports the current flags.
+        assert_eq!(
+            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 0),
+            b"\x1b[?0u"
+        );
+        assert_eq!(
+            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 5),
+            b"\x1b[?5u"
         );
     }
 }

@@ -457,9 +457,10 @@ fn host_main(
                     if client.is_none() && !asked.is_empty() {
                         let cursor = screen.cursor();
                         let size = screen.dimensions();
+                        let kitty_flags = screen.kitty_keyboard_flags();
                         let mut reply = Vec::new();
                         for q in asked {
-                            reply.extend_from_slice(&q.reply(cursor, size));
+                            reply.extend_from_slice(&q.reply(cursor, size, kitty_flags));
                         }
                         let mut w: &pty_process::blocking::Pty = &pty;
                         let _ = w.write_all(&reply);

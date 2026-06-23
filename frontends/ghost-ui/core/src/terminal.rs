@@ -389,7 +389,8 @@ impl TerminalModel {
             None => {
                 let app_cursor = self.screen.vt().cursor_key_app_mode();
                 let modify_other_keys = self.screen.vt().modify_other_keys();
-                match encode::encode(key, mods, app_cursor, modify_other_keys) {
+                let kitty_flags = self.screen.vt().kitty_keyboard_flags();
+                match encode::encode(key, mods, app_cursor, modify_other_keys, kitty_flags) {
                     // Typing returns to the live bottom, then sends the keystroke.
                     Some(bytes) => {
                         let mut cmds = self.snap_to_bottom();
@@ -522,7 +523,8 @@ impl TerminalModel {
             }
             let cursor = self.screen.cursor();
             let size = self.screen.dimensions();
-            let replies = query_replies(&mut self.scanner, bytes, cursor, size);
+            let kitty_flags = self.screen.kitty_keyboard_flags();
+            let replies = query_replies(&mut self.scanner, bytes, cursor, size, kitty_flags);
             if !replies.is_empty() {
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
@@ -827,10 +829,11 @@ pub fn query_replies(
     output: &[u8],
     cursor: (u16, u16),
     size: (u16, u16),
+    kitty_flags: u8,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for query in scanner.scan(output) {
-        out.extend_from_slice(&query.reply(cursor, size));
+        out.extend_from_slice(&query.reply(cursor, size, kitty_flags));
     }
     out
 }
@@ -1340,6 +1343,49 @@ mod tests {
         assert_eq!(
             key(&mut m, Key::Char("i".into()), Mods::CTRL),
             vec![sent("alpha", b"\x09")]
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_disambiguates_keys_after_negotiation() {
+        let mut m = model();
+        // Legacy: Ctrl+I collapses to the Tab byte, Esc is a bare ESC.
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x09")]
+        );
+        // The app pushes kitty disambiguate (flag 1) on its PTY...
+        feed(&mut m, b"\x1b[>1u");
+        // ...so Ctrl+I is now a distinct CSI u report, and Esc disambiguates.
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x1b[105;5u")]
+        );
+        assert_eq!(
+            key(&mut m, Key::Named(NamedKey::Escape), Mods::NONE),
+            vec![sent("alpha", b"\x1b[27u")]
+        );
+        // Popping the stack restores the legacy encoding.
+        feed(&mut m, b"\x1b[<u");
+        assert_eq!(
+            key(&mut m, Key::Char("i".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x09")]
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_query_is_answered_with_the_negotiated_flags() {
+        let mut m = model();
+        // The app enables kitty disambiguate (flag 1) on its PTY, then queries.
+        feed(&mut m, b"\x1b[>1u");
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?u".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[?1u")),
+            "the kitty query must report the negotiated flags, got {cmds:?}"
         );
     }
 
@@ -1892,9 +1938,21 @@ mod tests {
     fn query_replies_answers_cursor_position() {
         let mut s = QueryScanner::new();
         assert_eq!(
-            query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24)),
+            query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24), 0),
             b"\x1b[5;3R"
         );
+    }
+
+    #[test]
+    fn query_replies_answers_the_kitty_keyboard_query_with_current_flags() {
+        let mut s = QueryScanner::new();
+        // `CSI ? u` is answered with the flags passed in (the model supplies the
+        // live `kitty_keyboard_flags()`); a bare `CSI u` is not a query.
+        assert_eq!(
+            query_replies(&mut s, b"\x1b[?u", (1, 1), (80, 24), 5),
+            b"\x1b[?5u"
+        );
+        assert!(query_replies(&mut s, b"\x1b[u", (1, 1), (80, 24), 5).is_empty());
     }
 
     #[test]
