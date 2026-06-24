@@ -112,6 +112,15 @@ impl Client {
         self.conn.queue(msg);
     }
 
+    /// Queue raw output, split so each frame stays under the protocol's size cap.
+    /// A resync re-emitting images can exceed it; splitting raw output at any byte
+    /// boundary is safe (the client concatenates and feeds its parser).
+    fn queue_output(&mut self, bytes: Vec<u8>) {
+        for chunk in crate::protocol::output_chunks(&bytes) {
+            self.conn.queue(&ServerMsg::Output(chunk.to_vec()));
+        }
+    }
+
     /// Write as much of the pending output as the socket will accept.
     fn flush(&mut self) -> io::Result<()> {
         self.conn.flush()
@@ -684,7 +693,7 @@ fn handle_client_messages(
                 }
                 // First resize completes the attach handshake: repaint at size.
                 if !c.resynced {
-                    c.queue(&ServerMsg::Output(screen.resync()));
+                    c.queue_output(screen.resync());
                     c.resynced = true;
                 }
             }
@@ -699,7 +708,7 @@ fn handle_client_messages(
             }
             ClientMsg::Repaint => {
                 if c.resynced {
-                    c.queue(&ServerMsg::Output(screen.resync()));
+                    c.queue_output(screen.resync());
                 }
             }
         }

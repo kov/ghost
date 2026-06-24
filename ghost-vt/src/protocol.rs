@@ -49,6 +49,20 @@ pub enum ServerMsg {
 /// prefixes before we allocate.
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+/// Largest raw-output payload to put in a single [`ServerMsg::Output`] frame,
+/// leaving room under [`MAX_FRAME_LEN`] for the postcard enum tag and length
+/// prefix. A resync that re-emits images can exceed the frame cap, so callers
+/// split output with [`output_chunks`].
+pub const MAX_OUTPUT_CHUNK: usize = MAX_FRAME_LEN - 1024;
+
+/// Split raw output bytes into pieces that each encode to a frame within the size
+/// cap. Splitting at any byte boundary is safe: the client concatenates the
+/// pieces and feeds them to its parser, which carries state across feeds. Empty
+/// input yields no chunks.
+pub fn output_chunks(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.chunks(MAX_OUTPUT_CHUNK)
+}
+
 /// Encode a message as a length-prefixed frame ready to write to a stream.
 pub fn encode<M: Serialize>(msg: &M) -> Vec<u8> {
     let body =
@@ -106,6 +120,26 @@ impl FrameReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_chunks_each_fit_a_frame_and_reassemble() {
+        // A payload larger than one frame (as a resync carrying images can be)
+        // splits into chunks that each encode within the cap and reassemble.
+        let big = vec![7u8; MAX_OUTPUT_CHUNK * 2 + 123];
+        let chunks: Vec<&[u8]> = output_chunks(&big).collect();
+        assert!(chunks.len() >= 3, "a >2x payload splits into 3+ chunks");
+
+        let mut reassembled = Vec::new();
+        for chunk in &chunks {
+            let frame = encode(&ServerMsg::Output(chunk.to_vec()));
+            assert!(frame.len() <= MAX_FRAME_LEN, "each chunk fits one frame");
+            reassembled.extend_from_slice(chunk);
+        }
+        assert_eq!(reassembled, big, "chunks concatenate back to the input");
+
+        // A small payload is a single chunk.
+        assert_eq!(output_chunks(b"hi").count(), 1);
+    }
 
     #[test]
     fn roundtrip_client_msgs() {
