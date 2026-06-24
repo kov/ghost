@@ -4,7 +4,7 @@ mod dirty_lines;
 pub use self::cursor::{Cursor, CursorShape};
 use self::dirty_lines::DirtyLines;
 use crate::buffer::{Buffer, EraseMode};
-use crate::cell::{Cell, Occupancy};
+use crate::cell::{Cell, Occupancy, PLACEHOLDER};
 use crate::charset::Charset;
 use crate::graphics::{GraphicsState, Image, Placement};
 use crate::line::Line;
@@ -23,11 +23,6 @@ use unicode_width::UnicodeWidthChar;
 /// leaves the limit vendor-defined). Deeper nests just drop their oldest saved
 /// flag-set.
 const KITTY_KBD_STACK_MAX: usize = 32;
-
-/// The kitty Unicode-placeholder code point: a cell carrying this character is a
-/// virtual image placement, with the image id in its foreground colour and (in
-/// the trailing combining diacritics) the image row/col.
-const PLACEHOLDER: char = '\u{10eeee}';
 
 #[derive(Debug)]
 pub struct Terminal {

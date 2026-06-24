@@ -1655,6 +1655,54 @@ mod tests {
     }
 
     #[test]
+    fn unicode_placeholder_image_paints_at_its_cells() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // Transmit a 2x1 image as id 7 (store, no direct placement), then display
+        // it via two Unicode-placeholder cells whose foreground encodes id 7.
+        let mut v = Vt::new(20, 4);
+        v.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        v.feed_str("\x1b[38;2;0;0;7m\u{10eeee}\u{10eeee}");
+        let f = layout_frame(&v, TM);
+        assert_eq!(
+            f.images.len(),
+            1,
+            "the placeholder block becomes one placement"
+        );
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = v.graphics_image(7).expect("image stored");
+        r.upload_image(7, img.width, img.height, &img.pixels);
+
+        let (w, h) = Renderer::frame_size(&f);
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            }],
+        };
+        let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
+        // Image stretched across the 2x1 cell block (18px wide): left cell red,
+        // right cell green — the same result as a direct placement, via placeholders.
+        assert!(is_red(px(&out, 4, 9)), "left placeholder cell shows red");
+        assert!(
+            is_green(px(&out, 13, 9)),
+            "right placeholder cell shows green"
+        );
+    }
+
+    #[test]
     fn image_not_uploaded_is_skipped_not_panicking() {
         // A placement whose pixels were never uploaded must produce no image draw
         // (and not panic on a missing texture) — the frontend uploads lazily.

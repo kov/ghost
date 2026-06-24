@@ -613,14 +613,28 @@ impl TerminalModel {
         cmds
     }
 
-    /// Emit a [`Cmd::UploadImage`] for every image that a placement now displays
-    /// but whose pixels we have not yet sent the renderer. The blob travels out of
-    /// band (not through the `Scene`) and once per image.
+    /// Emit a [`Cmd::UploadImage`] for every image newly displayed — whether by a
+    /// direct placement or by a Unicode-placeholder cell in the viewport — whose
+    /// pixels we have not yet sent the renderer. The blob travels out of band (not
+    /// through the `Scene`) and once per image.
     fn upload_new_images(&mut self, cmds: &mut Vec<Cmd>) {
         let mut fresh: Vec<u32> = Vec::new();
         for p in self.screen.vt().graphics_placements() {
-            if !self.uploaded_images.contains(&p.image_id) && !fresh.contains(&p.image_id) {
-                fresh.push(p.image_id);
+            let id = p.image_id;
+            if !self.uploaded_images.contains(&id) && !fresh.contains(&id) {
+                fresh.push(id);
+            }
+        }
+        // Placeholder cells reference an image by id without a direct placement,
+        // so scan the viewport for them too.
+        for line in self.screen.vt().view() {
+            for cell in line.cells() {
+                if let Some(id) = cell.placeholder_image_id()
+                    && !self.uploaded_images.contains(&id)
+                    && !fresh.contains(&id)
+                {
+                    fresh.push(id);
+                }
             }
         }
         for id in fresh {
@@ -1842,6 +1856,34 @@ mod tests {
         assert!(cmds.contains(&sent("alpha", b"\x1b_Gi=5;OK\x1b\\")));
 
         // Later plain output does not re-upload the same image.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"x".to_vec(),
+            ended: false,
+        });
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
+    }
+
+    #[test]
+    fn session_data_uploads_images_referenced_only_by_placeholders() {
+        let mut m = model();
+        // Transmit (store, don't display) a 2x1 image as id 7, then print two
+        // Unicode-placeholder cells referencing it via the foreground colour.
+        let mut bytes = b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\\x1b[38;2;0;0;7m".to_vec();
+        bytes.extend("\u{10eeee}\u{10eeee}".as_bytes());
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes,
+            ended: false,
+        });
+        // Even with no direct placement, the placeholder reference triggers upload.
+        assert!(cmds.contains(&Cmd::UploadImage {
+            id: 7,
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+        }));
+        // And it uploads once: a later redraw-causing feed does not re-upload.
         let cmds = m.update(UiEvent::SessionData {
             name: "alpha".to_string(),
             bytes: b"x".to_vec(),

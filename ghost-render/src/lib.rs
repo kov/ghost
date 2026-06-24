@@ -11,6 +11,8 @@
 //! The only "font" input is [`CellMetrics`]: a monospace cell box. Pixel
 //! positions are pure arithmetic from it, so even geometry is unit-testable.
 
+use std::collections::BTreeMap;
+
 pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
 
@@ -211,6 +213,17 @@ pub fn layout_row(line: &Line, cursor_col: Option<usize>) -> RowLayout {
         if width == 0 {
             continue; // the tail half of a wide cell — its head already counted it
         }
+        // A kitty Unicode-placeholder cell draws an image slice, not its glyph:
+        // end the current run (so a ligature can't reach through it) and leave the
+        // column to the image layer. The placement comes from
+        // `layout_placeholder_placements`.
+        if cell.is_placeholder() {
+            if let Some(run) = cur.take() {
+                runs.push(run);
+            }
+            prev_was_cursor = false;
+            continue;
+        }
         let style = Style::from_pen(cell.pen());
         let is_cursor = cursor_col == Some(col);
         let start_new = match &cur {
@@ -276,13 +289,19 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
         })
         .collect();
 
+    // Both directly-placed images and Unicode-placeholder blocks draw through the
+    // same image layer; concatenate, keeping ascending z (placeholders are z 0).
+    let mut images = layout_image_placements(vt, metrics, offset, rows);
+    images.extend(layout_placeholder_placements(vt, offset, rows));
+    images.sort_by_key(|i| i.z);
+
     Frame {
         cols,
         rows,
         metrics,
         rows_layout,
         cursor: cursor_layout,
-        images: layout_image_placements(vt, metrics, offset, rows),
+        images,
     }
 }
 
@@ -335,6 +354,48 @@ pub fn layout_image_placements(
 
     images.sort_by_key(|i| i.z);
     images
+}
+
+/// Resolve kitty Unicode-placeholder cells in the visible viewport into
+/// [`ImagePlacement`]s. Placeholder cells (U+10EEEE) carry an image id in their
+/// foreground colour and tile the area an image occupies; we group the cells of
+/// each id into their bounding box and emit one placement spanning it, so the
+/// image is drawn stretched across exactly those cells.
+///
+/// Row/column *within* the image are inferred from cell position (the bounding
+/// box), not the kitty diacritics, which the emulator drops — correct for the
+/// common case of an image shown as one contiguous rectangular block. An id with
+/// no stored image is skipped (nothing to draw yet).
+pub fn layout_placeholder_placements(vt: &Vt, offset: usize, rows: usize) -> Vec<ImagePlacement> {
+    // id -> (min_row, min_col, max_row, max_col) in viewport cell coordinates.
+    let mut blocks: BTreeMap<u32, (usize, usize, usize, usize)> = BTreeMap::new();
+    for (row, line) in vt.view_at(offset).take(rows).enumerate() {
+        for (col, cell) in line.cells().iter().enumerate() {
+            let Some(id) = cell.placeholder_image_id() else {
+                continue;
+            };
+            let b = blocks.entry(id).or_insert((row, col, row, col));
+            b.0 = b.0.min(row);
+            b.1 = b.1.min(col);
+            b.2 = b.2.max(row);
+            b.3 = b.3.max(col);
+        }
+    }
+
+    blocks
+        .into_iter()
+        .filter_map(|(id, (r0, c0, r1, c1))| {
+            vt.graphics_image(id)?; // no stored image -> nothing to draw
+            Some(ImagePlacement {
+                image_id: id,
+                col: c0,
+                row: r0 as isize,
+                cols: c1 - c0 + 1,
+                rows: r1 - r0 + 1,
+                z: 0,
+            })
+        })
+        .collect()
 }
 
 /// How many whole cells an image dimension of `px` pixels spans, given a cell
@@ -600,6 +661,44 @@ mod tests {
         assert!(
             layout_frame(&v, M).images.is_empty(),
             "an image scrolled above the viewport is culled"
+        );
+    }
+
+    #[test]
+    fn unicode_placeholders_become_one_image_placement() {
+        let mut v = Vt::new(10, 3);
+        // Transmit (store, don't display) a 2x1 image as id 1.
+        v.feed_str(&format!("\x1b_Gi=1,a=t,f=24,s=2,v=1;{IMG_2X1}\x1b\\"));
+        // Two placeholder cells on row 0 with foreground = id 1 (RGB 0,0,1).
+        v.feed_str("\x1b[38;2;0;0;1m\u{10eeee}\u{10eeee}");
+
+        let f = layout_frame(&v, M);
+        // The two cells collapse to one placement spanning their 2x1 bounding box.
+        assert_eq!(f.images.len(), 1);
+        let p = f.images[0];
+        assert_eq!((p.image_id, p.col, p.row, p.cols, p.rows), (1, 0, 0, 2, 1));
+        // And the placeholder cells are not laid out as (tofu) text.
+        assert!(
+            f.rows_layout[0]
+                .runs
+                .iter()
+                .all(|r| !r.text.contains('\u{10eeee}')),
+            "placeholder cells draw an image, not their glyph"
+        );
+    }
+
+    #[test]
+    fn unicode_placeholder_without_a_stored_image_is_skipped() {
+        // Placeholder cells referencing an id that was never transmitted produce
+        // no placement (nothing to draw), and still aren't laid out as text.
+        let mut v = Vt::new(10, 3);
+        v.feed_str("\x1b[38;2;0;0;9m\u{10eeee}\u{10eeee}");
+        let f = layout_frame(&v, M);
+        assert!(f.images.is_empty(), "no stored image -> no placement");
+        assert!(
+            f.rows_layout
+                .first()
+                .is_none_or(|r| r.runs.iter().all(|run| !run.text.contains('\u{10eeee}')))
         );
     }
 
