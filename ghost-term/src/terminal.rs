@@ -190,15 +190,24 @@ impl Terminal {
     }
 
     /// Re-emit the kitty-graphics state as escapes, so a terminal fed the dump
-    /// regains it (reattach / replay-from-checkpoint): first the stored images
-    /// (`a=t`), then the direct placements (`a=p`) that fall in the current
-    /// viewport, each re-placed by positioning the cursor and saved/restored
-    /// around so the dump's restored cursor is unaffected. Placeholder placements
-    /// need nothing here — their cells ride in the text dump.
+    /// regains it (reattach / replay-from-checkpoint): the stored image transmits
+    /// followed by the direct placements. Used by the resync dump, where the
+    /// whole state travels as escapes; the recording instead dedups the image
+    /// bytes and re-emits only [`dump_graphics_placements`](Self::dump_graphics_placements).
     pub fn dump_graphics(&self) -> String {
+        let mut out = self.graphics.dump();
+        out.push_str(&self.dump_graphics_placements());
+        out
+    }
+
+    /// Re-emit only the direct placements (`a=p`) that fall in the current
+    /// viewport, each re-placed by positioning the cursor and saved/restored
+    /// around so the dump's restored cursor is unaffected. The referenced images
+    /// must already be transmitted. Placeholder placements need nothing here —
+    /// their cells ride in the text dump.
+    pub fn dump_graphics_placements(&self) -> String {
         use std::fmt::Write;
 
-        let mut out = self.graphics.dump();
         let top = self.lines_scrolled_off();
         let mut placed = String::new();
         for p in self.graphics.placements() {
@@ -234,12 +243,16 @@ impl Terminal {
             }
             placed.push_str("\u{1b}\\");
         }
-        if !placed.is_empty() {
-            out.push_str("\u{1b}7"); // save cursor
-            out.push_str(&placed);
-            out.push_str("\u{1b}8"); // restore cursor
+        if placed.is_empty() {
+            return placed;
         }
-        out
+        format!("\u{1b}7{placed}\u{1b}8") // save cursor … restore cursor
+    }
+
+    /// The stored kitty-graphics images, for the recording's content-addressed
+    /// dedup.
+    pub fn graphics_images(&self) -> impl Iterator<Item = &Image> {
+        self.graphics.images()
     }
 
     /// The number of stored kitty-graphics images.

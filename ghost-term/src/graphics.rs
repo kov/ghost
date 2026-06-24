@@ -75,6 +75,36 @@ impl std::fmt::Debug for Image {
     }
 }
 
+/// Encode one image as kitty transmit escapes (`a=t`, RGBA), chunked at the
+/// protocol's 4096-byte payload limit with the control data on the first chunk
+/// only. Shared by the resync/checkpoint dump ([`GraphicsState::dump`]) and the
+/// recording's reconstruction of a content-addressed image, so both restore an
+/// image byte-identically.
+pub fn encode_transmit(id: u32, width: u32, height: u32, pixels: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(pixels);
+    let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let last = i == chunks.len() - 1;
+        out.push_str("\u{1b}_G");
+        if i == 0 {
+            let _ = write!(out, "i={id},a=t,f=32,s={width},v={height}");
+            if !last {
+                out.push_str(",m=1");
+            }
+        } else {
+            out.push_str(if last { "m=0" } else { "m=1" });
+        }
+        out.push(';');
+        // base64 is ASCII, so the chunk is valid UTF-8.
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
+        out.push_str("\u{1b}\\");
+    }
+    out
+}
+
 /// A request to display an image at a screen location — what the renderer draws.
 ///
 /// `row` is an **absolute** line index (`lines_scrolled_off + cursor row` at
@@ -235,37 +265,22 @@ impl GraphicsState {
     /// feeding the result to a fresh terminal restores them. Used so images
     /// survive a reattach (the resync dump) and a replay from a recording
     /// checkpoint; placeholder cells, which carry only the id, can then resolve to
-    /// pixels again. Images are emitted in id order for a deterministic dump, and
-    /// the payload is chunked at the kitty 4096-byte limit with the control data
-    /// on the first chunk only.
+    /// pixels again. Images are emitted in id order for a deterministic dump.
     pub fn dump(&self) -> String {
-        use std::fmt::Write;
-
         let mut ids: Vec<u32> = self.images.keys().copied().collect();
         ids.sort_unstable();
         let mut out = String::new();
         for id in ids {
             let img = &self.images[&id];
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&img.pixels);
-            let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
-            for (i, chunk) in chunks.iter().enumerate() {
-                let last = i == chunks.len() - 1;
-                out.push_str("\u{1b}_G");
-                if i == 0 {
-                    let _ = write!(out, "i={id},a=t,f=32,s={},v={}", img.width, img.height);
-                    if !last {
-                        out.push_str(",m=1");
-                    }
-                } else {
-                    out.push_str(if last { "m=0" } else { "m=1" });
-                }
-                out.push(';');
-                // base64 is ASCII, so the chunk is valid UTF-8.
-                out.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
-                out.push_str("\u{1b}\\");
-            }
+            out.push_str(&encode_transmit(id, img.width, img.height, &img.pixels));
         }
         out
+    }
+
+    /// The stored images, for the recording's content-addressed dedup (which
+    /// stores each unique image once and reconstructs the transmit on replay).
+    pub fn images(&self) -> impl Iterator<Item = &Image> {
+        self.images.values()
     }
 
     /// The number of active placements.

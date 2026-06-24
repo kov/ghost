@@ -213,6 +213,27 @@ impl Vt {
 
         seq
     }
+
+    /// Like [`dump_with_scrollback`](Self::dump_with_scrollback) but omits the
+    /// image transmit escapes, keeping the graphics placements. For the
+    /// recording's content-addressed dedup: the image bytes are stored once
+    /// out-of-band (see [`graphics_images`](Self::graphics_images)) and the reader
+    /// reconstructs the transmits, so they need not be re-inlined every checkpoint.
+    pub fn dump_with_scrollback_without_images(&self) -> String {
+        let funs = self.terminal.dump_with_scrollback();
+        let mut seq = parser::dump(&funs);
+
+        seq.push_str(&self.terminal.dump_graphics_placements());
+        seq.push_str(&self.parser.dump());
+
+        seq
+    }
+
+    /// The stored kitty-graphics images, for the recording's content-addressed
+    /// dedup. Pair with [`dump_with_scrollback_without_images`](Self::dump_with_scrollback_without_images).
+    pub fn graphics_images(&self) -> impl Iterator<Item = &Image> {
+        self.terminal.graphics_images()
+    }
 }
 
 pub struct Builder {
@@ -348,6 +369,36 @@ mod tests {
             .expect("image re-transmitted in dump");
         assert_eq!((restored.width, restored.height), (2, 1));
         assert_eq!(restored.pixels, pixels);
+    }
+
+    #[test]
+    fn transmit_free_dump_plus_reconstructed_transmits_restores_everything() {
+        // The recording dedup stores image bytes out-of-band: feeding the
+        // transmit-free dump preceded by transmits reconstructed from those bytes
+        // must restore images and placements exactly like the full dump.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("\x1b_Gi=5,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+
+        let mut imgs: Vec<_> = vt
+            .graphics_images()
+            .map(|i| (i.id, i.width, i.height, i.pixels.clone()))
+            .collect();
+        imgs.sort_by_key(|i| i.0);
+        let mut dump = String::new();
+        for (id, w, h, px) in &imgs {
+            dump.push_str(&crate::encode_transmit(*id, *w, *h, px));
+        }
+        dump.push_str(&vt.dump_with_scrollback_without_images());
+
+        let mut fresh = Vt::new(10, 3);
+        fresh.feed_str(&dump);
+        assert_eq!(fresh.graphics_image_count(), 1);
+        assert_eq!(fresh.graphics_placement_count(), 1);
+        let p = fresh
+            .graphics_placements()
+            .next()
+            .expect("placement restored");
+        assert_eq!((p.col, p.cols, p.rows), (0, 2, 1));
     }
 
     #[test]

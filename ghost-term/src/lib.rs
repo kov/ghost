@@ -20,7 +20,7 @@ mod vt;
 pub use cell::Cell;
 pub use charset::Charset;
 pub use color::Color;
-pub use graphics::{Image, Placement};
+pub use graphics::{encode_transmit, Image, Placement};
 pub use line::Line;
 pub use pen::Pen;
 pub use terminal::CursorShape;
