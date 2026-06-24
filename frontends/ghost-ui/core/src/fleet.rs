@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use ghost_render::{
-    BadgeKind, CellMetrics, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, layout_frame,
+    BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, layout_frame,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -67,6 +67,15 @@ struct Tile {
     /// Whether the shell ever delivered output for this tile. Until then we keep
     /// re-emitting `Attach` (a lost attach race self-heals on the next refresh).
     fed: bool,
+    /// Cached laid-out preview, rebuilt only when this tile's content or size
+    /// changes (see [`FleetModel::refresh_dirty_frames`]); `view` clones it rather
+    /// than re-running `layout_frame` for every tile every frame. `None` until the
+    /// first refresh.
+    frame: Option<Frame>,
+    /// Set when `frame` is stale (the tile got output or was resized) so the next
+    /// refresh rebuilds it. Focus/bell/activity changes do not set this — they
+    /// affect only the border/badge/selection, which `view` composes separately.
+    frame_dirty: bool,
 }
 
 /// Whether the fleet may attach a session to drive a live preview. Sessions
@@ -86,6 +95,9 @@ pub struct FleetModel {
     size_px: (u32, u32),
     mine: HashSet<SessionId>,
     next_handle: u64,
+    /// Count of tile-frame (re)builds — bumped only when a dirty tile is actually
+    /// laid out, never on a cache hit. Lets a test prove unchanged tiles are reused.
+    frame_builds: u32,
 }
 
 /// Place `n` tiles in a near-square grid within `size_px`, with a uniform gap,
@@ -139,6 +151,7 @@ impl FleetModel {
             size_px,
             mine,
             next_handle: 0,
+            frame_builds: 0,
         }
     }
 
@@ -191,6 +204,8 @@ impl FleetModel {
             group,
             activity: 0,
             fed: false,
+            frame: None,
+            frame_dirty: true,
         });
     }
 
@@ -303,13 +318,18 @@ impl FleetModel {
     // ---- update ----
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        match ev {
+        let cmds = match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, bytes, ended),
             UiEvent::Resize { w_px, h_px, scale } => {
                 self.size_px = (w_px, h_px);
-                if scale > 0.0 {
+                if scale > 0.0 && self.scale != scale as f32 {
                     self.scale = scale as f32;
+                    // Effective metrics changed for every tile, so every preview
+                    // must be re-laid-out even if its grid size is unchanged.
+                    for tile in &mut self.tiles {
+                        tile.frame_dirty = true;
+                    }
                 }
                 self.relayout()
             }
@@ -328,7 +348,32 @@ impl FleetModel {
             // Everything else (text, non-nav keys, focus, paste replies) goes to
             // the focused tile's terminal.
             other => self.forward_to_focused(other),
+        };
+        // Rebuild any preview whose content or size this event changed, so `view`
+        // can stay a pure read of cached frames.
+        self.refresh_dirty_frames();
+        cmds
+    }
+
+    /// Re-lay-out the previews of tiles marked [`Tile::frame_dirty`] and clear the
+    /// flag, leaving unchanged tiles' cached frames untouched. Effective metrics
+    /// are the same for every tile, so they're computed once.
+    fn refresh_dirty_frames(&mut self) {
+        let metrics = self.effective_metrics();
+        let mut builds = 0;
+        for tile in &mut self.tiles {
+            if tile.frame_dirty {
+                tile.frame = Some(layout_frame(tile.model.screen().vt(), metrics));
+                tile.frame_dirty = false;
+                builds += 1;
+            }
         }
+        self.frame_builds += builds;
+    }
+
+    /// Total tile-frame (re)builds — see [`FleetModel::frame_builds`](Self::frame_builds).
+    pub fn frame_builds(&self) -> u32 {
+        self.frame_builds
     }
 
     fn reconcile(&mut self, infos: Vec<SessionInfo>) -> Vec<Cmd> {
@@ -416,6 +461,7 @@ impl FleetModel {
                     // The tile model emits Resize only when its grid changed; its
                     // Redraw is subsumed by the caller's own redraw decision.
                     if matches!(c, Cmd::Resize { .. }) {
+                        tile.frame_dirty = true; // grid changed; preview is stale
                         cmds.push(c);
                     }
                 }
@@ -449,6 +495,7 @@ impl FleetModel {
         });
         if had_output {
             tile.fed = true; // attached and live: stop re-attaching it
+            tile.frame_dirty = true; // its screen changed; preview is stale
             if background {
                 tile.activity = tile.activity.saturating_add(1);
             }
@@ -527,7 +574,11 @@ impl FleetModel {
                 continue;
             };
             let focused = self.focused.as_deref() == Some(id.as_str());
-            let frame = layout_frame(tile.model.screen().vt(), self.effective_metrics());
+            // Cached by `refresh_dirty_frames`; the fallback only fires if a tile
+            // is somehow viewed before its first refresh.
+            let frame = tile.frame.clone().unwrap_or_else(|| {
+                layout_frame(tile.model.screen().vt(), self.effective_metrics())
+            });
             items.push(SceneItem::Terminal {
                 id: SceneId::Tile(handle),
                 rect,
@@ -629,6 +680,49 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         })
+    }
+
+    #[test]
+    fn only_the_tile_that_changed_rebuilds_its_preview_frame() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // Both tiles laid out once by the reconcile; baseline the counter there.
+        let base = m.frame_builds();
+
+        // Output to one tile rebuilds exactly that tile's frame.
+        data(&mut m, "a", b"hello");
+        assert_eq!(m.frame_builds(), base + 1, "only tile a is re-laid-out");
+
+        // Rendering reads cached frames — it never re-lays-out.
+        let _ = m.view();
+        let _ = m.view();
+        assert_eq!(m.frame_builds(), base + 1, "view reuses cached frames");
+
+        // A nav keypress changes focus, not content: no frame is rebuilt.
+        key(&mut m, Key::Named(NamedKey::ArrowRight));
+        assert_eq!(m.frame_builds(), base + 1, "focus change rebuilds nothing");
+
+        // Output to the other tile rebuilds only it.
+        data(&mut m, "b", b"world");
+        assert_eq!(m.frame_builds(), base + 2);
+    }
+
+    #[test]
+    fn a_scale_change_re_lays_out_every_tile() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let base = m.frame_builds();
+        // A DPI change alters effective metrics for all tiles even if grids match.
+        m.update(UiEvent::Resize {
+            w_px: SIZE.0,
+            h_px: SIZE.1,
+            scale: 2.0,
+        });
+        assert_eq!(
+            m.frame_builds(),
+            base + 2,
+            "both previews re-laid-out on rescale"
+        );
     }
 
     fn rects_overlap(a: &RectPx, b: &RectPx) -> bool {
