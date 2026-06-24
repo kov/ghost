@@ -148,7 +148,27 @@ impl Selection {
     }
 }
 
-/// A full frame ready to draw: the laid-out viewport plus the cursor.
+/// A kitty-graphics image to draw, resolved to viewport cell coordinates and
+/// pixel-free — a *handle* (`image_id`) the renderer resolves to a cached
+/// texture, never the pixels themselves (so [`Frame`] stays cheap to `Clone` and
+/// compare). The cell rect is the image's footprint; `row` is viewport-relative
+/// and may be negative when the image's top has scrolled above the viewport (the
+/// renderer clips it). Emitted in ascending `z` so painter's order is `z`-order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImagePlacement {
+    pub image_id: u32,
+    /// Top-left cell: `col` is 0-based from the left; `row` is viewport-relative
+    /// (0 = top visible row), negative when the image starts above the viewport.
+    pub col: usize,
+    pub row: isize,
+    /// Footprint in cells — the explicit `c`/`r`, or derived from the image's
+    /// pixel size and the cell box when the client left sizing to the terminal.
+    pub cols: usize,
+    pub rows: usize,
+    pub z: i32,
+}
+
+/// A full frame ready to draw: the laid-out viewport, the cursor, and any images.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub cols: usize,
@@ -157,6 +177,8 @@ pub struct Frame {
     pub rows_layout: Vec<RowLayout>,
     /// `None` when the cursor is hidden (DECTCEM `?25l`).
     pub cursor: Option<CursorLayout>,
+    /// kitty-graphics images overlapping the viewport, in ascending `z`.
+    pub images: Vec<ImagePlacement>,
 }
 
 /// Lay out a single line into style- and cursor-delimited [`Run`]s.
@@ -260,7 +282,68 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
         metrics,
         rows_layout,
         cursor: cursor_layout,
+        images: layout_image_placements(vt, metrics, offset, rows),
     }
+}
+
+/// Resolve `vt`'s kitty-graphics placements into viewport-relative
+/// [`ImagePlacement`]s, keeping only those overlapping the visible `rows` (given
+/// the scroll `offset`), in ascending `z`.
+///
+/// Each placement's absolute anchor line maps to a viewport row via the live
+/// scroll position; its footprint is the explicit `c`/`r` cells, or — when the
+/// client left sizing to the terminal — derived by dividing the image's pixel
+/// size by the cell box (the metric the headless `vt` lacks, supplied here).
+pub fn layout_image_placements(
+    vt: &Vt,
+    metrics: CellMetrics,
+    offset: usize,
+    rows: usize,
+) -> Vec<ImagePlacement> {
+    // Absolute line index of the top visible row (see `Vt::lines_scrolled_off`).
+    let top_abs = vt.lines_scrolled_off() as isize - offset as isize;
+
+    let mut images: Vec<ImagePlacement> = vt
+        .graphics_placements()
+        .filter_map(|p| {
+            let image = vt.graphics_image(p.image_id)?;
+            let cell_cols = if p.cols > 0 {
+                p.cols as usize
+            } else {
+                cells_for(image.width as f32, metrics.advance)
+            };
+            let cell_rows = if p.rows > 0 {
+                p.rows as usize
+            } else {
+                cells_for(image.height as f32, metrics.line_height)
+            };
+            let row = p.row as isize - top_abs;
+            // Keep only placements whose cell span overlaps the viewport.
+            if row >= rows as isize || row + cell_rows as isize <= 0 {
+                return None;
+            }
+            Some(ImagePlacement {
+                image_id: p.image_id,
+                col: p.col,
+                row,
+                cols: cell_cols,
+                rows: cell_rows,
+                z: p.z,
+            })
+        })
+        .collect();
+
+    images.sort_by_key(|i| i.z);
+    images
+}
+
+/// How many whole cells an image dimension of `px` pixels spans, given a cell
+/// edge of `cell` pixels (rounding up; at least one cell).
+fn cells_for(px: f32, cell: f32) -> usize {
+    if cell <= 0.0 {
+        return 1;
+    }
+    (px / cell).ceil().max(1.0) as usize
 }
 
 #[cfg(test)]
@@ -468,5 +551,66 @@ mod tests {
         };
         assert_eq!(r.pixel_x(M), 24.0);
         assert_eq!(r.pixel_width(M), 32.0);
+    }
+
+    // A 2×1 RGB image (red, green) as the kitty direct-transmission payload.
+    const IMG_2X1: &str = "/wAAAP8A";
+
+    #[test]
+    fn image_placement_uses_explicit_cell_footprint_at_the_cursor() {
+        let v = feed(
+            20,
+            5,
+            &format!("\x1b[2;4H\x1b_Gi=1,a=T,f=24,s=2,v=1,c=3,r=2,z=7;{IMG_2X1}\x1b\\"),
+        );
+
+        let f = layout_frame(&v, M);
+        assert_eq!(f.images.len(), 1);
+        let img = f.images[0];
+        assert_eq!(img.image_id, 1);
+        assert_eq!((img.col, img.row), (3, 1)); // CUP 2;4 => row 1, col 3 (0-based)
+        assert_eq!((img.cols, img.rows), (3, 2)); // explicit c/r
+        assert_eq!(img.z, 7);
+    }
+
+    #[test]
+    fn image_placement_derives_footprint_from_pixels_when_cr_absent() {
+        // 20×1 px image (60 zero RGB bytes => 80 base64 'A's), no c/r. With an 8×16
+        // cell box: ceil(20/8) = 3 cols, ceil(1/16) = 1 row.
+        let payload = "A".repeat(80);
+        let v = feed(
+            40,
+            5,
+            &format!("\x1b_Gi=1,a=T,f=24,s=20,v=1;{payload}\x1b\\"),
+        );
+
+        let img = layout_frame(&v, M).images[0];
+        assert_eq!((img.cols, img.rows), (3, 1));
+    }
+
+    #[test]
+    fn image_placement_scrolls_with_content_and_culls_offscreen() {
+        let mut v = Vt::new(10, 3);
+        v.feed_str(&format!("\x1b_Gi=1,a=T,f=24,s=2,v=1;{IMG_2X1}\x1b\\"));
+        // Placed at the home row, it sits at viewport row 0.
+        assert_eq!(layout_frame(&v, M).images[0].row, 0);
+
+        // Enough output to scroll its (absolute) anchor line above the viewport.
+        v.feed_str("a\r\nb\r\nc\r\nd\r\n");
+        assert!(
+            layout_frame(&v, M).images.is_empty(),
+            "an image scrolled above the viewport is culled"
+        );
+    }
+
+    #[test]
+    fn image_placements_are_sorted_by_z() {
+        let mut v = Vt::new(20, 5);
+        v.feed_str(&format!("\x1b_Gi=1,a=T,f=24,s=2,v=1,z=5;{IMG_2X1}\x1b\\"));
+        v.feed_str(&format!("\x1b_Gi=2,a=T,f=24,s=2,v=1,z=-1;{IMG_2X1}\x1b\\"));
+
+        let f = layout_frame(&v, M);
+        let order: Vec<(u32, i32)> = f.images.iter().map(|i| (i.image_id, i.z)).collect();
+        assert_eq!(order, vec![(2, -1), (1, 5)]); // ascending z = painter order
     }
 }

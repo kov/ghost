@@ -186,6 +186,7 @@ mod tests {
                 },
                 rows_layout: vec![],
                 cursor: None,
+                images: vec![],
             },
             selection: None,
             dim: false,
