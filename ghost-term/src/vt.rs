@@ -372,6 +372,37 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_displayed_image_survives_eviction_pressure() {
+        use base64::Engine;
+
+        // Each 750-px RGB image stores 3000 RGBA bytes; the cfg(test) store cap is
+        // 8 KiB, so a third image forces eviction.
+        let px = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 750 * 3]);
+        let transmit = |id: u32| format!("\u{1b}_Gi={id},a=t,f=24,s=750,v=1;{px}\u{1b}\\");
+
+        let mut vt = Vt::new(20, 5);
+        // Image 1 is the OLDEST, but it's on screen via Unicode-placeholder cells
+        // (fg rgb(0,0,1) packs image id 1) rather than a placement.
+        vt.feed_str(&transmit(1));
+        vt.feed_str("\u{1b}[38;2;0;0;1m\u{10eeee}\u{10eeee}");
+        // Image 2 is newer and not displayed.
+        vt.feed_str(&transmit(2));
+        // Storing image 3 exceeds the cap. The LRU image is #1, but it's visibly on
+        // screen, so #2 (unreferenced) must be evicted instead.
+        vt.feed_str(&transmit(3));
+
+        assert!(
+            vt.graphics_image(1).is_some(),
+            "an on-screen placeholder image must not be evicted"
+        );
+        assert!(
+            vt.graphics_image(2).is_none(),
+            "the unreferenced image is evicted instead"
+        );
+        assert!(vt.graphics_image(3).is_some());
+    }
+
+    #[test]
     fn transmit_free_dump_plus_reconstructed_transmits_restores_everything() {
         // The recording dedup stores image bytes out-of-band: feeding the
         // transmit-free dump preceded by transmits reconstructed from those bytes

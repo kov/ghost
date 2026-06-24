@@ -16,7 +16,7 @@
 //! reference the session host's filesystem, which is an arbitrary-read hazard and
 //! is meaningless to a display attached from another machine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 
@@ -152,6 +152,11 @@ pub struct GraphicsState {
     /// under the storage quota. Bumped when an image is transmitted or placed.
     clock: u64,
     last_used: HashMap<u32, u64>,
+    /// Image ids shown on screen via Unicode placeholder cells (which create no
+    /// [`Placement`], so they'd otherwise look unreferenced). The terminal — which
+    /// owns the cell grid — refreshes this before a store that might evict, so
+    /// eviction spares a visible placeholder image. See [`set_placeholder_pins`].
+    placeholder_pins: HashSet<u32>,
     /// Acknowledgement bytes queued for the child's input stream.
     responses: Vec<u8>,
 }
@@ -455,14 +460,35 @@ impl GraphicsState {
         self.last_used.insert(id, self.clock);
     }
 
-    /// The image ids currently pinned by a placement on either screen; these are
-    /// visible (or visible after an alt-screen swap), so eviction must spare them.
-    fn pinned_ids(&self) -> std::collections::HashSet<u32> {
+    /// The image ids eviction must spare: those pinned by a placement on either
+    /// screen (visible, or visible after an alt-screen swap), plus the
+    /// placeholder-displayed ids the terminal last reported (see
+    /// [`set_placeholder_pins`](Self::set_placeholder_pins)).
+    fn pinned_ids(&self) -> HashSet<u32> {
         self.placements
             .iter()
             .chain(self.alternate_placements.iter())
             .map(|p| p.image_id)
+            .chain(self.placeholder_pins.iter().copied())
             .collect()
+    }
+
+    /// Whether a new transfer could trip the storage quota (and thus eviction).
+    /// The terminal checks this cheaply to decide whether it must first scan the
+    /// grid for placeholder-displayed image ids and report them via
+    /// [`set_placeholder_pins`](Self::set_placeholder_pins) — so the common,
+    /// well-under-quota case never pays for the scan.
+    pub fn near_quota(&self) -> bool {
+        self.stored_bytes + MAX_IMAGE_BYTES > MAX_STORED_BYTES
+            || self.images.len() + 1 > MAX_STORED_IMAGES
+    }
+
+    /// Report the image ids currently shown via Unicode placeholder cells, so the
+    /// next eviction spares them. Refreshed by the terminal before a near-quota
+    /// store; consulted only during eviction, so a stale set between stores is
+    /// harmless.
+    pub fn set_placeholder_pins(&mut self, ids: HashSet<u32>) {
+        self.placeholder_pins = ids;
     }
 
     /// Evict least-recently-used, unpinned images until a new `new_bytes` image

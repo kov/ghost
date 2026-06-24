@@ -15,7 +15,7 @@ use crate::parser::{
 use crate::pen::{Intensity, Pen};
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::mem;
 use unicode_width::UnicodeWidthChar;
 
@@ -276,6 +276,25 @@ impl Terminal {
         self.graphics.images()
     }
 
+    /// Image ids shown on screen via kitty Unicode-placeholder cells, scanned from
+    /// both screens' grids (viewport + retained scrollback). These carry their id
+    /// in the cell, not in a placement, so the image store can't see them; the
+    /// store uses this to spare visible placeholder images from eviction. Only
+    /// called when the store is near its quota, since it walks every cell.
+    fn live_placeholder_image_ids(&self) -> HashSet<u32> {
+        let mut ids = HashSet::new();
+        for buffer in [&self.buffer, &self.other_buffer] {
+            for line in buffer.lines() {
+                for cell in line.cells() {
+                    if let Some(id) = cell.placeholder_image_id() {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
     /// The number of stored kitty-graphics images.
     pub fn graphics_image_count(&self) -> usize {
         self.graphics.image_count()
@@ -467,6 +486,15 @@ impl Terminal {
             // with its content; the renderer maps that back to a viewport row.
             KittyGraphics(payload) => {
                 let anchor = (self.lines_scrolled_off() + self.cursor.row, self.cursor.col);
+                // Before a store that could trip the storage quota, tell the image
+                // store which images are on screen via Unicode placeholders — they
+                // create no placement, so eviction would otherwise treat a visible
+                // one as unreferenced and drop it. Gated on `near_quota` so the
+                // common, well-under-quota case never pays for the grid scan.
+                if self.graphics.near_quota() {
+                    let pins = self.live_placeholder_image_ids();
+                    self.graphics.set_placeholder_pins(pins);
+                }
                 self.graphics.handle(&payload, anchor);
             }
 
