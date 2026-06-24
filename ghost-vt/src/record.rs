@@ -589,6 +589,36 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_bakes_in_images_for_self_contained_replay() {
+        use ghost_term::Vt;
+
+        // A session transmits an image; the periodic checkpoint snapshots its dump.
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let dump = vt.dump_with_scrollback().into_bytes();
+        let buf = record_to_buf(|rec| {
+            rec.output(b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\")
+                .unwrap();
+            rec.checkpoint(20, 5, &dump).unwrap();
+        });
+
+        // A player seeking to the checkpoint feeds only its dump to a fresh
+        // terminal; the image must come back, so replay is self-contained.
+        let rec = read_bytes(&buf).unwrap();
+        let ck = rec.latest_checkpoint().unwrap();
+        let Item::Checkpoint { dump, .. } = &rec.items[ck] else {
+            panic!("expected a checkpoint");
+        };
+        let mut fresh = Vt::new(20, 5);
+        fresh.feed_str(std::str::from_utf8(dump).unwrap());
+        assert_eq!(
+            fresh.graphics_image_count(),
+            1,
+            "the checkpoint baked the image in"
+        );
+    }
+
+    #[test]
     fn checkpoints_decode_in_order_and_truncate() {
         let buf = record_to_buf(|rec| {
             rec.output(b"before").unwrap();
