@@ -541,6 +541,43 @@ fn clamp_scissor(r: RectPx, sw: u32, sh: u32) -> [u32; 4] {
     [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
 }
 
+/// Remembers the last scene a window actually drew, so an identical redraw
+/// request (a query-only PTY feed, a cursor-blink tick that changed nothing, a
+/// fleet tick where no tile moved) can be skipped before the GPU surface is even
+/// acquired — leaving the previously presented frame untouched on screen.
+///
+/// Kept free of any GPU handle so the decision is unit-testable without a device.
+#[derive(Default)]
+pub struct SceneCache {
+    last: Option<(Scene, f32)>,
+}
+
+impl SceneCache {
+    /// Whether `(scene, font_px)` differs from the last frame accepted here. When
+    /// it differs this records it as the new last and returns `true` (the caller
+    /// should draw); when identical it returns `false` (the caller may skip the
+    /// whole acquire/draw/present cycle).
+    ///
+    /// The comparison is exact `PartialEq` on the scene — never a hash — so an
+    /// equal verdict can never be a false positive that strands a stale frame.
+    pub fn needs_redraw(&mut self, scene: &Scene, font_px: f32) -> bool {
+        if matches!(&self.last, Some((s, px)) if s == scene && *px == font_px) {
+            return false;
+        }
+        self.last = Some((scene.clone(), font_px));
+        true
+    }
+
+    /// Forget the last scene so the next [`needs_redraw`](Self::needs_redraw)
+    /// always draws. The caller invalidates whenever it accepted a scene here but
+    /// then failed to actually present it (e.g. the surface was lost/outdated and
+    /// had to be reconfigured), so the recorded scene never gets ahead of what is
+    /// really on screen.
+    pub fn invalidate(&mut self) {
+        self.last = None;
+    }
+}
+
 /// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
 /// built once and reused across frames.
 pub struct Renderer {
@@ -1599,6 +1636,44 @@ mod tests {
 
     fn is_green(p: [u8; 4]) -> bool {
         p[0] < 0x20 && p[1] > 0x60 && p[2] < 0x20
+    }
+
+    #[test]
+    fn scene_cache_skips_identical_redraws_until_invalidated() {
+        let mut cache = SceneCache::default();
+        let a = Scene::new((100, 50));
+        let mut b = Scene::new((100, 50));
+        b.layers.push(Layer {
+            z: 0,
+            items: vec![SceneItem::Rect {
+                id: SceneId::Root,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+                color: [0.0, 0.0, 0.0, 1.0],
+                radius: 0.0,
+            }],
+        });
+
+        // First ever scene must draw; an identical follow-up is skipped.
+        assert!(cache.needs_redraw(&a, 16.0));
+        assert!(!cache.needs_redraw(&a, 16.0));
+
+        // A different scene draws, then is itself cached.
+        assert!(cache.needs_redraw(&b, 16.0));
+        assert!(!cache.needs_redraw(&b, 16.0));
+
+        // Same scene at a different font size must redraw (the raster differs).
+        assert!(cache.needs_redraw(&b, 20.0));
+        assert!(!cache.needs_redraw(&b, 20.0));
+
+        // After invalidation (e.g. a surface reconfigure that dropped the frame)
+        // the very next call redraws even though the scene is unchanged.
+        cache.invalidate();
+        assert!(cache.needs_redraw(&b, 20.0));
     }
 
     #[test]

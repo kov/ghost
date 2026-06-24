@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{Gpu, Rendered, Renderer};
+use ghost_renderer::{Gpu, Rendered, Renderer, SceneCache};
 use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
     TerminalModel, UiEvent,
@@ -319,6 +319,8 @@ struct Graphics {
     device: wgpu::Device,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
+    /// Skips re-drawing a scene identical to the last one presented.
+    scene_cache: SceneCache,
 }
 
 impl Graphics {
@@ -385,6 +387,7 @@ impl Graphics {
             device,
             config,
             renderer,
+            scene_cache: SceneCache::default(),
         }
     }
 
@@ -395,20 +398,33 @@ impl Graphics {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
+        // The reconfigured surface holds no drawn frame; force the next redraw.
+        self.scene_cache.invalidate();
     }
 
     /// Draw a scene into the surface. `scene.size_px` must equal the surface
     /// size, and `font_px` the glyph size the scene was laid out for (the model
     /// keeps both in sync via `UiEvent::Resize` and its render scale).
     fn render(&mut self, scene: &Scene, font_px: f32) {
+        // Nothing changed since the last presented frame — skip the whole
+        // acquire/draw/present cycle and leave that frame on screen.
+        if !self.scene_cache.needs_redraw(scene, font_px) {
+            return;
+        }
         let frame_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
+                // We accepted this scene above but didn't present it; forget it so
+                // the next request redraws onto the freshly reconfigured surface.
+                self.scene_cache.invalidate();
                 return;
             }
-            _ => return,
+            _ => {
+                self.scene_cache.invalidate();
+                return;
+            }
         };
         let target = frame_tex
             .texture
