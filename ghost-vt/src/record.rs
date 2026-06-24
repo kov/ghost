@@ -118,6 +118,12 @@ pub struct CheckpointImage<'a> {
 /// Content hash of an image, over its dimensions and pixels. Only ever compared
 /// against other hashes read back from the same recording, so the algorithm need
 /// only be deterministic, not stable across versions.
+///
+/// The 64-bit hash is the dedup key without a byte re-check, so a collision
+/// between two genuinely distinct images would alias them (the second is never
+/// stored and resolves to the first's pixels). With SipHash over the full pixels
+/// that is astronomically unlikely for any realistic image set; if it ever
+/// mattered, the fix is to byte-verify on a hash hit before treating it as a dup.
 fn image_hash(width: u32, height: u32, pixels: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut h);
@@ -267,11 +273,53 @@ impl FileRecorder {
         let tmp = std::path::PathBuf::from(tmp);
         std::fs::write(&tmp, &bounded)?;
         std::fs::rename(&tmp, &self.path)?;
+        // Compaction may have dropped image blobs the writer believed were on
+        // disk; resync `written_hashes` to exactly what survived, so a later
+        // re-transmit of a dropped image re-stores its blob rather than emitting
+        // a reference whose bytes are gone.
+        self.inner.written_hashes = stored_image_hashes(&bounded);
         // Continue appending to the freshly rewritten file.
         let file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
         self.inner.writer = BufWriter::new(file);
         Ok(())
     }
+}
+
+/// The content hashes of every image physically stored (in a [`FRAME_IMAGES`]
+/// frame) in an encoded recording. Used to resync a recorder's dedup set with
+/// the file after compaction. Frames that fail to decode are skipped.
+fn stored_image_hashes(bytes: &[u8]) -> HashSet<u64> {
+    let mut hashes = HashSet::new();
+    if bytes.len() < MAGIC.len() + 1 {
+        return hashes;
+    }
+    let mut pos = MAGIC.len() + 1;
+    let Some(hlen) = read_u32(bytes, &mut pos) else {
+        return hashes;
+    };
+    if take(bytes, &mut pos, hlen).is_none() {
+        return hashes;
+    }
+    while pos < bytes.len() {
+        let kind = bytes[pos];
+        let mut next = pos + 1;
+        let Some(clen) = read_u32(bytes, &mut next) else {
+            break;
+        };
+        let Some(payload) = take(bytes, &mut next, clen) else {
+            break;
+        };
+        pos = next;
+        if kind == FRAME_IMAGES
+            && let Ok(raw) = zstd::decode_all(payload)
+            && let Ok(list) = postcard::from_bytes::<Vec<ImageBlob>>(&raw)
+        {
+            for b in list {
+                hashes.insert(b.hash);
+            }
+        }
+    }
+    hashes
 }
 
 impl<W: Write> Recorder<W> {
@@ -565,8 +613,14 @@ pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
         let frame_start = pos;
         let kind = bytes[pos];
         let mut next = pos + 1;
-        let clen = read_u32(bytes, &mut next)?;
-        let payload = take(bytes, &mut next, clen)?;
+        // Tolerate a torn trailing frame the way `read_bytes` does: stop at the
+        // last complete frame rather than failing the whole compaction.
+        let Some(clen) = read_u32(bytes, &mut next) else {
+            break;
+        };
+        let Some(payload) = take(bytes, &mut next, clen) else {
+            break;
+        };
         frames.push(Frame {
             start: frame_start,
             kind,
@@ -827,6 +881,87 @@ mod tests {
             })
             .collect();
         rec.checkpoint_with_images(20, 5, &dump, &refs).unwrap();
+    }
+
+    /// As [`checkpoint_vt`] but to a [`FileRecorder`] (so compaction can fire).
+    fn checkpoint_file(rec: &mut FileRecorder, vt: &ghost_term::Vt) {
+        let dump = vt.dump_with_scrollback_without_images().into_bytes();
+        let refs: Vec<CheckpointImage> = vt
+            .graphics_images()
+            .map(|i| CheckpointImage {
+                id: i.id,
+                width: i.width,
+                height: i.height,
+                pixels: &i.pixels,
+            })
+            .collect();
+        rec.checkpoint_with_images(20, 5, &dump, &refs).unwrap();
+    }
+
+    #[test]
+    fn a_recurring_image_survives_compaction_that_dropped_its_blob() {
+        use ghost_term::Vt;
+
+        // Regression: the writer must not believe a blob is still on disk after
+        // compaction dropped it, or a returning image becomes a dangling
+        // reference and silently vanishes on replay.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.ghostrec");
+        // A 2×1 image displayed at the cursor (its size is irrelevant; what
+        // matters is that its blob frame exists, then is dropped, then is needed).
+        let img = "\x1b_Gi=7,a=T,f=24,s=2,v=1,c=1,r=1;/wAAAP8A\x1b\\";
+        // Incompressible filler so a recorded output frame actually grows the file
+        // past the cap (zstd would crush repetitive text away).
+        let filler = |seed: u32, n: usize| -> Vec<u8> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        let cap = 4 * 1024;
+        let mut rec = FileRecorder::create(&path, 20, 5, &[], Some(cap)).unwrap();
+        let mut vt = Vt::new(20, 5);
+
+        // Phase 1: image displayed; its blob is written to disk once.
+        vt.feed_str(img);
+        checkpoint_file(&mut rec, &vt);
+
+        // Phase 2: image gone, then a big incompressible output forces a single
+        // compaction whose retained (image-free) checkpoint doesn't reference the
+        // image — so its blob is dropped from disk.
+        vt.feed_str("\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 0);
+        rec.output(&filler(1, 8 * 1024)).unwrap();
+        checkpoint_file(&mut rec, &vt);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < cap as u64,
+            "phase 2 should have compacted below the cap"
+        );
+
+        // Phase 3: the same image returns once; the file stays under the cap, so a
+        // stale dedup set would leave a dangling reference with no blob on disk.
+        vt.feed_str(img);
+        rec.output(b"phase3\r\n").unwrap();
+        checkpoint_file(&mut rec, &vt);
+        drop(rec);
+
+        // The latest checkpoint must still reconstruct the recurring image.
+        let recording = read(&path).unwrap();
+        let ck = recording.latest_checkpoint().unwrap();
+        let Item::Checkpoint { dump, .. } = &recording.items[ck] else {
+            panic!("expected a checkpoint");
+        };
+        let mut fresh = Vt::new(20, 5);
+        fresh.feed_str(std::str::from_utf8(dump).unwrap());
+        assert_eq!(
+            fresh.graphics_image_count(),
+            1,
+            "the image that left and returned must survive compaction"
+        );
     }
 
     #[test]
