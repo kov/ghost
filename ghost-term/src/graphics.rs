@@ -521,8 +521,15 @@ impl GraphicsState {
                     self.placements.retain(|p| p.image_id != id);
                 }
                 // Uppercase frees the image data — but only once the image has no
-                // remaining placements (a placement-scoped delete may leave some).
-                if free_data && !self.placements.iter().any(|p| p.image_id == id) {
+                // remaining placements on *either* screen (a placement-scoped
+                // delete may leave some, and the parked alternate screen pins it
+                // too, matching `pinned_ids`).
+                let still_placed = self
+                    .placements
+                    .iter()
+                    .chain(self.alternate_placements.iter())
+                    .any(|p| p.image_id == id);
+                if free_data && !still_placed {
                     self.remove_image(id);
                 }
             }

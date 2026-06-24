@@ -202,9 +202,17 @@ impl Terminal {
 
     /// Re-emit only the direct placements (`a=p`) that fall in the current
     /// viewport, each re-placed by positioning the cursor and saved/restored
-    /// around so the dump's restored cursor is unaffected. The referenced images
-    /// must already be transmitted. Placeholder placements need nothing here —
-    /// their cells ride in the text dump.
+    /// so the dump's restored cursor is unaffected. The referenced images must
+    /// already be transmitted. Placeholder placements need nothing here — their
+    /// cells ride in the text dump.
+    ///
+    /// Repositioning is done without `DECSC`/`DECRC` (`\x1b7`/`\x1b8`), which
+    /// would overwrite the saved-cursor register the text dump just set to the
+    /// application's. Instead origin mode is disabled so the per-placement `CUP`s
+    /// are absolute (a non-zero top margin would otherwise shift them), then the
+    /// cursor and origin mode the dump left in effect are restored explicitly. A
+    /// pending-wrap at the cursor is not preserved across this — a rare, cosmetic
+    /// edge that self-corrects on the next output.
     pub fn dump_graphics_placements(&self) -> String {
         use std::fmt::Write;
 
@@ -246,7 +254,20 @@ impl Terminal {
         if placed.is_empty() {
             return placed;
         }
-        format!("\u{1b}7{placed}\u{1b}8") // save cursor … restore cursor
+        // Origin mode off → absolute CUP; then restore the cursor and (if set)
+        // origin mode, leaving the saved-cursor register untouched.
+        let mut out = String::from("\u{1b}[?6l");
+        out.push_str(&placed);
+        let _ = write!(
+            out,
+            "\u{1b}[{};{}H",
+            self.cursor.row + 1,
+            self.cursor.col + 1
+        );
+        if self.origin_mode {
+            out.push_str("\u{1b}[?6h");
+        }
+        out
     }
 
     /// The stored kitty-graphics images, for the recording's content-addressed
