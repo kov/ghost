@@ -465,6 +465,16 @@ fn host_main(
                         let mut w: &pty_process::blocking::Pty = &pty;
                         let _ = w.write_all(&reply);
                     }
+                    // kitty graphics acknowledgements are stateful, so they come
+                    // from the emulator rather than the scanner. Drain them every
+                    // feed (so they never accumulate) but, like the queries above,
+                    // only write them to the child while detached — an attached,
+                    // graphics-capable outer terminal answers via the pipe.
+                    let graphics_reply = screen.take_graphics_responses();
+                    if client.is_none() && !graphics_reply.is_empty() {
+                        let mut w: &pty_process::blocking::Pty = &pty;
+                        let _ = w.write_all(&graphics_reply);
+                    }
                     // Refresh the discoverable title when the child changes it
                     // (coalesced — only an actual change rewrites the meta file).
                     if screen.title() != meta.title {

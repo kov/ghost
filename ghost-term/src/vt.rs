@@ -1,3 +1,4 @@
+use crate::graphics::Image;
 use crate::line::Line;
 use crate::parser::{self, DecMode, Parser};
 use crate::terminal::{Cursor, Terminal};
@@ -129,6 +130,24 @@ impl Vt {
     /// modifyOtherKeys; the frontend key encoder reads it to pick `CSI u` output.
     pub fn kitty_keyboard_flags(&self) -> u8 {
         self.terminal.kitty_keyboard_flags()
+    }
+
+    /// Drain the kitty-graphics acknowledgement bytes the terminal has queued for
+    /// the child's input stream (image transfer / query OK and error replies).
+    /// Like the cursor and device-attribute queries, these are written back by
+    /// the host when detached and by the frontend when attached.
+    pub fn take_graphics_responses(&mut self) -> Vec<u8> {
+        self.terminal.take_graphics_responses()
+    }
+
+    /// A stored kitty-graphics image by id (RGBA8 pixels), for the renderer.
+    pub fn graphics_image(&self, id: u32) -> Option<&Image> {
+        self.terminal.graphics_image(id)
+    }
+
+    /// The number of stored kitty-graphics images.
+    pub fn graphics_image_count(&self) -> usize {
+        self.terminal.graphics_image_count()
     }
 
     /// The active mouse-reporting protocol (DEC modes 1000/1002/1003). When more
@@ -665,5 +684,235 @@ mod tests {
     fn assert_vts_eq(vt1: &Vt, vt2: &Vt) {
         vt1.parser.assert_eq(&vt2.parser);
         vt1.terminal.assert_eq(&vt2.terminal);
+    }
+
+    // kitty graphics protocol — receiving and storing images. The base64 strings
+    // below are tiny hand-checkable images:
+    //   "/wAAAP8A" = FF 00 00  00 FF 00     (a red then a green RGB pixel)
+    //   "AAAA"     = 00 00 00                (one black RGB pixel)
+    const RED_GREEN_RGB_B64: &str = "/wAAAP8A";
+
+    #[test]
+    fn kitty_graphics_transmit_stores_image_and_acks() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str(&format!(
+            "\x1b_Gi=5,a=t,f=24,s=2,v=1;{RED_GREEN_RGB_B64}\x1b\\"
+        ));
+
+        let image = vt.graphics_image(5).expect("image stored under id 5");
+        assert_eq!((image.width, image.height), (2, 1));
+        // RGB expands to RGBA with an opaque alpha.
+        assert_eq!(image.pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=5;OK\x1b\\");
+        // Responses are drained, not repeated.
+        assert!(vt.take_graphics_responses().is_empty());
+    }
+
+    #[test]
+    fn kitty_graphics_query_acks_support_without_storing() {
+        let mut vt = Vt::new(20, 5);
+
+        // The standard support probe: a 1×1 image with a=q.
+        vt.feed_str("\x1b_Gi=31,a=q,f=24,s=1,v=1;AAAA\x1b\\");
+
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=31;OK\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_assigns_id_for_image_number_and_echoes_it() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str(&format!(
+            "\x1b_GI=7,a=t,f=24,s=2,v=1;{RED_GREEN_RGB_B64}\x1b\\"
+        ));
+
+        // The terminal allocates an id and echoes both it and the image number.
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert_eq!(response, "\x1b_Gi=1,I=7;OK\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 1);
+        assert!(vt.graphics_image(1).is_some());
+    }
+
+    #[test]
+    fn kitty_graphics_refuses_non_direct_transmission() {
+        let mut vt = Vt::new(20, 5);
+
+        // t=f (file) is refused: reading the session host's filesystem is a
+        // security hazard and meaningless to a remote display.
+        vt.feed_str("\x1b_Gi=8,a=t,t=f,f=24,s=1,v=1;AAAA\x1b\\");
+
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert_eq!(
+            response,
+            "\x1b_Gi=8;ENOTSUPPORTED:only direct transmission is supported\x1b\\"
+        );
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_rejects_i_and_i_number_together() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str("\x1b_Gi=1,I=2,a=t,f=24,s=1,v=1;AAAA\x1b\\");
+
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(response.contains("EINVAL"), "got {response:?}");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_rejects_pixel_data_size_mismatch() {
+        let mut vt = Vt::new(20, 5);
+
+        // Claims 2×2 RGBA (16 bytes) but sends 3 bytes.
+        vt.feed_str("\x1b_Gi=4,a=t,f=32,s=2,v=2;AAAA\x1b\\");
+
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(response.contains("EINVAL"), "got {response:?}");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_reassembles_chunked_transfer() {
+        let mut vt = Vt::new(20, 5);
+
+        // The red+green RGB image split across two chunks (each a multiple of 4
+        // base64 bytes). The control data rides only the first chunk.
+        vt.feed_str("\x1b_Gi=9,a=t,f=24,s=2,v=1,m=1;/wAA\x1b\\");
+        // No image and no response until the final chunk arrives.
+        assert!(vt.graphics_image(9).is_none());
+        assert!(vt.take_graphics_responses().is_empty());
+
+        vt.feed_str("\x1b_Gm=0;AP8A\x1b\\");
+
+        let image = vt.graphics_image(9).expect("assembled image");
+        assert_eq!(image.pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=9;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_graphics_quiet_suppresses_ok_but_not_errors() {
+        let mut vt = Vt::new(20, 5);
+
+        // q=1 suppresses the OK acknowledgement.
+        vt.feed_str(&format!(
+            "\x1b_Gi=5,a=t,q=1,f=24,s=2,v=1;{RED_GREEN_RGB_B64}\x1b\\"
+        ));
+        assert!(vt.take_graphics_responses().is_empty());
+        assert!(vt.graphics_image(5).is_some());
+
+        // q=2 suppresses errors.
+        vt.feed_str("\x1b_Gi=6,a=t,q=2,t=f,f=24,s=1,v=1;AAAA\x1b\\");
+        assert!(vt.take_graphics_responses().is_empty());
+
+        // q=1 still lets an error through.
+        vt.feed_str("\x1b_Gi=6,a=t,q=1,t=f,f=24,s=1,v=1;AAAA\x1b\\");
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(response.contains("ENOTSUPPORTED"), "got {response:?}");
+    }
+
+    #[test]
+    fn kitty_graphics_decodes_png() {
+        let mut vt = Vt::new(20, 5);
+
+        // A 1×1 opaque-red PNG, base64-encoded (generated with the `png` crate).
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP4z8AAAAMBAQD3A0FDAAAAAElFTkSuQmCC";
+        vt.feed_str(&format!("\x1b_Gi=3,a=t,f=100;{png_b64}\x1b\\"));
+
+        let image = vt.graphics_image(3).expect("PNG stored");
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.pixels, vec![255, 0, 0, 255]);
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=3;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_graphics_hard_reset_clears_images() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str(&format!(
+            "\x1b_Gi=5,a=t,f=24,s=2,v=1;{RED_GREEN_RGB_B64}\x1b\\"
+        ));
+        assert_eq!(vt.graphics_image_count(), 1);
+        let _ = vt.take_graphics_responses();
+
+        vt.feed_str("\x1bc"); // RIS
+
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_rejects_oversized_raw_dimensions() {
+        let mut vt = Vt::new(20, 5);
+
+        // 100000×100000 RGBA = 40 GB; reject on the declared size before trying to
+        // match the (tiny) payload, never allocating.
+        vt.feed_str("\x1b_Gi=2,a=t,f=32,s=100000,v=100000;AAAA\x1b\\");
+
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(response.contains("EINVAL"), "got {response:?}");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_rejects_png_declaring_huge_dimensions() {
+        let mut vt = Vt::new(20, 5);
+
+        // A 66-byte PNG whose IHDR declares 1000×16_000_000 RGBA (1.6e10 px). The
+        // decoder's byte limit covers row buffers, not the output buffer, so we
+        // must reject on the declared size or the host allocates ~64 GB and dies.
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAA+gA9CQACAYAAADGj1CpAAAACUlEQVR4nGMAAAABAAFe/335AAAAAElFTkSuQmCC";
+        vt.feed_str(&format!("\x1b_Gi=2,a=t,f=100;{png_b64}\x1b\\"));
+
+        let response = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(response.contains("EINVAL"), "got {response:?}");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_store_is_bounded_and_refuses_when_full() {
+        let mut vt = Vt::new(20, 5);
+
+        // Transmit more distinct 1×1 images than the store's count backstop allows
+        // (1024). The store must cap and refuse the overflow rather than grow.
+        for id in 1..=1025u32 {
+            vt.feed_str(&format!("\x1b_Gi={id},a=t,q=2,f=24,s=1,v=1;AAAA\x1b\\"));
+        }
+        let _ = vt.take_graphics_responses();
+
+        assert_eq!(vt.graphics_image_count(), 1024);
+        assert!(vt.graphics_image(1025).is_none());
+    }
+
+    #[test]
+    fn kitty_graphics_unkeyed_command_emits_no_response() {
+        let mut vt = Vt::new(20, 5);
+
+        // No i and no I: a success stores under a reallocated id but is silent
+        // (nothing to match a reply against)…
+        vt.feed_str("\x1b_Ga=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        assert!(vt.take_graphics_responses().is_empty());
+        assert_eq!(vt.graphics_image_count(), 1);
+
+        // …and an unkeyed *error* is silent too (no unmatchable i=0 reply).
+        vt.feed_str("\x1b_Ga=t,f=24,s=2,v=2;AAAA\x1b\\");
+        assert!(vt.take_graphics_responses().is_empty());
+
+        // i=0 explicitly means "unset", so it behaves like an unkeyed command.
+        vt.feed_str("\x1b_Gi=0,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        assert!(vt.take_graphics_responses().is_empty());
+    }
+
+    #[test]
+    fn kitty_graphics_quiet_on_a_later_chunk_suppresses_the_response() {
+        let mut vt = Vt::new(20, 5);
+
+        // No q on the first chunk; q=1 on the final chunk must still suppress OK.
+        vt.feed_str("\x1b_Gi=9,a=t,f=24,s=2,v=1,m=1;/wAA\x1b\\");
+        vt.feed_str("\x1b_Gm=0,q=1;AP8A\x1b\\");
+
+        assert!(vt.take_graphics_responses().is_empty());
+        assert!(vt.graphics_image(9).is_some());
     }
 }

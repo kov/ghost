@@ -6,6 +6,7 @@ use self::dirty_lines::DirtyLines;
 use crate::buffer::{Buffer, EraseMode};
 use crate::cell::{Cell, Occupancy};
 use crate::charset::Charset;
+use crate::graphics::{GraphicsState, Image};
 use crate::line::Line;
 use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, EdScope, ElScope, Function, SgrOp, SgrOps,
@@ -67,6 +68,9 @@ pub struct Terminal {
     /// Number of BEL (0x07) controls executed. Ephemeral (never dumped); lets a
     /// host detect that the terminal rang the bell.
     bell_count: u64,
+    /// kitty graphics protocol state: stored images, an in-progress chunked
+    /// transfer, and acknowledgement bytes queued for the child's input.
+    graphics: GraphicsState,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -154,6 +158,7 @@ impl Terminal {
             tracked_modes: BTreeSet::new(),
             title: String::new(),
             bell_count: 0,
+            graphics: GraphicsState::default(),
         }
     }
 
@@ -164,6 +169,23 @@ impl Terminal {
     /// How many times the terminal bell (BEL) has rung since creation.
     pub fn bell_count(&self) -> u64 {
         self.bell_count
+    }
+
+    /// Drain the kitty-graphics acknowledgement bytes queued for the child's
+    /// input (image transfer / query OK and error replies). The host writes
+    /// these when detached; an attached frontend sends them as input.
+    pub fn take_graphics_responses(&mut self) -> Vec<u8> {
+        self.graphics.take_responses()
+    }
+
+    /// A stored kitty-graphics image by id, for the renderer.
+    pub fn graphics_image(&self, id: u32) -> Option<&Image> {
+        self.graphics.image(id)
+    }
+
+    /// The number of stored kitty-graphics images.
+    pub fn graphics_image_count(&self) -> usize {
+        self.graphics.image_count()
     }
 
     pub fn active_buffer_type(&self) -> BufferType {
@@ -326,9 +348,9 @@ impl Terminal {
                 };
             }
 
-            // kitty graphics: the APC carrier is parsed here; decoding the
-            // command, the image store, and responses arrive in a later commit.
-            KittyGraphics(_payload) => {}
+            // kitty graphics: decode and store the transmitted image (or answer
+            // a query), queuing the protocol acknowledgement for the child.
+            KittyGraphics(payload) => self.graphics.handle(&payload),
 
             Lf => {
                 self.lf();
@@ -727,6 +749,7 @@ impl Terminal {
         self.dirty_lines = DirtyLines::new(self.rows);
         self.tracked_modes.clear();
         self.title.clear();
+        self.graphics.reset();
     }
 
     fn primary_buffer(&self) -> &Buffer {

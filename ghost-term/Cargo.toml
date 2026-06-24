@@ -19,6 +19,9 @@ license = "Apache-2.0"
 rust-version = "1.82.0"
 
 [dependencies]
+base64 = "0.22.1"
+miniz_oxide = "0.9.1"
+png = "0.18.1"
 rgb = "0.8.33"
 unicode-width = "0.1.13"
 

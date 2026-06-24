@@ -134,6 +134,15 @@ impl Screen {
         self.vt.kitty_keyboard_flags()
     }
 
+    /// Drain the kitty-graphics acknowledgement bytes queued while feeding child
+    /// output (image transfer / query OK and error replies). Unlike DA/cursor
+    /// queries these are stateful, so they come from the emulator rather than the
+    /// query scanner; the host writes them to the child while detached and
+    /// discards them while attached (the outer terminal answers via the pipe).
+    pub fn take_graphics_responses(&mut self) -> Vec<u8> {
+        self.vt.take_graphics_responses()
+    }
+
     /// Cursor position as 1-based `(col, row)` — the form a cursor-position
     /// report (CPR) carries. `avt` tracks the cursor 0-based.
     pub fn cursor(&self) -> (u16, u16) {

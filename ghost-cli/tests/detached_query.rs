@@ -73,3 +73,38 @@ fn detached_session_answers_cursor_position_query() {
         "detached session did not answer the cursor-position query"
     );
 }
+
+#[test]
+fn detached_session_answers_kitty_graphics_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "graphics-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The never-attached child sends the standard kitty-graphics support probe (a
+    // 1×1 image with a=q) and reads up to 2s for the reply, whose APC terminator
+    // is a trailing backslash. The reply carries `OK` only if the host decoded the
+    // image and acknowledged it — and with no client attached, only the host could
+    // have answered.
+    let sentinel = xdg.join("graphics-answered");
+    let script = format!(
+        "printf '\\033_Gi=31,a=q,f=24,s=1,v=1;AAAA\\033\\\\'; \
+         if IFS= read -r -s -d '\\' -t 2 reply; then case \"$reply\" in *OK*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the kitty-graphics query"
+    );
+}
