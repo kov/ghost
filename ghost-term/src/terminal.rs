@@ -6,7 +6,7 @@ use self::dirty_lines::DirtyLines;
 use crate::buffer::{Buffer, EraseMode};
 use crate::cell::{Cell, Occupancy};
 use crate::charset::Charset;
-use crate::graphics::{GraphicsState, Image};
+use crate::graphics::{GraphicsState, Image, Placement};
 use crate::line::Line;
 use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, EdScope, ElScope, Function, SgrOp, SgrOps,
@@ -188,6 +188,17 @@ impl Terminal {
         self.graphics.image_count()
     }
 
+    /// The active kitty-graphics placements (what the renderer draws). Each row
+    /// is an absolute line index; convert with [`lines_scrolled_off`].
+    pub fn graphics_placements(&self) -> impl Iterator<Item = &Placement> {
+        self.graphics.placements()
+    }
+
+    /// The number of active kitty-graphics placements.
+    pub fn graphics_placement_count(&self) -> usize {
+        self.graphics.placement_count()
+    }
+
     pub fn active_buffer_type(&self) -> BufferType {
         self.active_buffer_type
     }
@@ -349,8 +360,13 @@ impl Terminal {
             }
 
             // kitty graphics: decode and store the transmitted image (or answer
-            // a query), queuing the protocol acknowledgement for the child.
-            KittyGraphics(payload) => self.graphics.handle(&payload),
+            // a query / place / delete), queuing the protocol acknowledgement.
+            // A placement is anchored to the cursor's absolute line so it scrolls
+            // with its content; the renderer maps that back to a viewport row.
+            KittyGraphics(payload) => {
+                let anchor = (self.lines_scrolled_off() + self.cursor.row, self.cursor.col);
+                self.graphics.handle(&payload, anchor);
+            }
 
             Lf => {
                 self.lf();
@@ -620,6 +636,7 @@ impl Terminal {
             self.active_buffer_type = BufferType::Alternate;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
             self.swap_kitty_kbd_screen_state();
+            self.graphics.swap_screen_placements();
             mem::swap(&mut self.buffer, &mut self.other_buffer);
             self.buffer = Buffer::new(self.cols, self.rows, Some(0), Some(&self.pen));
             self.dirty_lines.extend(0..self.rows);
@@ -631,6 +648,7 @@ impl Terminal {
             self.active_buffer_type = BufferType::Primary;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
             self.swap_kitty_kbd_screen_state();
+            self.graphics.swap_screen_placements();
             mem::swap(&mut self.buffer, &mut self.other_buffer);
             self.dirty_lines.extend(0..self.rows);
         }

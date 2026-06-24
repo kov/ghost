@@ -1,4 +1,4 @@
-use crate::graphics::Image;
+use crate::graphics::{Image, Placement};
 use crate::line::Line;
 use crate::parser::{self, DecMode, Parser};
 use crate::terminal::{Cursor, Terminal};
@@ -148,6 +148,18 @@ impl Vt {
     /// The number of stored kitty-graphics images.
     pub fn graphics_image_count(&self) -> usize {
         self.terminal.graphics_image_count()
+    }
+
+    /// The active kitty-graphics placements the renderer should draw. Each
+    /// placement's `row` is an absolute line index; map it to a viewport row with
+    /// [`lines_scrolled_off`](Self::lines_scrolled_off).
+    pub fn graphics_placements(&self) -> impl Iterator<Item = &Placement> {
+        self.terminal.graphics_placements()
+    }
+
+    /// The number of active kitty-graphics placements.
+    pub fn graphics_placement_count(&self) -> usize {
+        self.terminal.graphics_placement_count()
     }
 
     /// The active mouse-reporting protocol (DEC modes 1000/1002/1003). When more
@@ -914,5 +926,211 @@ mod tests {
 
         assert!(vt.take_graphics_responses().is_empty());
         assert!(vt.graphics_image(9).is_some());
+    }
+
+    #[test]
+    fn kitty_graphics_transmit_and_display_creates_a_placement_at_the_cursor() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str("\x1b[3;5H"); // cursor to row 3, col 5 (1-based) => (2, 4)
+        vt.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1,c=4,r=2,z=1;/wAAAP8A\x1b\\");
+
+        assert!(vt.graphics_image(7).is_some());
+        assert_eq!(vt.graphics_placement_count(), 1);
+        let p = vt.graphics_placements().next().unwrap().clone();
+        assert_eq!((p.image_id, p.placement_id), (7, 0));
+        assert_eq!((p.row, p.col), (2, 4));
+        assert_eq!((p.cols, p.rows, p.z), (4, 2, 1));
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=7;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_graphics_transmit_only_does_not_create_a_placement() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+
+        assert!(vt.graphics_image(7).is_some());
+        assert_eq!(vt.graphics_placement_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_put_displays_a_stored_image_and_errors_when_missing() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+
+        // a=p displays the already-stored image at placement 3.
+        vt.feed_str("\x1b_Gi=7,a=p,p=3;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 1);
+        assert_eq!(vt.graphics_placements().next().unwrap().placement_id, 3);
+        assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=7,p=3;OK\x1b\\");
+
+        // a=p for an unknown image is an ENOENT.
+        vt.feed_str("\x1b_Gi=99,a=p;\x1b\\");
+        let r = String::from_utf8(vt.take_graphics_responses()).unwrap();
+        assert!(r.contains("ENOENT"), "got {r:?}");
+        assert_eq!(vt.graphics_placement_count(), 1);
+    }
+
+    #[test]
+    fn kitty_graphics_placement_anchor_is_absolute_so_it_scrolls_with_content() {
+        let mut vt = Vt::new(10, 3);
+
+        // Push lines into scrollback so lines_scrolled_off > 0.
+        vt.feed_str("a\r\nb\r\nc\r\nd\r\ne\r\n");
+        let expected_row = vt.lines_scrolled_off() + vt.cursor().row;
+
+        vt.feed_str("\x1b_Gi=1,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+
+        assert_eq!(vt.graphics_placements().next().unwrap().row, expected_row);
+    }
+
+    #[test]
+    fn kitty_graphics_replacing_a_placement_does_not_duplicate_it() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+
+        // The same (image, placement) pair, placed twice at different anchors,
+        // updates in place rather than stacking.
+        vt.feed_str("\x1b[1;1H\x1b_Gi=7,a=p,p=2;\x1b\\");
+        vt.feed_str("\x1b[2;3H\x1b_Gi=7,a=p,p=2;\x1b\\");
+
+        assert_eq!(vt.graphics_placement_count(), 1);
+        let p = vt.graphics_placements().next().unwrap().clone();
+        assert_eq!((p.row, p.col), (1, 2)); // the second anchor won
+    }
+
+    #[test]
+    fn kitty_graphics_delete_by_id_removes_placements_and_uppercase_frees() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        vt.feed_str("\x1b_Gi=8,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+        assert_eq!(vt.graphics_placement_count(), 2);
+
+        // d=i (lowercase) drops image 7's placements but keeps its pixel data.
+        vt.feed_str("\x1b_Ga=d,d=i,i=7;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 1);
+        assert!(
+            vt.graphics_image(7).is_some(),
+            "lowercase d=i keeps the image"
+        );
+
+        // d=I (uppercase) drops image 8's placement and frees the image.
+        vt.feed_str("\x1b_Ga=d,d=I,i=8;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 0);
+        assert!(
+            vt.graphics_image(8).is_none(),
+            "uppercase d=I frees the image"
+        );
+        assert!(vt.graphics_image(7).is_some());
+
+        // Deletes carry no acknowledgement.
+        assert!(vt.take_graphics_responses().is_empty());
+    }
+
+    #[test]
+    fn kitty_graphics_delete_all_clears_placements_and_uppercase_frees_images() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        vt.feed_str("\x1b_Gi=8,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+
+        // d=a (lowercase) clears placements but keeps the images.
+        vt.feed_str("\x1b_Ga=d,d=a;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 0);
+        assert_eq!(vt.graphics_image_count(), 2);
+
+        // d=A frees the images too.
+        vt.feed_str("\x1b_Ga=d,d=A;\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_hard_reset_clears_placements() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 1);
+        let _ = vt.take_graphics_responses();
+
+        vt.feed_str("\x1bc"); // RIS
+
+        assert_eq!(vt.graphics_placement_count(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_placement_scoped_delete_keeps_image_until_last_placement() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        vt.feed_str("\x1b_Gi=7,a=p,p=1;\x1b\\");
+        vt.feed_str("\x1b_Gi=7,a=p,p=2;\x1b\\");
+        let _ = vt.take_graphics_responses();
+        assert_eq!(vt.graphics_placement_count(), 2);
+
+        // d=I scoped to placement 1 frees only that placement; image 7 stays
+        // because placement (7,2) still references it.
+        vt.feed_str("\x1b_Ga=d,d=I,i=7,p=1;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 1);
+        assert!(
+            vt.graphics_image(7).is_some(),
+            "the image must survive while a placement remains"
+        );
+
+        // Deleting the last placement (uppercase) now frees the image.
+        vt.feed_str("\x1b_Ga=d,d=I,i=7,p=2;\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 0);
+        assert!(vt.graphics_image(7).is_none());
+    }
+
+    #[test]
+    fn kitty_graphics_placements_are_per_screen() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=1,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+        assert_eq!(vt.graphics_placement_count(), 1);
+
+        // Entering the alternate screen parks the primary placement (not visible).
+        vt.feed_str("\x1b[?1049h");
+        assert_eq!(vt.graphics_placement_count(), 0);
+        // The image itself is global, so it is still stored.
+        assert!(vt.graphics_image(1).is_some());
+
+        // A placement made on the alternate screen is independent.
+        vt.feed_str("\x1b_Gi=2,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let _ = vt.take_graphics_responses();
+        assert_eq!(vt.graphics_placement_count(), 1);
+        assert_eq!(vt.graphics_placements().next().unwrap().image_id, 2);
+
+        // Leaving it restores the primary placement.
+        vt.feed_str("\x1b[?1049l");
+        assert_eq!(vt.graphics_placement_count(), 1);
+        assert_eq!(vt.graphics_placements().next().unwrap().image_id, 1);
+    }
+
+    #[test]
+    fn kitty_graphics_records_the_cursor_move_policy() {
+        let mut vt = Vt::new(20, 5);
+
+        vt.feed_str("\x1b_Gi=1,a=T,f=24,s=2,v=1,C=1;/wAAAP8A\x1b\\");
+        assert!(vt.graphics_placements().next().unwrap().no_cursor_move);
+
+        vt.feed_str("\x1b[2;1H\x1b_Gi=2,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let p2 = vt.graphics_placements().find(|p| p.image_id == 2).unwrap();
+        assert!(!p2.no_cursor_move);
+    }
+
+    #[test]
+    fn kitty_graphics_chunked_placement_anchors_to_the_first_chunk() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b[2;1H"); // cursor to row 2 (1-based) => row index 1
+        vt.feed_str("\x1b_Gi=9,a=T,f=24,s=2,v=1,m=1;/wAA\x1b\\");
+        vt.feed_str("\x1b[5;1H"); // move the cursor between chunks => row index 4
+        vt.feed_str("\x1b_Gm=0;AP8A\x1b\\");
+
+        // The placement anchors where the transfer began (row 1), not the final
+        // chunk's cursor (row 4).
+        assert_eq!(vt.graphics_placements().next().unwrap().row, 1);
     }
 }

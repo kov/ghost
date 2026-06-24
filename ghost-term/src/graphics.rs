@@ -44,6 +44,12 @@ const MAX_IMAGE_PIXELS: u64 = (MAX_IMAGE_BYTES / 4) as u64;
 const MAX_STORED_BYTES: usize = 320 * 1024 * 1024;
 const MAX_STORED_IMAGES: usize = 1024;
 
+/// Backstop on the number of active placements per screen, so a child cannot
+/// exhaust memory by creating endless distinct placements (`a=p`/`a=T` with
+/// distinct `p=`) of even a single stored image. A real screen shows a handful
+/// of images, so this is generous.
+const MAX_PLACEMENTS: usize = 4096;
+
 /// A decoded image: RGBA8 pixels in row-major order, `width` × `height`.
 pub struct Image {
     pub id: u32,
@@ -64,11 +70,42 @@ impl std::fmt::Debug for Image {
     }
 }
 
-/// The terminal's kitty-graphics state: the stored images, an in-progress chunked
-/// transfer, and the queued responses awaiting transmission to the child.
+/// A request to display an image at a screen location — what the renderer draws.
+///
+/// `row` is an **absolute** line index (`lines_scrolled_off + cursor row` at
+/// placement time) so the image tracks its content under vertical scrolling; the
+/// renderer maps it back to a viewport row. The anchor is only valid for the
+/// buffer and width in effect at placement time — a column resize re-wraps
+/// logical lines and shifts the absolute index, and placements are kept per
+/// screen; full reflow stability lands with the Unicode-placeholder phase.
+///
+/// `cols`/`rows` are the explicit cell footprint (`c`/`r`) or 0 when the client
+/// left sizing to the terminal (the renderer then derives it from the image and
+/// cell pixel size, which this headless core does not know). `no_cursor_move` is
+/// the `C=1` policy, recorded for the renderer phase that advances the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub row: usize,
+    pub col: usize,
+    pub cols: u32,
+    pub rows: u32,
+    pub z: i32,
+    pub no_cursor_move: bool,
+}
+
+/// The terminal's kitty-graphics state: the stored images, their placements, an
+/// in-progress chunked transfer, and the queued responses awaiting transmission.
 #[derive(Default)]
 pub struct GraphicsState {
     images: HashMap<u32, Image>,
+    /// Placements on the active screen. Images are global, but placements are
+    /// per-screen (kitty semantics), so the alternate screen's are parked in
+    /// `alternate_placements` and swapped in on the alt-buffer transition — a
+    /// transient alt-screen excursion must not lose or misplace primary images.
+    placements: Vec<Placement>,
+    alternate_placements: Vec<Placement>,
     chunk: Option<Chunk>,
     /// Next candidate id when the terminal must allocate one (image-number `I=`
     /// transfers, or a transfer with neither `i` nor `I`).
@@ -84,22 +121,29 @@ impl std::fmt::Debug for GraphicsState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphicsState")
             .field("images", &self.images.len())
+            .field("placements", &self.placements.len())
             .field("chunking", &self.chunk.is_some())
             .field("pending_response_bytes", &self.responses.len())
             .finish()
     }
 }
 
-/// An in-progress chunked transfer: the first chunk's control data plus the raw
-/// (base64-decoded) bytes accumulated so far.
+/// An in-progress chunked transfer: the first chunk's control data, the cursor
+/// anchor captured when it began, and the raw (base64-decoded) bytes so far.
 struct Chunk {
     control: Control,
+    anchor: (usize, usize),
     data: Vec<u8>,
 }
 
 impl GraphicsState {
     /// Handle one graphics command (the APC payload after the leading `G`).
-    pub fn handle(&mut self, payload: &str) {
+    ///
+    /// `anchor` is the cursor as `(absolute_row, col)` — `absolute_row` being
+    /// `lines_scrolled_off + cursor row` — recorded on any placement the command
+    /// creates so the image tracks its content under scrolling. For a chunked
+    /// transfer the anchor captured on the first chunk is the one used.
+    pub fn handle(&mut self, payload: &str, anchor: (usize, usize)) {
         let (control_str, data) = payload.split_once(';').unwrap_or((payload, ""));
 
         // A continuation chunk carries only `m` (and optionally `q`); the real
@@ -117,6 +161,22 @@ impl GraphicsState {
         }
 
         let control = Control::parse(control_str);
+
+        // Actions that carry no image data dispatch before the decode path.
+        match control.action {
+            // Display an already-stored image.
+            b'p' => {
+                self.place(&control, anchor);
+                return;
+            }
+            // Delete images/placements.
+            b'd' => {
+                self.delete(&control);
+                return;
+            }
+            _ => {}
+        }
+
         if control.more {
             // First chunk of a chunked transfer.
             match decode_base64(data) {
@@ -126,6 +186,7 @@ impl GraphicsState {
                 Ok(bytes) => {
                     self.chunk = Some(Chunk {
                         control,
+                        anchor,
                         data: bytes,
                     })
                 }
@@ -134,9 +195,9 @@ impl GraphicsState {
             return;
         }
 
-        // Single-shot command.
+        // Single-shot transmit/query command.
         match decode_base64(data) {
-            Ok(bytes) => self.process(control, bytes),
+            Ok(bytes) => self.process(control, bytes, anchor),
             Err(()) => self.respond_error(&control, "EINVAL", "invalid base64 payload"),
         }
     }
@@ -156,9 +217,27 @@ impl GraphicsState {
         self.images.len()
     }
 
+    /// The placements the renderer should draw, in insertion order.
+    pub fn placements(&self) -> impl Iterator<Item = &Placement> {
+        self.placements.iter()
+    }
+
+    /// The number of active placements.
+    pub fn placement_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// Park the active screen's placements and bring in the other screen's, on an
+    /// alternate-buffer transition. Images are global; placements are per screen.
+    pub fn swap_screen_placements(&mut self) {
+        std::mem::swap(&mut self.placements, &mut self.alternate_placements);
+    }
+
     /// Clear all graphics state (on RIS / hard reset).
     pub fn reset(&mut self) {
         self.images.clear();
+        self.placements.clear();
+        self.alternate_placements.clear();
         self.stored_bytes = 0;
         self.chunk = None;
         // Pending responses are transient output; leave them to be drained.
@@ -185,13 +264,16 @@ impl GraphicsState {
             return;
         }
         if !more {
+            // Anchor the placement to where the transfer *began*, not the final
+            // chunk's cursor.
             let chunk = self.chunk.take().expect("chunk present");
-            self.process(chunk.control, chunk.data);
+            self.process(chunk.control, chunk.data, chunk.anchor);
         }
     }
 
-    /// Decode and store (or, for a query, just validate) a fully-received image.
-    fn process(&mut self, control: Control, mut raw: Vec<u8>) {
+    /// Decode and store (or, for a query, just validate) a fully-received image,
+    /// creating a placement at `anchor` when the action also displays it (a=T).
+    fn process(&mut self, control: Control, mut raw: Vec<u8>, anchor: (usize, usize)) {
         if control.has_i && control.has_number {
             self.respond_error(&control, "EINVAL", "i and I are mutually exclusive");
             return;
@@ -253,7 +335,102 @@ impl GraphicsState {
                 pixels: image.2,
             },
         );
+        // a=T transmits *and* displays; a=t (and a=q, handled above) only stores.
+        // If the placement budget is full the image is still stored — a=T's
+        // success is the transmit, like kitty's lenient display behaviour.
+        if control.action == b'T' {
+            self.add_placement(id, &control, anchor);
+        }
         self.respond_ok(&control, id);
+    }
+
+    /// Display an already-stored image (a=p). The image is looked up by `i=`; a
+    /// missing image is `ENOENT`, and a full placement budget is `ENOSPC`.
+    fn place(&mut self, control: &Control, anchor: (usize, usize)) {
+        let id = control.id;
+        if id == 0 || !self.images.contains_key(&id) {
+            self.respond_error(control, "ENOENT", "image not found");
+            return;
+        }
+        if !self.add_placement(id, control, anchor) {
+            self.respond_error(control, "ENOSPC", "too many placements");
+            return;
+        }
+        self.respond_ok(control, id);
+    }
+
+    /// Record (or replace) a placement of `image_id` at the cursor anchor. A
+    /// placement is keyed by `(image_id, placement_id)`, so re-placing the same
+    /// pair updates it rather than stacking duplicates. Returns `false` (without
+    /// recording) when a *new* placement would exceed [`MAX_PLACEMENTS`].
+    fn add_placement(&mut self, image_id: u32, control: &Control, anchor: (usize, usize)) -> bool {
+        let placement_id = control.placement;
+        // Remove any existing placement for this pair first, so a re-place is
+        // always allowed and never blocked by the budget.
+        self.placements
+            .retain(|p| !(p.image_id == image_id && p.placement_id == placement_id));
+        if self.placements.len() >= MAX_PLACEMENTS {
+            return false;
+        }
+        let (row, col) = anchor;
+        self.placements.push(Placement {
+            image_id,
+            placement_id,
+            row,
+            col,
+            cols: control.cols,
+            rows: control.rows,
+            z: control.z,
+            // C=1 means "do not move the cursor after placing"; recorded for the
+            // renderer phase, which advances the cursor (it knows the cell size).
+            no_cursor_move: control.cursor_move == 1,
+        });
+        true
+    }
+
+    /// Delete images and/or placements (a=d). This phase handles the id-scoped
+    /// selectors the plan calls for — `d=a/A` (all) and `d=i/I` (by image id) —
+    /// where an uppercase selector additionally frees the image's pixel data
+    /// (lowercase keeps it for later re-display). Location/number selectors are
+    /// left for a later phase.
+    fn delete(&mut self, control: &Control) {
+        let free_data = control.delete.is_ascii_uppercase();
+        match control.delete.to_ascii_lowercase() {
+            b'a' => {
+                self.placements.clear();
+                if free_data {
+                    self.images.clear();
+                    self.stored_bytes = 0;
+                }
+            }
+            b'i' => {
+                let id = control.id;
+                if id == 0 {
+                    return; // a by-id delete needs i=
+                }
+                if control.placement != 0 {
+                    self.placements
+                        .retain(|p| !(p.image_id == id && p.placement_id == control.placement));
+                } else {
+                    self.placements.retain(|p| p.image_id != id);
+                }
+                // Uppercase frees the image data — but only once the image has no
+                // remaining placements (a placement-scoped delete may leave some).
+                if free_data && !self.placements.iter().any(|p| p.image_id == id) {
+                    self.remove_image(id);
+                }
+            }
+            // Number- and location-scoped deletes are not handled yet.
+            _ => {}
+        }
+        // Deletes carry no acknowledgement.
+    }
+
+    /// Remove a stored image and keep `stored_bytes` in step.
+    fn remove_image(&mut self, id: u32) {
+        if let Some(image) = self.images.remove(&id) {
+            self.stored_bytes = self.stored_bytes.saturating_sub(image.pixels.len());
+        }
     }
 
     /// Resolve the id to store under: the client-specified `i`, or a freshly
@@ -319,6 +496,15 @@ struct Control {
     height: u32,
     quiet: u8,
     has_quiet: bool,
+    /// Display size in cells (`c`/`r`); 0 = unspecified (the renderer derives it
+    /// from the image and cell pixel size, which the headless core does not know).
+    cols: u32,
+    rows: u32,
+    /// Z-index (`z`) and cursor-movement policy (`C`: 1 = leave the cursor put).
+    z: i32,
+    cursor_move: u8,
+    /// Delete selector (`d`); uppercase additionally frees the image data.
+    delete: u8,
 }
 
 impl Default for Control {
@@ -338,6 +524,11 @@ impl Default for Control {
             height: 0,
             quiet: 0,
             has_quiet: false,
+            cols: 0,
+            rows: 0,
+            z: 0,
+            cursor_move: 0,
+            delete: b'a', // a=d with no d= deletes all placements
         }
     }
 }
@@ -371,8 +562,13 @@ impl Control {
                     c.quiet = value.parse().unwrap_or(0);
                     c.has_quiet = true;
                 }
-                // Keys this phase does not act on (placement geometry, deletion,
-                // animation, alternate mediums' offsets): ignored, defaults apply.
+                "c" => c.cols = value.parse().unwrap_or(0),
+                "r" => c.rows = value.parse().unwrap_or(0),
+                "z" => c.z = value.parse().unwrap_or(0),
+                "C" => c.cursor_move = value.parse().unwrap_or(0),
+                "d" => c.delete = value.bytes().next().unwrap_or(b'a'),
+                // Keys this phase does not act on (source crop x/y/w/h, in-cell
+                // offsets X/Y, relative placement, animation): defaults apply.
                 _ => {}
             }
         }
@@ -495,19 +691,24 @@ mod tests {
         format!("i={id},a=t,f=24,s={w},v={h};{b64}")
     }
 
+    /// Feed a command at the origin anchor (these tests don't exercise placement).
+    fn feed(g: &mut GraphicsState, payload: &str) {
+        g.handle(payload, (0, 0));
+    }
+
     #[test]
     fn stored_bytes_tracks_the_store_and_does_not_double_count_replaces() {
         let mut g = GraphicsState::default();
 
         // Two distinct 1×1 RGB images -> 4 RGBA bytes each stored.
-        g.handle(&transmit_rgb(1, 1, 1, &[1, 2, 3]));
-        g.handle(&transmit_rgb(2, 1, 1, &[4, 5, 6]));
+        feed(&mut g, &transmit_rgb(1, 1, 1, &[1, 2, 3]));
+        feed(&mut g, &transmit_rgb(2, 1, 1, &[4, 5, 6]));
         assert_eq!(g.image_count(), 2);
         assert_eq!(g.stored_bytes, 8);
 
         // Re-transmitting id 1 with a bigger 2×1 image replaces it: the old 4
         // bytes are freed first, so the count holds and bytes reflect the new size.
-        g.handle(&transmit_rgb(1, 2, 1, &[1, 2, 3, 4, 5, 6]));
+        feed(&mut g, &transmit_rgb(1, 2, 1, &[1, 2, 3, 4, 5, 6]));
         assert_eq!(g.image_count(), 2);
         assert_eq!(g.stored_bytes, 8 + 4); // image 1 now 8 bytes, image 2 still 4
 
@@ -524,7 +725,7 @@ mod tests {
         // bytes of zlib that the bounded inflate must reject rather than expand.
         let bomb = miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; MAX_IMAGE_BYTES + 1], 6);
         let payload = base64::engine::general_purpose::STANDARD.encode(&bomb);
-        g.handle(&format!("i=2,a=t,o=z,f=32,s=1,v=1;{payload}"));
+        feed(&mut g, &format!("i=2,a=t,o=z,f=32,s=1,v=1;{payload}"));
 
         let response = String::from_utf8(g.take_responses()).unwrap();
         assert!(response.contains("EINVAL"), "got {response:?}");
@@ -540,11 +741,14 @@ mod tests {
         // buffer instead of growing without bound.
         let raw_per_chunk = 64 * 1024;
         let chunk_b64 = "A".repeat(raw_per_chunk / 3 * 4);
-        g.handle(&format!("i=1,a=t,f=32,s=4096,v=4096,m=1;{chunk_b64}"));
+        feed(
+            &mut g,
+            &format!("i=1,a=t,f=32,s=4096,v=4096,m=1;{chunk_b64}"),
+        );
 
         let mut aborted = false;
         for _ in 0..(MAX_IMAGE_BYTES / raw_per_chunk + 4) {
-            g.handle(&format!("m=1;{chunk_b64}"));
+            feed(&mut g, &format!("m=1;{chunk_b64}"));
             if String::from_utf8(g.take_responses())
                 .unwrap()
                 .contains("EINVAL")
@@ -560,7 +764,24 @@ mod tests {
         );
 
         // A fresh single-shot transfer still works after the abort.
-        g.handle(&transmit_rgb(3, 2, 1, &[255, 0, 0, 0, 255, 0]));
+        feed(&mut g, &transmit_rgb(3, 2, 1, &[255, 0, 0, 0, 255, 0]));
         assert!(g.image(3).is_some());
+    }
+
+    #[test]
+    fn placements_are_bounded() {
+        let mut g = GraphicsState::default();
+        feed(&mut g, &transmit_rgb(1, 1, 1, &[1, 2, 3])); // store one image
+        let _ = g.take_responses();
+
+        // Distinct placement ids of the one image must cap, not grow forever.
+        for pid in 1..=(MAX_PLACEMENTS as u32 + 1) {
+            g.handle(&format!("i=1,a=p,p={pid}"), (0, 0));
+        }
+
+        assert_eq!(g.placement_count(), MAX_PLACEMENTS);
+        // The overflowing placement was refused with ENOSPC.
+        let responses = String::from_utf8(g.take_responses()).unwrap();
+        assert!(responses.contains("ENOSPC"), "expected an ENOSPC refusal");
     }
 }
