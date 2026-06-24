@@ -30,14 +30,22 @@ fn recording_path(data_home: &Path, name: &str) -> PathBuf {
         .join(format!("{name}.ghostrec"))
 }
 
-fn ls(run: &Path, data: &Path) -> String {
-    let out = Command::new(GHOST)
-        .env("XDG_RUNTIME_DIR", run)
-        .env("XDG_DATA_HOME", data)
-        .arg("ls")
-        .output()
-        .expect("run `ghost ls`");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// Wait until the recording at `path` is readable and its reconstructed screen
+/// shows `marker`. This is the reliable "session is done and flushed" signal:
+/// the marker is the child's final output, so seeing it proves the session
+/// started, ran to completion, and the daemon finished writing the recording.
+///
+/// Polling session *listing* instead is racy — `!ls.contains(name)` reads as
+/// true both after the session ends and (under load) before the daemon has even
+/// registered, so a test can race ahead and read a not-yet-written file.
+fn wait_for_recording_marker(path: &Path, marker: &str) -> bool {
+    wait_until(Duration::from_secs(15), || {
+        let Ok(rec) = record::read(path) else {
+            return false;
+        };
+        let screen = ghost_vt::screen::Screen::from_recording(&rec, 1000);
+        screen.text().iter().any(|l| l.contains(marker))
+    })
 }
 
 #[test]
@@ -140,22 +148,19 @@ fn long_session_writes_checkpoints() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // Wait until the recording is complete (sentinel present), then assert it
+    // reconstructs to the true final screen with at least one mid-session
+    // checkpoint.
     let path = recording_path(data.path(), name);
-    // Wait until the recording is complete (sentinel present) and reconstructs
-    // to the true final screen, with at least one mid-session checkpoint.
     assert!(
-        wait_until(Duration::from_secs(10), || {
-            let Ok(rec) = record::read(&path) else {
-                return false;
-            };
-            if rec.checkpoint_count() < 1 {
-                return false;
-            }
-            let screen = ghost_vt::screen::Screen::from_recording(&rec, 1000);
-            screen.text().iter().any(|l| l.contains("DONE-CHK"))
-        }),
-        "recording lacked a checkpoint or did not reconstruct to completion at {}",
+        wait_for_recording_marker(&path, "DONE-CHK"),
+        "recording did not reconstruct to completion at {}",
         path.display()
+    );
+    let rec = record::read(&path).unwrap();
+    assert!(
+        rec.checkpoint_count() >= 1,
+        "long session lacked a mid-session checkpoint"
     );
 }
 
@@ -198,13 +203,7 @@ fn a_non_rendering_flood_writes_no_checkpoints() {
     // write (the file is written concurrently as the session runs).
     let path = recording_path(data.path(), name);
     assert!(
-        wait_until(Duration::from_secs(15), || {
-            let Ok(rec) = record::read(&path) else {
-                return false;
-            };
-            let screen = ghost_vt::screen::Screen::from_recording(&rec, 1000);
-            screen.text().iter().any(|l| l.contains("done-idle-chk"))
-        }),
+        wait_for_recording_marker(&path, "done-idle-chk"),
         "recording did not reconstruct to the sentinel at {}",
         path.display()
     );
@@ -226,6 +225,8 @@ fn recording_size_is_bounded() {
 
     // Emit 2 MB of incompressible output with a 256 KiB cap. Unbounded, the
     // recording would be ~2 MB; bounded, old history is dropped at checkpoints.
+    // A terminal reset (RIS) then a sentinel give a clean final screen to poll
+    // for, so we wait on the flushed recording rather than racing a delisting.
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
@@ -238,7 +239,7 @@ fn recording_size_is_bounded() {
             "--",
             "sh",
             "-c",
-            "head -c 2000000 /dev/urandom",
+            "head -c 2000000 /dev/urandom; printf '\\033c'; echo BOUNDED-DONE",
         ])
         .output()
         .unwrap();
@@ -248,15 +249,12 @@ fn recording_size_is_bounded() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The session exits on its own; wait until it is no longer listed, so the
-    // recording is finalized.
-    assert!(
-        wait_until(Duration::from_secs(15), || !ls(run.path(), data.path())
-            .contains(name)),
-        "session did not finish"
-    );
-
     let path = recording_path(data.path(), name);
+    assert!(
+        wait_for_recording_marker(&path, "BOUNDED-DONE"),
+        "bounded recording did not finalize at {}",
+        path.display()
+    );
     let len = std::fs::metadata(&path).unwrap().len();
     assert!(
         len <= 1_000_000,
@@ -296,11 +294,13 @@ fn export_produces_valid_asciicast() {
         "`ghost new` failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Wait for the session to finish so the recording is finalized.
+    // Wait until the recording is flushed (its marker reconstructs) so the
+    // export below reads a complete file.
+    let path = recording_path(data.path(), name);
     assert!(
-        wait_until(Duration::from_secs(10), || !ls(run.path(), data.path())
-            .contains(name)),
-        "session did not finish"
+        wait_for_recording_marker(&path, "HELLO-CAST"),
+        "recording did not finalize at {}",
+        path.display()
     );
 
     let out = Command::new(GHOST)
