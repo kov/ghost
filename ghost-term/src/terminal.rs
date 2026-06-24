@@ -17,11 +17,17 @@ use crate::tabs::Tabs;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::mem;
+use unicode_width::UnicodeWidthChar;
 
 /// Upper bound on the kitty-keyboard push/pop stack depth (a DoS guard; the spec
 /// leaves the limit vendor-defined). Deeper nests just drop their oldest saved
 /// flag-set.
 const KITTY_KBD_STACK_MAX: usize = 32;
+
+/// The kitty Unicode-placeholder code point: a cell carrying this character is a
+/// virtual image placement, with the image id in its foreground colour and (in
+/// the trailing combining diacritics) the image row/col.
+const PLACEHOLDER: char = '\u{10eeee}';
 
 #[derive(Debug)]
 pub struct Terminal {
@@ -35,6 +41,10 @@ pub struct Terminal {
     pen: Pen,
     charsets: [Charset; 2],
     active_charset: usize,
+    /// True immediately after printing a kitty Unicode-placeholder cell
+    /// (U+10EEEE), so the zero-width combining diacritics that follow are
+    /// consumed rather than printed as their own cells.
+    in_placeholder_run: bool,
     tabs: Tabs,
     insert_mode: bool,
     origin_mode: bool,
@@ -139,6 +149,7 @@ impl Terminal {
             pen: Pen::default(),
             charsets: [Charset::Ascii, Charset::Ascii],
             active_charset: 0,
+            in_placeholder_run: false,
             insert_mode: false,
             origin_mode: false,
             auto_wrap_mode: true,
@@ -750,6 +761,7 @@ impl Terminal {
         self.pen = Pen::default();
         self.charsets = [Charset::Ascii, Charset::Ascii];
         self.active_charset = 0;
+        self.in_placeholder_run = false;
         self.insert_mode = false;
         self.origin_mode = false;
         self.auto_wrap_mode = true;
@@ -902,6 +914,17 @@ impl Terminal {
 
     fn print(&mut self, mut ch: char) {
         ch = self.charsets[self.active_charset].translate(ch);
+
+        // A kitty Unicode-placeholder cell (U+10EEEE) is followed by zero-width
+        // combining diacritics encoding the image's row/col; the renderer derives
+        // those from cell position, so consume the marks here. Printing them would
+        // give each its own cell (we have no combining-mark support) and shove the
+        // rest of the line right. Scoped to a placeholder run, so ordinary text is
+        // untouched.
+        if self.in_placeholder_run && ch != PLACEHOLDER && ch.width() == Some(0) {
+            return;
+        }
+        self.in_placeholder_run = ch == PLACEHOLDER;
 
         match self.try_print(ch) {
             PrintResult::Printed(width) => self.advance_cursor_after_print(width),

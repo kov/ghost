@@ -302,6 +302,51 @@ mod tests {
     }
 
     #[test]
+    fn unicode_placeholder_consumes_trailing_diacritics() {
+        use crate::Color;
+        // kitty Unicode placeholder: U+10EEEE rides in a cell with the image id in
+        // the foreground colour, followed by zero-width combining diacritics (here
+        // U+0305) that encode the image row/col. The diacritics must not occupy
+        // cells or shove later text — the renderer resolves row/col from position.
+        let mut vt = Vt::builder().size(5, 1).build();
+        vt.feed_str("\x1b[38;2;0;0;5m\u{10eeee}\u{0305}\u{0305}X");
+
+        let cells = vt.line(0).cells();
+        assert_eq!(cells[0].char(), '\u{10eeee}', "placeholder occupies cell 0");
+        assert_eq!(
+            cells[0].pen().foreground(),
+            Some(Color::rgb(0, 0, 5)),
+            "the image id rides in the foreground colour"
+        );
+        assert_eq!(
+            cells[1].char(),
+            'X',
+            "the diacritics were consumed, so X lands in cell 1"
+        );
+        // Cursor advanced past the placeholder and X only, not the diacritics.
+        assert_eq!(vt.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn adjacent_placeholders_each_occupy_a_cell() {
+        // A multi-cell image is a grid of placeholder cells, each (optionally)
+        // followed by its own diacritics. Consecutive placeholders must each get
+        // their own cell — the placeholder is never consumed as a trailing mark.
+        let mut vt = Vt::builder().size(5, 1).build();
+        vt.feed_str("\u{10eeee}\u{0305}\u{10eeee}\u{0305}\u{10eeee}");
+
+        let cells = vt.line(0).cells();
+        assert_eq!(cells[0].char(), '\u{10eeee}');
+        assert_eq!(cells[1].char(), '\u{10eeee}');
+        assert_eq!(cells[2].char(), '\u{10eeee}');
+        assert_eq!(
+            vt.cursor(),
+            (3, 0),
+            "three placeholders, diacritics consumed"
+        );
+    }
+
+    #[test]
     fn feed_str_returns_trimmed_scrollback() {
         let mut vt = Vt::builder().size(2, 2).scrollback_limit(0).build();
 
