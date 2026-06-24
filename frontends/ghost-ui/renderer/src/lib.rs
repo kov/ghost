@@ -35,7 +35,25 @@ pub struct Gpu {
 impl Gpu {
     /// Acquire a headless context, preferring a software fallback adapter so CI
     /// output is reproducible regardless of the host's real GPU.
+    ///
+    /// Under the crate's own unit tests this hands out clones of a single shared
+    /// device: the software (lavapipe) adapter SIGSEGVs when many devices are live
+    /// at once, which the default parallel test runner would otherwise trigger.
+    /// `wgpu::Device`/`Queue` are `Arc`-backed and thread-safe, so sharing one is
+    /// both safe and cheaper than one device per test.
     pub fn headless() -> Self {
+        #[cfg(test)]
+        {
+            shared_test_gpu()
+        }
+        #[cfg(not(test))]
+        {
+            Self::request_headless()
+        }
+    }
+
+    /// Build a fresh headless device + queue on the software fallback adapter.
+    fn request_headless() -> Self {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(desc);
@@ -49,6 +67,22 @@ impl Gpu {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("request device");
         Gpu { device, queue }
+    }
+}
+
+/// One process-wide headless device shared by the crate's unit tests (see
+/// [`Gpu::headless`]). Built once on first use and never dropped.
+#[cfg(test)]
+fn shared_test_gpu() -> Gpu {
+    use std::sync::OnceLock;
+    static SHARED: OnceLock<(wgpu::Device, wgpu::Queue)> = OnceLock::new();
+    let (device, queue) = SHARED.get_or_init(|| {
+        let gpu = Gpu::request_headless();
+        (gpu.device, gpu.queue)
+    });
+    Gpu {
+        device: device.clone(),
+        queue: queue.clone(),
     }
 }
 
@@ -374,7 +408,27 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let cov = in.color.a * a;
     return vec4<f32>(in.color.rgb * cov, cov);
 }
+
+// Image variant: the bound texture is a full RGBA image, not the coverage atlas,
+// so sample all four channels and premultiply (the image instance's colour is
+// (1,1,1,1), leaving the texel unchanged) to match the premultiplied blending.
+@fragment
+fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(atlas, samp, in.uv);
+    let a = texel.a * in.color.a;
+    return vec4<f32>(texel.rgb * a, a);
+}
 "#;
+
+/// One kitty-graphics image to paint this frame: which uploaded image (by id),
+/// its pixel rect already translated into viewport space, the scissor it clips
+/// to, and its z-index (drawn low to high among images).
+struct ImageDraw {
+    image_id: u32,
+    rect: [f32; 4],
+    scissor: [u32; 4],
+    z: i32,
+}
 
 /// A glyph's slot in the atlas plus its pen-relative placement.
 #[derive(Clone, Copy)]
@@ -507,6 +561,22 @@ pub struct Renderer {
     instance_count: u32,
     /// Current text selection to highlight, in viewport cell coordinates.
     selection: Option<Selection>,
+    /// Bind-group layout shared by the glyph and image pipelines (uniform, a
+    /// filterable texture, a sampler) — kept so per-image bind groups can be
+    /// built when an image is uploaded.
+    bind_layout: wgpu::BindGroupLayout,
+    /// Sampler shared by both pipelines.
+    sampler: wgpu::Sampler,
+    /// RGBA pipeline for kitty-graphics image quads (samples `.rgba`, unlike the
+    /// glyph pipeline which reads the `.r` coverage atlas).
+    image_pipeline: wgpu::RenderPipeline,
+    /// Uploaded image bind groups, keyed by image id; the blob is sent once and
+    /// the bind group (which owns its texture) lives until eviction.
+    image_bind_groups: HashMap<u32, wgpu::BindGroup>,
+    /// Per-frame resolved image draws (z-sorted within a terminal) and the
+    /// one-quad-per-draw instance buffer they index.
+    image_draws: Vec<ImageDraw>,
+    image_instances: Option<wgpu::Buffer>,
 }
 
 impl Renderer {
@@ -670,6 +740,41 @@ impl Renderer {
                 cache: None,
             });
 
+        // The image pipeline is the glyph pipeline with the RGBA-sampling fragment
+        // entry: same layout, vertex format and premultiplied blending, so image
+        // quads share the instance vertex shader and the viewport uniform.
+        let image_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("image pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &ATTRS,
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_image"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Renderer {
             gpu,
             pipeline,
@@ -685,12 +790,186 @@ impl Renderer {
             instances: None,
             instance_count: 0,
             selection: None,
+            bind_layout,
+            sampler,
+            image_pipeline,
+            image_bind_groups: HashMap::new(),
+            image_draws: Vec::new(),
+            image_instances: None,
         }
     }
 
     /// Set (or clear) the text selection to highlight on subsequent frames.
     pub fn set_selection(&mut self, selection: Option<Selection>) {
         self.selection = selection;
+    }
+
+    /// Cache a kitty-graphics image's pixels on the GPU as its own RGBA texture,
+    /// keyed by `id`, so the (potentially large) upload happens once. `rgba` is
+    /// straight-alpha `Rgba8` packed row-major, `width * height * 4` bytes.
+    /// Idempotent per id for now — re-upload of a replaced id lands with LRU
+    /// eviction in a later phase. A zero dimension or short buffer is ignored.
+    pub fn upload_image(&mut self, id: u32, width: u32, height: u32, rgba: &[u8]) {
+        // A single dimension can exceed the device's max texture size while the
+        // image's total bytes stay within ghost-term's budget (e.g. 9000x1 RGBA is
+        // ~36 KiB), and create_texture treats that as an unrecoverable validation
+        // error that aborts the process. That's reachable from ordinary terminal
+        // output, so skip such an image rather than crash; scaling it down to fit
+        // is a later refinement.
+        let max = self.gpu.device.limits().max_texture_dimension_2d;
+        if width == 0
+            || height == 0
+            || width > max
+            || height > max
+            || self.image_bind_groups.contains_key(&id)
+            || (rgba.len() as u64) < u64::from(width) * u64::from(height) * 4
+        {
+            return;
+        }
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("kitty image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Linear, matching the renderer's direct treatment of colour (FORMAT
+            // is also non-sRGB), so a stored texel reaches the attachment unchanged.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The bind group owns strong references to the texture/view, so the
+        // local handles can drop while the cached entry keeps them alive.
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image bind group"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+        self.image_bind_groups.insert(id, bind_group);
+    }
+
+    /// Resolve `frame`'s image placements into pixel-space draws, offset to
+    /// `(ox, oy)` and clipped to `scissor`. Only images already uploaded are
+    /// emitted; an unknown id has no texture to sample yet, so it is skipped.
+    fn collect_image_draws(
+        &self,
+        frame: &Frame,
+        ox: f32,
+        oy: f32,
+        scissor: [u32; 4],
+        out: &mut Vec<ImageDraw>,
+    ) {
+        let m = frame.metrics;
+        for img in &frame.images {
+            if !self.image_bind_groups.contains_key(&img.image_id) {
+                continue;
+            }
+            out.push(ImageDraw {
+                image_id: img.image_id,
+                rect: [
+                    ox + img.col as f32 * m.advance,
+                    oy + img.row as f32 * m.line_height,
+                    img.cols as f32 * m.advance,
+                    img.rows as f32 * m.line_height,
+                ],
+                scissor,
+                z: img.z,
+            });
+        }
+    }
+
+    /// Upload the one-quad-per-draw instance buffer for `self.image_draws`,
+    /// painter-ordered low z to high (a stable sort, so equal-z images keep their
+    /// placement order). The instance buffer and [`Self::draw_images`] then share
+    /// this order, so quad index `i` is draw `i`.
+    fn build_image_instances(&mut self) {
+        if self.image_draws.is_empty() {
+            self.image_instances = None;
+            return;
+        }
+        self.image_draws.sort_by_key(|d| d.z);
+        let insts: Vec<Instance> = self
+            .image_draws
+            .iter()
+            .map(|d| Instance {
+                rect: d.rect,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+            })
+            .collect();
+        self.image_instances = Some(self.gpu.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("image instances"),
+                contents: bytemuck::cast_slice(&insts),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
+    /// Draw the prepared image quads over the glyph layer, each under its own
+    /// scissor and bound to its image's texture. Mirrors the glyph draw's empty
+    /// guard. Images currently paint over text (z relative to glyphs is a later
+    /// refinement); within a terminal they are ordered by their placement z.
+    fn draw_images<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
+        let Some(buf) = &self.image_instances else {
+            return;
+        };
+        pass.set_pipeline(&self.image_pipeline);
+        pass.set_vertex_buffer(0, buf.slice(..));
+        for (i, d) in self.image_draws.iter().enumerate() {
+            if d.scissor[2] == 0 || d.scissor[3] == 0 {
+                continue; // fully off-screen tile
+            }
+            // Defense-in-depth: collect_image_draws already drops un-uploaded ids,
+            // so this only fires if that invariant breaks — never in normal use.
+            let Some(bg) = self.image_bind_groups.get(&d.image_id) else {
+                continue;
+            };
+            pass.set_bind_group(0, bg, &[]);
+            pass.set_scissor_rect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+            let i = i as u32;
+            pass.draw(0..6, i..i + 1);
+        }
     }
 
     /// The pixel dimensions a frame renders to at its cell metrics.
@@ -962,6 +1241,10 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let mut imgs = Vec::new();
+        self.collect_image_draws(frame, 0.0, 0.0, [0, 0, vw, vh], &mut imgs);
+        self.image_draws = imgs;
+        self.build_image_instances();
     }
 
     /// Record a clear-and-draw pass into `view`, returning the command buffer.
@@ -1003,6 +1286,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..self.instance_count);
             }
+            self.draw_images(&mut pass);
         }
         encoder.finish()
     }
@@ -1049,10 +1333,11 @@ impl Renderer {
         scene: &Scene,
         font: FontRef,
         size_px: f32,
-    ) -> (Vec<Instance>, Vec<DrawGroup>) {
+    ) -> (Vec<Instance>, Vec<DrawGroup>, Vec<ImageDraw>) {
         let (sw, sh) = scene.size_px;
         let mut all: Vec<Instance> = Vec::new();
         let mut groups: Vec<DrawGroup> = Vec::new();
+        let mut images: Vec<ImageDraw> = Vec::new();
         let mut order: Vec<&Layer> = scene.layers.iter().collect();
         order.sort_by_key(|l| l.z); // stable: keeps insertion order within a z
 
@@ -1079,6 +1364,7 @@ impl Renderer {
                             dim_colors(&mut insts);
                         }
                         all.extend(insts);
+                        self.collect_image_draws(frame, rect.x, rect.y, scissor, &mut images);
                     }
                     SceneItem::Rect { rect, color, .. } => all.push(solid(*rect, *color)),
                     SceneItem::Border {
@@ -1107,7 +1393,7 @@ impl Renderer {
                 }
             }
         }
-        (all, groups)
+        (all, groups, images)
     }
 
     /// Glyph instances for a text item: its runs laid out as one line from
@@ -1152,7 +1438,9 @@ impl Renderer {
 
     /// Upload a scene's instances and viewport uniform; return the draw groups.
     fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<DrawGroup> {
-        let (instances, groups) = self.build_scene(scene, font, size_px);
+        let (instances, groups, images) = self.build_scene(scene, font, size_px);
+        self.image_draws = images;
+        self.build_image_instances();
         self.instance_count = instances.len() as u32;
         self.instances = Some(self.gpu.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -1222,6 +1510,7 @@ impl Renderer {
                     pass.draw(0..6, g.range.clone());
                 }
             }
+            self.draw_images(&mut pass);
         }
         encoder.finish()
     }
@@ -1303,6 +1592,119 @@ mod tests {
 
     fn is_red(p: [u8; 4]) -> bool {
         p[0] > 0x60 && p[1] < 0x20 && p[2] < 0x20
+    }
+
+    fn is_green(p: [u8; 4]) -> bool {
+        p[0] < 0x20 && p[1] > 0x60 && p[2] < 0x20
+    }
+
+    #[test]
+    fn kitty_graphics_image_paints_at_its_cell() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // Transmit + display a 2x1 RGB image (id 7): one red then one green pixel,
+        // with an explicit 2x1-cell footprint, at the cursor (top-left).
+        let mut v = Vt::new(20, 4);
+        v.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        let f = layout_frame(&v, TM);
+        assert_eq!(
+            f.images.len(),
+            1,
+            "the placement is laid out into the frame"
+        );
+
+        // Upload the decoded pixels out of band, as the core's Cmd::UploadImage would.
+        let mut r = Renderer::headless(Theme::default());
+        let img = v.graphics_image(7).expect("image stored");
+        r.upload_image(7, img.width, img.height, &img.pixels);
+
+        let (w, h) = Renderer::frame_size(&f);
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer {
+                z: 0,
+                items: vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            }],
+        };
+        let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
+
+        // The image spans cells (0,0)+(1,0): 18px wide (advance 9), 18px tall
+        // (line_height 18). Nearest sampling stretches the 2px image so the left
+        // cell shows red and the right cell green.
+        assert!(is_red(px(&out, 4, 9)), "left half shows the red pixel");
+        assert!(
+            is_green(px(&out, 13, 9)),
+            "right half shows the green pixel"
+        );
+        // Below the one-row footprint is plain background, neither red nor green.
+        let below = px(&out, 4, 40);
+        assert!(
+            !is_red(below) && !is_green(below),
+            "below the image is background"
+        );
+    }
+
+    #[test]
+    fn image_not_uploaded_is_skipped_not_panicking() {
+        // A placement whose pixels were never uploaded must produce no image draw
+        // (and not panic on a missing texture) — the frontend uploads lazily.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut v = Vt::new(20, 4);
+        v.feed_str("\x1b_Gi=9,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        let f = layout_frame(&v, TM);
+        assert_eq!(f.images.len(), 1);
+        let mut r = Renderer::headless(Theme::default());
+        let out = r.render_offscreen(&f, font, SIZE_PX);
+        // The collect-time skip drops it before any quad is built — assert that
+        // directly, so a regression that removes the skip is caught even though
+        // draw_images would still guard against a missing texture downstream.
+        assert!(
+            r.image_draws.is_empty(),
+            "an un-uploaded image produces no image draw"
+        );
+        // And nothing red/green is painted anywhere.
+        let any_colored = (0..out.width).step_by(3).any(|x| {
+            (0..out.height)
+                .step_by(3)
+                .any(|y| is_red(px(&out, x, y)) || is_green(px(&out, x, y)))
+        });
+        assert!(!any_colored, "an un-uploaded image paints nothing");
+    }
+
+    #[test]
+    fn upload_image_skips_oversize_dimensions_without_panicking() {
+        // An image one pixel wider than the device allows must be skipped, not
+        // sent to create_texture (a validation error there aborts the process).
+        // Reachable from ordinary input: total bytes stay tiny while a side blows
+        // past the limit.
+        let mut r = Renderer::headless(Theme::default());
+        let over = r.gpu.device.limits().max_texture_dimension_2d + 1;
+        let rgba = vec![0xFFu8; (over as usize) * 4]; // over x 1 RGBA
+        r.upload_image(5, over, 1, &rgba);
+        assert!(
+            !r.image_bind_groups.contains_key(&5),
+            "an oversize image is not cached"
+        );
+        // A placement of that id then draws nothing rather than crashing.
+        let mut v = Vt::new(20, 4);
+        v.feed_str("\x1b_Gi=5,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        let f = layout_frame(&v, TM);
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let _ = r.render_offscreen(&f, font, SIZE_PX);
+        assert!(
+            r.image_draws.is_empty(),
+            "the oversize image produces no draw"
+        );
     }
 
     fn render_text(s: &str) -> Rendered {
