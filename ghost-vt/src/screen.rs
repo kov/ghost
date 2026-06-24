@@ -24,6 +24,9 @@ pub struct Screen {
     rows: u16,
     /// Incomplete trailing UTF-8 bytes carried over from the previous feed.
     pending: Vec<u8>,
+    /// Reused scratch for the viewport rows the last [`feed`](Screen::feed)
+    /// changed, so reporting damage costs no per-feed allocation.
+    dirty_rows: Vec<usize>,
 }
 
 impl Screen {
@@ -37,6 +40,7 @@ impl Screen {
             cols,
             rows,
             pending: Vec::new(),
+            dirty_rows: Vec::new(),
         }
     }
 
@@ -65,7 +69,9 @@ impl Screen {
         };
         for item in rest {
             match item {
-                Item::Output { data, .. } => screen.feed(data),
+                Item::Output { data, .. } => {
+                    screen.feed(data);
+                }
                 Item::Resize { cols, rows, .. } => screen.resize(*cols, *rows),
                 Item::Checkpoint { .. } => {}
             }
@@ -75,13 +81,23 @@ impl Screen {
 
     /// Feed raw PTY bytes, decoding as much valid UTF-8 as possible and holding
     /// back only a genuinely incomplete trailing sequence for next time.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns the viewport rows this feed changed (sorted, deduplicated). The
+    /// contract is **"these rows definitely changed"**, not "only these changed":
+    /// scrolling, full clears, alt-screen switches and reflow conservatively
+    /// report the whole viewport. It is a damage hint — useful to skip work when
+    /// it is *empty or small*, never to assume an unlisted row is untouched. An
+    /// empty slice means nothing in the viewport changed (e.g. a query that only
+    /// produced a reply, or bytes held back as an incomplete tail).
+    pub fn feed(&mut self, bytes: &[u8]) -> &[usize] {
+        self.dirty_rows.clear();
         self.pending.extend_from_slice(bytes);
         loop {
             match std::str::from_utf8(&self.pending) {
                 Ok(s) => {
                     if !s.is_empty() {
-                        self.vt.feed_str(s);
+                        let lines = self.vt.feed_str(s).lines;
+                        self.dirty_rows.extend(lines);
                     }
                     self.pending.clear();
                     break;
@@ -91,7 +107,8 @@ impl Screen {
                     if valid > 0 {
                         // SAFETY: `valid_up_to` guarantees this prefix is UTF-8.
                         let s = unsafe { std::str::from_utf8_unchecked(&self.pending[..valid]) };
-                        self.vt.feed_str(s);
+                        let lines = self.vt.feed_str(s).lines;
+                        self.dirty_rows.extend(lines);
                     }
                     match e.error_len() {
                         // Incomplete tail: keep it, wait for the rest.
@@ -101,13 +118,17 @@ impl Screen {
                         }
                         // Invalid byte(s): emit a replacement char and skip them.
                         Some(bad) => {
-                            self.vt.feed_str("\u{fffd}");
+                            let lines = self.vt.feed_str("\u{fffd}").lines;
+                            self.dirty_rows.extend(lines);
                             self.pending.drain(..valid + bad);
                         }
                     }
                 }
             }
         }
+        self.dirty_rows.sort_unstable();
+        self.dirty_rows.dedup();
+        &self.dirty_rows
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -223,6 +244,27 @@ mod tests {
         let mut s = Screen::new(20, 4, 100);
         s.feed(b"hello world");
         assert!(screen_text(&s)[0].starts_with("hello world"));
+    }
+
+    #[test]
+    fn feed_reports_changed_rows_as_a_damage_hint() {
+        let mut s = Screen::new(20, 4, 100);
+
+        // The first feed paints from a fresh terminal, so every row is reported.
+        assert_eq!(s.feed(b"first"), &[0, 1, 2, 3]);
+
+        // After that, text on the top row reports only row 0.
+        assert_eq!(s.feed(b"more"), &[0]);
+
+        // A query that produces only a reply changes no visible row.
+        assert!(s.feed(b"\x1b[6n").is_empty());
+
+        // A full clear conservatively reports the whole viewport — the contract is
+        // "these definitely changed", not "only these".
+        assert_eq!(s.feed(b"\x1b[2J"), &[0, 1, 2, 3]);
+
+        // An incomplete trailing UTF-8 byte is held back: nothing changed yet.
+        assert!(s.feed(&[0xE2]).is_empty());
     }
 
     #[test]
