@@ -212,6 +212,15 @@ impl Terminal {
     pub fn execute(&mut self, fun: Function) {
         use Function::*;
 
+        // A Unicode-placeholder run only spans the characters printed immediately
+        // after the placeholder cell. Any other action (cursor move, line break,
+        // a control char) ends it, so a later zero-width mark isn't mistaken for
+        // one of the placeholder's diacritics. `Rep` repeats via `print`, which
+        // re-establishes the run if it repeats a placeholder.
+        if !matches!(fun, Print(_)) {
+            self.in_placeholder_run = false;
+        }
+
         match fun {
             Bell => {
                 self.bell_count += 1;

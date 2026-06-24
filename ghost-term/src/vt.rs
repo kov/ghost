@@ -328,6 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_run_ends_at_a_cursor_move() {
+        // The placeholder run only spans the characters that immediately follow the
+        // placeholder cell; a cursor move ends it, so a later combining mark is
+        // handled normally (the emulator's usual leading-mark behaviour) rather
+        // than being silently eaten as if it were one of the placeholder's.
+        let mut vt = Vt::builder().size(8, 1).build();
+        // Placeholder at col 0, move to column 5 (CHA, 1-based), then a combining
+        // mark and 'X'.
+        vt.feed_str("\x1b[38;2;0;0;5m\u{10eeee}\x1b[5G\u{0305}X");
+
+        let cells = vt.line(0).cells();
+        assert_eq!(cells[0].char(), '\u{10eeee}');
+        // The mark was NOT consumed: it sits in its own cell at column 4 and 'X'
+        // follows at column 5.
+        assert_eq!(cells[4].char(), '\u{0305}');
+        assert_eq!(cells[5].char(), 'X');
+    }
+
+    #[test]
     fn adjacent_placeholders_each_occupy_a_cell() {
         // A multi-cell image is a grid of placeholder cells, each (optionally)
         // followed by its own diacritics. Consecutive placeholders must each get

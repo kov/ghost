@@ -147,6 +147,11 @@ pub struct TerminalModel {
     /// kitty-graphics image ids whose pixels have been uploaded to the renderer,
     /// so the (potentially large) blob is sent once rather than every feed.
     uploaded_images: HashSet<u32>,
+    /// Count of stored graphics images at the last feed. When it grows, a newly
+    /// stored image may be referenced by a placeholder that has already scrolled
+    /// out of the live viewport, so we rescan all retained lines (not just the
+    /// viewport) for placeholder ids to upload.
+    last_image_count: usize,
     ended: bool,
 }
 
@@ -176,6 +181,7 @@ impl TerminalModel {
             preedit: String::new(),
             last_title: String::new(),
             uploaded_images: HashSet::new(),
+            last_image_count: 0,
             ended: false,
         }
     }
@@ -625,16 +631,32 @@ impl TerminalModel {
                 fresh.push(id);
             }
         }
-        // Placeholder cells reference an image by id without a direct placement,
-        // so scan the viewport for them too.
-        for line in self.screen.vt().view() {
-            for cell in line.cells() {
-                if let Some(id) = cell.placeholder_image_id()
-                    && !self.uploaded_images.contains(&id)
-                    && !fresh.contains(&id)
-                {
-                    fresh.push(id);
-                }
+        // Placeholder cells reference an image by id without a direct placement.
+        // Normally scan just the live viewport; but when a new image was just
+        // stored, also scan the retained scrollback, since the image may belong to
+        // a placeholder that already scrolled out of view (otherwise it would never
+        // upload and would render blank when scrolled back to).
+        let count = self.screen.vt().graphics_image_count();
+        let scan_all = count != self.last_image_count;
+        self.last_image_count = count;
+        let placeholder_ids: Vec<u32> = if scan_all {
+            self.screen
+                .vt()
+                .lines()
+                .flat_map(|line| line.cells())
+                .filter_map(|cell| cell.placeholder_image_id())
+                .collect()
+        } else {
+            self.screen
+                .vt()
+                .view()
+                .flat_map(|line| line.cells())
+                .filter_map(|cell| cell.placeholder_image_id())
+                .collect()
+        };
+        for id in placeholder_ids {
+            if !self.uploaded_images.contains(&id) && !fresh.contains(&id) {
+                fresh.push(id);
             }
         }
         for id in fresh {
@@ -1890,6 +1912,40 @@ mod tests {
             ended: false,
         });
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
+    }
+
+    #[test]
+    fn placeholder_image_transmitted_after_scrolling_off_still_uploads() {
+        let mut m = model();
+        // A placeholder referencing id 7 is printed before the image exists, then
+        // scrolled out of the viewport. No upload yet (nothing stored).
+        let mut bytes = b"\x1b[38;2;0;0;7m".to_vec();
+        bytes.extend("\u{10eeee}\r\n".as_bytes());
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes,
+            ended: false,
+        });
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
+        m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: vec![b'\n'; 30], // push the placeholder line into scrollback
+            ended: false,
+        });
+
+        // Now the image arrives. The placeholder is in scrollback, not the live
+        // viewport, but the freshly-stored image must still upload.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::UploadImage {
+            id: 7,
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+        }));
     }
 
     #[test]

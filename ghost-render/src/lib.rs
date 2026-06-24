@@ -11,7 +11,7 @@
 //! The only "font" input is [`CellMetrics`]: a monospace cell box. Pixel
 //! positions are pure arithmetic from it, so even geometry is unit-testable.
 
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 
 pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
@@ -156,7 +156,7 @@ impl Selection {
 /// compare). The cell rect is the image's footprint; `row` is viewport-relative
 /// and may be negative when the image's top has scrolled above the viewport (the
 /// renderer clips it). Emitted in ascending `z` so painter's order is `z`-order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImagePlacement {
     pub image_id: u32,
     /// Top-left cell: `col` is 0-based from the left; `row` is viewport-relative
@@ -168,6 +168,10 @@ pub struct ImagePlacement {
     pub cols: usize,
     pub rows: usize,
     pub z: i32,
+    /// Source sub-rectangle of the image to draw, as `[u0, v0, u1, v1]` in 0..1.
+    /// `[0, 0, 1, 1]` is the whole image (direct placements); Unicode-placeholder
+    /// cells use a per-cell slice so each cell shows its part of the image.
+    pub uv: [f32; 4],
 }
 
 /// A full frame ready to draw: the laid-out viewport, the cursor, and any images.
@@ -348,6 +352,7 @@ pub fn layout_image_placements(
                 cols: cell_cols,
                 rows: cell_rows,
                 z: p.z,
+                uv: [0.0, 0.0, 1.0, 1.0], // a direct placement draws the whole image
             })
         })
         .collect();
@@ -358,44 +363,80 @@ pub fn layout_image_placements(
 
 /// Resolve kitty Unicode-placeholder cells in the visible viewport into
 /// [`ImagePlacement`]s. Placeholder cells (U+10EEEE) carry an image id in their
-/// foreground colour and tile the area an image occupies; we group the cells of
-/// each id into their bounding box and emit one placement spanning it, so the
-/// image is drawn stretched across exactly those cells.
+/// foreground colour and tile the area an image occupies.
 ///
-/// Row/column *within* the image are inferred from cell position (the bounding
-/// box), not the kitty diacritics, which the emulator drops — correct for the
-/// common case of an image shown as one contiguous rectangular block. An id with
-/// no stored image is skipped (nothing to draw yet).
+/// Cells of the same id are grouped into 4-connected components — each is one
+/// displayed copy of that image — and every cell of a component emits a 1×1
+/// placement sampling the slice of the image it represents (its position within
+/// the component's bounding box). So two separate blocks of the same id are two
+/// independent copies rather than one image smeared across the gap, and a ragged
+/// block paints only its own cells, never the blanks inside its bounding box.
+/// Row/column come from cell position, not the kitty diacritics (which the
+/// emulator drops); an id with no stored image is skipped (nothing to draw yet).
 pub fn layout_placeholder_placements(vt: &Vt, offset: usize, rows: usize) -> Vec<ImagePlacement> {
-    // id -> (min_row, min_col, max_row, max_col) in viewport cell coordinates.
-    let mut blocks: BTreeMap<u32, (usize, usize, usize, usize)> = BTreeMap::new();
+    // Collect placeholder cells: (row, col) -> image id, in viewport coordinates.
+    let mut grid: HashMap<(usize, usize), u32> = HashMap::new();
     for (row, line) in vt.view_at(offset).take(rows).enumerate() {
         for (col, cell) in line.cells().iter().enumerate() {
-            let Some(id) = cell.placeholder_image_id() else {
-                continue;
-            };
-            let b = blocks.entry(id).or_insert((row, col, row, col));
-            b.0 = b.0.min(row);
-            b.1 = b.1.min(col);
-            b.2 = b.2.max(row);
-            b.3 = b.3.max(col);
+            if let Some(id) = cell.placeholder_image_id() {
+                grid.insert((row, col), id);
+            }
         }
     }
 
-    blocks
-        .into_iter()
-        .filter_map(|(id, (r0, c0, r1, c1))| {
-            vt.graphics_image(id)?; // no stored image -> nothing to draw
-            Some(ImagePlacement {
+    // Deterministic component order: walk cells in row-major order.
+    let mut starts: Vec<(usize, usize)> = grid.keys().copied().collect();
+    starts.sort_unstable();
+
+    let mut visited: HashSet<(usize, usize)> = HashSet::new();
+    let mut out: Vec<ImagePlacement> = Vec::new();
+    for &start in &starts {
+        if !visited.insert(start) {
+            continue;
+        }
+        let id = grid[&start];
+        // Flood-fill the same-id 4-connected component, recording its cells and
+        // bounding box.
+        let mut members: Vec<(usize, usize)> = Vec::new();
+        let (mut r0, mut c0, mut r1, mut c1) = (start.0, start.1, start.0, start.1);
+        let mut stack = vec![start];
+        while let Some((r, c)) = stack.pop() {
+            members.push((r, c));
+            r0 = r0.min(r);
+            c0 = c0.min(c);
+            r1 = r1.max(r);
+            c1 = c1.max(c);
+            let neighbors = [
+                (r.wrapping_sub(1), c),
+                (r + 1, c),
+                (r, c.wrapping_sub(1)),
+                (r, c + 1),
+            ];
+            for n in neighbors {
+                if grid.get(&n) == Some(&id) && visited.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+        if vt.graphics_image(id).is_none() {
+            continue; // no stored image -> nothing to draw for this copy
+        }
+        members.sort_unstable(); // deterministic emission order (row-major)
+        let (w, h) = ((c1 - c0 + 1) as f32, (r1 - r0 + 1) as f32);
+        for (r, c) in members {
+            let (gc, gr) = ((c - c0) as f32, (r - r0) as f32);
+            out.push(ImagePlacement {
                 image_id: id,
-                col: c0,
-                row: r0 as isize,
-                cols: c1 - c0 + 1,
-                rows: r1 - r0 + 1,
+                col: c,
+                row: r as isize,
+                cols: 1,
+                rows: 1,
                 z: 0,
-            })
-        })
-        .collect()
+                uv: [gc / w, gr / h, (gc + 1.0) / w, (gr + 1.0) / h],
+            });
+        }
+    }
+    out
 }
 
 /// How many whole cells an image dimension of `px` pixels spans, given a cell
@@ -665,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_placeholders_become_one_image_placement() {
+    fn unicode_placeholders_become_per_cell_image_slices() {
         let mut v = Vt::new(10, 3);
         // Transmit (store, don't display) a 2x1 image as id 1.
         v.feed_str(&format!("\x1b_Gi=1,a=t,f=24,s=2,v=1;{IMG_2X1}\x1b\\"));
@@ -673,10 +714,28 @@ mod tests {
         v.feed_str("\x1b[38;2;0;0;1m\u{10eeee}\u{10eeee}");
 
         let f = layout_frame(&v, M);
-        // The two cells collapse to one placement spanning their 2x1 bounding box.
-        assert_eq!(f.images.len(), 1);
-        let p = f.images[0];
-        assert_eq!((p.image_id, p.col, p.row, p.cols, p.rows), (1, 0, 0, 2, 1));
+        // Each cell of the contiguous 2x1 block is its own 1x1 placement sampling
+        // its half of the image: left cell -> left half, right cell -> right half.
+        assert_eq!(f.images.len(), 2);
+        assert_eq!(
+            (
+                f.images[0].col,
+                f.images[0].cols,
+                f.images[0].rows,
+                f.images[0].uv
+            ),
+            (0, 1, 1, [0.0, 0.0, 0.5, 1.0])
+        );
+        assert_eq!(
+            (
+                f.images[1].col,
+                f.images[1].cols,
+                f.images[1].rows,
+                f.images[1].uv
+            ),
+            (1, 1, 1, [0.5, 0.0, 1.0, 1.0])
+        );
+        assert!(f.images.iter().all(|p| p.image_id == 1 && p.row == 0));
         // And the placeholder cells are not laid out as (tofu) text.
         assert!(
             f.rows_layout[0]
@@ -684,6 +743,30 @@ mod tests {
                 .iter()
                 .all(|r| !r.text.contains('\u{10eeee}')),
             "placeholder cells draw an image, not their glyph"
+        );
+    }
+
+    #[test]
+    fn non_contiguous_placeholders_of_same_id_are_separate_copies() {
+        // The same id shown in two separated cells must be two independent copies,
+        // not one image stretched across the gap between them.
+        let mut v = Vt::new(10, 3);
+        v.feed_str(&format!("\x1b_Gi=1,a=t,f=24,s=2,v=1;{IMG_2X1}\x1b\\"));
+        // Placeholder at col 0; move to column 4 (CHA, 1-based); placeholder at col 3.
+        v.feed_str("\x1b[38;2;0;0;1m\u{10eeee}\x1b[4G\u{10eeee}");
+
+        let f = layout_frame(&v, M);
+        let cols: Vec<usize> = f.images.iter().map(|p| p.col).collect();
+        assert_eq!(
+            cols,
+            vec![0, 3],
+            "two copies at their own columns, no gap fill"
+        );
+        // Each is a standalone 1x1 component, so it shows the whole image.
+        assert!(
+            f.images
+                .iter()
+                .all(|p| p.uv == [0.0, 0.0, 1.0, 1.0] && p.cols == 1)
         );
     }
 

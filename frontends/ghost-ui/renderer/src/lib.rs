@@ -426,6 +426,8 @@ fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
 struct ImageDraw {
     image_id: u32,
     rect: [f32; 4],
+    /// Source sub-rectangle of the image to sample, `[u0, v0, u1, v1]`.
+    uv: [f32; 4],
     scissor: [u32; 4],
     z: i32,
 }
@@ -912,6 +914,7 @@ impl Renderer {
                     img.cols as f32 * m.advance,
                     img.rows as f32 * m.line_height,
                 ],
+                uv: img.uv,
                 scissor,
                 z: img.z,
             });
@@ -933,7 +936,7 @@ impl Renderer {
             .iter()
             .map(|d| Instance {
                 rect: d.rect,
-                uv: [0.0, 0.0, 1.0, 1.0],
+                uv: d.uv,
                 color: [1.0, 1.0, 1.0, 1.0],
             })
             .collect();
@@ -1665,8 +1668,8 @@ mod tests {
         let f = layout_frame(&v, TM);
         assert_eq!(
             f.images.len(),
-            1,
-            "the placeholder block becomes one placement"
+            2,
+            "the 2x1 placeholder block becomes one per-cell placement each"
         );
 
         let mut r = Renderer::headless(Theme::default());
