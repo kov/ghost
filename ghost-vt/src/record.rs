@@ -9,25 +9,34 @@
 //!
 //! ```text
 //! magic  "GHOSTREC"            8 bytes
-//! ver    u8                    format version
+//! ver    u8                    format version (2)
 //! header u32 len + postcard(Header)
 //! frame* repeated until EOF:
-//!          kind  u8            (0 = events, 1 = checkpoint; others reserved)
+//!          kind  u8            (0 = events, 1 = checkpoint, 2 = images)
 //!          clen  u32 LE        compressed payload length
-//!          data  [clen]        zstd( postcard(Vec<Event>) )  for kind 0
-//!                              zstd( postcard(Checkpoint) )   for kind 1
+//!          data  [clen]        zstd( postcard(Vec<Event>) )      for kind 0
+//!                              zstd( postcard(Checkpoint) )       for kind 1
+//!                              zstd( postcard(Vec<ImageBlob>) )   for kind 2
 //! ```
 //!
-//! A checkpoint frame carries a full emulator dump: a safe point to start
-//! replay from, and a safe point to cut the file at when bounding its size
-//! (everything before a checkpoint can be dropped losslessly).
+//! A checkpoint frame carries an emulator dump (minus kitty-graphics image
+//! transmits): a safe point to start replay from, and a safe point to cut the
+//! file at when bounding its size (everything before a checkpoint can be dropped
+//! losslessly). Image bytes are content-addressed and stored once in an images
+//! frame, then referenced by hash from the checkpoints that need them — so a
+//! recurring image is not re-inlined in every checkpoint. The reader resolves
+//! those references and reconstructs the full dump; bounding the file re-emits
+//! the images its retained checkpoints reference (the cut would otherwise drop
+//! the frame that stored them).
 //!
 //! Frames are independently compressed and length-prefixed, so the writer can
 //! append incrementally with bounded memory and a reader can stop cleanly at a
 //! torn final frame (e.g. after a crash) without failing — it returns every
 //! complete frame it found.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -35,9 +44,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"GHOSTREC";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const FRAME_EVENTS: u8 = 0;
 const FRAME_CHECKPOINT: u8 = 1;
+/// A content-addressed image store: kitty-graphics image bytes written once and
+/// referenced by hash from later checkpoints, so a recording bakes images in
+/// without re-inlining them in every checkpoint.
+const FRAME_IMAGES: u8 = 2;
 const ZSTD_LEVEL: i32 = 3;
 /// Flush a frame once this many bytes of output have accumulated.
 const FLUSH_THRESHOLD: usize = 64 * 1024;
@@ -74,15 +87,60 @@ struct Event {
     body: EventBody,
 }
 
+/// One kitty-graphics image stored in a [`FRAME_IMAGES`] frame, content-addressed
+/// by `hash` (over its dimensions and pixels). Stored once per recording; later
+/// checkpoints reference it by hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ImageBlob {
+    hash: u64,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// A checkpoint's reference to a stored image: the content `hash` to resolve and
+/// the `id` to re-transmit it under when reconstructing the dump on replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ImageRef {
+    id: u32,
+    hash: u64,
+}
+
+/// A live image handed to [`Recorder::checkpoint_with_images`] (borrowed from the
+/// emulator's graphics store, not yet hashed or copied).
+pub struct CheckpointImage<'a> {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: &'a [u8],
+}
+
+/// Content hash of an image, over its dimensions and pixels. Only ever compared
+/// against other hashes read back from the same recording, so the algorithm need
+/// only be deterministic, not stable across versions.
+fn image_hash(width: u32, height: u32, pixels: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut h);
+    height.hash(&mut h);
+    pixels.hash(&mut h);
+    h.finish()
+}
+
 /// The on-wire payload of a checkpoint frame: the emulator's serialized state
-/// (an extended `dump`) plus the geometry it was taken at.
+/// (an extended `dump`) plus the geometry it was taken at. As of format v2 the
+/// dump omits image transmit escapes; the images it needs are listed in `images`
+/// and stored in [`FRAME_IMAGES`] frames, and the reader reconstructs the full
+/// dump by re-transmitting them before the dump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Checkpoint {
     t_ms: u64,
     cols: u16,
     rows: u16,
-    /// The dump bytes that reconstruct the emulator state when fed to a fresh vt.
+    /// The dump bytes that reconstruct the emulator state when fed to a fresh vt,
+    /// minus the image transmits (those are reconstructed from `images`).
     dump: Vec<u8>,
+    /// References to the images this checkpoint's placeholders/placements need.
+    images: Vec<ImageRef>,
 }
 
 /// A decoded timeline entry. Checkpoints and output/resize events are flattened
@@ -108,6 +166,9 @@ pub struct Recorder<W: Write> {
     start: Instant,
     pending: Vec<Event>,
     pending_bytes: usize,
+    /// Content hashes of images already written to a [`FRAME_IMAGES`] frame, so a
+    /// checkpoint references an unchanged image rather than re-storing its bytes.
+    written_hashes: HashSet<u64>,
 }
 
 /// A recording on disk whose size is kept bounded. It appends like any
@@ -172,6 +233,20 @@ impl FileRecorder {
         self.compact_if_needed()
     }
 
+    /// Write a checkpoint with its referenced images (content-addressed dedup),
+    /// then compact the file if it has grown past the cap.
+    pub fn checkpoint_with_images(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        dump: &[u8],
+        images: &[CheckpointImage],
+    ) -> io::Result<()> {
+        self.inner
+            .checkpoint_with_images(cols, rows, dump, images)?;
+        self.compact_if_needed()
+    }
+
     fn compact_if_needed(&mut self) -> io::Result<()> {
         let Some(max) = self.max_bytes else {
             return Ok(());
@@ -216,6 +291,7 @@ impl<W: Write> Recorder<W> {
             start: Instant::now(),
             pending: Vec::new(),
             pending_bytes: 0,
+            written_hashes: HashSet::new(),
         })
     }
 
@@ -241,16 +317,54 @@ impl<W: Write> Recorder<W> {
         Ok(())
     }
 
+    /// Write a full-state checkpoint with no images (see
+    /// [`checkpoint_with_images`](Self::checkpoint_with_images)).
+    pub fn checkpoint(&mut self, cols: u16, rows: u16, dump: &[u8]) -> io::Result<()> {
+        self.checkpoint_with_images(cols, rows, dump, &[])
+    }
+
     /// Write a full-state checkpoint: a safe point to start replay from. Any
     /// buffered output is flushed first so the checkpoint reflects everything
-    /// recorded before it. `dump` is an extended emulator dump (state as bytes).
-    pub fn checkpoint(&mut self, cols: u16, rows: u16, dump: &[u8]) -> io::Result<()> {
+    /// recorded before it. `dump` is the emulator dump *without* image transmits;
+    /// `images` are the graphics images it references. Each image not already
+    /// stored is written to a [`FRAME_IMAGES`] frame first; the checkpoint then
+    /// references all of them by content hash, so an unchanged image is stored
+    /// once across many checkpoints.
+    pub fn checkpoint_with_images(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        dump: &[u8],
+        images: &[CheckpointImage],
+    ) -> io::Result<()> {
         self.flush_frame()?;
+
+        let mut refs = Vec::with_capacity(images.len());
+        let mut new_blobs = Vec::new();
+        for img in images {
+            let hash = image_hash(img.width, img.height, img.pixels);
+            refs.push(ImageRef { id: img.id, hash });
+            if self.written_hashes.insert(hash) {
+                new_blobs.push(ImageBlob {
+                    hash,
+                    width: img.width,
+                    height: img.height,
+                    pixels: img.pixels.to_vec(),
+                });
+            }
+        }
+        if !new_blobs.is_empty() {
+            let compressed = zstd::encode_all(&to_postcard(&new_blobs)?[..], ZSTD_LEVEL)?;
+            self.writer.write_all(&[FRAME_IMAGES])?;
+            write_len_prefixed(&mut self.writer, &compressed)?;
+        }
+
         let ckpt = Checkpoint {
             t_ms: self.elapsed_ms(),
             cols,
             rows,
             dump: dump.to_vec(),
+            images: refs,
         };
         let compressed = zstd::encode_all(&to_postcard(&ckpt)?[..], ZSTD_LEVEL)?;
         self.writer.write_all(&[FRAME_CHECKPOINT])?;
@@ -351,6 +465,9 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
     let header: Header = postcard::from_bytes(hbytes).map_err(io::Error::other)?;
 
     let mut items = Vec::new();
+    // The content-addressed image store, accumulated from FRAME_IMAGES frames as
+    // they are read, so a later checkpoint can reconstruct its image transmits.
+    let mut image_store: HashMap<u64, ImageBlob> = HashMap::new();
     // Each frame: kind(u8) + clen(u32) + payload. Stop cleanly on a short read,
     // which means the writer was interrupted mid-frame.
     while pos < bytes.len() {
@@ -378,14 +495,39 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
                     });
                 }
             }
+            FRAME_IMAGES => {
+                let raw = zstd::decode_all(payload)?;
+                let blobs: Vec<ImageBlob> = postcard::from_bytes(&raw).map_err(io::Error::other)?;
+                for blob in blobs {
+                    image_store.insert(blob.hash, blob);
+                }
+            }
             FRAME_CHECKPOINT => {
                 let raw = zstd::decode_all(payload)?;
                 let c: Checkpoint = postcard::from_bytes(&raw).map_err(io::Error::other)?;
+                // Reconstruct the full dump: re-transmit the referenced images
+                // (resolved from the store) before the transmit-free dump, so the
+                // returned dump is self-contained like a v1 dump was.
+                let mut dump = Vec::new();
+                for r in &c.images {
+                    if let Some(blob) = image_store.get(&r.hash) {
+                        dump.extend_from_slice(
+                            ghost_term::encode_transmit(
+                                r.id,
+                                blob.width,
+                                blob.height,
+                                &blob.pixels,
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+                dump.extend_from_slice(&c.dump);
                 items.push(Item::Checkpoint {
                     t_ms: c.t_ms,
                     cols: c.cols,
                     rows: c.rows,
-                    dump: c.dump,
+                    dump,
                 });
             }
             // Unknown frame kinds (forward compatibility) are skipped.
@@ -412,31 +554,91 @@ pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
     take(bytes, &mut pos, hlen)?;
     let frames_start = pos;
 
-    // Offsets of every checkpoint frame, earliest first.
-    let mut checkpoints = Vec::new();
+    // Walk frames once, keeping each frame's (start, kind, payload).
+    struct Frame<'a> {
+        start: usize,
+        kind: u8,
+        payload: &'a [u8],
+    }
+    let mut frames = Vec::new();
     while pos < bytes.len() {
         let frame_start = pos;
         let kind = bytes[pos];
         let mut next = pos + 1;
         let clen = read_u32(bytes, &mut next)?;
-        take(bytes, &mut next, clen)?;
-        if kind == FRAME_CHECKPOINT {
-            checkpoints.push(frame_start);
-        }
+        let payload = take(bytes, &mut next, clen)?;
+        frames.push(Frame {
+            start: frame_start,
+            kind,
+            payload,
+        });
         pos = next;
     }
 
     let len = bytes.len();
     // Suffix length shrinks as the cut moves later, so the earliest checkpoint
     // whose suffix fits retains the most history; fall back to the latest.
-    let cut = checkpoints
+    let cut = frames
         .iter()
-        .copied()
+        .filter(|f| f.kind == FRAME_CHECKPOINT)
+        .map(|f| f.start)
         .find(|&o| len - o <= target_bytes)
-        .or_else(|| checkpoints.last().copied())?;
+        .or_else(|| {
+            frames
+                .iter()
+                .rev()
+                .find(|f| f.kind == FRAME_CHECKPOINT)
+                .map(|f| f.start)
+        })?;
 
-    let mut out = Vec::with_capacity(frames_start + (len - cut));
+    // The cut drops every frame before it, including the FRAME_IMAGES frames that
+    // stored the content-addressed images. So gather the images referenced by the
+    // retained checkpoints and re-emit, at the front of the truncated recording,
+    // those not already present in the retained suffix — otherwise their hashes
+    // would no longer resolve. Image-free recordings collect nothing here, so the
+    // output is byte-identical to a plain cut.
+    let mut all_blobs: HashMap<u64, ImageBlob> = HashMap::new();
+    let mut in_suffix: HashSet<u64> = HashSet::new();
+    let mut needed: Vec<u64> = Vec::new();
+    let mut needed_seen: HashSet<u64> = HashSet::new();
+    for f in &frames {
+        match f.kind {
+            FRAME_IMAGES => {
+                let raw = zstd::decode_all(f.payload).ok()?;
+                let list: Vec<ImageBlob> = postcard::from_bytes(&raw).ok()?;
+                for b in list {
+                    if f.start >= cut {
+                        in_suffix.insert(b.hash);
+                    }
+                    all_blobs.insert(b.hash, b);
+                }
+            }
+            FRAME_CHECKPOINT if f.start >= cut => {
+                let raw = zstd::decode_all(f.payload).ok()?;
+                let c: Checkpoint = postcard::from_bytes(&raw).ok()?;
+                for r in c.images {
+                    if needed_seen.insert(r.hash) {
+                        needed.push(r.hash);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let reemit: Vec<ImageBlob> = needed
+        .iter()
+        .filter(|h| !in_suffix.contains(h))
+        .filter_map(|h| all_blobs.get(h).cloned())
+        .collect();
+
+    let mut out = Vec::with_capacity(frames_start + (len - cut) + 64);
     out.extend_from_slice(&bytes[..frames_start]);
+    if !reemit.is_empty() {
+        let compressed = zstd::encode_all(&to_postcard(&reemit).ok()?[..], ZSTD_LEVEL).ok()?;
+        out.push(FRAME_IMAGES);
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+    }
     out.extend_from_slice(&bytes[cut..]);
     Some(out)
 }
@@ -535,6 +737,29 @@ mod tests {
         buf
     }
 
+    /// Count the frames of a given kind in an encoded recording.
+    fn count_frames(bytes: &[u8], target_kind: u8) -> usize {
+        let mut pos = MAGIC.len() + 1;
+        let hlen = read_u32(bytes, &mut pos).unwrap();
+        take(bytes, &mut pos, hlen).unwrap();
+        let mut count = 0;
+        while pos < bytes.len() {
+            let kind = bytes[pos];
+            let mut next = pos + 1;
+            let Some(clen) = read_u32(bytes, &mut next) else {
+                break;
+            };
+            if take(bytes, &mut next, clen).is_none() {
+                break;
+            }
+            if kind == target_kind {
+                count += 1;
+            }
+            pos = next;
+        }
+        count
+    }
+
     #[test]
     fn roundtrip_output_and_resize() {
         let buf = record_to_buf(|rec| {
@@ -588,22 +813,34 @@ mod tests {
         );
     }
 
+    /// Write a content-addressed checkpoint from a vt, as the server does: the
+    /// transmit-free dump plus references to the graphics images.
+    fn checkpoint_vt(rec: &mut Recorder<&mut Vec<u8>>, vt: &ghost_term::Vt) {
+        let dump = vt.dump_with_scrollback_without_images().into_bytes();
+        let refs: Vec<CheckpointImage> = vt
+            .graphics_images()
+            .map(|i| CheckpointImage {
+                id: i.id,
+                width: i.width,
+                height: i.height,
+                pixels: &i.pixels,
+            })
+            .collect();
+        rec.checkpoint_with_images(20, 5, &dump, &refs).unwrap();
+    }
+
     #[test]
     fn checkpoint_bakes_in_images_for_self_contained_replay() {
         use ghost_term::Vt;
 
-        // A session transmits an image; the periodic checkpoint snapshots its dump.
+        // A session transmits an image; the periodic checkpoint snapshots it via
+        // the content-addressed dedup path.
         let mut vt = Vt::new(20, 5);
         vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
-        let dump = vt.dump_with_scrollback().into_bytes();
-        let buf = record_to_buf(|rec| {
-            rec.output(b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\")
-                .unwrap();
-            rec.checkpoint(20, 5, &dump).unwrap();
-        });
+        let buf = record_to_buf(|rec| checkpoint_vt(rec, &vt));
 
-        // A player seeking to the checkpoint feeds only its dump to a fresh
-        // terminal; the image must come back, so replay is self-contained.
+        // A player seeking to the checkpoint feeds only the reconstructed dump to
+        // a fresh terminal; the image must come back, so replay is self-contained.
         let rec = read_bytes(&buf).unwrap();
         let ck = rec.latest_checkpoint().unwrap();
         let Item::Checkpoint { dump, .. } = &rec.items[ck] else {
@@ -615,6 +852,60 @@ mod tests {
             fresh.graphics_image_count(),
             1,
             "the checkpoint baked the image in"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_image_is_stored_once_across_checkpoints() {
+        use ghost_term::Vt;
+
+        // The same image is displayed across many checkpoints. Content-addressed
+        // dedup must store its bytes once: only one FRAME_IMAGES frame appears.
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let buf = record_to_buf(|rec| {
+            for _ in 0..5 {
+                rec.output(b"tick").unwrap();
+                checkpoint_vt(rec, &vt);
+            }
+        });
+
+        let image_frames = count_frames(&buf, FRAME_IMAGES);
+        assert_eq!(
+            image_frames, 1,
+            "the image is stored once, not per checkpoint"
+        );
+        assert_eq!(read_bytes(&buf).unwrap().checkpoint_count(), 5);
+    }
+
+    #[test]
+    fn truncation_re_emits_images_a_retained_checkpoint_needs() {
+        use ghost_term::Vt;
+
+        // The image is stored before the first checkpoint. Bounding to the latest
+        // checkpoint drops that early image frame, so truncation must re-emit the
+        // image the retained checkpoint references — else its hash won't resolve.
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        let buf = record_to_buf(|rec| {
+            rec.output(b"first").unwrap();
+            checkpoint_vt(rec, &vt); // stores the image blob here
+            rec.output(b"second").unwrap();
+            checkpoint_vt(rec, &vt); // references it again, no new blob
+        });
+
+        let bounded = truncate_before_latest_checkpoint(&buf).unwrap();
+        let rec = read_bytes(&bounded).unwrap();
+        let ck = rec.latest_checkpoint().unwrap();
+        let Item::Checkpoint { dump, .. } = &rec.items[ck] else {
+            panic!("expected a checkpoint");
+        };
+        let mut fresh = Vt::new(20, 5);
+        fresh.feed_str(std::str::from_utf8(dump).unwrap());
+        assert_eq!(
+            fresh.graphics_image_count(),
+            1,
+            "truncation re-emitted the image the retained checkpoint needs"
         );
     }
 

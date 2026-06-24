@@ -155,9 +155,31 @@ impl Screen {
 
     /// The emulator state as an extended dump (scrollback + viewport + modes).
     /// Feeding these bytes to a fresh terminal reconstructs the state; this is
-    /// what a recording checkpoint stores.
+    /// what a reattach resync replays.
     pub fn dump(&self) -> Vec<u8> {
         self.vt.dump_with_scrollback().into_bytes()
+    }
+
+    /// The emulator dump without image transmit escapes, for a recording
+    /// checkpoint: the image bytes are stored once out-of-band (see
+    /// [`graphics_images`](Self::graphics_images)) and reconstructed on replay.
+    pub fn dump_without_images(&self) -> Vec<u8> {
+        self.vt.dump_with_scrollback_without_images().into_bytes()
+    }
+
+    /// The stored kitty-graphics images, for a recording checkpoint's
+    /// content-addressed dedup (borrowed; pair with
+    /// [`dump_without_images`](Self::dump_without_images)).
+    pub fn graphics_images(&self) -> Vec<crate::record::CheckpointImage<'_>> {
+        self.vt
+            .graphics_images()
+            .map(|i| crate::record::CheckpointImage {
+                id: i.id,
+                width: i.width,
+                height: i.height,
+                pixels: &i.pixels,
+            })
+            .collect()
     }
 
     /// A byte sequence that, sent to a real terminal, clears it and repaints the

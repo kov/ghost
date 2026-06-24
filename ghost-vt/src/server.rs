@@ -495,7 +495,12 @@ fn host_main(
                         bytes_since_checkpoint += n;
                         if bytes_since_checkpoint >= checkpoint_interval {
                             let (c, rws) = screen.dimensions();
-                            let _ = r.checkpoint(c, rws, &screen.dump());
+                            // Bake images into the recording via content-addressed
+                            // dedup: store the transmit-free dump plus references to
+                            // the graphics images (each unique image stored once).
+                            let dump = screen.dump_without_images();
+                            let imgs = screen.graphics_images();
+                            let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
                             bytes_since_checkpoint = 0;
                         }
                     }
