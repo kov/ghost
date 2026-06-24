@@ -580,6 +580,11 @@ impl App {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
+                Cmd::UploadImage { .. } => {
+                    // The renderer's image texture cache lands in the next commit;
+                    // until then the upload is accepted and dropped (nothing draws
+                    // the image yet).
+                }
                 Cmd::Redraw => {
                     if let Some(w) = self.windows.get(&wid) {
                         w.gfx.window.request_redraw();

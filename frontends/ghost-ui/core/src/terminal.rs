@@ -18,6 +18,8 @@ use ghost_term::{Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 
+use std::collections::HashSet;
+
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, SessionId, UiEvent, encode, mouse,
@@ -142,6 +144,9 @@ pub struct TerminalModel {
     preedit: String,
     /// Last window title pushed to the shell, to emit `SetTitle` only on change.
     last_title: String,
+    /// kitty-graphics image ids whose pixels have been uploaded to the renderer,
+    /// so the (potentially large) blob is sent once rather than every feed.
+    uploaded_images: HashSet<u32>,
     ended: bool,
 }
 
@@ -170,6 +175,7 @@ impl TerminalModel {
             scroll_offset: 0,
             preedit: String::new(),
             last_title: String::new(),
+            uploaded_images: HashSet::new(),
             ended: false,
         }
     }
@@ -573,6 +579,17 @@ impl TerminalModel {
                     bytes: replies,
                 });
             }
+            // kitty-graphics acknowledgements are stateful, so (unlike the scanner
+            // queries) they come from the emulator. The detached host stays out of
+            // the way while a client is attached, so we — the attached frontend —
+            // send them back to the child ourselves.
+            let graphics_replies = self.screen.take_graphics_responses();
+            if !graphics_replies.is_empty() {
+                cmds.push(Cmd::SendInput {
+                    session: self.session.clone(),
+                    bytes: graphics_replies,
+                });
+            }
             // At the live bottom, new output replaces the viewport, so a
             // viewport-relative selection no longer maps — drop it (unless a drag
             // is live). While scrolled back, stay-put keeps the same content on
@@ -586,6 +603,7 @@ impl TerminalModel {
                 self.last_title = self.screen.title().to_string();
                 cmds.push(Cmd::SetTitle(self.last_title.clone()));
             }
+            self.upload_new_images(&mut cmds);
             cmds.push(Cmd::Redraw);
         }
         if ended {
@@ -593,6 +611,29 @@ impl TerminalModel {
             cmds.push(Cmd::Redraw);
         }
         cmds
+    }
+
+    /// Emit a [`Cmd::UploadImage`] for every image that a placement now displays
+    /// but whose pixels we have not yet sent the renderer. The blob travels out of
+    /// band (not through the `Scene`) and once per image.
+    fn upload_new_images(&mut self, cmds: &mut Vec<Cmd>) {
+        let mut fresh: Vec<u32> = Vec::new();
+        for p in self.screen.vt().graphics_placements() {
+            if !self.uploaded_images.contains(&p.image_id) && !fresh.contains(&p.image_id) {
+                fresh.push(p.image_id);
+            }
+        }
+        for id in fresh {
+            if let Some(image) = self.screen.vt().graphics_image(id) {
+                cmds.push(Cmd::UploadImage {
+                    id,
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.pixels.clone(),
+                });
+                self.uploaded_images.insert(id);
+            }
+        }
     }
 
     // ---- pointer / selection state machine ----
@@ -1779,6 +1820,47 @@ mod tests {
             ended: false,
         });
         assert_eq!(cmds, vec![]);
+    }
+
+    #[test]
+    fn session_data_uploads_displayed_images_once_and_answers_the_transfer() {
+        let mut m = model();
+        // a=T: transmit a 2x1 RGB image (id 5) and display it.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
+            ended: false,
+        });
+        // The pixels are uploaded out of band, RGBA (red, green, opaque).
+        assert!(cmds.contains(&Cmd::UploadImage {
+            id: 5,
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+        }));
+        // The attached frontend answers the transfer with the OK ack itself.
+        assert!(cmds.contains(&sent("alpha", b"\x1b_Gi=5;OK\x1b\\")));
+
+        // Later plain output does not re-upload the same image.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"x".to_vec(),
+            ended: false,
+        });
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
+    }
+
+    #[test]
+    fn session_data_answers_a_graphics_query_without_uploading() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Gi=31,a=q,f=24,s=1,v=1;AAAA\x1b\\".to_vec(),
+            ended: false,
+        });
+        // A query is answered (support probe) but stores/displays nothing.
+        assert!(cmds.contains(&sent("alpha", b"\x1b_Gi=31;OK\x1b\\")));
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
     }
 
     #[test]

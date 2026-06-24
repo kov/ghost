@@ -55,6 +55,16 @@ pub enum Cmd {
     /// (stealing the display if another window held it) and replies
     /// `UiEvent::AdoptSession` so the window switches to its single view.
     TakeOver(SessionId),
+    /// Upload a kitty-graphics image's pixels to the renderer, out of band and
+    /// keyed by `id` (the pixels never travel through the `Scene`/`Frame`, which
+    /// stay cheap to clone and compare). Sent once per image, before the `Redraw`
+    /// that first draws it; the renderer caches it by `id`.
+    UploadImage {
+        id: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     /// Repaint the window.
     Redraw,
     /// Set the window title.
