@@ -37,11 +37,16 @@ const MAX_IMAGE_BYTES: usize = 512 * 1024;
 /// (png's own byte limit covers row buffers, not the output buffer).
 const MAX_IMAGE_PIXELS: u64 = (MAX_IMAGE_BYTES / 4) as u64;
 
-/// Backstop on the image store so an endless stream of distinct transmits cannot
-/// grow memory without bound (a child has no deletion path yet, and nothing is
-/// evicted at scrollback). A proper kitty-style LRU quota replaces this refusal
-/// in a later phase; for now we refuse once either budget is reached.
+/// Storage quota for the image store, bounding memory against an endless stream
+/// of distinct transmits. When a new image would exceed either budget, the
+/// least-recently-used images are evicted to make room (kitty-style); images
+/// pinned by a current placement are never evicted, so a transfer can still be
+/// refused (`ENOSPC`) when only pinned images remain. Lowered under `cfg(test)`
+/// so the eviction logic is exercised with small images.
+#[cfg(not(test))]
 const MAX_STORED_BYTES: usize = 320 * 1024 * 1024;
+#[cfg(test)]
+const MAX_STORED_BYTES: usize = 8 * 1024;
 const MAX_STORED_IMAGES: usize = 1024;
 
 /// Backstop on the number of active placements per screen, so a child cannot
@@ -113,6 +118,10 @@ pub struct GraphicsState {
     /// Running sum of stored `pixels.len()`, kept in step with `images` so the
     /// storage budget (`MAX_STORED_BYTES`) is an O(1) check.
     stored_bytes: usize,
+    /// Monotonic access clock and per-image last-use stamp, driving LRU eviction
+    /// under the storage quota. Bumped when an image is transmitted or placed.
+    clock: u64,
+    last_used: HashMap<u32, u64>,
     /// Acknowledgement bytes queued for the child's input stream.
     responses: Vec<u8>,
 }
@@ -276,6 +285,7 @@ impl GraphicsState {
         self.placements.clear();
         self.alternate_placements.clear();
         self.stored_bytes = 0;
+        self.last_used.clear();
         self.chunk = None;
         // Pending responses are transient output; leave them to be drained.
     }
@@ -351,18 +361,15 @@ impl GraphicsState {
 
         let id = self.assign_id(&control);
         let new_bytes = image.2.len();
-        let freed = self.images.get(&id).map_or(0, |old| old.pixels.len());
-        let projected = self.stored_bytes.saturating_sub(freed) + new_bytes;
-        // Storage backstop: refuse rather than grow the store without bound. A
-        // re-transmit of an existing id replaces (it frees the old bytes first),
-        // so it never trips the count limit. Replaced by an LRU quota later.
-        if projected > MAX_STORED_BYTES
-            || (!self.images.contains_key(&id) && self.images.len() >= MAX_STORED_IMAGES)
-        {
+        // Make room under the storage quota by evicting least-recently-used,
+        // unpinned images (a re-transmit of `id` replaces in place, freeing its
+        // old bytes). If only pinned images remain and it still won't fit, refuse.
+        if !self.evict_to_fit(id, new_bytes) {
             self.respond_error(&control, "ENOSPC", "image storage limit exceeded");
             return;
         }
-        self.stored_bytes = projected;
+        let freed = self.images.get(&id).map_or(0, |old| old.pixels.len());
+        self.stored_bytes = self.stored_bytes.saturating_sub(freed) + new_bytes;
         self.images.insert(
             id,
             Image {
@@ -372,6 +379,7 @@ impl GraphicsState {
                 pixels: image.2,
             },
         );
+        self.touch(id);
         // a=T transmits *and* displays; a=t (and a=q, handled above) only stores.
         // If the placement budget is full the image is still stored — a=T's
         // success is the transmit, like kitty's lenient display behaviour.
@@ -422,7 +430,52 @@ impl GraphicsState {
             // renderer phase, which advances the cursor (it knows the cell size).
             no_cursor_move: control.cursor_move == 1,
         });
+        self.touch(image_id);
         true
+    }
+
+    /// Stamp `id` as just-used, for LRU eviction ordering.
+    fn touch(&mut self, id: u32) {
+        self.clock += 1;
+        self.last_used.insert(id, self.clock);
+    }
+
+    /// The image ids currently pinned by a placement on either screen; these are
+    /// visible (or visible after an alt-screen swap), so eviction must spare them.
+    fn pinned_ids(&self) -> std::collections::HashSet<u32> {
+        self.placements
+            .iter()
+            .chain(self.alternate_placements.iter())
+            .map(|p| p.image_id)
+            .collect()
+    }
+
+    /// Evict least-recently-used, unpinned images until a new `new_bytes` image
+    /// under `id` fits within both storage budgets. A re-transmit of an existing
+    /// `id` replaces in place (its bytes are freed by the caller), so `id` is
+    /// never an eviction candidate. Returns `false` if room cannot be made
+    /// because only pinned images remain.
+    fn evict_to_fit(&mut self, id: u32, new_bytes: usize) -> bool {
+        let pinned = self.pinned_ids();
+        loop {
+            let freed = self.images.get(&id).map_or(0, |old| old.pixels.len());
+            let projected_bytes = self.stored_bytes.saturating_sub(freed) + new_bytes;
+            // Storing replaces an existing `id` (count unchanged) or adds one.
+            let projected_count = self.images.len() + usize::from(!self.images.contains_key(&id));
+            if projected_bytes <= MAX_STORED_BYTES && projected_count <= MAX_STORED_IMAGES {
+                return true;
+            }
+            let victim = self
+                .images
+                .keys()
+                .filter(|k| **k != id && !pinned.contains(k))
+                .min_by_key(|k| self.last_used.get(k).copied().unwrap_or(0))
+                .copied();
+            match victim {
+                Some(v) => self.remove_image(v),
+                None => return false, // only pinned images remain; cannot fit
+            }
+        }
     }
 
     /// Delete images and/or placements (a=d). This phase handles the id-scoped
@@ -438,6 +491,7 @@ impl GraphicsState {
                 if free_data {
                     self.images.clear();
                     self.stored_bytes = 0;
+                    self.last_used.clear();
                 }
             }
             b'i' => {
@@ -463,10 +517,11 @@ impl GraphicsState {
         // Deletes carry no acknowledgement.
     }
 
-    /// Remove a stored image and keep `stored_bytes` in step.
+    /// Remove a stored image and keep `stored_bytes` and the LRU stamp in step.
     fn remove_image(&mut self, id: u32) {
         if let Some(image) = self.images.remove(&id) {
             self.stored_bytes = self.stored_bytes.saturating_sub(image.pixels.len());
+            self.last_used.remove(&id);
         }
     }
 
@@ -752,6 +807,48 @@ mod tests {
         g.reset();
         assert_eq!(g.image_count(), 0);
         assert_eq!(g.stored_bytes, 0);
+    }
+
+    #[test]
+    fn storage_quota_evicts_the_least_recently_used_unpinned_image() {
+        // cfg(test) caps the store at 8 KiB; each 750-px RGB image is 3000 RGBA
+        // bytes, so a third image does not fit and storing it evicts the LRU.
+        let px = vec![0u8; 750 * 3];
+        let mut g = GraphicsState::default();
+        feed(&mut g, &transmit_rgb(1, 750, 1, &px));
+        feed(&mut g, &transmit_rgb(2, 750, 1, &px));
+        feed(&mut g, &transmit_rgb(3, 750, 1, &px));
+
+        assert!(
+            g.image(1).is_none(),
+            "the least-recently-used image is evicted"
+        );
+        assert!(g.image(2).is_some());
+        assert!(g.image(3).is_some());
+        assert!(g.stored_bytes <= MAX_STORED_BYTES);
+    }
+
+    #[test]
+    fn storage_quota_never_evicts_a_placed_image() {
+        let px = vec![0u8; 750 * 3];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+        let mut g = GraphicsState::default();
+        // Image 1 is displayed (a=T), so a placement pins it.
+        feed(&mut g, &format!("i=1,a=T,f=24,s=750,v=1;{b64}"));
+        feed(&mut g, &transmit_rgb(2, 750, 1, &px));
+        // Storing image 3 needs room: the pinned image 1 is spared and the
+        // unpinned image 2 is evicted instead, even though it is newer.
+        feed(&mut g, &transmit_rgb(3, 750, 1, &px));
+
+        assert!(
+            g.image(1).is_some(),
+            "a placed (visible) image is never evicted"
+        );
+        assert!(
+            g.image(2).is_none(),
+            "an unpinned image is evicted to spare the pinned one"
+        );
+        assert!(g.image(3).is_some());
     }
 
     #[test]

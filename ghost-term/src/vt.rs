@@ -991,18 +991,26 @@ mod tests {
     }
 
     #[test]
-    fn kitty_graphics_store_is_bounded_and_refuses_when_full() {
+    fn kitty_graphics_store_is_bounded_and_evicts_the_oldest_when_full() {
         let mut vt = Vt::new(20, 5);
 
-        // Transmit more distinct 1×1 images than the store's count backstop allows
-        // (1024). The store must cap and refuse the overflow rather than grow.
+        // Transmit more distinct 1×1 images than the store's count budget (1024).
+        // The store stays bounded by evicting the least-recently-used image rather
+        // than growing, or — as it once did — refusing the newest transfer.
         for id in 1..=1025u32 {
             vt.feed_str(&format!("\x1b_Gi={id},a=t,q=2,f=24,s=1,v=1;AAAA\x1b\\"));
         }
         let _ = vt.take_graphics_responses();
 
-        assert_eq!(vt.graphics_image_count(), 1024);
-        assert!(vt.graphics_image(1025).is_none());
+        assert_eq!(vt.graphics_image_count(), 1024, "the store stays bounded");
+        assert!(
+            vt.graphics_image(1).is_none(),
+            "the oldest image was evicted"
+        );
+        assert!(
+            vt.graphics_image(1025).is_some(),
+            "the newest image is kept"
+        );
     }
 
     #[test]
