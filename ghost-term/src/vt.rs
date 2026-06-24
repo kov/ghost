@@ -195,6 +195,7 @@ impl Vt {
         let funs = self.terminal.dump();
         let mut seq = parser::dump(&funs);
 
+        seq.push_str(&self.terminal.dump_graphics());
         seq.push_str(&self.parser.dump());
 
         seq
@@ -207,6 +208,7 @@ impl Vt {
         let funs = self.terminal.dump_with_scrollback();
         let mut seq = parser::dump(&funs);
 
+        seq.push_str(&self.terminal.dump_graphics());
         seq.push_str(&self.parser.dump());
 
         seq
@@ -325,6 +327,48 @@ mod tests {
         );
         // Cursor advanced past the placeholder and X only, not the diacritics.
         assert_eq!(vt.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn dump_re_transmits_stored_images_for_reattach() {
+        // A reattaching (or replaying-from-checkpoint) client is fed dump(); the
+        // stored images must come back so placeholder cells — which carry only the
+        // id — can resolve to pixels again.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 1);
+        let pixels = vt.graphics_image(7).expect("stored").pixels.clone();
+
+        let dump = vt.dump();
+        let mut fresh = Vt::new(10, 3);
+        fresh.feed_str(&dump);
+
+        let restored = fresh
+            .graphics_image(7)
+            .expect("image re-transmitted in dump");
+        assert_eq!((restored.width, restored.height), (2, 1));
+        assert_eq!(restored.pixels, pixels);
+    }
+
+    #[test]
+    fn dump_re_places_direct_placements_for_reattach() {
+        // A directly-placed image (a=T) must survive a reattach: both its bytes
+        // and its on-screen placement come back from the dump.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("\x1b_Gi=5,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        assert_eq!(vt.graphics_placement_count(), 1);
+
+        let dump = vt.dump();
+        let mut fresh = Vt::new(10, 3);
+        fresh.feed_str(&dump);
+
+        assert_eq!(fresh.graphics_image_count(), 1);
+        assert_eq!(fresh.graphics_placement_count(), 1);
+        let p = fresh
+            .graphics_placements()
+            .next()
+            .expect("placement restored");
+        assert_eq!((p.col, p.cols, p.rows), (0, 2, 1));
     }
 
     #[test]

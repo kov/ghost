@@ -189,6 +189,59 @@ impl Terminal {
         self.graphics.image(id)
     }
 
+    /// Re-emit the kitty-graphics state as escapes, so a terminal fed the dump
+    /// regains it (reattach / replay-from-checkpoint): first the stored images
+    /// (`a=t`), then the direct placements (`a=p`) that fall in the current
+    /// viewport, each re-placed by positioning the cursor and saved/restored
+    /// around so the dump's restored cursor is unaffected. Placeholder placements
+    /// need nothing here — their cells ride in the text dump.
+    pub fn dump_graphics(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = self.graphics.dump();
+        let top = self.lines_scrolled_off();
+        let mut placed = String::new();
+        for p in self.graphics.placements() {
+            // Skip placements scrolled above or below the visible viewport.
+            if p.row < top {
+                continue;
+            }
+            let vrow = p.row - top;
+            if vrow >= self.rows {
+                continue;
+            }
+            let _ = write!(
+                placed,
+                "\u{1b}[{};{}H\u{1b}_Gi={},a=p",
+                vrow + 1,
+                p.col + 1,
+                p.image_id
+            );
+            if p.placement_id != 0 {
+                let _ = write!(placed, ",p={}", p.placement_id);
+            }
+            if p.cols != 0 {
+                let _ = write!(placed, ",c={}", p.cols);
+            }
+            if p.rows != 0 {
+                let _ = write!(placed, ",r={}", p.rows);
+            }
+            if p.z != 0 {
+                let _ = write!(placed, ",z={}", p.z);
+            }
+            if p.no_cursor_move {
+                placed.push_str(",C=1");
+            }
+            placed.push_str("\u{1b}\\");
+        }
+        if !placed.is_empty() {
+            out.push_str("\u{1b}7"); // save cursor
+            out.push_str(&placed);
+            out.push_str("\u{1b}8"); // restore cursor
+        }
+        out
+    }
+
     /// The number of stored kitty-graphics images.
     pub fn graphics_image_count(&self) -> usize {
         self.graphics.image_count()
