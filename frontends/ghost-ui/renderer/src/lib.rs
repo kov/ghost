@@ -595,9 +595,13 @@ pub struct Renderer {
     pack_x: u32,
     pack_y: u32,
     shelf: u32,
-    // per-frame instance buffer.
+    // per-frame instance buffer, reused across frames and grown only when a
+    // frame needs more instances than it currently holds.
     instances: Option<wgpu::Buffer>,
     instance_count: u32,
+    /// Count of instance-buffer (re)allocations — bumped only when a buffer is
+    /// created or grown, never on a reuse. Lets a test prove the reuse path.
+    buffer_allocs: u32,
     /// Current text selection to highlight, in viewport cell coordinates.
     selection: Option<Selection>,
     /// Bind-group layout shared by the glyph and image pipelines (uniform, a
@@ -828,6 +832,7 @@ impl Renderer {
             shelf: 1,
             instances: None,
             instance_count: 0,
+            buffer_allocs: 0,
             selection: None,
             bind_layout,
             sampler,
@@ -977,13 +982,14 @@ impl Renderer {
                 color: [1.0, 1.0, 1.0, 1.0],
             })
             .collect();
-        self.image_instances = Some(self.gpu.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("image instances"),
-                contents: bytemuck::cast_slice(&insts),
-                usage: wgpu::BufferUsages::VERTEX,
-            },
-        ));
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.image_instances,
+            &mut self.buffer_allocs,
+            "image instances",
+            &insts,
+        );
     }
 
     /// Draw the prepared image quads over the glyph layer, each under its own
@@ -1262,18 +1268,56 @@ impl Renderer {
         backgrounds
     }
 
+    /// Number of instance-buffer (re)allocations so far — see
+    /// [`buffer_allocs`](Self::buffer_allocs).
+    pub fn buffer_allocs(&self) -> u32 {
+        self.buffer_allocs
+    }
+
+    /// Upload `data` into `*slot`, reusing the existing buffer when it is already
+    /// large enough (a cheap `queue.write_buffer`) and only reallocating to grow.
+    /// The buffer carries `COPY_DST` so it can be rewritten in place; callers draw
+    /// exactly the instance count they uploaded, so any unused tail is ignored.
+    /// Bumps `*allocs` only on a real (re)allocation.
+    fn upload_instances(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: &mut Option<wgpu::Buffer>,
+        allocs: &mut u32,
+        label: &str,
+        data: &[Instance],
+    ) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        match slot.as_ref() {
+            Some(buf) if buf.size() as usize >= bytes.len() => {
+                queue.write_buffer(buf, 0, bytes);
+            }
+            _ => {
+                *allocs += 1;
+                *slot = Some(
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    }),
+                );
+            }
+        }
+    }
+
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
     fn prepare(&mut self, frame: &Frame, font: FontRef, size_px: f32, vw: u32, vh: u32) {
         let instances = self.build_instances(frame, font, size_px, self.selection);
         self.instance_count = instances.len() as u32;
-        self.instances = Some(self.gpu.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            },
-        ));
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.instances,
+            &mut self.buffer_allocs,
+            "instances",
+            &instances,
+        );
         let uniforms = Uniforms {
             viewport: [vw as f32, vh as f32],
             _pad: [0.0, 0.0],
@@ -1482,13 +1526,14 @@ impl Renderer {
         self.image_draws = images;
         self.build_image_instances();
         self.instance_count = instances.len() as u32;
-        self.instances = Some(self.gpu.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("scene instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            },
-        ));
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.instances,
+            &mut self.buffer_allocs,
+            "scene instances",
+            &instances,
+        );
         let (vw, vh) = scene.size_px;
         let uniforms = Uniforms {
             viewport: [vw as f32, vh as f32],
@@ -1636,6 +1681,43 @@ mod tests {
 
     fn is_green(p: [u8; 4]) -> bool {
         p[0] < 0x20 && p[1] > 0x60 && p[2] < 0x20
+    }
+
+    #[test]
+    fn instance_buffer_is_reused_until_a_frame_must_grow_it() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut r = Renderer::headless(Theme::default());
+
+        // First frame allocates the instance buffer.
+        let _ = r.render_offscreen(&frame(20, 4, "hi"), font, SIZE_PX);
+        let after_first = r.buffer_allocs();
+        assert_eq!(after_first, 1, "first frame allocates once");
+
+        // A frame of the same shape reuses the buffer in place — no reallocation.
+        let _ = r.render_offscreen(&frame(20, 4, "yo"), font, SIZE_PX);
+        assert_eq!(
+            r.buffer_allocs(),
+            after_first,
+            "a same-size frame must reuse the buffer"
+        );
+
+        // A much larger frame needs more instances than the buffer holds, so it
+        // reallocates to grow.
+        let big = "x".repeat(80 * 24);
+        let _ = r.render_offscreen(&frame(80, 24, &big), font, SIZE_PX);
+        assert!(
+            r.buffer_allocs() > after_first,
+            "a larger frame must grow the buffer"
+        );
+
+        // Shrinking back fits in the now-larger buffer: reuse again.
+        let grown = r.buffer_allocs();
+        let _ = r.render_offscreen(&frame(20, 4, "hi"), font, SIZE_PX);
+        assert_eq!(
+            r.buffer_allocs(),
+            grown,
+            "a smaller frame fits the grown buffer and reuses it"
+        );
     }
 
     #[test]
