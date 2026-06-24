@@ -376,6 +376,10 @@ fn host_main(
         .ok()
     });
     let mut bytes_since_checkpoint = 0usize;
+    // Whether any viewport row changed since the last checkpoint we wrote. A
+    // checkpoint is a whole-state dump, so writing one for a screen that hasn't
+    // visibly changed is pure waste; this lets us skip it (see the trigger below).
+    let mut dirty_since_checkpoint = false;
     let checkpoint_interval = checkpoint_interval(opts.max_recording_bytes);
 
     // The attached display client, plus connections that have not yet
@@ -444,7 +448,10 @@ fn host_main(
             match (&pty).read(&mut ptybuf) {
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
-                    screen.feed(&ptybuf[..n]);
+                    // `feed` reports the rows it changed; an empty set means this
+                    // output was non-rendering (a query, a mode toggle, pen
+                    // changes) and left the visible screen untouched.
+                    dirty_since_checkpoint |= !screen.feed(&ptybuf[..n]).is_empty();
                     // A ground-state BEL that rings while nobody is attached is an
                     // unseen notification: mark it so a front-end can highlight the
                     // session. Bells seen while a client is attached are witnessed
@@ -494,13 +501,23 @@ fn host_main(
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
                         if bytes_since_checkpoint >= checkpoint_interval {
-                            let (c, rws) = screen.dimensions();
-                            // Bake images into the recording via content-addressed
-                            // dedup: store the transmit-free dump plus references to
-                            // the graphics images (each unique image stored once).
-                            let dump = screen.dump_without_images();
-                            let imgs = screen.graphics_images();
-                            let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
+                            if dirty_since_checkpoint {
+                                let (c, rws) = screen.dimensions();
+                                // Bake images into the recording via content-
+                                // addressed dedup: store the transmit-free dump
+                                // plus references to the graphics images (each
+                                // unique image stored once).
+                                let dump = screen.dump_without_images();
+                                let imgs = screen.graphics_images();
+                                let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
+                                dirty_since_checkpoint = false;
+                            }
+                            // Reset the budget whether or not we wrote: a screen
+                            // unchanged since the last checkpoint waits another full
+                            // interval before reconsidering, so a flood of non-
+                            // rendering bytes never forces repeated whole-state
+                            // dumps. Replay stays correct — the intervening output
+                            // frames reconstruct the state from the prior checkpoint.
                             bytes_since_checkpoint = 0;
                         }
                     }

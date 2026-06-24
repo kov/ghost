@@ -160,6 +160,65 @@ fn long_session_writes_checkpoints() {
 }
 
 #[test]
+fn a_non_rendering_flood_writes_no_checkpoints() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-idle";
+
+    // A 1 MiB cap pins the checkpoint interval to its 128 KiB floor. The child
+    // then emits ~450 KiB of SGR resets — several intervals — without ever
+    // touching a cell, then renders a sentinel and exits. Every interval boundary
+    // lands on an unchanged screen, so a checkpoint there would be pure waste. The
+    // clean output compresses to almost nothing, so the recording stays far under
+    // the cap (no truncation skews the checkpoint count).
+    let out = Command::new(GHOST)
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("XDG_DATA_HOME", data.path())
+        .args([
+            "new",
+            name,
+            "-d",
+            "--max-recording-size",
+            "1048576",
+            "--",
+            "sh",
+            "-c",
+            "awk 'BEGIN{for(i=0;i<150000;i++)printf \"\\033[m\"}'; echo done-idle-chk",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Poll the recording itself until it reconstructs to the sentinel — proving
+    // it is fully flushed — rather than racing a delisting against the final
+    // write (the file is written concurrently as the session runs).
+    let path = recording_path(data.path(), name);
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let Ok(rec) = record::read(&path) else {
+                return false;
+            };
+            let screen = ghost_vt::screen::Screen::from_recording(&rec, 1000);
+            screen.text().iter().any(|l| l.contains("done-idle-chk"))
+        }),
+        "recording did not reconstruct to the sentinel at {}",
+        path.display()
+    );
+    // Without the idle guard this would be several checkpoints, one per interval
+    // boundary crossed by the flood.
+    let rec = record::read(&path).unwrap();
+    assert!(
+        rec.checkpoint_count() <= 1,
+        "a non-rendering flood should not write checkpoints, got {}",
+        rec.checkpoint_count()
+    );
+}
+
+#[test]
 fn recording_size_is_bounded() {
     let run = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
