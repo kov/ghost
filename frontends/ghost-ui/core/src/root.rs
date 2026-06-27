@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::input::{Key, NamedKey};
+use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, UiEvent};
 
@@ -34,6 +34,16 @@ pub struct RootModel {
 /// F9 toggles the fleet overview.
 fn is_fleet_toggle(key: &Key) -> bool {
     matches!(key, Key::Named(NamedKey::F9))
+}
+
+/// Ctrl-Tab / Ctrl-Shift-Tab cycle the window's foreground among its attached
+/// sessions: `Some(true)` forward, `Some(false)` backward.
+fn cycle_dir(key: &Key, mods: Mods) -> Option<bool> {
+    if matches!(key, Key::Named(NamedKey::Tab)) && mods.ctrl {
+        Some(!mods.shift)
+    } else {
+        None
+    }
 }
 
 impl RootModel {
@@ -78,6 +88,9 @@ impl RootModel {
             if is_fleet_toggle(key) {
                 return self.toggle();
             }
+            if let Some(forward) = cycle_dir(key, *mods) {
+                return self.cycle(forward);
+            }
             // Window/app-level shortcuts are handled above the active view so
             // they work in either mode, even when the fleet has no focused tile.
             match classify_shortcut(key, *mods) {
@@ -106,9 +119,9 @@ impl RootModel {
 
     /// Switch to the single view of `id` (the shell has just attached it) and
     /// take ownership. From the fleet, the existing tile's screen is preserved;
-    /// otherwise (or from another single session) a fresh terminal is created and
-    /// the previously-shown session is detached — it keeps running and reappears
-    /// in the fleet.
+    /// otherwise (or from another single session) a fresh terminal is created.
+    /// The previously-shown session is NOT detached — the window keeps it warm so
+    /// Ctrl-Tab and the fleet can switch back to it.
     fn adopt(&mut self, id: SessionId) -> Vec<Cmd> {
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
             String::new(),
@@ -125,21 +138,50 @@ impl RootModel {
                     (*m, Vec::new())
                 } else {
                     let mut model = TerminalModel::new(id.clone(), 1, 1, self.metrics);
-                    let mut cmds = model.update(UiEvent::Resize {
+                    let cmds = model.update(UiEvent::Resize {
                         w_px: self.size_px.0.max(1),
                         h_px: self.size_px.1.max(1),
                         scale: self.scale as f64,
                     });
-                    cmds.push(Cmd::Detach(old));
+                    // The previous session is NOT detached: the window holds it,
+                    // warm, so Ctrl-Tab and the fleet can switch back to it.
                     (model, cmds)
                 }
             }
         };
         self.mode = Mode::Single(Box::new(model));
-        self.mine = HashSet::from([id.clone()]);
+        self.mine.insert(id.clone());
         self.primary = Some(id);
         cmds.push(Cmd::Redraw);
         cmds
+    }
+
+    /// Cycle the window's foreground among its attached sessions (Ctrl-Tab). The
+    /// concrete target is resolved here from the owned set, in a stable order, and
+    /// handed to the shell, which re-attaches it for a fresh resync. A window with
+    /// fewer than two sessions has nothing to cycle.
+    fn cycle(&mut self, forward: bool) -> Vec<Cmd> {
+        let mut names: Vec<&SessionId> = self.mine.iter().collect();
+        names.sort();
+        if names.len() < 2 {
+            return Vec::new();
+        }
+        let cur = self
+            .primary
+            .as_ref()
+            .and_then(|p| names.iter().position(|n| *n == p))
+            .unwrap_or(0);
+        let n = names.len();
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        let to = names[next].clone();
+        if Some(&to) == self.primary.as_ref() {
+            return Vec::new();
+        }
+        vec![Cmd::CycleSession { to }, Cmd::Redraw]
     }
 
     pub fn view(&self) -> Scene {
@@ -202,10 +244,10 @@ impl RootModel {
                 let (model, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 cmds.push(Cmd::Redraw);
-                // The extracted session is what this window now drives; record it
-                // so ownership is well-defined even for a fleet-started window.
+                // The extracted session becomes the foreground; the rest of the
+                // window's sessions stay attached (warm), so `mine` is preserved.
                 let id = model.session().to_string();
-                self.mine = HashSet::from([id.clone()]);
+                self.mine.insert(id.clone());
                 self.primary = Some(id);
                 (Mode::Single(Box::new(model)), cmds)
             }
@@ -470,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn adopt_of_a_freshly_spawned_session_makes_a_new_terminal_and_detaches_previews() {
+    fn adopt_of_a_freshly_spawned_session_makes_a_new_terminal_and_keeps_previews() {
         let mut r = root(); // owns alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         r.update(UiEvent::SessionList(vec![
@@ -480,10 +522,10 @@ mod tests {
         // Adopt a session that is NOT a tile yet (just spawned by the shell).
         let cmds = r.update(UiEvent::AdoptSession("gamma".into()));
         assert!(!r.is_fleet());
-        // The previewed tiles are dropped; the new session gets a fresh terminal.
+        // Nothing detaches — the window keeps its sessions warm.
         assert!(
-            cmds.contains(&Cmd::Detach("beta".into())),
-            "previews detach: {cmds:?}"
+            !cmds.iter().any(|c| matches!(c, Cmd::Detach(_))),
+            "previews stay attached: {cmds:?}"
         );
         assert_eq!(
             r.update(UiEvent::Text("z".into())),
@@ -495,13 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn adopt_from_single_view_detaches_the_previous_session() {
+    fn adopt_from_single_view_keeps_the_previous_session_attached() {
         let mut r = root(); // single view of alpha
         let cmds = r.update(UiEvent::AdoptSession("beta".into()));
         assert!(!r.is_fleet());
         assert!(
-            cmds.contains(&Cmd::Detach("alpha".into())),
-            "the previously-shown session detaches (keeps running): {cmds:?}"
+            !cmds.iter().any(|c| matches!(c, Cmd::Detach(_))),
+            "the previous session stays attached (warm): {cmds:?}"
         );
         assert_eq!(
             r.update(UiEvent::Text("z".into())),
@@ -509,6 +551,60 @@ mod tests {
                 session: "beta".into(),
                 bytes: b"z".to_vec()
             }]
+        );
+    }
+
+    /// Adopt sessions into the window so it owns several, then return the sorted
+    /// owned set the cycle walks.
+    fn with_three(r: &mut RootModel) {
+        r.update(UiEvent::AdoptSession("beta".into()));
+        r.update(UiEvent::AdoptSession("gamma".into()));
+        // Owns alpha, beta, gamma; foreground is gamma (last adopted).
+    }
+
+    fn ctrl_tab(r: &mut RootModel, shift: bool) -> Vec<Cmd> {
+        let mods = if shift {
+            Mods::CTRL | Mods::SHIFT
+        } else {
+            Mods::CTRL
+        };
+        key(r, Key::Named(NamedKey::Tab), mods)
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_to_the_next_attached_session() {
+        let mut r = root(); // owns alpha
+        with_three(&mut r); // -> alpha, beta, gamma (foreground gamma)
+        // Forward from gamma wraps to alpha (sorted: alpha, beta, gamma).
+        assert!(
+            ctrl_tab(&mut r, false).contains(&Cmd::CycleSession { to: "alpha".into() }),
+            "Ctrl-Tab advances to the next owned session"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_tab_cycles_to_the_previous_attached_session() {
+        let mut r = root();
+        with_three(&mut r); // foreground gamma
+        // Backward from gamma is beta.
+        assert!(
+            ctrl_tab(&mut r, true).contains(&Cmd::CycleSession { to: "beta".into() }),
+            "Ctrl-Shift-Tab steps to the previous owned session"
+        );
+    }
+
+    #[test]
+    fn ctrl_tab_with_a_single_session_is_a_noop() {
+        let mut r = root(); // owns only alpha
+        assert!(
+            ctrl_tab(&mut r, false).is_empty(),
+            "nothing to cycle with one session"
+        );
+        // And the Tab is not forwarded to the child as input.
+        assert!(
+            !ctrl_tab(&mut r, false)
+                .iter()
+                .any(|c| matches!(c, Cmd::SendInput { .. })),
         );
     }
 }

@@ -62,6 +62,12 @@ pub enum Cmd {
     /// (stealing the display if another window held it) and replies
     /// `UiEvent::AdoptSession` so the window switches to its single view.
     TakeOver(SessionId),
+    /// Switch the window's foreground to one of its already-attached sessions
+    /// (Ctrl-Tab). The shell re-attaches `to` for a fresh resync, then replies
+    /// `UiEvent::AdoptSession`.
+    CycleSession {
+        to: SessionId,
+    },
     /// Upload a kitty-graphics image's pixels to the renderer, out of band and
     /// keyed by `id` (the pixels never travel through the `Scene`/`Frame`, which
     /// stay cheap to clone and compare). Sent once per image, before the `Redraw`

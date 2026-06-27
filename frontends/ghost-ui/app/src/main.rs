@@ -600,15 +600,25 @@ impl App {
                     }
                 }
                 Cmd::TakeOver(id) => {
-                    // The fleet already attached take-over-able tiles; attach now
-                    // only if this window has no client yet (never an `Elsewhere`
-                    // session — the fleet won't emit `TakeOver` for one).
+                    // Switch the window to `id`'s single view. Attach if we don't
+                    // already hold it — stealing the display from another window for
+                    // a confirmed take-over of a session attached elsewhere.
                     let held = self
                         .windows
                         .get(&wid)
                         .is_some_and(|w| w.sessions.contains_key(&id));
                     if held || self.attach_into(wid, &id) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
+                    }
+                }
+                Cmd::CycleSession { to } => {
+                    // Re-attach for a fresh resync (the warm client may be sitting on
+                    // a stale screen), then switch the single view to it.
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.sessions.remove(&to);
+                    }
+                    if self.attach_into(wid, &to) {
+                        self.dispatch(wid, UiEvent::AdoptSession(to), event_loop);
                     }
                 }
                 Cmd::UploadImage {

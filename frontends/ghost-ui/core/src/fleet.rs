@@ -408,9 +408,10 @@ impl FleetModel {
         for tile in self.tiles {
             if Some(&tile.id) == keep.as_ref() {
                 kept = Some(tile.model);
-            } else {
-                cmds.push(Cmd::Detach(tile.id));
             }
+            // Other tiles' models are dropped, but their sessions stay attached to
+            // this window (warm) — they keep previewing in the fleet and are
+            // reachable with Ctrl-Tab. A vanished session is detached by reconcile.
         }
         let mut model =
             kept.unwrap_or_else(|| TerminalModel::new(keep.unwrap_or_default(), 1, 1, metrics));
@@ -424,8 +425,8 @@ impl FleetModel {
 
     /// Leave the overview showing `id` *specifically* — a spawn or take-over.
     /// Keeps `id`'s tile if it has one (preserving its screen); otherwise builds
-    /// a fresh terminal for it (the just-spawned session has no tile yet). Either
-    /// way every other previewed tile is detached. Unlike
+    /// a fresh terminal for it (the just-spawned session has no tile yet). The
+    /// other sessions stay attached to this window (warm). Unlike
     /// [`into_single_keeping`](Self::into_single_keeping) there is no fallback to
     /// a different session: the caller asked for `id`.
     pub fn into_single_adopting(
@@ -440,9 +441,9 @@ impl FleetModel {
         for tile in self.tiles {
             if tile.id == id {
                 kept = Some(tile.model);
-            } else {
-                cmds.push(Cmd::Detach(tile.id));
             }
+            // The other sessions stay attached to this window (warm); only their
+            // preview models are dropped.
         }
         let mut model = kept.unwrap_or_else(|| TerminalModel::new(id, 1, 1, metrics));
         cmds.append(&mut model.update(UiEvent::Resize {
@@ -1767,10 +1768,14 @@ mod tests {
             alts: None,
         });
         assert_eq!(f.focused(), Some("beta"));
-        // Toggling back returns the OWNED session, and detaches the foreign one.
+        // Toggling back returns the OWNED session and detaches nothing — the
+        // other sessions stay attached (warm) for Ctrl-Tab and live previews.
         let (model, cmds) = f.into_single(SIZE, 1.0);
         assert_eq!(model.session(), "alpha", "keeps the window's own session");
-        assert!(cmds.contains(&Cmd::Detach("beta".into())));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Detach(_))),
+            "no session is detached on toggle-back: {cmds:?}"
+        );
     }
 
     #[test]
