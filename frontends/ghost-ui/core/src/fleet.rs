@@ -24,26 +24,29 @@ use ghost_vt::session::SessionInfo;
 use crate::input::{Key, Mods, NamedKey};
 use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
 
-const GAP: f32 = 8.0;
+const GAP: f32 = 10.0;
 const FOCUS_BORDER: f32 = 2.0;
 const FOCUS_COLOR: Rgba = [0.30, 0.60, 0.95, 1.0];
 const BADGE_PX: f32 = 10.0;
-/// Height of a section's header band.
-const SECTION_HEADER_PX: f32 = 16.0;
 /// Colour of section header labels.
 const SECTION_LABEL_COLOR: Rgba = [0.65, 0.70, 0.78, 1.0];
-/// Placeholder fill for a tile's preview area with no live source.
-const PLACEHOLDER_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
+/// Preview area fill and the muted hint drawn on a tile with no live source.
+const PLACEHOLDER_BG: Rgba = [0.10, 0.11, 0.14, 1.0];
+const PLACEHOLDER_FG: Rgba = [0.42, 0.46, 0.54, 1.0];
 /// Default grid for a fleet-created tile mirror until the shell hands it a
 /// real-size model; previews are scaled to the tile regardless of this size.
+/// Also the assumed aspect ratio used to shape tiles into little terminals.
 const PREVIEW_COLS: u16 = 80;
 const PREVIEW_ROWS: u16 = 24;
-/// Card chrome: metadata header band and the button-row footer band.
-const CARD_HEADER_PX: f32 = 14.0;
-const CARD_FOOTER_PX: f32 = 16.0;
-const CARD_META_COLOR: Rgba = [0.60, 0.64, 0.72, 1.0];
-const BUTTON_BG: Rgba = [0.20, 0.21, 0.26, 1.0];
-const BUTTON_FG: Rgba = [0.78, 0.81, 0.87, 1.0];
+/// Preferred card width; the grid fits as many of these across as it can (then
+/// shrinks uniformly if the sections would overflow the window).
+const TARGET_TILE_W: f32 = 460.0;
+const MAX_PER_ROW: usize = 5;
+/// Card chrome colours (metadata header, button footer).
+const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
+const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
+const BUTTON_BG: Rgba = [0.17, 0.19, 0.24, 1.0];
+const BUTTON_FG: Rgba = [0.80, 0.83, 0.89, 1.0];
 /// Confirm-overlay colours (a scrim and its prompt text).
 const OVERLAY_BG: Rgba = [0.04, 0.04, 0.06, 0.82];
 const OVERLAY_FG: Rgba = [0.92, 0.94, 0.97, 1.0];
@@ -169,41 +172,12 @@ pub struct FleetModel {
     renaming: Option<Renaming>,
 }
 
-/// Place `n` tiles in a near-square grid within `size_px`, with a uniform gap,
-/// row-major. Pure geometry — shared by `view` and pointer hit-testing.
-fn grid_rects(n: usize, size_px: (u32, u32), gap: f32) -> Vec<RectPx> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let cols = (n as f32).sqrt().ceil() as usize;
-    let rows = n.div_ceil(cols);
-    let (w, h) = (size_px.0 as f32, size_px.1 as f32);
-    let cell_w = ((w - gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
-    let cell_h = ((h - gap * (rows as f32 + 1.0)) / rows as f32).max(1.0);
-    (0..n)
-        .map(|i| {
-            let (r, c) = (i / cols, i % cols);
-            // Clamp the origin into the window, then clamp the size to what's
-            // left, so a degenerate (tiny) window can never overflow the bounds
-            // even though the cell size is floored at 1px.
-            let x = (gap + c as f32 * (cell_w + gap)).min((w - 1.0).max(0.0));
-            let y = (gap + r as f32 * (cell_h + gap)).min((h - 1.0).max(0.0));
-            RectPx {
-                x,
-                y,
-                w: cell_w.min(w - x),
-                h: cell_h.min(h - y),
-            }
-        })
-        .collect()
-}
-
 /// Split a tile rect into its metadata header, preview area, and a row of three
-/// equal action buttons. Shared by `view` and pointer hit-testing so the buttons
-/// land exactly where they are drawn.
-fn card_layout(rect: RectPx) -> (RectPx, RectPx, [(Button, RectPx); 3]) {
-    let header_h = CARD_HEADER_PX.min(rect.h);
-    let footer_h = CARD_FOOTER_PX.min((rect.h - header_h).max(0.0));
+/// equal action buttons, given the chrome `band` height (shared by `view` and
+/// pointer hit-testing so the buttons land exactly where they are drawn).
+fn card_layout(rect: RectPx, band: f32) -> (RectPx, RectPx, [(Button, RectPx); 3]) {
+    let header_h = band.min(rect.h);
+    let footer_h = band.min((rect.h - header_h).max(0.0));
     let footer_y = rect.y + rect.h - footer_h;
     let header = RectPx {
         x: rect.x,
@@ -585,8 +559,17 @@ impl FleetModel {
     /// stacked per-section grids (a header band atop each section's grid). The
     /// height is shared between sections in proportion to the rows each needs.
     /// Shared by `view`, navigation and pointer hit-testing.
-    fn sections_layout(&self) -> (Vec<SectionHeader>, Vec<Placement>) {
+    /// Lay the overview out: a labelled band per non-empty attach-state section,
+    /// each followed by its tiles in a fixed-width grid. Tiles take the terminal's
+    /// aspect ratio so previews look like little terminals rather than tall boxes;
+    /// if the stacked sections would overflow the window everything shrinks
+    /// uniformly to fit. Returns the section headers, the tile placements (full
+    /// card rects), and the chrome `band` height (so `card_layout` and the view
+    /// split each card the same way).
+    fn sections_layout(&self) -> (Vec<SectionHeader>, Vec<Placement>, f32) {
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let metrics = self.effective_metrics();
+        let base_band = metrics.line_height + 6.0;
         // Tiles grouped by locality, preserving insertion order within each;
         // empty sections are dropped so they get no header.
         let sections: Vec<(Locality, Vec<&Tile>)> = [
@@ -604,39 +587,60 @@ impl FleetModel {
         .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
         .collect();
         if sections.is_empty() {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), base_band);
         }
-        // Rows each section needs (near-square), to share height proportionally.
-        let cols_of = |n: usize| (n as f32).sqrt().ceil().max(1.0) as usize;
-        let rows_of = |n: usize| n.div_ceil(cols_of(n));
-        let total_rows: usize = sections.iter().map(|(_, ts)| rows_of(ts.len())).sum();
-        let grid_h_total = (h - SECTION_HEADER_PX * sections.len() as f32).max(1.0);
+
+        // Fit as many target-width cards across as the window allows, then size
+        // each card to the terminal aspect ratio (header + preview + footer).
+        let per_row = (((w - GAP) / (TARGET_TILE_W + GAP)).floor() as usize).clamp(1, MAX_PER_ROW);
+        let base_tile_w = ((w - GAP * (per_row as f32 + 1.0)) / per_row as f32).max(1.0);
+        let aspect =
+            (PREVIEW_COLS as f32 * metrics.advance) / (PREVIEW_ROWS as f32 * metrics.line_height);
+        let base_card_h = 2.0 * base_band + (base_tile_w / aspect).max(1.0);
+
+        // Cards keep their full width; when the stacked sections would overflow,
+        // cap card *height* (the preview just letterboxes more) rather than
+        // shrinking width and leaving a big empty right margin.
+        let rows: Vec<usize> = sections
+            .iter()
+            .map(|(_, ts)| ts.len().div_ceil(per_row))
+            .collect();
+        let total_rows: usize = rows.iter().sum();
+        let avail = (h - GAP - sections.len() as f32 * (base_band + GAP) - total_rows as f32 * GAP)
+            .max(1.0);
+        let (band, tile_w, gap) = (base_band, base_tile_w, GAP);
+        let card_h = base_card_h.min((avail / total_rows as f32).max(1.0));
 
         let mut headers = Vec::new();
-        let mut tiles = Vec::new();
-        let mut y = 0.0_f32;
-        for (loc, ts) in &sections {
+        let mut placements = Vec::new();
+        let mut y = gap;
+        for ((loc, ts), &nrows) in sections.iter().zip(&rows) {
             headers.push((
                 *loc,
                 RectPx {
-                    x: GAP,
+                    x: gap,
                     y,
-                    w: (w - 2.0 * GAP).max(1.0),
-                    h: SECTION_HEADER_PX,
+                    w: (w - 2.0 * gap).max(1.0),
+                    h: band,
                 },
             ));
-            y += SECTION_HEADER_PX;
-            let band_h = (grid_h_total * rows_of(ts.len()) as f32 / total_rows as f32).max(1.0);
-            for (t, mut r) in ts
-                .iter()
-                .zip(grid_rects(ts.len(), (w as u32, band_h as u32), GAP))
-            {
-                r.y += y; // offset the section's grid into its band
-                tiles.push((t.handle, t.id.clone(), r));
+            y += band;
+            for (i, t) in ts.iter().enumerate() {
+                let (r, c) = (i / per_row, i % per_row);
+                placements.push((
+                    t.handle,
+                    t.id.clone(),
+                    RectPx {
+                        x: gap + c as f32 * (tile_w + gap),
+                        y: y + r as f32 * (card_h + gap),
+                        w: tile_w,
+                        h: card_h,
+                    },
+                ));
             }
-            y += band_h;
+            y += nrows as f32 * (card_h + gap);
         }
-        (headers, tiles)
+        (headers, placements, band)
     }
 
     /// Tile placements `(handle, id, rect)` in section order.
@@ -881,16 +885,14 @@ impl FleetModel {
             return Vec::new(); // the overview only reacts to presses
         }
         let (px, py) = (pos.x as f32, pos.y as f32);
-        let hit = self
-            .layout()
-            .into_iter()
-            .find(|(_, _, r)| r.contains(px, py));
+        let (_, placements, band) = self.sections_layout();
+        let hit = placements.into_iter().find(|(_, _, r)| r.contains(px, py));
         let Some((_, id, rect)) = hit else {
             return Vec::new();
         };
         self.set_focus(id.clone());
         // A press on a card button runs that action; anywhere else opens the tile.
-        let (_, _, buttons) = card_layout(rect);
+        let (_, _, buttons) = card_layout(rect, band);
         match buttons.iter().find(|(_, r)| r.contains(px, py)) {
             Some((button, _)) => self.button(*button, id),
             None => self.activate(Some(id)),
@@ -900,24 +902,32 @@ impl FleetModel {
     // ---- view ----
 
     pub fn view(&self) -> Scene {
-        let (headers, placements) = self.sections_layout();
+        let (headers, placements, band) = self.sections_layout();
+        let metrics = self.effective_metrics();
         let mut items = Vec::new();
         for (loc, rect) in headers {
             items.push(SceneItem::Text {
                 id: SceneId::Section(loc.rank()),
-                rect,
+                rect: text_line(rect, metrics, GAP * 0.5),
                 runs: vec![label_run(section_label(loc))],
-                metrics: self.effective_metrics(),
+                metrics,
                 color: SECTION_LABEL_COLOR,
             });
         }
-        let metrics = self.effective_metrics();
         for (handle, id, rect) in placements {
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
             let focused = self.focused.as_deref() == Some(id.as_str());
-            let (header, preview, buttons) = card_layout(rect);
+            let (header, preview, buttons) = card_layout(rect, band);
+
+            // The whole card on a solid panel, so it reads as one unit.
+            items.push(SceneItem::Rect {
+                id: SceneId::Tile(handle),
+                rect,
+                color: CARD_BG,
+                radius: 5.0,
+            });
 
             // Metadata header — or the live buffer of an in-progress rename.
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
@@ -926,13 +936,13 @@ impl FleetModel {
             };
             items.push(SceneItem::Text {
                 id: SceneId::Label(handle),
-                rect: inset(header, 4.0),
+                rect: text_line(header, metrics, 6.0),
                 runs: vec![label_run(&header_text)],
                 metrics,
                 color: CARD_META_COLOR,
             });
 
-            // Preview area: a live, scaled terminal, or a placeholder fill.
+            // Preview area: a live, scaled terminal, or a placeholder + hint.
             if tile.fed {
                 // Laid out at the session's real size; the renderer scales it to
                 // the preview rect. The cache fallback only fires before the first
@@ -954,24 +964,33 @@ impl FleetModel {
                 });
             } else {
                 items.push(SceneItem::Rect {
-                    id: SceneId::Tile(handle),
+                    id: SceneId::Label(handle),
                     rect: preview,
                     color: PLACEHOLDER_BG,
-                    radius: 4.0,
+                    radius: 3.0,
+                });
+                let hint = placeholder_hint(tile.locality);
+                items.push(SceneItem::Text {
+                    id: SceneId::Badge(handle),
+                    rect: centered_line(preview, metrics, hint),
+                    runs: vec![label_run(hint)],
+                    metrics,
+                    color: PLACEHOLDER_FG,
                 });
             }
 
-            // Action buttons.
+            // Action buttons — a centred label on its own inset chip.
             for (button, brect) in buttons {
+                let chip = inset(brect, 3.0);
                 items.push(SceneItem::Rect {
                     id: SceneId::Tile(handle),
-                    rect: brect,
+                    rect: chip,
                     color: BUTTON_BG,
-                    radius: 2.0,
+                    radius: 3.0,
                 });
                 items.push(SceneItem::Text {
                     id: SceneId::Label(handle),
-                    rect: inset(brect, 3.0),
+                    rect: centered_line(chip, metrics, button.label()),
                     runs: vec![label_run(button.label())],
                     metrics,
                     color: BUTTON_FG,
@@ -1045,6 +1064,38 @@ fn inset(rect: RectPx, pad: f32) -> RectPx {
         y: rect.y + pad,
         w: (rect.w - 2.0 * pad).max(1.0),
         h: (rect.h - 2.0 * pad).max(1.0),
+    }
+}
+
+/// A single left-aligned text line, vertically centred in `band` with `pad_x`
+/// horizontal padding. The renderer draws the baseline at 0.8·line_height below
+/// the rect top, so we offset the rect to centre the line within the band.
+fn text_line(band: RectPx, m: CellMetrics, pad_x: f32) -> RectPx {
+    RectPx {
+        x: band.x + pad_x,
+        y: band.y + ((band.h - m.line_height) * 0.5).max(0.0),
+        w: (band.w - 2.0 * pad_x).max(1.0),
+        h: m.line_height,
+    }
+}
+
+/// A single text line centred both horizontally and vertically within `area`.
+fn centered_line(area: RectPx, m: CellMetrics, text: &str) -> RectPx {
+    let tw = text.chars().count() as f32 * m.advance;
+    RectPx {
+        x: area.x + ((area.w - tw) * 0.5).max(0.0),
+        y: area.y + ((area.h - m.line_height) * 0.5).max(0.0),
+        w: tw.max(1.0),
+        h: m.line_height,
+    }
+}
+
+/// The muted hint shown in a tile that has no live preview yet.
+fn placeholder_hint(loc: Locality) -> &'static str {
+    match loc {
+        Locality::ThisWindow => "starting\u{2026}",
+        Locality::Elsewhere => "attached elsewhere",
+        Locality::Detached => "detached",
     }
 }
 
@@ -1133,6 +1184,18 @@ mod tests {
 
     fn fleet() -> FleetModel {
         FleetModel::new(METRICS, SIZE, HashSet::new())
+    }
+
+    /// A window wide enough for a multi-column grid, for tests that exercise
+    /// horizontal arrow nav or 2-D layout (the narrow default fits one column).
+    const WIDE: (u32, u32) = (1000, 700);
+
+    fn widen(m: &mut FleetModel) {
+        m.update(UiEvent::Resize {
+            w_px: WIDE.0,
+            h_px: WIDE.1,
+            scale: 1.0,
+        });
     }
 
     fn list(m: &mut FleetModel, names: &[&str]) -> Vec<Cmd> {
@@ -1229,6 +1292,7 @@ mod tests {
     fn arrow_down_moves_to_the_tile_below_not_the_next() {
         let mut m = fleet();
         list(&mut m, &["a", "b", "c", "d"]); // one section, 2x2 grid: a b / c d
+        widen(&mut m);
         assert_eq!(m.focused(), Some("a")); // top-left
         key(&mut m, Key::Named(NamedKey::ArrowDown));
         assert_eq!(
@@ -1239,6 +1303,7 @@ mod tests {
         // Right is the horizontal neighbour.
         let mut m = fleet();
         list(&mut m, &["a", "b", "c", "d"]);
+        widen(&mut m);
         key(&mut m, Key::Named(NamedKey::ArrowRight));
         assert_eq!(m.focused(), Some("b"));
     }
@@ -1256,6 +1321,7 @@ mod tests {
             sinfo("d1", false),
             sinfo("d2", false),
         ]));
+        widen(&mut m);
         assert_eq!(m.focused(), Some("a1"));
         assert_eq!(m.locality_of("a1"), Some(Locality::ThisWindow));
         key(&mut m, Key::Named(NamedKey::ArrowDown));
@@ -1489,6 +1555,7 @@ mod tests {
     fn arrow_moves_focus_without_sending_input() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]);
+        widen(&mut m);
         assert_eq!(m.focused(), Some("a"));
         let cmds = key(&mut m, Key::Named(NamedKey::ArrowRight));
         assert_eq!(m.focused(), Some("b"));
@@ -1523,8 +1590,9 @@ mod tests {
 
     /// The pixel rect of `id`'s `button` (centre is a good press target).
     fn button_rect(m: &FleetModel, id: &str, button: Button) -> RectPx {
-        let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
-        let (_, _, buttons) = card_layout(rect);
+        let (_, placements, band) = m.sections_layout();
+        let (_, _, rect) = placements.into_iter().find(|(_, i, _)| i == id).unwrap();
+        let (_, _, buttons) = card_layout(rect, band);
         buttons.iter().find(|(b, _)| *b == button).unwrap().1
     }
 
@@ -1682,6 +1750,7 @@ mod tests {
         // without a bell.
         let mut m = fleet();
         list(&mut m, &["a", "b"]); // focus a
+        widen(&mut m);
         data(&mut m, "b", b"work");
         assert_eq!(badges(&m), 1);
         // Focusing b clears its activity badge.
@@ -1691,21 +1760,25 @@ mod tests {
     }
 
     #[test]
-    fn grid_rects_stay_within_bounds() {
-        // Including degenerate tiny windows that force the 1px cell clamp.
-        for &size in &[(400u32, 200u32), (60, 40), (20, 20), (1, 1)] {
-            for n in 1..=16 {
-                for r in grid_rects(n, size, GAP) {
-                    assert!(r.x >= 0.0 && r.y >= 0.0, "size {size:?} n {n}: {r:?}");
-                    assert!(r.w >= 1.0 && r.h >= 1.0, "size {size:?} n {n}: {r:?}");
-                    assert!(
-                        r.x + r.w <= size.0 as f32 + 0.01,
-                        "x overflow at size {size:?} n {n}: {r:?}"
-                    );
-                    assert!(
-                        r.y + r.h <= size.1 as f32 + 0.01,
-                        "y overflow at size {size:?} n {n}: {r:?}"
-                    );
+    fn cards_stay_within_the_window_and_do_not_overlap() {
+        // A spread of session counts; the layout shrinks to keep every card on
+        // screen and never lets two cards overlap.
+        for n in 1..=12usize {
+            let mut m = fleet();
+            let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
+            m.update(UiEvent::SessionList(infos));
+            let (_, placements, _) = m.sections_layout();
+            assert_eq!(placements.len(), n);
+            let (w, h) = (SIZE.0 as f32, SIZE.1 as f32);
+            for (_, _, r) in &placements {
+                assert!(r.x >= 0.0 && r.y >= 0.0, "n {n}: {r:?}");
+                assert!(r.w >= 1.0 && r.h >= 1.0, "n {n}: {r:?}");
+                assert!(r.x + r.w <= w + 0.5, "x overflow n {n}: {r:?}");
+                assert!(r.y + r.h <= h + 0.5, "y overflow n {n}: {r:?}");
+            }
+            for (i, (_, _, a)) in placements.iter().enumerate() {
+                for (_, _, b) in &placements[i + 1..] {
+                    assert!(!rects_overlap(a, b), "overlap n {n}: {a:?} vs {b:?}");
                 }
             }
         }
