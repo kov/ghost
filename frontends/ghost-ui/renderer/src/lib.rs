@@ -25,6 +25,22 @@ pub struct Rendered {
     pub rgba: Vec<u8>,
 }
 
+impl Rendered {
+    /// Write the pixels to a PNG file — the first-class way to eyeball what the
+    /// renderer actually drew, from a golden test or a headless debug tool.
+    pub fn save_png(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), self.width, self.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(std::io::Error::other)?;
+        writer
+            .write_image_data(&self.rgba)
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+}
+
 /// A GPU context: device + queue. Build it headless ([`Gpu::headless`], a
 /// software adapter for reproducible tests) or wrap a windowed device directly.
 pub struct Gpu {

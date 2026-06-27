@@ -659,6 +659,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-shot"
+version = "0.1.0"
+dependencies = [
+ "ghost-render",
+ "ghost-renderer",
+ "ghost-shaper",
+ "ghost-ui-core",
+ "ghost-vt",
+]
+
+[[package]]
 name = "ghost-term"
 version = "0.18.0"
 dependencies = [

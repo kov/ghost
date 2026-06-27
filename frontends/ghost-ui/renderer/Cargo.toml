@@ -19,7 +19,6 @@ bytemuck = { version = "1", features = ["derive"] }
 # widths to place glyphs on the grid, and that must agree with the emulator's
 # own wide-cell decisions or glyphs desync from the cells.
 unicode-width = "0.1.13"
-
-[dev-dependencies]
-# png lets a test dump what it drew for eyeballing.
+# PNG output is first-class: `Rendered::save_png` lets a test or a headless tool
+# dump exactly what the renderer drew, for eyeballing and visual debugging.
 png = "0.18"

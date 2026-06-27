@@ -1,0 +1,14 @@
+[package]
+name = "ghost-shot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless render tool: draw ghost-ui scenes (fleet, single) to PNG for visual debugging."
+publish = false
+
+[dependencies]
+ghost-ui-core = { path = "../core" }
+ghost-renderer = { path = "../renderer" }
+ghost-shaper = { path = "../shaper" }
+ghost-render = { path = "../../../ghost-render" }
+ghost-vt = { path = "../../../ghost-vt" }
