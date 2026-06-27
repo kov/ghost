@@ -3,9 +3,9 @@
 //! Each tile is a real attached session mirrored by its own [`TerminalModel`]
 //! (the fleet owns them), so previews are live, not snapshots. The model
 //! reconciles a `SessionList` into tiles (emitting `Attach`/`Detach`), routes
-//! pumped `SessionData` to the matching tile by id, forwards keystrokes/text to
-//! the focused tile, intercepts arrow/Tab navigation to move focus (never
-//! forwarding it), focuses on click via a shared grid layout that doubles as the
+//! pumped `SessionData` to the matching tile by id, moves focus on arrow/Tab
+//! navigation (previews are view-only, so keystrokes/text are never forwarded),
+//! focuses on click via a shared grid layout that doubles as the
 //! hit-test, and renders the whole grid — dimming unfocused tiles, bordering the
 //! focused one, and badging bell/activity. Like [`TerminalModel`] it is pure, so
 //! all of this is asserted headlessly by feeding events and inspecting the
@@ -30,29 +30,29 @@ const REFRESH_MS: u64 = 500;
 
 /// Which window owns or sees a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Group {
+pub enum Locality {
     ThisWindow,
     Elsewhere,
     Detached,
 }
 
-impl Group {
+impl Locality {
     fn rank(self) -> u8 {
         match self {
-            Group::ThisWindow => 0,
-            Group::Elsewhere => 1,
-            Group::Detached => 2,
+            Locality::ThisWindow => 0,
+            Locality::Elsewhere => 1,
+            Locality::Detached => 2,
         }
     }
 }
 
-fn group_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Group {
+fn locality_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Locality {
     if mine.contains(id) {
-        Group::ThisWindow
+        Locality::ThisWindow
     } else if attached {
-        Group::Elsewhere
+        Locality::Elsewhere
     } else {
-        Group::Detached
+        Locality::Detached
     }
 }
 
@@ -61,7 +61,7 @@ struct Tile {
     id: SessionId,
     model: TerminalModel,
     bell: bool,
-    group: Group,
+    locality: Locality,
     /// Unseen-output count since this tile was last focused (drives the badge).
     activity: u32,
     /// Whether the shell ever delivered output for this tile. Until then we keep
@@ -81,8 +81,8 @@ struct Tile {
 /// Whether the fleet may attach a session to drive a live preview. Sessions
 /// owned by another window (`Elsewhere`) are left alone — attaching would steal
 /// their display client and shrink their PTY to the tile size.
-fn attachable(group: Group) -> bool {
-    !matches!(group, Group::Elsewhere)
+fn attachable(locality: Locality) -> bool {
+    !matches!(locality, Locality::Elsewhere)
 }
 
 pub struct FleetModel {
@@ -181,10 +181,10 @@ impl FleetModel {
         let mut f = FleetModel::new(metrics, size_px, mine);
         f.scale = scale;
         let id = primary.session().to_string();
-        let group = group_for(&f.mine, &id, true);
+        let locality = locality_for(&f.mine, &id, true);
         f.focused = Some(id.clone());
         // The adopted primary is already live; mark it fed so it isn't re-attached.
-        f.push_tile(id, primary, false, group);
+        f.push_tile(id, primary, false, locality);
         if let Some(t) = f.tiles.last_mut() {
             t.fed = true;
         }
@@ -193,7 +193,7 @@ impl FleetModel {
         (f, cmds)
     }
 
-    fn push_tile(&mut self, id: SessionId, model: TerminalModel, bell: bool, group: Group) {
+    fn push_tile(&mut self, id: SessionId, model: TerminalModel, bell: bool, locality: Locality) {
         let handle = self.next_handle;
         self.next_handle += 1;
         self.tiles.push(Tile {
@@ -201,7 +201,7 @@ impl FleetModel {
             id,
             model,
             bell,
-            group,
+            locality,
             activity: 0,
             fed: false,
             frame: None,
@@ -227,8 +227,8 @@ impl FleetModel {
             .map(|t| t.model.screen().text())
     }
 
-    pub fn group_of(&self, id: &str) -> Option<Group> {
-        self.tiles.iter().find(|t| t.id == id).map(|t| t.group)
+    pub fn locality_of(&self, id: &str) -> Option<Locality> {
+        self.tiles.iter().find(|t| t.id == id).map(|t| t.locality)
     }
 
     /// Extract a single terminal for a toggle back to the single view, detaching
@@ -345,9 +345,9 @@ impl FleetModel {
             UiEvent::Pointer {
                 phase, pos, clicks, ..
             } => self.pointer(phase, pos, clicks),
-            // Everything else (text, non-nav keys, focus, paste replies) goes to
-            // the focused tile's terminal.
-            other => self.forward_to_focused(other),
+            // Previews are view-only: text, ordinary keys, focus and paste
+            // replies are never forwarded to a tile as input.
+            _ => Vec::new(),
         };
         // Rebuild any preview whose content or size this event changed, so `view`
         // can stay a pure read of cached frames.
@@ -395,31 +395,31 @@ impl FleetModel {
             dirty = true;
         }
 
-        // Add new tiles; refresh bell/group on existing ones. Only attach
+        // Add new tiles; refresh bell/locality on existing ones. Only attach
         // sessions we may safely drive (ours or detached); re-attach a safe tile
         // that has never produced output (a lost attach race self-heals here).
         for info in &infos {
-            let group = group_for(&self.mine, &info.name, info.attached);
+            let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
-                if tile.bell != info.bell || tile.group != group {
+                if tile.bell != info.bell || tile.locality != locality {
                     dirty = true;
                 }
                 tile.bell = info.bell;
-                tile.group = group;
-                if attachable(group) && !tile.fed {
+                tile.locality = locality;
+                if attachable(locality) && !tile.fed {
                     cmds.push(Cmd::Attach(info.name.clone()));
                 }
             } else {
                 let model = TerminalModel::new(info.name.clone(), 1, 1, self.metrics);
-                self.push_tile(info.name.clone(), model, info.bell, group);
-                if attachable(group) {
+                self.push_tile(info.name.clone(), model, info.bell, locality);
+                if attachable(locality) {
                     cmds.push(Cmd::Attach(info.name.clone()));
                 }
                 dirty = true;
             }
         }
 
-        // Keep focus valid; default to the visually-first (grouped) tile.
+        // Keep focus valid; default to the visually-first tile.
         if self
             .focused
             .as_ref()
@@ -443,7 +443,7 @@ impl FleetModel {
         cmds
     }
 
-    /// Lay tiles out (grouped, then insertion order) and resize each tile's
+    /// Lay tiles out (by locality, then insertion order) and resize each tile's
     /// model to its rect so its preview renders at the tile's size. Returns only
     /// the `Resize` effects for tiles that actually changed size (callers decide
     /// whether to also redraw), so an idle re-layout produces nothing.
@@ -470,10 +470,10 @@ impl FleetModel {
         cmds
     }
 
-    /// Tile placements `(handle, id, rect)` in grouped grid order.
+    /// Tile placements `(handle, id, rect)` in locality grid order.
     fn layout(&self) -> Vec<(u64, SessionId, RectPx)> {
         let mut order: Vec<&Tile> = self.tiles.iter().collect();
-        order.sort_by_key(|t| t.group.rank()); // stable: insertion order within a group
+        order.sort_by_key(|t| t.locality.rank()); // stable: insertion order within a locality
         let rects = grid_rects(order.len(), self.size_px, GAP);
         order
             .into_iter()
@@ -533,16 +533,6 @@ impl FleetModel {
         self.focused = Some(id);
     }
 
-    fn forward_to_focused(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        let Some(focused) = self.focused.clone() else {
-            return Vec::new();
-        };
-        match self.tiles.iter_mut().find(|t| t.id == focused) {
-            Some(t) => t.model.update(ev),
-            None => Vec::new(),
-        }
-    }
-
     fn pointer(&mut self, phase: PointerPhase, pos: PointPx, clicks: u8) -> Vec<Cmd> {
         if phase != PointerPhase::Press {
             return Vec::new(); // the overview only reacts to clicks (focus / open)
@@ -558,7 +548,7 @@ impl FleetModel {
         // A double-click opens the tile: take it over into this window's single
         // view. A session live in another window (`Elsewhere`) is left alone —
         // taking it over would steal its display client (no observer-attach yet).
-        if clicks >= 2 && self.group_of(&id) != Some(Group::Elsewhere) {
+        if clicks >= 2 && self.locality_of(&id) != Some(Locality::Elsewhere) {
             vec![Cmd::TakeOver(id), Cmd::Redraw]
         } else {
             vec![Cmd::Redraw]
@@ -844,16 +834,20 @@ mod tests {
     }
 
     #[test]
-    fn text_goes_only_to_the_focused_tile() {
+    fn previews_are_read_only() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]); // focus defaults to "a"
-        let cmds = m.update(UiEvent::Text("x".into()));
+        // Text and ordinary keys must NOT reach a tile as input — fleet previews
+        // are view-only, so neither forwards anything to the focused session.
         assert_eq!(
-            cmds,
-            vec![Cmd::SendInput {
-                session: "a".into(),
-                bytes: b"x".to_vec()
-            }]
+            m.update(UiEvent::Text("x".into())),
+            vec![],
+            "typed text is not forwarded to a preview"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("a".into())),
+            vec![],
+            "ordinary keys are not forwarded to a preview"
         );
     }
 
@@ -940,7 +934,7 @@ mod tests {
         let mut a = info("a");
         a.attached = true;
         m.update(UiEvent::SessionList(vec![a]));
-        assert_eq!(m.group_of("a"), Some(Group::Elsewhere));
+        assert_eq!(m.locality_of("a"), Some(Locality::Elsewhere));
         let cmds = press(&mut m, "a", 2);
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
@@ -1055,7 +1049,7 @@ mod tests {
             !cmds.contains(&Cmd::Attach("foreign".into())),
             "must not attach a session owned elsewhere"
         );
-        assert_eq!(m.group_of("foreign"), Some(Group::Elsewhere));
+        assert_eq!(m.locality_of("foreign"), Some(Locality::Elsewhere));
         assert_eq!(m.tile_count(), 2); // still shown, as a placeholder tile
     }
 

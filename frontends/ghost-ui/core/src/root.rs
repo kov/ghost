@@ -1,5 +1,5 @@
 //! `RootModel` — the top of the model tree: either the single-terminal view or
-//! the fleet overview, with one key (Ctrl+Shift+E) toggling between them.
+//! the fleet overview, with one key (F9) toggling between them.
 //!
 //! Toggling preserves session state: going to the fleet *adopts* the current
 //! terminal as its focused tile (so its screen survives), and coming back
@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::input::{Key, Mods};
+use crate::input::{Key, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, UiEvent};
 
@@ -31,9 +31,9 @@ pub struct RootModel {
     primary: Option<SessionId>,
 }
 
-/// Ctrl+Shift+E toggles the fleet overview.
-fn is_fleet_toggle(key: &Key, mods: Mods) -> bool {
-    mods.ctrl && mods.shift && matches!(key, Key::Char(s) if s.eq_ignore_ascii_case("e"))
+/// F9 toggles the fleet overview.
+fn is_fleet_toggle(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::F9))
 }
 
 impl RootModel {
@@ -75,7 +75,7 @@ impl RootModel {
         } = &ev
             && kind.is_down()
         {
-            if is_fleet_toggle(key, *mods) {
+            if is_fleet_toggle(key) {
                 return self.toggle();
             }
             // Window/app-level shortcuts are handled above the active view so
@@ -218,7 +218,7 @@ impl RootModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::KeyEventKind;
+    use crate::input::{KeyEventKind, Mods};
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -256,7 +256,7 @@ mod tests {
     fn toggle_enters_fleet_and_lists_sessions() {
         let mut r = root();
         assert!(!r.is_fleet());
-        let cmds = key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(r.is_fleet());
         assert!(
             cmds.contains(&Cmd::ListSessions),
@@ -267,9 +267,9 @@ mod tests {
     #[test]
     fn toggle_round_trips_back_to_single() {
         let mut r = root();
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(r.is_fleet());
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(!r.is_fleet());
         // Back in single view, input is delegated to the (preserved) terminal.
         assert_eq!(
@@ -297,7 +297,7 @@ mod tests {
             }
         }
         let mut r = root(); // owns "alpha"
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> fleet
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         // The shell's ListSessions reply: our alpha plus a foreign detached beta.
         r.update(UiEvent::SessionList(vec![
             info("alpha", true),
@@ -310,7 +310,7 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         });
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> single
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single
         assert!(!r.is_fleet());
         // The single view returns to the OWNED session, not the focused foreign one.
         assert_eq!(
@@ -334,8 +334,8 @@ mod tests {
             scale: 2.0,
         });
         // Round-trip through the fleet overview.
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(!r.is_fleet());
         match r.view().terminals().next().unwrap() {
             SceneItem::Terminal { frame, .. } => {
@@ -351,8 +351,8 @@ mod tests {
     #[test]
     fn fleet_toggle_key_is_not_forwarded_as_input() {
         let mut r = root();
-        // The toggle chord must drive the app, never reach the child as bytes.
-        let cmds = key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        // The toggle key must drive the app, never reach the child as bytes.
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })));
         // A plain 'e' still types into the terminal.
         let mut r = root();
@@ -360,6 +360,31 @@ mod tests {
             key(&mut r, Key::Char("e".into()), Mods::NONE).as_slice(),
             [Cmd::SendInput { .. }]
         ));
+    }
+
+    #[test]
+    fn f9_toggles_the_fleet_overview() {
+        let mut r = root();
+        assert!(!r.is_fleet());
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet(), "F9 enters the fleet overview");
+        assert!(
+            cmds.contains(&Cmd::ListSessions),
+            "entering the fleet enumerates sessions"
+        );
+        // F9 again returns to the single view.
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(!r.is_fleet(), "F9 toggles back to the single view");
+    }
+
+    #[test]
+    fn ctrl_shift_e_no_longer_toggles_the_fleet() {
+        let mut r = root();
+        let _ = key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT);
+        assert!(
+            !r.is_fleet(),
+            "Ctrl+Shift+E is no longer the fleet toggle (F9 is)"
+        );
     }
 
     use ghost_vt::session::SessionInfo;
@@ -425,7 +450,7 @@ mod tests {
     #[test]
     fn adopt_from_fleet_drops_into_that_sessions_single_view() {
         let mut r = root(); // owns alpha
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> fleet
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         r.update(UiEvent::SessionList(vec![
             info("alpha", true),
             info("beta", false),
@@ -447,7 +472,7 @@ mod tests {
     #[test]
     fn adopt_of_a_freshly_spawned_session_makes_a_new_terminal_and_detaches_previews() {
         let mut r = root(); // owns alpha
-        key(&mut r, Key::Char("e".into()), Mods::CTRL | Mods::SHIFT); // -> fleet
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         r.update(UiEvent::SessionList(vec![
             info("alpha", true),
             info("beta", false),

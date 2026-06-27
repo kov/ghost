@@ -21,7 +21,7 @@ pub mod terminal;
 
 pub use cmd::Cmd;
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
-pub use fleet::{FleetModel, Group};
+pub use fleet::{FleetModel, Locality};
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{
