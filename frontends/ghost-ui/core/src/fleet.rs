@@ -275,6 +275,7 @@ impl FleetModel {
     /// screen state survives a toggle from the single-terminal view.
     pub fn adopting(
         primary: TerminalModel,
+        warm: Vec<TerminalModel>,
         metrics: CellMetrics,
         size_px: (u32, u32),
         scale: f32,
@@ -283,13 +284,17 @@ impl FleetModel {
         let mut f = FleetModel::new(metrics, size_px, mine);
         f.scale = scale;
         let id = primary.session().to_string();
-        let locality = locality_for(&f.mine, &id, true);
         f.focused = Some(id.clone());
-        // The adopted primary is already live; mark it fed so it stays a preview.
-        // Its command/pid fill in on the next reconcile.
-        f.push_tile(id, primary, false, locality, Vec::new(), 0);
-        if let Some(t) = f.tiles.last_mut() {
-            t.fed = true;
+        // The primary and the window's other driven sessions are all already
+        // live; add each as a fed tile so every preview is warm, not "starting…".
+        // Command/pid fill in on the next reconcile.
+        for model in std::iter::once(primary).chain(warm) {
+            let id = model.session().to_string();
+            let locality = locality_for(&f.mine, &id, true);
+            f.push_tile(id, model, false, locality, Vec::new(), 0);
+            if let Some(t) = f.tiles.last_mut() {
+                t.fed = true;
+            }
         }
         // The fleet never resizes its tiles' sessions; just repaint.
         (f, vec![Cmd::Redraw])
@@ -348,20 +353,27 @@ impl FleetModel {
     /// identity), falling back to the focused tile, then any tile — never a
     /// foreign session we merely previewed, so the single view always returns to
     /// what the window actually drives.
-    pub fn into_single(self, size_px: (u32, u32), scale: f32) -> (TerminalModel, Vec<Cmd>) {
+    pub fn into_single(
+        self,
+        size_px: (u32, u32),
+        scale: f32,
+    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
         self.into_single_keeping(None, size_px, scale)
     }
 
     /// Like [`into_single`](Self::into_single) but, when `target` names a present
     /// tile, keeps *that* session (a take-over of a specific tile). Otherwise it
     /// falls back to the owned session, then the focused tile, then any tile.
+    /// Returns the kept model, the *other driven sessions'* models (to keep warm
+    /// in the single view so their previews and Ctrl-Tab switches stay live), and
+    /// the resize commands. Placeholder tiles for sessions this window doesn't
+    /// drive are dropped.
     pub fn into_single_keeping(
         self,
         target: Option<SessionId>,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<Cmd>) {
-        let metrics = self.metrics;
+    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
         let keep = target
             .filter(|id| self.tiles.iter().any(|t| &t.id == id))
             .or_else(|| {
@@ -377,30 +389,13 @@ impl FleetModel {
                     .map(|t| t.id.clone())
             })
             .or_else(|| self.tiles.first().map(|t| t.id.clone()));
-        let mut kept = None;
-        let mut cmds = Vec::new();
-        for tile in self.tiles {
-            if Some(&tile.id) == keep.as_ref() {
-                kept = Some(tile.model);
-            }
-            // Other tiles' models are dropped, but their sessions stay attached to
-            // this window (warm) — they keep previewing in the fleet and are
-            // reachable with Ctrl-Tab. A vanished session is detached by reconcile.
-        }
-        let mut model =
-            kept.unwrap_or_else(|| TerminalModel::new(keep.unwrap_or_default(), 1, 1, metrics));
-        cmds.append(&mut model.update(UiEvent::Resize {
-            w_px: size_px.0.max(1),
-            h_px: size_px.1.max(1),
-            scale: scale as f64,
-        }));
-        (model, cmds)
+        self.extract(keep.clone(), keep.unwrap_or_default(), size_px, scale)
     }
 
     /// Leave the overview showing `id` *specifically* — a spawn or take-over.
     /// Keeps `id`'s tile if it has one (preserving its screen); otherwise builds
     /// a fresh terminal for it (the just-spawned session has no tile yet). The
-    /// other sessions stay attached to this window (warm). Unlike
+    /// other driven sessions are returned to be kept warm. Unlike
     /// [`into_single_keeping`](Self::into_single_keeping) there is no fallback to
     /// a different session: the caller asked for `id`.
     pub fn into_single_adopting(
@@ -408,24 +403,43 @@ impl FleetModel {
         id: SessionId,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<Cmd>) {
+    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
+        self.extract(Some(id.clone()), id, size_px, scale)
+    }
+
+    /// Consume the fleet, returning `keep`'s model (or a fresh one named `fresh`),
+    /// every other *driven* (this-window) session's model to keep warm, and the
+    /// resize commands sizing them all to the window.
+    fn extract(
+        self,
+        keep: Option<SessionId>,
+        fresh: SessionId,
+        size_px: (u32, u32),
+        scale: f32,
+    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
         let metrics = self.metrics;
+        let mine = self.mine.clone();
         let mut kept = None;
-        let mut cmds = Vec::new();
+        let mut warm = Vec::new();
         for tile in self.tiles {
-            if tile.id == id {
+            if Some(&tile.id) == keep.as_ref() {
                 kept = Some(tile.model);
+            } else if mine.contains(&tile.id) {
+                warm.push(tile.model); // a driven session: keep it warm
             }
-            // The other sessions stay attached to this window (warm); only their
-            // preview models are dropped.
+            // else: a placeholder for a session we don't drive — drop it.
         }
-        let mut model = kept.unwrap_or_else(|| TerminalModel::new(id, 1, 1, metrics));
-        cmds.append(&mut model.update(UiEvent::Resize {
+        let resize = UiEvent::Resize {
             w_px: size_px.0.max(1),
             h_px: size_px.1.max(1),
             scale: scale as f64,
-        }));
-        (model, cmds)
+        };
+        let mut model = kept.unwrap_or_else(|| TerminalModel::new(fresh, 1, 1, metrics));
+        let mut cmds = model.update(resize.clone());
+        for m in &mut warm {
+            cmds.append(&mut m.update(resize.clone()));
+        }
+        (model, warm, cmds)
     }
 
     // ---- update ----
@@ -932,7 +946,7 @@ impl FleetModel {
             // Metadata header — or the live buffer of an in-progress rename.
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
                 Some(r) => format!("{}\u{2588}", r.buffer), // trailing caret block
-                None => card_meta(tile),
+                None => card_meta(&tile.id, &tile.command, tile.pid),
             };
             items.push(SceneItem::Text {
                 id: SceneId::Label(handle),
@@ -1099,18 +1113,20 @@ fn placeholder_hint(loc: Locality) -> &'static str {
     }
 }
 
-/// One-line card metadata: name · command · pid.
-fn card_meta(tile: &Tile) -> String {
-    let cmd = if tile.command.is_empty() {
-        "$SHELL".to_string()
-    } else {
-        tile.command.join(" ")
-    };
-    if tile.pid > 0 {
-        format!("{} \u{b7} {} \u{b7} {}", tile.id, cmd, tile.pid)
-    } else {
-        format!("{} \u{b7} {}", tile.id, cmd)
+/// One-line card metadata: `name · command · pid`. The command is omitted when
+/// the session just runs the user's `$SHELL` (an empty command) — it's always the
+/// shell there, so it's noise; the pid is omitted when unknown.
+fn card_meta(id: &str, command: &[String], pid: i32) -> String {
+    let mut s = id.to_string();
+    if !command.is_empty() {
+        s.push_str(" \u{b7} ");
+        s.push_str(&command.join(" "));
     }
+    if pid > 0 {
+        s.push_str(" \u{b7} ");
+        s.push_str(&pid.to_string());
+    }
+    s
 }
 
 /// The prompt shown in the confirm overlay.
@@ -1760,6 +1776,19 @@ mod tests {
     }
 
     #[test]
+    fn card_metadata_omits_the_shell_command() {
+        // A shell session (empty command) shows just name · pid — no "$SHELL".
+        assert_eq!(card_meta("build", &[], 4012), "build \u{b7} 4012");
+        // A real command is shown.
+        assert_eq!(
+            card_meta("edit", &["nvim".into(), "x.rs".into()], 40),
+            "edit \u{b7} nvim x.rs \u{b7} 40"
+        );
+        // Unknown pid is omitted too.
+        assert_eq!(card_meta("s", &[], 0), "s");
+    }
+
+    #[test]
     fn cards_stay_within_the_window_and_do_not_overlap() {
         // A spread of session counts; the layout shrinks to keep every card on
         // screen and never lets two cards overlap.
@@ -1831,7 +1860,7 @@ mod tests {
         // The window owns "alpha"; the fleet also previews a foreign "beta".
         let mine = HashSet::from(["alpha".to_string()]);
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
-        let (mut f, _) = FleetModel::adopting(primary, METRICS, SIZE, 1.0, mine);
+        let (mut f, _) = FleetModel::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(vec![info("alpha"), info("beta")]));
         // Move focus onto the foreign tile (it's in the section below ours).
         f.update(UiEvent::Key {
@@ -1843,7 +1872,7 @@ mod tests {
         assert_eq!(f.focused(), Some("beta"));
         // Toggling back returns the OWNED session and detaches nothing — the
         // other sessions stay attached (warm) for Ctrl-Tab and live previews.
-        let (model, cmds) = f.into_single(SIZE, 1.0);
+        let (model, _warm, cmds) = f.into_single(SIZE, 1.0);
         assert_eq!(model.session(), "alpha", "keeps the window's own session");
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Detach(_))),

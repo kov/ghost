@@ -611,16 +611,6 @@ impl App {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
-                Cmd::CycleSession { to } => {
-                    // Re-attach for a fresh resync (the warm client may be sitting on
-                    // a stale screen), then switch the single view to it.
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.sessions.remove(&to);
-                    }
-                    if self.attach_into(wid, &to) {
-                        self.dispatch(wid, UiEvent::AdoptSession(to), event_loop);
-                    }
-                }
                 Cmd::UploadImage {
                     id,
                     width,

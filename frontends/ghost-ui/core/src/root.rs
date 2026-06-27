@@ -1,13 +1,15 @@
 //! `RootModel` — the top of the model tree: either the single-terminal view or
 //! the fleet overview, with one key (F9) toggling between them.
 //!
-//! Toggling preserves session state: going to the fleet *adopts* the current
-//! terminal as its focused tile (so its screen survives), and coming back
-//! *extracts* the focused tile's terminal (detaching the rest). The shell drives
-//! this model exactly as it drove a bare `TerminalModel` — `update` in, `Cmd`s
-//! out, `view` to draw — so the whole tree stays headlessly testable.
+//! Toggling preserves session state: every session this window drives stays
+//! live. Going to the fleet hands the foreground *and* the warm background
+//! mirrors to the grid as fed tiles; coming back extracts the chosen one as the
+//! foreground and keeps the rest as warm mirrors (fed and resized like the
+//! foreground), so previews never go cold and Ctrl-Tab switches are instant. The
+//! shell drives this model exactly as it drove a bare `TerminalModel` — `update`
+//! in, `Cmd`s out, `view` to draw — so the whole tree stays headlessly testable.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
@@ -29,6 +31,21 @@ pub struct RootModel {
     /// The session the single view shows / a fleet toggle returns to. `None` for
     /// a freshly-opened fleet window that hasn't adopted a session yet.
     primary: Option<SessionId>,
+    /// Live mirrors of the window's *background* sessions while in the single
+    /// view (the foreground lives in `mode`). They are fed and resized exactly
+    /// like the foreground, so their previews stay live and Ctrl-Tab switches are
+    /// instant and correctly sized. In the fleet, the models live in its tiles, so
+    /// this is empty.
+    warm: HashMap<SessionId, TerminalModel>,
+}
+
+/// Resize a model to the window (physical px + scale), returning its commands.
+fn resize_model(m: &mut TerminalModel, size_px: (u32, u32), scale: f32) -> Vec<Cmd> {
+    m.update(UiEvent::Resize {
+        w_px: size_px.0.max(1),
+        h_px: size_px.1.max(1),
+        scale: scale as f64,
+    })
 }
 
 /// F9 toggles the fleet overview.
@@ -57,6 +74,7 @@ impl RootModel {
             scale: 1.0,
             mine: HashSet::from([id.clone()]),
             primary: Some(id),
+            warm: HashMap::new(),
         }
     }
 
@@ -71,6 +89,7 @@ impl RootModel {
             scale,
             mine: HashSet::new(),
             primary: None,
+            warm: HashMap::new(),
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
@@ -105,16 +124,53 @@ impl RootModel {
             let id = id.clone();
             return self.adopt(id);
         }
-        if let UiEvent::Resize { w_px, h_px, scale } = &ev {
-            self.size_px = (*w_px, *h_px);
-            if *scale > 0.0 {
-                self.scale = *scale as f32;
+        // Output for a background session keeps its warm mirror live (the fleet
+        // owns every model, so this only matters in the single view).
+        if let UiEvent::SessionData { name, .. } = &ev
+            && let Mode::Single(m) = &self.mode
+            && m.session() != name
+        {
+            return self.feed_warm(ev);
+        }
+        if let UiEvent::Resize { w_px, h_px, scale } = ev {
+            self.size_px = (w_px, h_px);
+            if scale > 0.0 {
+                self.scale = scale as f32;
             }
+            // Resize the foreground and every warm background mirror, so a
+            // backgrounded session is never left at a stale size (its prompt or a
+            // full-screen program like `top` would come back mis-laid-out).
+            let mut cmds = match &mut self.mode {
+                Mode::Single(m) => resize_model(m, self.size_px, self.scale),
+                Mode::Fleet(f) => return f.update(UiEvent::Resize { w_px, h_px, scale }),
+            };
+            for m in self.warm.values_mut() {
+                cmds.extend(resize_model(m, self.size_px, self.scale));
+            }
+            return cmds;
         }
         match &mut self.mode {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         }
+    }
+
+    /// Feed output to a background session's warm mirror, dropping the mirror if
+    /// the session ended. Returns any replies the mirror produced (e.g. a program
+    /// querying the terminal still gets answered while backgrounded).
+    fn feed_warm(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        let UiEvent::SessionData { name, ended, .. } = &ev else {
+            return Vec::new();
+        };
+        let (name, ended) = (name.clone(), *ended);
+        let cmds = match self.warm.get_mut(&name) {
+            Some(m) => m.update(ev),
+            None => Vec::new(), // not a session this window mirrors
+        };
+        if ended {
+            self.warm.remove(&name);
+        }
+        cmds
     }
 
     /// Switch to the single view of `id` (the shell has just attached it) and
@@ -130,25 +186,35 @@ impl RootModel {
             self.metrics,
         )));
         let current = std::mem::replace(&mut self.mode, placeholder);
-        let (model, mut cmds) = match current {
-            Mode::Fleet(f) => f.into_single_adopting(id.clone(), self.size_px, self.scale),
+        let (mut model, mut cmds) = match current {
+            Mode::Fleet(f) => {
+                let (kept, warm, cmds) =
+                    f.into_single_adopting(id.clone(), self.size_px, self.scale);
+                // The window's other driven sessions stay warm in the background.
+                for m in warm {
+                    self.warm.insert(m.session().to_string(), m);
+                }
+                (kept, cmds)
+            }
             Mode::Single(m) => {
                 let old = m.session().to_string();
                 if old == id {
                     (*m, Vec::new())
                 } else {
-                    let mut model = TerminalModel::new(id.clone(), 1, 1, self.metrics);
-                    let cmds = model.update(UiEvent::Resize {
-                        w_px: self.size_px.0.max(1),
-                        h_px: self.size_px.1.max(1),
-                        scale: self.scale as f64,
-                    });
-                    // The previous session is NOT detached: the window holds it,
-                    // warm, so Ctrl-Tab and the fleet can switch back to it.
-                    (model, cmds)
+                    // Stow the outgoing foreground as a warm mirror; restore the
+                    // target's mirror if we have one (instant, no re-attach), else
+                    // build a fresh model.
+                    self.warm.insert(old, *m);
+                    let model = self
+                        .warm
+                        .remove(&id)
+                        .unwrap_or_else(|| TerminalModel::new(id.clone(), 1, 1, self.metrics));
+                    (model, Vec::new())
                 }
             }
         };
+        // Size the (possibly restored or fresh) foreground to the window.
+        cmds.extend(resize_model(&mut model, self.size_px, self.scale));
         self.mode = Mode::Single(Box::new(model));
         self.mine.insert(id.clone());
         self.primary = Some(id);
@@ -156,10 +222,10 @@ impl RootModel {
         cmds
     }
 
-    /// Cycle the window's foreground among its attached sessions (Ctrl-Tab). The
-    /// concrete target is resolved here from the owned set, in a stable order, and
-    /// handed to the shell, which re-attaches it for a fresh resync. A window with
-    /// fewer than two sessions has nothing to cycle.
+    /// Cycle the window's foreground among its attached sessions (Ctrl-Tab),
+    /// resolving the target from the owned set in a stable order. The switch is a
+    /// warm-mirror swap — no re-attach — so it's instant and correctly sized. A
+    /// window with fewer than two sessions has nothing to cycle.
     fn cycle(&mut self, forward: bool) -> Vec<Cmd> {
         let mut names: Vec<&SessionId> = self.mine.iter().collect();
         names.sort();
@@ -181,7 +247,7 @@ impl RootModel {
         if Some(&to) == self.primary.as_ref() {
             return Vec::new();
         }
-        vec![Cmd::CycleSession { to }, Cmd::Redraw]
+        self.adopt(to)
     }
 
     pub fn view(&self) -> Scene {
@@ -230,8 +296,12 @@ impl RootModel {
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, cmds) = match current {
             Mode::Single(m) => {
+                // Hand the foreground and every warm background mirror to the
+                // fleet, so all of this window's previews are live, not cold.
+                let warm: Vec<TerminalModel> = self.warm.drain().map(|(_, m)| m).collect();
                 let (fleet, mut cmds) = FleetModel::adopting(
                     *m,
+                    warm,
                     self.metrics,
                     self.size_px,
                     self.scale,
@@ -241,11 +311,14 @@ impl RootModel {
                 (Mode::Fleet(Box::new(fleet)), cmds)
             }
             Mode::Fleet(f) => {
-                let (model, mut cmds) =
+                let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
-                cmds.push(Cmd::Redraw);
                 // The extracted session becomes the foreground; the rest of the
-                // window's sessions stay attached (warm), so `mine` is preserved.
+                // window's driven sessions stay warm in the background.
+                for m in warm {
+                    self.warm.insert(m.session().to_string(), m);
+                }
+                cmds.push(Cmd::Redraw);
                 let id = model.session().to_string();
                 self.mine.insert(id.clone());
                 self.primary = Some(id);
@@ -489,6 +562,76 @@ mod tests {
         );
     }
 
+    fn feed(r: &mut RootModel, name: &str, bytes: &[u8]) -> Vec<Cmd> {
+        r.update(UiEvent::SessionData {
+            name: name.into(),
+            bytes: bytes.to_vec(),
+            ended: false,
+        })
+    }
+
+    #[test]
+    fn background_sessions_stay_live_and_keep_their_screens() {
+        // The window drives two sessions; alpha starts foreground.
+        let mut r = root(); // single view of alpha, mine = {alpha}
+        feed(&mut r, "alpha", b"alpha-screen");
+        // Switch to beta (alpha goes to the background, kept warm).
+        r.update(UiEvent::AdoptSession("beta".into()));
+        feed(&mut r, "beta", b"beta-screen");
+        // Background alpha keeps receiving output while beta is shown.
+        feed(&mut r, "alpha", b" still-running");
+
+        // Opening the fleet must show BOTH as live previews, not "starting…".
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet());
+        assert_eq!(
+            r.view().terminals().count(),
+            2,
+            "every session the window drives previews live"
+        );
+
+        // Switching back to alpha restores its (warm) screen and routes input to
+        // it — a warm-mirror swap, no re-attach (no Attach/Spawn/TakeOver).
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single (beta)
+        let cmds = r.update(UiEvent::AdoptSession("alpha".into()));
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::Spawn { .. } | Cmd::TakeOver(_))),
+            "switching to a warm session needs no re-attach: {cmds:?}"
+        );
+        assert_eq!(
+            r.update(UiEvent::Text("x".into())),
+            vec![Cmd::SendInput {
+                session: "alpha".into(),
+                bytes: b"x".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn refleeting_an_adopted_session_shows_a_live_preview_not_starting() {
+        // A fleet-started window (owns nothing); the user attaches a detached
+        // session, the shell feeds it, then the user reopens the fleet.
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.update(UiEvent::SessionList(vec![info("d", false)])); // detached
+        r.update(UiEvent::AdoptSession("d".into())); // attach + show single
+        r.update(UiEvent::SessionData {
+            name: "d".into(),
+            bytes: b"hello$ ".to_vec(),
+            ended: false,
+        });
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // back to the fleet
+        assert!(r.is_fleet());
+        // d is now a session this window drives, so its tile must be a live
+        // preview (a Terminal in the scene) — never the "starting…" placeholder.
+        assert_eq!(
+            r.view().terminals().count(),
+            1,
+            "the adopted session previews live, not as a placeholder"
+        );
+    }
+
     #[test]
     fn adopt_from_fleet_drops_into_that_sessions_single_view() {
         let mut r = root(); // owns alpha
@@ -571,14 +714,26 @@ mod tests {
         key(r, Key::Named(NamedKey::Tab), mods)
     }
 
+    /// The session the single view currently routes input to.
+    fn foreground(r: &mut RootModel) -> String {
+        match r.update(UiEvent::Text("x".into())).into_iter().next() {
+            Some(Cmd::SendInput { session, .. }) => session,
+            other => panic!("expected SendInput, got {other:?}"),
+        }
+    }
+
     #[test]
     fn ctrl_tab_cycles_to_the_next_attached_session() {
         let mut r = root(); // owns alpha
         with_three(&mut r); // -> alpha, beta, gamma (foreground gamma)
-        // Forward from gamma wraps to alpha (sorted: alpha, beta, gamma).
-        assert!(
-            ctrl_tab(&mut r, false).contains(&Cmd::CycleSession { to: "alpha".into() }),
-            "Ctrl-Tab advances to the next owned session"
+        // Forward from gamma wraps to alpha (sorted: alpha, beta, gamma); the
+        // switch is a warm swap, not a re-attach.
+        let cmds = ctrl_tab(&mut r, false);
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })));
+        assert_eq!(
+            foreground(&mut r),
+            "alpha",
+            "Ctrl-Tab advances the foreground"
         );
     }
 
@@ -586,10 +741,11 @@ mod tests {
     fn ctrl_shift_tab_cycles_to_the_previous_attached_session() {
         let mut r = root();
         with_three(&mut r); // foreground gamma
-        // Backward from gamma is beta.
-        assert!(
-            ctrl_tab(&mut r, true).contains(&Cmd::CycleSession { to: "beta".into() }),
-            "Ctrl-Shift-Tab steps to the previous owned session"
+        ctrl_tab(&mut r, true);
+        assert_eq!(
+            foreground(&mut r),
+            "beta",
+            "Ctrl-Shift-Tab steps the foreground backward"
         );
     }
 

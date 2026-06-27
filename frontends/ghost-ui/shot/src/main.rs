@@ -57,7 +57,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 
     // The focused/primary tile carries real content via `adopting`.
     let primary = TerminalModel::new("edit".to_string(), 80, 24, METRICS);
-    let (mut fleet, _) = FleetModel::adopting(primary, METRICS, size, 1.0, mine);
+    let (mut fleet, _) = FleetModel::adopting(primary, Vec::new(), METRICS, size, 1.0, mine);
 
     fleet.update(UiEvent::SessionList(vec![
         info("edit", true, &["nvim", "src/fleet.rs"], 4011),
