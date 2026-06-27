@@ -3,7 +3,9 @@
 //! `ghost-shaper`, and draw it on the GPU — asserting on the read-back pixels
 //! and dumping PNGs to eyeball. Runs headless on lavapipe.
 
-use ghost_render::{CellMetrics, Selection, layout_frame};
+use ghost_render::{
+    CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, layout_frame,
+};
 use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
 
@@ -293,4 +295,50 @@ fn translucent_theme_makes_default_background_see_through() {
         "an SGR background must stay opaque, got alpha {}",
         colored[3]
     );
+}
+
+#[test]
+fn scales_a_large_preview_frame_to_fit_its_tile() {
+    // A real-size session frame drawn into a tile smaller than itself must be
+    // scaled to "contain", not clipped. Mark the bottom-right cell blue: at 1:1
+    // it lands outside the tile (scissored away); scaled, it appears inside the
+    // tile's lower-right.
+    let mut vt = Vt::new(10, 4);
+    vt.feed_str("\x1b[?25l\x1b[4;10H\x1b[44m \x1b[0m"); // blue bg at row 4, col 10
+    let frame = layout_frame(&vt, METRICS);
+    // Frame is 90x72 px (10*9 x 4*18).
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    // A 90x72 surface with the frame drawn into the top-left 45x36 tile (0.5x).
+    let mut scene = Scene::new((90, 72));
+    scene.layers.push(Layer {
+        z: 0,
+        items: vec![SceneItem::Terminal {
+            id: SceneId::Tile(0),
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 45.0,
+                h: 36.0,
+            },
+            frame,
+            selection: None,
+            dim: false,
+        }],
+    });
+    let mut renderer = Renderer::headless(Theme::default());
+    let img = renderer.render_offscreen_scene(&scene, font, 15.0);
+    let path = write_png("ghost_scaled_preview_sample.png", &img);
+    eprintln!("WROTE PNG: {}", path.display());
+
+    // The blue marker (frame cell at 81,54) maps to ~(40,27) at 0.5x: inside the
+    // tile's lower-right quadrant.
+    let (inside, _) = rect(&img, 36, 45, 27, 36, strong_blue);
+    assert!(
+        inside > 0,
+        "scaled preview should bring the bottom-right cell inside the tile"
+    );
+    // Nothing draws outside the tile rect (x>=45 or y>=36 stays clear).
+    let (outside, _) = rect(&img, 45, 90, 0, 72, strong_blue);
+    assert_eq!(outside, 0, "preview must stay within its tile ({outside})");
 }

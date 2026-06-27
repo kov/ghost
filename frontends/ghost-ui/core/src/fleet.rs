@@ -1,11 +1,13 @@
-//! `FleetModel` — the overview grid of live session previews, as a pure reducer.
+//! `FleetModel` — the overview grid of session previews, as a pure reducer.
 //!
-//! Each tile is a real attached session mirrored by its own [`TerminalModel`]
-//! (the fleet owns them), so previews are live, not snapshots. The model
-//! reconciles a `SessionList` into tiles (emitting `Attach`/`Detach`), routes
-//! pumped `SessionData` to the matching tile by id, moves focus on arrow/Tab
-//! navigation (previews are view-only, so keystrokes/text are never forwarded),
-//! focuses on click via a shared grid layout that doubles as the
+//! Sessions this window drives are fed by the shell and mirrored by a per-tile
+//! [`TerminalModel`], so their previews are live — laid out at the session's
+//! real size and scaled to the tile at draw time. The fleet never attaches
+//! sessions itself; a tile with no live source renders as a placeholder. The
+//! model reconciles a `SessionList` into tiles bucketed by attach-state section,
+//! routes pumped `SessionData` to the matching tile by id, moves focus on
+//! arrow/Tab navigation (previews are view-only, so keystrokes/text are never
+//! forwarded), focuses on click via a shared grid layout that doubles as the
 //! hit-test, and renders the whole grid — dimming unfocused tiles, bordering the
 //! focused one, and badging bell/activity. Like [`TerminalModel`] it is pure, so
 //! all of this is asserted headlessly by feeding events and inspecting the
@@ -30,6 +32,13 @@ const BADGE_PX: f32 = 10.0;
 const SECTION_HEADER_PX: f32 = 16.0;
 /// Colour of section header labels.
 const SECTION_LABEL_COLOR: Rgba = [0.65, 0.70, 0.78, 1.0];
+/// Placeholder card colours for a tile with no live preview.
+const PLACEHOLDER_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
+const PLACEHOLDER_FG: Rgba = [0.70, 0.74, 0.80, 1.0];
+/// Default grid for a fleet-created tile mirror until the shell hands it a
+/// real-size model; previews are scaled to the tile regardless of this size.
+const PREVIEW_COLS: u16 = 80;
+const PREVIEW_ROWS: u16 = 24;
 /// How often (ms) the fleet asks the shell to re-enumerate sessions.
 const REFRESH_MS: u64 = 500;
 
@@ -74,8 +83,9 @@ struct Tile {
     locality: Locality,
     /// Unseen-output count since this tile was last focused (drives the badge).
     activity: u32,
-    /// Whether the shell ever delivered output for this tile. Until then we keep
-    /// re-emitting `Attach` (a lost attach race self-heals on the next refresh).
+    /// Whether the shell has delivered output for this tile (i.e. this window
+    /// drives the session). An unfed tile renders as a placeholder, not a live
+    /// preview.
     fed: bool,
     /// Cached laid-out preview, rebuilt only when this tile's content or size
     /// changes (see [`FleetModel::refresh_dirty_frames`]); `view` clones it rather
@@ -86,13 +96,6 @@ struct Tile {
     /// refresh rebuilds it. Focus/bell/activity changes do not set this — they
     /// affect only the border/badge/selection, which `view` composes separately.
     frame_dirty: bool,
-}
-
-/// Whether the fleet may attach a session to drive a live preview. Sessions
-/// owned by another window (`Elsewhere`) are left alone — attaching would steal
-/// their display client and shrink their PTY to the tile size.
-fn attachable(locality: Locality) -> bool {
-    !matches!(locality, Locality::Elsewhere)
 }
 
 pub struct FleetModel {
@@ -216,9 +219,8 @@ impl FleetModel {
         if let Some(t) = f.tiles.last_mut() {
             t.fed = true;
         }
-        let mut cmds = f.relayout();
-        cmds.push(Cmd::Redraw); // repaint into the overview immediately
-        (f, cmds)
+        // The fleet never resizes its tiles' sessions; just repaint.
+        (f, vec![Cmd::Redraw])
     }
 
     fn push_tile(&mut self, id: SessionId, model: TerminalModel, bell: bool, locality: Locality) {
@@ -359,7 +361,9 @@ impl FleetModel {
                         tile.frame_dirty = true;
                     }
                 }
-                self.relayout()
+                // Tiles never resize their sessions; previews are scaled to fit
+                // at draw time, so a window resize just repaints.
+                vec![Cmd::Redraw]
             }
             UiEvent::Key {
                 key, mods, kind, ..
@@ -425,9 +429,10 @@ impl FleetModel {
             dirty = true;
         }
 
-        // Add new tiles; refresh bell/locality on existing ones. Only attach
-        // sessions we may safely drive (ours or detached); re-attach a safe tile
-        // that has never produced output (a lost attach race self-heals here).
+        // Add placeholder tiles; refresh bell/locality on existing ones. The
+        // fleet never attaches sessions itself — only sessions this window
+        // already drives (fed by the shell) get a live preview; the rest stay
+        // placeholders until the snapshot follow-up.
         for info in &infos {
             let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
@@ -436,15 +441,10 @@ impl FleetModel {
                 }
                 tile.bell = info.bell;
                 tile.locality = locality;
-                if attachable(locality) && !tile.fed {
-                    cmds.push(Cmd::Attach(info.name.clone()));
-                }
             } else {
-                let model = TerminalModel::new(info.name.clone(), 1, 1, self.metrics);
+                let model =
+                    TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
                 self.push_tile(info.name.clone(), model, info.bell, locality);
-                if attachable(locality) {
-                    cmds.push(Cmd::Attach(info.name.clone()));
-                }
                 dirty = true;
             }
         }
@@ -458,11 +458,6 @@ impl FleetModel {
             self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
         }
 
-        let resizes = self.relayout();
-        if !resizes.is_empty() {
-            dirty = true;
-        }
-        cmds.extend(resizes);
         if dirty {
             cmds.push(Cmd::Redraw);
         }
@@ -470,33 +465,6 @@ impl FleetModel {
         cmds.push(Cmd::ScheduleTick {
             after_ms: REFRESH_MS,
         });
-        cmds
-    }
-
-    /// Lay tiles out (by locality, then insertion order) and resize each tile's
-    /// model to its rect so its preview renders at the tile's size. Returns only
-    /// the `Resize` effects for tiles that actually changed size (callers decide
-    /// whether to also redraw), so an idle re-layout produces nothing.
-    fn relayout(&mut self) -> Vec<Cmd> {
-        let placements = self.layout();
-        let scale = f64::from(self.scale);
-        let mut cmds = Vec::new();
-        for (_, id, rect) in placements {
-            if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) {
-                for c in tile.model.update(UiEvent::Resize {
-                    w_px: rect.w.max(1.0) as u32,
-                    h_px: rect.h.max(1.0) as u32,
-                    scale,
-                }) {
-                    // The tile model emits Resize only when its grid changed; its
-                    // Redraw is subsumed by the caller's own redraw decision.
-                    if matches!(c, Cmd::Resize { .. }) {
-                        tile.frame_dirty = true; // grid changed; preview is stale
-                        cmds.push(c);
-                    }
-                }
-            }
-        }
         cmds
     }
 
@@ -698,22 +666,46 @@ impl FleetModel {
                 continue;
             };
             let focused = self.focused.as_deref() == Some(id.as_str());
-            // Cached by `refresh_dirty_frames`; the fallback only fires if a tile
-            // is somehow viewed before its first refresh.
-            let frame = tile.frame.clone().unwrap_or_else(|| {
-                layout_frame(tile.model.screen().vt(), self.effective_metrics())
-            });
-            items.push(SceneItem::Terminal {
-                id: SceneId::Tile(handle),
-                rect,
-                frame,
-                selection: if focused {
-                    tile.model.selection()
-                } else {
-                    None
-                },
-                dim: !focused,
-            });
+            if tile.fed {
+                // A session this window drives: a live preview laid out at its
+                // real size, which the renderer scales to fit the tile. The cache
+                // fallback only fires if a tile is viewed before its first refresh.
+                let frame = tile.frame.clone().unwrap_or_else(|| {
+                    layout_frame(tile.model.screen().vt(), self.effective_metrics())
+                });
+                items.push(SceneItem::Terminal {
+                    id: SceneId::Tile(handle),
+                    rect,
+                    frame,
+                    selection: if focused {
+                        tile.model.selection()
+                    } else {
+                        None
+                    },
+                    dim: !focused,
+                });
+            } else {
+                // No live source yet (detached / attached elsewhere): a
+                // placeholder card carrying the session name.
+                items.push(SceneItem::Rect {
+                    id: SceneId::Tile(handle),
+                    rect,
+                    color: PLACEHOLDER_BG,
+                    radius: 4.0,
+                });
+                items.push(SceneItem::Text {
+                    id: SceneId::Label(handle),
+                    rect: RectPx {
+                        x: rect.x + 6.0,
+                        y: rect.y + 6.0,
+                        w: (rect.w - 12.0).max(1.0),
+                        h: self.effective_metrics().line_height,
+                    },
+                    runs: vec![label_run(&id)],
+                    metrics: self.effective_metrics(),
+                    color: PLACEHOLDER_FG,
+                });
+            }
             if focused {
                 items.push(SceneItem::Border {
                     id: SceneId::Tile(handle),
@@ -833,15 +825,19 @@ mod tests {
         }
     }
 
-    /// `(label, top-y)` for each section header in the rendered scene.
+    /// `(label, top-y)` for each section header in the rendered scene (the
+    /// Section-id Text items, not placeholder name labels).
     fn headers(m: &FleetModel) -> Vec<(String, f32)> {
         m.view().layers[0]
             .items
             .iter()
             .filter_map(|it| match it {
-                SceneItem::Text { runs, rect, .. } => {
-                    Some((runs.iter().map(|r| r.text.as_str()).collect(), rect.y))
-                }
+                SceneItem::Text {
+                    id: SceneId::Section(_),
+                    runs,
+                    rect,
+                    ..
+                } => Some((runs.iter().map(|r| r.text.as_str()).collect(), rect.y)),
                 _ => None,
             })
             .collect()
@@ -978,17 +974,54 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_attaches_new_and_detaches_gone() {
+    fn reconcile_creates_tiles_and_detaches_gone() {
         let mut m = fleet();
         let cmds = list(&mut m, &["a", "b"]);
-        assert!(cmds.contains(&Cmd::Attach("a".into())));
-        assert!(cmds.contains(&Cmd::Attach("b".into())));
+        // The fleet never attaches sessions itself.
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Attach(_))));
         assert_eq!(m.tile_count(), 2);
         assert_eq!(m.focused(), Some("a")); // first tile focused by default
 
         let cmds = list(&mut m, &["a"]);
         assert!(cmds.contains(&Cmd::Detach("b".into())));
         assert_eq!(m.tile_count(), 1);
+    }
+
+    #[test]
+    fn the_fleet_never_resizes_a_previewed_session() {
+        let mut m = fleet();
+        let cmds = list(&mut m, &["a", "b"]);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Resize { .. })),
+            "reconcile must not resize sessions: {cmds:?}"
+        );
+        // A window resize repaints but never resizes the previewed sessions.
+        let cmds = m.update(UiEvent::Resize {
+            w_px: 800,
+            h_px: 600,
+            scale: 1.0,
+        });
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Resize { .. })));
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn an_unfed_tile_is_a_placeholder_and_a_fed_tile_is_a_live_preview() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // Neither has produced output: both render as placeholders, no Terminal.
+        assert_eq!(
+            m.view().terminals().count(),
+            0,
+            "unfed tiles are placeholders"
+        );
+        // Feeding output to "a" promotes it to a live Terminal preview.
+        data(&mut m, "a", b"hello");
+        assert_eq!(
+            m.view().terminals().count(),
+            1,
+            "only the fed tile is a live preview"
+        );
     }
 
     #[test]
@@ -1204,6 +1237,8 @@ mod tests {
     fn view_dims_unfocused_tiles_and_borders_the_focused_one() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]); // focus "a"
+        data(&mut m, "a", b"A"); // make both tiles live previews
+        data(&mut m, "b", b"B");
         let scene = m.view();
         let terminals: Vec<_> = scene.terminals().collect();
         assert_eq!(terminals.len(), 2);
@@ -1295,20 +1330,20 @@ mod tests {
     }
 
     #[test]
-    fn foreign_attached_session_is_a_placeholder_not_attached() {
-        // A session owned by another window (attached elsewhere, not ours) must
-        // NOT be attached — that would steal its display client.
+    fn the_fleet_never_attaches_sessions_itself() {
+        // No auto-attach for anyone — neither a detached session nor one owned by
+        // another window. Live previews come only from sessions this window drives.
         let mut m = fleet(); // mine is empty
         let mut elsewhere = info("foreign");
         elsewhere.attached = true; // attached by some other window
         let cmds = m.update(UiEvent::SessionList(vec![info("mine-detached"), elsewhere]));
-        assert!(cmds.contains(&Cmd::Attach("mine-detached".into())));
         assert!(
-            !cmds.contains(&Cmd::Attach("foreign".into())),
-            "must not attach a session owned elsewhere"
+            !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
+            "the fleet must not attach any session: {cmds:?}"
         );
         assert_eq!(m.locality_of("foreign"), Some(Locality::Elsewhere));
-        assert_eq!(m.tile_count(), 2); // still shown, as a placeholder tile
+        assert_eq!(m.locality_of("mine-detached"), Some(Locality::Detached));
+        assert_eq!(m.tile_count(), 2); // both shown, as placeholder tiles
     }
 
     #[test]

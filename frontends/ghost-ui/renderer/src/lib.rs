@@ -467,6 +467,28 @@ fn translate(insts: &mut [Instance], dx: f32, dy: f32) {
     }
 }
 
+/// Scale instance geometry (position and size) about the origin. Used to shrink
+/// a real-size preview frame so it fits a smaller tile before translating it.
+fn scale_instances(insts: &mut [Instance], s: f32) {
+    for i in insts {
+        for v in &mut i.rect {
+            *v *= s;
+        }
+    }
+}
+
+/// "Contain" downscale to fit `frame`'s true pixel size inside `rect`, clamped
+/// to 1.0 so a frame no larger than its rect (e.g. the full-window single view)
+/// is never magnified. Returns 1.0 for a degenerate (zero-size) frame.
+fn preview_scale(frame: &Frame, rect: RectPx) -> f32 {
+    let fw = frame.cols as f32 * frame.metrics.advance;
+    let fh = frame.rows as f32 * frame.metrics.line_height;
+    if fw <= 0.0 || fh <= 0.0 {
+        return 1.0;
+    }
+    (rect.w / fw).min(rect.h / fh).min(1.0)
+}
+
 /// Darken instance colors (RGB only) for an unfocused/dimmed tile.
 fn dim_colors(insts: &mut [Instance]) {
     const DIM: f32 = 0.55;
@@ -940,6 +962,7 @@ impl Renderer {
         frame: &Frame,
         ox: f32,
         oy: f32,
+        scale: f32,
         scissor: [u32; 4],
         out: &mut Vec<ImageDraw>,
     ) {
@@ -951,10 +974,10 @@ impl Renderer {
             out.push(ImageDraw {
                 image_id: img.image_id,
                 rect: [
-                    ox + img.col as f32 * m.advance,
-                    oy + img.row as f32 * m.line_height,
-                    img.cols as f32 * m.advance,
-                    img.rows as f32 * m.line_height,
+                    ox + img.col as f32 * m.advance * scale,
+                    oy + img.row as f32 * m.line_height * scale,
+                    img.cols as f32 * m.advance * scale,
+                    img.rows as f32 * m.line_height * scale,
                 ],
                 uv: img.uv,
                 scissor,
@@ -1326,7 +1349,7 @@ impl Renderer {
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         let mut imgs = Vec::new();
-        self.collect_image_draws(frame, 0.0, 0.0, [0, 0, vw, vh], &mut imgs);
+        self.collect_image_draws(frame, 0.0, 0.0, 1.0, [0, 0, vw, vh], &mut imgs);
         self.image_draws = imgs;
         self.build_image_instances();
     }
@@ -1443,12 +1466,19 @@ impl Renderer {
                         ..
                     } => {
                         let mut insts = self.build_instances(frame, font, size_px, *selection);
+                        // A preview frame is laid out at the session's real size;
+                        // shrink it to "contain" within the tile. 1.0 = no scaling
+                        // (the full-window single view, where frame == surface).
+                        let s = preview_scale(frame, *rect);
+                        if s < 1.0 {
+                            scale_instances(&mut insts, s);
+                        }
                         translate(&mut insts, rect.x, rect.y);
                         if *dim {
                             dim_colors(&mut insts);
                         }
                         all.extend(insts);
-                        self.collect_image_draws(frame, rect.x, rect.y, scissor, &mut images);
+                        self.collect_image_draws(frame, rect.x, rect.y, s, scissor, &mut images);
                     }
                     SceneItem::Rect { rect, color, .. } => all.push(solid(*rect, *color)),
                     SceneItem::Border {
