@@ -32,13 +32,21 @@ const BADGE_PX: f32 = 10.0;
 const SECTION_HEADER_PX: f32 = 16.0;
 /// Colour of section header labels.
 const SECTION_LABEL_COLOR: Rgba = [0.65, 0.70, 0.78, 1.0];
-/// Placeholder card colours for a tile with no live preview.
+/// Placeholder fill for a tile's preview area with no live source.
 const PLACEHOLDER_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
-const PLACEHOLDER_FG: Rgba = [0.70, 0.74, 0.80, 1.0];
 /// Default grid for a fleet-created tile mirror until the shell hands it a
 /// real-size model; previews are scaled to the tile regardless of this size.
 const PREVIEW_COLS: u16 = 80;
 const PREVIEW_ROWS: u16 = 24;
+/// Card chrome: metadata header band and the button-row footer band.
+const CARD_HEADER_PX: f32 = 14.0;
+const CARD_FOOTER_PX: f32 = 16.0;
+const CARD_META_COLOR: Rgba = [0.60, 0.64, 0.72, 1.0];
+const BUTTON_BG: Rgba = [0.20, 0.21, 0.26, 1.0];
+const BUTTON_FG: Rgba = [0.78, 0.81, 0.87, 1.0];
+/// Confirm-overlay colours (a scrim and its prompt text).
+const OVERLAY_BG: Rgba = [0.04, 0.04, 0.06, 0.82];
+const OVERLAY_FG: Rgba = [0.92, 0.94, 0.97, 1.0];
 /// How often (ms) the fleet asks the shell to re-enumerate sessions.
 const REFRESH_MS: u64 = 500;
 
@@ -46,6 +54,44 @@ const REFRESH_MS: u64 = 500;
 type Placement = (u64, SessionId, RectPx);
 /// A section header: its locality and the header band's rect.
 type SectionHeader = (Locality, RectPx);
+
+/// A per-card action button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Button {
+    Kill,
+    Detach,
+    Rename,
+}
+
+impl Button {
+    fn label(self) -> &'static str {
+        match self {
+            Button::Kill => "kill",
+            Button::Detach => "detach",
+            Button::Rename => "rename",
+        }
+    }
+}
+
+/// An action awaiting a yes/no confirmation (a modal overlay).
+struct Pending {
+    id: SessionId,
+    action: PendingAction,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    /// Steal a session held by another window into this one.
+    TakeOver,
+    /// Kill the session and its process.
+    Kill,
+}
+
+/// An in-progress inline rename of a tile.
+struct Renaming {
+    id: SessionId,
+    buffer: String,
+}
 
 /// Which window owns or sees a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +127,11 @@ struct Tile {
     model: TerminalModel,
     bell: bool,
     locality: Locality,
+    /// The command the session runs (empty = the user's `$SHELL`), shown in the
+    /// card header.
+    command: Vec<String>,
+    /// The session's process id, shown in the card header.
+    pid: i32,
     /// Unseen-output count since this tile was last focused (drives the badge).
     activity: u32,
     /// Whether the shell has delivered output for this tile (i.e. this window
@@ -111,6 +162,11 @@ pub struct FleetModel {
     /// Count of tile-frame (re)builds — bumped only when a dirty tile is actually
     /// laid out, never on a cache hit. Lets a test prove unchanged tiles are reused.
     frame_builds: u32,
+    /// An action awaiting confirmation (kill, or stealing a session held
+    /// elsewhere); drives a modal confirm overlay and swallows input until resolved.
+    pending: Option<Pending>,
+    /// An in-progress inline rename; swallows text/keys into its buffer.
+    renaming: Option<Renaming>,
 }
 
 /// Place `n` tiles in a near-square grid within `size_px`, with a uniform gap,
@@ -140,6 +196,45 @@ fn grid_rects(n: usize, size_px: (u32, u32), gap: f32) -> Vec<RectPx> {
             }
         })
         .collect()
+}
+
+/// Split a tile rect into its metadata header, preview area, and a row of three
+/// equal action buttons. Shared by `view` and pointer hit-testing so the buttons
+/// land exactly where they are drawn.
+fn card_layout(rect: RectPx) -> (RectPx, RectPx, [(Button, RectPx); 3]) {
+    let header_h = CARD_HEADER_PX.min(rect.h);
+    let footer_h = CARD_FOOTER_PX.min((rect.h - header_h).max(0.0));
+    let footer_y = rect.y + rect.h - footer_h;
+    let header = RectPx {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: header_h,
+    };
+    let preview = RectPx {
+        x: rect.x,
+        y: rect.y + header_h,
+        w: rect.w,
+        h: (footer_y - (rect.y + header_h)).max(0.0),
+    };
+    let bw = rect.w / 3.0;
+    let button = |i: f32, b: Button| {
+        (
+            b,
+            RectPx {
+                x: rect.x + i * bw,
+                y: footer_y,
+                w: bw,
+                h: footer_h,
+            },
+        )
+    };
+    let buttons = [
+        button(0.0, Button::Kill),
+        button(1.0, Button::Detach),
+        button(2.0, Button::Rename),
+    ];
+    (header, preview, buttons)
 }
 
 /// A navigation action: a 2-D arrow direction over the grid, or a linear Tab
@@ -183,6 +278,8 @@ impl FleetModel {
             mine,
             next_handle: 0,
             frame_builds: 0,
+            pending: None,
+            renaming: None,
         }
     }
 
@@ -214,8 +311,9 @@ impl FleetModel {
         let id = primary.session().to_string();
         let locality = locality_for(&f.mine, &id, true);
         f.focused = Some(id.clone());
-        // The adopted primary is already live; mark it fed so it isn't re-attached.
-        f.push_tile(id, primary, false, locality);
+        // The adopted primary is already live; mark it fed so it stays a preview.
+        // Its command/pid fill in on the next reconcile.
+        f.push_tile(id, primary, false, locality, Vec::new(), 0);
         if let Some(t) = f.tiles.last_mut() {
             t.fed = true;
         }
@@ -223,7 +321,15 @@ impl FleetModel {
         (f, vec![Cmd::Redraw])
     }
 
-    fn push_tile(&mut self, id: SessionId, model: TerminalModel, bell: bool, locality: Locality) {
+    fn push_tile(
+        &mut self,
+        id: SessionId,
+        model: TerminalModel,
+        bell: bool,
+        locality: Locality,
+        command: Vec<String>,
+        pid: i32,
+    ) {
         let handle = self.next_handle;
         self.next_handle += 1;
         self.tiles.push(Tile {
@@ -232,6 +338,8 @@ impl FleetModel {
             model,
             bell,
             locality,
+            command,
+            pid,
             activity: 0,
             fed: false,
             frame: None,
@@ -365,22 +473,12 @@ impl FleetModel {
                 // at draw time, so a window resize just repaints.
                 vec![Cmd::Redraw]
             }
-            UiEvent::Key {
-                key, mods, kind, ..
-            } if kind.is_down() && nav(&key, mods).is_some() => {
-                match nav(&key, mods).unwrap() {
-                    Nav::Dir(d) => self.move_focus_dir(d),
-                    Nav::Step(delta, wrap) => self.move_focus_linear(delta, wrap),
-                }
-                vec![Cmd::Redraw]
-            }
             // Re-enumerate on the scheduled refresh tick.
             UiEvent::Tick { .. } => vec![Cmd::ListSessions],
-            UiEvent::Pointer {
-                phase, pos, clicks, ..
-            } => self.pointer(phase, pos, clicks),
-            // Previews are view-only: text, ordinary keys, focus and paste
-            // replies are never forwarded to a tile as input.
+            // Input goes through the modal router (rename / confirm / normal).
+            ev @ (UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }) => {
+                self.input(ev)
+            }
             _ => Vec::new(),
         };
         // Rebuild any preview whose content or size this event changed, so `view`
@@ -436,15 +534,28 @@ impl FleetModel {
         for info in &infos {
             let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
-                if tile.bell != info.bell || tile.locality != locality {
+                if tile.bell != info.bell
+                    || tile.locality != locality
+                    || tile.command != info.command
+                    || tile.pid != info.pid
+                {
                     dirty = true;
                 }
                 tile.bell = info.bell;
                 tile.locality = locality;
+                tile.command = info.command.clone();
+                tile.pid = info.pid;
             } else {
                 let model =
                     TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
-                self.push_tile(info.name.clone(), model, info.bell, locality);
+                self.push_tile(
+                    info.name.clone(),
+                    model,
+                    info.bell,
+                    locality,
+                    info.command.clone(),
+                    info.pid,
+                );
                 dirty = true;
             }
         }
@@ -625,25 +736,163 @@ impl FleetModel {
         self.focused = Some(id);
     }
 
-    fn pointer(&mut self, phase: PointerPhase, pos: PointPx, clicks: u8) -> Vec<Cmd> {
-        if phase != PointerPhase::Press {
-            return Vec::new(); // the overview only reacts to clicks (focus / open)
+    /// Route an input event. An active inline rename or confirm dialog swallows
+    /// input until resolved; otherwise arrows/Tab navigate, Enter activates the
+    /// focused tile, and a press hits a button or activates a tile.
+    fn input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        if self.renaming.is_some() {
+            return self.rename_input(ev);
         }
+        if self.pending.is_some() {
+            return self.pending_input(ev);
+        }
+        match ev {
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && nav(&key, mods).is_some() => {
+                match nav(&key, mods).unwrap() {
+                    Nav::Dir(d) => self.move_focus_dir(d),
+                    Nav::Step(delta, wrap) => self.move_focus_linear(delta, wrap),
+                }
+                vec![Cmd::Redraw]
+            }
+            UiEvent::Key { key, kind, .. }
+                if kind.is_down() && matches!(key, Key::Named(NamedKey::Enter)) =>
+            {
+                self.activate(self.focused.clone())
+            }
+            UiEvent::Pointer { phase, pos, .. } => self.pointer(phase, pos),
+            // Otherwise view-only: text and ordinary keys are dropped.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Open `id` into this window's single view. A session held by another window
+    /// is confirmed first, since taking it over steals its display client.
+    fn activate(&mut self, id: Option<SessionId>) -> Vec<Cmd> {
+        let Some(id) = id else {
+            return Vec::new();
+        };
+        match self.locality_of(&id) {
+            Some(Locality::Elsewhere) => {
+                self.pending = Some(Pending {
+                    id,
+                    action: PendingAction::TakeOver,
+                });
+                vec![Cmd::Redraw]
+            }
+            Some(_) => vec![Cmd::TakeOver(id), Cmd::Redraw],
+            None => Vec::new(),
+        }
+    }
+
+    /// Run a card button's action: detach immediately, confirm a kill, or open an
+    /// inline rename.
+    fn button(&mut self, button: Button, id: SessionId) -> Vec<Cmd> {
+        match button {
+            Button::Detach => vec![Cmd::Detach(id), Cmd::Redraw],
+            Button::Kill => {
+                self.pending = Some(Pending {
+                    id,
+                    action: PendingAction::Kill,
+                });
+                vec![Cmd::Redraw]
+            }
+            Button::Rename => {
+                self.renaming = Some(Renaming {
+                    buffer: id.clone(),
+                    id,
+                });
+                vec![Cmd::Redraw]
+            }
+        }
+    }
+
+    /// Keyboard for the confirm dialog: Enter runs the pending action, Escape
+    /// cancels it.
+    fn pending_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        let UiEvent::Key { key, kind, .. } = ev else {
+            return Vec::new();
+        };
+        if !kind.is_down() {
+            return Vec::new();
+        }
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                let p = self.pending.take().expect("pending checked by caller");
+                let cmd = match p.action {
+                    PendingAction::TakeOver => Cmd::TakeOver(p.id),
+                    PendingAction::Kill => Cmd::Kill(p.id),
+                };
+                vec![cmd, Cmd::Redraw]
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.pending = None;
+                vec![Cmd::Redraw]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Keyboard for an inline rename: text appends, Backspace deletes, Enter
+    /// commits (a no-op for an empty/unchanged name), Escape cancels.
+    fn rename_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        match ev {
+            UiEvent::Text(s) => {
+                if let Some(r) = &mut self.renaming {
+                    r.buffer.push_str(&s);
+                }
+                vec![Cmd::Redraw]
+            }
+            UiEvent::Key { key, kind, .. } if kind.is_down() => match key {
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(r) = &mut self.renaming {
+                        r.buffer.pop();
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let r = self.renaming.take().expect("renaming checked by caller");
+                    if r.buffer.is_empty() || r.buffer == r.id {
+                        vec![Cmd::Redraw]
+                    } else {
+                        vec![
+                            Cmd::Rename {
+                                session: r.id,
+                                name: r.buffer,
+                            },
+                            Cmd::Redraw,
+                        ]
+                    }
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.renaming = None;
+                    vec![Cmd::Redraw]
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn pointer(&mut self, phase: PointerPhase, pos: PointPx) -> Vec<Cmd> {
+        if phase != PointerPhase::Press {
+            return Vec::new(); // the overview only reacts to presses
+        }
+        let (px, py) = (pos.x as f32, pos.y as f32);
         let hit = self
             .layout()
             .into_iter()
-            .find(|(_, _, r)| r.contains(pos.x as f32, pos.y as f32));
-        let Some((_, id, _)) = hit else {
+            .find(|(_, _, r)| r.contains(px, py));
+        let Some((_, id, rect)) = hit else {
             return Vec::new();
         };
         self.set_focus(id.clone());
-        // A double-click opens the tile: take it over into this window's single
-        // view. A session live in another window (`Elsewhere`) is left alone —
-        // taking it over would steal its display client (no observer-attach yet).
-        if clicks >= 2 && self.locality_of(&id) != Some(Locality::Elsewhere) {
-            vec![Cmd::TakeOver(id), Cmd::Redraw]
-        } else {
-            vec![Cmd::Redraw]
+        // A press on a card button runs that action; anywhere else opens the tile.
+        let (_, _, buttons) = card_layout(rect);
+        match buttons.iter().find(|(_, r)| r.contains(px, py)) {
+            Some((button, _)) => self.button(*button, id),
+            None => self.activate(Some(id)),
         }
     }
 
@@ -661,21 +910,39 @@ impl FleetModel {
                 color: SECTION_LABEL_COLOR,
             });
         }
+        let metrics = self.effective_metrics();
         for (handle, id, rect) in placements {
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
             let focused = self.focused.as_deref() == Some(id.as_str());
+            let (header, preview, buttons) = card_layout(rect);
+
+            // Metadata header — or the live buffer of an in-progress rename.
+            let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
+                Some(r) => format!("{}\u{2588}", r.buffer), // trailing caret block
+                None => card_meta(tile),
+            };
+            items.push(SceneItem::Text {
+                id: SceneId::Label(handle),
+                rect: inset(header, 4.0),
+                runs: vec![label_run(&header_text)],
+                metrics,
+                color: CARD_META_COLOR,
+            });
+
+            // Preview area: a live, scaled terminal, or a placeholder fill.
             if tile.fed {
-                // A session this window drives: a live preview laid out at its
-                // real size, which the renderer scales to fit the tile. The cache
-                // fallback only fires if a tile is viewed before its first refresh.
-                let frame = tile.frame.clone().unwrap_or_else(|| {
-                    layout_frame(tile.model.screen().vt(), self.effective_metrics())
-                });
+                // Laid out at the session's real size; the renderer scales it to
+                // the preview rect. The cache fallback only fires before the first
+                // refresh.
+                let frame = tile
+                    .frame
+                    .clone()
+                    .unwrap_or_else(|| layout_frame(tile.model.screen().vt(), metrics));
                 items.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
-                    rect,
+                    rect: preview,
                     frame,
                     selection: if focused {
                         tile.model.selection()
@@ -685,27 +952,31 @@ impl FleetModel {
                     dim: !focused,
                 });
             } else {
-                // No live source yet (detached / attached elsewhere): a
-                // placeholder card carrying the session name.
                 items.push(SceneItem::Rect {
                     id: SceneId::Tile(handle),
-                    rect,
+                    rect: preview,
                     color: PLACEHOLDER_BG,
                     radius: 4.0,
                 });
+            }
+
+            // Action buttons.
+            for (button, brect) in buttons {
+                items.push(SceneItem::Rect {
+                    id: SceneId::Tile(handle),
+                    rect: brect,
+                    color: BUTTON_BG,
+                    radius: 2.0,
+                });
                 items.push(SceneItem::Text {
                     id: SceneId::Label(handle),
-                    rect: RectPx {
-                        x: rect.x + 6.0,
-                        y: rect.y + 6.0,
-                        w: (rect.w - 12.0).max(1.0),
-                        h: self.effective_metrics().line_height,
-                    },
-                    runs: vec![label_run(&id)],
-                    metrics: self.effective_metrics(),
-                    color: PLACEHOLDER_FG,
+                    rect: inset(brect, 3.0),
+                    runs: vec![label_run(button.label())],
+                    metrics,
+                    color: BUTTON_FG,
                 });
             }
+
             if focused {
                 items.push(SceneItem::Border {
                     id: SceneId::Tile(handle),
@@ -731,9 +1002,77 @@ impl FleetModel {
                 });
             }
         }
+
+        // A pending action scrims the whole grid with a confirm prompt.
+        if let Some(p) = &self.pending {
+            let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+            items.push(SceneItem::Rect {
+                id: SceneId::Sidebar,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w,
+                    h,
+                },
+                color: OVERLAY_BG,
+                radius: 0.0,
+            });
+            items.push(SceneItem::Text {
+                id: SceneId::NavBar,
+                rect: RectPx {
+                    x: 16.0,
+                    y: (h - metrics.line_height) / 2.0,
+                    w: (w - 32.0).max(1.0),
+                    h: metrics.line_height,
+                },
+                runs: vec![label_run(&confirm_prompt(p))],
+                metrics,
+                color: OVERLAY_FG,
+            });
+        }
+
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer { z: 0, items });
         scene
+    }
+}
+
+/// Inset a rect by `pad` on every side (clamped to a positive size).
+fn inset(rect: RectPx, pad: f32) -> RectPx {
+    RectPx {
+        x: rect.x + pad,
+        y: rect.y + pad,
+        w: (rect.w - 2.0 * pad).max(1.0),
+        h: (rect.h - 2.0 * pad).max(1.0),
+    }
+}
+
+/// One-line card metadata: name · command · pid.
+fn card_meta(tile: &Tile) -> String {
+    let cmd = if tile.command.is_empty() {
+        "$SHELL".to_string()
+    } else {
+        tile.command.join(" ")
+    };
+    if tile.pid > 0 {
+        format!("{} \u{b7} {} \u{b7} {}", tile.id, cmd, tile.pid)
+    } else {
+        format!("{} \u{b7} {}", tile.id, cmd)
+    }
+}
+
+/// The prompt shown in the confirm overlay.
+fn confirm_prompt(p: &Pending) -> String {
+    match p.action {
+        PendingAction::Kill => {
+            format!("Kill {}?  Enter = confirm, Esc = cancel", p.id)
+        }
+        PendingAction::TakeOver => {
+            format!(
+                "{} is open in another window — take it over?  Enter / Esc",
+                p.id
+            )
+        }
     }
 }
 
@@ -1083,9 +1422,12 @@ mod tests {
             })
             .collect();
         assert_eq!(undimmed.len(), 1, "exactly one focused (undimmed) tile");
-        assert_eq!(
-            borders[0], undimmed[0],
-            "the border outlines the focused tile"
+        // The border outlines the whole focused card; its live preview sits
+        // inside that card (the preview is a sub-rect, below the metadata header).
+        let (b, t) = (borders[0], undimmed[0]);
+        assert!(
+            t.x >= b.x && t.y >= b.y && t.x + t.w <= b.x + b.w && t.y + t.h <= b.y + b.h,
+            "the focused preview {t:?} must sit within its card border {b:?}"
         );
     }
 
@@ -1157,79 +1499,143 @@ mod tests {
         assert_eq!(m.focused(), Some("a"));
     }
 
-    #[test]
-    fn click_focuses_the_hit_tile() {
-        let mut m = fleet();
-        list(&mut m, &["a", "b"]);
-        // Find b's rect and click its center.
-        let (_, _, rect) = m.layout().into_iter().find(|(_, id, _)| id == "b").unwrap();
-        let cmds = m.update(UiEvent::Pointer {
-            phase: PointerPhase::Press,
-            button: Some(crate::PointerButton::Left),
-            pos: PointPx {
-                x: (rect.x + rect.w / 2.0) as f64,
-                y: (rect.y + rect.h / 2.0) as f64,
-            },
-            mods: crate::Mods::NONE,
-            wheel_dy: 0.0,
-            clicks: 1,
-        });
-        assert_eq!(m.focused(), Some("b"));
-        assert_eq!(cmds, vec![Cmd::Redraw]);
+    /// Press at the centre of `id`'s tile (its preview area).
+    fn press(m: &mut FleetModel, id: &str) -> Vec<Cmd> {
+        let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
+        press_at(m, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
     }
 
-    /// Press at the centre of `id`'s tile with the given click count.
-    fn press(m: &mut FleetModel, id: &str, clicks: u8) -> Vec<Cmd> {
-        let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
+    /// Press at point `(x, y)`.
+    fn press_at(m: &mut FleetModel, x: f32, y: f32) -> Vec<Cmd> {
         m.update(UiEvent::Pointer {
             phase: PointerPhase::Press,
             button: Some(crate::PointerButton::Left),
             pos: PointPx {
-                x: (rect.x + rect.w / 2.0) as f64,
-                y: (rect.y + rect.h / 2.0) as f64,
+                x: x as f64,
+                y: y as f64,
             },
             mods: crate::Mods::NONE,
             wheel_dy: 0.0,
-            clicks,
+            clicks: 1,
         })
     }
 
+    /// The pixel rect of `id`'s `button` (centre is a good press target).
+    fn button_rect(m: &FleetModel, id: &str, button: Button) -> RectPx {
+        let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
+        let (_, _, buttons) = card_layout(rect);
+        buttons.iter().find(|(b, _)| *b == button).unwrap().1
+    }
+
     #[test]
-    fn double_click_takes_over_a_detached_tile() {
+    fn clicking_a_detached_tile_focuses_and_opens_it() {
         let mut m = fleet();
-        list(&mut m, &["a", "b"]); // both detached → take-over-able
-        let cmds = press(&mut m, "b", 2);
+        list(&mut m, &["a", "b"]); // both detached
+        let cmds = press(&mut m, "b");
+        assert_eq!(m.focused(), Some("b"));
         assert!(
             cmds.contains(&Cmd::TakeOver("b".into())),
-            "double-click opens (takes over) the tile: {cmds:?}"
+            "clicking a detached tile opens it: {cmds:?}"
         );
-        assert_eq!(m.focused(), Some("b"));
     }
 
     #[test]
-    fn single_click_focuses_without_taking_over() {
+    fn clicking_the_detach_button_detaches_instead_of_opening() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]);
-        let cmds = press(&mut m, "b", 1);
+        let r = button_rect(&m, "b", Button::Detach);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            cmds.contains(&Cmd::Detach("b".into())),
+            "the detach button detaches: {cmds:?}"
+        );
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
-            "a single click only focuses: {cmds:?}"
+            "a button press must not also open the tile"
         );
     }
 
     #[test]
-    fn double_click_leaves_a_session_live_elsewhere_alone() {
+    fn the_kill_button_confirms_then_kills() {
         let mut m = fleet();
-        // Attached but not ours = Elsewhere; taking it over would steal its
-        // display client, which we don't do without observer-attach.
+        list(&mut m, &["a", "b"]);
+        let r = button_rect(&m, "b", Button::Kill);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Kill(_))),
+            "kill is confirmed, not immediate: {cmds:?}"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Kill("b".into())),
+            "Enter confirms the kill: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_a_pending_confirmation() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let cmds = key(&mut m, Key::Named(NamedKey::Escape));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Kill(_))),
+            "Esc cancels the confirmation: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_rename_button_opens_an_inline_edit_committed_on_enter() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Typing buffers into the rename; nothing is committed yet.
+        let cmds = m.update(UiEvent::Text("X".into()));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
+            "rename buffers until Enter: {cmds:?}"
+        );
+        // Enter commits the edited name.
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "a".into(),
+                name: "aX".into()
+            }),
+            "Enter commits the rename: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn opening_an_elsewhere_tile_asks_for_confirmation_first() {
+        let mut m = fleet();
         let mut a = info("a");
-        a.attached = true;
+        a.attached = true; // attached by another window
         m.update(UiEvent::SessionList(vec![a]));
         assert_eq!(m.locality_of("a"), Some(Locality::Elsewhere));
-        let cmds = press(&mut m, "a", 2);
+        let cmds = press(&mut m, "a");
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
-            "must not steal an Elsewhere session: {cmds:?}"
+            "must confirm before stealing an elsewhere session: {cmds:?}"
+        );
+        // Confirming with Enter issues the take-over.
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::TakeOver("a".into())),
+            "Enter confirms the take-over: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_focused_tile() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]); // focus defaults to "a" (detached)
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::TakeOver("a".into())),
+            "Enter opens the focused tile: {cmds:?}"
         );
     }
 

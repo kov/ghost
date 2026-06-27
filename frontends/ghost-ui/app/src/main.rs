@@ -561,6 +561,21 @@ impl App {
                         w.sessions.remove(&id);
                     }
                 }
+                Cmd::Kill(id) => {
+                    // Kill the session and its process, then drop any client we held.
+                    let _ = session::kill_session(&id);
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.sessions.remove(&id);
+                    }
+                }
+                Cmd::Rename {
+                    session: target,
+                    name,
+                } => {
+                    // A control connection rename — works whether or not this
+                    // window holds the session.
+                    let _ = ghost_vt::client::rename(&target, &name);
+                }
                 Cmd::Spawn { name, command } => {
                     spawn_session(&name, command);
                     // Best-effort attach; a later reconcile re-attaches if it lost the race.

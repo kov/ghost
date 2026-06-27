@@ -36,6 +36,13 @@ pub enum Cmd {
     /// Open / close a session socket (e.g. for a fleet tile preview).
     Attach(SessionId),
     Detach(SessionId),
+    /// Kill a session and its process (the shell sends `ClientMsg::Kill`).
+    Kill(SessionId),
+    /// Rename a session (the shell sends `ClientMsg::Rename`).
+    Rename {
+        session: SessionId,
+        name: String,
+    },
     /// Spawn a new session (take-over / new window).
     Spawn {
         name: SessionId,
