@@ -8,12 +8,13 @@
 //! `ghost-shaper`.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ghost_render::{
     BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
     Style,
 };
-use ghost_shaper::{FontRef, Synthesis};
+use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
@@ -629,6 +630,13 @@ pub struct Renderer {
     format: wgpu::TextureFormat,
     /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
     cache: HashMap<(u16, u32, Synthesis), Option<Slot>>,
+    /// Shaped-run cache keyed by (font key, font size bits, run text). Shaping
+    /// dominates per-frame CPU, and a run's text is identical across redraws
+    /// (navigation, unchanged tiles), so caching it makes a repaint nearly free.
+    shape_cache: HashMap<(u64, u32, String), Rc<Vec<ShapedGlyph>>>,
+    /// Count of actual shaping calls (cache misses) — never bumped on a hit. Lets
+    /// a test prove a repaint of unchanged text re-shapes nothing.
+    shape_misses: u32,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -865,6 +873,8 @@ impl Renderer {
             theme,
             format,
             cache: HashMap::new(),
+            shape_cache: HashMap::new(),
+            shape_misses: 0,
             pack_x: 1,
             pack_y: 0,
             shelf: 1,
@@ -1066,6 +1076,32 @@ impl Renderer {
         (w, h)
     }
 
+    /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
+    /// is the dominant per-frame cost, and a run's text is identical across
+    /// redraws, so the cache turns a repaint into a hash lookup + `Rc` clone.
+    fn shape_cached(&mut self, font: FontRef, text: &str, size_px: f32) -> Rc<Vec<ShapedGlyph>> {
+        // Bound long-term growth from scrollback churn; the working set (the
+        // currently-visible runs) is tiny next to this, so we clear rarely.
+        if self.shape_cache.len() > 8192 {
+            self.shape_cache.clear();
+        }
+        let key = (font.key.value(), size_px.to_bits(), text.to_string());
+        let mut missed = false;
+        let rc = Rc::clone(self.shape_cache.entry(key).or_insert_with(|| {
+            missed = true;
+            Rc::new(ghost_shaper::shape(font, text, size_px))
+        }));
+        if missed {
+            self.shape_misses += 1;
+        }
+        rc
+    }
+
+    /// Total shaping calls (cache misses) — see [`Self::shape_misses`](Self::shape_misses).
+    pub fn shape_misses(&self) -> u32 {
+        self.shape_misses
+    }
+
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
     fn ensure_glyph(
         &mut self,
@@ -1221,7 +1257,8 @@ impl Renderer {
                 // ligature spans its cells naturally and a wide char occupies two
                 // columns regardless of the font's reported advance.
                 let starts = cell_starts(&run.text);
-                for g in ghost_shaper::shape(font, &run.text, size_px) {
+                let shaped = self.shape_cached(font, &run.text, size_px);
+                for g in shaped.iter() {
                     let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
                     let synth = Synthesis {
@@ -1542,7 +1579,8 @@ impl Renderer {
         let mut out = Vec::new();
         for run in runs {
             let starts = cell_starts(&run.text);
-            for g in ghost_shaper::shape(font, &run.text, size_px) {
+            let shaped = self.shape_cached(font, &run.text, size_px);
+            for g in shaped.iter() {
                 let cell = starts.get(&g.cluster).copied().unwrap_or(0);
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
                 let synth = Synthesis {

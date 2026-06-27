@@ -342,3 +342,41 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
     let (outside, _) = rect(&img, 45, 90, 0, 72, strong_blue);
     assert_eq!(outside, 0, "preview must stay within its tile ({outside})");
 }
+
+#[test]
+fn an_identical_repaint_reshapes_nothing() {
+    // Shaping dominates per-frame CPU. The cache must make a repaint of unchanged
+    // text re-shape nothing, so fleet navigation and idle previews stay cheap.
+    let mut vt = Vt::new(40, 6);
+    vt.feed_str("fn main() != ok { let x = 1; }\r\nsecond line of text => here");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    let mut scene = Scene::new((360, 108)); // 40*9 x 6*18
+    scene.layers.push(Layer {
+        z: 0,
+        items: vec![SceneItem::Terminal {
+            id: SceneId::Tile(0),
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 360.0,
+                h: 108.0,
+            },
+            frame,
+            selection: None,
+            dim: false,
+        }],
+    });
+
+    let mut r = Renderer::headless(Theme::default());
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    let after_first = r.shape_misses();
+    assert!(after_first > 0, "the first paint shapes its runs");
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        r.shape_misses(),
+        after_first,
+        "an identical repaint must re-shape nothing (shaping is cached)"
+    );
+}
