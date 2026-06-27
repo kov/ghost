@@ -303,9 +303,9 @@ mod tests {
             info("alpha", true),
             info("beta", false),
         ]));
-        // Move focus onto the foreign tile, then toggle back.
+        // Move focus onto the foreign tile (in the section below), then toggle back.
         r.update(UiEvent::Key {
-            key: Key::Named(NamedKey::ArrowRight),
+            key: Key::Named(NamedKey::ArrowDown),
             mods: Mods::NONE,
             kind: KeyEventKind::Press,
             alts: None,

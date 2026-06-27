@@ -14,7 +14,8 @@
 use std::collections::HashSet;
 
 use ghost_render::{
-    BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, layout_frame,
+    BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Style,
+    layout_frame,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -25,8 +26,17 @@ const GAP: f32 = 8.0;
 const FOCUS_BORDER: f32 = 2.0;
 const FOCUS_COLOR: Rgba = [0.30, 0.60, 0.95, 1.0];
 const BADGE_PX: f32 = 10.0;
+/// Height of a section's header band.
+const SECTION_HEADER_PX: f32 = 16.0;
+/// Colour of section header labels.
+const SECTION_LABEL_COLOR: Rgba = [0.65, 0.70, 0.78, 1.0];
 /// How often (ms) the fleet asks the shell to re-enumerate sessions.
 const REFRESH_MS: u64 = 500;
+
+/// A laid-out tile: stable handle, session id, and pixel rect.
+type Placement = (u64, SessionId, RectPx);
+/// A section header: its locality and the header band's rect.
+type SectionHeader = (Locality, RectPx);
 
 /// Which window owns or sees a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,14 +139,32 @@ fn grid_rects(n: usize, size_px: (u32, u32), gap: f32) -> Vec<RectPx> {
         .collect()
 }
 
-/// Arrow/Tab navigation: `(focus delta, wrap?)`, or `None` if not a nav key.
-/// Shift+Tab steps backward; arrows clamp at the ends, Tab wraps.
-fn nav(key: &Key, mods: Mods) -> Option<(i32, bool)> {
+/// A navigation action: a 2-D arrow direction over the grid, or a linear Tab
+/// step `(delta, wrap)` through tiles in layout order.
+enum Nav {
+    Dir(Dir),
+    Step(i32, bool),
+}
+
+#[derive(Clone, Copy)]
+enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Map a key to a navigation action, or `None` if it isn't one. Arrows move in
+/// 2-D (down really goes down a row, crossing section boundaries); Shift+Tab
+/// steps backward, Tab forward, both wrapping.
+fn nav(key: &Key, mods: Mods) -> Option<Nav> {
     match key {
-        Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown) => Some((1, false)),
-        Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp) => Some((-1, false)),
-        Key::Named(NamedKey::Tab) if mods.shift => Some((-1, true)),
-        Key::Named(NamedKey::Tab) => Some((1, true)),
+        Key::Named(NamedKey::ArrowUp) => Some(Nav::Dir(Dir::Up)),
+        Key::Named(NamedKey::ArrowDown) => Some(Nav::Dir(Dir::Down)),
+        Key::Named(NamedKey::ArrowLeft) => Some(Nav::Dir(Dir::Left)),
+        Key::Named(NamedKey::ArrowRight) => Some(Nav::Dir(Dir::Right)),
+        Key::Named(NamedKey::Tab) if mods.shift => Some(Nav::Step(-1, true)),
+        Key::Named(NamedKey::Tab) => Some(Nav::Step(1, true)),
         _ => None,
     }
 }
@@ -336,8 +364,10 @@ impl FleetModel {
             UiEvent::Key {
                 key, mods, kind, ..
             } if kind.is_down() && nav(&key, mods).is_some() => {
-                let (delta, wrap) = nav(&key, mods).unwrap();
-                self.move_focus(delta, wrap);
+                match nav(&key, mods).unwrap() {
+                    Nav::Dir(d) => self.move_focus_dir(d),
+                    Nav::Step(delta, wrap) => self.move_focus_linear(delta, wrap),
+                }
                 vec![Cmd::Redraw]
             }
             // Re-enumerate on the scheduled refresh tick.
@@ -470,16 +500,68 @@ impl FleetModel {
         cmds
     }
 
-    /// Tile placements `(handle, id, rect)` in locality grid order.
-    fn layout(&self) -> Vec<(u64, SessionId, RectPx)> {
-        let mut order: Vec<&Tile> = self.tiles.iter().collect();
-        order.sort_by_key(|t| t.locality.rank()); // stable: insertion order within a locality
-        let rects = grid_rects(order.len(), self.size_px, GAP);
-        order
-            .into_iter()
-            .zip(rects)
-            .map(|(t, r)| (t.handle, t.id.clone(), r))
-            .collect()
+    /// Section headers `(locality, rect)` for every non-empty attach-state
+    /// section, plus all tile placements `(handle, id, rect)`, laid out as
+    /// stacked per-section grids (a header band atop each section's grid). The
+    /// height is shared between sections in proportion to the rows each needs.
+    /// Shared by `view`, navigation and pointer hit-testing.
+    fn sections_layout(&self) -> (Vec<SectionHeader>, Vec<Placement>) {
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        // Tiles grouped by locality, preserving insertion order within each;
+        // empty sections are dropped so they get no header.
+        let sections: Vec<(Locality, Vec<&Tile>)> = [
+            Locality::ThisWindow,
+            Locality::Elsewhere,
+            Locality::Detached,
+        ]
+        .into_iter()
+        .map(|loc| {
+            (
+                loc,
+                self.tiles.iter().filter(|t| t.locality == loc).collect(),
+            )
+        })
+        .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
+        .collect();
+        if sections.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Rows each section needs (near-square), to share height proportionally.
+        let cols_of = |n: usize| (n as f32).sqrt().ceil().max(1.0) as usize;
+        let rows_of = |n: usize| n.div_ceil(cols_of(n));
+        let total_rows: usize = sections.iter().map(|(_, ts)| rows_of(ts.len())).sum();
+        let grid_h_total = (h - SECTION_HEADER_PX * sections.len() as f32).max(1.0);
+
+        let mut headers = Vec::new();
+        let mut tiles = Vec::new();
+        let mut y = 0.0_f32;
+        for (loc, ts) in &sections {
+            headers.push((
+                *loc,
+                RectPx {
+                    x: GAP,
+                    y,
+                    w: (w - 2.0 * GAP).max(1.0),
+                    h: SECTION_HEADER_PX,
+                },
+            ));
+            y += SECTION_HEADER_PX;
+            let band_h = (grid_h_total * rows_of(ts.len()) as f32 / total_rows as f32).max(1.0);
+            for (t, mut r) in ts
+                .iter()
+                .zip(grid_rects(ts.len(), (w as u32, band_h as u32), GAP))
+            {
+                r.y += y; // offset the section's grid into its band
+                tiles.push((t.handle, t.id.clone(), r));
+            }
+            y += band_h;
+        }
+        (headers, tiles)
+    }
+
+    /// Tile placements `(handle, id, rect)` in section order.
+    fn layout(&self) -> Vec<Placement> {
+        self.sections_layout().1
     }
 
     fn session_data(&mut self, name: &str, bytes: Vec<u8>, ended: bool) -> Vec<Cmd> {
@@ -507,7 +589,8 @@ impl FleetModel {
             .collect()
     }
 
-    fn move_focus(&mut self, delta: i32, wrap: bool) {
+    /// Tab/Shift+Tab: step linearly through tiles in layout order, wrapping.
+    fn move_focus_linear(&mut self, delta: i32, wrap: bool) {
         let order: Vec<SessionId> = self.layout().into_iter().map(|(_, id, _)| id).collect();
         if order.is_empty() {
             return;
@@ -524,6 +607,47 @@ impl FleetModel {
             (cur + delta).clamp(0, n - 1)
         };
         self.set_focus(order[next as usize].clone());
+    }
+
+    /// Arrow keys: move focus to the nearest tile in `dir`, using laid-out tile
+    /// centres so it tracks the visual grid and crosses section boundaries
+    /// naturally. Stays put when there is no tile that way.
+    fn move_focus_dir(&mut self, dir: Dir) {
+        let placements = self.layout();
+        let Some((_, _, cur)) = placements
+            .iter()
+            .find(|(_, id, _)| Some(id.as_str()) == self.focused.as_deref())
+            .cloned()
+        else {
+            // No valid focus yet: fall back to the first tile.
+            if let Some((_, id, _)) = placements.first() {
+                self.set_focus(id.clone());
+            }
+            return;
+        };
+        let (cx, cy) = (cur.x + cur.w / 2.0, cur.y + cur.h / 2.0);
+        let mut best: Option<(f32, SessionId)> = None;
+        for (_, id, r) in &placements {
+            if Some(id.as_str()) == self.focused.as_deref() {
+                continue;
+            }
+            let (dx, dy) = (r.x + r.w / 2.0 - cx, r.y + r.h / 2.0 - cy);
+            // Keep only tiles in the half-plane of `dir`; score = distance along
+            // the axis plus a perpendicular penalty so aligned tiles win.
+            let score = match dir {
+                Dir::Down if dy > 0.5 => dy + dx.abs(),
+                Dir::Up if dy < -0.5 => -dy + dx.abs(),
+                Dir::Right if dx > 0.5 => dx + dy.abs(),
+                Dir::Left if dx < -0.5 => -dx + dy.abs(),
+                _ => continue,
+            };
+            if best.as_ref().is_none_or(|(b, _)| score < *b) {
+                best = Some((score, id.clone()));
+            }
+        }
+        if let Some((_, id)) = best {
+            self.set_focus(id);
+        }
     }
 
     fn set_focus(&mut self, id: SessionId) {
@@ -558,8 +682,18 @@ impl FleetModel {
     // ---- view ----
 
     pub fn view(&self) -> Scene {
+        let (headers, placements) = self.sections_layout();
         let mut items = Vec::new();
-        for (handle, id, rect) in self.layout() {
+        for (loc, rect) in headers {
+            items.push(SceneItem::Text {
+                id: SceneId::Section(loc.rank()),
+                rect,
+                runs: vec![label_run(section_label(loc))],
+                metrics: self.effective_metrics(),
+                color: SECTION_LABEL_COLOR,
+            });
+        }
+        for (handle, id, rect) in placements {
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
@@ -608,6 +742,26 @@ impl FleetModel {
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer { z: 0, items });
         scene
+    }
+}
+
+/// The header label for an attach-state section.
+fn section_label(loc: Locality) -> &'static str {
+    match loc {
+        Locality::ThisWindow => "Attached",
+        Locality::Elsewhere => "Attached elsewhere",
+        Locality::Detached => "Detached",
+    }
+}
+
+/// A single left-aligned chrome label run. The renderer draws chrome text in the
+/// item's colour and ignores per-run style, so a default `Style` is fine.
+fn label_run(text: &str) -> Run {
+    Run {
+        start_col: 0,
+        width_cols: text.chars().count(),
+        text: text.to_string(),
+        style: Style::default(),
     }
 }
 
@@ -670,6 +824,110 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         })
+    }
+
+    fn sinfo(name: &str, attached: bool) -> SessionInfo {
+        SessionInfo {
+            attached,
+            ..info(name)
+        }
+    }
+
+    /// `(label, top-y)` for each section header in the rendered scene.
+    fn headers(m: &FleetModel) -> Vec<(String, f32)> {
+        m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, rect, .. } => {
+                    Some((runs.iter().map(|r| r.text.as_str()).collect(), rect.y))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The laid-out top-y of a tile (tests reach into the private layout).
+    fn tile_y(m: &FleetModel, id: &str) -> f32 {
+        m.layout()
+            .into_iter()
+            .find(|(_, i, _)| i == id)
+            .unwrap()
+            .2
+            .y
+    }
+
+    #[test]
+    fn tiles_are_split_into_attach_state_sections() {
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", false), // ours -> Attached
+            sinfo("b", true),  // attached elsewhere
+            sinfo("c", false), // detached
+        ]));
+        assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
+        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        // Three headers, in attach-state order, stacked top to bottom.
+        let hs = headers(&m);
+        let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["Attached", "Attached elsewhere", "Detached"]);
+        assert!(
+            hs[0].1 < hs[1].1 && hs[1].1 < hs[2].1,
+            "sections stack downward: {hs:?}"
+        );
+        // Each tile sits in its section's vertical band.
+        assert!(tile_y(&m, "a") < tile_y(&m, "b"));
+        assert!(tile_y(&m, "b") < tile_y(&m, "c"));
+    }
+
+    #[test]
+    fn only_nonempty_sections_get_a_header() {
+        let mut m = fleet(); // empty mine
+        list(&mut m, &["x", "y"]); // both detached
+        let labels: Vec<String> = headers(&m).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, vec!["Detached".to_string()]);
+    }
+
+    #[test]
+    fn arrow_down_moves_to_the_tile_below_not_the_next() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b", "c", "d"]); // one section, 2x2 grid: a b / c d
+        assert_eq!(m.focused(), Some("a")); // top-left
+        key(&mut m, Key::Named(NamedKey::ArrowDown));
+        assert_eq!(
+            m.focused(),
+            Some("c"),
+            "Down moves to the tile below, not the next in order"
+        );
+        // Right is the horizontal neighbour.
+        let mut m = fleet();
+        list(&mut m, &["a", "b", "c", "d"]);
+        key(&mut m, Key::Named(NamedKey::ArrowRight));
+        assert_eq!(m.focused(), Some("b"));
+    }
+
+    #[test]
+    fn arrow_down_crosses_into_the_next_section() {
+        let mut m = FleetModel::new(
+            METRICS,
+            SIZE,
+            HashSet::from(["a1".to_string(), "a2".to_string()]),
+        );
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a1", false),
+            sinfo("a2", false),
+            sinfo("d1", false),
+            sinfo("d2", false),
+        ]));
+        assert_eq!(m.focused(), Some("a1"));
+        assert_eq!(m.locality_of("a1"), Some(Locality::ThisWindow));
+        key(&mut m, Key::Named(NamedKey::ArrowDown));
+        assert_eq!(
+            m.locality_of(m.focused().unwrap()),
+            Some(Locality::Detached),
+            "Down from the attached row enters the detached section"
+        );
     }
 
     #[test]
@@ -1060,9 +1318,9 @@ mod tests {
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
         let (mut f, _) = FleetModel::adopting(primary, METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(vec![info("alpha"), info("beta")]));
-        // Move focus onto the foreign tile.
+        // Move focus onto the foreign tile (it's in the section below ours).
         f.update(UiEvent::Key {
-            key: Key::Named(NamedKey::ArrowRight),
+            key: Key::Named(NamedKey::ArrowDown),
             mods: crate::Mods::NONE,
             kind: KeyEventKind::Press,
             alts: None,

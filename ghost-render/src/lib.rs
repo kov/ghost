@@ -32,7 +32,7 @@ pub struct CellMetrics {
 /// A run's resolved visual attributes. Palette resolution (indexed→RGB,
 /// default fg/bg, inverse swap) happens downstream; here we carry the pen's
 /// logical state verbatim so the layout stays free of theme decisions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,

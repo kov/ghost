@@ -45,6 +45,8 @@ pub enum SceneId {
     Badge(u64),
     Sidebar,
     NavBar,
+    /// An attach-state section header, keyed by locality rank.
+    Section(u8),
 }
 
 /// A per-tile indicator.
