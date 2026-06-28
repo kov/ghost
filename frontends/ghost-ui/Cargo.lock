@@ -667,6 +667,7 @@ dependencies = [
  "ghost-shaper",
  "ghost-ui-core",
  "ghost-vt",
+ "rustix 1.1.4",
 ]
 
 [[package]]

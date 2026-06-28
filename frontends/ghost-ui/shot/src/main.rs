@@ -51,12 +51,48 @@ fn main() {
         return;
     }
 
+    if which == "calib-tui" {
+        // Take over the real terminal and draw the calibration pattern — run it as a
+        // ghost session, then eyeball its tile in the fleet.
+        calib_tui();
+        return;
+    }
+
+    if which == "calib" {
+        // `calib [WxH] [N] [out.png]` — render the fleet with N calibration sessions
+        // so preview position, scale, aspect and grid density can be checked at any
+        // window size and session count.
+        let (mut size, mut count, mut out) = (
+            (720u32, 432u32),
+            12usize,
+            "ghost-shot-calib.png".to_string(),
+        );
+        for a in args {
+            if let Some(s) = parse_size(&a) {
+                size = s;
+            } else if let Ok(n) = a.parse::<usize>() {
+                count = n;
+            } else {
+                out = a;
+            }
+        }
+        let scene = calib_scene(size, count);
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+        let mut renderer = Renderer::headless(Theme::default());
+        let img = renderer.render_offscreen_scene(&scene, font, SIZE_PX);
+        img.save_png(&out).expect("write png");
+        println!("wrote calib fleet ({}x{}) to {out}", size.0, size.1);
+        return;
+    }
+
     let out = args.next().unwrap_or_else(|| "ghost-shot.png".to_string());
     let (scene, w, h) = match which.as_str() {
         "fleet" => fleet_scene(),
         "single" => single_scene(),
         other => {
-            eprintln!("unknown scene '{other}' (expected: fleet | single | bench)");
+            eprintln!(
+                "unknown scene '{other}' (expected: fleet | single | bench | calib | calib-tui)"
+            );
             std::process::exit(2);
         }
     };
@@ -247,6 +283,127 @@ fn dense_screen() -> String {
     s
 }
 
+// ---- calibration pattern (geometry validation) -------------------------
+
+/// Parse a `WxH` size string (e.g. `1400x900`).
+fn parse_size(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// Write `text` into the char grid at `(row, col)`, clipped to bounds.
+fn put(g: &mut [Vec<char>], row: usize, col: usize, text: &str) {
+    if row >= g.len() {
+        return;
+    }
+    for (i, ch) in text.chars().enumerate() {
+        if col + i < g[row].len() {
+            g[row][col + i] = ch;
+        }
+    }
+}
+
+/// A full-screen calibration pattern for a `cols`×`rows` terminal: a box-drawing
+/// border flush to the grid edges, tick marks every 10 columns / 5 rows with an
+/// interior dot lattice, labelled corners (TL/TR/BL/BR), a centre crosshair and
+/// the size. Rendered into a fleet preview it makes geometry bugs obvious — a
+/// correct preview shows the border touching the tile edges with an evenly-spaced,
+/// square-celled lattice; a stretched one shows an off-centre border or a lattice
+/// whose horizontal and vertical spacing differ.
+fn calibration_screen(cols: u16, rows: u16) -> String {
+    let (cols, rows) = (cols.max(2) as usize, rows.max(2) as usize);
+    let mut g = vec![vec![' '; cols]; rows];
+
+    // Border.
+    let last = rows - 1;
+    for cell in g[0].iter_mut() {
+        *cell = '─';
+    }
+    for cell in g[last].iter_mut() {
+        *cell = '─';
+    }
+    for row in g.iter_mut() {
+        row[0] = '│';
+        row[cols - 1] = '│';
+    }
+    g[0][0] = '┌';
+    g[0][cols - 1] = '┐';
+    g[rows - 1][0] = '└';
+    g[rows - 1][cols - 1] = '┘';
+
+    // Ticks every 10 columns / 5 rows, plus an interior dot at each intersection.
+    for x in (10..cols - 1).step_by(10) {
+        g[0][x] = '┬';
+        g[rows - 1][x] = '┴';
+    }
+    for y in (5..rows - 1).step_by(5) {
+        g[y][0] = '├';
+        g[y][cols - 1] = '┤';
+        for x in (10..cols - 1).step_by(10) {
+            g[y][x] = '·';
+        }
+    }
+
+    // Corner labels just inside, a centre crosshair, and the size below it.
+    put(&mut g, 1, 2, "TL");
+    put(&mut g, 1, cols.saturating_sub(4), "TR");
+    put(&mut g, rows - 2, 2, "BL");
+    put(&mut g, rows - 2, cols.saturating_sub(4), "BR");
+    let (cx, cy) = (cols / 2, rows / 2);
+    g[cy][cx] = '+';
+    let label = format!("{cols}x{rows}");
+    put(&mut g, cy + 1, cx.saturating_sub(label.len() / 2), &label);
+
+    // Emit each row at an absolute position (no reliance on scroll), in cyan.
+    let mut s = String::from("\x1b[2J\x1b[H");
+    for (y, row) in g.iter().enumerate() {
+        let line: String = row.iter().collect();
+        s.push_str(&format!("\x1b[{};1H\x1b[36m{line}\x1b[0m", y + 1));
+    }
+    s
+}
+
+/// Build a fleet scene whose live tiles show the calibration pattern, at window
+/// `size` with `count` sessions — the headless way to validate preview geometry
+/// (and how card size adapts to the session count) at any size.
+fn calib_scene(size: (u32, u32), count: usize) -> ghost_render::Scene {
+    let names: Vec<String> = (0..count.max(1)).map(|i| format!("calib-{i:02}")).collect();
+    let mine: HashSet<String> = names.iter().cloned().collect();
+    let primary = TerminalModel::new(names[0].clone(), 80, 24, METRICS);
+    let (mut fleet, _) = FleetModel::adopting(primary, Vec::new(), METRICS, size, 1.0, mine);
+    let infos: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| info(n, true, &[], i as i32 + 1))
+        .collect();
+    fleet.update(UiEvent::SessionList(infos));
+    let cal = calibration_screen(80, 24);
+    for n in &names {
+        feed(&mut fleet, n, &cal);
+    }
+    fleet.view()
+}
+
+/// Take over the real terminal: draw the calibration pattern at the terminal's
+/// own size on the alternate screen, wait for Enter, then restore. Run it as a
+/// ghost session to validate preview geometry live.
+fn calib_tui() {
+    use std::io::Write;
+    let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
+        .map(|w| (w.ws_col, w.ws_row))
+        .unwrap_or((80, 24));
+    let (cols, rows) = (cols.max(2), rows.max(2));
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[?1049h\x1b[?25l"); // alt screen, hide cursor
+    let _ = write!(out, "{}", calibration_screen(cols, rows));
+    let _ = write!(out, "\x1b[{};3H press Enter to exit ", rows); // over the bottom edge
+    let _ = out.flush();
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+    let _ = write!(out, "\x1b[?25h\x1b[?1049l"); // restore
+    let _ = out.flush();
+}
+
 /// A representative fleet overview: two sessions this window drives (live),
 /// one held by another window, and one detached — covering all three sections,
 /// cards, buttons, the focus border, and scaled live previews.
@@ -324,3 +481,29 @@ const BUILD: &str = "\x1b[1;32m~/ghost\x1b[0m $ cargo test -p ghost-ui-core\r\n\
 \x1b[1mrunning 134 tests\x1b[0m\r\n\
 \x1b[32mtest result: ok.\x1b[0m 134 passed; 0 failed\r\n\
 $ \x1b[5m_\x1b[0m\r\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_reads_wxh() {
+        assert_eq!(parse_size("1400x900"), Some((1400, 900)));
+        assert_eq!(parse_size("720x432"), Some((720, 432)));
+        assert_eq!(parse_size("nope"), None);
+        assert_eq!(parse_size("12xy"), None);
+    }
+
+    #[test]
+    fn calibration_screen_has_border_corners_and_size() {
+        let s = calibration_screen(80, 24);
+        for corner in ['┌', '┐', '└', '┘'] {
+            assert!(s.contains(corner), "missing corner {corner}");
+        }
+        assert!(s.contains("80x24"), "missing size label");
+        assert!(
+            s.contains("TL") && s.contains("BR"),
+            "missing corner labels"
+        );
+    }
+}

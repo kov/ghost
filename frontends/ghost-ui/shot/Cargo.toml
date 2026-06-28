@@ -12,3 +12,5 @@ ghost-renderer = { path = "../renderer" }
 ghost-shaper = { path = "../shaper" }
 ghost-render = { path = "../../../ghost-render" }
 ghost-vt = { path = "../../../ghost-vt" }
+# Terminal size query for the live `calib-tui` mode (same version as the workspace).
+rustix = { version = "1.1.4", features = ["termios", "stdio"] }
