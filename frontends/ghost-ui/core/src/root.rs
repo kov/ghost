@@ -574,6 +574,14 @@ mod tests {
     fn background_sessions_stay_live_and_keep_their_screens() {
         // The window drives two sessions; alpha starts foreground.
         let mut r = root(); // single view of alpha, mine = {alpha}
+        // A tall window so both readable tiles are on screen at once (otherwise the
+        // grid scrolls and culls the off-screen one — that is exercised in fleet's
+        // own tests; here we only care that both are live, not "starting…").
+        r.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 1200,
+            scale: 1.0,
+        });
         feed(&mut r, "alpha", b"alpha-screen");
         // Switch to beta (alpha goes to the background, kept warm).
         r.update(UiEvent::AdoptSession("beta".into()));

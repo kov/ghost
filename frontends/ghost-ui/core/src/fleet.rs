@@ -38,10 +38,26 @@ const PLACEHOLDER_FG: Rgba = [0.42, 0.46, 0.54, 1.0];
 /// Also the assumed aspect ratio used to shape tiles into little terminals.
 const PREVIEW_COLS: u16 = 80;
 const PREVIEW_ROWS: u16 = 24;
-/// Preferred card width; the grid fits as many of these across as it can (then
-/// shrinks uniformly if the sections would overflow the window).
-const TARGET_TILE_W: f32 = 460.0;
-const MAX_PER_ROW: usize = 5;
+/// Most cards per row; the grid fits as many aspect-locked cards across as the
+/// window width allows, up to this many.
+const MAX_PER_ROW: usize = 8;
+/// A card never shrinks below this many preview lines tall (the two chrome bands
+/// are extra). With many sessions the grid scrolls rather than collapsing every
+/// preview to an unreadable sliver; this floor guards small windows / odd metrics.
+const MIN_PREVIEW_LINES: f32 = 8.0;
+/// The COMPACT preview size (fraction of the session's native size) used when the
+/// grid is crowded — a readable thumbnail. A few sessions grow ABOVE this, up to
+/// native (1:1, beyond which a preview can't get sharper), to use the space; a
+/// crowded grid shrinks to it and scrolls. Scale-aware (relative to native).
+const PREVIEW_COMPACT_SCALE: f32 = 0.5;
+/// A card grows no taller than this fraction of the viewport — a bit under half —
+/// so even with few sessions a section header and other cards stay visible on a
+/// short window (rather than one card filling the screen). Only binds when the
+/// window is short; tall windows are capped by native size instead.
+const MAX_CARD_VIEWPORT_FRAC: f32 = 0.45;
+/// Lines of vertical scroll per mouse-wheel notch (sign only, like the terminal's
+/// scrollback — magnitude is ignored so a touchpad and a notched wheel agree).
+const SCROLL_LINES: f32 = 3.0;
 /// Card chrome colours (metadata header, button footer).
 const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
 const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
@@ -170,6 +186,10 @@ pub struct FleetModel {
     pending: Option<Pending>,
     /// An in-progress inline rename; swallows text/keys into its buffer.
     renaming: Option<Renaming>,
+    /// Vertical scroll offset in physical pixels (0 = top). The grid lays out at a
+    /// readable tile size regardless of session count and scrolls when it overflows
+    /// the viewport, rather than shrinking previews to fit.
+    scroll_y: f32,
 }
 
 /// Split a tile rect into its metadata header, preview area, and a row of three
@@ -254,6 +274,7 @@ impl FleetModel {
             frame_builds: 0,
             pending: None,
             renaming: None,
+            scroll_y: 0.0,
         }
     }
 
@@ -473,6 +494,9 @@ impl FleetModel {
         // Rebuild any preview whose content or size this event changed, so `view`
         // can stay a pure read of cached frames.
         self.refresh_dirty_frames();
+        // A resize, or tiles appearing/disappearing, can change the content height
+        // or viewport — keep the scroll offset valid (nav/wheel clamp themselves).
+        self.clamp_scroll();
         cmds
     }
 
@@ -568,19 +592,15 @@ impl FleetModel {
         cmds
     }
 
-    /// Section headers `(locality, rect)` for every non-empty attach-state
-    /// section, plus all tile placements `(handle, id, rect)`, laid out as
-    /// stacked per-section grids (a header band atop each section's grid). The
-    /// height is shared between sections in proportion to the rows each needs.
-    /// Shared by `view`, navigation and pointer hit-testing.
-    /// Lay the overview out: a labelled band per non-empty attach-state section,
-    /// each followed by its tiles in a fixed-width grid. Tiles take the terminal's
-    /// aspect ratio so previews look like little terminals rather than tall boxes;
-    /// if the stacked sections would overflow the window everything shrinks
-    /// uniformly to fit. Returns the section headers, the tile placements (full
-    /// card rects), and the chrome `band` height (so `card_layout` and the view
-    /// split each card the same way).
-    fn sections_layout(&self) -> (Vec<SectionHeader>, Vec<Placement>, f32) {
+    /// Lay out section headers and tile placements in *content* space (unscrolled,
+    /// origin at the top of the grid): a labelled band per non-empty attach-state
+    /// section, each followed by its tiles in a fixed-width grid sized to the
+    /// terminal's aspect ratio so previews look like little terminals. Returns the
+    /// headers, the tile placements (full card rects), the chrome `band` height (so
+    /// `card_layout` and the view split each card the same way), and the total
+    /// content height. The grid is sized for readability and simply grows past the
+    /// viewport, which then scrolls (`view`/`pointer` apply [`Self::scroll_y`]).
+    fn sections_layout(&self) -> (Vec<SectionHeader>, Vec<Placement>, f32, f32) {
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
         let metrics = self.effective_metrics();
         let base_band = metrics.line_height + 6.0;
@@ -601,40 +621,88 @@ impl FleetModel {
         .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
         .collect();
         if sections.is_empty() {
-            return (Vec::new(), Vec::new(), base_band);
+            return (Vec::new(), Vec::new(), base_band, 0.0);
         }
 
-        // Fit as many target-width cards across as the window allows, then size
-        // each card to the terminal aspect ratio (header + preview + footer).
-        let per_row = (((w - GAP) / (TARGET_TILE_W + GAP)).floor() as usize).clamp(1, MAX_PER_ROW);
-        let base_tile_w = ((w - GAP * (per_row as f32 + 1.0)) / per_row as f32).max(1.0);
+        let (band, gap) = (base_band, GAP);
+        // Preview pixel aspect (width : height) of the terminal grid.
         let aspect =
             (PREVIEW_COLS as f32 * metrics.advance) / (PREVIEW_ROWS as f32 * metrics.line_height);
-        let base_card_h = 2.0 * base_band + (base_tile_w / aspect).max(1.0);
 
-        // Cards keep their full width; when the stacked sections would overflow,
-        // cap card *height* (the preview just letterboxes more) rather than
-        // shrinking width and leaving a big empty right margin.
-        let rows: Vec<usize> = sections
-            .iter()
-            .map(|(_, ts)| ts.len().div_ceil(per_row))
-            .collect();
-        let total_rows: usize = rows.iter().sum();
-        let avail = (h - GAP - sections.len() as f32 * (base_band + GAP) - total_rows as f32 * GAP)
-            .max(1.0);
-        let (band, tile_w, gap) = (base_band, base_tile_w, GAP);
-        let card_h = base_card_h.min((avail / total_rows as f32).max(1.0));
+        // A card is an aspect-locked little terminal (the preview) plus two chrome
+        // bands. Its SIZE adapts to the session count: a crowded grid uses the
+        // compact thumbnail size and scrolls, while a few sessions GROW (up to
+        // native 1:1 — past that the preview can't get any sharper) to use the
+        // space. Width follows the terminal aspect ratio rather than stretching to
+        // fill the column (which would distort the preview); a narrow window shrinks
+        // it to fit.
+        let avail_w = (w - 2.0 * gap).max(1.0);
+        let min_card_h = 2.0 * band + MIN_PREVIEW_LINES * metrics.line_height;
+        let native_card_h = 2.0 * band + PREVIEW_ROWS as f32 * metrics.line_height;
+        let compact_card_h =
+            2.0 * band + PREVIEW_ROWS as f32 * metrics.line_height * PREVIEW_COMPACT_SCALE;
+        // Grow no taller than native, and on a short window no taller than a bit
+        // under half the viewport (so a header + other cards stay visible); never
+        // below the readable floor.
+        let cap = native_card_h.min((h * MAX_CARD_VIEWPORT_FRAC).max(min_card_h));
+        let floor = compact_card_h.clamp(min_card_h, cap);
+
+        // Total content height for a candidate card height, recomputing the column
+        // count (cards are aspect-locked, so a taller card is wider and fewer fit).
+        let seg: Vec<usize> = sections.iter().map(|(_, ts)| ts.len()).collect();
+        let content_for = |ch: f32| -> f32 {
+            let pw = ((ch - 2.0 * band) * aspect).min(avail_w);
+            let per_row = (((w - gap) / (pw + gap)).floor() as usize).clamp(1, MAX_PER_ROW);
+            let mut yy = gap;
+            for &n in &seg {
+                yy += band + n.div_ceil(per_row) as f32 * (ch + gap);
+            }
+            yy
+        };
+        // Largest card height in [floor, cap] whose whole grid still fits the
+        // viewport (few sessions enlarge to use the space); if even the compact grid
+        // overflows, use the compact size and let it scroll (crowded stays dense).
+        let card_h = if content_for(floor) >= h {
+            floor
+        } else {
+            let (mut lo, mut hi) = (floor, cap);
+            for _ in 0..24 {
+                let mid = 0.5 * (lo + hi);
+                if content_for(mid) <= h {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+
+        let mut preview_h = card_h - 2.0 * band;
+        let mut card_w = preview_h * aspect;
+        if card_w > avail_w {
+            card_w = avail_w; // width-bound (narrow window): keep aspect, shrink
+            preview_h = card_w / aspect;
+        }
+        let card_h = (preview_h + 2.0 * band).max(min_card_h);
+
+        // Fit as many aspect-locked cards across as the width allows, then centre
+        // the row so the leftover width is shared as margins (the scroll, when the
+        // grid overflows, is vertical only).
+        let per_row = (((w - gap) / (card_w + gap)).floor() as usize).clamp(1, MAX_PER_ROW);
+        let row_w = per_row as f32 * card_w + (per_row as f32 - 1.0) * gap;
+        let left = ((w - row_w) / 2.0).max(gap);
 
         let mut headers = Vec::new();
         let mut placements = Vec::new();
         let mut y = gap;
-        for ((loc, ts), &nrows) in sections.iter().zip(&rows) {
+        for (loc, ts) in &sections {
+            let nrows = ts.len().div_ceil(per_row);
             headers.push((
                 *loc,
                 RectPx {
-                    x: gap,
+                    x: left,
                     y,
-                    w: (w - 2.0 * gap).max(1.0),
+                    w: row_w.max(1.0),
                     h: band,
                 },
             ));
@@ -645,21 +713,71 @@ impl FleetModel {
                     t.handle,
                     t.id.clone(),
                     RectPx {
-                        x: gap + c as f32 * (tile_w + gap),
+                        x: left + c as f32 * (card_w + gap),
                         y: y + r as f32 * (card_h + gap),
-                        w: tile_w,
+                        w: card_w,
                         h: card_h,
                     },
                 ));
             }
             y += nrows as f32 * (card_h + gap);
         }
-        (headers, placements, band)
+        (headers, placements, band, y)
     }
 
-    /// Tile placements `(handle, id, rect)` in section order.
+    /// Tile placements `(handle, id, rect)` in section order, content space.
     fn layout(&self) -> Vec<Placement> {
         self.sections_layout().1
+    }
+
+    /// Greatest valid scroll offset: how far the content extends past the viewport
+    /// (0 when everything fits).
+    fn max_scroll(&self) -> f32 {
+        let content_h = self.sections_layout().3;
+        (content_h - self.size_px.1 as f32).max(0.0)
+    }
+
+    /// Keep [`Self::scroll_y`] within `[0, max_scroll]` after anything that changes
+    /// the content height or viewport (resize, tile add/remove, wheel, navigation).
+    fn clamp_scroll(&mut self) {
+        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+    }
+
+    /// Scroll a mouse-wheel notch. Sign only (magnitude ignored, like the
+    /// terminal's scrollback); wheel up reveals tiles above. Returns a redraw iff
+    /// the offset actually moved.
+    fn wheel(&mut self, dy: f64) -> Vec<Cmd> {
+        if dy == 0.0 {
+            return Vec::new();
+        }
+        let step = SCROLL_LINES * self.effective_metrics().line_height;
+        let before = self.scroll_y;
+        self.scroll_y += if dy > 0.0 { -step } else { step };
+        self.clamp_scroll();
+        if self.scroll_y == before {
+            Vec::new()
+        } else {
+            vec![Cmd::Redraw]
+        }
+    }
+
+    /// After moving focus with the arrows, scroll just enough to bring the focused
+    /// tile fully into view (with a small margin).
+    fn scroll_to_focused(&mut self) {
+        let (_, placements, _, _) = self.sections_layout();
+        let Some((_, _, rect)) = placements
+            .iter()
+            .find(|(_, id, _)| Some(id.as_str()) == self.focused.as_deref())
+        else {
+            return;
+        };
+        let view_h = self.size_px.1 as f32;
+        if rect.y - GAP < self.scroll_y {
+            self.scroll_y = (rect.y - GAP).max(0.0);
+        } else if rect.y + rect.h + GAP > self.scroll_y + view_h {
+            self.scroll_y = rect.y + rect.h + GAP - view_h;
+        }
+        self.clamp_scroll();
     }
 
     fn session_data(&mut self, name: &str, bytes: Vec<u8>, ended: bool) -> Vec<Cmd> {
@@ -773,6 +891,8 @@ impl FleetModel {
                     Nav::Dir(d) => self.move_focus_dir(d),
                     Nav::Step(delta, wrap) => self.move_focus_linear(delta, wrap),
                 }
+                // Keep the newly-focused tile on screen when the grid scrolls.
+                self.scroll_to_focused();
                 vec![Cmd::Redraw]
             }
             UiEvent::Key { key, kind, .. }
@@ -780,6 +900,11 @@ impl FleetModel {
             {
                 self.activate(self.focused.clone())
             }
+            UiEvent::Pointer {
+                phase: PointerPhase::Wheel,
+                wheel_dy,
+                ..
+            } => self.wheel(wheel_dy),
             UiEvent::Pointer { phase, pos, .. } => self.pointer(phase, pos),
             // Otherwise view-only: text and ordinary keys are dropped.
             _ => Vec::new(),
@@ -898,8 +1023,9 @@ impl FleetModel {
         if phase != PointerPhase::Press {
             return Vec::new(); // the overview only reacts to presses
         }
-        let (px, py) = (pos.x as f32, pos.y as f32);
-        let (_, placements, band) = self.sections_layout();
+        // Hit-test in content space: the viewport point plus the scroll offset.
+        let (px, py) = (pos.x as f32, pos.y as f32 + self.scroll_y);
+        let (_, placements, band, _) = self.sections_layout();
         let hit = placements.into_iter().find(|(_, _, r)| r.contains(px, py));
         let Some((_, id, rect)) = hit else {
             return Vec::new();
@@ -916,10 +1042,13 @@ impl FleetModel {
     // ---- view ----
 
     pub fn view(&self) -> Scene {
-        let (headers, placements, band) = self.sections_layout();
+        let (headers, placements, band, _content_h) = self.sections_layout();
         let metrics = self.effective_metrics();
+        let view_h = self.size_px.1 as f32;
+        let sy = self.scroll_y;
         let mut items = Vec::new();
-        for (loc, rect) in headers {
+        for (loc, mut rect) in headers {
+            rect.y -= sy;
             items.push(SceneItem::Text {
                 id: SceneId::Section(loc.rank()),
                 rect: text_line(rect, metrics, GAP * 0.5),
@@ -928,7 +1057,14 @@ impl FleetModel {
                 color: SECTION_LABEL_COLOR,
             });
         }
-        for (handle, id, rect) in placements {
+        for (handle, id, mut rect) in placements {
+            rect.y -= sy;
+            // Cull tiles fully outside the viewport: otherwise their previews are
+            // re-rendered to textures (costly with many sessions) only to be
+            // scissored away. Headers above stay, so the section structure shows.
+            if rect.y + rect.h <= 0.0 || rect.y >= view_h {
+                continue;
+            }
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
@@ -1237,6 +1373,23 @@ mod tests {
         })
     }
 
+    fn wheel(m: &mut FleetModel, dy: f64) -> Vec<Cmd> {
+        m.update(UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 0.0, y: 0.0 },
+            mods: crate::Mods::NONE,
+            wheel_dy: dy,
+            clicks: 1,
+        })
+    }
+
+    /// List `n` detached sessions named `s0..sn`.
+    fn list_many(m: &mut FleetModel, n: usize) {
+        let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
+        m.update(UiEvent::SessionList(infos));
+    }
+
     fn sinfo(name: &str, attached: bool) -> SessionInfo {
         SessionInfo {
             attached,
@@ -1450,6 +1603,14 @@ mod tests {
     fn view_lays_tiles_in_a_non_overlapping_grid_with_one_focus_border() {
         let mut m = fleet();
         list(&mut m, &["a", "b", "c"]);
+        // A viewport tall enough to show all three readable tiles (otherwise the
+        // grid scrolls and culls the off-screen ones — exercised separately).
+        const TALL: (u32, u32) = (400, 1000);
+        m.update(UiEvent::Resize {
+            w_px: TALL.0,
+            h_px: TALL.1,
+            scale: 1.0,
+        });
         // Distinct content per tile, so each previews real routed output.
         data(&mut m, "a", b"AAA");
         data(&mut m, "b", b"BBB");
@@ -1473,9 +1634,9 @@ mod tests {
             assert!(
                 a.x >= 0.0
                     && a.y >= 0.0
-                    && a.x + a.w <= SIZE.0 as f32
-                    && a.y + a.h <= SIZE.1 as f32,
-                "tile {a:?} must fit the {SIZE:?} viewport"
+                    && a.x + a.w <= TALL.0 as f32
+                    && a.y + a.h <= TALL.1 as f32,
+                "tile {a:?} must fit the {TALL:?} viewport"
             );
             for b in &terminals[i + 1..] {
                 assert!(
@@ -1606,7 +1767,7 @@ mod tests {
 
     /// The pixel rect of `id`'s `button` (centre is a good press target).
     fn button_rect(m: &FleetModel, id: &str, button: Button) -> RectPx {
-        let (_, placements, band) = m.sections_layout();
+        let (_, placements, band, _) = m.sections_layout();
         let (_, _, rect) = placements.into_iter().find(|(_, i, _)| i == id).unwrap();
         let (_, _, buttons) = card_layout(rect, band);
         buttons.iter().find(|(b, _)| *b == button).unwrap().1
@@ -1728,6 +1889,7 @@ mod tests {
     fn view_dims_unfocused_tiles_and_borders_the_focused_one() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]); // focus "a"
+        widen(&mut m); // both tiles on one visible row (else the 2nd scrolls off)
         data(&mut m, "a", b"A"); // make both tiles live previews
         data(&mut m, "b", b"B");
         let scene = m.view();
@@ -1750,6 +1912,7 @@ mod tests {
     #[test]
     fn bell_and_background_activity_raise_badges() {
         let mut m = fleet();
+        widen(&mut m); // keep both tiles on one visible row
         let mut infos = vec![info("a"), info("b")];
         infos[1].bell = true; // "b" rang the bell
         m.update(UiEvent::SessionList(infos));
@@ -1789,28 +1952,225 @@ mod tests {
     }
 
     #[test]
-    fn cards_stay_within_the_window_and_do_not_overlap() {
-        // A spread of session counts; the layout shrinks to keep every card on
-        // screen and never lets two cards overlap.
+    fn cards_stay_within_the_window_width_keep_a_min_height_and_do_not_overlap() {
+        // A spread of session counts. Cards fit the window WIDTH and never overlap,
+        // and every card keeps a readable minimum height — the grid grows past the
+        // viewport (and scrolls) rather than collapsing previews to fit.
+        let min_card_h =
+            2.0 * (METRICS.line_height + 6.0) + MIN_PREVIEW_LINES * METRICS.line_height;
         for n in 1..=12usize {
             let mut m = fleet();
             let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
             m.update(UiEvent::SessionList(infos));
-            let (_, placements, _) = m.sections_layout();
+            let (_, placements, _, content_h) = m.sections_layout();
             assert_eq!(placements.len(), n);
-            let (w, h) = (SIZE.0 as f32, SIZE.1 as f32);
+            let w = SIZE.0 as f32;
             for (_, _, r) in &placements {
                 assert!(r.x >= 0.0 && r.y >= 0.0, "n {n}: {r:?}");
-                assert!(r.w >= 1.0 && r.h >= 1.0, "n {n}: {r:?}");
-                assert!(r.x + r.w <= w + 0.5, "x overflow n {n}: {r:?}");
-                assert!(r.y + r.h <= h + 0.5, "y overflow n {n}: {r:?}");
+                assert!(r.x + r.w <= w + 0.5, "width overflow n {n}: {r:?}");
+                assert!(
+                    r.h >= min_card_h - 0.5,
+                    "card collapsed below the minimum height n {n}: {r:?}"
+                );
             }
             for (i, (_, _, a)) in placements.iter().enumerate() {
                 for (_, _, b) in &placements[i + 1..] {
                     assert!(!rects_overlap(a, b), "overlap n {n}: {a:?} vs {b:?}");
                 }
             }
+            // With enough sessions the grid overflows the viewport (then scrolls).
+            if n >= 2 {
+                assert!(
+                    content_h > SIZE.1 as f32,
+                    "n {n}: {content_h} should overflow the {}px viewport",
+                    SIZE.1
+                );
+            }
         }
+    }
+
+    #[test]
+    fn cards_keep_the_terminal_aspect_ratio() {
+        // The preview area must keep the terminal's width:height ratio, not stretch
+        // to full column width once the card height is capped.
+        let aspect =
+            (PREVIEW_COLS as f32 * METRICS.advance) / (PREVIEW_ROWS as f32 * METRICS.line_height);
+        // A range of windows, including the default that surfaced the bug.
+        for (w, h) in [(720, 432), (1400, 900), (1000, 700), (500, 1000)] {
+            let mut m = fleet();
+            m.update(UiEvent::Resize {
+                w_px: w,
+                h_px: h,
+                scale: 1.0,
+            });
+            list_many(&mut m, 4);
+            let (_, placements, band, _) = m.sections_layout();
+            for (_, _, r) in &placements {
+                let preview_w = r.w; // the preview spans the full card width
+                let preview_h = r.h - 2.0 * band; // minus the header + footer bands
+                let got = preview_w / preview_h;
+                assert!(
+                    (got - aspect).abs() < 0.02,
+                    "card {w}x{h}: preview aspect {got:.3} != terminal {aspect:.3} ({r:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crowded_grids_use_the_compact_card_size() {
+        let band = METRICS.line_height + 6.0;
+        let compact =
+            2.0 * band + PREVIEW_ROWS as f32 * METRICS.line_height * PREVIEW_COMPACT_SCALE;
+
+        // Far more sessions than fit: cards settle at the compact thumbnail size and
+        // the grid scrolls, rather than each card growing.
+        let mut m = fleet();
+        m.update(UiEvent::Resize {
+            w_px: 2000,
+            h_px: 1200,
+            scale: 1.0,
+        });
+        list_many(&mut m, 40);
+        let ch = m.sections_layout().1[0].2.h;
+        assert!(
+            (ch - compact).abs() < 1.0,
+            "a crowded grid should use the compact card ({compact}), got {ch}"
+        );
+    }
+
+    #[test]
+    fn a_few_sessions_get_larger_previews() {
+        let band = METRICS.line_height + 6.0;
+        let native = 2.0 * band + PREVIEW_ROWS as f32 * METRICS.line_height;
+        let size = UiEvent::Resize {
+            w_px: 2000,
+            h_px: 1200,
+            scale: 1.0,
+        };
+
+        // A couple of sessions grow to use the space; a crowded grid stays compact.
+        let mut few = fleet();
+        few.update(size.clone());
+        list_many(&mut few, 2);
+        let few_h = few.sections_layout().1[0].2.h;
+
+        let mut many = fleet();
+        many.update(size);
+        list_many(&mut many, 40);
+        let many_h = many.sections_layout().1[0].2.h;
+
+        assert!(
+            few_h > many_h + 1.0,
+            "a couple of sessions should preview larger than a crowded grid ({few_h} vs {many_h})"
+        );
+        assert!(
+            few_h <= native + 1.0,
+            "previews should not grow past native size ({few_h} > {native})"
+        );
+    }
+
+    #[test]
+    fn the_grid_scrolls_with_the_wheel_and_clamps_to_the_ends() {
+        let mut m = fleet();
+        list_many(&mut m, 6); // overflows the 400x200 viewport
+        assert!(
+            m.max_scroll() > 0.0,
+            "the grid must overflow to be scrollable"
+        );
+        assert_eq!(m.scroll_y, 0.0, "starts pinned to the top");
+
+        // Wheel up at the top is a no-op (already clamped).
+        assert_eq!(wheel(&mut m, 1.0), vec![], "no scroll past the top");
+        assert_eq!(m.scroll_y, 0.0);
+
+        // Wheel down scrolls toward the bottom.
+        assert_eq!(wheel(&mut m, -1.0), vec![Cmd::Redraw]);
+        assert!(m.scroll_y > 0.0, "wheel down scrolled");
+
+        // Many notches clamp at the bottom; further ones do nothing.
+        for _ in 0..50 {
+            wheel(&mut m, -1.0);
+        }
+        assert_eq!(m.scroll_y, m.max_scroll(), "clamps at the bottom");
+        assert_eq!(wheel(&mut m, -1.0), vec![], "no scroll past the bottom");
+
+        // And back up to the top.
+        for _ in 0..50 {
+            wheel(&mut m, 1.0);
+        }
+        assert_eq!(m.scroll_y, 0.0, "returns to the top");
+    }
+
+    #[test]
+    fn arrow_navigation_scrolls_the_focused_tile_into_view() {
+        let mut m = fleet();
+        // A viewport taller than one tile but shorter than the whole column, so
+        // walking down must scroll while keeping the focused tile fully visible.
+        m.update(UiEvent::Resize {
+            w_px: 400,
+            h_px: 500,
+            scale: 1.0,
+        });
+        list_many(&mut m, 6); // single column (narrow), taller than 500px
+        assert_eq!(m.focused(), Some("s0"));
+        assert_eq!(m.scroll_y, 0.0);
+
+        let view_h = 500.0;
+        for _ in 0..5 {
+            key(&mut m, Key::Named(NamedKey::ArrowDown));
+            let (_, placements, _, _) = m.sections_layout();
+            let (_, _, r) = placements
+                .into_iter()
+                .find(|(_, id, _)| Some(id.as_str()) == m.focused())
+                .unwrap();
+            let (top, bottom) = (r.y - m.scroll_y, r.y + r.h - m.scroll_y);
+            assert!(
+                top >= -0.5 && bottom <= view_h + 0.5,
+                "focused tile {top}..{bottom} must stay within the {view_h}px viewport"
+            );
+        }
+        assert!(m.scroll_y > 0.0, "navigating down scrolled the grid");
+    }
+
+    #[test]
+    fn offscreen_tiles_are_culled_but_the_section_header_stays() {
+        let mut m = fleet();
+        m.update(UiEvent::Resize {
+            w_px: 400,
+            h_px: 400,
+            scale: 1.0,
+        });
+        list_many(&mut m, 6);
+        for i in 0..6 {
+            data(&mut m, &format!("s{i}"), b"live"); // every tile a live preview
+        }
+        let visible = m.view().terminals().count();
+        assert!(
+            (1..6).contains(&visible),
+            "only on-screen tiles render previews, got {visible}/6"
+        );
+        // The section header is still emitted even though most tiles are culled.
+        assert_eq!(headers(&m).len(), 1, "the section header survives culling");
+    }
+
+    #[test]
+    fn enlarging_the_window_clamps_the_scroll_offset() {
+        let mut m = fleet();
+        list_many(&mut m, 6);
+        for _ in 0..50 {
+            wheel(&mut m, -1.0); // scroll to the bottom
+        }
+        assert!(m.scroll_y > 0.0 && m.scroll_y == m.max_scroll());
+
+        // A viewport tall enough to hold everything leaves nothing to scroll.
+        m.update(UiEvent::Resize {
+            w_px: 400,
+            h_px: 5000,
+            scale: 1.0,
+        });
+        assert_eq!(m.max_scroll(), 0.0, "a tall window fits the whole grid");
+        assert_eq!(m.scroll_y, 0.0, "scroll clamps back to the top");
     }
 
     #[test]
