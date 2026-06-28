@@ -794,20 +794,55 @@ impl App {
     /// (relayout/reflow/PTY-resize/re-raster) is deferred to `about_to_wait`, which
     /// commits it once the drag settles — so dragging stays cheap and smooth even
     /// with a fleet of sessions on a software rasterizer.
-    fn resize_step(&mut self, wid: WindowId, w_px: u32, h_px: u32, scale: f64) {
+    fn resize_step(
+        &mut self,
+        wid: WindowId,
+        w_px: u32,
+        h_px: u32,
+        scale: f64,
+        event_loop: &ActiveEventLoop,
+    ) {
         let now_ms = self.now_ms();
-        let Some(w) = self.windows.get_mut(&wid) else {
-            return;
+        let step = {
+            let Some(w) = self.windows.get_mut(&wid) else {
+                return;
+            };
+            let step = w.resize.note(now_ms, w_px, h_px, scale);
+            match step {
+                // Isolated resize (maximize / snap / un-maximize / a drag's first
+                // grab): drop any snapshot and resize the surface now; the real
+                // relayout is dispatched below, crisply.
+                resize::Step::CommitNow((cw, ch, _)) => {
+                    w.gfx.renderer.clear_snapshot();
+                    w.gfx.resize(cw, ch);
+                }
+                // A drag is streaming: capture the last crisp frame once, then
+                // stretch-blit it cheaply until the gesture settles (the real
+                // resize is committed from `about_to_wait`).
+                resize::Step::Defer => {
+                    if !w.gfx.renderer.has_snapshot() {
+                        let scene = w.root.view();
+                        let font_px = SIZE_PX * w.root.render_scale();
+                        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+                        w.gfx.renderer.capture_snapshot(&scene, font, font_px);
+                    }
+                    w.gfx.resize(w_px, h_px);
+                    w.gfx.blit_snapshot();
+                }
+            }
+            step
         };
-        if !w.gfx.renderer.has_snapshot() {
-            let scene = w.root.view();
-            let font_px = SIZE_PX * w.root.render_scale();
-            let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-            w.gfx.renderer.capture_snapshot(&scene, font, font_px);
+        if let resize::Step::CommitNow((cw, ch, cs)) = step {
+            self.dispatch(
+                wid,
+                UiEvent::Resize {
+                    w_px: cw,
+                    h_px: ch,
+                    scale: cs,
+                },
+                event_loop,
+            );
         }
-        w.gfx.resize(w_px, h_px);
-        w.resize.note(now_ms, w_px, h_px, scale);
-        w.gfx.blit_snapshot();
     }
 
     /// Open a new window in the fleet overview (owning no session yet). The user
@@ -831,7 +866,11 @@ impl App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
-                resize: resize::ResizeCoalescer::new(resize::SETTLE_MS, resize::MAX_MS),
+                resize: resize::ResizeCoalescer::new(
+                    resize::SETTLE_MS,
+                    resize::MAX_MS,
+                    resize::DRAG_GAP_MS,
+                ),
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -889,7 +928,11 @@ impl App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
-                resize: resize::ResizeCoalescer::new(resize::SETTLE_MS, resize::MAX_MS),
+                resize: resize::ResizeCoalescer::new(
+                    resize::SETTLE_MS,
+                    resize::MAX_MS,
+                    resize::DRAG_GAP_MS,
+                ),
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -1038,7 +1081,7 @@ impl ApplicationHandler for App {
                 let Some(scale) = self.windows.get(&id).map(|w| w.gfx.window.scale_factor()) else {
                     return;
                 };
-                self.resize_step(id, size.width.max(1), size.height.max(1), scale);
+                self.resize_step(id, size.width.max(1), size.height.max(1), scale, event_loop);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // The display's DPI changed (e.g. the window moved to another
@@ -1047,7 +1090,13 @@ impl ApplicationHandler for App {
                 let Some(s) = self.windows.get(&id).map(|w| w.gfx.window.inner_size()) else {
                     return;
                 };
-                self.resize_step(id, s.width.max(1), s.height.max(1), scale_factor);
+                self.resize_step(
+                    id,
+                    s.width.max(1),
+                    s.height.max(1),
+                    scale_factor,
+                    event_loop,
+                );
             }
             WindowEvent::RedrawRequested => {
                 if let Some(win) = self.windows.get_mut(&id) {
