@@ -140,6 +140,17 @@ fn locality_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Locality
     }
 }
 
+/// Stable, deterministic sort key for a tile *within* its section — and, when the
+/// grouping feature lands, within its group (the comparator is hierarchy-ready:
+/// section/group first, then this key). Oldest session first by creation time so
+/// a session keeps its slot for life and new ones land at the end; a tile with no
+/// recorded creation time sorts last (newest) until reconcile fills it in. The
+/// monotonic `handle` breaks ties (and stands in for missing times), so order is
+/// decoupled from how the host enumerated sessions and never reshuffles.
+fn tile_order_key(t: &Tile) -> (i64, u64) {
+    (t.created_at.unwrap_or(i64::MAX), t.handle)
+}
+
 struct Tile {
     handle: u64,
     id: SessionId,
@@ -151,6 +162,10 @@ struct Tile {
     command: Vec<String>,
     /// The session's process id, shown in the card header.
     pid: i32,
+    /// Unix seconds at which the session was created, or `None` if the host
+    /// hasn't recorded it (or the tile was adopted before its first reconcile).
+    /// The primary, stable sort key (see [`tile_order_key`]).
+    created_at: Option<i64>,
     /// Unseen-output count since this tile was last focused (drives the badge).
     activity: u32,
     /// Whether the shell has delivered output for this tile (i.e. this window
@@ -312,7 +327,10 @@ impl FleetModel {
         for model in std::iter::once(primary).chain(warm) {
             let id = model.session().to_string();
             let locality = locality_for(&f.mine, &id, true);
-            f.push_tile(id, model, false, locality, Vec::new(), 0);
+            // No SessionInfo yet (these are live models handed over on a toggle);
+            // creation time fills in on the next reconcile. Until then they sort
+            // last — which is correct, they are the window's current sessions.
+            f.push_tile(id, model, false, locality, Vec::new(), 0, None);
             if let Some(t) = f.tiles.last_mut() {
                 t.fed = true;
             }
@@ -321,6 +339,7 @@ impl FleetModel {
         (f, vec![Cmd::Redraw])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_tile(
         &mut self,
         id: SessionId,
@@ -329,6 +348,7 @@ impl FleetModel {
         locality: Locality,
         command: Vec<String>,
         pid: i32,
+        created_at: Option<i64>,
     ) {
         let handle = self.next_handle;
         self.next_handle += 1;
@@ -340,6 +360,7 @@ impl FleetModel {
             locality,
             command,
             pid,
+            created_at,
             activity: 0,
             fed: false,
             frame: None,
@@ -367,6 +388,16 @@ impl FleetModel {
 
     pub fn locality_of(&self, id: &str) -> Option<Locality> {
         self.tiles.iter().find(|t| t.id == id).map(|t| t.locality)
+    }
+
+    /// The on-screen preview rect of a tile (post-scroll), exactly as [`view`](Self::view)
+    /// draws the little terminal — the camera target the fleet-zoom animation frames.
+    /// `None` if the tile isn't present.
+    pub fn preview_rect(&self, id: &str) -> Option<RectPx> {
+        let (_, placements, band, _) = self.sections_layout();
+        let (_, _, mut rect) = placements.into_iter().find(|(_, i, _)| i == id)?;
+        rect.y -= self.scroll_y;
+        Some(card_layout(rect, band).1)
     }
 
     /// Extract a single terminal for a toggle back to the single view, detaching
@@ -551,13 +582,17 @@ impl FleetModel {
                     || tile.locality != locality
                     || tile.command != info.command
                     || tile.pid != info.pid
+                    || tile.created_at != info.created_at
                 {
+                    // A creation-time change reorders the grid (it's the sort key),
+                    // so it warrants a repaint just like locality/metadata changes.
                     dirty = true;
                 }
                 tile.bell = info.bell;
                 tile.locality = locality;
                 tile.command = info.command.clone();
                 tile.pid = info.pid;
+                tile.created_at = info.created_at;
             } else {
                 let model =
                     TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
@@ -568,6 +603,7 @@ impl FleetModel {
                     locality,
                     info.command.clone(),
                     info.pid,
+                    info.created_at,
                 );
                 dirty = true;
             }
@@ -613,10 +649,11 @@ impl FleetModel {
         ]
         .into_iter()
         .map(|loc| {
-            (
-                loc,
-                self.tiles.iter().filter(|t| t.locality == loc).collect(),
-            )
+            let mut ts: Vec<&Tile> = self.tiles.iter().filter(|t| t.locality == loc).collect();
+            // Stable spatial order within the section: a session keeps its slot
+            // for life regardless of enumeration order (see [`tile_order_key`]).
+            ts.sort_by_key(|t| tile_order_key(t));
+            (loc, ts)
         })
         .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
         .collect();
@@ -1202,7 +1239,7 @@ impl FleetModel {
         }
 
         let mut scene = Scene::new(self.size_px);
-        scene.layers.push(Layer { z: 0, items });
+        scene.layers.push(Layer::new(0, items));
         scene
     }
 }
@@ -1423,6 +1460,55 @@ mod tests {
             .unwrap()
             .2
             .y
+    }
+
+    /// A detached session with a recorded creation time (Unix seconds).
+    fn info_at(name: &str, created_at: i64) -> SessionInfo {
+        SessionInfo {
+            created_at: Some(created_at),
+            ..info(name)
+        }
+    }
+
+    /// Session ids in laid-out order (section order, then within-section order).
+    fn order(m: &FleetModel) -> Vec<String> {
+        m.layout().into_iter().map(|(_, id, _)| id).collect()
+    }
+
+    #[test]
+    fn within_a_section_tiles_order_by_creation_time_not_enumeration() {
+        let mut m = fleet();
+        // Enumerated in a scrambled order; creation time is the intended spatial
+        // order, so the grid must not follow how the host happened to list them.
+        m.update(UiEvent::SessionList(vec![
+            info_at("c", 30),
+            info_at("a", 10),
+            info_at("b", 20),
+        ]));
+        assert_eq!(
+            order(&m),
+            vec!["a", "b", "c"],
+            "oldest session first, regardless of enumeration order"
+        );
+        // A later reconcile in yet another order must not reshuffle the grid.
+        m.update(UiEvent::SessionList(vec![
+            info_at("b", 20),
+            info_at("c", 30),
+            info_at("a", 10),
+        ]));
+        assert_eq!(
+            order(&m),
+            vec!["a", "b", "c"],
+            "ordering is stable across reconciles"
+        );
+        // A brand-new (newest) session lands at the end; existing tiles keep slots.
+        m.update(UiEvent::SessionList(vec![
+            info_at("d", 40),
+            info_at("b", 20),
+            info_at("a", 10),
+            info_at("c", 30),
+        ]));
+        assert_eq!(order(&m), vec!["a", "b", "c", "d"]);
     }
 
     #[test]

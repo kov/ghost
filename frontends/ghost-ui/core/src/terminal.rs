@@ -303,16 +303,16 @@ impl TerminalModel {
             h: self.size_px.1 as f32,
         };
         let mut scene = Scene::new(self.size_px);
-        scene.layers.push(Layer {
-            z: 0,
-            items: vec![SceneItem::Terminal {
+        scene.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Terminal {
                 id: SceneId::Root,
                 rect,
                 frame,
                 selection: self.selection,
                 dim: false,
             }],
-        });
+        ));
         scene
     }
 

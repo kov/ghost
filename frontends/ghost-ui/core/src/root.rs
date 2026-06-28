@@ -13,11 +13,55 @@ use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
-use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, UiEvent};
+use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, Transform, UiEvent};
 
 enum Mode {
     Single(Box<TerminalModel>),
     Fleet(Box<FleetModel>),
+}
+
+/// Duration of the fleet zoom in/out animation, in milliseconds.
+const ANIM_MS: u64 = 180;
+/// Frame cadence while animating (~60 fps).
+const ANIM_TICK_MS: u64 = 16;
+
+/// An in-flight fleet zoom. The active view is rendered under `current`, a camera
+/// interpolated from `from` to `to` (always identity at rest) over `dur_ms` once
+/// the first tick stamps the start time. The mode swap is instant — this is purely
+/// the visual flourish on top — so it never gates input or the logical state.
+struct Anim {
+    from: Transform,
+    to: Transform,
+    current: Transform,
+    /// The start time, stamped on the first tick; `None` until then.
+    t0: Option<u64>,
+    dur_ms: u64,
+}
+
+impl Anim {
+    fn new(from: Transform, to: Transform) -> Self {
+        Anim {
+            from,
+            to,
+            current: from,
+            t0: None,
+            dur_ms: ANIM_MS,
+        }
+    }
+
+    /// Advance the camera to `now_ms`; returns true once the animation is done.
+    fn advance(&mut self, now_ms: u64) -> bool {
+        let t0 = *self.t0.get_or_insert(now_ms);
+        let elapsed = now_ms.saturating_sub(t0);
+        if elapsed >= self.dur_ms {
+            self.current = self.to;
+            true
+        } else {
+            let p = elapsed as f32 / self.dur_ms as f32;
+            self.current = Transform::lerp(self.from, self.to, p);
+            false
+        }
+    }
 }
 
 pub struct RootModel {
@@ -37,6 +81,10 @@ pub struct RootModel {
     /// instant and correctly sized. In the fleet, the models live in its tiles, so
     /// this is empty.
     warm: HashMap<SessionId, TerminalModel>,
+    /// The in-flight fleet zoom, if any. Purely visual: the mode swap is instant,
+    /// so this never affects logical state or input — `view` just renders the
+    /// active scene under its camera until it completes.
+    anim: Option<Anim>,
 }
 
 /// Resize a model to the window (physical px + scale), returning its commands.
@@ -75,6 +123,7 @@ impl RootModel {
             mine: HashSet::from([id.clone()]),
             primary: Some(id),
             warm: HashMap::new(),
+            anim: None,
         }
     }
 
@@ -90,6 +139,7 @@ impl RootModel {
             mine: HashSet::new(),
             primary: None,
             warm: HashMap::new(),
+            anim: None,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
@@ -98,7 +148,20 @@ impl RootModel {
         matches!(self.mode, Mode::Fleet(_))
     }
 
+    /// Whether a fleet zoom animation is currently playing.
+    pub fn is_animating(&self) -> bool {
+        self.anim.is_some()
+    }
+
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        // While a zoom plays, the animation owns the tick stream (driving the
+        // camera at ~60fps); it hands one tick back to the fleet on completion so
+        // the periodic session refresh resumes.
+        if let UiEvent::Tick { now_ms } = &ev
+            && self.anim.is_some()
+        {
+            return self.tick_anim(*now_ms);
+        }
         if let UiEvent::Key {
             key, mods, kind, ..
         } = &ev
@@ -179,6 +242,7 @@ impl RootModel {
     /// The previously-shown session is NOT detached — the window keeps it warm so
     /// Ctrl-Tab and the fleet can switch back to it.
     fn adopt(&mut self, id: SessionId) -> Vec<Cmd> {
+        let win = (self.size_px.0 as f32, self.size_px.1 as f32);
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
             String::new(),
             1,
@@ -186,8 +250,12 @@ impl RootModel {
             self.metrics,
         )));
         let current = std::mem::replace(&mut self.mode, placeholder);
+        let mut from = None;
         let (mut model, mut cmds) = match current {
             Mode::Fleet(f) => {
+                // Opening a tile zooms in from where it sat in the grid (a freshly
+                // spawned session with no tile yet simply opens without the zoom).
+                from = f.preview_rect(&id).map(|r| Transform::place_in(win, r));
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
                 // The window's other driven sessions stay warm in the background.
@@ -219,6 +287,10 @@ impl RootModel {
         self.mine.insert(id.clone());
         self.primary = Some(id);
         cmds.push(Cmd::Redraw);
+        if let Some(from) = from {
+            self.anim = Some(Anim::new(from, Transform::IDENTITY));
+            cmds.push(Cmd::ScheduleTick { after_ms: 0 });
+        }
         cmds
     }
 
@@ -251,10 +323,17 @@ impl RootModel {
     }
 
     pub fn view(&self) -> Scene {
-        match &self.mode {
+        let mut scene = match &self.mode {
             Mode::Single(m) => m.view(),
             Mode::Fleet(f) => f.view(),
+        };
+        // While zooming, render the whole active view under the animation camera.
+        if let Some(anim) = &self.anim {
+            for layer in &mut scene.layers {
+                layer.transform = anim.current;
+            }
         }
+        scene
     }
 
     /// Combined render scale (device × zoom) of the active view, so the shell
@@ -285,6 +364,7 @@ impl RootModel {
     }
 
     fn toggle(&mut self) -> Vec<Cmd> {
+        let win = (self.size_px.0 as f32, self.size_px.1 as f32);
         // Swap the mode out behind a cheap placeholder so we can move the owned
         // model/fleet into the conversion.
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
@@ -294,7 +374,7 @@ impl RootModel {
             self.metrics,
         )));
         let current = std::mem::replace(&mut self.mode, placeholder);
-        let (next, cmds) = match current {
+        let (next, mut cmds, from) = match current {
             Mode::Single(m) => {
                 // Hand the foreground and every warm background mirror to the
                 // fleet, so all of this window's previews are live, not cold.
@@ -308,9 +388,25 @@ impl RootModel {
                     self.mine.clone(),
                 );
                 cmds.insert(0, Cmd::ListSessions); // populate the grid
-                (Mode::Fleet(Box::new(fleet)), cmds)
+                // Zoom out: the fleet starts framed on the session we left and
+                // pulls back to the overview.
+                let from = self
+                    .primary
+                    .as_deref()
+                    .and_then(|p| fleet.preview_rect(p))
+                    .map(|r| Transform::zoom_to(r, win));
+                (Mode::Fleet(Box::new(fleet)), cmds, from)
             }
             Mode::Fleet(f) => {
+                // Zoom in: the single view grows from the tile we're landing on.
+                let target = self
+                    .primary
+                    .clone()
+                    .or_else(|| f.focused().map(str::to_string));
+                let from = target
+                    .as_deref()
+                    .and_then(|t| f.preview_rect(t))
+                    .map(|r| Transform::place_in(win, r));
                 let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
@@ -322,10 +418,37 @@ impl RootModel {
                 let id = model.session().to_string();
                 self.mine.insert(id.clone());
                 self.primary = Some(id);
-                (Mode::Single(Box::new(model)), cmds)
+                (Mode::Single(Box::new(model)), cmds, from)
             }
         };
         self.mode = next;
+        // Kick the (purely visual) zoom: the first scheduled tick stamps its start.
+        if let Some(from) = from {
+            self.anim = Some(Anim::new(from, Transform::IDENTITY));
+            cmds.push(Cmd::ScheduleTick { after_ms: 0 });
+        }
+        cmds
+    }
+
+    /// Advance the in-flight zoom on a clock tick: repaint (and schedule the next
+    /// frame) while running; on completion clear the animation and hand one tick
+    /// back to the fleet so its periodic session refresh resumes.
+    fn tick_anim(&mut self, now_ms: u64) -> Vec<Cmd> {
+        let Some(anim) = self.anim.as_mut() else {
+            return Vec::new();
+        };
+        let done = anim.advance(now_ms);
+        let mut cmds = vec![Cmd::Redraw];
+        if done {
+            self.anim = None;
+            if let Mode::Fleet(f) = &mut self.mode {
+                cmds.extend(f.update(UiEvent::Tick { now_ms }));
+            }
+        } else {
+            cmds.push(Cmd::ScheduleTick {
+                after_ms: ANIM_TICK_MS,
+            });
+        }
         cmds
     }
 }
@@ -461,6 +584,133 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Drive the animation clock to completion, returning the number of ticks fed.
+    fn settle(r: &mut RootModel) -> u32 {
+        let mut n = 0;
+        let mut now = 10_000;
+        while r.is_animating() && n < 1000 {
+            r.update(UiEvent::Tick { now_ms: now });
+            now += 16;
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn f9_starts_a_zoom_animation_and_completes() {
+        let mut r = root(); // single view of alpha (owned)
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet(), "the mode swaps immediately");
+        assert!(r.is_animating(), "F9 starts a zoom animation");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the animation is kicked by scheduling a tick: {cmds:?}"
+        );
+        // A tick mid-flight re-arms the next frame and keeps animating.
+        let mid = r.update(UiEvent::Tick { now_ms: 1_000 });
+        assert!(r.is_animating(), "still animating shortly after the start");
+        assert!(
+            mid.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "an in-flight tick re-arms the next frame: {mid:?}"
+        );
+        // A tick past the duration completes the animation and stops re-arming.
+        let done = r.update(UiEvent::Tick {
+            now_ms: 1_000 + 10_000,
+        });
+        assert!(!r.is_animating(), "completes after its duration");
+        assert!(
+            done.contains(&Cmd::Redraw),
+            "a final repaint settles it: {done:?}"
+        );
+        assert!(
+            !done.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "a completed animation stops scheduling frames: {done:?}"
+        );
+    }
+
+    #[test]
+    fn the_view_carries_the_camera_while_animating_then_settles_to_identity() {
+        use crate::Transform;
+        let mut r = root();
+        r.update(UiEvent::Resize {
+            w_px: 1000,
+            h_px: 700,
+            scale: 1.0,
+        });
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet, zoom-out
+        r.update(UiEvent::Tick { now_ms: 5_000 }); // progress 0: camera = "from"
+        let scene = r.view();
+        assert!(
+            scene
+                .layers
+                .iter()
+                .any(|l| l.transform != Transform::IDENTITY),
+            "mid-zoom the world renders under a non-identity camera"
+        );
+        settle(&mut r);
+        let scene = r.view();
+        assert!(
+            scene
+                .layers
+                .iter()
+                .all(|l| l.transform == Transform::IDENTITY),
+            "after the zoom the fleet renders untransformed"
+        );
+    }
+
+    #[test]
+    fn zoom_animation_does_not_block_input_routing() {
+        // The animation is purely visual: the mode swaps instantly, so input still
+        // routes to the freshly-shown session even while the camera is mid-flight.
+        let mut r = root();
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet (animating)
+        assert!(r.is_animating());
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single (animating)
+        assert!(!r.is_fleet(), "mode is single immediately");
+        assert_eq!(
+            r.update(UiEvent::Text("z".into())),
+            vec![Cmd::SendInput {
+                session: "alpha".into(),
+                bytes: b"z".to_vec()
+            }],
+            "text routes to the session even while the zoom plays"
+        );
+    }
+
+    #[test]
+    fn opening_a_fleet_tile_animates_the_zoom_in() {
+        let mut r = root(); // owns alpha
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
+        settle(&mut r);
+        r.update(UiEvent::SessionList(vec![
+            info("alpha", true),
+            info("beta", false),
+        ]));
+        // The shell attaches a clicked tile, then replies AdoptSession.
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(!r.is_fleet(), "adopting drops into the single view");
+        assert!(r.is_animating(), "opening a tile plays a zoom-in");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the zoom is kicked by scheduling a tick: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn adopting_a_session_without_a_tile_does_not_animate() {
+        // A freshly spawned session has no tile in the grid yet, so there's nothing
+        // to zoom from — it just opens.
+        let mut r = root();
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        settle(&mut r);
+        let cmds = r.update(UiEvent::AdoptSession("gamma".into())); // never listed
+        assert!(!r.is_animating(), "no tile to zoom from → no animation");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "no zoom scheduled: {cmds:?}"
+        );
     }
 
     #[test]
