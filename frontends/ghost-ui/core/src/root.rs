@@ -517,6 +517,7 @@ mod tests {
 
     #[test]
     fn window_and_session_shortcuts_are_intercepted_above_the_view() {
+        // Window management: Cmd+X on macOS, Ctrl+Shift+X elsewhere.
         for chord in [Mods::SUPER, Mods::CTRL | Mods::SHIFT] {
             let mut r = root();
             assert_eq!(
@@ -527,11 +528,18 @@ mod tests {
                 key(&mut r, Key::Char("w".into()), chord),
                 vec![Cmd::CloseWindow]
             );
-            assert_eq!(
-                key(&mut r, Key::Char("t".into()), chord),
-                vec![Cmd::SpawnSession]
-            );
         }
+        // New session is Cmd+T on macOS, Alt+T elsewhere.
+        let new_session = if cfg!(target_os = "macos") {
+            Mods::SUPER
+        } else {
+            Mods::ALT
+        };
+        let mut r = root();
+        assert_eq!(
+            key(&mut r, Key::Char("t".into()), new_session),
+            vec![Cmd::SpawnSession]
+        );
         // They also fire in the fleet overview, which may have no focused tile to
         // forward keys to — so they can't be left to the per-terminal path.
         let (mut f, _) = RootModel::fleet(METRICS, SIZE, 1.0);
@@ -541,7 +549,7 @@ mod tests {
             vec![Cmd::NewWindow]
         );
         assert_eq!(
-            key(&mut f, Key::Char("t".into()), Mods::SUPER),
+            key(&mut f, Key::Char("t".into()), new_session),
             vec![Cmd::SpawnSession]
         );
         // Bare Ctrl+N (no Shift) is NOT a shortcut: it must reach the child.

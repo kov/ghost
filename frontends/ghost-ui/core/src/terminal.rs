@@ -72,7 +72,7 @@ pub enum Shortcut {
     NewWindow,
     /// Close this window (Cmd+W / Ctrl+Shift+W).
     CloseWindow,
-    /// Spawn a fresh session in this window (Cmd+T / Ctrl+Shift+T).
+    /// Spawn a fresh session in this window and switch to it (Cmd+T / Alt+T).
     NewSession,
 }
 
@@ -81,6 +81,18 @@ pub enum Shortcut {
 /// Cmd / Ctrl+Shift combo so a bare Ctrl+C still sends SIGINT, while zoom uses
 /// plain Cmd/Ctrl + `+`/`=`/`-`/`0` (matching ghost-gtk's `<Primary>` accels).
 pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
+    // New session: Cmd+T on macOS, Alt+T elsewhere. Checked first because Alt+T is
+    // not a "primary" (Cmd/Ctrl) chord, yet must still resolve here rather than be
+    // encoded and sent to the child as Meta+T.
+    let new_session = if cfg!(target_os = "macos") {
+        mods.sup && !mods.ctrl && !mods.alt
+    } else {
+        mods.alt && !mods.sup && !mods.ctrl
+    };
+    if new_session && matches!(key, Key::Char(s) if s.eq_ignore_ascii_case("t")) {
+        return Some(Shortcut::NewSession);
+    }
+
     let primary = mods.sup || mods.ctrl;
     if !primary {
         return None;
@@ -92,11 +104,10 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
             // Cmd+Q (macOS) / Ctrl+Shift+Q (elsewhere) quits — never bare Ctrl+Q,
             // which must stay XOFF flow control.
             Key::Char(s) if s.eq_ignore_ascii_case("q") => return Some(Shortcut::Quit),
-            // Window/session management, same Cmd / Ctrl+Shift gating: new window,
-            // close window, new session. Bare Ctrl+N/W/T stay terminal input.
+            // Window management, same Cmd / Ctrl+Shift gating. Bare Ctrl+N/W stay
+            // terminal input.
             Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
             Key::Char(s) if s.eq_ignore_ascii_case("w") => return Some(Shortcut::CloseWindow),
-            Key::Char(s) if s.eq_ignore_ascii_case("t") => return Some(Shortcut::NewSession),
             _ => {}
         }
     }
@@ -1583,6 +1594,40 @@ mod tests {
             key(&mut m, Key::Char("q".into()), Mods::CTRL),
             vec![sent("alpha", b"\x11")],
             "bare Ctrl+Q is XOFF, not quit"
+        );
+    }
+
+    #[test]
+    fn new_session_shortcut_is_cmd_t_on_macos_and_alt_t_elsewhere() {
+        let mut m = model();
+        // The platform's new-session chord spawns a fresh session.
+        let chord = if cfg!(target_os = "macos") {
+            Mods::SUPER
+        } else {
+            Mods::ALT
+        };
+        assert_eq!(
+            key(&mut m, Key::Char("t".into()), chord),
+            vec![Cmd::SpawnSession],
+            "the platform new-session chord spawns a session"
+        );
+        // Bare 't' is ordinary terminal input.
+        assert_eq!(
+            key(&mut m, Key::Char("t".into()), Mods::NONE),
+            vec![sent("alpha", b"t")],
+            "bare t is terminal input"
+        );
+        // The other platform's modifier must NOT spawn — on Linux the former
+        // Ctrl+Shift+T no longer has a binding; on macOS Option+T types a glyph.
+        let other = if cfg!(target_os = "macos") {
+            Mods::ALT
+        } else {
+            Mods::CTRL | Mods::SHIFT
+        };
+        assert_ne!(
+            key(&mut m, Key::Char("t".into()), other),
+            vec![Cmd::SpawnSession],
+            "the non-platform chord does not spawn a session"
         );
     }
 
