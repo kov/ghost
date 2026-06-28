@@ -57,79 +57,74 @@ fn main() {
     println!("wrote {which} scene ({w}x{h}) to {out}");
 }
 
-/// Benchmark the fleet hot path: `tiles` live, window-sized previews, then
-/// `frames` rounds of (move focus → rebuild scene → render) — exactly what an
-/// arrow-key press triggers. Reports model vs. render time so `perf record` can
-/// attribute the cost. The screens are filled so each preview carries a realistic
-/// number of glyphs.
+/// Benchmark the real fleet hot path through `RootModel`, mirroring the user
+/// flow: open a fresh window (fleet, owning nothing) → attach `tiles` sessions
+/// (each becomes the foreground briefly and prints a full screen) → F9 into the
+/// fleet → then `frames` rounds of arrow-nav between the tiles (move focus →
+/// rebuild scene → render). Reports model vs. render time so `perf record` can
+/// attribute the cost. This is exactly what holding an arrow key in the fleet does.
 fn bench(tiles: usize, frames: usize) {
     use std::time::Instant;
 
     let size = (1400u32, 900u32);
-    let names: Vec<String> = (0..tiles).map(|i| format!("s{i}")).collect();
-    let mine: HashSet<String> = names.iter().cloned().collect();
+    let key = |k: NamedKey| UiEvent::Key {
+        key: Key::Named(k),
+        mods: Mods::NONE,
+        kind: KeyEventKind::Press,
+        alts: None,
+    };
 
-    // Build `tiles` window-sized terminals, each with a full screen of text.
-    let mut models: Vec<TerminalModel> = names
-        .iter()
-        .map(|name| {
-            let mut m = TerminalModel::new(name.clone(), 80, 24, METRICS);
-            m.update(UiEvent::Resize {
-                w_px: size.0,
-                h_px: size.1,
-                scale: 1.0,
-            });
-            m.update(UiEvent::SessionData {
-                name: name.clone(),
-                bytes: dense_screen().into_bytes(),
-                ended: false,
-            });
-            m
-        })
-        .collect();
-    let primary = models.remove(0);
-    let (mut fleet, _) = FleetModel::adopting(primary, models, METRICS, size, 1.0, mine);
-    fleet.update(UiEvent::SessionList(
-        names
-            .iter()
-            .map(|n| info(n, true, &["program", "--flag"], 1000))
-            .collect(),
-    ));
+    // A freshly-opened window starts in the fleet overview, owning nothing.
+    let (mut root, _) = RootModel::fleet(METRICS, size, 1.0);
+    root.update(UiEvent::Resize {
+        w_px: size.0,
+        h_px: size.1,
+        scale: 1.0,
+    });
+    // Attach `tiles` sessions the way the shell does (spawn / take-over reply with
+    // AdoptSession), each producing a full screen of output.
+    for i in 0..tiles {
+        let name = format!("s{i}");
+        root.update(UiEvent::AdoptSession(name.clone()));
+        root.update(UiEvent::SessionData {
+            name,
+            bytes: dense_screen().into_bytes(),
+            ended: false,
+        });
+    }
+    // Open the fleet overview (F9).
+    root.update(key(NamedKey::F9));
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
     let mut renderer = Renderer::headless(Theme::default());
+    let px = |r: &RootModel| SIZE_PX * r.render_scale();
 
-    // Warm up (first frame builds the glyph atlas + caches).
-    let _ = renderer.render_offscreen_scene(&fleet.view(), font, SIZE_PX);
-    let builds_before = fleet.frame_builds();
+    // Warm up (first frame builds the glyph atlas + shaping/frame caches).
+    let _ = renderer.render_offscreen_scene(&root.view(), font, px(&root));
 
-    let dirs = [NamedKey::ArrowDown, NamedKey::ArrowRight, NamedKey::ArrowUp];
+    let dirs = [
+        NamedKey::ArrowDown,
+        NamedKey::ArrowRight,
+        NamedKey::ArrowUp,
+        NamedKey::ArrowLeft,
+    ];
     let (mut model_ns, mut render_ns) = (0u128, 0u128);
     for i in 0..frames {
         let nav = Instant::now();
-        fleet.update(UiEvent::Key {
-            key: Key::Named(dirs[i % dirs.len()]),
-            mods: Mods::NONE,
-            kind: KeyEventKind::Press,
-            alts: None,
-        });
-        let scene = fleet.view();
+        root.update(key(dirs[i % dirs.len()]));
+        let scene = root.view();
         model_ns += nav.elapsed().as_nanos();
 
         let r = Instant::now();
-        let _ = renderer.render_offscreen_scene(&scene, font, SIZE_PX);
+        let _ = renderer.render_offscreen_scene(&scene, font, px(&root));
         render_ns += r.elapsed().as_nanos();
     }
 
     let per = |ns: u128| (ns as f64) / (frames as f64) / 1.0e6;
-    println!("bench: {tiles} live window-sized tiles, {frames} nav frames");
+    println!("bench: {tiles} attached sessions, fleet open, {frames} arrow-nav frames");
     println!("  model  (update + view): {:.3} ms/frame", per(model_ns));
     println!("  render (build + raster): {:.3} ms/frame", per(render_ns));
-    println!(
-        "  total: {:.3} ms/frame; frame relayouts during nav = {} (want 0)",
-        per(model_ns + render_ns),
-        fleet.frame_builds() - builds_before
-    );
+    println!("  total: {:.3} ms/frame", per(model_ns + render_ns));
 }
 
 /// A full 80×24 screen of varied, coloured glyphs — a dense-ish preview.
