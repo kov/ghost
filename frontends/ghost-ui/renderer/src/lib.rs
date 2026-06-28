@@ -7,12 +7,12 @@
 //! color resolution are handled here; glyph shaping (with ligatures) comes from
 //! `ghost-shaper`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use ghost_render::{
-    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
-    Style,
+    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneId, SceneItem,
+    Selection, Style,
 };
 use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -435,6 +435,14 @@ fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
     let a = texel.a * in.color.a;
     return vec4<f32>(texel.rgb * a, a);
 }
+
+// Blit variant for cached previews: the bound texture was rendered with the glyph
+// pipeline, so it is *already* premultiplied — composite it as-is (scaled by the
+// instance alpha, which stays valid premultiplied) rather than premultiplying again.
+@fragment
+fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(atlas, samp, in.uv) * in.color.a;
+}
 "#;
 
 /// One kitty-graphics image to paint this frame: which uploaded image (by id),
@@ -471,9 +479,38 @@ const OPAQUE_UV: [f32; 4] = [
 
 /// A contiguous run of instances and the scissor rect (`x, y, w, h`, framebuffer
 /// pixels) it must be clipped to when drawn.
-struct DrawGroup {
-    scissor: [u32; 4],
-    range: std::ops::Range<u32>,
+/// One unit of the scene's main render pass, in painter order. Glyph/solid
+/// content draws from the shared instance buffer; a preview blits its cached
+/// texture. Walking these in order (rather than all glyphs then all images) keeps
+/// z-order correct — e.g. the take-over overlay and focus border, emitted after a
+/// tile, draw over its preview.
+enum Draw {
+    /// A run of glyph/solid instances (chrome, the single view, dim overlays).
+    Glyphs {
+        scissor: [u32; 4],
+        range: std::ops::Range<u32>,
+    },
+    /// Blit cached preview `id`'s texture (quad `quad` of the preview buffer).
+    Preview {
+        scissor: [u32; 4],
+        quad: u32,
+        id: SceneId,
+    },
+}
+
+/// A fleet tile's preview rendered once to its own texture, then blitted on every
+/// repaint until its content or size changes. Caching the pixels means navigation
+/// (and unchanged tiles while another is busy) re-rasterizes nothing — the win
+/// that matters on a software rasterizer.
+struct CachedPreview {
+    /// Kept alive for the bind group that samples it.
+    _texture: wgpu::Texture,
+    /// Samples `_texture` in the main pass (uniform + view + sampler).
+    bind_group: wgpu::BindGroup,
+    /// The content this texture was rendered from; a different frame re-renders.
+    frame: Frame,
+    /// Texture (= tile) pixel size; a resize/relayout re-renders.
+    size: (u32, u32),
 }
 
 /// Translate every instance's screen rect by `(dx, dy)`.
@@ -505,6 +542,11 @@ fn preview_scale(frame: &Frame, rect: RectPx) -> f32 {
     }
     (rect.w / fw).min(rect.h / fh).min(1.0)
 }
+
+/// Translucent black overlaid on an unfocused preview tile to dim it. The alpha
+/// matches [`dim_colors`]' 0.55 RGB factor (a `1.0 - 0.55` black "over"); colors
+/// are straight-alpha here (the fragment shader premultiplies).
+const DIM_OVERLAY: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
 
 /// Darken instance colors (RGB only) for an unfocused/dimmed tile.
 fn dim_colors(insts: &mut [Instance]) {
@@ -659,6 +701,17 @@ pub struct Renderer {
     /// RGBA pipeline for kitty-graphics image quads (samples `.rgba`, unlike the
     /// glyph pipeline which reads the `.r` coverage atlas).
     image_pipeline: wgpu::RenderPipeline,
+    /// Blit pipeline for cached preview textures — like `image_pipeline` but with
+    /// the passthrough `fs_blit` (the texture is already premultiplied).
+    preview_pipeline: wgpu::RenderPipeline,
+    /// Cached preview textures by tile id (see [`CachedPreview`]).
+    preview_cache: HashMap<SceneId, CachedPreview>,
+    /// One blit quad per preview drawn this scene, parallel to the `Draw::Preview`
+    /// quad indices.
+    preview_instances: Option<wgpu::Buffer>,
+    /// Count of preview textures actually (re)rendered — a cache miss. A test
+    /// asserts an unchanged repaint re-renders none.
+    preview_renders: u32,
     /// Uploaded image bind groups, keyed by image id; the blob is sent once and
     /// the bind group (which owns its texture) lives until eviction.
     image_bind_groups: HashMap<u32, wgpu::BindGroup>,
@@ -864,6 +917,41 @@ impl Renderer {
                 cache: None,
             });
 
+        // The preview-blit pipeline: identical to the image pipeline but with the
+        // passthrough fragment, since a cached preview texture is already
+        // premultiplied (rendered through the glyph pipeline).
+        let preview_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("preview pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &ATTRS,
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_blit"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Renderer {
             gpu,
             pipeline,
@@ -885,6 +973,10 @@ impl Renderer {
             bind_layout,
             sampler,
             image_pipeline,
+            preview_pipeline,
+            preview_cache: HashMap::new(),
+            preview_instances: None,
+            preview_renders: 0,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
             image_instances: None,
@@ -1074,6 +1166,164 @@ impl Renderer {
             .ceil()
             .max(1.0) as u32;
         (w, h)
+    }
+
+    /// Pixel size a preview texture/blit uses for `rect` (the tile size, ≥ 1).
+    fn preview_size(rect: RectPx) -> (u32, u32) {
+        ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
+    }
+
+    /// Ensure tile `id`'s preview texture is current for `frame` at `rect`,
+    /// (re)rendering only on a content or size change. The main pass then blits
+    /// the cached texture, so an unchanged tile re-rasterizes nothing — the win
+    /// that keeps fleet navigation cheap on a software rasterizer.
+    fn ensure_preview(
+        &mut self,
+        id: SceneId,
+        frame: &Frame,
+        rect: RectPx,
+        font: FontRef,
+        size_px: f32,
+    ) {
+        let size = Self::preview_size(rect);
+        if self
+            .preview_cache
+            .get(&id)
+            .is_some_and(|c| c.size == size && c.frame == *frame)
+        {
+            return; // cache hit: blit the existing texture
+        }
+        let preview = self.render_preview_texture(frame, rect, font, size_px);
+        self.preview_renders += 1;
+        self.preview_cache.insert(id, preview);
+    }
+
+    /// Render `frame` (scaled to "contain" within `rect`) to its own texture and
+    /// build the bind group that samples it. The shared viewport uniform is set to
+    /// the texture size for this sub-pass; `prepare_scene` resets it to the scene
+    /// size before the main pass, which always runs after every preview sub-pass.
+    fn render_preview_texture(
+        &mut self,
+        frame: &Frame,
+        rect: RectPx,
+        font: FontRef,
+        size_px: f32,
+    ) -> CachedPreview {
+        let size = Self::preview_size(rect);
+        let (tw, th) = size;
+
+        // Full-size glyphs shrunk to the tile (the same GPU minification the inline
+        // preview used), left at the texture origin; the blit applies the offset.
+        let mut insts = self.build_instances(frame, font, size_px, None);
+        let s = preview_scale(frame, rect);
+        if s < 1.0 {
+            scale_instances(&mut insts, s);
+        }
+
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview"),
+            size: wgpu::Extent3d {
+                width: tw,
+                height: th,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Point the shared viewport uniform at this texture for the sub-pass.
+        let uniforms = Uniforms {
+            viewport: [tw as f32, th as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let buf = (!insts.is_empty()).then(|| {
+            self.gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("preview instances"),
+                    contents: bytemuck::cast_slice(&insts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        // Transparent clear: default-background cells emit no quad,
+                        // so the card behind the blit shows through, matching the
+                        // inline preview (which drew straight over the card).
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(buf) = &buf {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..insts.len() as u32);
+            }
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("preview bind group"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+        CachedPreview {
+            _texture: texture,
+            bind_group,
+            frame: frame.clone(),
+            size,
+        }
+    }
+
+    /// Count of preview textures (re)rendered (cache misses). A test asserts an
+    /// unchanged repaint re-renders none.
+    pub fn preview_renders(&self) -> u32 {
+        self.preview_renders
     }
 
     /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
@@ -1483,63 +1733,114 @@ impl Renderer {
         }
     }
 
-    /// Build a scene's combined instance list plus the per-item draw groups
-    /// (each carrying the scissor rect it must be clipped to). Layers are walked
-    /// low `z` to high; items keep insertion order within a layer. A `Terminal`
-    /// reuses [`Self::build_instances`] translated to its rect and clipped to it
-    /// (without the clip, neighbouring tiles would bleed into each other).
+    /// Build a scene's draws in painter order. Glyph/solid content accumulates in
+    /// one instance list (returned, drawn by range); a scaled `Terminal` (a fleet
+    /// preview) instead renders to a cached texture and emits a blit, whose tile
+    /// rect is collected into `blits`. Layers are walked low `z` to high, items in
+    /// insertion order within a layer. Terminals clip to their rect (so neighbours
+    /// don't bleed); chrome may draw anywhere. The full-window single view
+    /// (`preview_scale == 1.0`) still builds glyphs inline, byte-identical to before.
     fn build_scene(
         &mut self,
         scene: &Scene,
         font: FontRef,
         size_px: f32,
-    ) -> (Vec<Instance>, Vec<DrawGroup>, Vec<ImageDraw>) {
+    ) -> (Vec<Instance>, Vec<Draw>, Vec<ImageDraw>, Vec<RectPx>) {
         let (sw, sh) = scene.size_px;
         let mut all: Vec<Instance> = Vec::new();
-        let mut groups: Vec<DrawGroup> = Vec::new();
+        let mut draws: Vec<Draw> = Vec::new();
         let mut images: Vec<ImageDraw> = Vec::new();
+        let mut blits: Vec<RectPx> = Vec::new();
+        let mut seen: HashSet<SceneId> = HashSet::new();
         let mut order: Vec<&Layer> = scene.layers.iter().collect();
         order.sort_by_key(|l| l.z); // stable: keeps insertion order within a z
 
+        // Push `insts` into `all` as one glyph draw under `scissor`, if non-empty.
+        let push_glyphs =
+            |all: &mut Vec<Instance>, draws: &mut Vec<Draw>, scissor, insts: Vec<Instance>| {
+                let start = all.len() as u32;
+                all.extend(insts);
+                let end = all.len() as u32;
+                if end > start {
+                    draws.push(Draw::Glyphs {
+                        scissor,
+                        range: start..end,
+                    });
+                }
+            };
+
         for layer in order {
             for item in &layer.items {
-                let start = all.len() as u32;
-                // Only terminals clip to their rect; chrome may legitimately draw
-                // anywhere (e.g. a border one pixel outside its content box).
                 let scissor = match item {
                     SceneItem::Terminal { rect, .. } => clamp_scissor(*rect, sw, sh),
                     _ => [0, 0, sw, sh],
                 };
                 match item {
                     SceneItem::Terminal {
+                        id,
                         rect,
                         frame,
                         selection,
                         dim,
-                        ..
                     } => {
-                        let mut insts = self.build_instances(frame, font, size_px, *selection);
-                        // A preview frame is laid out at the session's real size;
-                        // shrink it to "contain" within the tile. 1.0 = no scaling
-                        // (the full-window single view, where frame == surface).
-                        let s = preview_scale(frame, *rect);
-                        if s < 1.0 {
-                            scale_instances(&mut insts, s);
+                        if preview_scale(frame, *rect) < 1.0 {
+                            // Preview: blit a cached texture (re-rendered only when
+                            // its content or size changes) instead of re-rasterizing
+                            // the glyphs every frame. Selection isn't shown in the
+                            // read-only previews, so the cache keys on frame alone.
+                            self.ensure_preview(*id, frame, *rect, font, size_px);
+                            seen.insert(*id);
+                            draws.push(Draw::Preview {
+                                scissor,
+                                quad: blits.len() as u32,
+                                id: *id,
+                            });
+                            blits.push(*rect);
+                            if *dim {
+                                // Darken the unfocused tile with a translucent
+                                // overlay over the blit (matches `dim_colors`'
+                                // 0.55 RGB factor: black at 1.0 - 0.55 alpha).
+                                push_glyphs(
+                                    &mut all,
+                                    &mut draws,
+                                    scissor,
+                                    vec![solid(*rect, DIM_OVERLAY)],
+                                );
+                            }
+                        } else {
+                            // Full-window single view: glyphs inline, as before.
+                            let mut insts = self.build_instances(frame, font, size_px, *selection);
+                            translate(&mut insts, rect.x, rect.y);
+                            if *dim {
+                                dim_colors(&mut insts);
+                            }
+                            push_glyphs(&mut all, &mut draws, scissor, insts);
+                            self.collect_image_draws(
+                                frame,
+                                rect.x,
+                                rect.y,
+                                1.0,
+                                scissor,
+                                &mut images,
+                            );
                         }
-                        translate(&mut insts, rect.x, rect.y);
-                        if *dim {
-                            dim_colors(&mut insts);
-                        }
-                        all.extend(insts);
-                        self.collect_image_draws(frame, rect.x, rect.y, s, scissor, &mut images);
                     }
-                    SceneItem::Rect { rect, color, .. } => all.push(solid(*rect, *color)),
+                    SceneItem::Rect { rect, color, .. } => {
+                        push_glyphs(&mut all, &mut draws, scissor, vec![solid(*rect, *color)])
+                    }
                     SceneItem::Border {
                         rect, color, width, ..
-                    } => push_border(&mut all, *rect, *color, *width),
-                    SceneItem::Badge { rect, kind, .. } => {
-                        all.push(solid(*rect, badge_color(*kind)))
+                    } => {
+                        let mut insts = Vec::new();
+                        push_border(&mut insts, *rect, *color, *width);
+                        push_glyphs(&mut all, &mut draws, scissor, insts);
                     }
+                    SceneItem::Badge { rect, kind, .. } => push_glyphs(
+                        &mut all,
+                        &mut draws,
+                        scissor,
+                        vec![solid(*rect, badge_color(*kind))],
+                    ),
                     SceneItem::Text {
                         rect,
                         runs,
@@ -1548,19 +1849,14 @@ impl Renderer {
                         ..
                     } => {
                         let t = self.text_instances(*rect, runs, *metrics, *color, font, size_px);
-                        all.extend(t);
+                        push_glyphs(&mut all, &mut draws, scissor, t);
                     }
-                }
-                let end = all.len() as u32;
-                if end > start {
-                    groups.push(DrawGroup {
-                        scissor,
-                        range: start..end,
-                    });
                 }
             }
         }
-        (all, groups, images)
+        // Drop textures for tiles no longer on screen, bounding cache memory.
+        self.preview_cache.retain(|id, _| seen.contains(id));
+        (all, draws, images, blits)
     }
 
     /// Glyph instances for a text item: its runs laid out as one line from
@@ -1604,11 +1900,38 @@ impl Renderer {
         out
     }
 
-    /// Upload a scene's instances and viewport uniform; return the draw groups.
-    fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<DrawGroup> {
-        let (instances, groups, images) = self.build_scene(scene, font, size_px);
+    /// One blit quad per preview, parallel to the `Draw::Preview` quad indices.
+    fn build_preview_instances(&mut self, blits: &[RectPx]) {
+        if blits.is_empty() {
+            self.preview_instances = None;
+            return;
+        }
+        let insts: Vec<Instance> = blits
+            .iter()
+            .map(|r| Instance {
+                rect: [r.x, r.y, r.w, r.h],
+                uv: [0.0, 0.0, 1.0, 1.0], // sample the whole preview texture
+                color: [1.0, 1.0, 1.0, 1.0],
+            })
+            .collect();
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.preview_instances,
+            &mut self.buffer_allocs,
+            "preview blits",
+            &insts,
+        );
+    }
+
+    /// Upload a scene's instances and viewport uniform; return the ordered draws.
+    /// `build_scene` runs every preview sub-pass first (each repointing the shared
+    /// uniform), so the scene-size uniform write here must come last.
+    fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<Draw> {
+        let (instances, draws, images, blits) = self.build_scene(scene, font, size_px);
         self.image_draws = images;
         self.build_image_instances();
+        self.build_preview_instances(&blits);
         self.instance_count = instances.len() as u32;
         Self::upload_instances(
             &self.gpu.device,
@@ -1626,11 +1949,14 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-        groups
+        draws
     }
 
-    /// Clear once, then draw each group under its own scissor rect.
-    fn encode_scene(&self, view: &wgpu::TextureView, groups: &[DrawGroup]) -> wgpu::CommandBuffer {
+    /// Clear once, then walk `draws` in painter order, switching pipeline as each
+    /// glyph run or preview blit requires (so chrome drawn after a tile — focus
+    /// border, take-over overlay — composites over its preview). Kitty images draw
+    /// last, as before.
+    fn encode_scene(&self, view: &wgpu::TextureView, draws: &[Draw]) -> wgpu::CommandBuffer {
         let mut encoder = self
             .gpu
             .device
@@ -1660,23 +1986,37 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // The `> 0` guard mirrors `encode`: an empty scene (e.g. a blank
-            // screen with a hidden cursor) produces no instances, and slicing a
-            // zero-size vertex buffer panics. The clear above still happens, so
-            // an empty scene reads back as the solid background — byte-identical
-            // to `render_offscreen` on the same empty frame.
-            if let Some(buf) = &self.instances
-                && self.instance_count > 0
-            {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                for g in groups {
-                    if g.scissor[2] == 0 || g.scissor[3] == 0 {
-                        continue; // fully off-screen tile: nothing to draw
+            // An empty scene (e.g. a blank screen, hidden cursor) emits no draws;
+            // the clear above still yields the solid background, byte-identical to
+            // `render_offscreen` on the same empty frame.
+            for d in draws {
+                match d {
+                    Draw::Glyphs { scissor, range } => {
+                        if scissor[2] == 0 || scissor[3] == 0 {
+                            continue; // fully off-screen
+                        }
+                        let Some(buf) = &self.instances else { continue };
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                        pass.draw(0..6, range.clone());
                     }
-                    pass.set_scissor_rect(g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]);
-                    pass.draw(0..6, g.range.clone());
+                    Draw::Preview { scissor, quad, id } => {
+                        if scissor[2] == 0 || scissor[3] == 0 {
+                            continue;
+                        }
+                        let (Some(buf), Some(cached)) =
+                            (&self.preview_instances, self.preview_cache.get(id))
+                        else {
+                            continue; // texture evicted/missing: skip rather than err
+                        };
+                        pass.set_pipeline(&self.preview_pipeline);
+                        pass.set_bind_group(0, &cached.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                        pass.draw(0..6, *quad..*quad + 1);
+                    }
                 }
             }
             self.draw_images(&mut pass);

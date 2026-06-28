@@ -344,6 +344,50 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
 }
 
 #[test]
+fn an_unchanged_preview_is_not_re_rasterized() {
+    // Two scaled previews (a real-size frame shrunk into a small tile). Rendering
+    // the scene twice must re-render zero preview textures the second time — the
+    // cache turns fleet nav and idle tiles into cheap blits, the whole point of RTT.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let frame = {
+        let mut vt = Vt::new(80, 24); // 720x432 px at METRICS
+        vt.feed_str("preview content => fn main() { let answer = 42; }");
+        layout_frame(&vt, METRICS)
+    };
+    let tile = |id, x: f32| SceneItem::Terminal {
+        id,
+        rect: RectPx {
+            x,
+            y: 0.0,
+            w: 360.0,
+            h: 216.0,
+        }, // 0.5x: preview_scale < 1
+        frame: frame.clone(),
+        selection: None,
+        dim: false,
+    };
+    let mut scene = Scene::new((800, 240));
+    scene.layers.push(Layer {
+        z: 0,
+        items: vec![tile(SceneId::Tile(0), 0.0), tile(SceneId::Tile(1), 380.0)],
+    });
+
+    let mut r = Renderer::headless(Theme::default());
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        r.preview_renders(),
+        2,
+        "the first paint renders both preview textures"
+    );
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        r.preview_renders(),
+        2,
+        "an unchanged repaint blits the cache, re-rasterizing nothing"
+    );
+}
+
+#[test]
 fn an_identical_repaint_reshapes_nothing() {
     // Shaping dominates per-frame CPU. The cache must make a repaint of unchanged
     // text re-shape nothing, so fleet navigation and idle previews stay cheap.
