@@ -391,13 +391,40 @@ impl FleetModel {
     }
 
     /// The on-screen preview rect of a tile (post-scroll), exactly as [`view`](Self::view)
-    /// draws the little terminal — the camera target the fleet-zoom animation frames.
+    /// draws the little terminal — the box the session's frame is fit into.
     /// `None` if the tile isn't present.
     pub fn preview_rect(&self, id: &str) -> Option<RectPx> {
         let (_, placements, band, _) = self.sections_layout();
         let (_, _, mut rect) = placements.into_iter().find(|(_, i, _)| i == id)?;
         rect.y -= self.scroll_y;
         Some(card_layout(rect, band).1)
+    }
+
+    /// The on-screen rect the session's *content* actually occupies in its tile: its
+    /// frame contain-fit into the preview box, anchored at the box's top-left, exactly
+    /// as the renderer draws the preview. This — not the preview box, which is shaped
+    /// to a fixed aspect — is the camera target for the fleet-zoom, so a full zoom
+    /// lands the session at native size and matches the live single view, with no
+    /// scale jump at the dive boundary. `None` if the tile isn't present.
+    pub fn dive_target_rect(&self, id: &str) -> Option<RectPx> {
+        let preview = self.preview_rect(id)?;
+        let tile = self.tiles.iter().find(|t| t.id == id)?;
+        let (cols, rows) = tile.model.dims();
+        let (fw, fh) = (
+            cols as f32 * self.metrics.advance,
+            rows as f32 * self.metrics.line_height,
+        );
+        if fw <= 0.0 || fh <= 0.0 {
+            return Some(preview);
+        }
+        // Contain-fit, never magnifying — matching the renderer's preview scale.
+        let s = (preview.w / fw).min(preview.h / fh).min(1.0);
+        Some(RectPx {
+            x: preview.x,
+            y: preview.y,
+            w: fw * s,
+            h: fh * s,
+        })
     }
 
     /// Extract a single terminal for a toggle back to the single view, detaching
@@ -1664,6 +1691,50 @@ mod tests {
         });
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::Resize { .. })));
         assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn the_dive_target_matches_the_session_aspect_not_the_card_box() {
+        // A window-sized session has the window's aspect (1400:900 ≈ 1.56), which is
+        // not the card's fixed 80×24 preview-box aspect (≈ 1.67).
+        let win = (1400u32, 900u32);
+        let mut primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        primary.update(UiEvent::Resize {
+            w_px: win.0,
+            h_px: win.1,
+            scale: 1.0,
+        });
+        let (cols, rows) = primary.dims();
+        let session_aspect = (cols as f32 * METRICS.advance) / (rows as f32 * METRICS.line_height);
+        let mine = HashSet::from(["alpha".to_string()]);
+        let (f, _) = FleetModel::adopting(primary, Vec::new(), METRICS, win, 1.0, mine);
+
+        let aspect = |r: RectPx| r.w / r.h;
+        let target = f.dive_target_rect("alpha").expect("the tile is present");
+        let preview = f.preview_rect("alpha").expect("the tile is present");
+
+        // The dive aims at where the content is actually drawn, so a cover-zoom lands
+        // the session at native size (matching the live single view) — no boundary pop.
+        assert!(
+            (aspect(target) - session_aspect).abs() < 0.02,
+            "dive target aspect {} should match the session aspect {session_aspect}",
+            aspect(target)
+        );
+        // Which is meaningfully different from the fixed-aspect preview box (the bug).
+        assert!(
+            (aspect(preview) - aspect(target)).abs() > 0.05,
+            "and should differ from the preview box aspect ({} vs {})",
+            aspect(preview),
+            aspect(target)
+        );
+        // It is the frame's drawn sub-rect: same top-left, contained within the box.
+        assert!(
+            target.x == preview.x
+                && target.y == preview.y
+                && target.w <= preview.w + 0.5
+                && target.h <= preview.h + 0.5,
+            "the target is the contain-fit sub-rect of the preview box"
+        );
     }
 
     #[test]

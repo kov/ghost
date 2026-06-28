@@ -206,6 +206,11 @@ impl TerminalModel {
         &self.session
     }
 
+    /// The terminal's grid size in cells (cols, rows).
+    pub fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
     pub fn selection(&self) -> Option<Selection> {
         self.selection
     }

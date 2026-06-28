@@ -1244,16 +1244,24 @@ impl Renderer {
     }
 
     /// Pixel size a preview texture/blit uses for `rect` (the tile size, ≥ 1).
-    /// Pixel size of a tile's preview texture: the on-screen rect, but never larger
-    /// than the frame's own native resolution (`cols×advance` by `rows×line_height`)
-    /// — past 1:1 there is no more detail to show, and the cap bounds cost (and lets
-    /// the cache settle) when a dive scales a tile up toward the window.
+    /// Pixel size of a tile's preview texture: the on-screen rect, rendered at that
+    /// size for crispness, but never so large that the frame contain-fit inside would
+    /// exceed its native resolution (`cols×advance` by `rows×line_height`) — past 1:1
+    /// there's no more detail, and the cap bounds cost (and lets the cache settle)
+    /// when a dive scales a tile up toward the window. The cap is UNIFORM so the
+    /// rect's aspect is preserved: a per-axis cap would squash the preview and, under
+    /// the dive camera at full zoom, render the tile at a different size/aspect than
+    /// the live single view — a visible pop at the dive boundary.
     fn preview_size(frame: &Frame, rect: RectPx) -> (u32, u32) {
         let nw = (frame.cols as f32 * frame.metrics.advance).max(1.0);
         let nh = (frame.rows as f32 * frame.metrics.line_height).max(1.0);
+        // How much the frame would scale to contain-fit `rect`; if that would magnify
+        // past native (>1), shrink the texture uniformly so the frame lands at 1:1.
+        let contain = (rect.w / nw).min(rect.h / nh);
+        let k = if contain > 1.0 { 1.0 / contain } else { 1.0 };
         (
-            (rect.w.min(nw).ceil() as u32).max(1),
-            (rect.h.min(nh).ceil() as u32).max(1),
+            ((rect.w * k).ceil() as u32).max(1),
+            ((rect.h * k).ceil() as u32).max(1),
         )
     }
 

@@ -295,7 +295,7 @@ impl RootModel {
                 // Opening a tile dives into where it sat in the grid: snapshot the
                 // fleet world so the whole grid stays visible during the descent (a
                 // freshly spawned session with no tile yet just opens, no dive).
-                anim = f.preview_rect(&id).map(|r| {
+                anim = f.dive_target_rect(&id).map(|r| {
                     Anim::new(
                         Transform::IDENTITY,
                         Transform::zoom_to(r, win),
@@ -460,7 +460,7 @@ impl RootModel {
                 let anim = self
                     .primary
                     .as_deref()
-                    .and_then(|p| fleet.preview_rect(p))
+                    .and_then(|p| fleet.dive_target_rect(p))
                     .map(|r| Anim::new(Transform::zoom_to(r, win), Transform::IDENTITY, None));
                 (Mode::Fleet(Box::new(fleet)), cmds, anim)
             }
@@ -474,7 +474,7 @@ impl RootModel {
                     .or_else(|| f.focused().map(str::to_string));
                 let to = target
                     .as_deref()
-                    .and_then(|t| f.preview_rect(t))
+                    .and_then(|t| f.dive_target_rect(t))
                     .map(|r| Transform::zoom_to(r, win));
                 let anim = to.map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view())));
                 let (model, warm, mut cmds) =
@@ -666,6 +666,105 @@ mod tests {
             n += 1;
         }
         n
+    }
+
+    /// The on-screen rect of the (single) terminal preview with the camera applied —
+    /// i.e. what the renderer would actually draw. With one session there's exactly
+    /// one terminal in the scene, so this is unambiguous.
+    fn target_onscreen(r: &RootModel) -> crate::RectPx {
+        let scene = r.view();
+        scene
+            .layers
+            .iter()
+            .flat_map(|l| l.items.iter().map(move |it| (l.transform, it)))
+            .find_map(|(t, it)| match it {
+                SceneItem::Terminal { rect, .. } => Some(t.apply_rect(*rect)),
+                _ => None,
+            })
+            .expect("a terminal is on screen")
+    }
+
+    #[test]
+    fn dive_geometry_zooms_the_target_between_its_tile_and_the_whole_window() {
+        use crate::RectPx;
+        let (w, h) = (1400.0f32, 900.0f32);
+        // A "cover" framing fills the window (one dimension exact, the other spills).
+        let covers =
+            |r: RectPx| r.x <= 0.5 && r.y <= 0.5 && r.x + r.w >= w - 0.5 && r.y + r.h >= h - 0.5;
+        let area = |r: RectPx| r.w * r.h;
+
+        let mut r = root();
+        r.update(UiEvent::Resize {
+            w_px: w as u32,
+            h_px: h as u32,
+            scale: 1.0,
+        });
+
+        // Dive OUT (single → fleet): begins framed on the tile (filling the window)
+        // and pulls back, so the on-screen target shrinks monotonically to a tile.
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        let base = 10_000u64;
+        let out: Vec<RectPx> = [0u64, 25, 50, 75]
+            .iter()
+            .map(|pct| {
+                r.update(UiEvent::Tick {
+                    now_ms: base + ANIM_MS * pct / 100,
+                });
+                target_onscreen(&r)
+            })
+            .collect();
+        assert!(
+            covers(out[0]),
+            "dive-out begins with the tile filling the window: {:?}",
+            out[0]
+        );
+        for pair in out.windows(2) {
+            assert!(
+                area(pair[1]) < area(pair[0]),
+                "the target shrinks monotonically while pulling back: {out:?}"
+            );
+        }
+        r.update(UiEvent::Tick {
+            now_ms: base + 10_000,
+        }); // settle
+        let settled = target_onscreen(&r);
+        assert!(
+            !covers(settled) && area(settled) < w * h,
+            "dive-out settles to a tile smaller than the window: {settled:?}"
+        );
+
+        // Dive IN (open the tile): the on-screen target grows monotonically back to
+        // the whole window, landing in the single view.
+        r.update(UiEvent::AdoptSession("alpha".to_string()));
+        let base = 30_000u64;
+        let inn: Vec<RectPx> = [0u64, 25, 50, 75]
+            .iter()
+            .map(|pct| {
+                r.update(UiEvent::Tick {
+                    now_ms: base + ANIM_MS * pct / 100,
+                });
+                target_onscreen(&r)
+            })
+            .collect();
+        assert!(
+            !covers(inn[0]),
+            "dive-in begins from the small grid tile: {:?}",
+            inn[0]
+        );
+        for pair in inn.windows(2) {
+            assert!(
+                area(pair[1]) > area(pair[0]),
+                "the target grows monotonically while diving in: {inn:?}"
+            );
+        }
+        r.update(UiEvent::Tick {
+            now_ms: base + 10_000,
+        }); // settle
+        assert!(!r.is_fleet(), "dive-in lands in the single view");
+        assert!(
+            covers(target_onscreen(&r)),
+            "and the landed target fills the window"
+        );
     }
 
     #[test]
