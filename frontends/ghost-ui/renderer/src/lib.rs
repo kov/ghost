@@ -1244,8 +1244,17 @@ impl Renderer {
     }
 
     /// Pixel size a preview texture/blit uses for `rect` (the tile size, ≥ 1).
-    fn preview_size(rect: RectPx) -> (u32, u32) {
-        ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
+    /// Pixel size of a tile's preview texture: the on-screen rect, but never larger
+    /// than the frame's own native resolution (`cols×advance` by `rows×line_height`)
+    /// — past 1:1 there is no more detail to show, and the cap bounds cost (and lets
+    /// the cache settle) when a dive scales a tile up toward the window.
+    fn preview_size(frame: &Frame, rect: RectPx) -> (u32, u32) {
+        let nw = (frame.cols as f32 * frame.metrics.advance).max(1.0);
+        let nh = (frame.rows as f32 * frame.metrics.line_height).max(1.0);
+        (
+            (rect.w.min(nw).ceil() as u32).max(1),
+            (rect.h.min(nh).ceil() as u32).max(1),
+        )
     }
 
     /// Ensure tile `id`'s preview texture is current for `frame` at `rect`,
@@ -1260,7 +1269,7 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) {
-        let size = Self::preview_size(rect);
+        let size = Self::preview_size(frame, rect);
         if self
             .preview_cache
             .get(&id)
@@ -1284,11 +1293,14 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) -> CachedPreview {
-        let size = Self::preview_size(rect);
+        let size = Self::preview_size(frame, rect);
         let (tw, th) = size;
 
-        // Full-size glyphs shrunk to the tile (the same GPU minification the inline
-        // preview used), left at the texture origin; the blit applies the offset.
+        // Full-size glyphs scaled to the texture (the same GPU minification the
+        // inline preview used), left at the texture origin; the blit applies the
+        // offset. `rect` is the on-screen (camera-scaled) size, so once a dive grows
+        // a tile past its native resolution `preview_scale` saturates at 1.0 and the
+        // texture (capped to native) holds crisp 1:1 glyphs.
         let mut insts = self.build_instances(frame, font, size_px, None);
         let s = preview_scale(frame, rect);
         if s < 1.0 {
@@ -1871,7 +1883,11 @@ impl Renderer {
                             // its content or size changes) instead of re-rasterizing
                             // the glyphs every frame. Selection isn't shown in the
                             // read-only previews, so the cache keys on frame alone.
-                            self.ensure_preview(*id, frame, *rect, font, size_px);
+                            // Size the texture to the tile's *on-screen* (camera-
+                            // scaled) rect, so a tile being dived into stays crisp as
+                            // it grows rather than blitting a small texture stretched.
+                            let eff = layer.transform.apply_rect(*rect);
+                            self.ensure_preview(*id, frame, eff, font, size_px);
                             seen.insert(*id);
                             draws.push(Draw::Preview {
                                 scissor,

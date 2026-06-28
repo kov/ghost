@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
-use crate::{CellMetrics, Cmd, FleetModel, Scene, SessionId, TerminalModel, Transform, UiEvent};
+use crate::{
+    CellMetrics, Cmd, FleetModel, Scene, SceneItem, SessionId, TerminalModel, Transform, UiEvent,
+};
 
 enum Mode {
     Single(Box<TerminalModel>),
@@ -59,6 +61,8 @@ impl Anim {
     }
 
     /// Advance the camera to `now_ms`; returns true once the animation is done.
+    /// Time is eased (ease-in-out) so the dive accelerates out of rest and settles
+    /// gently instead of moving at a constant, mechanical rate.
     fn advance(&mut self, now_ms: u64) -> bool {
         let t0 = *self.t0.get_or_insert(now_ms);
         let elapsed = now_ms.saturating_sub(t0);
@@ -66,10 +70,36 @@ impl Anim {
             self.current = self.to;
             true
         } else {
-            let p = elapsed as f32 / self.dur_ms as f32;
+            let p = ease_in_out(elapsed as f32 / self.dur_ms as f32);
             self.current = Transform::lerp(self.from, self.to, p);
             false
         }
+    }
+
+    /// How opaque the fleet *chrome* (everything but the terminal previews) should
+    /// be at the current camera: fully shown at the overview end, faded to nothing
+    /// as the dive reaches the tile, so a tile becomes a clean terminal rather than
+    /// a giant card with buttons. Derived from the camera scale, so it follows the
+    /// eased motion. Direction-agnostic (identity end = 1, zoomed-in end = 0).
+    fn chrome_alpha(&self) -> f32 {
+        let tile_scale = self.from.scale.max(self.to.scale);
+        let fleet_scale = self.from.scale.min(self.to.scale);
+        if tile_scale <= fleet_scale {
+            return 1.0;
+        }
+        ((tile_scale - self.current.scale) / (tile_scale - fleet_scale)).clamp(0.0, 1.0)
+    }
+}
+
+/// Cubic ease-in-out on `t` in [0, 1]: slow at both ends, fast in the middle, with
+/// exact fixed points at 0 and 1.
+fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        let f = -2.0 * t + 2.0;
+        1.0 - f * f * f / 2.0
     }
 }
 
@@ -350,10 +380,24 @@ impl RootModel {
                 Mode::Fleet(f) => f.view(),
             },
         };
-        // While zooming, render the whole world under the animation camera.
+        // While zooming, render the whole world under the animation camera and fade
+        // the fleet chrome (everything but the terminal previews) toward the tile,
+        // so a card resolves into a clean terminal rather than a giant button bar.
         if let Some(anim) = &self.anim {
+            let chrome = anim.chrome_alpha();
             for layer in &mut scene.layers {
                 layer.transform = anim.current;
+                if chrome < 1.0 {
+                    for item in &mut layer.items {
+                        match item {
+                            // The preview is the content that becomes the terminal.
+                            SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
+                            SceneItem::Rect { color, .. }
+                            | SceneItem::Text { color, .. }
+                            | SceneItem::Border { color, .. } => color[3] *= chrome,
+                        }
+                    }
+                }
             }
         }
         scene
@@ -683,6 +727,55 @@ mod tests {
                 .iter()
                 .all(|l| l.transform == Transform::IDENTITY),
             "after the zoom the fleet renders untransformed"
+        );
+    }
+
+    #[test]
+    fn ease_in_out_has_fixed_endpoints_and_is_monotonic() {
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        assert!((ease_in_out(0.5) - 0.5).abs() < 1e-3, "symmetric midpoint");
+        assert!(ease_in_out(0.25) < 0.25, "slow start (eased in)");
+        assert!(ease_in_out(0.75) > 0.75, "slow end (eased out)");
+        let mut prev = -1.0;
+        for i in 0..=10 {
+            let v = ease_in_out(i as f32 / 10.0);
+            assert!(v >= prev, "monotonic non-decreasing");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn chrome_fades_during_the_dive() {
+        use crate::{SceneId, SceneItem};
+        let mut r = root(); // single view of alpha (owned)
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet, dive-out
+        // Progress 0: the camera sits at the tile end, so the chrome is faded out.
+        r.update(UiEvent::Tick { now_ms: 1_000 });
+        let section_alpha = |r: &RootModel| {
+            r.view()
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .find_map(|it| match it {
+                    SceneItem::Text {
+                        id: SceneId::Section(_),
+                        color,
+                        ..
+                    } => Some(color[3]),
+                    _ => None,
+                })
+        };
+        let during = section_alpha(&r).expect("a section header is present in the fleet");
+        assert!(
+            during < 0.99,
+            "fleet chrome is faded during the dive (a={during})"
+        );
+        settle(&mut r);
+        let rest = section_alpha(&r).expect("section header at rest");
+        assert!(
+            rest > 0.99,
+            "chrome is fully opaque once the dive settles (a={rest})"
         );
     }
 
