@@ -271,13 +271,38 @@ fn spawn_session(name: &str, command: Vec<String>) {
     .expect("spawn session");
 }
 
+/// How a freshly-launched window should start.
+enum StartupChoice {
+    /// Attach to a specific, explicitly-requested session (single view).
+    Attach(String),
+    /// Spawn a fresh session and show it (single view) — nothing to reconnect to.
+    Spawn,
+    /// Open the fleet so the user can reconnect, rather than piling up sessions.
+    Fleet,
+}
+
+/// Decide how to start: honour an explicit `$GHOST_SESSION` request; otherwise
+/// open the fleet whenever any session is detached (so launching reconnects
+/// instead of accumulating new sessions), and only spawn a fresh session when
+/// there is nothing detached to return to.
+fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) -> StartupChoice {
+    match requested {
+        Some(name) => StartupChoice::Attach(name),
+        None if sessions.iter().any(|s| !s.attached) => StartupChoice::Fleet,
+        None => StartupChoice::Spawn,
+    }
+}
+
 fn interactive() {
-    let name = match std::env::var("GHOST_SESSION") {
-        Ok(n) => n, // attach to an existing session
-        Err(_) => {
+    let requested = std::env::var("GHOST_SESSION").ok();
+    let sessions = session::list().unwrap_or_default();
+    let initial_name = match startup_choice(requested, &sessions) {
+        StartupChoice::Attach(name) => Some(name),
+        StartupChoice::Fleet => None,
+        StartupChoice::Spawn => {
             let n = format!("ghost-ui-{}", std::process::id());
             spawn_session(&n, vec![]);
-            n
+            Some(n)
         }
     };
 
@@ -287,7 +312,7 @@ fn interactive() {
         windows: HashMap::new(),
         clipboard: None,
         start: Instant::now(),
-        initial_name: name,
+        initial_name,
         next_session_seq: 0,
     };
     event_loop.run_app(&mut app).expect("run app");
@@ -531,9 +556,10 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     /// Start of the monotonic clock injected into models via `Tick`.
     start: Instant,
-    /// Session name for the first window, set at construction and consumed by
-    /// the first `resumed`.
-    initial_name: String,
+    /// How the first window starts, set at construction and consumed by the first
+    /// `resumed`: `Some(name)` opens a single view attached to that session; `None`
+    /// opens the fleet (chosen when detached sessions exist to reconnect to).
+    initial_name: Option<String>,
     /// Per-process counter making spawned session names unique.
     next_session_seq: u64,
 }
@@ -830,30 +856,27 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.windows.is_empty() {
-            return;
-        }
+impl App {
+    /// Open the first window as a single-session view attached to `name`. Returns
+    /// false if the attach fails (the caller exits the app).
+    fn open_single_window(&mut self, event_loop: &ActiveEventLoop, name: &str) -> bool {
         let cfg = config::UiConfig::load();
         let gfx = Graphics::new(event_loop, cfg.theme());
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
-        let name = self.initial_name.clone();
-        let session = match attach(&name, cols, rows) {
+        let session = match attach(name, cols, rows) {
             Ok(session) => session,
             Err(e) => {
                 eprintln!("could not attach to session '{name}': {e}");
-                event_loop.exit();
-                return;
+                return false;
             }
         };
-        let model = TerminalModel::new(name.clone(), cols, rows, METRICS);
+        let model = TerminalModel::new(name.to_string(), cols, rows, METRICS);
         let root = RootModel::single(model, METRICS, (gfx.config.width, gfx.config.height));
         let (w, h) = (gfx.config.width, gfx.config.height);
         let mut sessions = HashMap::new();
-        sessions.insert(name, session);
+        sessions.insert(name.to_string(), session);
         self.windows.insert(
             wid,
             WindowState {
@@ -886,6 +909,26 @@ impl ApplicationHandler for App {
         // Apply the persisted zoom now that the viewport is known, so it re-grids
         // against the real surface size (the model clamps to its bounds).
         self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
+        true
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return;
+        }
+        // `Some(name)` → single view of that session; `None` → fleet (chosen at
+        // launch when there were detached sessions to reconnect to).
+        match self.initial_name.take() {
+            None => self.open_fleet_window(event_loop),
+            Some(name) => {
+                if !self.open_single_window(event_loop, &name) {
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
@@ -1156,8 +1199,51 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_alpha_mode;
+    use super::{StartupChoice, choose_alpha_mode, startup_choice};
+    use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
+
+    fn info(name: &str, attached: bool) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            pid: 1,
+            created_at: None,
+            title: String::new(),
+            command: Vec::new(),
+            attached,
+            bell: false,
+        }
+    }
+
+    #[test]
+    fn startup_attaches_to_an_explicitly_requested_session() {
+        // `$GHOST_SESSION` wins regardless of what else is around.
+        let sessions = [info("a", false)];
+        assert!(matches!(
+            startup_choice(Some("x".into()), &sessions),
+            StartupChoice::Attach(n) if n == "x"
+        ));
+    }
+
+    #[test]
+    fn startup_opens_the_fleet_when_any_session_is_detached() {
+        let sessions = [info("a", true), info("b", false)];
+        assert!(matches!(
+            startup_choice(None, &sessions),
+            StartupChoice::Fleet
+        ));
+    }
+
+    #[test]
+    fn startup_spawns_when_nothing_is_detached() {
+        // No sessions at all, or only sessions attached elsewhere → fresh session.
+        assert!(matches!(startup_choice(None, &[]), StartupChoice::Spawn));
+        let attached_elsewhere = [info("a", true)];
+        assert!(matches!(
+            startup_choice(None, &attached_elsewhere),
+            StartupChoice::Spawn
+        ));
+    }
 
     #[test]
     fn alpha_mode_prefers_premultiplied_when_transparent() {
