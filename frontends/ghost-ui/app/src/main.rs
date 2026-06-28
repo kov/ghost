@@ -20,6 +20,7 @@
 
 mod config;
 mod from_winit;
+mod pacer;
 
 use std::collections::HashMap;
 use std::io;
@@ -457,6 +458,9 @@ struct WindowState {
     /// double/triple clicks, and the running click count.
     last_click: Option<(Instant, PointerButton, PointPx)>,
     click_count: u8,
+    /// Rate-limits repaints so output floods / held keys can't drive a software
+    /// rasterizer at the 8 ms poll rate (see [`pacer`]).
+    pacer: pacer::FramePacer,
 }
 
 impl WindowState {
@@ -622,8 +626,10 @@ impl App {
                     }
                 }
                 Cmd::Redraw => {
-                    if let Some(w) = self.windows.get(&wid) {
-                        w.gfx.window.request_redraw();
+                    // Don't paint inline — record the request and let the pacer
+                    // release it within the frame budget (coalescing bursts).
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.pacer.request();
                     }
                 }
                 Cmd::SetTitle(t) => {
@@ -742,6 +748,7 @@ impl App {
                 next_tick: None,
                 last_click: None,
                 click_count: 0,
+                pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -801,6 +808,7 @@ impl ApplicationHandler for App {
                 next_tick: None,
                 last_click: None,
                 click_count: 0,
+                pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -875,6 +883,17 @@ impl ApplicationHandler for App {
         if self.windows.is_empty() {
             event_loop.exit();
             return;
+        }
+        // Release any paced repaint that the frame budget now allows. The loop
+        // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
+        // paint is always re-checked and fires within a frame of becoming due;
+        // a keystroke's repaint, handled in this same pass, paints at once.
+        let now_ms = self.now_ms();
+        for w in self.windows.values_mut() {
+            if w.pacer.poll(now_ms) == pacer::Pace::PaintNow {
+                w.gfx.window.request_redraw();
+                w.pacer.painted(now_ms);
+            }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
