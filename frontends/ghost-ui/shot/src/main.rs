@@ -86,22 +86,30 @@ fn main() {
     }
 
     if which == "zoom" {
-        // `zoom [out.png] [now_ms]` — render a fleet zoom mid-flight (F9 from the
-        // single view), so the camera animation can be eyeballed at any progress.
-        // The animation runs ~180ms, so `now_ms` ≈ 90 is mid-zoom; 0 is fully in.
-        let out = args
-            .next()
+        // `zoom [in|out] [out.png] [now_ms]` — render a fleet dive mid-flight so the
+        // camera animation can be eyeballed at any progress. `out` dives single →
+        // fleet (default), `in` dives fleet → single. The dive runs ~180ms, so
+        // `now_ms` ≈ 90 is mid-dive. Both render the fleet world under the camera.
+        let mut rest: Vec<String> = args.collect();
+        let dir = if rest.first().is_some_and(|s| s == "in" || s == "out") {
+            rest.remove(0)
+        } else {
+            "out".to_string()
+        };
+        let out = rest
+            .first()
+            .cloned()
             .unwrap_or_else(|| "ghost-shot-zoom.png".to_string());
-        let at = args
-            .next()
+        let at = rest
+            .get(1)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(90);
-        let (scene, w, h) = zoom_scene(at);
+        let (scene, w, h) = zoom_scene(&dir, at);
         let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
         let mut renderer = Renderer::headless(Theme::default());
         let img = renderer.render_offscreen_scene(&scene, font, SIZE_PX);
         img.save_png(&out).expect("write png");
-        println!("wrote zoom frame at now_ms={at} ({w}x{h}) to {out}");
+        println!("wrote {dir}-dive frame at now_ms={at} ({w}x{h}) to {out}");
         return;
     }
 
@@ -450,11 +458,12 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     (scene, size.0, size.1)
 }
 
-/// A fleet zoom mid-flight: open a fleet window, drive several sessions (so the
-/// grid has tiles), drop into the single view of one, then press F9 (zoom out) and
-/// advance the clock to `at_ms`. The returned scene is the whole fleet world under
-/// the partway camera — the spatial dive frozen at one frame.
-fn zoom_scene(at_ms: u64) -> (ghost_render::Scene, u32, u32) {
+/// A fleet dive mid-flight: open a fleet window, drive several sessions (so the
+/// grid has tiles) and drop into the single view of one. For `out`, press F9 (dive
+/// single → fleet) and advance to `at_ms`. For `in`, additionally settle that dive,
+/// then press F9 again (dive fleet → single) and advance to `at_ms`. Either way the
+/// returned scene is the whole fleet world under the partway camera.
+fn zoom_scene(dir: &str, at_ms: u64) -> (ghost_render::Scene, u32, u32) {
     let size = (1400u32, 900u32);
     let key = |k: NamedKey| UiEvent::Key {
         key: Key::Named(k),
@@ -485,11 +494,21 @@ fn zoom_scene(at_ms: u64) -> (ghost_render::Scene, u32, u32) {
             ended: false,
         });
     }
-    // Now in the single view of `docs`. F9 zooms out into the fleet; stamp the
-    // animation start (now_ms 0), then advance to `at_ms`.
+    // Now in the single view of `docs`. F9 dives out into the fleet.
     root.update(key(NamedKey::F9));
-    root.update(UiEvent::Tick { now_ms: 0 });
-    root.update(UiEvent::Tick { now_ms: at_ms });
+    if dir == "in" {
+        // Settle the dive-out, then dive back in (fleet → single).
+        root.update(UiEvent::Tick { now_ms: 0 });
+        root.update(UiEvent::Tick { now_ms: 1_000 });
+        root.update(key(NamedKey::F9));
+        root.update(UiEvent::Tick { now_ms: 2_000 }); // stamp the new dive's start
+        root.update(UiEvent::Tick {
+            now_ms: 2_000 + at_ms,
+        });
+    } else {
+        root.update(UiEvent::Tick { now_ms: 0 }); // stamp the start
+        root.update(UiEvent::Tick { now_ms: at_ms });
+    }
     (root.view(), size.0, size.1)
 }
 

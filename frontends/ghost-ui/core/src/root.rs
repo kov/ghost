@@ -25,25 +25,34 @@ const ANIM_MS: u64 = 180;
 /// Frame cadence while animating (~60 fps).
 const ANIM_TICK_MS: u64 = 16;
 
-/// An in-flight fleet zoom. The active view is rendered under `current`, a camera
-/// interpolated from `from` to `to` (always identity at rest) over `dur_ms` once
-/// the first tick stamps the start time. The mode swap is instant — this is purely
-/// the visual flourish on top — so it never gates input or the logical state.
+/// An in-flight fleet zoom — a camera over the *fleet world*, interpolated from
+/// `from` to `to` (one end is identity = the overview at rest, the other is
+/// [`Transform::zoom_to`] a tile = it filling the window) over `dur_ms` once the
+/// first tick stamps the start. The mode swap is instant, so this never gates
+/// input or logical state — it's purely the visual dive.
+///
+/// On a dive-IN (fleet → single) the mode is already single, so `world` carries a
+/// frozen snapshot of the fleet scene to render *behind* the camera until the dive
+/// lands; on a dive-OUT (single → fleet) the live fleet is the mode, so it's `None`.
 struct Anim {
     from: Transform,
     to: Transform,
     current: Transform,
+    /// The frozen fleet scene to render during a dive-in (the mode is already
+    /// single by then); `None` for a dive-out, which renders the live fleet mode.
+    world: Option<Scene>,
     /// The start time, stamped on the first tick; `None` until then.
     t0: Option<u64>,
     dur_ms: u64,
 }
 
 impl Anim {
-    fn new(from: Transform, to: Transform) -> Self {
+    fn new(from: Transform, to: Transform, world: Option<Scene>) -> Self {
         Anim {
             from,
             to,
             current: from,
+            world,
             t0: None,
             dur_ms: ANIM_MS,
         }
@@ -250,12 +259,19 @@ impl RootModel {
             self.metrics,
         )));
         let current = std::mem::replace(&mut self.mode, placeholder);
-        let mut from = None;
+        let mut anim = None;
         let (mut model, mut cmds) = match current {
             Mode::Fleet(f) => {
-                // Opening a tile zooms in from where it sat in the grid (a freshly
-                // spawned session with no tile yet simply opens without the zoom).
-                from = f.preview_rect(&id).map(|r| Transform::place_in(win, r));
+                // Opening a tile dives into where it sat in the grid: snapshot the
+                // fleet world so the whole grid stays visible during the descent (a
+                // freshly spawned session with no tile yet just opens, no dive).
+                anim = f.preview_rect(&id).map(|r| {
+                    Anim::new(
+                        Transform::IDENTITY,
+                        Transform::zoom_to(r, win),
+                        Some(f.view()),
+                    )
+                });
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
                 // The window's other driven sessions stay warm in the background.
@@ -287,8 +303,8 @@ impl RootModel {
         self.mine.insert(id.clone());
         self.primary = Some(id);
         cmds.push(Cmd::Redraw);
-        if let Some(from) = from {
-            self.anim = Some(Anim::new(from, Transform::IDENTITY));
+        if let Some(anim) = anim {
+            self.anim = Some(anim);
             cmds.push(Cmd::ScheduleTick { after_ms: 0 });
         }
         cmds
@@ -323,11 +339,18 @@ impl RootModel {
     }
 
     pub fn view(&self) -> Scene {
-        let mut scene = match &self.mode {
-            Mode::Single(m) => m.view(),
-            Mode::Fleet(f) => f.view(),
+        // During a dive-in the mode is already single, so render the frozen fleet
+        // snapshot the dive launched from; otherwise the live active view.
+        let mut scene = match &self.anim {
+            Some(Anim {
+                world: Some(world), ..
+            }) => world.clone(),
+            _ => match &self.mode {
+                Mode::Single(m) => m.view(),
+                Mode::Fleet(f) => f.view(),
+            },
         };
-        // While zooming, render the whole active view under the animation camera.
+        // While zooming, render the whole world under the animation camera.
         if let Some(anim) = &self.anim {
             for layer in &mut scene.layers {
                 layer.transform = anim.current;
@@ -374,7 +397,7 @@ impl RootModel {
             self.metrics,
         )));
         let current = std::mem::replace(&mut self.mode, placeholder);
-        let (next, mut cmds, from) = match current {
+        let (next, mut cmds, anim) = match current {
             Mode::Single(m) => {
                 // Hand the foreground and every warm background mirror to the
                 // fleet, so all of this window's previews are live, not cold.
@@ -388,25 +411,28 @@ impl RootModel {
                     self.mine.clone(),
                 );
                 cmds.insert(0, Cmd::ListSessions); // populate the grid
-                // Zoom out: the fleet starts framed on the session we left and
+                // Dive out: the live fleet starts framed on the session we left and
                 // pulls back to the overview.
-                let from = self
+                let anim = self
                     .primary
                     .as_deref()
                     .and_then(|p| fleet.preview_rect(p))
-                    .map(|r| Transform::zoom_to(r, win));
-                (Mode::Fleet(Box::new(fleet)), cmds, from)
+                    .map(|r| Anim::new(Transform::zoom_to(r, win), Transform::IDENTITY, None));
+                (Mode::Fleet(Box::new(fleet)), cmds, anim)
             }
             Mode::Fleet(f) => {
-                // Zoom in: the single view grows from the tile we're landing on.
+                // Dive in: snapshot the fleet world so the whole grid stays visible
+                // while we descend into the tile we land on, then take over with the
+                // live single view once the dive lands.
                 let target = self
                     .primary
                     .clone()
                     .or_else(|| f.focused().map(str::to_string));
-                let from = target
+                let to = target
                     .as_deref()
                     .and_then(|t| f.preview_rect(t))
-                    .map(|r| Transform::place_in(win, r));
+                    .map(|r| Transform::zoom_to(r, win));
+                let anim = to.map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view())));
                 let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
@@ -418,13 +444,13 @@ impl RootModel {
                 let id = model.session().to_string();
                 self.mine.insert(id.clone());
                 self.primary = Some(id);
-                (Mode::Single(Box::new(model)), cmds, from)
+                (Mode::Single(Box::new(model)), cmds, anim)
             }
         };
         self.mode = next;
-        // Kick the (purely visual) zoom: the first scheduled tick stamps its start.
-        if let Some(from) = from {
-            self.anim = Some(Anim::new(from, Transform::IDENTITY));
+        // Kick the (purely visual) dive: the first scheduled tick stamps its start.
+        if let Some(anim) = anim {
+            self.anim = Some(anim);
             cmds.push(Cmd::ScheduleTick { after_ms: 0 });
         }
         cmds
@@ -658,6 +684,53 @@ mod tests {
                 .all(|l| l.transform == Transform::IDENTITY),
             "after the zoom the fleet renders untransformed"
         );
+    }
+
+    #[test]
+    fn dive_in_renders_the_frozen_fleet_world_until_it_lands() {
+        use crate::{SceneId, SceneItem};
+        let mut r = root(); // single view of alpha (owned)
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
+        settle(&mut r); // finish the dive-out
+        // F9 back: the mode swaps to single immediately, but while the dive plays
+        // the *fleet world* is on screen (its section header proves it's the grid,
+        // not the single terminal) — the symmetric grid-dive, both directions.
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(!r.is_fleet(), "mode is single immediately");
+        assert!(r.is_animating(), "a dive-in is playing");
+        r.update(UiEvent::Tick { now_ms: 5_000 });
+        let scene = r.view();
+        let has_section_header = scene.layers.iter().flat_map(|l| &l.items).any(|it| {
+            matches!(
+                it,
+                SceneItem::Text {
+                    id: SceneId::Section(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_section_header,
+            "the frozen fleet world (with its section header) renders during the dive"
+        );
+        // Once it lands, the real single view takes over: one terminal, no chrome.
+        settle(&mut r);
+        let scene = r.view();
+        assert!(
+            !scene
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .any(|it| matches!(
+                    it,
+                    SceneItem::Text {
+                        id: SceneId::Section(_),
+                        ..
+                    }
+                )),
+            "after landing, the single view (no fleet chrome) is shown"
+        );
+        assert_eq!(scene.terminals().count(), 1, "just the one terminal");
     }
 
     #[test]
