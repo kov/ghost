@@ -513,6 +513,20 @@ struct CachedPreview {
     size: (u32, u32),
 }
 
+/// The last fully-rendered scene, captured to a texture so an interactive resize
+/// can stretch-blit it to the changing surface instead of re-laying-out and
+/// re-rasterizing the whole window at every drag step — ruinous in the fleet view
+/// on a software rasterizer. Captured at the gesture's first resize event and
+/// dropped when it settles and a crisp scene is rendered.
+struct Snapshot {
+    /// Kept alive for the bind group that samples it.
+    _texture: wgpu::Texture,
+    /// Samples `_texture` with the linear sampler, for a smooth stretch.
+    bind_group: wgpu::BindGroup,
+    /// The captured pixel size (the surface size at capture time).
+    size: (u32, u32),
+}
+
 /// Translate every instance's screen rect by `(dx, dy)`.
 fn translate(insts: &mut [Instance], dx: f32, dy: f32) {
     for i in insts {
@@ -719,6 +733,14 @@ pub struct Renderer {
     /// one-quad-per-draw instance buffer they index.
     image_draws: Vec<ImageDraw>,
     image_instances: Option<wgpu::Buffer>,
+    /// Linear sampler for the resize snapshot blit, so stretching the last crisp
+    /// frame while dragging looks smooth (the glyph/preview sampler is nearest).
+    linear_sampler: wgpu::Sampler,
+    /// The crisp scene captured for an in-flight interactive resize, if any (see
+    /// [`Snapshot`]); stretch-blitted each drag step until the resize commits.
+    snapshot: Option<Snapshot>,
+    /// The single full-surface quad that blits `snapshot`, reused across steps.
+    snapshot_instances: Option<wgpu::Buffer>,
 }
 
 impl Renderer {
@@ -772,6 +794,14 @@ impl Renderer {
             label: Some("glyph sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        // Linear, for the resize snapshot blit: stretching the last crisp frame to
+        // a different surface size reads smooth rather than blocky.
+        let linear_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("snapshot sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -980,6 +1010,9 @@ impl Renderer {
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
             image_instances: None,
+            linear_sampler,
+            snapshot: None,
+            snapshot_instances: None,
         }
     }
 
@@ -2055,6 +2088,177 @@ impl Renderer {
         let target = offscreen_target(&self.gpu.device, w, h, self.format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let cb = self.encode_scene(&view, &groups);
+        self.gpu.queue.submit([cb]);
+        let rgba = read_back(&self.gpu, &target, w, h);
+        Rendered {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+
+    /// Capture `scene` to a texture so an interactive resize can stretch-blit it
+    /// (see [`Self::blit_snapshot_to_view`]) instead of re-laying-out and
+    /// re-rasterizing the whole window at every drag step. Renders the scene
+    /// exactly as the surface path would; the texture is kept (premultiplied, in
+    /// the surface format) and later sampled with linear filtering so the stretch
+    /// is smooth. Replaces any previously held snapshot.
+    pub fn capture_snapshot(&mut self, scene: &Scene, font: FontRef, size_px: f32) {
+        let w = scene.size_px.0.max(1);
+        let h = scene.size_px.1.max(1);
+        let draws = self.prepare_scene(scene, font, size_px);
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("resize snapshot"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let cb = self.encode_scene(&view, &draws);
+        self.gpu.queue.submit([cb]);
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("snapshot bind group"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                    },
+                ],
+            });
+        self.snapshot = Some(Snapshot {
+            _texture: texture,
+            bind_group,
+            size: (w, h),
+        });
+    }
+
+    /// Whether a resize snapshot is currently held.
+    pub fn has_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    /// The captured snapshot's pixel size, if one is held.
+    pub fn snapshot_size(&self) -> Option<(u32, u32)> {
+        self.snapshot.as_ref().map(|s| s.size)
+    }
+
+    /// Drop the resize snapshot — call once the resize commits so subsequent
+    /// frames render the crisp scene again.
+    pub fn clear_snapshot(&mut self) {
+        self.snapshot = None;
+    }
+
+    /// Point the shared viewport uniform at the `w`×`h` blit target and (re)build
+    /// the single full-surface quad that samples the snapshot. No-op if no
+    /// snapshot is held.
+    fn prepare_snapshot_blit(&mut self, w: u32, h: u32) {
+        if self.snapshot.is_none() {
+            return;
+        }
+        let uniforms = Uniforms {
+            viewport: [w as f32, h as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let quad = [Instance {
+            rect: [0.0, 0.0, w as f32, h as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        }];
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.snapshot_instances,
+            &mut self.buffer_allocs,
+            "snapshot blit",
+            &quad,
+        );
+    }
+
+    /// Clear to transparent, then blit the snapshot quad over the whole target.
+    /// The snapshot is premultiplied, so "over" transparent reproduces it exactly
+    /// (preserving a translucent theme's see-through background). Falls back to a
+    /// bare clear when no snapshot is held, so a stray call paints nothing rather
+    /// than reading an empty buffer.
+    fn encode_snapshot(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("snapshot blit"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("snapshot blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let (Some(snap), Some(buf)) = (&self.snapshot, &self.snapshot_instances) {
+                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_bind_group(0, &snap.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
+        encoder.finish()
+    }
+
+    /// Stretch-blit the captured snapshot to fill `view` (a window surface) at
+    /// `w`×`h`. Cheap — a single textured quad — so an interactive resize stays
+    /// smooth regardless of how much content the window holds. The caller owns
+    /// acquiring/presenting the surface texture. No-op if no snapshot is held.
+    pub fn blit_snapshot_to_view(&mut self, view: &wgpu::TextureView, w: u32, h: u32) {
+        if self.snapshot.is_none() {
+            return;
+        }
+        self.prepare_snapshot_blit(w, h);
+        let cb = self.encode_snapshot(view);
+        self.gpu.queue.submit([cb]);
+    }
+
+    /// Stretch-blit the captured snapshot to a fresh `w`×`h` offscreen target and
+    /// read it back — the windowless counterpart of [`Self::blit_snapshot_to_view`]
+    /// for tests and `ghost-shot`.
+    pub fn blit_snapshot_offscreen(&mut self, w: u32, h: u32) -> Rendered {
+        let w = w.max(1);
+        let h = h.max(1);
+        self.prepare_snapshot_blit(w, h);
+        let target = offscreen_target(&self.gpu.device, w, h, self.format);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let cb = self.encode_snapshot(&view);
         self.gpu.queue.submit([cb]);
         let rgba = read_back(&self.gpu, &target, w, h);
         Rendered {

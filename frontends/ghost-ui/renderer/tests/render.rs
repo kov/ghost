@@ -388,6 +388,91 @@ fn an_unchanged_preview_is_not_re_rasterized() {
 }
 
 #[test]
+fn a_resize_blit_scales_the_snapshot_without_reshaping() {
+    // During an interactive resize the shell captures the last crisp scene to a
+    // texture and stretch-blits it to the changing surface, deferring the real
+    // relayout. The blit must reproduce the snapshot (scaled) yet re-shape and
+    // re-rasterize NOTHING — that cheapness is the whole reason it exists.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+
+    // Text (so shaping happens) over a full green backdrop (a deterministic
+    // colour to find after the stretch).
+    let frame = {
+        let mut vt = Vt::new(20, 4); // 180x72 px at METRICS
+        vt.feed_str("snapshot text => fn main() {}");
+        layout_frame(&vt, METRICS)
+    };
+    let mut scene = Scene::new((180, 72));
+    scene.layers.push(Layer {
+        z: 0,
+        items: vec![SceneItem::Rect {
+            id: SceneId::Root,
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 180.0,
+                h: 72.0,
+            },
+            color: [0.0, 1.0, 0.0, 1.0], // opaque green
+            radius: 0.0,
+        }],
+    });
+    scene.layers.push(Layer {
+        z: 1,
+        items: vec![SceneItem::Terminal {
+            id: SceneId::Root,
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 180.0,
+                h: 72.0,
+            },
+            frame,
+            selection: None,
+            dim: false,
+        }],
+    });
+
+    // Capture the snapshot — one real render, which shapes the text.
+    r.capture_snapshot(&scene, font, 15.0);
+    assert!(r.has_snapshot(), "a snapshot is held after capture");
+    let shapes = r.shape_misses();
+    assert!(shapes > 0, "capturing the snapshot shaped its runs");
+
+    // Stretch-blit it to 2x: reshape and re-render nothing.
+    let big = r.blit_snapshot_offscreen(360, 144);
+    assert_eq!((big.width, big.height), (360, 144));
+    assert_eq!(
+        r.shape_misses(),
+        shapes,
+        "a snapshot blit re-shapes nothing"
+    );
+    assert_eq!(
+        r.preview_renders(),
+        0,
+        "a snapshot blit renders no previews"
+    );
+
+    // The green backdrop survives the scaled blit: sample a lower row (the text
+    // is on row 0; rows 1..3 are blank, so the rect shows through there).
+    let is_green = |p: [u8; 4]| p[0] < 0x40 && p[1] > 0xa0 && p[2] < 0x40;
+    assert!(
+        is_green(px(&big, 180, 110)),
+        "the blit must reproduce the (scaled) snapshot, got {:?}",
+        px(&big, 180, 110)
+    );
+
+    // A second blit at a different size is also free.
+    let _ = r.blit_snapshot_offscreen(270, 108);
+    assert_eq!(r.shape_misses(), shapes, "repeated blits stay free");
+
+    // Clearing the snapshot ends the resize path.
+    r.clear_snapshot();
+    assert!(!r.has_snapshot(), "clear_snapshot drops the held frame");
+}
+
+#[test]
 fn an_identical_repaint_reshapes_nothing() {
     // Shaping dominates per-frame CPU. The cache must make a repaint of unchanged
     // text re-shape nothing, so fleet navigation and idle previews stay cheap.

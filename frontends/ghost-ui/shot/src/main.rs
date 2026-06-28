@@ -7,7 +7,9 @@
 //! the first-class visual-debugging path: change the UI, run the tool, eyeball
 //! the image.
 //!
-//! Usage: `ghost-shot <fleet|single> [out.png]` (default `ghost-shot.png`).
+//! Usage: `ghost-shot <fleet|single> [out.png]` (default `ghost-shot.png`), or
+//! `ghost-shot bench [tiles] [frames]` (arrow-nav) / `ghost-shot bench resize
+//! [tiles] [steps]` (window resize) for the headless performance benchmarks.
 
 use std::collections::HashSet;
 
@@ -34,9 +36,18 @@ fn main() {
     let which = args.next().unwrap_or_else(|| "fleet".to_string());
 
     if which == "bench" {
-        let tiles = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
-        let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
-        bench(tiles, frames);
+        // `bench [tiles] [frames]` runs the arrow-nav benchmark (back-compat);
+        // `bench resize [tiles] [steps]` runs the window-resize benchmark.
+        let mode = args.next().unwrap_or_default();
+        if mode == "resize" {
+            let tiles = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
+            let steps = args.next().and_then(|s| s.parse().ok()).unwrap_or(120);
+            bench_resize(tiles, steps);
+        } else {
+            let tiles = mode.parse().unwrap_or(6);
+            let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
+            bench(tiles, frames);
+        }
         return;
     }
 
@@ -125,6 +136,102 @@ fn bench(tiles: usize, frames: usize) {
     println!("  model  (update + view): {:.3} ms/frame", per(model_ns));
     println!("  render (build + raster): {:.3} ms/frame", per(render_ns));
     println!("  total: {:.3} ms/frame", per(model_ns + render_ns));
+}
+
+/// Benchmark the window-resize hot path in the fleet view, the case the shell's
+/// resize coalescing targets. Sets up `tiles` attached sessions in the fleet, then
+/// sweeps the window size over `steps` (a grab-shrink-grow drag) two ways: relayout
+/// plus raster every step (what dragging cost before coalescing), versus capture
+/// once then stretch-blit every step (the per-step cost now). The first is O(tiles)
+/// per step (every preview re-renders at the new size); the second is a single
+/// textured quad, flat in tile count. The live shell still does one real relayout
+/// when the drag settles (and ~every 250 ms during a long drag), so the effective
+/// win is close to this per-step ratio.
+fn bench_resize(tiles: usize, steps: usize) {
+    use std::time::Instant;
+
+    let key = |k: NamedKey| UiEvent::Key {
+        key: Key::Named(k),
+        mods: Mods::NONE,
+        kind: KeyEventKind::Press,
+        alts: None,
+    };
+
+    let base = (1400u32, 900u32);
+    let (mut root, _) = RootModel::fleet(METRICS, base, 1.0);
+    root.update(UiEvent::Resize {
+        w_px: base.0,
+        h_px: base.1,
+        scale: 1.0,
+    });
+    for i in 0..tiles {
+        let name = format!("s{i}");
+        root.update(UiEvent::AdoptSession(name.clone()));
+        root.update(UiEvent::SessionData {
+            name,
+            bytes: dense_screen().into_bytes(),
+            ended: false,
+        });
+    }
+    root.update(key(NamedKey::F9));
+
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+    let mut renderer = Renderer::headless(Theme::default());
+    let px = |r: &RootModel| SIZE_PX * r.render_scale();
+
+    // A grab-shrink-grow drag: width 1400 → 900 → 1400, height tracking the aspect.
+    let sizes: Vec<(u32, u32)> = (0..steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let w = (1400.0 - 500.0 * (std::f32::consts::PI * t).sin()).round() as u32;
+            let h = (w as f32 * 9.0 / 14.0).round() as u32;
+            (w.max(200), h.max(200))
+        })
+        .collect();
+
+    // Warm caches at the base size.
+    let _ = renderer.render_offscreen_scene(&root.view(), font, px(&root));
+
+    // Old behaviour: every drag step relayouts the model and re-rasters every tile.
+    let mut relayout_ns = 0u128;
+    for &(w, h) in &sizes {
+        let t = Instant::now();
+        root.update(UiEvent::Resize {
+            w_px: w,
+            h_px: h,
+            scale: 1.0,
+        });
+        let scene = root.view();
+        let _ = renderer.render_offscreen_scene(&scene, font, px(&root));
+        relayout_ns += t.elapsed().as_nanos();
+    }
+
+    // New behaviour: capture once at the gesture start, then stretch-blit each step.
+    root.update(UiEvent::Resize {
+        w_px: base.0,
+        h_px: base.1,
+        scale: 1.0,
+    });
+    renderer.capture_snapshot(&root.view(), font, px(&root));
+    let mut blit_ns = 0u128;
+    for &(w, h) in &sizes {
+        let t = Instant::now();
+        let _ = renderer.blit_snapshot_offscreen(w, h);
+        blit_ns += t.elapsed().as_nanos();
+    }
+    renderer.clear_snapshot();
+
+    let per = |ns: u128| (ns as f64) / (steps as f64) / 1.0e6;
+    println!("bench resize: {tiles} attached sessions, fleet open, {steps} drag steps");
+    println!(
+        "  relayout+raster per step (old): {:.3} ms",
+        per(relayout_ns)
+    );
+    println!("  stretch-blit per step (new):    {:.3} ms", per(blit_ns));
+    println!(
+        "  per-step speedup: {:.1}x",
+        relayout_ns as f64 / blit_ns.max(1) as f64
+    );
 }
 
 /// A full 80×24 screen of varied, coloured glyphs — a dense-ish preview.

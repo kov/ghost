@@ -21,6 +21,7 @@
 mod config;
 mod from_winit;
 mod pacer;
+mod resize;
 
 use std::collections::HashMap;
 use std::io;
@@ -403,6 +404,35 @@ impl Graphics {
         self.scene_cache.invalidate();
     }
 
+    /// Stretch-blit the renderer's held resize snapshot to the (already
+    /// reconfigured) surface — immediate feedback during an interactive resize,
+    /// without the relayout/re-raster of a full scene render. No-op if the
+    /// renderer holds no snapshot.
+    fn blit_snapshot(&mut self) {
+        if !self.renderer.has_snapshot() {
+            return;
+        }
+        let frame_tex = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            _ => return,
+        };
+        let target = frame_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer
+            .blit_snapshot_to_view(&target, self.config.width, self.config.height);
+        self.window.pre_present_notify();
+        frame_tex.present();
+        // What's on screen is the stretched snapshot, not a model scene; keep the
+        // scene cache invalid so the eventual crisp commit always redraws.
+        self.scene_cache.invalidate();
+    }
+
     /// Draw a scene into the surface. `scene.size_px` must equal the surface
     /// size, and `font_px` the glyph size the scene was laid out for (the model
     /// keeps both in sync via `UiEvent::Resize` and its render scale).
@@ -461,6 +491,9 @@ struct WindowState {
     /// Rate-limits repaints so output floods / held keys can't drive a software
     /// rasterizer at the 8 ms poll rate (see [`pacer`]).
     pacer: pacer::FramePacer,
+    /// Defers the costly relayout/reflow during an interactive resize, stretching
+    /// the last crisp frame in the meantime (see [`resize`]).
+    resize: resize::ResizeCoalescer,
 }
 
 impl WindowState {
@@ -728,6 +761,29 @@ impl App {
         }
     }
 
+    /// Handle one step of an interactive resize for window `wid`. On the gesture's
+    /// first step it captures the current crisp scene to a texture; every step then
+    /// reconfigures the surface, records the new size for a deferred commit, and
+    /// stretch-blits the snapshot for immediate feedback. The expensive real resize
+    /// (relayout/reflow/PTY-resize/re-raster) is deferred to `about_to_wait`, which
+    /// commits it once the drag settles — so dragging stays cheap and smooth even
+    /// with a fleet of sessions on a software rasterizer.
+    fn resize_step(&mut self, wid: WindowId, w_px: u32, h_px: u32, scale: f64) {
+        let now_ms = self.now_ms();
+        let Some(w) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if !w.gfx.renderer.has_snapshot() {
+            let scene = w.root.view();
+            let font_px = SIZE_PX * w.root.render_scale();
+            let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+            w.gfx.renderer.capture_snapshot(&scene, font, font_px);
+        }
+        w.gfx.resize(w_px, h_px);
+        w.resize.note(now_ms, w_px, h_px, scale);
+        w.gfx.blit_snapshot();
+    }
+
     /// Open a new window in the fleet overview (owning no session yet). The user
     /// spawns or takes over a session from there.
     fn open_fleet_window(&mut self, event_loop: &ActiveEventLoop) {
@@ -749,6 +805,7 @@ impl App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
+                resize: resize::ResizeCoalescer::new(resize::SETTLE_MS, resize::MAX_MS),
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -809,6 +866,7 @@ impl ApplicationHandler for App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
+                resize: resize::ResizeCoalescer::new(resize::SETTLE_MS, resize::MAX_MS),
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -884,11 +942,34 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        // Commit any interactive resize that has settled (drag paused/released) or
+        // hit its max refresh interval: drop the stretch-blit snapshot and dispatch
+        // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred
+        // while dragging. Its `Cmd::Redraw` then paints the crisp scene.
+        let now_ms = self.now_ms();
+        let commits: Vec<(WindowId, u32, u32, f64)> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(id, w)| w.resize.poll(now_ms).map(|(cw, ch, cs)| (*id, cw, ch, cs)))
+            .collect();
+        for (wid, cw, ch, cs) in commits {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.gfx.renderer.clear_snapshot();
+            }
+            self.dispatch(
+                wid,
+                UiEvent::Resize {
+                    w_px: cw,
+                    h_px: ch,
+                    scale: cs,
+                },
+                event_loop,
+            );
+        }
         // Release any paced repaint that the frame budget now allows. The loop
         // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
-        let now_ms = self.now_ms();
         for w in self.windows.values_mut() {
             if w.pacer.poll(now_ms) == pacer::Pace::PaintNow {
                 w.gfx.window.request_redraw();
@@ -909,59 +990,43 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                let Some(scale) = self.windows.get_mut(&id).map(|w| {
-                    w.gfx.resize(size.width, size.height);
-                    w.gfx.window.scale_factor()
-                }) else {
+                // Defer the costly relayout: capture + stretch-blit now, commit the
+                // real resize once the drag settles (see `resize_step`).
+                let Some(scale) = self.windows.get(&id).map(|w| w.gfx.window.scale_factor()) else {
                     return;
                 };
-                self.dispatch(
-                    id,
-                    UiEvent::Resize {
-                        w_px: size.width.max(1),
-                        h_px: size.height.max(1),
-                        scale,
-                    },
-                    event_loop,
-                );
+                self.resize_step(id, size.width.max(1), size.height.max(1), scale);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // The display's DPI changed (e.g. the window moved to another
-                // monitor). Reconfigure the surface to the window's *actual* new
-                // physical size and re-derive the grid at the new scale, so a
-                // redraw arriving before the (usual) following Resized still
-                // renders with matching metrics rather than the stale config size.
-                let size = self.windows.get_mut(&id).map(|w| {
-                    let s = w.gfx.window.inner_size();
-                    w.gfx.resize(s.width, s.height);
-                    (s.width, s.height)
-                });
-                if let Some((w, h)) = size {
-                    self.dispatch(
-                        id,
-                        UiEvent::Resize {
-                            w_px: w.max(1),
-                            h_px: h.max(1),
-                            scale: scale_factor,
-                        },
-                        event_loop,
-                    );
-                }
+                // monitor). Treat it like a resize step against the window's actual
+                // new physical size, deferring the re-grid at the new scale.
+                let Some(s) = self.windows.get(&id).map(|w| w.gfx.window.inner_size()) else {
+                    return;
+                };
+                self.resize_step(id, s.width.max(1), s.height.max(1), scale_factor);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    let scene = win.root.view();
-                    // Rasterize at the model's render scale (device × zoom) so
-                    // glyph size matches the grid the scene was laid out for.
-                    let font_px = SIZE_PX * win.root.render_scale();
-                    // Keep the IME candidate window pinned to the text cursor.
-                    if let Some(a) = win.root.ime_cursor_area() {
-                        win.gfx.window.set_ime_cursor_area(
-                            PhysicalPosition::new(a.x, a.y),
-                            PhysicalSize::new(a.w, a.h),
-                        );
+                    if win.gfx.renderer.has_snapshot() {
+                        // A resize is in flight: blit the snapshot to the current
+                        // surface rather than render a scene whose size no longer
+                        // matches it (the model resize is deferred until settle).
+                        win.gfx.blit_snapshot();
+                    } else {
+                        let scene = win.root.view();
+                        // Rasterize at the model's render scale (device × zoom) so
+                        // glyph size matches the grid the scene was laid out for.
+                        let font_px = SIZE_PX * win.root.render_scale();
+                        // Keep the IME candidate window pinned to the text cursor.
+                        if let Some(a) = win.root.ime_cursor_area() {
+                            win.gfx.window.set_ime_cursor_area(
+                                PhysicalPosition::new(a.x, a.y),
+                                PhysicalSize::new(a.w, a.h),
+                            );
+                        }
+                        win.gfx.render(&scene, font_px);
                     }
-                    win.gfx.render(&scene, font_px);
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
