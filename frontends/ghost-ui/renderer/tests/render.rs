@@ -4,7 +4,7 @@
 //! and dumping PNGs to eyeball. Runs headless on lavapipe.
 
 use ghost_render::{
-    CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, layout_frame,
+    CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, Transform, layout_frame,
 };
 use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
@@ -311,9 +311,9 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
 
     // A 90x72 surface with the frame drawn into the top-left 45x36 tile (0.5x).
     let mut scene = Scene::new((90, 72));
-    scene.layers.push(Layer {
-        z: 0,
-        items: vec![SceneItem::Terminal {
+    scene.layers.push(Layer::new(
+        0,
+        vec![SceneItem::Terminal {
             id: SceneId::Tile(0),
             rect: RectPx {
                 x: 0.0,
@@ -325,7 +325,7 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
             selection: None,
             dim: false,
         }],
-    });
+    ));
     let mut renderer = Renderer::headless(Theme::default());
     let img = renderer.render_offscreen_scene(&scene, font, 15.0);
     let path = write_png("ghost_scaled_preview_sample.png", &img);
@@ -367,10 +367,10 @@ fn an_unchanged_preview_is_not_re_rasterized() {
         dim: false,
     };
     let mut scene = Scene::new((800, 240));
-    scene.layers.push(Layer {
-        z: 0,
-        items: vec![tile(SceneId::Tile(0), 0.0), tile(SceneId::Tile(1), 380.0)],
-    });
+    scene.layers.push(Layer::new(
+        0,
+        vec![tile(SceneId::Tile(0), 0.0), tile(SceneId::Tile(1), 380.0)],
+    ));
 
     let mut r = Renderer::headless(Theme::default());
     let _ = r.render_offscreen_scene(&scene, font, 15.0);
@@ -404,9 +404,9 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
         layout_frame(&vt, METRICS)
     };
     let mut scene = Scene::new((180, 72));
-    scene.layers.push(Layer {
-        z: 0,
-        items: vec![SceneItem::Rect {
+    scene.layers.push(Layer::new(
+        0,
+        vec![SceneItem::Rect {
             id: SceneId::Root,
             rect: RectPx {
                 x: 0.0,
@@ -417,10 +417,10 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
             color: [0.0, 1.0, 0.0, 1.0], // opaque green
             radius: 0.0,
         }],
-    });
-    scene.layers.push(Layer {
-        z: 1,
-        items: vec![SceneItem::Terminal {
+    ));
+    scene.layers.push(Layer::new(
+        1,
+        vec![SceneItem::Terminal {
             id: SceneId::Root,
             rect: RectPx {
                 x: 0.0,
@@ -432,7 +432,7 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
             selection: None,
             dim: false,
         }],
-    });
+    ));
 
     // Capture the snapshot — one real render, which shapes the text.
     r.capture_snapshot(&scene, font, 15.0);
@@ -482,9 +482,9 @@ fn an_identical_repaint_reshapes_nothing() {
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
 
     let mut scene = Scene::new((360, 108)); // 40*9 x 6*18
-    scene.layers.push(Layer {
-        z: 0,
-        items: vec![SceneItem::Terminal {
+    scene.layers.push(Layer::new(
+        0,
+        vec![SceneItem::Terminal {
             id: SceneId::Tile(0),
             rect: RectPx {
                 x: 0.0,
@@ -496,7 +496,7 @@ fn an_identical_repaint_reshapes_nothing() {
             selection: None,
             dim: false,
         }],
-    });
+    ));
 
     let mut r = Renderer::headless(Theme::default());
     let _ = r.render_offscreen_scene(&scene, font, 15.0);
@@ -507,5 +507,101 @@ fn an_identical_repaint_reshapes_nothing() {
         r.shape_misses(),
         after_first,
         "an identical repaint must re-shape nothing (shaping is cached)"
+    );
+}
+
+#[test]
+fn a_layer_transform_moves_and_scales_its_content() {
+    // A red square at layer-space (0,0,20,20) in a layer scaled 2x and shifted by
+    // (40,40) must be drawn on screen at (40,40)..(80,80) — the camera the
+    // spatial-navigation zoom rides on.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut scene = Scene::new((100, 100));
+    scene.layers.push(
+        Layer::new(
+            0,
+            vec![SceneItem::Rect {
+                id: SceneId::Root,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 20.0,
+                    h: 20.0,
+                },
+                color: [1.0, 0.0, 0.0, 1.0],
+                radius: 0.0,
+            }],
+        )
+        .with_transform(Transform {
+            scale: 2.0,
+            tx: 40.0,
+            ty: 40.0,
+        }),
+    );
+    let mut r = Renderer::headless(Theme::default());
+    let img = r.render_offscreen_scene(&scene, font, 15.0);
+    write_png("ghost_layer_transform.png", &img);
+
+    // Red lands inside the transformed rect...
+    assert!(
+        strong_red(px(&img, 60, 60)),
+        "center of the moved/scaled rect"
+    );
+    assert!(
+        strong_red(px(&img, 42, 42)),
+        "near its top-left corner (40,40)"
+    );
+    assert!(
+        strong_red(px(&img, 78, 78)),
+        "near its bottom-right corner (80,80)"
+    );
+    // ...and nowhere near the untransformed (0,0,20,20) location, nor past it.
+    assert!(
+        !strong_red(px(&img, 10, 10)),
+        "untransformed origin is now clear"
+    );
+    assert!(
+        !strong_red(px(&img, 90, 90)),
+        "nothing spills past the scaled rect"
+    );
+}
+
+#[test]
+fn a_layer_opacity_fades_its_content() {
+    // A fully-opaque red fill in a layer with opacity 0 must vanish (the dark
+    // background shows through); at full opacity it paints solid red. This is the
+    // alpha the chrome fade rides on.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let red = |opacity: f32| {
+        let mut scene = Scene::new((40, 40));
+        scene.layers.push(
+            Layer::new(
+                0,
+                vec![SceneItem::Rect {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 40.0,
+                        h: 40.0,
+                    },
+                    color: [1.0, 0.0, 0.0, 1.0],
+                    radius: 0.0,
+                }],
+            )
+            .with_opacity(opacity),
+        );
+        scene
+    };
+    let mut r = Renderer::headless(Theme::default());
+    let opaque = r.render_offscreen_scene(&red(1.0), font, 15.0);
+    assert!(
+        strong_red(px(&opaque, 20, 20)),
+        "opacity 1 paints solid red"
+    );
+    let faded = r.render_offscreen_scene(&red(0.0), font, 15.0);
+    assert!(
+        !strong_red(px(&faded, 20, 20)),
+        "opacity 0 fades the fill away to the background"
     );
 }

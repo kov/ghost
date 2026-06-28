@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use ghost_render::{
     BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneId, SceneItem,
-    Selection, Style,
+    Selection, Style, Transform,
 };
 use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -541,6 +541,48 @@ fn scale_instances(insts: &mut [Instance], s: f32) {
     for i in insts {
         for v in &mut i.rect {
             *v *= s;
+        }
+    }
+}
+
+/// Bring a layer's emitted geometry into screen space and fade it as one unit:
+/// scale + translate every instance/blit/image rect by the camera, and multiply
+/// each instance's alpha by the layer opacity. Identity + full opacity is a no-op
+/// (the common case), so untransformed layers pay nothing. Textured previews and
+/// images aren't faded — the spatial-nav camera zooms tiles, it doesn't dissolve
+/// them; only instance-based chrome (rects/text/borders/badges) carries opacity.
+fn apply_layer(
+    t: Transform,
+    opacity: f32,
+    insts: &mut [Instance],
+    blits: &mut [RectPx],
+    images: &mut [ImageDraw],
+) {
+    let identity = t == Transform::IDENTITY;
+    if identity && opacity >= 1.0 {
+        return;
+    }
+    for inst in insts.iter_mut() {
+        if !identity {
+            inst.rect[0] = inst.rect[0] * t.scale + t.tx;
+            inst.rect[1] = inst.rect[1] * t.scale + t.ty;
+            inst.rect[2] *= t.scale;
+            inst.rect[3] *= t.scale;
+        }
+        inst.color[3] *= opacity;
+    }
+    if !identity {
+        for r in blits.iter_mut() {
+            *r = t.apply_rect(*r);
+        }
+        for im in images.iter_mut() {
+            let r = t.apply_rect(RectPx {
+                x: im.rect[0],
+                y: im.rect[1],
+                w: im.rect[2],
+                h: im.rect[3],
+            });
+            im.rect = [r.x, r.y, r.w, r.h];
         }
     }
 }
@@ -1803,9 +1845,17 @@ impl Renderer {
             };
 
         for layer in order {
+            // Ranges this layer pushes into the shared buffers, so its camera +
+            // opacity can be applied to exactly its own geometry afterwards.
+            let (inst0, blit0, img0) = (all.len(), blits.len(), images.len());
             for item in &layer.items {
                 let scissor = match item {
-                    SceneItem::Terminal { rect, .. } => clamp_scissor(*rect, sw, sh),
+                    // A tile's scissor is computed in screen space (camera applied,
+                    // then clamped) so clipping follows where the tile is drawn; the
+                    // tile's geometry is brought into the same space below.
+                    SceneItem::Terminal { rect, .. } => {
+                        clamp_scissor(layer.transform.apply_rect(*rect), sw, sh)
+                    }
                     _ => [0, 0, sw, sh],
                 };
                 match item {
@@ -1886,6 +1936,14 @@ impl Renderer {
                     }
                 }
             }
+            // Move/scale and fade everything this layer emitted as one unit.
+            apply_layer(
+                layer.transform,
+                layer.opacity,
+                &mut all[inst0..],
+                &mut blits[blit0..],
+                &mut images[img0..],
+            );
         }
         // Drop textures for tiles no longer on screen, bounding cache memory.
         self.preview_cache.retain(|id, _| seen.contains(id));
@@ -2353,9 +2411,9 @@ mod tests {
         let mut cache = SceneCache::default();
         let a = Scene::new((100, 50));
         let mut b = Scene::new((100, 50));
-        b.layers.push(Layer {
-            z: 0,
-            items: vec![SceneItem::Rect {
+        b.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Rect {
                 id: SceneId::Root,
                 rect: RectPx {
                     x: 0.0,
@@ -2366,7 +2424,7 @@ mod tests {
                 color: [0.0, 0.0, 0.0, 1.0],
                 radius: 0.0,
             }],
-        });
+        ));
 
         // First ever scene must draw; an identical follow-up is skipped.
         assert!(cache.needs_redraw(&a, 16.0));
@@ -2408,9 +2466,9 @@ mod tests {
         let (w, h) = Renderer::frame_size(&f);
         let scene = Scene {
             size_px: (w, h),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Terminal {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
                     id: SceneId::Root,
                     rect: RectPx {
                         x: 0.0,
@@ -2422,7 +2480,7 @@ mod tests {
                     selection: None,
                     dim: false,
                 }],
-            }],
+            )],
         };
         let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
 
@@ -2464,9 +2522,9 @@ mod tests {
         let (w, h) = Renderer::frame_size(&f);
         let scene = Scene {
             size_px: (w, h),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Terminal {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
                     id: SceneId::Root,
                     rect: RectPx {
                         x: 0.0,
@@ -2478,7 +2536,7 @@ mod tests {
                     selection: None,
                     dim: false,
                 }],
-            }],
+            )],
         };
         let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
         // Image stretched across the 2x1 cell block (18px wide): left cell red,
@@ -2613,9 +2671,9 @@ mod tests {
 
         let scene = Scene {
             size_px: (w, h),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Terminal {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
                     id: SceneId::Root,
                     rect: RectPx {
                         x: 0.0,
@@ -2627,7 +2685,7 @@ mod tests {
                     selection: None,
                     dim: false,
                 }],
-            }],
+            )],
         };
         let via_scene =
             Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
@@ -2650,9 +2708,9 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let scene = Scene {
             size_px: (200, 40),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Terminal {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
                     id: SceneId::Tile(1),
                     rect: RectPx {
                         x: 0.0,
@@ -2664,7 +2722,7 @@ mod tests {
                     selection: None,
                     dim: false,
                 }],
-            }],
+            )],
         };
         let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
 
@@ -2690,9 +2748,9 @@ mod tests {
         let direct = Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX);
         let scene = Scene {
             size_px: (w, h),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Terminal {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
                     id: SceneId::Root,
                     rect: RectPx {
                         x: 0.0,
@@ -2704,7 +2762,7 @@ mod tests {
                     selection: None,
                     dim: false,
                 }],
-            }],
+            )],
         };
         let via_scene =
             Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, SIZE_PX);
@@ -2720,9 +2778,9 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let scene = Scene {
             size_px: (60, 60),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Border {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Border {
                     id: SceneId::Tile(1),
                     rect: RectPx {
                         x: 0.0,
@@ -2733,7 +2791,7 @@ mod tests {
                     color: [1.0, 0.0, 0.0, 0.5], // translucent red
                     width: 6.0,
                 }],
-            }],
+            )],
         };
         let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
         // A corner pixel and a top-edge-midpoint pixel must blend identically:
@@ -2751,9 +2809,9 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let scene = Scene {
             size_px: (40, 40),
-            layers: vec![Layer {
-                z: 0,
-                items: vec![SceneItem::Rect {
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Rect {
                     id: SceneId::Sidebar,
                     rect: RectPx {
                         x: 10.0,
@@ -2764,7 +2822,7 @@ mod tests {
                     color: [0.0, 1.0, 0.0, 1.0], // opaque green
                     radius: 0.0,
                 }],
-            }],
+            )],
         };
         let img = r.render_offscreen_scene(&scene, font, SIZE_PX);
         assert_eq!(px(&img, 20, 20), [0, 255, 0, 255], "rect interior is green");
