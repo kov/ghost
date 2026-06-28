@@ -85,13 +85,33 @@ fn main() {
         return;
     }
 
+    if which == "zoom" {
+        // `zoom [out.png] [now_ms]` — render a fleet zoom mid-flight (F9 from the
+        // single view), so the camera animation can be eyeballed at any progress.
+        // The animation runs ~180ms, so `now_ms` ≈ 90 is mid-zoom; 0 is fully in.
+        let out = args
+            .next()
+            .unwrap_or_else(|| "ghost-shot-zoom.png".to_string());
+        let at = args
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90);
+        let (scene, w, h) = zoom_scene(at);
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+        let mut renderer = Renderer::headless(Theme::default());
+        let img = renderer.render_offscreen_scene(&scene, font, SIZE_PX);
+        img.save_png(&out).expect("write png");
+        println!("wrote zoom frame at now_ms={at} ({w}x{h}) to {out}");
+        return;
+    }
+
     let out = args.next().unwrap_or_else(|| "ghost-shot.png".to_string());
     let (scene, w, h) = match which.as_str() {
         "fleet" => fleet_scene(),
         "single" => single_scene(),
         other => {
             eprintln!(
-                "unknown scene '{other}' (expected: fleet | single | bench | calib | calib-tui)"
+                "unknown scene '{other}' (expected: fleet | single | zoom | bench | calib | calib-tui)"
             );
             std::process::exit(2);
         }
@@ -428,6 +448,49 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 
     let scene = fleet.view();
     (scene, size.0, size.1)
+}
+
+/// A fleet zoom mid-flight: open a fleet window, drive several sessions (so the
+/// grid has tiles), drop into the single view of one, then press F9 (zoom out) and
+/// advance the clock to `at_ms`. The returned scene is the whole fleet world under
+/// the partway camera — the spatial dive frozen at one frame.
+fn zoom_scene(at_ms: u64) -> (ghost_render::Scene, u32, u32) {
+    let size = (1400u32, 900u32);
+    let key = |k: NamedKey| UiEvent::Key {
+        key: Key::Named(k),
+        mods: Mods::NONE,
+        kind: KeyEventKind::Press,
+        alts: None,
+    };
+    let (mut root, _) = RootModel::fleet(METRICS, size, 1.0);
+    root.update(UiEvent::Resize {
+        w_px: size.0,
+        h_px: size.1,
+        scale: 1.0,
+    });
+    let names = ["edit", "build", "logs", "prod", "test", "docs"];
+    root.update(UiEvent::SessionList(
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| info(n, true, &[], i as i32 + 1))
+            .collect(),
+    ));
+    let cal = calibration_screen(80, 24);
+    for n in names {
+        root.update(UiEvent::AdoptSession(n.to_string()));
+        root.update(UiEvent::SessionData {
+            name: n.to_string(),
+            bytes: cal.clone().into_bytes(),
+            ended: false,
+        });
+    }
+    // Now in the single view of `docs`. F9 zooms out into the fleet; stamp the
+    // animation start (now_ms 0), then advance to `at_ms`.
+    root.update(key(NamedKey::F9));
+    root.update(UiEvent::Tick { now_ms: 0 });
+    root.update(UiEvent::Tick { now_ms: at_ms });
+    (root.view(), size.0, size.1)
 }
 
 /// The single-terminal view, for comparison / regression on the same content.
