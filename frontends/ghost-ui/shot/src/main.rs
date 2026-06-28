@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use ghost_render::CellMetrics;
-use ghost_renderer::{Renderer, Theme};
+use ghost_renderer::{Rendered, Renderer, Theme};
 use ghost_ui_core::{
     FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, TerminalModel, UiEvent,
 };
@@ -86,30 +86,60 @@ fn main() {
     }
 
     if which == "zoom" {
-        // `zoom [in|out] [out.png] [now_ms]` — render a fleet dive mid-flight so the
-        // camera animation can be eyeballed at any progress. `out` dives single →
-        // fleet (default), `in` dives fleet → single. The dive runs ~180ms, so
-        // `now_ms` ≈ 90 is mid-dive. Both render the fleet world under the camera.
+        // `zoom [in|out] [count] [prefix]` — render a CONTACT SHEET of the fleet dive:
+        // one tile per progress step, every 5 %, so the whole camera motion can be
+        // eyeballed at once. The dive is into/out of the *second* session. With no
+        // direction both sheets are written (`{prefix}-in.png`, `{prefix}-out.png`);
+        // `count` sessions (default 2). A thin white bar across each tile's top marks
+        // progress (0 → 100 %), read left-to-right, top-to-bottom.
         let mut rest: Vec<String> = args.collect();
-        let dir = if rest.first().is_some_and(|s| s == "in" || s == "out") {
-            rest.remove(0)
-        } else {
-            "out".to_string()
-        };
-        let out = rest
+        let dir = rest
             .first()
+            .filter(|s| *s == "in" || *s == "out")
             .cloned()
-            .unwrap_or_else(|| "ghost-shot-zoom.png".to_string());
-        let at = rest
-            .get(1)
+            .inspect(|_| {
+                rest.remove(0);
+            });
+        let count = rest
+            .iter()
+            .find_map(|s| s.parse::<usize>().ok())
+            .unwrap_or(2);
+        let prefix = rest
+            .iter()
+            .find(|s| s.parse::<usize>().is_err())
+            .cloned()
+            .unwrap_or_else(|| "dive".to_string());
+        for d in ["in", "out"] {
+            if dir.as_deref().is_none_or(|want| want == d) {
+                zoom_contact_sheet(d, count, &format!("{prefix}-{d}.png"));
+            }
+        }
+        return;
+    }
+
+    if which == "frame" {
+        // `frame <in|out> <pct> [count] [out.png]` — one full-resolution dive frame at
+        // `pct` %, for inspecting detail the downscaled contact sheet can't show.
+        let dir = args.next().unwrap_or_else(|| "in".to_string());
+        let pct = args
+            .next()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(90);
-        let (scene, w, h) = zoom_scene(&dir, at);
+            .unwrap_or(50);
+        let mut count = 2usize;
+        let mut out = format!("dive-{dir}-{pct:03}.png");
+        for a in args {
+            if let Ok(n) = a.parse::<usize>() {
+                count = n;
+            } else {
+                out = a;
+            }
+        }
+        let (scene, w, h) = dive_frame_scene(&dir, count, pct);
         let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
         let mut renderer = Renderer::headless(Theme::default());
         let img = renderer.render_offscreen_scene(&scene, font, SIZE_PX);
         img.save_png(&out).expect("write png");
-        println!("wrote {dir}-dive frame at now_ms={at} ({w}x{h}) to {out}");
+        println!("wrote {dir}-dive frame at {pct}% ({w}x{h}) to {out}");
         return;
     }
 
@@ -463,7 +493,13 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 /// single → fleet) and advance to `at_ms`. For `in`, additionally settle that dive,
 /// then press F9 again (dive fleet → single) and advance to `at_ms`. Either way the
 /// returned scene is the whole fleet world under the partway camera.
-fn zoom_scene(dir: &str, at_ms: u64) -> (ghost_render::Scene, u32, u32) {
+/// The dive runs this long (mirrors `root::ANIM_MS`); the sheet samples across it.
+const DIVE_MS: u64 = 180;
+
+/// Build a `count`-session fleet and kick a dive into/out of the *second* session,
+/// returning the model and the `base` time whose first tick stamps the dive's start
+/// (tick at `base + DIVE_MS * pct / 100` to land at `pct` %).
+fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
     let size = (1400u32, 900u32);
     let key = |k: NamedKey| UiEvent::Key {
         key: Key::Named(k),
@@ -471,13 +507,20 @@ fn zoom_scene(dir: &str, at_ms: u64) -> (ghost_render::Scene, u32, u32) {
         kind: KeyEventKind::Press,
         alts: None,
     };
+    let names: Vec<String> = ["edit", "build", "logs", "prod", "test", "docs"]
+        .iter()
+        .take(count.max(1))
+        .map(|s| s.to_string())
+        .collect();
+    // The "second" session (clamped), the one we dive into and out of.
+    let target = names[1.min(names.len() - 1)].clone();
+
     let (mut root, _) = RootModel::fleet(METRICS, size, 1.0);
     root.update(UiEvent::Resize {
         w_px: size.0,
         h_px: size.1,
         scale: 1.0,
     });
-    let names = ["edit", "build", "logs", "prod", "test", "docs"];
     root.update(UiEvent::SessionList(
         names
             .iter()
@@ -485,31 +528,146 @@ fn zoom_scene(dir: &str, at_ms: u64) -> (ghost_render::Scene, u32, u32) {
             .map(|(i, n)| info(n, true, &[], i as i32 + 1))
             .collect(),
     ));
-    let cal = calibration_screen(80, 24);
-    for n in names {
-        root.update(UiEvent::AdoptSession(n.to_string()));
+    // A full-grid calibration pattern (border flush to the window-sized 155×50 grid)
+    // so a tile's extent — and whether the dive lands it at native size — is
+    // unambiguous: the border sits at the window edges iff the content fills it.
+    let content = calibration_screen(155, 50);
+    for n in &names {
+        root.update(UiEvent::AdoptSession(n.clone()));
         root.update(UiEvent::SessionData {
-            name: n.to_string(),
-            bytes: cal.clone().into_bytes(),
+            name: n.clone(),
+            bytes: content.clone().into_bytes(),
             ended: false,
         });
     }
-    // Now in the single view of `docs`. F9 dives out into the fleet.
-    root.update(key(NamedKey::F9));
+    // Make the target the foreground so a dive-out pulls back from it.
+    root.update(UiEvent::AdoptSession(target.clone()));
+
+    // `base` is well past the settle ticks so its first tick cleanly stamps the start.
+    let base = 10_000u64;
     if dir == "in" {
-        // Settle the dive-out, then dive back in (fleet → single).
+        root.update(key(NamedKey::F9)); // → fleet (dive-out)
         root.update(UiEvent::Tick { now_ms: 0 });
-        root.update(UiEvent::Tick { now_ms: 1_000 });
-        root.update(key(NamedKey::F9));
-        root.update(UiEvent::Tick { now_ms: 2_000 }); // stamp the new dive's start
-        root.update(UiEvent::Tick {
-            now_ms: 2_000 + at_ms,
-        });
+        root.update(UiEvent::Tick { now_ms: 1_000 }); // settle it
+        root.update(UiEvent::AdoptSession(target)); // dive into the target tile
     } else {
-        root.update(UiEvent::Tick { now_ms: 0 }); // stamp the start
-        root.update(UiEvent::Tick { now_ms: at_ms });
+        root.update(key(NamedKey::F9)); // single → fleet (dive-out)
     }
-    (root.view(), size.0, size.1)
+    (root, base)
+}
+
+/// Render a single full-resolution dive frame at `pct` %, for inspecting detail the
+/// downscaled contact sheet can't show (e.g. the handoff at 0 % / 100 %).
+fn dive_frame_scene(dir: &str, count: usize, pct: u64) -> (ghost_render::Scene, u32, u32) {
+    let (mut root, base) = kicked_dive(dir, count);
+    // The first tick only stamps the dive's start (elapsed 0); a second advances it.
+    root.update(UiEvent::Tick { now_ms: base });
+    root.update(UiEvent::Tick {
+        now_ms: base + DIVE_MS * pct.min(100) / 100,
+    });
+    (root.view(), 1400, 900)
+}
+
+/// Render a contact sheet of the fleet dive — one tile per 5 % step — so the whole
+/// camera motion can be inspected at once. `out` dives single → fleet from the second
+/// session; `in` dives fleet → single into it (the "select a session" gesture).
+fn zoom_contact_sheet(dir: &str, count: usize, out_path: &str) {
+    let (mut root, base) = kicked_dive(dir, count);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+    let mut renderer = Renderer::headless(Theme::default());
+    let pcts: Vec<u64> = (0..=100).step_by(5).collect();
+    let frames: Vec<Rendered> = pcts
+        .iter()
+        .map(|pct| {
+            root.update(UiEvent::Tick {
+                now_ms: base + DIVE_MS * pct / 100,
+            });
+            renderer.render_offscreen_scene(&root.view(), font, SIZE_PX)
+        })
+        .collect();
+
+    let sheet = contact_sheet(&frames, &pcts, 4, 340, 219, 8);
+    sheet.save_png(out_path).expect("write png");
+    println!(
+        "wrote {dir}-dive contact sheet ({} frames, {}x{}) to {out_path}",
+        frames.len(),
+        sheet.width,
+        sheet.height
+    );
+}
+
+/// Nearest-neighbour downscale of an RGBA image to `tw`×`th`.
+fn downscale(src: &Rendered, tw: u32, th: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (tw * th * 4) as usize];
+    for y in 0..th {
+        let sy = (y * src.height / th).min(src.height - 1);
+        for x in 0..tw {
+            let sx = (x * src.width / tw).min(src.width - 1);
+            let si = ((sy * src.width + sx) * 4) as usize;
+            let di = ((y * tw + x) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+        }
+    }
+    out
+}
+
+/// Tile `frames` into a `cols`-wide grid of `tw`×`th` thumbnails on a dark canvas,
+/// each with a thin progress bar across its top marking its percent. Frames read
+/// left-to-right, top-to-bottom.
+fn contact_sheet(
+    frames: &[Rendered],
+    pcts: &[u64],
+    cols: u32,
+    tw: u32,
+    th: u32,
+    gap: u32,
+) -> Rendered {
+    let n = frames.len() as u32;
+    let rows = n.div_ceil(cols);
+    let width = cols * tw + (cols + 1) * gap;
+    let height = rows * th + (rows + 1) * gap;
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    // Dark canvas (matches the app background) at full alpha.
+    for px in rgba.chunks_exact_mut(4) {
+        px.copy_from_slice(&[20, 20, 24, 255]);
+    }
+    let put = |rgba: &mut [u8], x: u32, y: u32, c: [u8; 4]| {
+        let di = ((y * width + x) * 4) as usize;
+        rgba[di..di + 4].copy_from_slice(&c);
+    };
+    for (i, frame) in frames.iter().enumerate() {
+        let thumb = downscale(frame, tw, th);
+        let (cx, cy) = (i as u32 % cols, i as u32 / cols);
+        let (ox, oy) = (gap + cx * (tw + gap), gap + cy * (th + gap));
+        for y in 0..th {
+            for x in 0..tw {
+                let si = ((y * tw + x) * 4) as usize;
+                put(
+                    &mut rgba,
+                    ox + x,
+                    oy + y,
+                    thumb[si..si + 4].try_into().unwrap(),
+                );
+            }
+        }
+        // Progress bar across the top edge: white for the elapsed fraction.
+        let filled = tw * pcts[i] as u32 / 100;
+        for y in 0..3 {
+            for x in 0..tw {
+                let c = if x < filled {
+                    [235, 235, 245, 255]
+                } else {
+                    [60, 60, 70, 255]
+                };
+                put(&mut rgba, ox + x, oy + y, c);
+            }
+        }
+    }
+    Rendered {
+        width,
+        height,
+        rgba,
+    }
 }
 
 /// The single-terminal view, for comparison / regression on the same content.
