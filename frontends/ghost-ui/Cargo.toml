@@ -5,3 +5,11 @@
 [workspace]
 resolver = "3"
 members = ["core", "shaper", "renderer", "app", "shot"]
+exclude = ["vendor/winit"]
+
+# Vendored winit 0.30.13 carrying a one-line patch to `is_stateless()` (recognise
+# partially-tiled / snapped windows) so the window restores to its pre-snap size on
+# Wayland/GNOME — see vendor/winit/.../linux/wayland/window/state.rs. To be reported
+# upstream (winit + smithay-client-toolkit), then dropped.
+[patch.crates-io]
+winit = { path = "vendor/winit" }

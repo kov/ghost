@@ -787,13 +787,12 @@ impl App {
         }
     }
 
-    /// Handle one step of an interactive resize for window `wid`. On the gesture's
-    /// first step it captures the current crisp scene to a texture; every step then
-    /// reconfigures the surface, records the new size for a deferred commit, and
-    /// stretch-blits the snapshot for immediate feedback. The expensive real resize
-    /// (relayout/reflow/PTY-resize/re-raster) is deferred to `about_to_wait`, which
-    /// commits it once the drag settles — so dragging stays cheap and smooth even
-    /// with a fleet of sessions on a software rasterizer.
+    /// Handle one interactive resize step for window `wid`. An isolated resize
+    /// (maximize / snap / un-maximize / a drag's first grab) is applied immediately
+    /// and crisply; a rapid drag stream captures the crisp scene once, then
+    /// reconfigures the surface and stretch-blits that snapshot for cheap feedback,
+    /// deferring the expensive real resize (relayout/reflow/PTY-resize/re-raster) to
+    /// `about_to_wait`, which commits it once the drag settles.
     fn resize_step(
         &mut self,
         wid: WindowId,
