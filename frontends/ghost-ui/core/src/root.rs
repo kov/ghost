@@ -22,7 +22,9 @@ enum Mode {
     Fleet(Box<FleetModel>),
 }
 
-/// Duration of the fleet zoom in/out animation, in milliseconds.
+/// Default duration of the fleet zoom in/out animation, in milliseconds. The shell
+/// can override it per-window (see [`RootModel::set_anim_ms`]) — e.g. from the
+/// `GHOST_DIVE_MS` env var — to slow the dive right down while validating it.
 const ANIM_MS: u64 = 180;
 /// Frame cadence while animating (~60 fps).
 const ANIM_TICK_MS: u64 = 16;
@@ -49,14 +51,14 @@ struct Anim {
 }
 
 impl Anim {
-    fn new(from: Transform, to: Transform, world: Option<Scene>) -> Self {
+    fn new(from: Transform, to: Transform, world: Option<Scene>, dur_ms: u64) -> Self {
         Anim {
             from,
             to,
             current: from,
             world,
             t0: None,
-            dur_ms: ANIM_MS,
+            dur_ms,
         }
     }
 
@@ -120,10 +122,21 @@ pub struct RootModel {
     /// instant and correctly sized. In the fleet, the models live in its tiles, so
     /// this is empty.
     warm: HashMap<SessionId, TerminalModel>,
+    /// A dive-out (single → fleet) waiting for the host's session list before it
+    /// animates. F9 swaps to the fleet instantly for input, but the grid it builds
+    /// only knows *this* window's sessions; the real fleet (foreign/detached tiles,
+    /// final order) assembles from the `ListSessions` reply. So we hold the camera
+    /// framed on this session (it keeps filling the window) until that reply lands,
+    /// then launch the pull-back over the *complete* grid — every tile already in its
+    /// final slot, nothing reshuffling at the end. Holds the session to frame.
+    pending_dive: Option<SessionId>,
     /// The in-flight fleet zoom, if any. Purely visual: the mode swap is instant,
     /// so this never affects logical state or input — `view` just renders the
     /// active scene under its camera until it completes.
     anim: Option<Anim>,
+    /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
+    /// validation (kept here rather than read from the env so the core stays pure).
+    anim_ms: u64,
 }
 
 /// Resize a model to the window (physical px + scale), returning its commands.
@@ -162,7 +175,9 @@ impl RootModel {
             mine: HashSet::from([id.clone()]),
             primary: Some(id),
             warm: HashMap::new(),
+            pending_dive: None,
             anim: None,
+            anim_ms: ANIM_MS,
         }
     }
 
@@ -178,13 +193,22 @@ impl RootModel {
             mine: HashSet::new(),
             primary: None,
             warm: HashMap::new(),
+            pending_dive: None,
             anim: None,
+            anim_ms: ANIM_MS,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
 
     pub fn is_fleet(&self) -> bool {
         matches!(self.mode, Mode::Fleet(_))
+    }
+
+    /// Override the dive duration (ms) — e.g. the shell wiring `GHOST_DIVE_MS` to
+    /// slow the animation right down for visual validation. Affects dives started
+    /// after this call.
+    pub fn set_anim_ms(&mut self, ms: u64) {
+        self.anim_ms = ms;
     }
 
     /// Whether a fleet zoom animation is currently playing.
@@ -251,10 +275,42 @@ impl RootModel {
             }
             return cmds;
         }
+        // The session list completes the fleet (foreign/detached tiles, final order).
+        // If a dive-out was waiting on it, launch the pull-back now that the grid is
+        // whole — every tile already in its final slot, so nothing reshuffles.
+        if let UiEvent::SessionList(_) = &ev {
+            let mut cmds = match &mut self.mode {
+                Mode::Single(m) => m.update(ev),
+                Mode::Fleet(f) => f.update(ev),
+            };
+            if let Some(p) = self.pending_dive.take() {
+                cmds.extend(self.launch_dive_out(&p));
+            }
+            return cmds;
+        }
         match &mut self.mode {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         }
+    }
+
+    /// Start the deferred dive-out pull-back over the now-complete fleet: zoom from
+    /// the framed session (filling the window) back to the whole grid. A no-op if the
+    /// session has no tile (e.g. it ended while we waited).
+    fn launch_dive_out(&mut self, framed: &str) -> Vec<Cmd> {
+        let Mode::Fleet(f) = &self.mode else {
+            return Vec::new();
+        };
+        let Some(camera) = f.dive_camera(framed) else {
+            return vec![Cmd::Redraw];
+        };
+        self.anim = Some(Anim::new(
+            camera,
+            Transform::IDENTITY,
+            Some(f.view()),
+            self.anim_ms,
+        ));
+        vec![Cmd::ScheduleTick { after_ms: 0 }]
     }
 
     /// Feed output to a background session's warm mirror, dropping the mirror if
@@ -281,13 +337,17 @@ impl RootModel {
     /// The previously-shown session is NOT detached — the window keeps it warm so
     /// Ctrl-Tab and the fleet can switch back to it.
     fn adopt(&mut self, id: SessionId) -> Vec<Cmd> {
-        let win = (self.size_px.0 as f32, self.size_px.1 as f32);
+        // A new transition cancels any in-flight dive (a still-waiting dive-out, or an
+        // animation that hasn't settled) so a stale camera/snapshot can't linger.
+        self.pending_dive = None;
+        self.anim = None;
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
             String::new(),
             1,
             1,
             self.metrics,
         )));
+        let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let mut anim = None;
         let (mut model, mut cmds) = match current {
@@ -295,13 +355,9 @@ impl RootModel {
                 // Opening a tile dives into where it sat in the grid: snapshot the
                 // fleet world so the whole grid stays visible during the descent (a
                 // freshly spawned session with no tile yet just opens, no dive).
-                anim = f.dive_target_rect(&id).map(|r| {
-                    Anim::new(
-                        Transform::IDENTITY,
-                        Transform::zoom_to(r, win),
-                        Some(f.view()),
-                    )
-                });
+                anim = f
+                    .dive_camera(&id)
+                    .map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view()), dur));
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
                 // The window's other driven sessions stay warm in the background.
@@ -369,9 +425,21 @@ impl RootModel {
     }
 
     pub fn view(&self) -> Scene {
+        // A dive-out waiting on the session list: hold the camera framed on the
+        // session we left (it keeps filling the window, as in the single view) until
+        // the reply lands and the pull-back is launched. Chrome fully faded — we're
+        // zoomed all the way in — matching the dive's zoomed-in end.
+        if self.anim.is_none()
+            && let Some(p) = &self.pending_dive
+            && let Mode::Fleet(f) = &self.mode
+            && let Some(camera) = f.dive_camera(p)
+        {
+            return Self::with_camera(f.view(), camera, 0.0);
+        }
+
         // During a dive-in the mode is already single, so render the frozen fleet
         // snapshot the dive launched from; otherwise the live active view.
-        let mut scene = match &self.anim {
+        let scene = match &self.anim {
             Some(Anim {
                 world: Some(world), ..
             }) => world.clone(),
@@ -383,19 +451,25 @@ impl RootModel {
         // While zooming, render the whole world under the animation camera and fade
         // the fleet chrome (everything but the terminal previews) toward the tile,
         // so a card resolves into a clean terminal rather than a giant button bar.
-        if let Some(anim) = &self.anim {
-            let chrome = anim.chrome_alpha();
-            for layer in &mut scene.layers {
-                layer.transform = anim.current;
-                if chrome < 1.0 {
-                    for item in &mut layer.items {
-                        match item {
-                            // The preview is the content that becomes the terminal.
-                            SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
-                            SceneItem::Rect { color, .. }
-                            | SceneItem::Text { color, .. }
-                            | SceneItem::Border { color, .. } => color[3] *= chrome,
-                        }
+        match &self.anim {
+            Some(anim) => Self::with_camera(scene, anim.current, anim.chrome_alpha()),
+            None => scene,
+        }
+    }
+
+    /// Render a scene under a camera transform, fading the fleet chrome (everything
+    /// but terminal previews and badges) by `chrome` so a card resolves into a clean
+    /// terminal as the camera zooms in.
+    fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
+        for layer in &mut scene.layers {
+            layer.transform = camera;
+            if chrome < 1.0 {
+                for item in &mut layer.items {
+                    match item {
+                        SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
+                        SceneItem::Rect { color, .. }
+                        | SceneItem::Text { color, .. }
+                        | SceneItem::Border { color, .. } => color[3] *= chrome,
                     }
                 }
             }
@@ -431,7 +505,6 @@ impl RootModel {
     }
 
     fn toggle(&mut self) -> Vec<Cmd> {
-        let win = (self.size_px.0 as f32, self.size_px.1 as f32);
         // Swap the mode out behind a cheap placeholder so we can move the owned
         // model/fleet into the conversion.
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
@@ -440,6 +513,11 @@ impl RootModel {
             1,
             self.metrics,
         )));
+        // A new transition cancels any in-flight dive (a still-waiting dive-out, or an
+        // animation that hasn't settled) so a stale camera/snapshot can't linger.
+        self.pending_dive = None;
+        self.anim = None;
+        let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, mut cmds, anim) = match current {
             Mode::Single(m) => {
@@ -454,15 +532,15 @@ impl RootModel {
                     self.scale,
                     self.mine.clone(),
                 );
-                cmds.insert(0, Cmd::ListSessions); // populate the grid
-                // Dive out: the live fleet starts framed on the session we left and
-                // pulls back to the overview.
-                let anim = self
-                    .primary
-                    .as_deref()
-                    .and_then(|p| fleet.dive_target_rect(p))
-                    .map(|r| Anim::new(Transform::zoom_to(r, win), Transform::IDENTITY, None));
-                (Mode::Fleet(Box::new(fleet)), cmds, anim)
+                cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
+                // Dive out, but don't animate yet: the grid we just built only knows
+                // this window's sessions. Wait for the ListSessions reply to assemble
+                // the whole fleet (foreign/detached tiles, final order), then launch
+                // the pull-back so it animates the ACTUAL result with nothing
+                // reshuffling at the end. Until then `view` holds the camera framed on
+                // this session (it keeps filling the window, as in the single view).
+                self.pending_dive = self.primary.clone();
+                (Mode::Fleet(Box::new(fleet)), cmds, None)
             }
             Mode::Fleet(f) => {
                 // Dive in: snapshot the fleet world so the whole grid stays visible
@@ -472,11 +550,8 @@ impl RootModel {
                     .primary
                     .clone()
                     .or_else(|| f.focused().map(str::to_string));
-                let to = target
-                    .as_deref()
-                    .and_then(|t| f.dive_target_rect(t))
-                    .map(|r| Transform::zoom_to(r, win));
-                let anim = to.map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view())));
+                let to = target.as_deref().and_then(|t| f.dive_camera(t));
+                let anim = to.map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view()), dur));
                 let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
@@ -546,6 +621,26 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         })
+    }
+
+    fn sess(name: &str, attached: bool, created_at: i64) -> ghost_vt::session::SessionInfo {
+        ghost_vt::session::SessionInfo {
+            name: name.to_string(),
+            pid: 1,
+            created_at: Some(created_at),
+            title: name.to_string(),
+            command: vec![],
+            attached,
+            bell: false,
+        }
+    }
+
+    /// F9 to dive out, then deliver the host's session list so the deferred dive
+    /// launches over the complete fleet (mirrors the real flow). After this the dive
+    /// is animating.
+    fn dive_out(r: &mut RootModel, sessions: &[ghost_vt::session::SessionInfo]) {
+        key(r, Key::Named(NamedKey::F9), Mods::NONE);
+        r.update(UiEvent::SessionList(sessions.to_vec()));
     }
 
     #[test]
@@ -702,7 +797,8 @@ mod tests {
 
         // Dive OUT (single → fleet): begins framed on the tile (filling the window)
         // and pulls back, so the on-screen target shrinks monotonically to a tile.
-        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        // The dive launches once the session list arrives.
+        dive_out(&mut r, &[sess("alpha", true, 1)]);
         let base = 10_000u64;
         let out: Vec<RectPx> = [0u64, 25, 50, 75]
             .iter()
@@ -772,10 +868,22 @@ mod tests {
         let mut r = root(); // single view of alpha (owned)
         let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
         assert!(r.is_fleet(), "the mode swaps immediately");
-        assert!(r.is_animating(), "F9 starts a zoom animation");
         assert!(
-            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
-            "the animation is kicked by scheduling a tick: {cmds:?}"
+            !r.is_animating(),
+            "the dive waits for the session list before animating"
+        );
+        assert!(
+            cmds.contains(&Cmd::ListSessions),
+            "F9 fetches the complete grid first: {cmds:?}"
+        );
+        // The session list arrives: now the pull-back animation launches.
+        let launched = r.update(UiEvent::SessionList(vec![sess("alpha", true, 1)]));
+        assert!(r.is_animating(), "the session list launches the zoom");
+        assert!(
+            launched
+                .iter()
+                .any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the animation is kicked by scheduling a tick: {launched:?}"
         );
         // A tick mid-flight re-arms the next frame and keeps animating.
         let mid = r.update(UiEvent::Tick { now_ms: 1_000 });
@@ -800,6 +908,152 @@ mod tests {
     }
 
     #[test]
+    fn dive_out_freezes_the_fleet_against_a_mid_dive_reconcile() {
+        // Capture (which tile, where) — not just positions: a reorder swaps which
+        // session sits at each position, so comparing bare rects would miss it.
+        let tiles = |r: &RootModel| -> Vec<(crate::SceneId, crate::RectPx)> {
+            r.view()
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .filter_map(|it| match it {
+                    SceneItem::Terminal { id, rect, .. } => Some((*id, *rect)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Own two sessions; foreground = beta. Both fed so they render as live tiles.
+        let mut r = root(); // single view of alpha
+        r.update(UiEvent::AdoptSession("beta".to_string())); // foreground beta, alpha warm
+        r.update(UiEvent::SessionData {
+            name: "beta".to_string(),
+            bytes: b"beta".to_vec(),
+            ended: false,
+        });
+        r.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"alpha".to_vec(),
+            ended: false,
+        });
+        // Dive out launches over the complete, stable grid once the list arrives.
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", true, 2)]);
+        r.update(UiEvent::Tick { now_ms: 1_000 }); // progress 0
+        let before = tiles(&r);
+        assert!(before.len() >= 2, "both sessions render as preview tiles");
+
+        // A later reply that REVERSES the order would reshuffle the live fleet. The
+        // dive renders a frozen snapshot, so each tile must stay put — otherwise a
+        // different session slides under the camera mid-dive.
+        r.update(UiEvent::SessionList(vec![
+            sess("alpha", true, 9), // now newer
+            sess("beta", true, 1),  // now older
+        ]));
+        assert_eq!(
+            before,
+            tiles(&r),
+            "the dive renders a frozen snapshot, immune to a mid-dive reconcile"
+        );
+    }
+
+    #[test]
+    fn diving_back_out_keeps_the_settled_order_so_tiles_do_not_swap() {
+        // Tiles left-to-right, by their stable SceneId::Tile(handle).
+        let order = |r: &RootModel| -> Vec<crate::SceneId> {
+            let mut ts: Vec<(f32, crate::SceneId)> = r
+                .view()
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .filter_map(|it| match it {
+                    SceneItem::Terminal { id, rect, .. } => Some((rect.x, *id)),
+                    _ => None,
+                })
+                .collect();
+            ts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            ts.into_iter().map(|(_, id)| id).collect()
+        };
+
+        // Window owns alpha (older) and beta (newer); beta is the foreground. Both
+        // fed so they render as live preview tiles.
+        let mut r = root(); // single view of alpha
+        r.update(UiEvent::AdoptSession("beta".to_string()));
+        for n in ["alpha", "beta"] {
+            r.update(UiEvent::SessionData {
+                name: n.to_string(),
+                bytes: n.as_bytes().to_vec(),
+                ended: false,
+            });
+        }
+        // Dive out: launches over the complete, stable grid (oldest-first) once the
+        // list arrives, so it animates the very order it will settle into.
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", true, 2)]);
+        let during = order(&r); // the order the dive animates
+        // A further reply lands mid-dive, as the host's poll does.
+        r.update(UiEvent::SessionList(vec![
+            sess("alpha", true, 1),
+            sess("beta", true, 2),
+        ]));
+        let mut t = 1_000_000;
+        while r.is_animating() {
+            r.update(UiEvent::Tick { now_ms: t });
+            t += 100_000;
+        }
+        let settled = order(&r); // the order it lands in
+        assert_eq!(
+            during, settled,
+            "dive-out must animate the same order it settles into — no end-of-dive swap"
+        );
+    }
+
+    #[test]
+    fn dive_out_waits_for_the_session_list_then_animates_the_complete_fleet() {
+        // Distinct tiles (live previews AND placeholders) by stable handle.
+        let tile_count = |r: &RootModel| -> usize {
+            r.view()
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .filter_map(|it| match it.id() {
+                    crate::SceneId::Tile(h) => Some(h),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+
+        let mut r = root(); // single view of alpha, mine = {alpha}
+        r.update(UiEvent::Resize {
+            w_px: 1400,
+            h_px: 900,
+            scale: 1.0,
+        }); // roomy enough that all four tiles fit without scrolling
+        // F9 dives out, but holds framed on alpha until the host's session list lands.
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet(), "mode swaps for input immediately");
+        assert!(!r.is_animating(), "the dive waits for the complete grid");
+        assert!(
+            cmds.contains(&Cmd::ListSessions),
+            "F9 fetches the whole fleet: {cmds:?}"
+        );
+
+        // The reply: this window's attached alpha plus three detached foreign sessions
+        // (the user's "1 attached + 3 detached" case).
+        r.update(UiEvent::SessionList(vec![
+            sess("alpha", true, 1),
+            sess("x", false, 2),
+            sess("y", false, 3),
+            sess("z", false, 4),
+        ]));
+        assert!(r.is_animating(), "the dive launches once the grid is whole");
+        assert_eq!(
+            tile_count(&r),
+            4,
+            "the dive animates every session — detached tiles included, in final position"
+        );
+    }
+
+    #[test]
     fn the_view_carries_the_camera_while_animating_then_settles_to_identity() {
         use crate::Transform;
         let mut r = root();
@@ -808,7 +1062,7 @@ mod tests {
             h_px: 700,
             scale: 1.0,
         });
-        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet, zoom-out
+        dive_out(&mut r, &[sess("alpha", true, 1)]); // -> fleet, zoom-out launched
         r.update(UiEvent::Tick { now_ms: 5_000 }); // progress 0: camera = "from"
         let scene = r.view();
         assert!(
@@ -848,7 +1102,7 @@ mod tests {
     fn chrome_fades_during_the_dive() {
         use crate::{SceneId, SceneItem};
         let mut r = root(); // single view of alpha (owned)
-        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet, dive-out
+        dive_out(&mut r, &[sess("alpha", true, 1)]); // -> fleet, dive-out launched
         // Progress 0: the camera sits at the tile end, so the chrome is faded out.
         r.update(UiEvent::Tick { now_ms: 1_000 });
         let section_alpha = |r: &RootModel| {
@@ -930,7 +1184,7 @@ mod tests {
         // The animation is purely visual: the mode swaps instantly, so input still
         // routes to the freshly-shown session even while the camera is mid-flight.
         let mut r = root();
-        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet (animating)
+        dive_out(&mut r, &[sess("alpha", true, 1)]); // -> fleet (animating)
         assert!(r.is_animating());
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single (animating)
         assert!(!r.is_fleet(), "mode is single immediately");

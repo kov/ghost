@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use ghost_render::{
     BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Style,
-    layout_frame,
+    Transform, layout_frame,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -425,6 +425,25 @@ impl FleetModel {
             w: fw * s,
             h: fh * s,
         })
+    }
+
+    /// The full-zoom camera for a dive into/out of `id`: it maps the tile's drawn
+    /// frame onto its NATIVE size at the window origin — exactly how the single view
+    /// draws it (top-left, no cover-stretch). Using this (rather than `zoom_to`,
+    /// which fills the window and so stretches a frame whose native width is a few
+    /// pixels shy of the window) makes the dive's endpoint line up with the single
+    /// view pixel-for-pixel. `None` if the tile isn't present.
+    pub fn dive_camera(&self, id: &str) -> Option<Transform> {
+        let from = self.dive_target_rect(id)?;
+        let tile = self.tiles.iter().find(|t| t.id == id)?;
+        let (cols, rows) = tile.model.dims();
+        let to = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: cols as f32 * self.metrics.advance,
+            h: rows as f32 * self.metrics.line_height,
+        };
+        Some(Transform::map_rect(from, to))
     }
 
     /// Extract a single terminal for a toggle back to the single view, detaching

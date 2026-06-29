@@ -208,6 +208,23 @@ impl Transform {
         }
     }
 
+    /// The transform that maps `from` onto `to` (uniform scale + translate),
+    /// top-left anchored. `from` and `to` are assumed to share an aspect ratio, so
+    /// the width ratio sets the uniform scale; the corners then line up exactly. This
+    /// frames a fleet tile's drawn frame onto the single view's rect, so the dive's
+    /// full-zoom endpoint matches the single view pixel-for-pixel (no cover-stretch).
+    pub fn map_rect(from: RectPx, to: RectPx) -> Transform {
+        if from.w <= 0.0 || from.h <= 0.0 {
+            return Transform::IDENTITY;
+        }
+        let scale = to.w / from.w;
+        Transform {
+            scale,
+            tx: to.x - from.x * scale,
+            ty: to.y - from.y * scale,
+        }
+    }
+
     /// Linear interpolation between two transforms at `t` (0 = `a`, 1 = `b`). The
     /// animation clock drives `t`; easing, if any, is applied to `t` by the caller.
     pub fn lerp(a: Transform, b: Transform, t: f32) -> Transform {
@@ -382,6 +399,39 @@ mod tests {
         assert!(f.w > 100.0, "width overflows (cover): {f:?}");
         assert!((f.x + f.w * 0.5 - 50.0).abs() < 1e-3, "centred x: {f:?}");
         assert!((f.y + f.h * 0.5 - 50.0).abs() < 1e-3, "centred y: {f:?}");
+    }
+
+    #[test]
+    fn map_rect_lands_from_exactly_onto_to_top_left_anchored() {
+        let from = RectPx {
+            x: 30.0,
+            y: 12.0,
+            w: 80.0,
+            h: 50.0,
+        };
+        // A same-aspect target the frame should land on exactly (corners coincide).
+        let to = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 160.0,
+            h: 100.0,
+        };
+        let f = Transform::map_rect(from, to).apply_rect(from);
+        assert!(
+            (f.x - to.x).abs() < 1e-3
+                && (f.y - to.y).abs() < 1e-3
+                && (f.w - to.w).abs() < 1e-3
+                && (f.h - to.h).abs() < 1e-3,
+            "from must map exactly onto to: {f:?}"
+        );
+        // Degenerate input is the identity (no panic / NaN).
+        let zero = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        assert_eq!(Transform::map_rect(zero, to), Transform::IDENTITY);
     }
 
     #[test]

@@ -328,6 +328,18 @@ fn bench_resize(tiles: usize, steps: usize) {
     );
 }
 
+/// A screen filled with a solid truecolor background — a flat block that makes a
+/// tile instantly identifiable (and its extent obvious) in a dive frame.
+fn solid_screen(r: u8, g: u8, b: u8) -> String {
+    let mut s = String::from("\x1b[2J\x1b[H");
+    for _ in 0..60 {
+        s.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
+        s.push_str(&" ".repeat(170));
+        s.push_str("\x1b[0m\r\n");
+    }
+    s
+}
+
 /// A full 80×24 screen of varied, coloured glyphs — a dense-ish preview.
 fn dense_screen() -> String {
     let mut s = String::new();
@@ -493,7 +505,9 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 /// single → fleet) and advance to `at_ms`. For `in`, additionally settle that dive,
 /// then press F9 again (dive fleet → single) and advance to `at_ms`. Either way the
 /// returned scene is the whole fleet world under the partway camera.
-/// The dive runs this long (mirrors `root::ANIM_MS`); the sheet samples across it.
+/// The dive runs this long (mirrors the core's default `ANIM_MS`); the sheet
+/// samples across it. The tool drives a default-duration `RootModel`, so this is
+/// just the matching step size, not the live `GHOST_DIVE_MS` override.
 const DIVE_MS: u64 = 180;
 
 /// Build a `count`-session fleet and kick a dive into/out of the *second* session,
@@ -521,22 +535,39 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
         h_px: size.1,
         scale: 1.0,
     });
-    root.update(UiEvent::SessionList(
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| info(n, true, &[], i as i32 + 1))
-            .collect(),
-    ));
-    // A full-grid calibration pattern (border flush to the window-sized 155×50 grid)
-    // so a tile's extent — and whether the dive lands it at native size — is
-    // unambiguous: the border sits at the window edges iff the content fills it.
-    let content = calibration_screen(155, 50);
-    for n in &names {
+    // Reconcile WITH creation times (oldest first), as the host does and as a real
+    // window has already seen by the time it dives. RootModel caches these across the
+    // toggle, so the fleet it rebuilds on F9 is in its final order from the start.
+    let reconcile = || {
+        UiEvent::SessionList(
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let mut si = info(n, true, &[], i as i32 + 1);
+                    si.created_at = Some(i as i64 + 1); // names[0] oldest
+                    si
+                })
+                .collect(),
+        )
+    };
+    root.update(reconcile());
+    // Each session gets a distinct solid fill so it's obvious *which* session a dive
+    // frames: green = first, red = second, then blue/yellow; a full-grid calibration
+    // pattern for any beyond. The border/fill is flush to the window-sized grid, so a
+    // tile's extent (and which session it is) reads unambiguously at any zoom.
+    for (i, n) in names.iter().enumerate() {
         root.update(UiEvent::AdoptSession(n.clone()));
+        let content = match i {
+            0 => solid_screen(0, 200, 0),
+            1 => solid_screen(220, 0, 0),
+            2 => solid_screen(0, 80, 255),
+            3 => solid_screen(230, 200, 0),
+            _ => calibration_screen(155, 50),
+        };
         root.update(UiEvent::SessionData {
             name: n.clone(),
-            bytes: content.clone().into_bytes(),
+            bytes: content.into_bytes(),
             ended: false,
         });
     }
@@ -552,6 +583,9 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
         root.update(UiEvent::AdoptSession(target)); // dive into the target tile
     } else {
         root.update(key(NamedKey::F9)); // single → fleet (dive-out)
+        // The host keeps reconciling mid-dive; with the cache seeded above this is a
+        // no-op for ordering, so the dive lands in the same order it animated.
+        root.update(reconcile());
     }
     (root, base)
 }
@@ -745,5 +779,113 @@ mod tests {
             s.contains("TL") && s.contains("BR"),
             "missing corner labels"
         );
+    }
+
+    /// ANSI that paints a distinct 2×2-cell colour block in each corner of a
+    /// `cols`×`rows` grid (TL red, TR green, BL blue, BR yellow), on a grey fill.
+    fn corner_markers(cols: u16, rows: u16) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = write!(s, "\x1b[48;2;30;30;30m\x1b[2J"); // grey fill
+        let mut blk = |row: u16, col: u16, r: u8, g: u8, b: u8| {
+            for dr in 0..2u16 {
+                let _ = write!(s, "\x1b[{};{}H\x1b[48;2;{r};{g};{b}m  ", row + dr, col);
+            }
+        };
+        blk(1, 1, 255, 0, 0); // TL red
+        blk(1, cols - 1, 0, 255, 0); // TR green
+        blk(rows - 1, 1, 0, 0, 255); // BL blue
+        blk(rows - 1, cols - 1, 255, 255, 0); // BR yellow
+        let _ = write!(s, "\x1b[0m");
+        s
+    }
+
+    /// Bounding-box centre of pixels matching `rgb` within `tol`; None if absent.
+    fn find(img: &Rendered, rgb: [u8; 3], tol: i16) -> Option<(f32, f32)> {
+        let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut n = 0u64;
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let i = ((y * img.width + x) * 4) as usize;
+                let p = &img.rgba[i..i + 3];
+                if (p[0] as i16 - rgb[0] as i16).abs() <= tol
+                    && (p[1] as i16 - rgb[1] as i16).abs() <= tol
+                    && (p[2] as i16 - rgb[2] as i16).abs() <= tol
+                {
+                    minx = minx.min(x);
+                    miny = miny.min(y);
+                    maxx = maxx.max(x);
+                    maxy = maxy.max(y);
+                    n += 1;
+                }
+            }
+        }
+        (n > 0).then(|| ((minx + maxx) as f32 / 2.0, (miny + maxy) as f32 / 2.0))
+    }
+
+    // The dive's full-zoom endpoints (dive-out start, dive-in end) must frame the
+    // session exactly like the single view — corner markers land in the same place,
+    // none clipped off-screen. GPU test: needs the lavapipe ICD.
+    #[test]
+    fn dive_full_zoom_aligns_the_session_with_the_single_view() {
+        let size = (1400u32, 900u32);
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+        let mut renderer = Renderer::headless(Theme::default());
+        let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+
+        // A single session sized to the window; learn its grid from the scene.
+        let mut root = RootModel::single(
+            TerminalModel::new("m".to_string(), 80, 24, METRICS),
+            METRICS,
+            size,
+        );
+        root.update(UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: 1.0,
+        });
+        let (cols, rows) = match root.view().terminals().next().unwrap() {
+            ghost_render::SceneItem::Terminal { frame, .. } => {
+                (frame.cols as u16, frame.rows as u16)
+            }
+            _ => unreachable!(),
+        };
+        root.update(UiEvent::SessionData {
+            name: "m".to_string(),
+            bytes: corner_markers(cols, rows).into_bytes(),
+            ended: false,
+        });
+
+        // Reference: the single (full-window) view.
+        let single = renderer.render_offscreen_scene(&root.view(), font, SIZE_PX);
+        let want: Vec<(f32, f32)> = colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                find(&single, *c, 40).unwrap_or_else(|| panic!("single view missing corner {i}"))
+            })
+            .collect();
+
+        // Dive-out start: full zoom. Should match the single view.
+        let key = UiEvent::Key {
+            key: Key::Named(NamedKey::F9),
+            mods: Mods::NONE,
+            kind: KeyEventKind::Press,
+            alts: None,
+        };
+        root.update(key);
+        root.update(UiEvent::SessionList(vec![info("m", true, &[], 1)]));
+        root.update(UiEvent::Tick { now_ms: 10_000 }); // stamp t0 → progress 0 = full zoom
+        let dive = renderer.render_offscreen_scene(&root.view(), font, SIZE_PX);
+
+        for (i, c) in colors.iter().enumerate() {
+            let (wx, wy) = want[i];
+            let (dx, dy) = find(&dive, *c, 40)
+                .unwrap_or_else(|| panic!("dive lost corner {i} (clipped off-screen?)"));
+            assert!(
+                (dx - wx).abs() < 2.0 && (dy - wy).abs() < 2.0,
+                "corner {i} misaligned: single=({wx:.0},{wy:.0}) dive=({dx:.0},{dy:.0})"
+            );
+        }
     }
 }
