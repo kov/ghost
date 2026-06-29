@@ -507,8 +507,17 @@ impl Graphics {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-        self.renderer
-            .render_scene_to_view_damaged(&target, scene, font, font_px, band);
+        // Render into our own backbuffer (a banded redraw is only valid against a
+        // target whose old contents survive), then blit the whole backbuffer onto the
+        // acquired swapchain image — whose prior contents Vulkan leaves undefined.
+        self.renderer.present_scene(
+            &target,
+            (self.config.width, self.config.height),
+            scene,
+            font,
+            font_px,
+            band,
+        );
         self.window.pre_present_notify();
         frame_tex.present();
     }

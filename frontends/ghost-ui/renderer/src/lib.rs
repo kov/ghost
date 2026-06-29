@@ -603,6 +603,23 @@ struct Snapshot {
     size: (u32, u32),
 }
 
+/// Our own full-window render target, composited onto the swapchain each present.
+/// A banded (partial) redraw is only valid against a target whose previous contents
+/// survive — and Vulkan leaves an *acquired swapchain image*'s contents UNDEFINED,
+/// so painting a partial frame straight onto it loses everything outside the band on
+/// drivers that don't happen to preserve it. We own this texture and never recycle
+/// it, so `LoadOp::Load` here always sees the last complete frame; each present
+/// renders the scene (full or banded) into it, then blits the WHOLE texture onto the
+/// acquired image, so the displayed frame is always complete regardless of what the
+/// swapchain handed back.
+struct Backbuffer {
+    w: u32,
+    h: u32,
+    texture: wgpu::Texture,
+    /// Samples `texture` (nearest, 1:1) for the composite blit.
+    bind_group: wgpu::BindGroup,
+}
+
 /// Per-row instance offsets for a steady single view, so a damaged (banded)
 /// redraw can draw only the band's rows instead of the whole instance buffer.
 /// llvmpipe processes every *drawn* instance's vertices at submit time regardless
@@ -1042,6 +1059,16 @@ pub struct Renderer {
     /// Reused target for [`Self::render_to_cached_target`] (headless present
     /// benchmarking) — kept across frames so its contents persist for `LoadOp::Load`.
     bench_target: Option<(u32, u32, wgpu::Texture)>,
+    /// The owned full-window backbuffer (see [`Backbuffer`]); the partial redraw lands
+    /// here and is then blitted whole onto the swapchain.
+    backbuffer: Option<Backbuffer>,
+    /// Whether the backbuffer currently holds the complete last-presented frame. A
+    /// full redraw goes straight to the swapchain (covering every pixel, so it needs
+    /// no backbuffer) and leaves this `false`; the next banded present then repaints
+    /// the backbuffer fully before resuming cheap band updates.
+    backbuffer_valid: bool,
+    /// The fullscreen quad that blits the backbuffer onto the surface, reused.
+    backbuffer_quad: Option<wgpu::Buffer>,
     /// Per-row instance offsets for the last prepared scene, when it was a steady
     /// single view (one identity-transformed full-window Terminal). `Some` lets a
     /// damaged redraw draw only the band's rows; `None` (chrome, fleet, multi-item)
@@ -1350,6 +1377,9 @@ impl Renderer {
             shape_misses: 0,
             bg_fill,
             bench_target: None,
+            backbuffer: None,
+            backbuffer_valid: false,
+            backbuffer_quad: None,
             single_row_index: None,
             band_instances: 0,
             pack_x: 1,
@@ -2775,10 +2805,186 @@ impl Renderer {
             .filter(|(tw, th, _)| *tw == w && *th == h)
             .unwrap_or_else(|| (w, h, offscreen_target(&self.gpu.device, w, h, self.format)));
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        self.render_scene_to_view_damaged(&view, scene, font, size_px, band);
+        self.present_scene(&view, (w, h), scene, font, size_px, band);
         drop(view);
         let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
         self.bench_target = Some((tw, th, tex));
+    }
+
+    /// (Re)create the owned [`Backbuffer`] when absent or resized, returning `true`
+    /// if it was just created — its contents are then undefined, so the caller must
+    /// redraw it fully (not banded) this frame. Sampled nearest at 1:1 for the blit.
+    fn ensure_backbuffer(&mut self, w: u32, h: u32) -> bool {
+        if self
+            .backbuffer
+            .as_ref()
+            .is_some_and(|b| b.w == w && b.h == h)
+        {
+            return false;
+        }
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backbuffer"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("backbuffer bind group"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+        self.backbuffer = Some(Backbuffer {
+            w,
+            h,
+            texture,
+            bind_group,
+        });
+        true
+    }
+
+    /// Point the shared uniform at `w`×`h` and (re)build the fullscreen quad that
+    /// blits the backbuffer onto the surface.
+    fn prepare_blit_quad(&mut self, w: u32, h: u32) {
+        let uniforms = Uniforms {
+            viewport: [w as f32, h as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let quad = [Instance {
+            rect: [0.0, 0.0, w as f32, h as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        }];
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.backbuffer_quad,
+            &mut self.buffer_allocs,
+            "backbuffer blit",
+            &quad,
+        );
+    }
+
+    /// Clear `view` and blit the whole backbuffer over it. The backbuffer is
+    /// premultiplied, so "over" a transparent clear reproduces it exactly (keeping a
+    /// translucent theme see-through); every pixel is written, so the surface holds a
+    /// complete frame regardless of the acquired image's prior contents.
+    fn encode_backbuffer_blit(
+        &self,
+        view: &wgpu::TextureView,
+        bb: &Backbuffer,
+    ) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("backbuffer blit"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("backbuffer blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(buf) = &self.backbuffer_quad {
+                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_bind_group(0, &bb.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
+        encoder.finish()
+    }
+
+    /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
+    ///
+    /// A full redraw (`band == None`) covers every pixel, so it goes STRAIGHT to the
+    /// swapchain — it needs nothing of the image's prior contents, which Vulkan leaves
+    /// undefined. A banded redraw, however, relies on the rest of the frame already
+    /// being present; the swapchain can't guarantee that, so it is rendered into a
+    /// backbuffer WE own (where `LoadOp::Load` always sees the last complete frame) and
+    /// the whole backbuffer is then blitted onto the swapchain. This keeps the cheap
+    /// banded raster for typing while keeping bulk output (all full redraws) blit-free,
+    /// and is correct regardless of swapchain content persistence. The caller owns
+    /// acquiring/presenting the surface texture.
+    pub fn present_scene(
+        &mut self,
+        view: &wgpu::TextureView,
+        surf: (u32, u32),
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+        band: Option<RectPx>,
+    ) {
+        let Some(b) = band else {
+            // Full redraw: straight to the swapchain. The backbuffer (if any) is now
+            // stale — the next banded present repaints it fully before banding.
+            self.render_scene_to_view_damaged(view, scene, font, size_px, None);
+            self.backbuffer_valid = false;
+            return;
+        };
+        let (bw, bh) = (scene.size_px.0.max(1), scene.size_px.1.max(1));
+        // The backbuffer must hold the complete current frame for the band to land on
+        // top of it. If it was just (re)created, or a full redraw left it stale, repaint
+        // it fully this frame; otherwise update just the band.
+        let fresh = self.ensure_backbuffer(bw, bh);
+        let bb_band = if fresh || !self.backbuffer_valid {
+            None
+        } else {
+            Some(b)
+        };
+        // Take the backbuffer out so the `&mut self` render call doesn't alias it.
+        let bb = self.backbuffer.take().expect("backbuffer ensured above");
+        let bb_view = bb
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_scene_to_view_damaged(&bb_view, scene, font, size_px, bb_band);
+        drop(bb_view);
+        // Composite the whole backbuffer onto the surface (resets the uniform, which
+        // the render above set to the scene size, to the surface size for the quad).
+        self.prepare_blit_quad(surf.0, surf.1);
+        let cb = self.encode_backbuffer_blit(view, &bb);
+        self.gpu.queue.submit([cb]);
+        self.backbuffer = Some(bb);
+        self.backbuffer_valid = true;
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a
@@ -3586,6 +3792,105 @@ mod tests {
         assert_eq!(
             damaged, full.rgba,
             "a damaged partial redraw must be byte-identical to a full render of the new frame"
+        );
+    }
+
+    /// Clear `tex` to a solid colour — models a swapchain image handing back
+    /// arbitrary, non-persisted contents on acquire.
+    fn fill_target(gpu: &Gpu, tex: &wgpu::Texture, c: [f64; 4]) {
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("garbage fill"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: c[0],
+                        g: c[1],
+                        b: c[2],
+                        a: c[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        gpu.queue.submit([enc.finish()]);
+    }
+
+    #[test]
+    fn present_survives_a_nonpersistent_swapchain() {
+        // Vulkan leaves an acquired swapchain image's contents UNDEFINED, so a damaged
+        // present must still display the COMPLETE frame — not just the band — even when
+        // the image held unrelated content. Model that: corrupt the "swapchain image"
+        // before each present, then assert the result equals a full render of the new
+        // frame. (This is the regression from rendering the band straight onto the
+        // surface: everything outside the band was lost.)
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (20usize, 5usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let row_band = |row: usize| RectPx {
+            x: 0.0,
+            y: row as f32 * TM.line_height,
+            w: w as f32,
+            h: TM.line_height,
+        };
+        // Three frames, each changing one more row than the last (a cumulative edit, as
+        // typing does), so a band carries exactly the changed row and the backbuffer
+        // must accumulate the rest.
+        let a = frame(cols, rows, "r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        let b = frame(cols, rows, "r0\r\nB1\r\nr2\r\nr3\r\nr4"); // row 1 changed
+        let c = frame(cols, rows, "r0\r\nB1\r\nC2\r\nr3\r\nr4"); // row 2 changed
+
+        let mut r = Renderer::headless(Theme::default());
+        // Two images the "swapchain" cycles between; NEITHER persists its contents.
+        let imgs = [
+            offscreen_target(&r.gpu.device, w, h, r.format),
+            offscreen_target(&r.gpu.device, w, h, r.format),
+        ];
+        let views: Vec<_> = imgs
+            .iter()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect();
+
+        // Present A full, then B and C as single-row bands — each onto a freshly
+        // corrupted image, cycling buffers, so a band that only updated the backbuffer
+        // (not the whole surface) would leave garbage behind.
+        let presents = [
+            (a, None),
+            (b, Some(row_band(1))),
+            (c.clone(), Some(row_band(2))),
+        ];
+        let n = presents.len();
+        for (i, (f, band)) in presents.into_iter().enumerate() {
+            let idx = i % imgs.len();
+            fill_target(&r.gpu, &imgs[idx], [0.0, 1.0, 0.0, 1.0]); // garbage green
+            r.present_scene(
+                &views[idx],
+                (w, h),
+                &single_scene(f, w, h),
+                font,
+                SIZE_PX,
+                band,
+            );
+        }
+
+        // The last present (frame C, a steady band) must have produced the COMPLETE
+        // frame on its image despite the garbage and the band.
+        let last = (n - 1) % imgs.len();
+        let got = read_back(&r.gpu, &imgs[last], w, h);
+        let full = r.render_offscreen_scene(&single_scene(c, w, h), font, SIZE_PX);
+        assert_eq!(
+            got, full.rgba,
+            "a banded present must display the complete frame even when the swapchain image held unrelated content"
         );
     }
 
