@@ -446,6 +446,34 @@ impl FleetModel {
         Some(Transform::map_rect(from, to))
     }
 
+    /// Whether `id`'s tile is showing a live preview (it has had output fed in).
+    /// `false` if the tile is a cold placeholder, or absent.
+    pub fn tile_fed(&self, id: &str) -> bool {
+        self.tiles.iter().any(|t| t.id == id && t.fed)
+    }
+
+    /// Prepare a cold tile (a detached session we're taking over, with no live
+    /// preview yet) for a deferred dive-in: size its session to the window so its
+    /// preview loads — and the dive lands — at full size, returning the resize
+    /// commands for the shell to forward. `None` if the tile is already live (its
+    /// preview is ready, so the caller should dive immediately) or absent.
+    pub fn prepare_takeover(
+        &mut self,
+        id: &str,
+        size_px: (u32, u32),
+        scale: f32,
+    ) -> Option<Vec<Cmd>> {
+        let tile = self.tiles.iter_mut().find(|t| t.id == id)?;
+        if tile.fed {
+            return None;
+        }
+        Some(tile.model.update(UiEvent::Resize {
+            w_px: size_px.0.max(1),
+            h_px: size_px.1.max(1),
+            scale: scale as f64,
+        }))
+    }
+
     /// Extract a single terminal for a toggle back to the single view, detaching
     /// every other tile's session. The window's *owned* session is kept (stable
     /// identity), falling back to the focused tile, then any tile — never a

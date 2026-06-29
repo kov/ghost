@@ -30,20 +30,20 @@ const ANIM_MS: u64 = 180;
 const ANIM_TICK_MS: u64 = 16;
 
 /// An in-flight fleet zoom — a camera over the *fleet world*, interpolated from
-/// `from` to `to` (one end is identity = the overview at rest, the other is
-/// [`Transform::zoom_to`] a tile = it filling the window) over `dur_ms` once the
-/// first tick stamps the start. The mode swap is instant, so this never gates
-/// input or logical state — it's purely the visual dive.
+/// `from` to `to` (one end is identity = the overview at rest, the other is a tile
+/// filling the window) over `dur_ms` once the first tick stamps the start. The mode
+/// swap is instant, so this never gates input or logical state — it's purely the
+/// visual dive.
 ///
-/// On a dive-IN (fleet → single) the mode is already single, so `world` carries a
-/// frozen snapshot of the fleet scene to render *behind* the camera until the dive
-/// lands; on a dive-OUT (single → fleet) the live fleet is the mode, so it's `None`.
+/// `world` carries a frozen snapshot of the fleet scene, rendered *under* the camera
+/// for the whole dive (either direction): on a dive-in the mode is already single, so
+/// there'd be no fleet to show otherwise; on a dive-out it freezes the grid against a
+/// reconcile arriving mid-flight, so tiles don't reshuffle as we pull back.
 struct Anim {
     from: Transform,
     to: Transform,
     current: Transform,
-    /// The frozen fleet scene to render during a dive-in (the mode is already
-    /// single by then); `None` for a dive-out, which renders the live fleet mode.
+    /// The frozen fleet scene rendered under the camera for the dive's duration.
     world: Option<Scene>,
     /// The start time, stamped on the first tick; `None` until then.
     t0: Option<u64>,
@@ -130,6 +130,13 @@ pub struct RootModel {
     /// then launch the pull-back over the *complete* grid — every tile already in its
     /// final slot, nothing reshuffling at the end. Holds the session to frame.
     pending_dive: Option<SessionId>,
+    /// A dive-IN (fleet → single) waiting for a cold tile's preview to load. Opening a
+    /// detached session we don't yet drive would otherwise zoom an empty placeholder
+    /// sized to the preview, not the window — landing tiny in the top-left with the
+    /// contents popping in afterwards. So we size that session to the window, hold in
+    /// the fleet until its first output makes the tile live, then dive into the now
+    /// full-size, content-bearing preview. Holds the session being opened.
+    pending_dive_in: Option<SessionId>,
     /// The in-flight fleet zoom, if any. Purely visual: the mode swap is instant,
     /// so this never affects logical state or input — `view` just renders the
     /// active scene under its camera until it completes.
@@ -176,6 +183,7 @@ impl RootModel {
             primary: Some(id),
             warm: HashMap::new(),
             pending_dive: None,
+            pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
         }
@@ -194,6 +202,7 @@ impl RootModel {
             primary: None,
             warm: HashMap::new(),
             pending_dive: None,
+            pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
         };
@@ -257,6 +266,26 @@ impl RootModel {
             && m.session() != name
         {
             return self.feed_warm(ev);
+        }
+        // In the fleet, feeding a tile can complete a deferred take-over: once the
+        // session being opened produces its first output, its preview is live and
+        // full-size, so dive into it now (re-entering adopt, which this time sees a
+        // fed tile and animates).
+        if let UiEvent::SessionData { name, .. } = &ev
+            && matches!(self.mode, Mode::Fleet(_))
+        {
+            let name = name.clone();
+            let mut cmds = match &mut self.mode {
+                Mode::Fleet(f) => f.update(ev),
+                Mode::Single(_) => unreachable!(),
+            };
+            if self.pending_dive_in.as_deref() == Some(name.as_str())
+                && matches!(&self.mode, Mode::Fleet(f) if f.tile_fed(&name))
+            {
+                self.pending_dive_in = None;
+                cmds.extend(self.adopt(name));
+            }
+            return cmds;
         }
         if let UiEvent::Resize { w_px, h_px, scale } = ev {
             self.size_px = (w_px, h_px);
@@ -340,7 +369,21 @@ impl RootModel {
         // A new transition cancels any in-flight dive (a still-waiting dive-out, or an
         // animation that hasn't settled) so a stale camera/snapshot can't linger.
         self.pending_dive = None;
+        self.pending_dive_in = None;
         self.anim = None;
+        // Opening a cold tile (a detached session we don't yet drive): size it to the
+        // window and hold in the fleet until its first output makes the preview live,
+        // then re-enter to dive into the now full-size, content-bearing tile. The shell
+        // has already begun attaching; the resize commands reach the session through it.
+        if let Mode::Fleet(f) = &mut self.mode
+            && let Some(mut cmds) = f.prepare_takeover(&id, self.size_px, self.scale)
+        {
+            // Don't claim ownership yet — the re-entry once the preview is live does
+            // that. Leaving the tile foreign keeps it put if a reconcile lands first.
+            self.pending_dive_in = Some(id);
+            cmds.push(Cmd::Redraw);
+            return cmds;
+        }
         let placeholder = Mode::Single(Box::new(TerminalModel::new(
             String::new(),
             1,
@@ -513,9 +556,11 @@ impl RootModel {
             1,
             self.metrics,
         )));
-        // A new transition cancels any in-flight dive (a still-waiting dive-out, or an
-        // animation that hasn't settled) so a stale camera/snapshot can't linger.
+        // A new transition cancels any in-flight dive (a still-waiting dive-out, an
+        // animation that hasn't settled, or a take-over awaiting its preview) so a
+        // stale camera/snapshot can't linger.
         self.pending_dive = None;
+        self.pending_dive_in = None;
         self.anim = None;
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
@@ -1207,8 +1252,15 @@ mod tests {
             info("alpha", true),
             info("beta", false),
         ]));
-        // The shell attaches a clicked tile, then replies AdoptSession.
-        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        // The shell attaches a clicked tile, then replies AdoptSession. beta is a
+        // cold detached tile, so the open waits for its preview to load; its first
+        // output lands the dive into the single view.
+        r.update(UiEvent::AdoptSession("beta".into()));
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"$ ".to_vec(),
+            ended: false,
+        });
         assert!(!r.is_fleet(), "adopting drops into the single view");
         assert!(r.is_animating(), "opening a tile plays a zoom-in");
         assert!(
@@ -1418,6 +1470,39 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_detached_session_loads_its_preview_before_diving() {
+        // A fleet window (owns nothing) previewing a detached foreign session: its
+        // tile is a cold placeholder with no live preview yet. The window is larger
+        // than a preview, so taking the session over genuinely resizes it.
+        let (mut r, _) = RootModel::fleet(METRICS, (1400, 900), 1.0);
+        r.update(UiEvent::SessionList(vec![sess("d", false, 1)]));
+        // Open it. The shell has begun attaching; this is its AdoptSession reply.
+        let cmds = r.update(UiEvent::AdoptSession("d".into()));
+        assert!(r.is_fleet(), "stays in the fleet while the preview loads");
+        assert!(!r.is_animating(), "no dive yet — the preview is still cold");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "d")),
+            "sizes the session to the window so the dive and single view are full-size: {cmds:?}"
+        );
+        // Its content arrives → the tile goes live → now it dives into the live
+        // preview (with the contents already showing), zooming up to the full window.
+        r.update(UiEvent::SessionData {
+            name: "d".into(),
+            bytes: b"user@host:~$ ".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !r.is_fleet(),
+            "dives into the session once its preview is live"
+        );
+        assert!(
+            r.is_animating(),
+            "the zoom plays, with content already on the preview"
+        );
+    }
+
+    #[test]
     fn adopt_from_fleet_drops_into_that_sessions_single_view() {
         let mut r = root(); // owns alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
@@ -1426,8 +1511,18 @@ mod tests {
             info("beta", false),
         ]));
         // What the shell sends after attaching a double-clicked / spawned session.
+        // beta is a cold detached tile, so the open waits for its preview to load
+        // (see opening_a_detached_session_…); feeding it lands the dive into single.
         let cmds = r.update(UiEvent::AdoptSession("beta".into()));
-        assert!(!r.is_fleet(), "adopting leaves the overview");
+        r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"$ ".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !r.is_fleet(),
+            "adopting leaves the overview once the preview loads"
+        );
         assert!(cmds.contains(&Cmd::Redraw));
         // Input now routes to the adopted session.
         assert_eq!(
