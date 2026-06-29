@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use ghost_render::CellMetrics;
-use ghost_renderer::{Rendered, Renderer, Theme};
+use ghost_renderer::{Damage, Rendered, Renderer, SceneCache, Theme};
 use ghost_ui_core::{
     FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, TerminalModel, UiEvent,
 };
@@ -53,6 +53,16 @@ fn main() {
             let scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(2.0);
             let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(120);
             bench_single(size, scale, frames);
+        } else if mode == "type" {
+            // `bench type [WxH] [scale] [frames]` — typing into the single view (one
+            // row changes per frame): full redraw vs damage-aware partial redraw.
+            let size = args
+                .next()
+                .and_then(|s| parse_size(&s))
+                .unwrap_or((3840, 2160));
+            let scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
+            bench_type(size, scale, frames);
         } else {
             let tiles = mode.parse().unwrap_or(6);
             let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
@@ -449,6 +459,88 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
         "  total:                            {:.3} ms/frame",
         per(model_ns + render_ns)
     );
+}
+
+/// Benchmark TYPING into the single view (one row changes per frame — the common
+/// interactive case) at `size`: full redraw of the whole surface every frame versus
+/// damage-aware partial redraw (only the changed band). Renders through the headless
+/// "present" path (`render_to_cached_target`, no per-frame alloc or readback) so the
+/// figure tracks the live cost. On lavapipe at 4K the full path repaints the whole
+/// surface each keystroke; the damaged path touches only a row.
+fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
+    use std::time::Instant;
+
+    let name = "bench";
+    let cols = (size.0 as f32 / (METRICS.advance * scale)).floor().max(1.0) as usize;
+    let rows = (size.1 as f32 / (METRICS.line_height * scale))
+        .floor()
+        .max(1.0) as usize;
+    let mid = rows / 2 + 1; // 1-based row for the CUP escape
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+
+    // One char written at (mid, cycling column) per frame — only row `mid` changes.
+    let keystroke = |i: usize| format!("\x1b[{};{}Hx", mid, (i % cols) + 1).into_bytes();
+
+    let run = |damage_aware: bool| -> f64 {
+        let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
+        let mut root = RootModel::single(model, METRICS, size);
+        root.update(UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: scale as f64,
+        });
+        root.update(UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: dense_screen_sized(cols, rows).into_bytes(),
+            ended: false,
+        });
+        let px = SIZE_PX * root.render_scale();
+        let mut renderer = Renderer::headless(Theme::default());
+        let mut cache = SceneCache::default();
+
+        let feed =
+            |root: &mut RootModel, renderer: &mut Renderer, cache: &mut SceneCache, i: usize| {
+                root.update(UiEvent::SessionData {
+                    name: name.to_string(),
+                    bytes: keystroke(i),
+                    ended: false,
+                });
+                let scene = root.view();
+                let band = match cache.damage(&scene, px) {
+                    Damage::None => return,
+                    _ if !damage_aware => None,
+                    Damage::Full => None,
+                    Damage::Band(b) => Some(b),
+                };
+                renderer.render_to_cached_target(&scene, font, px, band);
+            };
+
+        // Warm the caches and let the damage window settle past the initial full frames.
+        for i in 0..16 {
+            feed(&mut root, &mut renderer, &mut cache, i);
+        }
+        let t = Instant::now();
+        for i in 0..frames {
+            feed(&mut root, &mut renderer, &mut cache, i);
+        }
+        (t.elapsed().as_nanos() as f64) / (frames as f64) / 1.0e6
+    };
+
+    let full = run(false);
+    let damaged = run(true);
+    println!(
+        "bench type: {}x{} @ {scale}x ({cols}x{rows} grid), {frames} typing frames (1 row/frame)",
+        size.0, size.1
+    );
+    println!(
+        "  full redraw:   {full:.3} ms/frame  ({:.0} fps)",
+        1000.0 / full
+    );
+    println!(
+        "  damage-aware:  {damaged:.3} ms/frame  ({:.0} fps)",
+        1000.0 / damaged
+    );
+    println!("  speedup:       {:.1}x", full / damaged);
 }
 
 // ---- calibration pattern (geometry validation) -------------------------

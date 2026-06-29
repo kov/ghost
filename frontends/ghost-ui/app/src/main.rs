@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{Gpu, Rendered, Renderer, SceneCache};
+use ghost_renderer::{Damage, Gpu, Rendered, Renderer, SceneCache};
 use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
     TerminalModel, UiEvent,
@@ -357,8 +357,13 @@ struct Graphics {
     device: wgpu::Device,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
-    /// Skips re-drawing a scene identical to the last one presented.
+    /// Skips re-drawing a scene identical to the last presented, and computes the
+    /// changed band for a partial redraw.
     scene_cache: SceneCache,
+    /// Whether the window is opaque. Partial (damaged) redraws only apply to opaque
+    /// windows — a translucent background band would blend with the preserved pixels
+    /// instead of replacing them — so a translucent window always redraws in full.
+    opaque: bool,
 }
 
 impl Graphics {
@@ -426,6 +431,7 @@ impl Graphics {
             config,
             renderer,
             scene_cache: SceneCache::default(),
+            opaque: !want_transparent,
         }
     }
 
@@ -473,18 +479,22 @@ impl Graphics {
     /// size, and `font_px` the glyph size the scene was laid out for (the model
     /// keeps both in sync via `UiEvent::Resize` and its render scale).
     fn render(&mut self, scene: &Scene, font_px: f32) {
-        // Nothing changed since the last presented frame — skip the whole
-        // acquire/draw/present cycle and leave that frame on screen.
-        if !self.scene_cache.needs_redraw(scene, font_px) {
-            return;
-        }
+        // Decide what to redraw vs the last presented frame: skip an identical scene
+        // (leave it on screen), redraw only the changed band for a steady single
+        // view, or repaint the whole surface.
+        let band = match self.scene_cache.damage(scene, font_px) {
+            Damage::None => return,
+            Damage::Full => None,
+            Damage::Band(b) if self.opaque => Some(b),
+            Damage::Band(_) => None, // translucent window: always full (see `opaque`)
+        };
         let frame_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                // We accepted this scene above but didn't present it; forget it so
-                // the next request redraws onto the freshly reconfigured surface.
+                // We accepted this scene above but didn't present it; forget it so the
+                // next request fully redraws onto the freshly reconfigured surface.
                 self.scene_cache.invalidate();
                 return;
             }
@@ -498,7 +508,7 @@ impl Graphics {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         self.renderer
-            .render_scene_to_view(&target, scene, font, font_px);
+            .render_scene_to_view_damaged(&target, scene, font, font_px, band);
         self.window.pre_present_notify();
         frame_tex.present();
     }

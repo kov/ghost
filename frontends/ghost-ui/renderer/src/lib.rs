@@ -7,7 +7,7 @@
 //! color resolution are handled here; glyph shaping (with ligatures) comes from
 //! `ghost-shaper`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
@@ -754,40 +754,235 @@ fn clamp_scissor(r: RectPx, sw: u32, sh: u32) -> [u32; 4] {
     [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
 }
 
-/// Remembers the last scene a window actually drew, so an identical redraw
-/// request (a query-only PTY feed, a cursor-blink tick that changed nothing, a
-/// fleet tick where no tile moved) can be skipped before the GPU surface is even
-/// acquired — leaving the previously presented frame untouched on screen.
+/// The overlap of two `[x, y, w, h]` scissor rects (empty `w`/`h` ⇒ no overlap).
+/// A damaged redraw clips every scene draw to the damage band with this.
+fn intersect_scissor(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+}
+
+/// What changed between the last presented scene and the next one — the verdict a
+/// window uses to skip, partially redraw, or fully redraw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Damage {
+    /// Identical to the last presented frame — skip the whole acquire/draw/present
+    /// cycle, leaving that frame untouched on screen.
+    None,
+    /// Redraw the entire surface (no prior frame, a structural change, an animation,
+    /// or the accumulated change covers ~the whole window).
+    Full,
+    /// Redraw only this pixel band; the rest of the surface is preserved as-is.
+    Band(RectPx),
+}
+
+/// A safe upper bound on the surface swapchain length (Fifo at
+/// `desired_maximum_frame_latency = 2` is typically 2–3 images; this leaves margin
+/// for compositors that report a higher minimum). A just-acquired image was last
+/// presented up to its swapchain-length frames ago, so a partial redraw repaints
+/// everything that changed across the last `SWAPCHAIN_DEPTH` presents — the union —
+/// so whichever image we land on comes out whole. Over-estimating only over-draws a
+/// few extra rows; under-estimating would strand stale ones, so err high.
+const SWAPCHAIN_DEPTH: usize = 6;
+
+/// Remembers the last scene a window actually drew, so an identical redraw request
+/// (a query-only PTY feed, a cursor-blink tick that changed nothing, a fleet tick
+/// where no tile moved) can be skipped before the GPU surface is even acquired, and
+/// so a steady single view that changed only a row or two can be redrawn partially
+/// instead of repainting the whole (at 4K, expensive) surface.
 ///
 /// Kept free of any GPU handle so the decision is unit-testable without a device.
 #[derive(Default)]
 pub struct SceneCache {
     last: Option<(Scene, f32)>,
+    /// Damage bands of the last few PRESENTED frames, unioned to cover a stale
+    /// swapchain image (see [`SWAPCHAIN_DEPTH`]).
+    history: VecDeque<RectPx>,
 }
 
 impl SceneCache {
-    /// Whether `(scene, font_px)` differs from the last frame accepted here. When
-    /// it differs this records it as the new last and returns `true` (the caller
-    /// should draw); when identical it returns `false` (the caller may skip the
-    /// whole acquire/draw/present cycle).
-    ///
-    /// The comparison is exact `PartialEq` on the scene — never a hash — so an
-    /// equal verdict can never be a false positive that strands a stale frame.
-    pub fn needs_redraw(&mut self, scene: &Scene, font_px: f32) -> bool {
-        if matches!(&self.last, Some((s, px)) if s == scene && *px == font_px) {
-            return false;
+    /// The [`Damage`] between the last presented scene and `(scene, font_px)`. On a
+    /// real change it records the new scene as last and (for a partial) folds this
+    /// frame's band into the swapchain-depth window, returning the union to redraw.
+    /// The structural comparison is exact `PartialEq` — never a hash — so `None` can
+    /// never be a false positive that strands a stale frame.
+    pub fn damage(&mut self, scene: &Scene, font_px: f32) -> Damage {
+        let raw = match &self.last {
+            Some((s, px)) if *px == font_px => scene_damage(s, scene),
+            _ => RawDamage::Full,
+        };
+        match raw {
+            RawDamage::Identical => Damage::None,
+            RawDamage::Full => {
+                self.last = Some((scene.clone(), font_px));
+                // A full redraw fixes only the image we land on; the other swapchain
+                // images are still stale, so keep forcing full for the next
+                // SWAPCHAIN_DEPTH presents (the window-sized band ages out of the
+                // union after that).
+                self.history.clear();
+                self.history.push_back(full_band(scene));
+                Damage::Full
+            }
+            RawDamage::Band(b) => {
+                self.last = Some((scene.clone(), font_px));
+                self.history.push_back(b);
+                while self.history.len() > SWAPCHAIN_DEPTH {
+                    self.history.pop_front();
+                }
+                let union = self.history.iter().copied().reduce(union_rect).unwrap_or(b);
+                let (sw, sh) = (scene.size_px.0 as f32, scene.size_px.1 as f32);
+                if union.x <= 0.0 && union.y <= 0.0 && union.w >= sw && union.h >= sh {
+                    Damage::Full
+                } else {
+                    Damage::Band(union)
+                }
+            }
         }
-        self.last = Some((scene.clone(), font_px));
-        true
     }
 
-    /// Forget the last scene so the next [`needs_redraw`](Self::needs_redraw)
-    /// always draws. The caller invalidates whenever it accepted a scene here but
-    /// then failed to actually present it (e.g. the surface was lost/outdated and
-    /// had to be reconfigured), so the recorded scene never gets ahead of what is
-    /// really on screen.
+    /// Forget the last scene (and damage window) so the next [`damage`](Self::damage)
+    /// is `Full`. The caller invalidates whenever it accepted a scene here but then
+    /// failed to actually present it (surface lost/outdated and reconfigured), so the
+    /// recorded scene never gets ahead of what is really on screen, and so the freshly
+    /// reconfigured swapchain (all images undefined) is fully repainted.
     pub fn invalidate(&mut self) {
         self.last = None;
+        self.history.clear();
+    }
+}
+
+/// Raw per-frame damage before the swapchain-depth union is applied.
+enum RawDamage {
+    Identical,
+    Full,
+    Band(RectPx),
+}
+
+/// A band covering the whole window (a `Full` redraw expressed as a rect).
+fn full_band(scene: &Scene) -> RectPx {
+    RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: scene.size_px.0 as f32,
+        h: scene.size_px.1 as f32,
+    }
+}
+
+/// The smallest rect covering both `a` and `b`.
+fn union_rect(a: RectPx, b: RectPx) -> RectPx {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    RectPx {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+/// Damage between two scenes, BEFORE the swapchain-depth union. Only the steady
+/// single view qualifies for a partial band: scenes of the same size whose layers
+/// are all identity-transformed, fully opaque, and contain only `Terminal` items
+/// (so there is no chrome a band repaint could erase), differing solely in those
+/// terminals' row content (same id/rect/selection/dim/grid/metrics, no images). The
+/// band is the changed rows ∪ the cursor's old/new rows. Anything else ⇒ `Full`.
+fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
+    if prev == new {
+        return RawDamage::Identical;
+    }
+    if prev.size_px != new.size_px || prev.layers.len() != new.layers.len() {
+        return RawDamage::Full;
+    }
+    let mut band: Option<RectPx> = None;
+    for (lp, ln) in prev.layers.iter().zip(&new.layers) {
+        if lp == ln {
+            continue;
+        }
+        if lp.z != ln.z
+            || lp.opacity != 1.0
+            || ln.opacity != 1.0
+            || lp.transform != Transform::IDENTITY
+            || ln.transform != Transform::IDENTITY
+            || lp.items.len() != ln.items.len()
+            || lp
+                .items
+                .iter()
+                .chain(&ln.items)
+                .any(|it| !matches!(it, SceneItem::Terminal { .. }))
+        {
+            return RawDamage::Full;
+        }
+        for (ip, in_) in lp.items.iter().zip(&ln.items) {
+            if ip == in_ {
+                continue;
+            }
+            let (
+                SceneItem::Terminal {
+                    id: i1,
+                    rect: r1,
+                    frame: f1,
+                    selection: s1,
+                    dim: d1,
+                },
+                SceneItem::Terminal {
+                    id: i2,
+                    rect: r2,
+                    frame: f2,
+                    selection: s2,
+                    dim: d2,
+                },
+            ) = (ip, in_)
+            else {
+                return RawDamage::Full;
+            };
+            if i1 != i2
+                || r1 != r2
+                || s1 != s2
+                || d1 != d2
+                || f1.cols != f2.cols
+                || f1.rows != f2.rows
+                || f1.metrics != f2.metrics
+                || !f1.images.is_empty()
+                || !f2.images.is_empty()
+            {
+                return RawDamage::Full;
+            }
+            let lh = f1.metrics.line_height;
+            let row_band = |row: usize| RectPx {
+                x: r1.x,
+                y: r1.y + row as f32 * lh,
+                w: r1.w,
+                h: lh,
+            };
+            let rowcount = f1.rows_layout.len().max(f2.rows_layout.len());
+            for row in 0..rowcount {
+                if f1.rows_layout.get(row) != f2.rows_layout.get(row) {
+                    let rb = row_band(row);
+                    band = Some(band.map_or(rb, |b| union_rect(b, rb)));
+                }
+            }
+            // A cursor shape change (or hide/show) need not alter rows_layout, so
+            // fold in the cursor's old and new rows explicitly.
+            if f1.cursor != f2.cursor {
+                for cur in [f1.cursor.as_ref(), f2.cursor.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let rb = row_band(cur.row);
+                    band = Some(band.map_or(rb, |b| union_rect(b, rb)));
+                }
+            }
+        }
+    }
+    match band {
+        Some(b) => RawDamage::Band(b),
+        // The scenes differ but no localizable band emerged (shouldn't happen given
+        // the equality short-circuit above) — repaint fully to stay correct.
+        None => RawDamage::Full,
     }
 }
 
@@ -819,6 +1014,14 @@ pub struct Renderer {
     // frame needs more instances than it currently holds.
     instances: Option<wgpu::Buffer>,
     instance_count: u32,
+    /// A single reused instance holding the background quad for a damaged (partial)
+    /// redraw: when we skip the full clear and only redraw a band of changed rows
+    /// (`LoadOp::Load`), this repaints the band's background first, since
+    /// default-background cells emit no quad of their own.
+    bg_fill: wgpu::Buffer,
+    /// Reused target for [`Self::render_to_cached_target`] (headless present
+    /// benchmarking) — kept across frames so its contents persist for `LoadOp::Load`.
+    bench_target: Option<(u32, u32, wgpu::Texture)>,
     /// Count of instance-buffer (re)allocations — bumped only when a buffer is
     /// created or grown, never on a reuse. Lets a test prove the reuse path.
     buffer_allocs: u32,
@@ -926,6 +1129,12 @@ impl Renderer {
             label: Some("uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bg_fill = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("damage bg fill"),
+            size: std::mem::size_of::<Instance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -1111,6 +1320,8 @@ impl Renderer {
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
             shape_misses: 0,
+            bg_fill,
+            bench_target: None,
             pack_x: 1,
             pack_y: 0,
             shelf: 1,
@@ -2218,6 +2429,84 @@ impl Renderer {
         encoder.finish()
     }
 
+    /// Like [`Self::encode_scene`] but for a DAMAGED partial redraw: preserve the
+    /// attachment (`LoadOp::Load` — no full clear), repaint just the `band`'s
+    /// background (the caller wrote `bg_fill` for it, since default-background cells
+    /// emit no quad), then replay the scene's draws clipped to `band`. The unchanged
+    /// rest of the surface keeps the pixels already there. The partial path is never
+    /// taken when the frame has images (the caller falls back to a full redraw), so
+    /// this skips the image pass.
+    fn encode_scene_banded(
+        &self,
+        view: &wgpu::TextureView,
+        draws: &[Draw],
+        band: [u32; 4],
+    ) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scene (damaged)"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene (damaged)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // Repaint the band's background first (no clear ran).
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.bg_fill.slice(..));
+            pass.set_scissor_rect(band[0], band[1], band[2], band[3]);
+            pass.draw(0..6, 0..1);
+            for d in draws {
+                match d {
+                    Draw::Glyphs { scissor, range } => {
+                        let sc = intersect_scissor(*scissor, band);
+                        if sc[2] == 0 || sc[3] == 0 {
+                            continue;
+                        }
+                        let Some(buf) = &self.instances else { continue };
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
+                        pass.draw(0..6, range.clone());
+                    }
+                    Draw::Preview { scissor, quad, id } => {
+                        let sc = intersect_scissor(*scissor, band);
+                        if sc[2] == 0 || sc[3] == 0 {
+                            continue;
+                        }
+                        let (Some(buf), Some(cached)) =
+                            (&self.preview_instances, self.preview_cache.get(id))
+                        else {
+                            continue;
+                        };
+                        pass.set_pipeline(&self.preview_pipeline);
+                        pass.set_bind_group(0, &cached.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
+                        pass.draw(0..6, *quad..*quad + 1);
+                    }
+                }
+            }
+        }
+        encoder.finish()
+    }
+
     /// Render a scene into a window surface's texture view. `scene.size_px` must
     /// equal `view`'s dimensions: it drives both the NDC viewport and the
     /// scissor clamp, so a mismatch (e.g. mid-resize) would scissor past the
@@ -2229,9 +2518,81 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) {
+        self.render_scene_to_view_damaged(view, scene, font, size_px, None);
+    }
+
+    /// Render a scene into a surface view, optionally as a DAMAGED partial redraw.
+    /// `band = Some(rect)` redraws only that pixel band (preserving the rest via
+    /// `LoadOp::Load`); `None` is a full clear-and-draw. The caller computes the band
+    /// (see `SceneCache::damage`) and guarantees the view already holds the frames the
+    /// band was diffed against. Used for the steady single view, where typically only
+    /// a row or two changes between frames.
+    pub fn render_scene_to_view_damaged(
+        &mut self,
+        view: &wgpu::TextureView,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+        band: Option<RectPx>,
+    ) {
         let groups = self.prepare_scene(scene, font, size_px);
-        let cb = self.encode_scene(view, &groups);
+        let cb = match band {
+            Some(b) => {
+                let (sw, sh) = scene.size_px;
+                let scissor = clamp_scissor(b, sw, sh);
+                if scissor[2] == 0 || scissor[3] == 0 {
+                    return; // nothing visible to redraw
+                }
+                // Background quad for the band, in the premultiplied clear color so it
+                // matches `encode_scene`'s `LoadOp::Clear` exactly (opaque only — a
+                // translucent bg would blend with the loaded pixels instead of
+                // replacing, so the caller passes `None` for translucent themes).
+                let a = self.theme.bg_alpha;
+                let fill = solid(
+                    b,
+                    [
+                        f32::from(self.theme.bg[0]) / 255.0 * a,
+                        f32::from(self.theme.bg[1]) / 255.0 * a,
+                        f32::from(self.theme.bg[2]) / 255.0 * a,
+                        a,
+                    ],
+                );
+                self.gpu
+                    .queue
+                    .write_buffer(&self.bg_fill, 0, bytemuck::bytes_of(&fill));
+                self.encode_scene_banded(view, &groups, scissor)
+            }
+            None => self.encode_scene(view, &groups),
+        };
         self.gpu.queue.submit([cb]);
+    }
+
+    /// Render `scene` to an internal reused target (no per-frame allocation, no
+    /// readback) and block until the GPU finishes — a windowless stand-in for the
+    /// surface present path, for benchmarking the real cost of a full vs. damaged
+    /// redraw. The target persists across calls so `LoadOp::Load` sees the prior
+    /// frame, exactly like a swapchain image. `band` is as in
+    /// [`Self::render_scene_to_view_damaged`].
+    pub fn render_to_cached_target(
+        &mut self,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+        band: Option<RectPx>,
+    ) {
+        let (w, h) = (scene.size_px.0.max(1), scene.size_px.1.max(1));
+        // Take the target out so the &mut self render call below doesn't alias it;
+        // (re)allocate only when the size changed, then put it back.
+        let (tw, th, tex) = self
+            .bench_target
+            .take()
+            .filter(|(tw, th, _)| *tw == w && *th == h)
+            .unwrap_or_else(|| (w, h, offscreen_target(&self.gpu.device, w, h, self.format)));
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_scene_to_view_damaged(&view, scene, font, size_px, band);
+        drop(view);
+        let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        self.bench_target = Some((tw, th, tex));
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a
@@ -2529,22 +2890,26 @@ mod tests {
             }],
         ));
 
+        // These chrome scenes carry no Terminal, so any real change is a full redraw
+        // and an identical follow-up is a skip (`Damage::None`).
+        let draws = |d: Damage| d != Damage::None;
+
         // First ever scene must draw; an identical follow-up is skipped.
-        assert!(cache.needs_redraw(&a, 16.0));
-        assert!(!cache.needs_redraw(&a, 16.0));
+        assert!(draws(cache.damage(&a, 16.0)));
+        assert!(!draws(cache.damage(&a, 16.0)));
 
         // A different scene draws, then is itself cached.
-        assert!(cache.needs_redraw(&b, 16.0));
-        assert!(!cache.needs_redraw(&b, 16.0));
+        assert!(draws(cache.damage(&b, 16.0)));
+        assert!(!draws(cache.damage(&b, 16.0)));
 
         // Same scene at a different font size must redraw (the raster differs).
-        assert!(cache.needs_redraw(&b, 20.0));
-        assert!(!cache.needs_redraw(&b, 20.0));
+        assert!(draws(cache.damage(&b, 20.0)));
+        assert!(!draws(cache.damage(&b, 20.0)));
 
         // After invalidation (e.g. a surface reconfigure that dropped the frame)
         // the very next call redraws even though the scene is unchanged.
         cache.invalidate();
-        assert!(cache.needs_redraw(&b, 20.0));
+        assert!(draws(cache.damage(&b, 20.0)));
     }
 
     #[test]
@@ -2961,6 +3326,148 @@ mod tests {
         assert_eq!(index_to_rgb(231), [0xff, 0xff, 0xff]); // cube white
         assert_eq!(index_to_rgb(232), [8, 8, 8]); // grayscale start
         assert_eq!(index_to_rgb(255), [238, 238, 238]); // grayscale end
+    }
+
+    /// A full-window single-`Terminal` scene for `f`, at `w`×`h` px.
+    fn single_scene(f: Frame, w: u32, h: u32) -> Scene {
+        Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f,
+                    selection: None,
+                    dim: false,
+                }],
+            )],
+        }
+    }
+
+    #[test]
+    fn damaged_render_matches_a_full_render() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (20usize, 5usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18); // TM metrics: 180x90
+
+        // Frame A, then frame B differing only in row 2 — and SHORTER there, so a
+        // correct damaged redraw must ERASE the old longer text (repaint the band's
+        // background), not merely overdraw it.
+        let a = frame(
+            cols,
+            rows,
+            "AAAAAAAA\r\nBBBBBBBB\r\nHELLO WORLD\r\nDDDDDDDD\r\nEEEEEEEE",
+        );
+        let b = frame(
+            cols,
+            rows,
+            "AAAAAAAA\r\nBBBBBBBB\r\nhi\r\nDDDDDDDD\r\nEEEEEEEE",
+        );
+
+        let mut r = Renderer::headless(Theme::default());
+        // One persistent target both frames render into (COPY_SRC for readback).
+        let target = offscreen_target(&r.gpu.device, w, h, r.format);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Full render of A, then a DAMAGED redraw of B (band = row 2) onto the same
+        // target, so rows 0,1,3,4 survive from A (LoadOp::Load) and row 2 is repainted.
+        r.render_scene_to_view(&view, &single_scene(a, w, h), font, SIZE_PX);
+        let band = RectPx {
+            x: 0.0,
+            y: 2.0 * TM.line_height,
+            w: w as f32,
+            h: TM.line_height,
+        };
+        r.render_scene_to_view_damaged(
+            &view,
+            &single_scene(b.clone(), w, h),
+            font,
+            SIZE_PX,
+            Some(band),
+        );
+        let damaged = read_back(&r.gpu, &target, w, h);
+
+        // Ground truth: a from-scratch full render of B.
+        let full = r.render_offscreen_scene(&single_scene(b, w, h), font, SIZE_PX);
+
+        assert_eq!(damaged.len(), full.rgba.len());
+        assert_eq!(
+            damaged, full.rgba,
+            "a damaged partial redraw must be byte-identical to a full render of the new frame"
+        );
+    }
+
+    #[test]
+    fn scene_cache_partial_redraws_a_steady_single_view() {
+        let (w, h) = (180u32, 90u32);
+        let scene = |s: &str| single_scene(frame(20, 5, s), w, h);
+        let mut c = SceneCache::default();
+
+        // The first present is always Full (no prior frame); re-presenting the same
+        // scene is a skip.
+        assert_eq!(
+            c.damage(&scene("a\r\nb\r\nROW2\r\nd\r\ne"), 15.0),
+            Damage::Full
+        );
+        assert_eq!(
+            c.damage(&scene("a\r\nb\r\nROW2\r\nd\r\ne"), 15.0),
+            Damage::None
+        );
+
+        // Change only row 2 each frame. The initial full band has to age out of the
+        // swapchain-depth window first; after that we get a partial band at row 2.
+        let mut last = Damage::Full;
+        for i in 0..SWAPCHAIN_DEPTH + 2 {
+            last = c.damage(&scene(&format!("a\r\nb\r\nr{i}\r\nd\r\ne")), 15.0);
+        }
+        let Damage::Band(rect) = last else {
+            panic!("expected a partial band once the view settled, got {last:?}");
+        };
+        // Row 2 spans y∈[36,54) at line-height 18; the band covers it and excludes
+        // the unchanged rows above.
+        assert!(
+            rect.y >= 18.0 && rect.y + rect.h >= 54.0 && rect.y <= 36.0,
+            "band should cover row 2 only: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn scene_cache_full_redraws_on_resize_and_chrome() {
+        let mut c = SceneCache::default();
+        let a = single_scene(frame(20, 5, "hi"), 180, 90);
+        assert_eq!(c.damage(&a, 15.0), Damage::Full);
+        assert_eq!(c.damage(&a, 15.0), Damage::None);
+
+        // A resize (different surface size) can never be a partial band.
+        let resized = single_scene(frame(20, 5, "hi"), 200, 90);
+        assert_eq!(c.damage(&resized, 15.0), Damage::Full);
+
+        // A scene carrying chrome (a non-Terminal item) never partials, even if only
+        // a terminal row changed — a band repaint could erase chrome over that row.
+        let with_chrome = |s: &str| {
+            let mut sc = single_scene(frame(20, 5, s), 180, 90);
+            sc.layers[0].items.push(SceneItem::Rect {
+                id: SceneId::Tile(7),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 180.0,
+                    h: 18.0,
+                },
+                color: [1.0, 1.0, 1.0, 1.0],
+                radius: 0.0,
+            });
+            sc
+        };
+        let mut c2 = SceneCache::default();
+        assert_eq!(c2.damage(&with_chrome("x\r\ny"), 15.0), Damage::Full);
+        assert_eq!(c2.damage(&with_chrome("x\r\nY"), 15.0), Damage::Full);
     }
 
     #[test]
