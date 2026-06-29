@@ -1656,7 +1656,8 @@ impl Renderer {
         // offset. `rect` is the on-screen (camera-scaled) size, so once a dive grows
         // a tile past its native resolution `preview_scale` saturates at 1.0 and the
         // texture (capped to native) holds crisp 1:1 glyphs.
-        let (mut insts, _) = self.build_instances(frame, font, size_px, None);
+        let (mut insts, _) =
+            self.build_instances(frame, font, size_px, None, 0..frame.rows_layout.len());
         let s = preview_scale(frame, rect);
         if s < 1.0 {
             scale_instances(&mut insts, s);
@@ -1872,27 +1873,37 @@ impl Renderer {
     /// then glyph quads on top. Coordinates are frame-local (origin `(0, 0)`);
     /// the scene path translates them to the tile's rect. `selection` is passed
     /// explicitly so each terminal in a scene carries its own.
+    /// Build the instances for `rows` of `frame` (a sub-range, or `0..rows_layout.len()`
+    /// for the whole frame), in painter order (backgrounds, selection, glyphs). Each
+    /// instance is positioned at its absolute frame-local cell, so a sub-range builds
+    /// exactly the geometry it would have in a full build — the incremental banded path
+    /// builds just the band's rows and relies on the backbuffer holding the rest. The
+    /// returned [`RowIndex`] is indexed from `rows.start` (so a whole-frame build indexes
+    /// it by absolute row, as the banded-draw fast path expects).
     fn build_instances(
         &mut self,
         frame: &Frame,
         font: FontRef,
         size_px: f32,
         selection: Option<Selection>,
+        rows: std::ops::Range<usize>,
     ) -> (Vec<Instance>, RowIndex) {
         let metrics = frame.metrics;
         let baseline = metrics.line_height * 0.8;
         let cursor = frame.cursor;
         let n = frame.rows_layout.len();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let nrows = rows.len();
 
         let mut backgrounds: Vec<Instance> = Vec::new();
         let mut selection_rects: Vec<Instance> = Vec::new();
         let mut glyphs: Vec<Instance> = Vec::new();
-        // Per-row offsets within each segment (`rows + 1` entries each), so a damaged
+        // Per-row offsets within each segment (`nrows + 1` entries each), so a damaged
         // redraw can draw just the band's rows. Backgrounds/glyphs are filled in the
         // main loop, selection here.
-        let mut bg_pre: Vec<u32> = Vec::with_capacity(n + 1);
-        let mut glyph_pre: Vec<u32> = Vec::with_capacity(n + 1);
-        let mut sel_pre: Vec<u32> = vec![0; n + 1];
+        let mut bg_pre: Vec<u32> = Vec::with_capacity(nrows + 1);
+        let mut glyph_pre: Vec<u32> = Vec::with_capacity(nrows + 1);
+        let mut sel_pre: Vec<u32> = vec![0; nrows + 1];
 
         // Selection highlight: one translucent rect per selected row, computed
         // straight from cell geometry (trimmed trailing blanks carry no run, so
@@ -1905,8 +1916,8 @@ impl Renderer {
                 f32::from(b) / 255.0,
                 SELECTION_ALPHA,
             ];
-            for (row, slot) in sel_pre.iter_mut().enumerate().take(n) {
-                *slot = selection_rects.len() as u32;
+            for row in rows.clone() {
+                sel_pre[row - rows.start] = selection_rects.len() as u32;
                 if let Some((c0, c1)) = sel.row_span(row, frame.cols) {
                     selection_rects.push(Instance {
                         rect: [
@@ -1921,11 +1932,12 @@ impl Renderer {
                 }
             }
         }
-        sel_pre[n] = selection_rects.len() as u32;
+        sel_pre[nrows] = selection_rects.len() as u32;
 
         // Reused across runs so the per-run column lookup allocates only to grow.
         let mut col_of_byte: Vec<u16> = Vec::new();
-        for (row, layout) in frame.rows_layout.iter().enumerate() {
+        for row in rows.clone() {
+            let layout = &frame.rows_layout[row];
             bg_pre.push(backgrounds.len() as u32);
             glyph_pre.push(glyphs.len() as u32);
             let row_y = row as f32 * metrics.line_height;
@@ -2116,7 +2128,13 @@ impl Renderer {
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
     fn prepare(&mut self, frame: &Frame, font: FontRef, size_px: f32, vw: u32, vh: u32) {
-        let (instances, _) = self.build_instances(frame, font, size_px, self.selection);
+        let (instances, _) = self.build_instances(
+            frame,
+            font,
+            size_px,
+            self.selection,
+            0..frame.rows_layout.len(),
+        );
         // This path (render_to_view / render_offscreen) never does a banded redraw.
         self.single_row_index = None;
         self.instance_count = instances.len() as u32;
@@ -2312,8 +2330,13 @@ impl Renderer {
                             }
                         } else {
                             // Full-window single view: glyphs inline, as before.
-                            let (mut insts, mut ri) =
-                                self.build_instances(frame, font, size_px, *selection);
+                            let (mut insts, mut ri) = self.build_instances(
+                                frame,
+                                font,
+                                size_px,
+                                *selection,
+                                0..frame.rows_layout.len(),
+                            );
                             translate(&mut insts, rect.x, rect.y);
                             if *dim {
                                 dim_colors(&mut insts);
@@ -2976,7 +2999,13 @@ impl Renderer {
         let bb_view = bb
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.render_scene_to_view_damaged(&bb_view, scene, font, size_px, bb_band);
+        match bb_band {
+            // Refresh the whole backbuffer (it was just (re)created or left stale).
+            None => self.render_scene_to_view_damaged(&bb_view, scene, font, size_px, None),
+            // Steady band: build + upload + draw ONLY the band's rows into the
+            // backbuffer, which already holds the rest.
+            Some(bp) => self.render_band_incremental(&bb_view, scene, font, size_px, bp),
+        }
         drop(bb_view);
         // Composite the whole backbuffer onto the surface (resets the uniform, which
         // the render above set to the scene size, to the surface size for the quad).
@@ -2985,6 +3014,96 @@ impl Renderer {
         self.gpu.queue.submit([cb]);
         self.backbuffer = Some(bb);
         self.backbuffer_valid = true;
+    }
+
+    /// Redraw just `band` into the backbuffer view, building + uploading ONLY the
+    /// band's rows (±1 for spill) rather than the whole frame — the rest is already in
+    /// the backbuffer. Byte-identical to a full build drawn band-restricted, since the
+    /// band rows carry the same geometry; it just avoids rebuilding/re-uploading ~all
+    /// the other rows. Falls back to a full build + band-restricted draw for any scene
+    /// that isn't a lone identity-transformed terminal (the banded path's invariant, but
+    /// be safe).
+    fn render_band_incremental(
+        &mut self,
+        bb_view: &wgpu::TextureView,
+        scene: &Scene,
+        font: FontRef,
+        size_px: f32,
+        band: RectPx,
+    ) {
+        let eligible = scene.layers.len() == 1
+            && scene.layers[0].items.len() == 1
+            && scene.layers[0].transform == Transform::IDENTITY;
+        let Some(SceneItem::Terminal {
+            frame,
+            rect,
+            selection,
+            dim,
+            ..
+        }) = eligible.then(|| &scene.layers[0].items[0])
+        else {
+            self.render_scene_to_view_damaged(bb_view, scene, font, size_px, Some(band));
+            return;
+        };
+        let n = frame.rows_layout.len();
+        let lh = frame.metrics.line_height;
+        if n == 0 || lh <= 0.0 {
+            self.render_scene_to_view_damaged(bb_view, scene, font, size_px, Some(band));
+            return;
+        }
+        // Band pixel span → rows, expanded one row each way for glyphs / sub-pixel
+        // backgrounds spilling across a row boundary (matches `banded_row_ranges`).
+        let last = n - 1;
+        let a = (((band.y - rect.y) / lh).floor().max(0.0) as usize).min(last);
+        let b = ((((band.y + band.h - rect.y) / lh).ceil() as i64 - 1).max(0) as usize).min(last);
+        let (lo, hi) = (a.saturating_sub(1), (b + 1).min(last));
+
+        let (mut insts, _) = self.build_instances(frame, font, size_px, *selection, lo..hi + 1);
+        translate(&mut insts, rect.x, rect.y);
+        if *dim {
+            dim_colors(&mut insts);
+        }
+        self.instance_count = insts.len() as u32;
+        Self::upload_instances(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut self.instances,
+            &mut self.buffer_allocs,
+            "band instances",
+            &insts,
+        );
+        self.band_instances = self.instance_count;
+        // The build set no uniform; point it at the backbuffer (scene) size for NDC.
+        let (vw, vh) = scene.size_px;
+        let uniforms = Uniforms {
+            viewport: [vw as f32, vh as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let scissor = clamp_scissor(band, vw, vh);
+        if scissor[2] == 0 || scissor[3] == 0 {
+            return;
+        }
+        // Band background fill (premultiplied, matching `encode_scene`'s clear).
+        let alpha = self.theme.bg_alpha;
+        let fill = solid(
+            band,
+            [
+                f32::from(self.theme.bg[0]) / 255.0 * alpha,
+                f32::from(self.theme.bg[1]) / 255.0 * alpha,
+                f32::from(self.theme.bg[2]) / 255.0 * alpha,
+                alpha,
+            ],
+        );
+        self.gpu
+            .queue
+            .write_buffer(&self.bg_fill, 0, bytemuck::bytes_of(&fill));
+        // One contiguous range: the whole band-rows buffer (drawn under the band scissor).
+        let all = 0..self.instance_count;
+        let cb = self.encode_scene_banded_rows(bb_view, std::slice::from_ref(&all), scissor);
+        self.gpu.queue.submit([cb]);
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a
@@ -3891,6 +4010,70 @@ mod tests {
         assert_eq!(
             got, full.rgba,
             "a banded present must display the complete frame even when the swapchain image held unrelated content"
+        );
+    }
+
+    #[test]
+    fn steady_band_present_builds_only_its_rows() {
+        // The incremental banded present builds + uploads ONLY the band's rows (the
+        // backbuffer holds the rest), so instance_count after a steady band must be a
+        // small fraction of a full build of the same frame.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (20usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        // Cumulative single-row edits: A base, B changes row 11, C changes row 12.
+        let scene_of = |changed: &[usize]| {
+            let mut s = String::new();
+            for row in 0..rows {
+                if row > 0 {
+                    s.push_str("\r\n");
+                }
+                s.push_str(if changed.contains(&row) {
+                    "CHANGED ROW"
+                } else {
+                    "static line"
+                });
+            }
+            single_scene(frame(cols, rows, &s), w, h)
+        };
+        let band_of = |row: usize| RectPx {
+            x: 0.0,
+            y: row as f32 * TM.line_height,
+            w: w as f32,
+            h: TM.line_height,
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A full; B band (fresh backbuffer → full refresh); C band (steady → incremental).
+        r.present_scene(&v, (w, h), &scene_of(&[]), font, SIZE_PX, None);
+        r.present_scene(
+            &v,
+            (w, h),
+            &scene_of(&[11]),
+            font,
+            SIZE_PX,
+            Some(band_of(11)),
+        );
+        r.present_scene(
+            &v,
+            (w, h),
+            &scene_of(&[11, 12]),
+            font,
+            SIZE_PX,
+            Some(band_of(12)),
+        );
+        let incremental = r.instance_count();
+
+        // A full build of the same frame, for the reference count.
+        let _ = r.render_offscreen_scene(&scene_of(&[11, 12]), font, SIZE_PX);
+        let full = r.instance_count();
+        assert!(incremental > 0, "the band still builds its rows");
+        assert!(
+            incremental * 4 < full,
+            "a steady band must build only its rows ({incremental}) vs a full build ({full})"
         );
     }
 
