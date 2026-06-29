@@ -63,6 +63,16 @@ fn main() {
             let scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(2.0);
             let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
             bench_type(size, scale, frames);
+        } else if mode == "dive" {
+            // `bench dive [WxH] [scale] [sessions]` — the single<->fleet zoom animation
+            // with `sessions` tiles (first half attached): full-surface repaint per frame.
+            let size = args
+                .next()
+                .and_then(|s| parse_size(&s))
+                .unwrap_or((3840, 2160));
+            let scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let sessions = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
+            bench_dive(size, scale, sessions);
         } else {
             let tiles = mode.parse().unwrap_or(6);
             let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
@@ -541,6 +551,146 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
         1000.0 / damaged
     );
     println!("  speedup:       {:.1}x", full / damaged);
+}
+
+/// Benchmark the single↔fleet DIVE animation at a given window size: a fleet of
+/// `count` sessions (the first half attached to this window, with live previews; the
+/// rest detached/elsewhere as cold cards), dived single→fleet (F9) then fleet→single
+/// (select the tile), driven frame by frame at the live ~60fps cadence. Every dive
+/// frame carries the camera transform, so the damage detector classifies it `Full` —
+/// a whole-surface repaint each frame — which is the cost this measures. Reports
+/// render ms/frame (avg + worst) against the 16 ms (60fps) budget; over budget means
+/// the dive can't hold 60fps. Runs each dive once to warm the preview/atlas caches,
+/// then measures a second pass (the steady cost of a repeat dive).
+fn bench_dive(size: (u32, u32), scale: f32, count: usize) {
+    use std::time::Instant;
+
+    // ~60fps dive cadence, mirroring the core's ANIM_TICK_MS.
+    const TICK_MS: u64 = 16;
+    let key = |k: NamedKey| UiEvent::Key {
+        key: Key::Named(k),
+        mods: Mods::NONE,
+        kind: KeyEventKind::Press,
+        alts: None,
+    };
+    let names: Vec<String> = ["edit", "build", "logs", "prod", "test", "docs"]
+        .iter()
+        .take(count.clamp(1, 6))
+        .map(|s| s.to_string())
+        .collect();
+    let count = names.len();
+    let attached_n = count.div_ceil(2); // first half attached to THIS window
+    let target = names[0].clone();
+
+    let (mut root, _) = RootModel::fleet(METRICS, size, scale);
+    root.update(UiEvent::Resize {
+        w_px: size.0,
+        h_px: size.1,
+        scale: scale as f64,
+    });
+    // The host's session list: the first `attached_n` are this window's (attached,
+    // live previews below); the rest are detached/elsewhere sessions — cold cards.
+    let reconcile = || {
+        UiEvent::SessionList(
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let mut si = info(n, i < attached_n, &[], i as i32 + 1);
+                    si.created_at = Some(i as i64 + 1); // names[0] oldest
+                    si
+                })
+                .collect(),
+        )
+    };
+    root.update(reconcile());
+    // Drive a full dense screen into the half we're attached to (real preview cost).
+    for n in &names[..attached_n] {
+        root.update(UiEvent::AdoptSession(n.clone()));
+        root.update(UiEvent::SessionData {
+            name: n.clone(),
+            bytes: dense_screen().into_bytes(),
+            ended: false,
+        });
+    }
+    root.update(reconcile());
+    // Foreground the target: now in the single view, so F9 dives OUT to the fleet.
+    root.update(UiEvent::AdoptSession(target.clone()));
+
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+    let mut renderer = Renderer::headless(Theme::default());
+    let px = SIZE_PX * root.render_scale();
+
+    // Drive the in-flight dive to completion, one frame per ~60fps tick, returning
+    // (avg model ms, avg render ms, worst render ms, frame count, ending clock).
+    let drive = |root: &mut RootModel, renderer: &mut Renderer, start: u64| {
+        let mut t = start;
+        root.update(UiEvent::Tick { now_ms: t }); // stamps the dive's start
+        let (mut model_ns, mut render_ns, mut max_ns, mut frames) = (0u128, 0u128, 0u128, 0usize);
+        while root.is_animating() {
+            let m = Instant::now();
+            let scene = root.view();
+            model_ns += m.elapsed().as_nanos();
+
+            let r = Instant::now();
+            // The camera transform makes every dive frame a full-surface redraw.
+            renderer.render_to_cached_target(&scene, font, px, None);
+            let e = r.elapsed().as_nanos();
+            render_ns += e;
+            max_ns = max_ns.max(e);
+            frames += 1;
+
+            t += TICK_MS;
+            root.update(UiEvent::Tick { now_ms: t });
+        }
+        let f = frames.max(1) as f64;
+        (
+            model_ns as f64 / f / 1.0e6,
+            render_ns as f64 / f / 1.0e6,
+            max_ns as f64 / 1.0e6,
+            frames,
+            t,
+        )
+    };
+
+    // Warm the glyph atlas and the fleet's preview-texture cache: one full out-and-back
+    // dive, discarded, so the measured pass reflects a repeat dive's steady cost.
+    // A dive-OUT only launches once the host's session list completes the grid, so
+    // reconcile right after F9 (as the shell does); a dive-IN kicks straight off the
+    // tile selection.
+    renderer.render_to_cached_target(&root.view(), font, px, None);
+    let mut clock = 1_000_000u64;
+    root.update(key(NamedKey::F9));
+    root.update(reconcile());
+    let (_, _, _, _, c) = drive(&mut root, &mut renderer, clock);
+    clock = c + 1_000;
+    root.update(UiEvent::AdoptSession(target.clone()));
+    let (_, _, _, _, c) = drive(&mut root, &mut renderer, clock);
+    clock = c + 1_000;
+
+    // Measured pass.
+    root.update(key(NamedKey::F9)); // single -> fleet
+    root.update(reconcile());
+    let (mo, ro, xo, fo, c) = drive(&mut root, &mut renderer, clock);
+    clock = c + 1_000;
+    root.update(UiEvent::AdoptSession(target)); // fleet -> single
+    let (mi, ri, xi, fi, _) = drive(&mut root, &mut renderer, clock);
+
+    println!(
+        "bench dive: {}x{} @ {scale}x, {count} sessions ({attached_n} attached, {} detached), ~60fps dive",
+        size.0,
+        size.1,
+        count - attached_n,
+    );
+    let line = |label: &str, render: f64, max: f64, model: f64, frames: usize| {
+        println!(
+            "  {label}: {render:.3} ms/frame render (worst {max:.3}), {model:.3} model, {frames} frames  ({:.0} fps)",
+            1000.0 / (render + model)
+        );
+    };
+    line("single -> fleet", ro, xo, mo, fo);
+    line("fleet -> single", ri, xi, mi, fi);
+    println!("  60fps budget = 16.667 ms/frame (over it, the dive can't hold 60fps)");
 }
 
 // ---- calibration pattern (geometry validation) -------------------------
