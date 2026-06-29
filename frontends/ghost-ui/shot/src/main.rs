@@ -7,9 +7,10 @@
 //! the first-class visual-debugging path: change the UI, run the tool, eyeball
 //! the image.
 //!
-//! Usage: `ghost-shot <fleet|single> [out.png]` (default `ghost-shot.png`), or
-//! `ghost-shot bench [tiles] [frames]` (arrow-nav) / `ghost-shot bench resize
-//! [tiles] [steps]` (window resize) for the headless performance benchmarks.
+//! Usage: `ghost-shot <fleet|single> [out.png]` (default `ghost-shot.png`), or one
+//! of the headless performance benchmarks: `ghost-shot bench [tiles] [frames]`
+//! (fleet arrow-nav) / `bench resize [tiles] [steps]` (window resize) / `bench
+//! single [WxH] [scale] [frames]` (the maximized single view, e.g. 4K).
 
 use std::collections::HashSet;
 
@@ -43,6 +44,15 @@ fn main() {
             let tiles = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
             let steps = args.next().and_then(|s| s.parse().ok()).unwrap_or(120);
             bench_resize(tiles, steps);
+        } else if mode == "single" {
+            // `bench single [WxH] [scale] [frames]` — the maximized 4K single view.
+            let size = args
+                .next()
+                .and_then(|s| parse_size(&s))
+                .unwrap_or((3840, 2160));
+            let scale = args.next().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(120);
+            bench_single(size, scale, frames);
         } else {
             let tiles = mode.parse().unwrap_or(6);
             let frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
@@ -351,6 +361,94 @@ fn dense_screen() -> String {
         s.push_str("\r\n");
     }
     s
+}
+
+/// A full `cols`×`rows` screen of varied coloured glyphs — the dense-content case
+/// for the single-view benchmark (every cell carries a glyph and a colour run).
+fn dense_screen_sized(cols: usize, rows: usize) -> String {
+    let mut s = String::new();
+    for row in 0..rows {
+        s.push_str(&format!("\x1b[38;5;{}m", 16 + (row % 200)));
+        for col in 0..cols {
+            s.push(char::from(b'!' + ((row * 7 + col * 3) % 90) as u8));
+        }
+        if row + 1 < rows {
+            s.push_str("\r\n");
+        }
+    }
+    s
+}
+
+/// Benchmark the single (one-terminal) view at a given window size — the maximized
+/// 4K case the user hits. Fills the whole grid with dense coloured text, then feeds
+/// one fresh line per frame (the active-output case: the screen scrolls, so every
+/// row changes) and renders, separating model time from render time. On lavapipe the
+/// render figure is dominated by software rasterization of the full surface.
+fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
+    use std::time::Instant;
+
+    let name = "bench";
+    let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
+    let mut root = RootModel::single(model, METRICS, size);
+    root.update(UiEvent::Resize {
+        w_px: size.0,
+        h_px: size.1,
+        scale: scale as f64,
+    });
+    let cols = (size.0 as f32 / (METRICS.advance * scale)).floor().max(1.0) as usize;
+    let rows = (size.1 as f32 / (METRICS.line_height * scale))
+        .floor()
+        .max(1.0) as usize;
+    root.update(UiEvent::SessionData {
+        name: name.to_string(),
+        bytes: dense_screen_sized(cols, rows).into_bytes(),
+        ended: false,
+    });
+
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
+    let mut renderer = Renderer::headless(Theme::default());
+    let px = SIZE_PX * root.render_scale();
+
+    // Warm up (first frame builds the glyph atlas + shaping/frame caches).
+    let _ = renderer.render_offscreen_scene(&root.view(), font, px);
+
+    let (mut model_ns, mut render_ns) = (0u128, 0u128);
+    for i in 0..frames {
+        let line = format!(
+            "\x1b[38;5;{}mframe {i}: the quick brown fox jumps over the lazy dog\r\n",
+            16 + (i % 200)
+        );
+        let m = Instant::now();
+        root.update(UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: line.into_bytes(),
+            ended: false,
+        });
+        let scene = root.view();
+        model_ns += m.elapsed().as_nanos();
+
+        let r = Instant::now();
+        let _ = renderer.render_offscreen_scene(&scene, font, px);
+        render_ns += r.elapsed().as_nanos();
+    }
+
+    let per = |ns: u128| (ns as f64) / (frames as f64) / 1.0e6;
+    println!(
+        "bench single: {}x{} @ {scale}x ({cols}x{rows} grid), {frames} frames of scrolling output",
+        size.0, size.1
+    );
+    println!(
+        "  model  (update + view):          {:.3} ms/frame",
+        per(model_ns)
+    );
+    println!(
+        "  render (build+raster+alloc+read): {:.3} ms/frame",
+        per(render_ns)
+    );
+    println!(
+        "  total:                            {:.3} ms/frame",
+        per(model_ns + render_ns)
+    );
 }
 
 // ---- calibration pattern (geometry validation) -------------------------

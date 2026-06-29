@@ -8,6 +8,7 @@
 //! `ghost-shaper`.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use ghost_render::{
@@ -18,6 +19,73 @@ use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
+
+/// A fast, non-cryptographic hasher (the well-known "FxHash" — rotate-xor-multiply)
+/// for the renderer's hot internal caches, whose keys are small integers/tuples and
+/// short strings looked up thousands of times per frame. The default `SipHash` showed
+/// up at a few percent of frame time in profiling; these maps are process-local and
+/// never exposed, so HashDoS resistance is irrelevant. Vendored (it's ~15 lines)
+/// rather than depending on `rustc-hash`, which is only in the tree at an old 1.x.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    #[inline]
+    fn add(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[..8]);
+            self.add(u64::from_le_bytes(b));
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[..4]);
+            self.add(u32::from_le_bytes(b) as u64);
+            bytes = &bytes[4..];
+        }
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// An RGBA8 image read back from the GPU, tightly packed (`width * 4` per row).
 pub struct Rendered {
@@ -351,14 +419,22 @@ fn run_colors(style: &Style, theme: Theme) -> ([f32; 4], Option<[f32; 4]>) {
 /// Map each char's byte offset in a run's text to its starting cell column
 /// within the run, so a shaped glyph (keyed by cluster byte offset) can be
 /// snapped to the grid. Wide characters advance the column by two.
-fn cell_starts(text: &str) -> HashMap<u32, usize> {
-    let mut map = HashMap::new();
-    let mut col = 0usize;
+/// Fill `buf[byte] = starting column` for every byte of `text`, so a shaped glyph's
+/// cluster (a byte offset into the run) maps to its grid column with a plain index —
+/// no per-run `HashMap`. `buf` is reused across runs, so it allocates only to grow.
+/// A wide char fills both of its byte..byte+len slots with its (single) start column;
+/// the next char's column then jumps by the width, matching the fixed terminal grid.
+fn fill_cell_cols(buf: &mut Vec<u16>, text: &str) {
+    buf.clear();
+    buf.resize(text.len(), 0);
+    let mut col: u16 = 0;
     for (byte, ch) in text.char_indices() {
-        map.insert(byte as u32, col);
-        col += UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        let end = byte + ch.len_utf8();
+        for slot in &mut buf[byte..end] {
+            *slot = col;
+        }
+        col = col.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(1).max(1) as u16);
     }
-    map
 }
 
 // ---- GPU plumbing -------------------------------------------------------
@@ -727,11 +803,11 @@ pub struct Renderer {
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
     /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
-    cache: HashMap<(u16, u32, Synthesis), Option<Slot>>,
+    cache: FastMap<(u16, u32, Synthesis), Option<Slot>>,
     /// Shaped-run cache keyed by (font key, font size bits, run text). Shaping
     /// dominates per-frame CPU, and a run's text is identical across redraws
     /// (navigation, unchanged tiles), so caching it makes a repaint nearly free.
-    shape_cache: HashMap<(u64, u32, String), Rc<Vec<ShapedGlyph>>>,
+    shape_cache: FastMap<(u64, u32, String), Rc<Vec<ShapedGlyph>>>,
     /// Count of actual shaping calls (cache misses) — never bumped on a hit. Lets
     /// a test prove a repaint of unchanged text re-shapes nothing.
     shape_misses: u32,
@@ -1032,8 +1108,8 @@ impl Renderer {
             atlas,
             theme,
             format,
-            cache: HashMap::new(),
-            shape_cache: HashMap::new(),
+            cache: FastMap::default(),
+            shape_cache: FastMap::default(),
             shape_misses: 0,
             pack_x: 1,
             pack_y: 0,
@@ -1567,6 +1643,8 @@ impl Renderer {
             }
         }
 
+        // Reused across runs so the per-run column lookup allocates only to grow.
+        let mut col_of_byte: Vec<u16> = Vec::new();
         for (row, layout) in frame.rows_layout.iter().enumerate() {
             let row_y = row as f32 * metrics.line_height;
             let baseline_y = row_y + baseline;
@@ -1601,10 +1679,10 @@ impl Renderer {
                 // accumulating font advance — a terminal is a fixed grid, so a
                 // ligature spans its cells naturally and a wide char occupies two
                 // columns regardless of the font's reported advance.
-                let starts = cell_starts(&run.text);
+                fill_cell_cols(&mut col_of_byte, &run.text);
                 let shaped = self.shape_cached(font, &run.text, size_px);
                 for g in shaped.iter() {
-                    let cell = starts.get(&g.cluster).copied().unwrap_or(0);
+                    let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
                     let synth = Synthesis {
                         italic: run.style.italic,
@@ -1988,11 +2066,12 @@ impl Renderer {
     ) -> Vec<Instance> {
         let baseline = rect.y + metrics.line_height * 0.8;
         let mut out = Vec::new();
+        let mut col_of_byte: Vec<u16> = Vec::new();
         for run in runs {
-            let starts = cell_starts(&run.text);
+            fill_cell_cols(&mut col_of_byte, &run.text);
             let shaped = self.shape_cached(font, &run.text, size_px);
             for g in shaped.iter() {
-                let cell = starts.get(&g.cluster).copied().unwrap_or(0);
+                let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
                 let synth = Synthesis {
                     italic: run.style.italic,
@@ -2885,17 +2964,21 @@ mod tests {
     }
 
     #[test]
-    fn cell_starts_snaps_glyphs_to_the_grid() {
+    fn cell_cols_snaps_glyphs_to_the_grid() {
+        let mut buf = Vec::new();
+
         // ASCII: one cell per char.
-        let m = cell_starts("ab");
-        assert_eq!(m.get(&0), Some(&0));
-        assert_eq!(m.get(&1), Some(&1));
+        fill_cell_cols(&mut buf, "ab");
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 1);
 
         // Wide char occupies two columns: 'a'@b0->col0, '世'@b1(3 bytes)->col1,
-        // 'b'@b4->col3 (skips the wide char's second column).
-        let m = cell_starts("a世b");
-        assert_eq!(m.get(&0), Some(&0));
-        assert_eq!(m.get(&1), Some(&1));
-        assert_eq!(m.get(&4), Some(&3));
+        // 'b'@b4->col3 (skips the wide char's second column). Reusing `buf` (it was
+        // longer) must not leak stale columns.
+        fill_cell_cols(&mut buf, "a世b");
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf[0], 0); // 'a'
+        assert_eq!(buf[1], 1); // '世' start byte
+        assert_eq!(buf[4], 3); // 'b'
     }
 }
