@@ -213,6 +213,26 @@ impl RootModel {
         matches!(self.mode, Mode::Fleet(_))
     }
 
+    /// The window's terminal grid in cells at its current pixel size and device
+    /// scale — the size a session this window shows is laid out at, and the size
+    /// the shell must complete an attach handshake at.
+    ///
+    /// Attaching at anything else (e.g. a fixed provisional 80×24) makes the host
+    /// lay out its resync there: a full-size screen is reflowed down and its
+    /// cursor pinned to that smaller bottom row, and a later resize back up can't
+    /// recover it — the next output lands mid-screen. So the shell reads this and
+    /// hands the host its real geometry up front. Matches the per-cell math a
+    /// freshly-adopted [`TerminalModel`] uses when it resizes itself to the window
+    /// (device scale, zoom 1), so the handshake size and the model's own first
+    /// resize agree and the host never reflows.
+    pub fn grid(&self) -> (u16, u16) {
+        let advance = self.metrics.advance * self.scale;
+        let line_height = self.metrics.line_height * self.scale;
+        let cols = (self.size_px.0 as f32 / advance).floor().max(1.0) as u16;
+        let rows = (self.size_px.1 as f32 / line_height).floor().max(1.0) as u16;
+        (cols, rows)
+    }
+
     /// Override the dive duration (ms) — e.g. the shell wiring `GHOST_DIVE_MS` to
     /// slow the animation right down for visual validation. Affects dives started
     /// after this call.
@@ -768,6 +788,41 @@ mod tests {
                 bytes: b"z".to_vec()
             }]
         );
+    }
+
+    #[test]
+    fn grid_is_the_window_size_and_matches_the_models_own_resize() {
+        // A window much larger than the legacy 80×24 default: `grid` must report
+        // the real cell grid, never a fixed provisional size, so an attach
+        // handshake lays the host's resync out where we'll actually show it.
+        let mut r = root();
+        r.update(UiEvent::Resize {
+            w_px: 1600,
+            h_px: 900,
+            scale: 1.0,
+        });
+        // 1600/9 = 177 cols, 900/18 = 50 rows.
+        assert_eq!(r.grid(), (177, 50));
+
+        // The handshake size must equal what a freshly-adopted model resizes
+        // itself to at the same geometry — otherwise the host would reflow
+        // between the handshake and the model's first resize.
+        let mut m = TerminalModel::new("x".to_string(), 1, 1, METRICS);
+        m.update(UiEvent::Resize {
+            w_px: 1600,
+            h_px: 900,
+            scale: 1.0,
+        });
+        assert_eq!(r.grid(), m.dims());
+
+        // HiDPI: a 2× surface doubles the cells, so the grid halves — still the
+        // real size, not a constant.
+        r.update(UiEvent::Resize {
+            w_px: 1600,
+            h_px: 900,
+            scale: 2.0,
+        });
+        assert_eq!(r.grid(), (88, 25));
     }
 
     #[test]

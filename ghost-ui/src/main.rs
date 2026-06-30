@@ -648,9 +648,12 @@ impl App {
                 Cmd::Attach(id) => {
                     if let Some(w) = self.windows.get_mut(&wid)
                         && !w.sessions.contains_key(&id)
-                        && let Ok(s) = attach(&id, COLS, ROWS)
                     {
-                        w.sessions.insert(id, s);
+                        // Handshake at the window's real grid (see `attach_into`).
+                        let (cols, rows) = w.root.grid();
+                        if let Ok(s) = attach(&id, cols, rows) {
+                            w.sessions.insert(id, s);
+                        }
                     }
                 }
                 Cmd::Detach(id) => {
@@ -678,10 +681,12 @@ impl App {
                 Cmd::Spawn { name, command } => {
                     spawn_session(&name, command);
                     // Best-effort attach; a later reconcile re-attaches if it lost the race.
-                    if let Some(w) = self.windows.get_mut(&wid)
-                        && let Ok(s) = attach(&name, COLS, ROWS)
-                    {
-                        w.sessions.insert(name, s);
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        // Handshake at the window's real grid (see `attach_into`).
+                        let (cols, rows) = w.root.grid();
+                        if let Ok(s) = attach(&name, cols, rows) {
+                            w.sessions.insert(name, s);
+                        }
                     }
                 }
                 Cmd::NewWindow => self.open_fleet_window(event_loop),
@@ -840,7 +845,13 @@ impl App {
         if w.sessions.contains_key(name) {
             return true;
         }
-        match attach(name, COLS, ROWS) {
+        // Complete the handshake at the window's real grid, never a provisional
+        // 80×24: the host lays out its resync at the handshake size, so attaching
+        // a maximized window at 80×24 would reflow a full-size screen down and
+        // pin its cursor to that smaller bottom row — the next output then lands
+        // mid-screen (see `RootModel::grid`).
+        let (cols, rows) = w.root.grid();
+        match attach(name, cols, rows) {
             Ok(s) => {
                 w.sessions.insert(name.to_string(), s);
                 true
