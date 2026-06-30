@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{
-    CellMetrics, Cmd, FleetModel, Scene, SceneItem, SessionId, TerminalModel, Transform, UiEvent,
+    CellMetrics, Cmd, FleetModel, Scene, SceneId, SceneItem, SessionId, TerminalModel, Transform,
+    UiEvent,
 };
 
 enum Mode {
@@ -161,18 +162,28 @@ impl Slide {
         let out_dx = -self.dir * self.p * w;
         let in_dx = self.dir * (1.0 - self.p) * w;
         let mut scene = Scene::new(self.outgoing.size_px);
-        push_shifted(&mut scene, &self.outgoing, out_dx);
-        push_shifted(&mut scene, &self.incoming, in_dx);
+        // Re-id each side to a distinct slide id (the single view's lone terminal is
+        // SceneId::Root for both): the renderer caches a terminal's rastered frame by
+        // id, so distinct ids let it composite two stable textures instead of
+        // re-rasterizing both every frame.
+        push_shifted(&mut scene, &self.outgoing, out_dx, SceneId::Slide(0));
+        push_shifted(&mut scene, &self.incoming, in_dx, SceneId::Slide(1));
         scene
     }
 }
 
 /// Append `src`'s layers to `dst`, each translated right by `dx` screen pixels
-/// (post-composed onto whatever camera the layer already carries).
-fn push_shifted(dst: &mut Scene, src: &Scene, dx: f32) {
+/// (post-composed onto whatever camera the layer already carries) and with every
+/// terminal re-ided to `term_id` so the composited sides cache independently.
+fn push_shifted(dst: &mut Scene, src: &Scene, dx: f32, term_id: SceneId) {
     for layer in &src.layers {
         let mut layer = layer.clone();
         layer.transform.tx += dx;
+        for item in &mut layer.items {
+            if let SceneItem::Terminal { id, .. } = item {
+                *id = term_id;
+            }
+        }
         dst.layers.push(layer);
     }
 }
@@ -1974,6 +1985,23 @@ mod tests {
         assert!(ticks > 1, "the slide ran for several frames, not one");
         assert_eq!(r.view().terminals().count(), 1, "settles to one view");
         assert_eq!(foreground(&mut r), "alpha");
+    }
+
+    #[test]
+    fn slide_terminals_carry_distinct_ids_so_the_texture_cache_wont_collide() {
+        // The renderer caches each terminal's rastered texture by SceneId; if the
+        // two sliding terminals shared an id they'd evict each other every frame
+        // (defeating the render-once-composite-many win). They must be distinct.
+        let mut r = root();
+        with_three(&mut r);
+        ctrl_tab(&mut r, false);
+        let scene = r.view();
+        let ids: Vec<_> = scene.terminals().map(|t| t.id()).collect();
+        assert_eq!(ids.len(), 2, "both sessions are drawn during the slide");
+        assert_ne!(
+            ids[0], ids[1],
+            "the outgoing and incoming terminals need distinct cache ids"
+        );
     }
 
     #[test]

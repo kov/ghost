@@ -37,6 +37,12 @@ impl RectPx {
 pub enum SceneId {
     /// The single full-window terminal (non-fleet mode).
     Root,
+    /// One of the two full-window terminals composited during a session slide,
+    /// by side (`0` = the one leaving, `1` = the one arriving). Distinct from
+    /// [`Root`](Self::Root) and from each other so the renderer caches each
+    /// frozen frame as its own texture and composites it — rather than
+    /// re-rasterizing both every frame.
+    Slide(u8),
     /// A fleet tile, by stable handle.
     Tile(u64),
     /// A tile's title label.

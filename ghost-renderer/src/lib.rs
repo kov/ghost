@@ -2315,6 +2315,13 @@ impl Renderer {
                     }
                     _ => [0, 0, sw, sh],
                 };
+                // Cull anything translated fully off-screen — notably a slide's far
+                // side before it scrolls into view: no texture render, no blit, no
+                // glyphs for it this frame, so the costly first raster of each side
+                // lands on the frame it first appears, not all at once up front.
+                if scissor[2] == 0 || scissor[3] == 0 {
+                    continue;
+                }
                 match item {
                     SceneItem::Terminal {
                         id,
@@ -2323,16 +2330,25 @@ impl Renderer {
                         selection,
                         dim,
                     } => {
-                        if preview_scale(frame, *rect) < 1.0 {
+                        // Composite a cached texture instead of re-rasterizing glyphs
+                        // every frame when the terminal is EITHER shrunk (a fleet
+                        // preview) OR being moved/scaled by an animation (the slide):
+                        // in both cases the glyphs are frozen frame-to-frame, so render
+                        // once and let the blit carry the transform — accelerated-
+                        // compositing style. A steady full-window terminal (identity
+                        // transform, preview_scale == 1.0) still builds glyphs inline,
+                        // keeping its damaged-band fast path.
+                        let animated = layer.transform != Transform::IDENTITY;
+                        if preview_scale(frame, *rect) < 1.0 || animated {
                             // Preview: blit a cached texture (re-rendered only when
                             // its content or size changes) instead of re-rasterizing
                             // the glyphs every frame. Selection isn't shown in the
                             // read-only previews, so the cache keys on frame alone.
                             // Size the texture to a camera-INDEPENDENT native-resolution
-                            // rect, not the live on-screen rect: a dive animates the
-                            // camera every frame, so on-screen sizing would re-render
-                            // every tile every frame. The blit (below) carries the
-                            // camera, so the tile still zooms; the texture stays put.
+                            // rect, not the live on-screen rect: an animation moves the
+                            // layer every frame, so on-screen sizing would re-render
+                            // every frame. The blit (below) carries the transform, so
+                            // the terminal still moves/zooms; the texture stays put.
                             let src = preview_source_rect(frame, *rect);
                             self.ensure_preview(*id, frame, src, font, size_px);
                             seen.insert(*id);
@@ -3884,6 +3900,72 @@ mod tests {
                 }],
             )],
         }
+    }
+
+    /// A two-terminal slide scene as the model composes it: the outgoing terminal
+    /// (`Slide(0)`) translated by `out_dx`, the incoming (`Slide(1)`) by `in_dx`,
+    /// both full-window, each in its own translated layer.
+    fn slide_scene(out: Frame, inc: Frame, out_dx: f32, in_dx: f32, w: u32, h: u32) -> Scene {
+        let side = |id, f: Frame, dx: f32| {
+            Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f,
+                    selection: None,
+                    dim: false,
+                }],
+            )
+            .with_transform(Transform {
+                scale: 1.0,
+                tx: dx,
+                ty: 0.0,
+            })
+        };
+        Scene {
+            size_px: (w, h),
+            layers: vec![
+                side(SceneId::Slide(0), out, out_dx),
+                side(SceneId::Slide(1), inc, in_dx),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_slide_composites_cached_textures_instead_of_re_rasterizing() {
+        // The slide moves two full-window terminals every frame, but their content is
+        // frozen for the whole animation. The renderer must raster each side to a
+        // texture ONCE and then composite (blit) it under the moving transform — not
+        // rebuild its glyphs every frame (the cost that pegged the CPU). A full-window
+        // terminal is the case that, untransformed, renders glyphs inline; the moving
+        // layer is what routes it through the texture cache. `preview_renders` counts
+        // only real texture (re)rasters, so it must land at 2 across the whole slide.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let out = frame(cols, rows, "the session that is leaving the screen");
+        let inc = frame(cols, rows, "the session that is arriving on screen");
+
+        let mut r = Renderer::headless(Theme::default());
+        let frames = 12;
+        for i in 0..frames {
+            let p = i as f32 / (frames - 1) as f32; // 0 → 1 across the slide
+            let out_dx = -p * w as f32;
+            let in_dx = (1.0 - p) * w as f32;
+            let scene = slide_scene(out.clone(), inc.clone(), out_dx, in_dx, w, h);
+            let _ = r.render_offscreen_scene(&scene, font, SIZE_PX);
+        }
+        assert_eq!(
+            r.preview_renders(),
+            2,
+            "each side rasters exactly once for the whole slide, then composites"
+        );
     }
 
     #[test]
