@@ -1,16 +1,26 @@
-//! `ghost` — reference CLI for the `ghost-vt` engine.
+//! The `ghost` command-line interface: the `new`/`ls`/`attach`/`kill`/`rename`/
+//! `export` subcommands over the `ghost-vt` engine. The `ghost` binary (the GUI
+//! crate) calls [`run_subcommand`] right after the session-host re-exec check — a
+//! present subcommand runs here and the process exits; no subcommand falls through
+//! to the windowed UI.
 
 use clap::{Parser, Subcommand};
 use ghost_vt::client;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
 
-/// Run terminals in the background and reattach without losing state.
+/// The `ghost` command line: background terminals you can reattach to, plus —
+/// with no subcommand — the windowed GPU terminal.
 #[derive(Parser)]
-#[command(name = "ghost", version, about)]
+#[command(
+    name = "ghost",
+    version,
+    about = "Run terminals in the background and reattach without losing state. \
+             With no subcommand, ghost opens its windowed GPU terminal."
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -70,13 +80,22 @@ enum Command {
     },
 }
 
-fn main() {
-    // If we were re-exec'd as a session host, become it and never return here.
-    // Must run before clap, which would reject the internal `__host` argv.
-    server::run_host_if_invoked();
+/// Parse the command line; if it names a subcommand, run it and return `true` (the
+/// caller should exit). With no subcommand, return `false` so the caller launches
+/// the GUI. The session-host re-exec check must already have run (it consumes the
+/// internal `__host` argv that clap would otherwise reject).
+pub fn run_subcommand() -> bool {
+    match Cli::parse().command {
+        Some(command) => {
+            dispatch(command);
+            true
+        }
+        None => false,
+    }
+}
 
-    let cli = Cli::parse();
-    match cli.command {
+fn dispatch(command: Command) {
+    match command {
         Command::New {
             name,
             detached,

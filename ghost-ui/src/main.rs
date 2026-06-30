@@ -61,6 +61,12 @@ fn main() {
     // MUST be first: re-execs into the session host when invoked as one.
     server::run_host_if_invoked();
 
+    // `ghost <subcommand>` (ls/attach/new/…) is the CLI; it runs and exits. A bare
+    // `ghost` has no subcommand and falls through to the windowed UI below.
+    if ghost_cli::run_subcommand() {
+        return;
+    }
+
     if let Some(path) = std::env::var_os("GHOST_CAPTURE") {
         capture(PathBuf::from(path));
     } else {

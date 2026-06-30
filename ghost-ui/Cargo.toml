@@ -3,14 +3,17 @@ name = "ghost-ui"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "ghost's windowed GPU terminal frontend (winit + wgpu + ghost-renderer)."
+description = "ghost — the windowed GPU terminal (winit + wgpu + ghost-renderer), with the CLI subcommands folded in."
 publish = false
 
+# The headline binary: `ghost` with no subcommand opens the GUI; with a subcommand
+# (ls/attach/new/…, via ghost-cli) it runs that and exits.
 [[bin]]
-name = "ghost-ui"
+name = "ghost"
 path = "src/main.rs"
 
 [dependencies]
+ghost-cli = { path = "../ghost-cli" }
 ghost-ui-core = { path = "../ghost-ui-core" }
 ghost-ui-harness = { path = "../ghost-ui-harness" }
 ghost-renderer = { path = "../ghost-renderer" }
@@ -27,4 +30,8 @@ png = "0.18"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 
 [dev-dependencies]
+# The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.
 tempfile = "3"
+pty-process = "0.5.3"
+rustix = { version = "1.1.4", features = ["termios"] }
+serde_json = "1.0.150"

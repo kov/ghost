@@ -1,4 +1,4 @@
-//! End-to-end: run the ghost-ui binary in headless capture mode, which spawns a
+//! End-to-end: run the `ghost` binary in headless capture mode, which spawns a
 //! real ghost session, attaches as a client, streams its output into a local
 //! Screen, and renders it offscreen to a PNG. Asserts the session's output
 //! reached our screen and that a non-blank image was produced — exercising the
@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_ghost-ui");
+const BIN: &str = env!("CARGO_BIN_EXE_ghost");
 const LAVAPIPE: &str = "/usr/share/vulkan/icd.d/lvp_icd.aarch64.json";
 
 #[test]

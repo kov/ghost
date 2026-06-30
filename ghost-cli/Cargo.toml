@@ -3,19 +3,8 @@ name = "ghost-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference CLI for ghost-vt: run terminals in the background and reattach to them."
-
-[[bin]]
-name = "ghost"
-path = "src/main.rs"
+description = "The ghost CLI subcommands (new/ls/attach/kill/rename/export) over ghost-vt; a library composed into the `ghost` binary."
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 ghost-vt = { path = "../ghost-vt" }
-
-[dev-dependencies]
-ghost-vt = { path = "../ghost-vt" }
-pty-process = "0.5.3"
-rustix = { version = "1.1.4", features = ["termios"] }
-serde_json = "1.0.150"
-tempfile = "3"
