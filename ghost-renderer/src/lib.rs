@@ -654,15 +654,13 @@ enum Draw {
     },
 }
 
-/// A fleet tile's preview rendered once to its own texture, then blitted on every
-/// repaint until its content or size changes. Caching the pixels means navigation
-/// (and unchanged tiles while another is busy) re-rasterizes nothing — the win
-/// that matters on a software rasterizer.
 /// One session's rendered texture — its [`Frame`] rasterized once at native resolution
-/// and then composited (blitted) wherever the session appears (a tile, a slide side, a
-/// dive). It persists across frames: when the session's frame changes in only some rows,
-/// those rows are re-rendered IN PLACE (a banded update), so a live preview re-rasterizes
-/// just what changed — the on-texture analog of the steady single view's damaged redraw.
+/// (the COMPLETE session: background at its true alpha, glyphs, images, cursor, selection)
+/// and then composited (blitted) wherever the session appears (the foreground, a tile, a
+/// slide side, a dive). It persists across frames: when the session's frame changes in
+/// only some rows, those rows are re-rendered IN PLACE (a banded update), so a live
+/// preview re-rasterizes just what changed — the on-texture analog of the steady single
+/// view's damaged redraw. One renderer, one texture, composited everywhere.
 struct Surface {
     /// The native-res texture, rendered into (full or banded) and sampled by `bind_group`.
     texture: wgpu::Texture,
@@ -672,6 +670,9 @@ struct Surface {
     /// The frame the texture currently holds; the next frame is diffed against it to
     /// decide a band (or, on a size/metrics change, a full re-render).
     frame: Frame,
+    /// The selection baked into the texture. A selection change with no frame change must
+    /// still re-render (it can't be diffed as a row band), so it's part of the cache key.
+    selection: Option<Selection>,
     /// Texture pixel size; a resize/relayout re-renders in full.
     size: (u32, u32),
 }
@@ -1821,6 +1822,33 @@ impl Renderer {
         )
     }
 
+    /// The premultiplied theme background as a render-pass clear colour: `bg·α` in the
+    /// colour channels, `α` straight — an opaque theme clears opaque, a translucent one
+    /// stays see-through. This is the session's OWN background, the same value the main
+    /// pass clears to, so a session's texture holds its true appearance and composites
+    /// identically wherever it lands (foreground, tile, slide), translucency included.
+    fn clear_color(&self) -> wgpu::Color {
+        let a = f64::from(self.theme.bg_alpha);
+        wgpu::Color {
+            r: f64::from(self.theme.bg[0]) / 255.0 * a,
+            g: f64::from(self.theme.bg[1]) / 255.0 * a,
+            b: f64::from(self.theme.bg[2]) / 255.0 * a,
+            a,
+        }
+    }
+
+    /// The same premultiplied theme background as an instance colour — for a banded
+    /// redraw's background fill / erase-replace quad.
+    fn bg_fill_color(&self) -> [f32; 4] {
+        let a = self.theme.bg_alpha;
+        [
+            f32::from(self.theme.bg[0]) / 255.0 * a,
+            f32::from(self.theme.bg[1]) / 255.0 * a,
+            f32::from(self.theme.bg[2]) / 255.0 * a,
+            a,
+        ]
+    }
+
     /// Ensure tile `id`'s preview texture is current for `frame` at `rect`,
     /// (re)rendering only on a content or size change. The main pass then blits
     /// the cached texture, so an unchanged tile re-rasterizes nothing — the win
@@ -1829,6 +1857,7 @@ impl Renderer {
         &mut self,
         session: u64,
         frame: &Frame,
+        selection: Option<Selection>,
         rect: RectPx,
         font: FontRef,
         size_px: f32,
@@ -1837,15 +1866,22 @@ impl Renderer {
         // Decide against the cached surface up front, copying out a plan so no borrow of
         // the cache is held while we mutate it below.
         enum Plan {
-            Current,            // identical frame: the texture is already right
+            Current,            // identical frame + selection: the texture is already right
             Band(usize, usize), // localized change: re-render just rows [lo, hi] in place
-            Full,               // no surface, a resize, or an un-bandable change
+            Full, // no surface, a resize, a selection change, or an un-bandable change
         }
         let plan = match self.preview_cache.get(&session) {
-            Some(c) if c.size == size && c.frame == *frame => Plan::Current,
-            // Band only when the texture size is unchanged and the preview is rendered
-            // 1:1 (un-downscaled), so a frame row maps to the texture at native lh.
-            Some(c) if c.size == size && preview_scale(frame, rect) >= 1.0 => {
+            Some(c) if c.size == size && c.frame == *frame && c.selection == selection => {
+                Plan::Current
+            }
+            // Band only when the texture size AND selection are unchanged and the preview
+            // is rendered 1:1 (un-downscaled), so a frame row maps to the texture at
+            // native lh. A selection change re-renders in full (it isn't a row band).
+            Some(c)
+                if c.size == size
+                    && c.selection == selection
+                    && preview_scale(frame, rect) >= 1.0 =>
+            {
                 match changed_rows(&c.frame, frame) {
                     Some((lo, hi)) => Plan::Band(lo, hi),
                     None => Plan::Full,
@@ -1857,12 +1893,12 @@ impl Renderer {
             Plan::Current => {} // cache hit: blit the existing texture
             Plan::Band(lo, hi) => {
                 let mut surface = self.preview_cache.remove(&session).expect("present above");
-                self.update_preview_band(&mut surface, frame, lo, hi, font, size_px);
+                self.update_preview_band(&mut surface, frame, selection, (lo, hi), font, size_px);
                 self.preview_cache.insert(session, surface);
                 self.preview_band_updates += 1;
             }
             Plan::Full => {
-                let preview = self.render_preview_texture(frame, rect, font, size_px);
+                let preview = self.render_preview_texture(frame, selection, rect, font, size_px);
                 self.preview_renders += 1;
                 self.preview_cache.insert(session, preview);
             }
@@ -1870,22 +1906,24 @@ impl Renderer {
     }
 
     /// Re-render rows `lo..=hi` of `frame` into `surface`'s existing native-res texture
-    /// in place: ERASE that band to transparent, then repaint only those rows (plus the
-    /// ±1 neighbours, clipped, so a glyph spilling across a row boundary still lands),
-    /// leaving the rest of the texture untouched (`LoadOp::Load`). The on-texture analog
-    /// of [`render_band_incremental`](Self::render_band_incremental); it erases rather
-    /// than fills with the theme bg because a preview is cleared to transparent (the card
-    /// shows through default-bg cells). Only reached for a 1:1 preview (no downscale), so
-    /// rows map to the texture at native line-height with no scaling.
+    /// in place: REPLACE that band's background (the session's bg at its true alpha), then
+    /// repaint only those rows (plus the ±1 neighbours, clipped, so a glyph spilling
+    /// across a row boundary still lands), leaving the rest of the texture untouched
+    /// (`LoadOp::Load`). The on-texture analog of the steady single view's damaged redraw.
+    /// The band's bg is written with the blend-disabled `erase_pipeline` (REPLACE), so it
+    /// overwrites the old pixels at ANY alpha — opaque covers, translucent replaces cleanly
+    /// (a plain blended fill would ghost). Only reached for a 1:1 preview (no downscale),
+    /// so rows map to the texture at native line-height with no scaling.
     fn update_preview_band(
         &mut self,
         surface: &mut Surface,
         frame: &Frame,
-        lo: usize,
-        hi: usize,
+        selection: Option<Selection>,
+        rows: (usize, usize),
         font: FontRef,
         size_px: f32,
     ) {
+        let (lo, hi) = rows;
         let (tw, th) = surface.size;
         let lh = frame.metrics.line_height;
         // The TIGHT changed band (what we erase + scissor), clamped to the texture.
@@ -1902,14 +1940,17 @@ impl Renderer {
             return;
         }
         // Build the ±1-expanded rows so an adjacent row's glyph spilling INTO the band
-        // is drawn (then clipped to the band by the scissor) — exactly as
-        // `render_band_incremental` expands its build. Selection isn't shown in previews.
+        // is drawn (then clipped to the band by the scissor) — exactly as the steady
+        // damaged redraw expands its build. Selection is part of the session, so a band
+        // that intersects it repaints the tint.
         let last = frame.rows_layout.len().saturating_sub(1);
         let (build_lo, build_hi) = (lo.saturating_sub(1), (hi + 1).min(last));
-        let (insts, _) = self.build_instances(frame, font, size_px, None, build_lo..build_hi + 1);
+        let (insts, _) =
+            self.build_instances(frame, font, size_px, selection, build_lo..build_hi + 1);
 
-        // The transparent erase quad (replace-blend) and the band glyphs (alpha-blend).
-        let erase = [solid(band, [0.0, 0.0, 0.0, 0.0])];
+        // The bg-replace quad (replace-blend, so it overwrites at any alpha) and the band
+        // glyphs/selection (alpha-blend over it).
+        let erase = [solid(band, self.bg_fill_color())];
         let erase_buf = self
             .gpu
             .device
@@ -1965,7 +2006,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-            // Erase the band to transparent (replace), then repaint its glyphs (over).
+            // Replace the band's background (any alpha), then repaint its glyphs (over).
             pass.set_pipeline(&self.erase_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, erase_buf.slice(..));
@@ -2019,6 +2060,7 @@ impl Renderer {
                 texture: bb.texture,
                 bind_group: bb.bind_group,
                 frame: frame.clone(),
+                selection: None,
                 size: Self::preview_size(frame, src),
             },
         );
@@ -2033,6 +2075,7 @@ impl Renderer {
     fn render_preview_texture(
         &mut self,
         frame: &Frame,
+        selection: Option<Selection>,
         rect: RectPx,
         font: FontRef,
         size_px: f32,
@@ -2046,7 +2089,7 @@ impl Renderer {
         // (see `preview_source_rect`), so `preview_scale` lands the frame at 1:1 and
         // the texture holds crisp glyphs the blit then minifies to the on-screen tile.
         let (mut insts, _) =
-            self.build_instances(frame, font, size_px, None, 0..frame.rows_layout.len());
+            self.build_instances(frame, font, size_px, selection, 0..frame.rows_layout.len());
         let s = preview_scale(frame, rect);
         if s < 1.0 {
             scale_instances(&mut insts, s);
@@ -2129,10 +2172,11 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        // Transparent clear: default-background cells emit no quad,
-                        // so the card behind the blit shows through, matching the
-                        // inline preview (which drew straight over the card).
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        // Clear to the session's OWN background at its true alpha — the
+                        // same value the main pass clears to — so the texture holds the
+                        // session's true appearance and composites identically wherever it
+                        // lands (a translucent session yields a translucent preview).
+                        load: wgpu::LoadOp::Clear(self.clear_color()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2191,6 +2235,7 @@ impl Renderer {
             texture,
             bind_group,
             frame: frame.clone(),
+            selection,
             size,
         }
     }
@@ -2779,10 +2824,10 @@ impl Renderer {
                         // below before it has moved.
                         let animated = layer.transform != Transform::IDENTITY;
                         if preview_scale(frame, *rect) < 1.0 || animated || multi_terminal {
-                            // Preview: blit a cached texture (re-rendered only when
-                            // its content or size changes) instead of re-rasterizing
-                            // the glyphs every frame. Selection isn't shown in the
-                            // read-only previews, so the cache keys on frame alone.
+                            // Preview: blit a cached texture (re-rendered only when its
+                            // content, selection, or size changes) instead of re-
+                            // rasterizing the glyphs every frame — the SAME session
+                            // renderer as the inline path, just into a texture.
                             // Size the texture to a camera-INDEPENDENT native-resolution
                             // rect, not the live on-screen rect: an animation moves the
                             // layer every frame, so on-screen sizing would re-render
@@ -2799,7 +2844,7 @@ impl Renderer {
                             if multi_terminal && self.backbuffer_session == Some(*session) {
                                 self.adopt_backbuffer_as_preview(*session, frame, src, sw, sh);
                             }
-                            self.ensure_preview(*session, frame, src, font, size_px);
+                            self.ensure_preview(*session, frame, *selection, src, font, size_px);
                             seen.insert(*session);
                             draws.push(Draw::Preview {
                                 scissor,
@@ -4608,6 +4653,61 @@ mod tests {
         assert_eq!(
             banded, full,
             "a banded preview update reproduces a full re-raster exactly"
+        );
+    }
+
+    #[test]
+    fn a_full_window_preview_renders_identically_to_the_inline_path() {
+        // The preview path and the inline full-window path are ONE session renderer: for
+        // the same frame AND selection they must produce identical pixels — background,
+        // glyphs, and the selection tint. The inline path renders selection; the preview
+        // path must too (it is not a read-only second renderer). A second, off-screen
+        // terminal forces the visible one through the texture/preview path at 1:1.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let f = frame(20, 4, "hello world\r\nsecond line\r\nthird row\r\nfourth");
+        let sel = Some(Selection::new((0, 0), (1, 6))); // spans rows 0-1
+        let (w, h) = Renderer::frame_size(&f);
+        let full = |x: f32, session, selection| SceneItem::Terminal {
+            id: SceneId::Root,
+            session,
+            rect: RectPx {
+                x,
+                y: 0.0,
+                w: w as f32,
+                h: h as f32,
+            },
+            frame: f.clone(),
+            selection,
+            dim: false,
+        };
+
+        // Inline: a lone full-window terminal with a selection.
+        let inline = {
+            let scene = Scene {
+                size_px: (w, h),
+                layers: vec![Layer::new(0, vec![full(0.0, session_key("a"), sel)])],
+            };
+            Renderer::headless(Theme::default())
+                .render_offscreen_scene(&scene, font, SIZE_PX)
+                .rgba
+        };
+        // Preview: the same terminal forced through the texture path by a second,
+        // off-screen (culled) terminal, blitted 1:1 over the full window.
+        let preview = {
+            let scene = Scene {
+                size_px: (w, h),
+                layers: vec![
+                    Layer::new(0, vec![full(0.0, session_key("a"), sel)]),
+                    Layer::new(0, vec![full(w as f32, session_key("off"), None)]),
+                ],
+            };
+            Renderer::headless(Theme::default())
+                .render_offscreen_scene(&scene, font, SIZE_PX)
+                .rgba
+        };
+        assert_eq!(
+            inline, preview,
+            "the preview path must render the session identically to the inline path"
         );
     }
 
