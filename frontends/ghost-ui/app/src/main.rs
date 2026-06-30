@@ -18,7 +18,9 @@
 //!   `view()` offscreen, write a PNG, and exit. The model/`Scene` path is the
 //!   single source of truth, so this is a binary-level test of the contract.
 
+mod bench;
 mod config;
+mod framestats;
 mod from_winit;
 mod pacer;
 mod resize;
@@ -305,15 +307,22 @@ fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) 
 }
 
 fn interactive() {
-    let requested = std::env::var("GHOST_SESSION").ok();
-    let sessions = session::list().unwrap_or_default();
-    let initial_name = match startup_choice(requested, &sessions) {
-        StartupChoice::Attach(name) => Some(name),
-        StartupChoice::Fleet => None,
-        StartupChoice::Spawn => {
-            let n = format!("ghost-ui-{}", std::process::id());
-            spawn_session(&n, vec![]);
-            Some(n)
+    // Bench mode (`GHOST_BENCH=dive`) drives a scripted dive against this same real
+    // path with a synthetic session list, so the fleet opens with no host running.
+    let harness = bench::Harness::from_env();
+    let initial_name = if harness.is_some() {
+        None // open the fleet; the harness populates and dives it
+    } else {
+        let requested = std::env::var("GHOST_SESSION").ok();
+        let sessions = session::list().unwrap_or_default();
+        match startup_choice(requested, &sessions) {
+            StartupChoice::Attach(name) => Some(name),
+            StartupChoice::Fleet => None,
+            StartupChoice::Spawn => {
+                let n = format!("ghost-ui-{}", std::process::id());
+                spawn_session(&n, vec![]);
+                Some(n)
+            }
         }
     };
 
@@ -325,6 +334,7 @@ fn interactive() {
         start: Instant::now(),
         initial_name,
         next_session_seq: 0,
+        bench: harness,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -496,12 +506,17 @@ impl Graphics {
     /// Draw a scene into the surface. `scene.size_px` must equal the surface
     /// size, and `font_px` the glyph size the scene was laid out for (the model
     /// keeps both in sync via `UiEvent::Resize` and its render scale).
-    fn render(&mut self, scene: &Scene, font_px: f32) {
+    /// Returns `Some((build, present))` durations when a frame was presented —
+    /// `build` is the damage check + scene build + submit, `present` the (Fifo
+    /// vsync-blocking) present — or `None` when nothing was drawn (identical scene
+    /// or a lost surface). [`FrameStats`](framestats::FrameStats) consumes the split.
+    fn render(&mut self, scene: &Scene, font_px: f32) -> Option<(Duration, Duration)> {
+        let t_build = Instant::now();
         // Decide what to redraw vs the last presented frame: skip an identical scene
         // (leave it on screen), redraw only the changed band for a steady single
         // view, or repaint the whole surface.
         let band = match self.scene_cache.damage(scene, font_px) {
-            Damage::None => return,
+            Damage::None => return None,
             Damage::Full => None,
             Damage::Band(b) if self.opaque => Some(b),
             Damage::Band(_) => None, // translucent window: always full (see `opaque`)
@@ -514,11 +529,11 @@ impl Graphics {
                 // We accepted this scene above but didn't present it; forget it so the
                 // next request fully redraws onto the freshly reconfigured surface.
                 self.scene_cache.invalidate();
-                return;
+                return None;
             }
             _ => {
                 self.scene_cache.invalidate();
-                return;
+                return None;
             }
         };
         let target = frame_tex
@@ -536,8 +551,11 @@ impl Graphics {
             font_px,
             band,
         );
+        let build = t_build.elapsed();
+        let t_present = Instant::now();
         self.window.pre_present_notify();
         frame_tex.present();
+        Some((build, t_present.elapsed()))
     }
 }
 
@@ -567,6 +585,9 @@ struct WindowState {
     /// Defers the costly relayout/reflow during an interactive resize, stretching
     /// the last crisp frame in the meantime (see [`resize`]).
     resize: resize::ResizeCoalescer,
+    /// Per-frame timing during animations, printed on dive end when
+    /// `GHOST_FRAME_STATS` is set (see [`framestats`]). Inert otherwise.
+    stats: framestats::FrameStats,
 }
 
 impl WindowState {
@@ -610,6 +631,9 @@ struct App {
     initial_name: Option<String>,
     /// Per-process counter making spawned session names unique.
     next_session_seq: u64,
+    /// Frame-pacing bench harness (`GHOST_BENCH=dive`): scripts dives against the
+    /// real render path and synthesises the session list. `None` in normal use.
+    bench: Option<bench::Harness>,
 }
 
 impl App {
@@ -654,7 +678,12 @@ impl App {
                 }
                 Cmd::WritePrimary(text) => self.write_primary(text),
                 Cmd::ListSessions => {
-                    let infos = session::list().unwrap_or_default();
+                    // In bench mode the host isn't running; answer from the harness so
+                    // a reconcile keeps the synthetic fleet populated.
+                    let infos = match &self.bench {
+                        Some(h) => h.session_list(),
+                        None => session::list().unwrap_or_default(),
+                    };
                     self.dispatch(wid, UiEvent::SessionList(infos), event_loop);
                 }
                 Cmd::Attach(id) => {
@@ -807,6 +836,35 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// Advance the bench harness one turn: fire the next scripted dive when the last
+    /// has settled, or exit when the run is done. The single bench window's
+    /// `is_animating` gates the script (so a dive only starts once the prior one
+    /// finishes); dispatched F9 / tile-selects drive the real render+present path.
+    fn drive_bench(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(wid) = self.windows.keys().next().copied() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+        let animating = self
+            .windows
+            .get(&wid)
+            .is_some_and(|w| w.root.is_animating());
+        // Collect first (releases the `&mut self.bench` borrow) so dispatch can run.
+        let actions = match self.bench.as_mut() {
+            Some(h) => h.step(now_ms, animating),
+            None => return,
+        };
+        for action in actions {
+            match action {
+                bench::Action::Dispatch(ev) => self.dispatch(wid, ev, event_loop),
+                bench::Action::Exit => {
+                    eprintln!("ghost bench: scripted dives complete");
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
     /// A fresh, process-unique session name for a spawned session.
     fn unique_session_name(&mut self) -> String {
         let seq = self.next_session_seq;
@@ -919,6 +977,7 @@ impl App {
                     resize::MAX_MS,
                     resize::DRAG_GAP_MS,
                 ),
+                stats: framestats::FrameStats::from_env(),
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -982,6 +1041,7 @@ impl App {
                     resize::MAX_MS,
                     resize::DRAG_GAP_MS,
                 ),
+                stats: framestats::FrameStats::from_env(),
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -1019,6 +1079,14 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
+            }
+        }
+        // Bench mode: populate the fleet and load every preview before any dive.
+        if self.bench.is_some()
+            && let Some(wid) = self.windows.keys().next().copied()
+        {
+            for ev in self.bench.as_ref().expect("bench present").setup_events() {
+                self.dispatch(wid, ev, event_loop);
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
@@ -1062,6 +1130,11 @@ impl ApplicationHandler for App {
             }
             let now_ms = self.now_ms();
             self.dispatch(wid, UiEvent::Tick { now_ms }, event_loop);
+        }
+        // Bench mode: advance the scripted dive (after ticks, so `is_animating`
+        // reflects this turn's animation state).
+        if self.bench.is_some() {
+            self.drive_bench(event_loop);
         }
         // Close any window whose model has ended; exit once the last is gone.
         let ended: Vec<WindowId> = self
@@ -1155,7 +1228,9 @@ impl ApplicationHandler for App {
                         // matches it (the model resize is deferred until settle).
                         win.gfx.blit_snapshot();
                     } else {
+                        let t_model = Instant::now();
                         let scene = win.root.view();
+                        let model = t_model.elapsed();
                         // Rasterize at the model's render scale (device × zoom) so
                         // glyph size matches the grid the scene was laid out for.
                         let font_px = SIZE_PX * win.root.render_scale();
@@ -1166,7 +1241,19 @@ impl ApplicationHandler for App {
                                 PhysicalSize::new(a.w, a.h),
                             );
                         }
-                        win.gfx.render(&scene, font_px);
+                        if let Some((build, present)) = win.gfx.render(&scene, font_px) {
+                            // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
+                            // this frame and print a summary when a dive ends.
+                            if let Some(summary) = win.stats.record(
+                                win.root.is_animating(),
+                                model,
+                                build,
+                                present,
+                                Instant::now(),
+                            ) {
+                                eprintln!("{}", summary.report());
+                            }
+                        }
                     }
                 }
             }
