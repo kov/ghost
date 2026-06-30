@@ -1106,20 +1106,9 @@ impl ApplicationHandler for App {
         if self.bench.is_some() {
             self.drive_bench(event_loop);
         }
-        // Close any window whose model has ended; exit once the last is gone.
-        let ended: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, w)| w.root.ended())
-            .map(|(id, _)| *id)
-            .collect();
-        for wid in ended {
-            self.close_window(wid);
-        }
-        if self.windows.is_empty() {
-            event_loop.exit();
-            return;
-        }
+        // A session ending never closes its window: the model has already switched
+        // to the next attached session (or the fleet), so the window lives on until
+        // the user closes it. Windows are removed only on an explicit close.
         // Commit any interactive resize that has settled (drag paused/released) or
         // hit its max refresh interval: drop the stretch-blit snapshot and dispatch
         // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred

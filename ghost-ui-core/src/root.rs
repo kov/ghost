@@ -279,6 +279,17 @@ impl RootModel {
             let id = id.clone();
             return self.adopt(id);
         }
+        // The foreground session's child exited (the shell was quit). Exiting a
+        // shell never quits the app: switch to the next attached session, or drop
+        // to the fleet overview when this window has none left.
+        if let UiEvent::SessionData {
+            name, ended: true, ..
+        } = &ev
+            && let Mode::Single(m) = &self.mode
+            && m.session() == name
+        {
+            return self.foreground_ended();
+        }
         // Output for a background session keeps its warm mirror live (the fleet
         // owns every model, so this only matters in the single view).
         if let UiEvent::SessionData { name, .. } = &ev
@@ -375,7 +386,10 @@ impl RootModel {
             None => Vec::new(), // not a session this window mirrors
         };
         if ended {
+            // A dead background session is no longer ours: drop its mirror and
+            // ownership so Ctrl-Tab and the fleet never land on it.
             self.warm.remove(&name);
+            self.mine.remove(&name);
         }
         cmds
     }
@@ -457,6 +471,61 @@ impl RootModel {
             cmds.push(Cmd::ScheduleTick { after_ms: 0 });
         }
         cmds
+    }
+
+    /// The foreground session's child exited. Exiting a shell never quits the
+    /// window: drop the dead session and switch to the next attached one — the
+    /// forward-cycle successor Ctrl-Tab would pick, reusing its already-attached
+    /// warm mirror — or, when the window has none left, fall back to the fleet
+    /// overview (which lists whatever sessions still exist, empty if none).
+    fn foreground_ended(&mut self) -> Vec<Cmd> {
+        let Mode::Single(m) = &self.mode else {
+            return Vec::new();
+        };
+        let gone = m.session().to_string();
+        // The session is dead: drop our ownership and any warm mirror of it, and
+        // cancel any in-flight dive so a stale camera/snapshot can't linger.
+        self.mine.remove(&gone);
+        self.warm.remove(&gone);
+        self.pending_dive = None;
+        self.pending_dive_in = None;
+        self.anim = None;
+
+        // Pick the next session in the same forward order Ctrl-Tab walks: the
+        // first survivor sorted after the one that exited, wrapping to the first.
+        let mut survivors: Vec<String> = self.mine.iter().cloned().collect();
+        survivors.sort();
+        let next = survivors
+            .iter()
+            .find(|n| n.as_str() > gone.as_str())
+            .or_else(|| survivors.first())
+            .cloned();
+
+        if let Some(next) = next {
+            // Promote its warm mirror to the foreground (already attached and kept
+            // resized); the dead model is discarded, never stowed as a mirror.
+            let mut model = self
+                .warm
+                .remove(&next)
+                .unwrap_or_else(|| TerminalModel::new(next.clone(), 1, 1, self.metrics));
+            let mut cmds = resize_model(&mut model, self.size_px, self.scale);
+            self.mode = Mode::Single(Box::new(model));
+            self.primary = Some(next);
+            cmds.push(Cmd::Redraw);
+            return cmds;
+        }
+
+        // Nothing left to show: drop to the fleet overview.
+        let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
+        // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
+        fleet.update(UiEvent::Resize {
+            w_px: self.size_px.0.max(1),
+            h_px: self.size_px.1.max(1),
+            scale: self.scale as f64,
+        });
+        self.mode = Mode::Fleet(Box::new(fleet));
+        self.primary = None;
+        vec![Cmd::ListSessions, Cmd::Redraw]
     }
 
     /// Cycle the window's foreground among its attached sessions (Ctrl-Tab),
@@ -555,15 +624,6 @@ impl RootModel {
         match &self.mode {
             Mode::Single(m) => m.ime_cursor_area(),
             Mode::Fleet(_) => None,
-        }
-    }
-
-    /// Whether the app should exit: the single view's child ended. A fleet tile
-    /// ending never quits the app.
-    pub fn ended(&self) -> bool {
-        match &self.mode {
-            Mode::Single(m) => m.ended(),
-            Mode::Fleet(_) => false,
         }
     }
 
@@ -1696,6 +1756,50 @@ mod tests {
             !ctrl_tab(&mut r, false)
                 .iter()
                 .any(|c| matches!(c, Cmd::SendInput { .. })),
+        );
+    }
+
+    /// The foreground session's child exited (the shell was quit).
+    fn end_foreground(r: &mut RootModel, name: &str) -> Vec<Cmd> {
+        r.update(UiEvent::SessionData {
+            name: name.into(),
+            bytes: Vec::new(),
+            ended: true,
+        })
+    }
+
+    #[test]
+    fn exiting_the_foreground_shell_switches_to_the_next_session_not_quit() {
+        let mut r = root();
+        with_three(&mut r); // owns alpha, beta, gamma; foreground gamma
+        let cmds = end_foreground(&mut r, "gamma");
+        // The window stays a live single view — it must not end/close.
+        assert!(
+            !r.is_fleet(),
+            "other sessions remain, so stay in the single view"
+        );
+        // Switches to the forward-cycle successor of gamma (wraps to alpha), the
+        // same target Ctrl-Tab would pick — via the warm mirror, no re-attach.
+        assert_eq!(foreground(&mut r), "alpha");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::TakeOver(_) | Cmd::Spawn { .. })),
+            "the next session is already attached; no re-attach: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn exiting_the_last_shell_shows_the_fleet_not_quit() {
+        let mut r = root(); // owns only alpha (foreground)
+        let cmds = end_foreground(&mut r, "alpha");
+        assert!(
+            r.is_fleet(),
+            "no sessions left in the window -> fleet overview, not quit"
+        );
+        assert!(
+            cmds.contains(&Cmd::ListSessions),
+            "the fleet repopulates from the host: {cmds:?}"
         );
     }
 }
