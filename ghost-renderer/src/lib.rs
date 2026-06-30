@@ -1204,6 +1204,10 @@ pub struct Renderer {
     /// Count of preview textures actually (re)rendered — a cache miss. A test
     /// asserts an unchanged repaint re-renders none.
     preview_renders: u32,
+    /// Count of times the steady-view backbuffer was adopted as a slide's outgoing
+    /// preview instead of re-rasterizing it. A test asserts a slide after a steady
+    /// view reuses the on-screen pixels rather than rebuilding them.
+    backbuffer_adoptions: u32,
     /// Uploaded image bind groups, keyed by image id; the blob is sent once and
     /// the bind group (which owns its texture) lives until eviction.
     image_bind_groups: HashMap<u32, wgpu::BindGroup>,
@@ -1498,6 +1502,7 @@ impl Renderer {
             preview_cache: HashMap::new(),
             preview_instances: None,
             preview_renders: 0,
+            backbuffer_adoptions: 0,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
             image_instances: None,
@@ -1737,6 +1742,51 @@ impl Renderer {
         self.preview_cache.insert(id, preview);
     }
 
+    /// Adopt the steady-view backbuffer as preview `id`'s texture, if it holds a
+    /// complete `sw`×`sh` full-window frame — which it does whenever a slide follows a
+    /// steady single view, since the backbuffer is literally what was last on screen,
+    /// i.e. the outgoing session. Reuses those pixels instead of re-rasterizing the
+    /// outgoing side; the subsequent [`ensure_preview`](Self::ensure_preview) then hits
+    /// this entry. No-op (so the caller rasters normally) if there's already a cached
+    /// texture, the backbuffer is invalid, or its size doesn't match.
+    ///
+    /// The recorded `size` is what `ensure_preview` will look up (`preview_size`), so
+    /// later frames hit; the texture itself is the full-window backbuffer, blitted 1:1
+    /// into the full-window rect, so it's pixel-exact (only `size` keys the cache —
+    /// `size` is never assumed to equal the texture's real dimensions). Consumes the
+    /// backbuffer: the animation's `band == None` frames go straight to the swapchain,
+    /// so it was about to go stale regardless.
+    fn adopt_backbuffer_as_preview(
+        &mut self,
+        id: SceneId,
+        frame: &Frame,
+        src: RectPx,
+        sw: u32,
+        sh: u32,
+    ) {
+        if self.preview_cache.contains_key(&id) || !self.backbuffer_valid {
+            return;
+        }
+        let bb = match self.backbuffer.take() {
+            Some(bb) if bb.w == sw && bb.h == sh => bb,
+            other => {
+                self.backbuffer = other; // size mismatch (or none): raster normally
+                return;
+            }
+        };
+        self.preview_cache.insert(
+            id,
+            CachedPreview {
+                _texture: bb.texture,
+                bind_group: bb.bind_group,
+                frame: frame.clone(),
+                size: Self::preview_size(frame, src),
+            },
+        );
+        self.backbuffer_valid = false;
+        self.backbuffer_adoptions += 1;
+    }
+
     /// Render `frame` (scaled to "contain" within `rect`) to its own texture and
     /// build the bind group that samples it. The shared viewport uniform is set to
     /// the texture size for this sub-pass; `prepare_scene` resets it to the scene
@@ -1867,6 +1917,13 @@ impl Renderer {
     /// unchanged repaint re-renders none.
     pub fn preview_renders(&self) -> u32 {
         self.preview_renders
+    }
+
+    /// Count of backbuffer→outgoing-preview adoptions (see
+    /// [`Self::adopt_backbuffer_as_preview`]). A test asserts a slide after a steady
+    /// view reuses the on-screen pixels instead of re-rasterizing the outgoing side.
+    pub fn backbuffer_adoptions(&self) -> u32 {
+        self.backbuffer_adoptions
     }
 
     /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
@@ -2415,8 +2472,16 @@ impl Renderer {
                         // compositing style. A steady full-window terminal (identity
                         // transform, preview_scale == 1.0) still builds glyphs inline,
                         // keeping its damaged-band fast path.
+                        //
+                        // A slide side is always texture-backed, even on the frame its
+                        // transform is momentarily identity (p = 0 or p = 1): otherwise
+                        // it would render inline-crisp that one frame and switch to a
+                        // blit the next — a visible pop — and would raster twice. Keying
+                        // off the id (not the transform) also lets the outgoing side
+                        // adopt the backbuffer below before it has moved.
                         let animated = layer.transform != Transform::IDENTITY;
-                        if preview_scale(frame, *rect) < 1.0 || animated {
+                        let is_slide = matches!(id, SceneId::Slide(_));
+                        if preview_scale(frame, *rect) < 1.0 || animated || is_slide {
                             // Preview: blit a cached texture (re-rendered only when
                             // its content or size changes) instead of re-rasterizing
                             // the glyphs every frame. Selection isn't shown in the
@@ -2427,6 +2492,14 @@ impl Renderer {
                             // every frame. The blit (below) carries the transform, so
                             // the terminal still moves/zooms; the texture stays put.
                             let src = preview_source_rect(frame, *rect);
+                            // The outgoing slide side is exactly what was last on screen
+                            // full-window — and the backbuffer still holds those pixels.
+                            // Adopt them as its texture (no raster); `ensure_preview`
+                            // then hits the adopted entry. Only the incoming side, new
+                            // content, actually rasters.
+                            if matches!(id, SceneId::Slide(0)) {
+                                self.adopt_backbuffer_as_preview(*id, frame, src, sw, sh);
+                            }
                             self.ensure_preview(*id, frame, src, font, size_px);
                             seen.insert(*id);
                             draws.push(Draw::Preview {
@@ -4056,6 +4129,88 @@ mod tests {
             2,
             "each side rasters exactly once for the whole slide, then composites"
         );
+    }
+
+    #[test]
+    fn a_slide_after_a_steady_view_reuses_the_backbuffer_for_the_outgoing_side() {
+        // The outgoing session is exactly what was just on screen, and the backbuffer
+        // still holds those pixels. A slide that follows a steady single view must
+        // REUSE the backbuffer for the outgoing side (Slide(0)) instead of
+        // re-rasterizing it; only the incoming side, genuinely new content, rasters.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let a = frame(cols, rows, "the session that is leaving");
+        let a2 = frame(cols, rows, "the session that is leaving NOW"); // a later edit (the band)
+        let inc = frame(cols, rows, "the session that is arriving");
+        let band = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: w as f32,
+            h: TM.line_height,
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Reference: a full render of the outgoing session (computed up front so it
+        // doesn't perturb the cache mid-sequence).
+        let full = r
+            .render_offscreen_scene(&single_scene(a2.clone(), w, h), font, SIZE_PX)
+            .rgba;
+
+        // Establish a valid backbuffer holding the outgoing frame: a full present,
+        // then a banded one (the steady single-view path).
+        r.present_scene(&v, (w, h), &single_scene(a, w, h), font, SIZE_PX, None);
+        r.present_scene(
+            &v,
+            (w, h),
+            &single_scene(a2.clone(), w, h),
+            font,
+            SIZE_PX,
+            Some(band),
+        );
+        assert_eq!(
+            r.backbuffer_adoptions(),
+            0,
+            "no adoption during the steady view"
+        );
+
+        let before = r.preview_renders();
+        // First slide frame: the outgoing fills the window (identity), the incoming
+        // sits fully off the right edge (culled). The outgoing adopts the backbuffer.
+        let f0 = slide_scene(a2.clone(), inc.clone(), 0.0, w as f32, w, h);
+        r.present_scene(&v, (w, h), &f0, font, SIZE_PX, None);
+        assert_eq!(
+            r.backbuffer_adoptions(),
+            1,
+            "the outgoing side adopts the backbuffer"
+        );
+        assert_eq!(
+            r.preview_renders(),
+            before,
+            "and rasters nothing (the incoming is off-screen)"
+        );
+
+        // The composited frame must reproduce the outgoing session's last on-screen
+        // frame — the adopted pixels are blitted, not garbage.
+        let got = read_back(&r.gpu, &img, w, h);
+        assert_eq!(
+            got, full,
+            "the adopted outgoing side reproduces its last on-screen frame"
+        );
+
+        // Mid-slide: the outgoing has moved (cache hit, no raster); the incoming is now
+        // on screen and rasters exactly once.
+        let f1 = slide_scene(a2, inc, -(w as f32) / 2.0, (w as f32) / 2.0, w, h);
+        r.present_scene(&v, (w, h), &f1, font, SIZE_PX, None);
+        assert_eq!(
+            r.preview_renders(),
+            before + 1,
+            "only the incoming side rasters"
+        );
+        assert_eq!(r.backbuffer_adoptions(), 1, "no further adoption");
     }
 
     #[test]
