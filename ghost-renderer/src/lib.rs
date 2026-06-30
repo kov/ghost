@@ -1062,6 +1062,7 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
             let (
                 SceneItem::Terminal {
                     id: i1,
+                    session: sess1,
                     rect: r1,
                     frame: f1,
                     selection: s1,
@@ -1069,6 +1070,7 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
                 },
                 SceneItem::Terminal {
                     id: i2,
+                    session: sess2,
                     rect: r2,
                     frame: f2,
                     selection: s2,
@@ -1079,6 +1081,7 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
                 return RawDamage::Full;
             };
             if i1 != i2
+                || sess1 != sess2
                 || r1 != r2
                 || s1 != s2
                 || d1 != d2
@@ -2506,6 +2509,7 @@ impl Renderer {
                         frame,
                         selection,
                         dim,
+                        ..
                     } => {
                         // Composite a cached texture instead of re-rasterizing glyphs
                         // every frame when the terminal is EITHER shrunk (a fleet
@@ -3544,7 +3548,7 @@ pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, theme: Theme) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, layout_frame};
+    use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, layout_frame, session_key};
     use ghost_term::Vt;
 
     const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
@@ -3683,6 +3687,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Root,
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -3742,6 +3747,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Slide(0), // routes through render_preview_texture
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -3792,6 +3798,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Root,
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -3941,6 +3948,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Root,
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -3978,6 +3986,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Tile(1),
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -4018,6 +4027,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Root,
+                    session: 0,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -4147,6 +4157,7 @@ mod tests {
                 0,
                 vec![SceneItem::Terminal {
                     id: SceneId::Root,
+                    session: session_key("single"),
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -4165,11 +4176,12 @@ mod tests {
     /// (`Slide(0)`) translated by `out_dx`, the incoming (`Slide(1)`) by `in_dx`,
     /// both full-window, each in its own translated layer.
     fn slide_scene(out: Frame, inc: Frame, out_dx: f32, in_dx: f32, w: u32, h: u32) -> Scene {
-        let side = |id, f: Frame, dx: f32| {
+        let side = |id, session, f: Frame, dx: f32| {
             Layer::new(
                 0,
                 vec![SceneItem::Terminal {
                     id,
+                    session,
                     rect: RectPx {
                         x: 0.0,
                         y: 0.0,
@@ -4190,8 +4202,8 @@ mod tests {
         Scene {
             size_px: (w, h),
             layers: vec![
-                side(SceneId::Slide(0), out, out_dx),
-                side(SceneId::Slide(1), inc, in_dx),
+                side(SceneId::Slide(0), session_key("single"), out, out_dx),
+                side(SceneId::Slide(1), session_key("incoming"), inc, in_dx),
             ],
         }
     }

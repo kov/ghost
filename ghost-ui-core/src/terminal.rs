@@ -312,6 +312,7 @@ impl TerminalModel {
             0,
             vec![SceneItem::Terminal {
                 id: SceneId::Root,
+                session: ghost_render::session_key(self.session()),
                 rect,
                 frame,
                 selection: self.selection,

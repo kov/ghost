@@ -62,6 +62,20 @@ pub enum BadgeKind {
     Activity,
 }
 
+/// A stable per-process key for a session id. The renderer caches a session's
+/// rendered texture under this key so the texture follows the *session* across
+/// every scene role and rebuild it appears in — a fleet tile (whose
+/// [`SceneId::Tile`] handle is reassigned on every rebuild), a slide side, the
+/// single-view root — rather than being tied to the ephemeral [`SceneId`]. It
+/// keys a live, in-memory cache and is never persisted, so it need only be
+/// deterministic within one run; a plain `DefaultHasher` suffices.
+pub fn session_key(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
 /// One drawable primitive. Every variant carries `id` and `rect`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneItem {
@@ -81,9 +95,14 @@ pub enum SceneItem {
         color: Rgba,
     },
     /// An embedded terminal viewport, drawn from a [`Frame`] offset to `rect`
-    /// and clipped to it. `dim` darkens an unfocused tile.
+    /// and clipped to it. `dim` darkens an unfocused tile. `session` is the
+    /// stable [`session_key`] of the session shown here — the renderer keys its
+    /// rendered texture by it, so the texture follows the session across roles
+    /// and rebuilds (see [`session_key`]); independent of `id`, which is the
+    /// item's z/role identity for hit-testing.
     Terminal {
         id: SceneId,
+        session: u64,
         rect: RectPx,
         frame: Frame,
         selection: Option<Selection>,
@@ -344,6 +363,7 @@ mod tests {
     fn term(id: SceneId, x: f32, y: f32, w: f32, h: f32) -> SceneItem {
         SceneItem::Terminal {
             id,
+            session: 0,
             rect: RectPx { x, y, w, h },
             frame: Frame {
                 cols: 0,

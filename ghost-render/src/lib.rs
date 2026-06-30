@@ -17,7 +17,9 @@ pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
 
 pub mod scene;
-pub use scene::{BadgeKind, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, Transform};
+pub use scene::{
+    BadgeKind, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, Transform, session_key,
+};
 
 /// The monospace cell box. The sole metric input the layout needs; pixel
 /// coordinates derive from it by multiplication.

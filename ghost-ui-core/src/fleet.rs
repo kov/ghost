@@ -1221,6 +1221,7 @@ impl FleetModel {
                     .unwrap_or_else(|| layout_frame(tile.model.screen().vt(), metrics));
                 items.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
+                    session: ghost_render::session_key(&tile.id),
                     rect: preview,
                     frame,
                     selection: if focused {

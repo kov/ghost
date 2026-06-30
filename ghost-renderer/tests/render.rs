@@ -5,6 +5,7 @@
 
 use ghost_render::{
     CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, Transform, layout_frame,
+    session_key,
 };
 use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
@@ -315,6 +316,7 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
         0,
         vec![SceneItem::Terminal {
             id: SceneId::Tile(0),
+            session: 0,
             rect: RectPx {
                 x: 0.0,
                 y: 0.0,
@@ -356,6 +358,7 @@ fn an_unchanged_preview_is_not_re_rasterized() {
     };
     let tile = |id, x: f32| SceneItem::Terminal {
         id,
+        session: session_key(&format!("{id:?}")),
         rect: RectPx {
             x,
             y: 0.0,
@@ -405,6 +408,7 @@ fn an_animated_dive_camera_does_not_re_rasterize_previews_each_frame() {
     // RTT preview path is taken); the camera — not the rect — is what animates.
     let tile = |id, x: f32| SceneItem::Terminal {
         id,
+        session: session_key(&format!("{id:?}")),
         rect: RectPx {
             x,
             y: 0.0,
@@ -479,6 +483,7 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
         1,
         vec![SceneItem::Terminal {
             id: SceneId::Root,
+            session: 0,
             rect: RectPx {
                 x: 0.0,
                 y: 0.0,
@@ -543,6 +548,7 @@ fn an_identical_repaint_reshapes_nothing() {
         0,
         vec![SceneItem::Terminal {
             id: SceneId::Tile(0),
+            session: 0,
             rect: RectPx {
                 x: 0.0,
                 y: 0.0,
