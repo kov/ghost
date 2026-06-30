@@ -388,6 +388,63 @@ fn an_unchanged_preview_is_not_re_rasterized() {
 }
 
 #[test]
+fn an_animated_dive_camera_does_not_re_rasterize_previews_each_frame() {
+    // The single<->fleet dive zooms by animating each layer's camera transform every
+    // frame (the world is frozen; only the camera moves). A tile's preview TEXTURE
+    // must not depend on the live camera scale — otherwise a continuously-zooming
+    // dive re-renders every tile's texture on every frame, the O(sessions x frames)
+    // cost that makes the dive sluggish with more than one live preview. Each tile
+    // must (re-)rasterize at most once for the whole dive, not once per frame.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let frame = {
+        let mut vt = Vt::new(80, 24); // 720x432 px native at METRICS
+        vt.feed_str("preview content => fn main() { let answer = 42; }");
+        layout_frame(&vt, METRICS)
+    };
+    // Two tiles at a fixed WORLD rect a quarter of native (preview_scale < 1, so the
+    // RTT preview path is taken); the camera — not the rect — is what animates.
+    let tile = |id, x: f32| SceneItem::Terminal {
+        id,
+        rect: RectPx {
+            x,
+            y: 0.0,
+            w: 180.0,
+            h: 108.0,
+        }, // 0.25x native
+        frame: frame.clone(),
+        selection: None,
+        dim: false,
+    };
+    let mut scene = Scene::new((1920, 1080));
+    scene.layers.push(Layer::new(
+        0,
+        vec![tile(SceneId::Tile(0), 0.0), tile(SceneId::Tile(1), 200.0)],
+    ));
+
+    let mut r = Renderer::headless(Theme::default());
+    let tiles = 2;
+    // Drive a zoom: a distinct camera scale every frame, each keeping the on-screen
+    // size below the native cap, so size-keyed caching would miss on every frame.
+    let frames = 24u32;
+    for i in 0..frames {
+        let s = 1.0 + (i as f32) * (2.8 / frames as f32); // 1.0 .. ~3.8 (eff < 720 px)
+        scene.layers[0].transform = Transform {
+            scale: s,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    }
+    assert_eq!(
+        r.preview_renders(),
+        tiles,
+        "each tile's preview must render once for the whole dive, not once per \
+         frame: got {} re-renders for {tiles} tiles over {frames} animated frames",
+        r.preview_renders(),
+    );
+}
+
+#[test]
 fn a_resize_blit_scales_the_snapshot_without_reshaping() {
     // During an interactive resize the shell captures the last crisp scene to a
     // texture and stretch-blits it to the changing surface, deferring the real

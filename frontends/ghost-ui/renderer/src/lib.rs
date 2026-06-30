@@ -700,6 +700,28 @@ fn apply_layer(
     }
 }
 
+/// The camera-independent rect to size a tile's preview texture from. A dive zooms
+/// a tile by animating its layer's camera every frame; sizing the texture to the
+/// live *on-screen* rect re-renders it on every frame (O(tiles) texture rebuilds
+/// per frame — the cost that made the dive sluggish with more than one live
+/// preview). Instead, size it once: the tile's world `rect` scaled up uniformly
+/// until the frame lands at its native resolution inside it — the most detail any
+/// zoom can show (a larger on-screen rect is [`Renderer::preview_size`]-capped to
+/// native anyway). The blit quad still carries the live camera, so the tile
+/// visually zooms; only the texture is stable, so a whole dive (re)rasterizes each
+/// preview at most once. Uniform scaling preserves the world rect's aspect, so the
+/// contain-fit/letterbox the blit reproduces is exactly the steady single-view's.
+fn preview_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
+    let nw = frame.cols as f32 * frame.metrics.advance;
+    let nh = frame.rows as f32 * frame.metrics.line_height;
+    let k = (nw / rect.w.max(1.0)).max(nh / rect.h.max(1.0));
+    RectPx {
+        w: rect.w * k,
+        h: rect.h * k,
+        ..rect
+    }
+}
+
 /// "Contain" downscale to fit `frame`'s true pixel size inside `rect`, clamped
 /// to 1.0 so a frame no larger than its rect (e.g. the full-window single view)
 /// is never magnified. Returns 1.0 for a degenerate (zero-size) frame.
@@ -1590,15 +1612,13 @@ impl Renderer {
         (w, h)
     }
 
-    /// Pixel size a preview texture/blit uses for `rect` (the tile size, ≥ 1).
-    /// Pixel size of a tile's preview texture: the on-screen rect, rendered at that
-    /// size for crispness, but never so large that the frame contain-fit inside would
-    /// exceed its native resolution (`cols×advance` by `rows×line_height`) — past 1:1
-    /// there's no more detail, and the cap bounds cost (and lets the cache settle)
-    /// when a dive scales a tile up toward the window. The cap is UNIFORM so the
-    /// rect's aspect is preserved: a per-axis cap would squash the preview and, under
-    /// the dive camera at full zoom, render the tile at a different size/aspect than
-    /// the live single view — a visible pop at the dive boundary.
+    /// Pixel size of a tile's preview texture for `rect`, which the caller has
+    /// already sized via [`preview_source_rect`] (a camera-independent rect, not the
+    /// live on-screen one), capped so the frame contain-fit inside never exceeds its
+    /// native resolution (`cols×advance` by `rows×line_height`) — past 1:1 there's no
+    /// more detail, and the cap bounds the texture's cost. The cap is UNIFORM so the
+    /// rect's aspect is preserved: a per-axis cap would squash the preview and render
+    /// the tile at a different aspect than the steady single view — a visible pop.
     fn preview_size(frame: &Frame, rect: RectPx) -> (u32, u32) {
         let nw = (frame.cols as f32 * frame.metrics.advance).max(1.0);
         let nh = (frame.rows as f32 * frame.metrics.line_height).max(1.0);
@@ -1653,9 +1673,9 @@ impl Renderer {
 
         // Full-size glyphs scaled to the texture (the same GPU minification the
         // inline preview used), left at the texture origin; the blit applies the
-        // offset. `rect` is the on-screen (camera-scaled) size, so once a dive grows
-        // a tile past its native resolution `preview_scale` saturates at 1.0 and the
-        // texture (capped to native) holds crisp 1:1 glyphs.
+        // offset. `rect` is the camera-independent native-resolution source rect
+        // (see `preview_source_rect`), so `preview_scale` lands the frame at 1:1 and
+        // the texture holds crisp glyphs the blit then minifies to the on-screen tile.
         let (mut insts, _) =
             self.build_instances(frame, font, size_px, None, 0..frame.rows_layout.len());
         let s = preview_scale(frame, rect);
@@ -2305,11 +2325,13 @@ impl Renderer {
                             // its content or size changes) instead of re-rasterizing
                             // the glyphs every frame. Selection isn't shown in the
                             // read-only previews, so the cache keys on frame alone.
-                            // Size the texture to the tile's *on-screen* (camera-
-                            // scaled) rect, so a tile being dived into stays crisp as
-                            // it grows rather than blitting a small texture stretched.
-                            let eff = layer.transform.apply_rect(*rect);
-                            self.ensure_preview(*id, frame, eff, font, size_px);
+                            // Size the texture to a camera-INDEPENDENT native-resolution
+                            // rect, not the live on-screen rect: a dive animates the
+                            // camera every frame, so on-screen sizing would re-render
+                            // every tile every frame. The blit (below) carries the
+                            // camera, so the tile still zooms; the texture stays put.
+                            let src = preview_source_rect(frame, *rect);
+                            self.ensure_preview(*id, frame, src, font, size_px);
                             seen.insert(*id);
                             draws.push(Draw::Preview {
                                 scissor,
