@@ -350,6 +350,31 @@ fn choose_alpha_mode(
     modes[0]
 }
 
+/// Pick the surface (swapchain) format. Our shader writes colours that are
+/// already sRGB-encoded 8-bit bytes — the offscreen golden target is
+/// [`ghost_renderer::FORMAT`] (`Rgba8Unorm`) — so the swapchain must be a plain
+/// (non-sRGB) 8-bit UNORM BGRA/RGBA format: an sRGB target would re-encode and
+/// wash the colours out, and an HDR / high-bit-depth target (`Rgba16Float`,
+/// `Rgb10a2Unorm`, all of which report `is_srgb() == false`) would reinterpret
+/// the bytes. Prefer `Bgra8Unorm` (the native swapchain format on most platforms
+/// and the one WebGPU guarantees), then `Rgba8Unorm`; the explicit order makes
+/// the choice deterministic rather than dependent on driver enumeration order.
+/// Only if neither is offered do we fall back to the first non-sRGB format, and
+/// finally — degraded — to the first format. A capability list is never empty.
+fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    use wgpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm};
+    for preferred in [Bgra8Unorm, Rgba8Unorm] {
+        if formats.contains(&preferred) {
+            return preferred;
+        }
+    }
+    formats
+        .iter()
+        .copied()
+        .find(|f| !f.is_srgb())
+        .unwrap_or(formats[0])
+}
+
 /// Per-window GPU state, valid only once the window (and surface) exist.
 struct Graphics {
     window: Arc<Window>,
@@ -397,14 +422,7 @@ impl Graphics {
                 .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
-        // Prefer a non-sRGB format: our colors are already sRGB, so an sRGB
-        // target would double-encode and wash them out.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        let format = choose_surface_format(&caps.formats);
         let win = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1279,9 +1297,12 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupChoice, choose_alpha_mode, startup_choice};
+    use super::{StartupChoice, choose_alpha_mode, choose_surface_format, startup_choice};
     use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
+    use wgpu::TextureFormat::{
+        Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
+    };
 
     fn info(name: &str, attached: bool) -> SessionInfo {
         SessionInfo {
@@ -1337,5 +1358,51 @@ mod tests {
         assert_eq!(choose_alpha_mode(&[Opaque, PostMultiplied], true), Opaque);
         // An opaque window ignores transparency entirely.
         assert_eq!(choose_alpha_mode(&[Opaque, PreMultiplied], false), Opaque);
+    }
+
+    #[test]
+    fn surface_format_prefers_bgra8_unorm() {
+        // Bgra8Unorm is the native swapchain format on most platforms and the one
+        // WebGPU guarantees; take it ahead of Rgba8Unorm even when both are offered.
+        assert_eq!(choose_surface_format(&[Rgba8Unorm, Bgra8Unorm]), Bgra8Unorm);
+    }
+
+    #[test]
+    fn surface_format_is_deterministic_regardless_of_order() {
+        // The result must not depend on driver enumeration order: an sRGB or HDR
+        // format appearing first must not shadow the 8-bit UNORM target.
+        assert_eq!(
+            choose_surface_format(&[Bgra8UnormSrgb, Rgba16Float, Bgra8Unorm, Rgba8Unorm]),
+            Bgra8Unorm
+        );
+        assert_eq!(
+            choose_surface_format(&[Rgba16Float, Rgba8Unorm, Bgra8Unorm]),
+            Bgra8Unorm
+        );
+    }
+
+    #[test]
+    fn surface_format_falls_back_to_rgba8_unorm() {
+        // No Bgra8Unorm offered: the other plain 8-bit UNORM target still beats any
+        // non-sRGB HDR/high-bit-depth format.
+        assert_eq!(
+            choose_surface_format(&[Rgba16Float, Rgb10a2Unorm, Rgba8Unorm]),
+            Rgba8Unorm
+        );
+    }
+
+    #[test]
+    fn surface_format_avoids_srgb_and_hdr_when_no_unorm8() {
+        // Neither 8-bit UNORM BGRA/RGBA is offered. Prefer any non-sRGB format
+        // (here the HDR one) over an sRGB target that would double-encode.
+        assert_eq!(
+            choose_surface_format(&[Rgba8UnormSrgb, Rgba16Float]),
+            Rgba16Float
+        );
+        // Only sRGB formats remain: nothing good to pick, take the first.
+        assert_eq!(
+            choose_surface_format(&[Rgba8UnormSrgb, Bgra8UnormSrgb]),
+            Rgba8UnormSrgb
+        );
     }
 }
