@@ -658,14 +658,21 @@ enum Draw {
 /// repaint until its content or size changes. Caching the pixels means navigation
 /// (and unchanged tiles while another is busy) re-rasterizes nothing — the win
 /// that matters on a software rasterizer.
-struct CachedPreview {
-    /// Kept alive for the bind group that samples it.
-    _texture: wgpu::Texture,
-    /// Samples `_texture` in the main pass (uniform + view + sampler).
+/// One session's rendered texture — its [`Frame`] rasterized once at native resolution
+/// and then composited (blitted) wherever the session appears (a tile, a slide side, a
+/// dive). It persists across frames: when the session's frame changes in only some rows,
+/// those rows are re-rendered IN PLACE (a banded update), so a live preview re-rasterizes
+/// just what changed — the on-texture analog of the steady single view's damaged redraw.
+struct Surface {
+    /// The native-res texture, rendered into (full or banded) and sampled by `bind_group`.
+    texture: wgpu::Texture,
+    /// Samples `texture` in the main pass (uniform + view + sampler). A banded update
+    /// renders into the same texture, so this stays valid without rebuilding.
     bind_group: wgpu::BindGroup,
-    /// The content this texture was rendered from; a different frame re-renders.
+    /// The frame the texture currently holds; the next frame is diffed against it to
+    /// decide a band (or, on a size/metrics change, a full re-render).
     frame: Frame,
-    /// Texture (= tile) pixel size; a resize/relayout re-renders.
+    /// Texture pixel size; a resize/relayout re-renders in full.
     size: (u32, u32),
 }
 
@@ -1128,6 +1135,44 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
     }
 }
 
+/// The TIGHT (un-expanded) inclusive row range `[lo, hi]` that differs between two
+/// frames of the same session — the rows a banded preview update repaints. `None` means
+/// a band can't be used and the caller must re-render in full: a layout change
+/// (cols/rows/metrics) or a frame carrying images (the banded path has no image pass,
+/// mirroring [`scene_damage`]'s full-redraw triggers). A cursor move with no rows_layout
+/// change folds in the cursor's old and new rows, exactly as [`scene_damage`] does.
+fn changed_rows(old: &Frame, new: &Frame) -> Option<(usize, usize)> {
+    if old.cols != new.cols
+        || old.rows != new.rows
+        || old.metrics != new.metrics
+        || !old.images.is_empty()
+        || !new.images.is_empty()
+    {
+        return None;
+    }
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    let mut bump = |row: usize| {
+        lo = lo.min(row);
+        hi = hi.max(row);
+    };
+    let n = old.rows_layout.len().max(new.rows_layout.len());
+    for row in 0..n {
+        if old.rows_layout.get(row) != new.rows_layout.get(row) {
+            bump(row);
+        }
+    }
+    if old.cursor != new.cursor {
+        for cur in [old.cursor.as_ref(), new.cursor.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            bump(cur.row);
+        }
+    }
+    // Nothing localizable changed (e.g. an unreachable equal-frames case) ⇒ full redraw.
+    (lo != usize::MAX).then_some((lo, hi))
+}
+
 /// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
 /// built once and reused across frames.
 pub struct Renderer {
@@ -1199,17 +1244,26 @@ pub struct Renderer {
     /// Blit pipeline for cached preview textures — like `image_pipeline` but with
     /// the passthrough `fs_blit` (the texture is already premultiplied).
     preview_pipeline: wgpu::RenderPipeline,
-    /// Cached preview textures by [`session_key`] (see [`CachedPreview`]). Keying by
+    /// The glyph pipeline with blending DISABLED (`blend: None` ⇒ the fragment replaces
+    /// the destination). A banded preview update draws one transparent quad with it to
+    /// erase the band's old pixels to (0,0,0,0) before repainting — the only way to clear
+    /// a sub-region of a transparent-backed texture, since `LoadOp::Clear` is whole-target.
+    erase_pipeline: wgpu::RenderPipeline,
+    /// Per-session rendered textures by [`session_key`] (see [`Surface`]). Keying by
     /// session — not the ephemeral [`SceneId`] role/handle — means a session's texture
     /// follows it across roles and fleet rebuilds, so a role change re-rasterizes
     /// nothing.
-    preview_cache: HashMap<u64, CachedPreview>,
+    preview_cache: HashMap<u64, Surface>,
     /// One blit quad per preview drawn this scene, parallel to the `Draw::Preview`
     /// quad indices.
     preview_instances: Option<wgpu::Buffer>,
-    /// Count of preview textures actually (re)rendered — a cache miss. A test
+    /// Count of preview textures actually (re)rendered in full — a cache miss. A test
     /// asserts an unchanged repaint re-renders none.
     preview_renders: u32,
+    /// Count of in-place banded preview updates: a live session whose frame changed in
+    /// only some rows re-rasterizes just those rows into its persistent texture instead
+    /// of a full re-render. A test asserts a one-row change band-updates, not re-renders.
+    preview_band_updates: u32,
     /// Count of times the steady-view backbuffer was adopted as a slide's outgoing
     /// preview instead of re-rasterizing it. A test asserts a slide after a steady
     /// view reuses the on-screen pixels rather than rebuilding them.
@@ -1482,6 +1536,41 @@ impl Renderer {
                 cache: None,
             });
 
+        // The erase pipeline: the glyph pipeline with blending OFF, so a solid quad's
+        // colour REPLACES the destination instead of blending over it. Used only to
+        // clear a band to transparent before a banded preview repaint.
+        let erase_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("erase pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &ATTRS,
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None, // replace, not blend: write the quad's exact colour
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Renderer {
             gpu,
             pipeline,
@@ -1511,9 +1600,11 @@ impl Renderer {
             sampler,
             image_pipeline,
             preview_pipeline,
+            erase_pipeline,
             preview_cache: HashMap::new(),
             preview_instances: None,
             preview_renders: 0,
+            preview_band_updates: 0,
             backbuffer_adoptions: 0,
             backbuffer_session: None,
             image_bind_groups: HashMap::new(),
@@ -1743,16 +1834,151 @@ impl Renderer {
         size_px: f32,
     ) {
         let size = Self::preview_size(frame, rect);
-        if self
-            .preview_cache
-            .get(&session)
-            .is_some_and(|c| c.size == size && c.frame == *frame)
-        {
-            return; // cache hit: blit the existing texture
+        // Decide against the cached surface up front, copying out a plan so no borrow of
+        // the cache is held while we mutate it below.
+        enum Plan {
+            Current,            // identical frame: the texture is already right
+            Band(usize, usize), // localized change: re-render just rows [lo, hi] in place
+            Full,               // no surface, a resize, or an un-bandable change
         }
-        let preview = self.render_preview_texture(frame, rect, font, size_px);
-        self.preview_renders += 1;
-        self.preview_cache.insert(session, preview);
+        let plan = match self.preview_cache.get(&session) {
+            Some(c) if c.size == size && c.frame == *frame => Plan::Current,
+            // Band only when the texture size is unchanged and the preview is rendered
+            // 1:1 (un-downscaled), so a frame row maps to the texture at native lh.
+            Some(c) if c.size == size && preview_scale(frame, rect) >= 1.0 => {
+                match changed_rows(&c.frame, frame) {
+                    Some((lo, hi)) => Plan::Band(lo, hi),
+                    None => Plan::Full,
+                }
+            }
+            _ => Plan::Full,
+        };
+        match plan {
+            Plan::Current => {} // cache hit: blit the existing texture
+            Plan::Band(lo, hi) => {
+                let mut surface = self.preview_cache.remove(&session).expect("present above");
+                self.update_preview_band(&mut surface, frame, lo, hi, font, size_px);
+                self.preview_cache.insert(session, surface);
+                self.preview_band_updates += 1;
+            }
+            Plan::Full => {
+                let preview = self.render_preview_texture(frame, rect, font, size_px);
+                self.preview_renders += 1;
+                self.preview_cache.insert(session, preview);
+            }
+        }
+    }
+
+    /// Re-render rows `lo..=hi` of `frame` into `surface`'s existing native-res texture
+    /// in place: ERASE that band to transparent, then repaint only those rows (plus the
+    /// ±1 neighbours, clipped, so a glyph spilling across a row boundary still lands),
+    /// leaving the rest of the texture untouched (`LoadOp::Load`). The on-texture analog
+    /// of [`render_band_incremental`](Self::render_band_incremental); it erases rather
+    /// than fills with the theme bg because a preview is cleared to transparent (the card
+    /// shows through default-bg cells). Only reached for a 1:1 preview (no downscale), so
+    /// rows map to the texture at native line-height with no scaling.
+    fn update_preview_band(
+        &mut self,
+        surface: &mut Surface,
+        frame: &Frame,
+        lo: usize,
+        hi: usize,
+        font: FontRef,
+        size_px: f32,
+    ) {
+        let (tw, th) = surface.size;
+        let lh = frame.metrics.line_height;
+        // The TIGHT changed band (what we erase + scissor), clamped to the texture.
+        let top = (lo as f32 * lh).min(th as f32);
+        let band = RectPx {
+            x: 0.0,
+            y: top,
+            w: tw as f32,
+            h: (((hi - lo + 1) as f32) * lh).min(th as f32 - top).max(0.0),
+        };
+        let scissor = clamp_scissor(band, tw, th);
+        if scissor[2] == 0 || scissor[3] == 0 {
+            surface.frame = frame.clone();
+            return;
+        }
+        // Build the ±1-expanded rows so an adjacent row's glyph spilling INTO the band
+        // is drawn (then clipped to the band by the scissor) — exactly as
+        // `render_band_incremental` expands its build. Selection isn't shown in previews.
+        let last = frame.rows_layout.len().saturating_sub(1);
+        let (build_lo, build_hi) = (lo.saturating_sub(1), (hi + 1).min(last));
+        let (insts, _) = self.build_instances(frame, font, size_px, None, build_lo..build_hi + 1);
+
+        // The transparent erase quad (replace-blend) and the band glyphs (alpha-blend).
+        let erase = [solid(band, [0.0, 0.0, 0.0, 0.0])];
+        let erase_buf = self
+            .gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("preview erase"),
+                contents: bytemuck::cast_slice(&erase),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let glyph_buf = (!insts.is_empty()).then(|| {
+            self.gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("preview band instances"),
+                    contents: bytemuck::cast_slice(&insts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+
+        // Point the shared viewport uniform at the texture for this sub-pass (reset to
+        // the scene size before the main pass, as `render_preview_texture` relies on).
+        let uniforms = Uniforms {
+            viewport: [tw as f32, th as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let view = surface
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview band"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview band"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // keep the rest of the texture
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+            // Erase the band to transparent (replace), then repaint its glyphs (over).
+            pass.set_pipeline(&self.erase_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, erase_buf.slice(..));
+            pass.draw(0..6, 0..1);
+            if let Some(buf) = &glyph_buf {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..insts.len() as u32);
+            }
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+        surface.frame = frame.clone();
     }
 
     /// Adopt the steady-view backbuffer as `session`'s preview texture, if it holds a
@@ -1789,8 +2015,8 @@ impl Renderer {
         };
         self.preview_cache.insert(
             session,
-            CachedPreview {
-                _texture: bb.texture,
+            Surface {
+                texture: bb.texture,
                 bind_group: bb.bind_group,
                 frame: frame.clone(),
                 size: Self::preview_size(frame, src),
@@ -1810,7 +2036,7 @@ impl Renderer {
         rect: RectPx,
         font: FontRef,
         size_px: f32,
-    ) -> CachedPreview {
+    ) -> Surface {
         let size = Self::preview_size(frame, rect);
         let (tw, th) = size;
 
@@ -1961,8 +2187,8 @@ impl Renderer {
                 ],
             });
 
-        CachedPreview {
-            _texture: texture,
+        Surface {
+            texture,
             bind_group,
             frame: frame.clone(),
             size,
@@ -1973,6 +2199,13 @@ impl Renderer {
     /// unchanged repaint re-renders none.
     pub fn preview_renders(&self) -> u32 {
         self.preview_renders
+    }
+
+    /// Count of in-place banded preview updates (see
+    /// [`Self::preview_band_updates`](Self::preview_band_updates) field). A test asserts
+    /// a live session's one-row change band-updates rather than fully re-rastering.
+    pub fn preview_band_updates(&self) -> u32 {
+        self.preview_band_updates
     }
 
     /// Count of backbuffer→outgoing-preview adoptions (see
@@ -4301,6 +4534,80 @@ mod tests {
             r.preview_renders(),
             1,
             "the texture follows the session across the id change — no re-raster"
+        );
+    }
+
+    #[test]
+    fn a_live_previews_changed_row_band_updates_in_place() {
+        // A live fleet tile keeps producing output. Re-rasterizing its whole (native-
+        // res) texture on every change is the cost a banded update removes: only the
+        // rows that changed re-render into the persistent texture, and the result is
+        // byte-identical to a full re-raster.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        // A quarter-size tile → the preview path (native-res texture, blitted down).
+        let rect = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: w as f32 / 4.0,
+            h: h as f32 / 4.0,
+        };
+        let sess = session_key("live-tile");
+        let tile = |f: Frame| Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Tile(1),
+                    session: sess,
+                    rect,
+                    frame: f,
+                    selection: None,
+                    dim: false,
+                }],
+            )],
+        };
+        // Two frames differing only in row 3 — and SHORTER there, so a correct update
+        // must ERASE the old longer text (the transparent-clear analog of the
+        // backbuffer's damaged-redraw test).
+        let fa = frame(
+            cols,
+            rows,
+            "aaaa\r\nbbbb\r\ncccc\r\nLONG ORIGINAL ROW THREE\r\neeee",
+        );
+        let fb = frame(cols, rows, "aaaa\r\nbbbb\r\ncccc\r\nshort3\r\neeee");
+
+        let mut r = Renderer::headless(Theme::default());
+        let _ = r.render_offscreen_scene(&tile(fa), font, SIZE_PX);
+        assert_eq!(
+            r.preview_renders(),
+            1,
+            "the first paint full-rasters the texture"
+        );
+        assert_eq!(r.preview_band_updates(), 0);
+
+        let banded = r
+            .render_offscreen_scene(&tile(fb.clone()), font, SIZE_PX)
+            .rgba;
+        assert_eq!(
+            r.preview_renders(),
+            1,
+            "a one-row change does NOT re-raster the whole texture"
+        );
+        assert_eq!(
+            r.preview_band_updates(),
+            1,
+            "it band-updates the changed row in place"
+        );
+
+        // The banded update must be byte-identical to a fresh full render of frame b.
+        let full = Renderer::headless(Theme::default())
+            .render_offscreen_scene(&tile(fb), font, SIZE_PX)
+            .rgba;
+        assert_eq!(
+            banded, full,
+            "a banded preview update reproduces a full re-raster exactly"
         );
     }
 
