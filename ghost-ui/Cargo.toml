@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "ghost — the windowed GPU terminal (winit + wgpu + ghost-renderer), with the CLI subcommands folded in."
 publish = false
+# Steers a bare `cargo run` at the workspace root to `ghost` (otherwise it's
+# ambiguous against ghost-shot's binary). This leaves workspace.default-members
+# alone, so bare `cargo build`/`cargo test` still cover every crate.
+default-run = "ghost"
 
 # The headline binary: `ghost` with no subcommand opens the GUI; with a subcommand
 # (ls/attach/new/…, via ghost-cli) it runs that and exits.
