@@ -84,10 +84,11 @@ fn grid_from_pixels(w: u32, h: u32, scale: f32) -> (u16, u16) {
     (cols, rows)
 }
 
-/// Apply the `GHOST_DIVE_MS` override (a fleet-zoom duration in ms) to a fresh
-/// window, if set — for slowing the dive right down while validating it.
-fn apply_dive_ms(root: &mut RootModel) {
-    if let Some(ms) = std::env::var("GHOST_DIVE_MS")
+/// Apply the `GHOST_ANIM_MS` override (the duration, in ms, of the UI animations —
+/// the fleet dive and the session slide) to a fresh window, if set — for slowing
+/// them right down while validating them.
+fn apply_anim_ms(root: &mut RootModel) {
+    if let Some(ms) = std::env::var("GHOST_ANIM_MS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
@@ -929,7 +930,7 @@ impl App {
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
         let (mut root, init) = RootModel::fleet(METRICS, (w, h), scale as f32);
-        apply_dive_ms(&mut root);
+        apply_anim_ms(&mut root);
         self.windows.insert(
             wid,
             WindowState {
@@ -991,7 +992,7 @@ impl App {
         };
         let model = TerminalModel::new(name.to_string(), cols, rows, METRICS);
         let mut root = RootModel::single(model, METRICS, (w, h));
-        apply_dive_ms(&mut root);
+        apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);
         self.windows.insert(

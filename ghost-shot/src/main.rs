@@ -828,7 +828,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 /// returned scene is the whole fleet world under the partway camera.
 /// The dive runs this long (mirrors the core's default `ANIM_MS`); the sheet
 /// samples across it. The tool drives a default-duration `RootModel`, so this is
-/// just the matching step size, not the live `GHOST_DIVE_MS` override.
+/// just the matching step size, not the live `GHOST_ANIM_MS` override.
 const DIVE_MS: u64 = 180;
 
 /// Build a `count`-session fleet and kick a dive into/out of the *second* session,

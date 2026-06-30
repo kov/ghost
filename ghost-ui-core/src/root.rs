@@ -22,9 +22,10 @@ enum Mode {
     Fleet(Box<FleetModel>),
 }
 
-/// Default duration of the fleet zoom in/out animation, in milliseconds. The shell
-/// can override it per-window (see [`RootModel::set_anim_ms`]) — e.g. from the
-/// `GHOST_DIVE_MS` env var — to slow the dive right down while validating it.
+/// Default duration of the UI animations (the fleet zoom and the session slide),
+/// in milliseconds. The shell can override it per-window (see
+/// [`RootModel::set_anim_ms`]) — e.g. from the `GHOST_ANIM_MS` env var — to slow
+/// the animations right down while validating them.
 const ANIM_MS: u64 = 180;
 /// Frame cadence while animating (~60 fps).
 const ANIM_TICK_MS: u64 = 16;
@@ -105,6 +106,77 @@ fn ease_in_out(t: f32) -> f32 {
     }
 }
 
+/// An in-flight horizontal slide between two single-view sessions — the Ctrl-Tab
+/// cycle and the switch made when a foreground shell exits. Like the dive it's
+/// purely visual: the model swap is instant, so input already routes to the new
+/// session; this just slides the outgoing session off one edge while the incoming
+/// one slides in from the other. Both scenes are **frozen** at the start, so the
+/// outgoing one — whose session may have just exited — stays a stable rendered
+/// stand-in for the slide's whole duration.
+struct Slide {
+    /// Frozen scene of the session being left (the stand-in).
+    outgoing: Scene,
+    /// Frozen scene of the session being entered.
+    incoming: Scene,
+    /// `+1` slides the incoming in from the right (next), `-1` from the left (prev).
+    dir: f32,
+    /// Eased progress in `[0, 1]`, advanced each tick.
+    p: f32,
+    /// Start time, stamped on the first tick; `None` until then.
+    t0: Option<u64>,
+    dur_ms: u64,
+}
+
+impl Slide {
+    fn new(outgoing: Scene, incoming: Scene, dir: f32, dur_ms: u64) -> Self {
+        Slide {
+            outgoing,
+            incoming,
+            dir,
+            p: 0.0,
+            t0: None,
+            dur_ms,
+        }
+    }
+
+    /// Advance to `now_ms`; returns true once the slide is done.
+    fn advance(&mut self, now_ms: u64) -> bool {
+        let t0 = *self.t0.get_or_insert(now_ms);
+        let elapsed = now_ms.saturating_sub(t0);
+        if elapsed >= self.dur_ms {
+            self.p = 1.0;
+            true
+        } else {
+            self.p = ease_in_out(elapsed as f32 / self.dur_ms as f32);
+            false
+        }
+    }
+
+    /// The composed frame at the current progress: the two sessions side by side,
+    /// translated so the outgoing one leaves and the incoming one arrives. At `p`=0
+    /// the outgoing fills the window and the incoming sits just off the far edge; at
+    /// `p`=1 they have exchanged places.
+    fn scene(&self) -> Scene {
+        let w = self.outgoing.size_px.0 as f32;
+        let out_dx = -self.dir * self.p * w;
+        let in_dx = self.dir * (1.0 - self.p) * w;
+        let mut scene = Scene::new(self.outgoing.size_px);
+        push_shifted(&mut scene, &self.outgoing, out_dx);
+        push_shifted(&mut scene, &self.incoming, in_dx);
+        scene
+    }
+}
+
+/// Append `src`'s layers to `dst`, each translated right by `dx` screen pixels
+/// (post-composed onto whatever camera the layer already carries).
+fn push_shifted(dst: &mut Scene, src: &Scene, dx: f32) {
+    for layer in &src.layers {
+        let mut layer = layer.clone();
+        layer.transform.tx += dx;
+        dst.layers.push(layer);
+    }
+}
+
 pub struct RootModel {
     mode: Mode,
     metrics: CellMetrics,
@@ -141,6 +213,9 @@ pub struct RootModel {
     /// so this never affects logical state or input — `view` just renders the
     /// active scene under its camera until it completes.
     anim: Option<Anim>,
+    /// The in-flight session slide (Ctrl-Tab / shell-exit switch), if any. Also
+    /// purely visual and mutually exclusive with [`anim`](Self::anim).
+    slide: Option<Slide>,
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
@@ -185,6 +260,7 @@ impl RootModel {
             pending_dive: None,
             pending_dive_in: None,
             anim: None,
+            slide: None,
             anim_ms: ANIM_MS,
         }
     }
@@ -204,6 +280,7 @@ impl RootModel {
             pending_dive: None,
             pending_dive_in: None,
             anim: None,
+            slide: None,
             anim_ms: ANIM_MS,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
@@ -233,19 +310,26 @@ impl RootModel {
         (cols, rows)
     }
 
-    /// Override the dive duration (ms) — e.g. the shell wiring `GHOST_DIVE_MS` to
-    /// slow the animation right down for visual validation. Affects dives started
-    /// after this call.
+    /// Override the animation duration (ms) — e.g. the shell wiring `GHOST_ANIM_MS`
+    /// to slow the animations right down for visual validation. Affects dives and
+    /// slides started after this call.
     pub fn set_anim_ms(&mut self, ms: u64) {
         self.anim_ms = ms;
     }
 
-    /// Whether a fleet zoom animation is currently playing.
+    /// Whether a visual animation (a fleet zoom or a session slide) is playing.
     pub fn is_animating(&self) -> bool {
-        self.anim.is_some()
+        self.anim.is_some() || self.slide.is_some()
     }
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        // A playing slide owns the tick stream until it settles (the model swap
+        // already happened, so this is purely the visual hand-off).
+        if let UiEvent::Tick { now_ms } = &ev
+            && self.slide.is_some()
+        {
+            return self.tick_slide(*now_ms);
+        }
         // While a zoom plays, the animation owns the tick stream (driving the
         // camera at ~60fps); it hands one tick back to the fleet on completion so
         // the periodic session refresh resumes.
@@ -323,6 +407,9 @@ impl RootModel {
             if scale > 0.0 {
                 self.scale = scale as f32;
             }
+            // A slide's frozen scenes are sized to the old window; drop it so the
+            // live view re-renders at the new size rather than sliding stale frames.
+            self.slide = None;
             // Resize the foreground and every warm background mirror, so a
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
@@ -400,11 +487,13 @@ impl RootModel {
     /// The previously-shown session is NOT detached — the window keeps it warm so
     /// Ctrl-Tab and the fleet can switch back to it.
     fn adopt(&mut self, id: SessionId) -> Vec<Cmd> {
-        // A new transition cancels any in-flight dive (a still-waiting dive-out, or an
-        // animation that hasn't settled) so a stale camera/snapshot can't linger.
+        // A new transition cancels any in-flight dive or slide (a still-waiting
+        // dive-out, or an animation that hasn't settled) so a stale camera/snapshot
+        // can't linger. A slide built *around* an adopt (Ctrl-Tab) re-arms it after.
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
+        self.slide = None;
         // Opening a cold tile (a detached session we don't yet drive): size it to the
         // window and hold in the fleet until its first output makes the preview live,
         // then re-enter to dive into the now full-size, content-bearing tile. The shell
@@ -483,13 +572,17 @@ impl RootModel {
             return Vec::new();
         };
         let gone = m.session().to_string();
+        // Freeze the dead session's last frame now, before we discard it — it's the
+        // rendered stand-in that slides out under the switch.
+        let outgoing = self.live_scene();
         // The session is dead: drop our ownership and any warm mirror of it, and
-        // cancel any in-flight dive so a stale camera/snapshot can't linger.
+        // cancel any in-flight dive/slide so a stale camera/snapshot can't linger.
         self.mine.remove(&gone);
         self.warm.remove(&gone);
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
+        self.slide = None;
 
         // Pick the next session in the same forward order Ctrl-Tab walks: the
         // first survivor sorted after the one that exited, wrapping to the first.
@@ -511,6 +604,10 @@ impl RootModel {
             let mut cmds = resize_model(&mut model, self.size_px, self.scale);
             self.mode = Mode::Single(Box::new(model));
             self.primary = Some(next);
+            // Slide the next session in (forward, like a Ctrl-Tab) over the dead
+            // session's frozen stand-in.
+            let incoming = self.live_scene();
+            cmds.extend(self.start_slide(outgoing, incoming, true));
             cmds.push(Cmd::Redraw);
             return cmds;
         }
@@ -553,10 +650,58 @@ impl RootModel {
         if Some(&to) == self.primary.as_ref() {
             return Vec::new();
         }
-        self.adopt(to)
+        // Freeze the current view, swap instantly, then slide the new session in
+        // from the side we're heading (right when going forward, left when back).
+        let outgoing = self.live_scene();
+        let mut cmds = self.adopt(to);
+        let incoming = self.live_scene();
+        cmds.extend(self.start_slide(outgoing, incoming, forward));
+        cmds
+    }
+
+    /// The window's current live scene (the foreground terminal, or the fleet
+    /// grid) — what `view` renders when no animation is in flight, and the frozen
+    /// endpoints a slide is built from.
+    fn live_scene(&self) -> Scene {
+        match &self.mode {
+            Mode::Single(m) => m.view(),
+            Mode::Fleet(f) => f.view(),
+        }
+    }
+
+    /// Begin a session slide from `outgoing` to `incoming` (a fresh one replaces any
+    /// in flight), and ask for the first frame. `forward` slides the incoming in
+    /// from the right; backward, from the left.
+    fn start_slide(&mut self, outgoing: Scene, incoming: Scene, forward: bool) -> Vec<Cmd> {
+        let dir = if forward { 1.0 } else { -1.0 };
+        self.slide = Some(Slide::new(outgoing, incoming, dir, self.anim_ms));
+        vec![Cmd::ScheduleTick { after_ms: 0 }]
+    }
+
+    /// Advance the in-flight slide on a clock tick: repaint (and schedule the next
+    /// frame) while running; clear it on completion so the live view takes over.
+    fn tick_slide(&mut self, now_ms: u64) -> Vec<Cmd> {
+        let Some(slide) = self.slide.as_mut() else {
+            return Vec::new();
+        };
+        let done = slide.advance(now_ms);
+        let mut cmds = vec![Cmd::Redraw];
+        if done {
+            self.slide = None;
+        } else {
+            cmds.push(Cmd::ScheduleTick {
+                after_ms: ANIM_TICK_MS,
+            });
+        }
+        cmds
     }
 
     pub fn view(&self) -> Scene {
+        // A slide owns the frame while it plays (mutually exclusive with a dive).
+        if let Some(slide) = &self.slide {
+            return slide.scene();
+        }
+
         // A dive-out waiting on the session list: hold the camera framed on the
         // session we left (it keeps filling the window, as in the single view) until
         // the reply lands and the pull-back is launched. Chrome fully faded — we're
@@ -636,12 +781,13 @@ impl RootModel {
             1,
             self.metrics,
         )));
-        // A new transition cancels any in-flight dive (a still-waiting dive-out, an
-        // animation that hasn't settled, or a take-over awaiting its preview) so a
-        // stale camera/snapshot can't linger.
+        // A new transition cancels any in-flight dive or slide (a still-waiting
+        // dive-out, an animation that hasn't settled, or a take-over awaiting its
+        // preview) so a stale camera/snapshot can't linger.
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
+        self.slide = None;
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, mut cmds, anim) = match current {
@@ -1801,5 +1947,54 @@ mod tests {
             cmds.contains(&Cmd::ListSessions),
             "the fleet repopulates from the host: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn ctrl_tab_plays_a_slide_between_the_two_sessions() {
+        let mut r = root();
+        with_three(&mut r); // foreground gamma; owns alpha, beta, gamma
+        assert!(!r.is_animating(), "settled before the cycle");
+
+        let cmds = ctrl_tab(&mut r, false); // forward: gamma -> alpha
+        assert!(r.is_animating(), "Ctrl-Tab plays a slide");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the slide schedules its first frame: {cmds:?}"
+        );
+        // Mid-slide the leaving and arriving sessions are both drawn.
+        assert_eq!(
+            r.view().terminals().count(),
+            2,
+            "both sessions are on screen during the slide"
+        );
+
+        // It settles to just the new foreground — which input already routes to,
+        // the swap being instant.
+        let ticks = settle(&mut r);
+        assert!(ticks > 1, "the slide ran for several frames, not one");
+        assert_eq!(r.view().terminals().count(), 1, "settles to one view");
+        assert_eq!(foreground(&mut r), "alpha");
+    }
+
+    #[test]
+    fn exiting_the_foreground_shell_slides_to_the_next_session() {
+        let mut r = root();
+        with_three(&mut r); // foreground gamma
+        end_foreground(&mut r, "gamma");
+
+        // The auto-switch to the next session plays a slide, with the dead
+        // session's frozen last frame as the outgoing stand-in.
+        assert!(r.is_animating(), "the auto-switch plays a slide");
+        assert_eq!(
+            r.view().terminals().count(),
+            2,
+            "the dead session's stand-in slides out as the next slides in"
+        );
+
+        settle(&mut r);
+        assert!(!r.is_animating());
+        assert!(!r.is_fleet(), "still a live single view");
+        assert_eq!(r.view().terminals().count(), 1);
+        assert_eq!(foreground(&mut r), "alpha");
     }
 }
