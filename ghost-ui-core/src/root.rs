@@ -31,67 +31,133 @@ const ANIM_MS: u64 = 180;
 /// Frame cadence while animating (~60 fps).
 const ANIM_TICK_MS: u64 = 16;
 
-/// An in-flight fleet zoom — a camera over the *fleet world*, interpolated from
-/// `from` to `to` (one end is identity = the overview at rest, the other is a tile
-/// filling the window) over `dur_ms` once the first tick stamps the start. The mode
-/// swap is instant, so this never gates input or logical state — it's purely the
-/// visual dive.
+/// An in-flight UI animation — a transform timeline over a few **frozen** content
+/// layers. Each [`AnimLayer`] carries a snapshot scene and a `from`→`to` transform;
+/// [`Anim::scene`] interpolates them at the current eased progress and stacks the
+/// results into one frame. The model swap is always instant, so an animation never
+/// gates input or logical state — it's purely visual, and the renderer composites the
+/// frozen content as textures rather than re-rasterizing it every frame.
 ///
-/// `world` carries a frozen snapshot of the fleet scene, rendered *under* the camera
-/// for the whole dive (either direction): on a dive-in the mode is already single, so
-/// there'd be no fleet to show otherwise; on a dive-out it freezes the grid against a
-/// reconcile arriving mid-flight, so tiles don't reshuffle as we pull back.
+/// Two shapes are built today, but the timeline and the renderer are both
+/// animation-agnostic, so a new effect is just a new set of layers:
+///
+/// - a fleet **dive** ([`Anim::dive`]) — one layer holding the frozen fleet world,
+///   zoomed by a camera lerped between the overview (identity) and a tile filling the
+///   window, with its chrome faded toward the zoomed-in end. Freezing the world keeps
+///   tiles from reshuffling if a reconcile lands mid-dive, and gives a dive-in (whose
+///   mode is already single) a fleet to pull back to.
+/// - a session **slide** ([`Anim::slide`]) — two single-view layers translated past
+///   each other so the outgoing session leaves one edge as the incoming one arrives
+///   from the other. The frozen outgoing scene is a stable stand-in even if its shell
+///   just exited.
 struct Anim {
-    from: Transform,
-    to: Transform,
-    current: Transform,
-    /// The frozen fleet scene rendered under the camera for the dive's duration.
-    world: Option<Scene>,
-    /// The start time, stamped on the first tick; `None` until then.
+    layers: Vec<AnimLayer>,
+    /// Output frame size (the window); every layer composes into this.
+    size_px: (u32, u32),
+    /// Start time, stamped on the first tick; `None` until then.
     t0: Option<u64>,
     dur_ms: u64,
+    /// Eased progress in `[0, 1]`, advanced each tick.
+    p: f32,
+}
+
+/// One frozen layer of an [`Anim`]: `content` carried from `from` to `to` across the
+/// animation. `fade_chrome` dissolves the non-terminal items as the layer zooms in
+/// (the dive's card→terminal resolve); a slide layer leaves it off.
+struct AnimLayer {
+    content: Scene,
+    from: Transform,
+    to: Transform,
+    fade_chrome: bool,
 }
 
 impl Anim {
-    fn new(from: Transform, to: Transform, world: Option<Scene>, dur_ms: u64) -> Self {
+    /// A fleet zoom: the frozen `world` under a camera lerped `from`→`to`, chrome
+    /// fading toward the zoomed-in end so a card resolves into a clean terminal.
+    fn dive(world: Scene, from: Transform, to: Transform, dur_ms: u64) -> Self {
+        let size_px = world.size_px;
         Anim {
-            from,
-            to,
-            current: from,
-            world,
+            layers: vec![AnimLayer {
+                content: world,
+                from,
+                to,
+                fade_chrome: true,
+            }],
+            size_px,
             t0: None,
             dur_ms,
+            p: 0.0,
         }
     }
 
-    /// Advance the camera to `now_ms`; returns true once the animation is done.
-    /// Time is eased (ease-in-out) so the dive accelerates out of rest and settles
-    /// gently instead of moving at a constant, mechanical rate.
+    /// A horizontal slide between two single-view sessions: the outgoing leaves one
+    /// edge (`+1` dir → incoming arrives from the right, the "next" direction) as the
+    /// incoming arrives from the other. Both scenes are re-ided to distinct slide ids
+    /// so the renderer caches each side's texture independently (the single view's lone
+    /// terminal is [`SceneId::Root`] for both, which would otherwise collide).
+    fn slide(mut outgoing: Scene, mut incoming: Scene, dir: f32, dur_ms: u64) -> Self {
+        let size_px = outgoing.size_px;
+        let w = size_px.0 as f32;
+        reid_terminals(&mut outgoing, SceneId::Slide(0));
+        reid_terminals(&mut incoming, SceneId::Slide(1));
+        let translate = |tx| Transform {
+            scale: 1.0,
+            tx,
+            ty: 0.0,
+        };
+        Anim {
+            layers: vec![
+                AnimLayer {
+                    content: outgoing,
+                    from: Transform::IDENTITY,
+                    to: translate(-dir * w),
+                    fade_chrome: false,
+                },
+                AnimLayer {
+                    content: incoming,
+                    from: translate(dir * w),
+                    to: Transform::IDENTITY,
+                    fade_chrome: false,
+                },
+            ],
+            size_px,
+            t0: None,
+            dur_ms,
+            p: 0.0,
+        }
+    }
+
+    /// Advance to `now_ms`; returns true once the animation is done. Time is eased
+    /// (ease-in-out) so motion accelerates out of rest and settles gently instead of
+    /// moving at a constant, mechanical rate.
     fn advance(&mut self, now_ms: u64) -> bool {
         let t0 = *self.t0.get_or_insert(now_ms);
         let elapsed = now_ms.saturating_sub(t0);
         if elapsed >= self.dur_ms {
-            self.current = self.to;
+            self.p = 1.0;
             true
         } else {
-            let p = ease_in_out(elapsed as f32 / self.dur_ms as f32);
-            self.current = Transform::lerp(self.from, self.to, p);
+            self.p = ease_in_out(elapsed as f32 / self.dur_ms as f32);
             false
         }
     }
 
-    /// How opaque the fleet *chrome* (everything but the terminal previews) should
-    /// be at the current camera: fully shown at the overview end, faded to nothing
-    /// as the dive reaches the tile, so a tile becomes a clean terminal rather than
-    /// a giant card with buttons. Derived from the camera scale, so it follows the
-    /// eased motion. Direction-agnostic (identity end = 1, zoomed-in end = 0).
-    fn chrome_alpha(&self) -> f32 {
-        let tile_scale = self.from.scale.max(self.to.scale);
-        let fleet_scale = self.from.scale.min(self.to.scale);
-        if tile_scale <= fleet_scale {
-            return 1.0;
+    /// The composed frame at the current progress: each layer's frozen content under
+    /// its interpolated transform (chrome faded for a zooming layer), stacked low→high
+    /// in declaration order.
+    fn scene(&self) -> Scene {
+        let mut out = Scene::new(self.size_px);
+        for layer in &self.layers {
+            let camera = Transform::lerp(layer.from, layer.to, self.p);
+            let chrome = if layer.fade_chrome {
+                chrome_alpha(layer.from, layer.to, camera)
+            } else {
+                1.0
+            };
+            out.layers
+                .extend(with_camera(layer.content.clone(), camera, chrome).layers);
         }
-        ((tile_scale - self.current.scale) / (tile_scale - fleet_scale)).clamp(0.0, 1.0)
+        out
     }
 }
 
@@ -107,84 +173,53 @@ fn ease_in_out(t: f32) -> f32 {
     }
 }
 
-/// An in-flight horizontal slide between two single-view sessions — the Ctrl-Tab
-/// cycle and the switch made when a foreground shell exits. Like the dive it's
-/// purely visual: the model swap is instant, so input already routes to the new
-/// session; this just slides the outgoing session off one edge while the incoming
-/// one slides in from the other. Both scenes are **frozen** at the start, so the
-/// outgoing one — whose session may have just exited — stays a stable rendered
-/// stand-in for the slide's whole duration.
-struct Slide {
-    /// Frozen scene of the session being left (the stand-in).
-    outgoing: Scene,
-    /// Frozen scene of the session being entered.
-    incoming: Scene,
-    /// `+1` slides the incoming in from the right (next), `-1` from the left (prev).
-    dir: f32,
-    /// Eased progress in `[0, 1]`, advanced each tick.
-    p: f32,
-    /// Start time, stamped on the first tick; `None` until then.
-    t0: Option<u64>,
-    dur_ms: u64,
+/// How opaque the fleet *chrome* (everything but the terminal previews) should be at
+/// the current camera: fully shown at the overview end, faded to nothing as the camera
+/// reaches the tile, so a tile becomes a clean terminal rather than a giant card with
+/// buttons. Derived from the camera scale, so it follows the eased motion.
+/// Direction-agnostic (identity end = 1, zoomed-in end = 0).
+fn chrome_alpha(from: Transform, to: Transform, current: Transform) -> f32 {
+    let tile_scale = from.scale.max(to.scale);
+    let fleet_scale = from.scale.min(to.scale);
+    if tile_scale <= fleet_scale {
+        return 1.0;
+    }
+    ((tile_scale - current.scale) / (tile_scale - fleet_scale)).clamp(0.0, 1.0)
 }
 
-impl Slide {
-    fn new(outgoing: Scene, incoming: Scene, dir: f32, dur_ms: u64) -> Self {
-        Slide {
-            outgoing,
-            incoming,
-            dir,
-            p: 0.0,
-            t0: None,
-            dur_ms,
-        }
-    }
-
-    /// Advance to `now_ms`; returns true once the slide is done.
-    fn advance(&mut self, now_ms: u64) -> bool {
-        let t0 = *self.t0.get_or_insert(now_ms);
-        let elapsed = now_ms.saturating_sub(t0);
-        if elapsed >= self.dur_ms {
-            self.p = 1.0;
-            true
-        } else {
-            self.p = ease_in_out(elapsed as f32 / self.dur_ms as f32);
-            false
-        }
-    }
-
-    /// The composed frame at the current progress: the two sessions side by side,
-    /// translated so the outgoing one leaves and the incoming one arrives. At `p`=0
-    /// the outgoing fills the window and the incoming sits just off the far edge; at
-    /// `p`=1 they have exchanged places.
-    fn scene(&self) -> Scene {
-        let w = self.outgoing.size_px.0 as f32;
-        let out_dx = -self.dir * self.p * w;
-        let in_dx = self.dir * (1.0 - self.p) * w;
-        let mut scene = Scene::new(self.outgoing.size_px);
-        // Re-id each side to a distinct slide id (the single view's lone terminal is
-        // SceneId::Root for both): the renderer caches a terminal's rastered frame by
-        // id, so distinct ids let it composite two stable textures instead of
-        // re-rasterizing both every frame.
-        push_shifted(&mut scene, &self.outgoing, out_dx, SceneId::Slide(0));
-        push_shifted(&mut scene, &self.incoming, in_dx, SceneId::Slide(1));
-        scene
-    }
-}
-
-/// Append `src`'s layers to `dst`, each translated right by `dx` screen pixels
-/// (post-composed onto whatever camera the layer already carries) and with every
-/// terminal re-ided to `term_id` so the composited sides cache independently.
-fn push_shifted(dst: &mut Scene, src: &Scene, dx: f32, term_id: SceneId) {
-    for layer in &src.layers {
-        let mut layer = layer.clone();
-        layer.transform.tx += dx;
-        for item in &mut layer.items {
-            if let SceneItem::Terminal { id, .. } = item {
-                *id = term_id;
+/// Place a frozen `scene` under a `camera` transform, fading the fleet chrome
+/// (everything but terminal previews and badges) by `chrome`. Replaces each layer's
+/// own transform with `camera` — single-view layers carry identity, so this is a plain
+/// set; the fleet world's layers are already expressed in world space, so the camera
+/// is the whole transform there too.
+fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
+    for layer in &mut scene.layers {
+        layer.transform = camera;
+        if chrome < 1.0 {
+            for item in &mut layer.items {
+                match item {
+                    SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
+                    SceneItem::Rect { color, .. }
+                    | SceneItem::Text { color, .. }
+                    | SceneItem::Border { color, .. } => color[3] *= chrome,
+                }
             }
         }
-        dst.layers.push(layer);
+    }
+    scene
+}
+
+/// Stamp every terminal in `scene` with `id` so a composited copy caches separately
+/// from the original. The renderer keys a terminal's rastered texture by its
+/// [`SceneId`]; a slide's two single-view sides are both [`SceneId::Root`] otherwise
+/// and would evict each other.
+fn reid_terminals(scene: &mut Scene, id: SceneId) {
+    for layer in &mut scene.layers {
+        for item in &mut layer.items {
+            if let SceneItem::Terminal { id: tid, .. } = item {
+                *tid = id;
+            }
+        }
     }
 }
 
@@ -220,13 +255,10 @@ pub struct RootModel {
     /// the fleet until its first output makes the tile live, then dive into the now
     /// full-size, content-bearing preview. Holds the session being opened.
     pending_dive_in: Option<SessionId>,
-    /// The in-flight fleet zoom, if any. Purely visual: the mode swap is instant,
-    /// so this never affects logical state or input — `view` just renders the
-    /// active scene under its camera until it completes.
+    /// The in-flight animation (a fleet dive or a session slide), if any. Purely
+    /// visual: the mode swap is instant, so this never affects logical state or
+    /// input — `view` just renders [`Anim::scene`] until it completes.
     anim: Option<Anim>,
-    /// The in-flight session slide (Ctrl-Tab / shell-exit switch), if any. Also
-    /// purely visual and mutually exclusive with [`anim`](Self::anim).
-    slide: Option<Slide>,
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
@@ -271,7 +303,6 @@ impl RootModel {
             pending_dive: None,
             pending_dive_in: None,
             anim: None,
-            slide: None,
             anim_ms: ANIM_MS,
         }
     }
@@ -291,7 +322,6 @@ impl RootModel {
             pending_dive: None,
             pending_dive_in: None,
             anim: None,
-            slide: None,
             anim_ms: ANIM_MS,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
@@ -330,20 +360,14 @@ impl RootModel {
 
     /// Whether a visual animation (a fleet zoom or a session slide) is playing.
     pub fn is_animating(&self) -> bool {
-        self.anim.is_some() || self.slide.is_some()
+        self.anim.is_some()
     }
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        // A playing slide owns the tick stream until it settles (the model swap
-        // already happened, so this is purely the visual hand-off).
-        if let UiEvent::Tick { now_ms } = &ev
-            && self.slide.is_some()
-        {
-            return self.tick_slide(*now_ms);
-        }
-        // While a zoom plays, the animation owns the tick stream (driving the
-        // camera at ~60fps); it hands one tick back to the fleet on completion so
-        // the periodic session refresh resumes.
+        // While an animation plays it owns the tick stream (driving the timeline at
+        // ~60fps); the model swap already happened, so this is purely the visual
+        // hand-off. On completion it hands one tick back so the periodic session
+        // refresh resumes.
         if let UiEvent::Tick { now_ms } = &ev
             && self.anim.is_some()
         {
@@ -418,9 +442,10 @@ impl RootModel {
             if scale > 0.0 {
                 self.scale = scale as f32;
             }
-            // A slide's frozen scenes are sized to the old window; drop it so the
-            // live view re-renders at the new size rather than sliding stale frames.
-            self.slide = None;
+            // An animation's frozen scenes are sized to the old window; drop it so
+            // the live view re-renders at the new size rather than animating stale
+            // frames (a slide would shear; a dive would zoom the wrong geometry).
+            self.anim = None;
             // Resize the foreground and every warm background mirror, so a
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
@@ -462,10 +487,10 @@ impl RootModel {
         let Some(camera) = f.dive_camera(framed) else {
             return vec![Cmd::Redraw];
         };
-        self.anim = Some(Anim::new(
+        self.anim = Some(Anim::dive(
+            f.view(),
             camera,
             Transform::IDENTITY,
-            Some(f.view()),
             self.anim_ms,
         ));
         vec![Cmd::ScheduleTick { after_ms: 0 }]
@@ -504,7 +529,6 @@ impl RootModel {
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
-        self.slide = None;
         // Opening a cold tile (a detached session we don't yet drive): size it to the
         // window and hold in the fleet until its first output makes the preview live,
         // then re-enter to dive into the now full-size, content-bearing tile. The shell
@@ -534,7 +558,7 @@ impl RootModel {
                 // freshly spawned session with no tile yet just opens, no dive).
                 anim = f
                     .dive_camera(&id)
-                    .map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view()), dur));
+                    .map(|to| Anim::dive(f.view(), Transform::IDENTITY, to, dur));
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
                 // The window's other driven sessions stay warm in the background.
@@ -593,7 +617,6 @@ impl RootModel {
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
-        self.slide = None;
 
         // Pick the next session in the same forward order Ctrl-Tab walks: the
         // first survivor sorted after the one that exited, wrapping to the first.
@@ -685,84 +708,28 @@ impl RootModel {
     /// from the right; backward, from the left.
     fn start_slide(&mut self, outgoing: Scene, incoming: Scene, forward: bool) -> Vec<Cmd> {
         let dir = if forward { 1.0 } else { -1.0 };
-        self.slide = Some(Slide::new(outgoing, incoming, dir, self.anim_ms));
+        self.anim = Some(Anim::slide(outgoing, incoming, dir, self.anim_ms));
         vec![Cmd::ScheduleTick { after_ms: 0 }]
     }
 
-    /// Advance the in-flight slide on a clock tick: repaint (and schedule the next
-    /// frame) while running; clear it on completion so the live view takes over.
-    fn tick_slide(&mut self, now_ms: u64) -> Vec<Cmd> {
-        let Some(slide) = self.slide.as_mut() else {
-            return Vec::new();
-        };
-        let done = slide.advance(now_ms);
-        let mut cmds = vec![Cmd::Redraw];
-        if done {
-            self.slide = None;
-        } else {
-            cmds.push(Cmd::ScheduleTick {
-                after_ms: ANIM_TICK_MS,
-            });
-        }
-        cmds
-    }
-
     pub fn view(&self) -> Scene {
-        // A slide owns the frame while it plays (mutually exclusive with a dive).
-        if let Some(slide) = &self.slide {
-            return slide.scene();
+        // An animation owns the frame while it plays — the composed timeline frame.
+        if let Some(anim) = &self.anim {
+            return anim.scene();
         }
 
         // A dive-out waiting on the session list: hold the camera framed on the
         // session we left (it keeps filling the window, as in the single view) until
         // the reply lands and the pull-back is launched. Chrome fully faded — we're
         // zoomed all the way in — matching the dive's zoomed-in end.
-        if self.anim.is_none()
-            && let Some(p) = &self.pending_dive
+        if let Some(p) = &self.pending_dive
             && let Mode::Fleet(f) = &self.mode
             && let Some(camera) = f.dive_camera(p)
         {
-            return Self::with_camera(f.view(), camera, 0.0);
+            return with_camera(f.view(), camera, 0.0);
         }
 
-        // During a dive-in the mode is already single, so render the frozen fleet
-        // snapshot the dive launched from; otherwise the live active view.
-        let scene = match &self.anim {
-            Some(Anim {
-                world: Some(world), ..
-            }) => world.clone(),
-            _ => match &self.mode {
-                Mode::Single(m) => m.view(),
-                Mode::Fleet(f) => f.view(),
-            },
-        };
-        // While zooming, render the whole world under the animation camera and fade
-        // the fleet chrome (everything but the terminal previews) toward the tile,
-        // so a card resolves into a clean terminal rather than a giant button bar.
-        match &self.anim {
-            Some(anim) => Self::with_camera(scene, anim.current, anim.chrome_alpha()),
-            None => scene,
-        }
-    }
-
-    /// Render a scene under a camera transform, fading the fleet chrome (everything
-    /// but terminal previews and badges) by `chrome` so a card resolves into a clean
-    /// terminal as the camera zooms in.
-    fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
-        for layer in &mut scene.layers {
-            layer.transform = camera;
-            if chrome < 1.0 {
-                for item in &mut layer.items {
-                    match item {
-                        SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
-                        SceneItem::Rect { color, .. }
-                        | SceneItem::Text { color, .. }
-                        | SceneItem::Border { color, .. } => color[3] *= chrome,
-                    }
-                }
-            }
-        }
-        scene
+        self.live_scene()
     }
 
     /// Combined render scale (device × zoom) of the active view, so the shell
@@ -798,7 +765,6 @@ impl RootModel {
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
-        self.slide = None;
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, mut cmds, anim) = match current {
@@ -833,7 +799,7 @@ impl RootModel {
                     .clone()
                     .or_else(|| f.focused().map(str::to_string));
                 let to = target.as_deref().and_then(|t| f.dive_camera(t));
-                let anim = to.map(|to| Anim::new(Transform::IDENTITY, to, Some(f.view()), dur));
+                let anim = to.map(|to| Anim::dive(f.view(), Transform::IDENTITY, to, dur));
                 let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
@@ -857,9 +823,9 @@ impl RootModel {
         cmds
     }
 
-    /// Advance the in-flight zoom on a clock tick: repaint (and schedule the next
-    /// frame) while running; on completion clear the animation and hand one tick
-    /// back to the fleet so its periodic session refresh resumes.
+    /// Advance the in-flight animation on a clock tick: repaint (and schedule the
+    /// next frame) while running; on completion clear it and, if we landed in the
+    /// fleet, hand one tick back so its periodic session refresh resumes.
     fn tick_anim(&mut self, now_ms: u64) -> Vec<Cmd> {
         let Some(anim) = self.anim.as_mut() else {
             return Vec::new();
@@ -2024,5 +1990,54 @@ mod tests {
         assert!(!r.is_fleet(), "still a live single view");
         assert_eq!(r.view().terminals().count(), 1);
         assert_eq!(foreground(&mut r), "alpha");
+    }
+
+    #[test]
+    fn a_slide_interpolates_the_two_sides_to_half_width_at_mid_progress() {
+        // The unified animation is a transform timeline: each side is a frozen scene
+        // carried by a from->to translate. At half (eased) progress the outgoing side
+        // has slid half a window-width toward the edge it's leaving and the incoming
+        // side sits half a width in from the edge it entered. This pins the actual
+        // interpolated geometry, not just that "two terminals are on screen".
+        let mut r = root();
+        with_three(&mut r); // foreground gamma; sorted alpha, beta, gamma
+        ctrl_tab(&mut r, false); // forward (gamma -> alpha): incoming arrives from the right
+
+        let w = SIZE.0 as f32;
+        // The first tick stamps the start (progress 0); a tick at half the duration
+        // lands exactly mid-timeline, since ease_in_out(0.5) == 0.5.
+        let base = 10_000u64;
+        r.update(UiEvent::Tick { now_ms: base });
+        r.update(UiEvent::Tick {
+            now_ms: base + ANIM_MS / 2,
+        });
+
+        let mut sides: Vec<(SceneId, f32)> = r
+            .view()
+            .layers
+            .iter()
+            .flat_map(|l| l.items.iter().map(move |it| (l.transform.tx, it)))
+            .filter_map(|(tx, it)| match it {
+                SceneItem::Terminal { id, .. } => Some((*id, tx)),
+                _ => None,
+            })
+            .collect();
+        sides.sort_by_key(|(id, _)| match id {
+            SceneId::Slide(n) => *n,
+            _ => u8::MAX,
+        });
+        assert_eq!(sides.len(), 2, "both sides are on screen mid-slide");
+        let (out_id, out_tx) = sides[0];
+        let (in_id, in_tx) = sides[1];
+        assert_eq!(out_id, SceneId::Slide(0), "side 0 is the outgoing session");
+        assert_eq!(in_id, SceneId::Slide(1), "side 1 is the incoming session");
+        assert!(
+            (out_tx + w / 2.0).abs() < 0.5,
+            "the outgoing side slid half a width left, got tx={out_tx}"
+        );
+        assert!(
+            (in_tx - w / 2.0).abs() < 0.5,
+            "the incoming side sits half a width in from the right, got tx={in_tx}"
+        );
     }
 }
