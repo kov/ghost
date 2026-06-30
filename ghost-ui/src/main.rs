@@ -314,8 +314,8 @@ fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) 
 }
 
 fn interactive() {
-    // Bench mode (`GHOST_BENCH=dive`) drives a scripted dive against this same real
-    // path with a synthetic session list, so the fleet opens with no host running.
+    // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
+    // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
     let initial_name = if harness.is_some() {
         None // open the fleet; the harness populates and dives it
@@ -414,9 +414,13 @@ impl Graphics {
         // Request a transparent window only when the theme is translucent, so an
         // opaque setup never pays the compositor's alpha-blending cost.
         let want_transparent = theme.bg_alpha < 1.0;
+        // Bench mode measures the render path at a realistic size, so open maximized
+        // (the small default grid would understate per-frame raster cost).
+        let maximized = std::env::var_os("GHOST_BENCH").is_some();
         let attrs = Window::default_attributes()
             .with_title("ghost")
             .with_inner_size(size)
+            .with_maximized(maximized)
             .with_transparent(want_transparent);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
@@ -591,8 +595,9 @@ struct App {
     initial_name: Option<String>,
     /// Per-process counter making spawned session names unique.
     next_session_seq: u64,
-    /// Frame-pacing bench harness (`GHOST_BENCH=dive`): scripts dives against the
-    /// real render path and synthesises the session list. `None` in normal use.
+    /// Frame-pacing bench harness (`GHOST_BENCH=dive`/`slide`): scripts animations
+    /// against the real render path and synthesises the session list. `None` in
+    /// normal use.
     bench: Option<bench::Harness>,
 }
 
@@ -801,10 +806,10 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
-    /// Advance the bench harness one turn: fire the next scripted dive when the last
-    /// has settled, or exit when the run is done. The single bench window's
-    /// `is_animating` gates the script (so a dive only starts once the prior one
-    /// finishes); dispatched F9 / tile-selects drive the real render+present path.
+    /// Advance the bench harness one turn: fire the next scripted animation when the
+    /// last has settled, or exit when the run is done. The single bench window's
+    /// `is_animating` gates the script (so one only starts once the prior finishes);
+    /// dispatched F9 / tile-selects / Ctrl-Tabs drive the real render+present path.
     fn drive_bench(&mut self, event_loop: &ActiveEventLoop) {
         let Some(wid) = self.windows.keys().next().copied() else {
             return;
@@ -1052,7 +1057,7 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        // Bench mode: populate the fleet and load every preview before any dive.
+        // Bench mode: populate the fleet and load every preview before any animation.
         if self.bench.is_some()
             && let Some(wid) = self.windows.keys().next().copied()
         {
@@ -1102,7 +1107,7 @@ impl ApplicationHandler for App {
             let now_ms = self.now_ms();
             self.dispatch(wid, UiEvent::Tick { now_ms }, event_loop);
         }
-        // Bench mode: advance the scripted dive (after ticks, so `is_animating`
+        // Bench mode: advance the scripted animation (after ticks, so `is_animating`
         // reflects this turn's animation state).
         if self.bench.is_some() {
             self.drive_bench(event_loop);

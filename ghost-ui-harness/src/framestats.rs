@@ -173,7 +173,7 @@ impl DiveSummary {
             0.0
         };
         format!(
-            "ghost frame-stats: dive {} frames | interval p50 {:.1} ({:.0} fps) p90 {:.1} \
+            "ghost frame-stats: anim {} frames | interval p50 {:.1} ({:.0} fps) p90 {:.1} \
              avg {:.1} worst {:.1} ms, {} dropped | cpu avg {:.2} worst {:.2} ms \
              ({} over {:.1} ms budget) | model {:.2}, build {:.2}, present {:.2} ms avg | {:.0} fps avg",
             self.frames,
