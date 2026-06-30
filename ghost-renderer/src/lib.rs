@@ -142,6 +142,44 @@ impl Gpu {
 
     /// Build a fresh headless device + queue on the software fallback adapter.
     fn request_headless() -> Self {
+        // `force_fallback_adapter` below picks the CPU-type adapter (lavapipe) for
+        // reproducible output — but the Vulkan loader only offers one if lavapipe is
+        // in the enumerated set, and a dev/CI shell that pins `VK_DRIVER_FILES` /
+        // `VK_ICD_FILENAMES` to a hardware driver (e.g. this VM's venus) hides it,
+        // making the request fail with NotFound. So pin the loader to ONLY the
+        // lavapipe ICD. Pinning (rather than just clearing the inherited pin to scan
+        // every ICD) is deliberate: scanning would also LOAD the venus driver, which
+        // registers a TLS destructor that segfaults at libtest worker-thread teardown
+        // (the venus-teardown bug) even though we render on lavapipe. Only the headless
+        // software path calls this — the windowed app requests its own surface-
+        // compatible adapter elsewhere and never comes through here.
+        //
+        // Done once under a `Once`: integration-test binaries build this crate without
+        // `#[cfg(test)]`, so they DON'T share `shared_test_gpu`'s device — every test
+        // thread calls this concurrently, and a bare env mutation from many threads is
+        // a data race that corrupts `environ` and segfaults.
+        static PIN_SOFTWARE_ICD: std::sync::Once = std::sync::Once::new();
+        PIN_SOFTWARE_ICD.call_once(|| {
+            // SAFETY: `call_once` runs this on exactly one thread with every other
+            // `request_headless` caller blocked until it returns, and before any of
+            // them create a Vulkan instance — these vars are read only by the Vulkan
+            // loader at `Instance::new`, which all callers reach only afterwards, so
+            // there is no concurrent read or write.
+            unsafe {
+                match find_lavapipe_icd() {
+                    Some(icd) => {
+                        std::env::set_var("VK_DRIVER_FILES", &icd);
+                        std::env::remove_var("VK_ICD_FILENAMES");
+                    }
+                    // No lavapipe manifest found: drop any hardware pin so the loader
+                    // at least scans the default ICD dirs for a fallback adapter.
+                    None => {
+                        std::env::remove_var("VK_DRIVER_FILES");
+                        std::env::remove_var("VK_ICD_FILENAMES");
+                    }
+                }
+            }
+        });
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(desc);
@@ -156,6 +194,45 @@ impl Gpu {
                 .expect("request device");
         Gpu { device, queue }
     }
+}
+
+/// Locate a lavapipe (llvmpipe) Vulkan ICD manifest so [`Gpu::request_headless`]
+/// can pin the loader to the software adapter regardless of an inherited hardware
+/// pin. Searches the dirs of any current `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` entry
+/// (the lavapipe manifest usually sits beside the hardware one) and the standard ICD
+/// dirs, for a `*.json` whose name mentions `lvp`/`lavapipe`. `None` if absent (e.g.
+/// no software driver installed), leaving the caller to fall back.
+fn find_lavapipe_icd() -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for var in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+        if let Ok(v) = std::env::var(var) {
+            for entry in v.split(':') {
+                if let Some(parent) = Path::new(entry).parent() {
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    dirs.push(PathBuf::from("/usr/share/vulkan/icd.d"));
+    dirs.push(PathBuf::from("/etc/vulkan/icd.d"));
+    for dir in dirs {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            if is_lavapipe_manifest(&entry.file_name().to_string_lossy()) {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+/// Whether an ICD manifest filename is lavapipe's (the software rasterizer). Mesa
+/// ships it as `lvp_icd.<arch>.json`; match `lvp`/`lavapipe` defensively.
+fn is_lavapipe_manifest(name: &str) -> bool {
+    name.ends_with(".json") && (name.contains("lvp") || name.contains("lavapipe"))
 }
 
 /// One process-wide headless device shared by the crate's unit tests (see
@@ -3878,6 +3955,19 @@ mod tests {
         assert_eq!(index_to_rgb(231), [0xff, 0xff, 0xff]); // cube white
         assert_eq!(index_to_rgb(232), [8, 8, 8]); // grayscale start
         assert_eq!(index_to_rgb(255), [238, 238, 238]); // grayscale end
+    }
+
+    #[test]
+    fn recognises_the_lavapipe_icd_manifest() {
+        // The headless device pins the loader to this manifest so it never loads a
+        // hardware driver (venus would segfault libtest teardown); the match must
+        // accept lavapipe and reject the others sitting in the same ICD dir.
+        assert!(is_lavapipe_manifest("lvp_icd.aarch64.json"));
+        assert!(is_lavapipe_manifest("lvp_icd.x86_64.json"));
+        assert!(is_lavapipe_manifest("lavapipe_icd.json"));
+        assert!(!is_lavapipe_manifest("virtio_icd.aarch64.json")); // venus
+        assert!(!is_lavapipe_manifest("radeon_icd.aarch64.json"));
+        assert!(!is_lavapipe_manifest("lvp_icd.json.bak")); // not a manifest
     }
 
     /// A full-window single-`Terminal` scene for `f`, at `w`×`h` px.
