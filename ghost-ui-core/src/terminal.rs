@@ -28,7 +28,7 @@ use crate::{
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
 const SCROLL_LINES: i64 = 3;
 
-/// User zoom (font-scale) bounds and step, matching ghost-gtk.
+/// User zoom (font-scale) bounds and step, inherited from the retired ghost-gtk frontend.
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
 const ZOOM_STEP: f32 = 0.1;
@@ -79,7 +79,7 @@ pub enum Shortcut {
 /// Classify a pressed key as a frontend shortcut, if it is one. The primary
 /// modifier is Cmd on macOS and Ctrl elsewhere; copy/paste keep the stricter
 /// Cmd / Ctrl+Shift combo so a bare Ctrl+C still sends SIGINT, while zoom uses
-/// plain Cmd/Ctrl + `+`/`=`/`-`/`0` (matching ghost-gtk's `<Primary>` accels).
+/// plain Cmd/Ctrl + `+`/`=`/`-`/`0` (carried over from ghost-gtk's `<Primary>` accels).
 pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
     // New session: Cmd+T on macOS, Alt+T elsewhere. Checked first because Alt+T is
     // not a "primary" (Cmd/Ctrl) chord, yet must still resolve here rather than be

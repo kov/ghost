@@ -3,9 +3,9 @@
 //! a persisted font zoom (`[zoom]`), and the background opacity (`[window]`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
-//! is pure and unit-tested. Scheme ids match ghost-gtk's so the two frontends can
-//! eventually share a config. Unknown sections/fields are ignored, so a file that
-//! also carries (not-yet-read) `[font]` settings still loads.
+//! is pure and unit-tested. Scheme ids are inherited from the retired ghost-gtk
+//! frontend (kept stable because they're persisted). Unknown sections/fields are
+//! ignored, so a file that also carries (not-yet-read) `[font]` settings still loads.
 
 use ghost_renderer::Theme;
 use serde::Deserialize;
@@ -18,8 +18,8 @@ struct Scheme {
     palette: [[u8; 3]; 16],
 }
 
-// Shared palettes, copied verbatim from ghost-gtk (frontends/ghost-gtk/src/
-// settings.rs) so a scheme renders identically in both frontends.
+// Palettes copied verbatim from the retired ghost-gtk frontend, so these schemes
+// render identically to how they did there.
 #[rustfmt::skip]
 const GNOME_PALETTE: [[u8; 3]; 16] = [
     [0x1e, 0x1e, 0x1e], [0xc0, 0x1c, 0x28], [0x26, 0xa2, 0x69], [0xa2, 0x73, 0x4c],
@@ -49,7 +49,7 @@ const LINUX_PALETTE: [[u8; 3]; 16] = [
     [0x55, 0x55, 0xff], [0xff, 0x55, 0xff], [0x55, 0xff, 0xff], [0xff, 0xff, 0xff],
 ];
 
-/// Built-in schemes, ids matching ghost-gtk. Keep ids stable: they're persisted.
+/// Built-in schemes; ids inherited from ghost-gtk. Keep ids stable: they're persisted.
 const SCHEMES: &[Scheme] = &[
     Scheme {
         id: "gnome-dark",
