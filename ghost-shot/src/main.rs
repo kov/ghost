@@ -1063,7 +1063,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
     }
 }
 
-const EDIT: &str = "\x1b[1;34m~/ghost/frontends/ghost-ui\x1b[0m\r\n\
+const EDIT: &str = "\x1b[1;34m~/ghost/ghost-ui\x1b[0m\r\n\
 \x1b[38;5;240m  1\x1b[0m \x1b[35mfn\x1b[0m \x1b[33mfleet_scene\x1b[0m() -> Scene {\r\n\
 \x1b[38;5;240m  2\x1b[0m     \x1b[35mlet\x1b[0m mine = [\x1b[32m\"edit\"\x1b[0m, \x1b[32m\"build\"\x1b[0m];\r\n\
 \x1b[38;5;240m  3\x1b[0m     \x1b[35mlet\x1b[0m (fleet, _) = FleetModel::adopting(..);\r\n\

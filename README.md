@@ -15,12 +15,33 @@ session is one terminal.
 
 ## Layout
 
-- **`vt/`** — a vendored fork of [avt] (asciinema's VT engine, package name kept
-  as `avt`), the low-level terminal emulator. Tracks authoritative screen state
-  and produces the resync/checkpoint dumps. Apache-2.0; see `vt/LICENSE`.
-- **`ghost-vt/`** — the main library: session lifecycle, PTY, transport,
-  recording, server and client. This is what a GUI terminal would depend on.
-- **`ghost-cli/`** — the reference CLI binary, `ghost`.
+One workspace. The headline product is the **`ghost`** binary — a windowed GPU
+terminal that also carries the CLI: a bare `ghost` opens the GUI, while
+`ghost <subcommand>` runs the CLI and exits.
+
+Backend:
+
+- **`ghost-term/`** — our owned terminal-emulation core, a hard fork of
+  asciinema's [avt]. Tracks authoritative screen state and produces the
+  resync/checkpoint dumps. Apache-2.0; see `ghost-term/LICENSE`.
+- **`ghost-vt/`** — the engine: session lifecycle, PTY, transport, recording,
+  server and client.
+- **`ghost-cli/`** — the `new`/`ls`/`attach`/`kill`/`rename`/`export`
+  subcommands, as a library folded into the `ghost` binary.
+- **`ghost-render/`** — pure, pixel-free terminal layout (grid → scene), shared
+  by the frontend and its tests.
+
+Frontend (winit + wgpu + swash):
+
+- **`ghost-ui/`** — the `ghost` binary: window, event loop, and CLI dispatch.
+- **`ghost-ui-core/`** — the Elm-style functional core (model → scene),
+  headlessly testable.
+- **`ghost-shaper/`** (swash) and **`ghost-renderer/`** (wgpu) — text shaping
+  and the GPU renderer.
+- **`ghost-ui-harness/`** drives the real frontend for tests and benches;
+  **`ghost-shot/`** renders scenes to PNG headlessly.
+- **`vendor/winit/`** — winit with a one-line Wayland snap-restore patch (see the
+  `[patch.crates-io]` in the root manifest); excluded from the workspace.
 
 [avt]: https://github.com/asciinema/avt
 
@@ -104,7 +125,7 @@ macOS (no `signalfd`/`kqueue` split).
 ```sh
 cargo test --workspace         # unit tests + binary-driven PTY E2E tests
 cargo fmt --all
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests follow a strict test-first workflow: every fix or feature starts with a
@@ -114,5 +135,6 @@ then the implementation brings it to green. A pre-commit hook runs `fmt` and
 
 ## License
 
-MIT OR Apache-2.0, except the vendored `vt/` engine, which is Apache-2.0
+MIT OR Apache-2.0, except `ghost-term/` (our avt fork) and the vendored
+`vendor/winit/`, which are Apache-2.0
 (see `vt/LICENSE`).

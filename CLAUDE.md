@@ -8,7 +8,9 @@ code.
 
 Every fix or feature starts with a **failing test**, then code to green. No
 exceptions without asking. Prefer driving the real `ghost` binary end-to-end
-(`ghost-cli/tests/`) over unit tests when the behaviour is observable there.
+(`ghost-ui/tests/`) over unit tests when the behaviour is observable there. The
+`ghost` binary is the GUI with the CLI subcommands folded in (`ghost-ui` crate +
+`ghost-cli` library), so its PTY E2E suite lives in the `ghost-ui` crate.
 
 E2E tests drive the binary over a PTY and assert on the **screen** (feed output
 into a `vt` emulator), never on raw bytes. Sync is read-until-predicate with a

@@ -13,7 +13,7 @@ The fleet overview (and anything that lists sessions) learns about sessions by
 - `Cmd::ListSessions` → `ghost_vt::session::list()` → `list_in()` reads
   `paths::runtime_dir()` and, per entry, stats marker files
   (`attached: path.join("attached").exists()`, `bell: …` in `session.rs`).
-- The fleet drives this on a timer (`frontends/ghost-ui/core/src/fleet.rs`,
+- The fleet drives this on a timer (`ghost-ui-core/src/fleet.rs`,
   `REFRESH_MS = 500`).
 
 Two problems:
@@ -149,4 +149,4 @@ timer), with a slow reconcile floor as a backstop.
 *Provenance: this consolidates the 2026-06-23 research-workflow verdict (formerly
 only in agent memory / the workflow transcript). The companion frontend backlog
 lives in the foundation-parity notes; window chrome is in
-`frontends/ghost-ui/docs/window-decorations.md`.*
+`ghost-ui/docs/window-decorations.md`.*
