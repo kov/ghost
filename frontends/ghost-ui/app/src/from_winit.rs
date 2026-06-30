@@ -171,3 +171,176 @@ fn named(n: WNamed) -> NamedKey {
         _ => NamedKey::Other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Covers the pure winit → core mappings. `alternates` is the one function not
+    //! tested here: it needs a real `winit::event::KeyEvent` (private, platform-
+    //! populated fields — `key_without_modifiers` is filled by the OS), which can't
+    //! be constructed in a unit test. Its downstream effect — the kitty
+    //! report-alternate-keys encoding — is covered by `ghost-ui-core`'s `encode`
+    //! tests; only the winit extraction is uncovered.
+    use super::{key, modifier_side, mods, named, us_layout_char};
+    use ghost_ui_core::input::{Key, Mods, NamedKey};
+    use winit::keyboard::{
+        Key as WKey, KeyCode, ModifiersState, NamedKey as WNamed, NativeKey, NativeKeyCode,
+        PhysicalKey,
+    };
+
+    fn code(c: KeyCode) -> PhysicalKey {
+        PhysicalKey::Code(c)
+    }
+
+    #[test]
+    fn mods_maps_each_modifier_independently() {
+        assert_eq!(mods(ModifiersState::empty()), Mods::default());
+        assert_eq!(
+            mods(ModifiersState::SHIFT),
+            Mods {
+                shift: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            mods(ModifiersState::CONTROL),
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            mods(ModifiersState::ALT),
+            Mods {
+                alt: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            mods(ModifiersState::SUPER),
+            Mods {
+                sup: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn mods_combines_all() {
+        let all = ModifiersState::SHIFT
+            | ModifiersState::CONTROL
+            | ModifiersState::ALT
+            | ModifiersState::SUPER;
+        assert_eq!(
+            mods(all),
+            Mods {
+                shift: true,
+                ctrl: true,
+                alt: true,
+                sup: true,
+            }
+        );
+    }
+
+    #[test]
+    fn key_maps_named_character_dead_and_unidentified() {
+        let p = code(KeyCode::KeyA); // physical is irrelevant for non-modifier keys
+        assert_eq!(
+            key(&WKey::Named(WNamed::Enter), p),
+            Key::Named(NamedKey::Enter)
+        );
+        assert_eq!(key(&WKey::Named(WNamed::F9), p), Key::Named(NamedKey::F9));
+        // A logical character arrives shift/layout-resolved (the glyph, not the base).
+        assert_eq!(key(&WKey::Character("a".into()), p), Key::Char("a".into()));
+        assert_eq!(key(&WKey::Character("(".into()), p), Key::Char("(".into()));
+        assert_eq!(key(&WKey::Dead(Some('\u{0301}')), p), Key::Dead);
+        assert_eq!(key(&WKey::Dead(None), p), Key::Dead);
+        assert_eq!(
+            key(&WKey::Unidentified(NativeKey::Unidentified), p),
+            Key::Unidentified
+        );
+    }
+
+    #[test]
+    fn key_resolves_modifier_side_from_the_physical_key() {
+        // The logical key carries no side; `key` reads it from the physical position.
+        assert_eq!(
+            key(&WKey::Named(WNamed::Shift), code(KeyCode::ShiftLeft)),
+            Key::Named(NamedKey::ShiftLeft)
+        );
+        assert_eq!(
+            key(&WKey::Named(WNamed::Shift), code(KeyCode::ShiftRight)),
+            Key::Named(NamedKey::ShiftRight)
+        );
+        assert_eq!(
+            key(&WKey::Named(WNamed::Control), code(KeyCode::ControlRight)),
+            Key::Named(NamedKey::ControlRight)
+        );
+    }
+
+    #[test]
+    fn modifier_side_picks_left_or_right_per_physical_key() {
+        let cases = [
+            (WNamed::Shift, KeyCode::ShiftLeft, NamedKey::ShiftLeft),
+            (WNamed::Shift, KeyCode::ShiftRight, NamedKey::ShiftRight),
+            (WNamed::Control, KeyCode::ControlLeft, NamedKey::ControlLeft),
+            (
+                WNamed::Control,
+                KeyCode::ControlRight,
+                NamedKey::ControlRight,
+            ),
+            (WNamed::Alt, KeyCode::AltLeft, NamedKey::AltLeft),
+            (WNamed::Alt, KeyCode::AltRight, NamedKey::AltRight),
+            (WNamed::Super, KeyCode::SuperLeft, NamedKey::SuperLeft),
+            (WNamed::Super, KeyCode::SuperRight, NamedKey::SuperRight),
+        ];
+        for (m, phys, want) in cases {
+            assert_eq!(modifier_side(code(phys), m), want, "{m:?} at {phys:?}");
+        }
+    }
+
+    #[test]
+    fn modifier_side_defaults_to_left_when_position_unknown() {
+        // A modifier whose physical key isn't a known L/R code falls back to left.
+        assert_eq!(
+            modifier_side(code(KeyCode::KeyA), WNamed::Shift),
+            NamedKey::ShiftLeft
+        );
+        assert_eq!(
+            modifier_side(
+                PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                WNamed::Alt
+            ),
+            NamedKey::AltLeft
+        );
+    }
+
+    #[test]
+    fn named_maps_known_keys_and_falls_back_to_other() {
+        assert_eq!(named(WNamed::Enter), NamedKey::Enter);
+        assert_eq!(named(WNamed::Tab), NamedKey::Tab);
+        assert_eq!(named(WNamed::Escape), NamedKey::Escape);
+        assert_eq!(named(WNamed::ArrowLeft), NamedKey::ArrowLeft);
+        assert_eq!(named(WNamed::Delete), NamedKey::Delete);
+        assert_eq!(named(WNamed::PageDown), NamedKey::PageDown);
+        assert_eq!(named(WNamed::F1), NamedKey::F1);
+        assert_eq!(named(WNamed::F12), NamedKey::F12);
+        // Anything ghost doesn't special-case collapses to `Other`.
+        assert_eq!(named(WNamed::CapsLock), NamedKey::Other);
+    }
+
+    #[test]
+    fn us_layout_char_covers_printable_keys_only() {
+        assert_eq!(us_layout_char(code(KeyCode::KeyA)), Some('a'));
+        assert_eq!(us_layout_char(code(KeyCode::KeyZ)), Some('z'));
+        assert_eq!(us_layout_char(code(KeyCode::Digit1)), Some('1'));
+        assert_eq!(us_layout_char(code(KeyCode::Backquote)), Some('`'));
+        assert_eq!(us_layout_char(code(KeyCode::Slash)), Some('/'));
+        assert_eq!(us_layout_char(code(KeyCode::Backslash)), Some('\\'));
+        // Non-printable physical keys, and non-`Code` positions, have no layout char.
+        assert_eq!(us_layout_char(code(KeyCode::Enter)), None);
+        assert_eq!(
+            us_layout_char(PhysicalKey::Unidentified(NativeKeyCode::Unidentified)),
+            None
+        );
+    }
+}
