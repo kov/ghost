@@ -5,9 +5,16 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
 
 fn ghost(xdg: &Path) -> Command {
     let mut c = Command::new(GHOST);
@@ -77,5 +84,43 @@ fn ls_reports_the_session_title() {
         wait_until(Duration::from_secs(5), || ls(xdg).contains("MY-TITLE")),
         "`ghost ls` never reported the session title; got: {:?}",
         ls(xdg)
+    );
+}
+
+#[test]
+fn created_at_is_recorded_in_milliseconds() {
+    // Creation time is the fleet's spatial sort key. At one-second resolution
+    // sessions spawned in the same second tie and fall back to the name tiebreak;
+    // millisecond resolution gives them their true chronological order. Pin the
+    // unit so it can't silently regress to seconds: a millisecond stamp is ~1000×
+    // a second stamp, so "now" in ms is far larger than any plausible seconds value.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "ms-stamp";
+    let _guard = KillOnDrop { xdg, name };
+
+    let before = now_millis();
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let meta_path = xdg.join("run").join("ghost").join(name).join("meta");
+    assert!(
+        wait_until(Duration::from_secs(5), || meta_path.exists()),
+        "session meta never appeared"
+    );
+    let meta = ghost_vt::meta::read(&meta_path).expect("read meta");
+    let after = now_millis();
+    assert!(
+        (before..=after).contains(&meta.created_at),
+        "created_at {} is not a millisecond stamp in [{before}, {after}] — \
+         a seconds stamp would be ~1000× smaller",
+        meta.created_at
     );
 }

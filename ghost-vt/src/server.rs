@@ -354,9 +354,12 @@ fn host_main(
     // Descriptive metadata for discovery (the GUI sidebar). Created time and
     // command are fixed; the title is refreshed below whenever it changes.
     let mut meta = crate::meta::Meta {
+        // Milliseconds, not seconds: this is the fleet's spatial sort key, so
+        // sub-second resolution keeps sessions spawned in the same second in their
+        // true creation order rather than tie-breaking by name.
         created_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0),
         command: opts.command.clone(),
         title: String::new(),

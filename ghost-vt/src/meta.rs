@@ -13,7 +13,8 @@ use std::path::Path;
 /// Descriptive metadata for one session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
-    /// Unix seconds at which the session was created.
+    /// Unix milliseconds at which the session was created. The fleet's spatial
+    /// sort key, so the resolution is sub-second to order same-second sessions.
     pub created_at: i64,
     /// The command the session runs (empty means the user's `$SHELL`).
     pub command: Vec<String>,
@@ -44,7 +45,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("meta");
         let meta = Meta {
-            created_at: 1_700_000_000,
+            created_at: 1_700_000_000_000,
             command: vec!["vim".into(), "main.rs".into()],
             title: "vim · main.rs".into(),
         };

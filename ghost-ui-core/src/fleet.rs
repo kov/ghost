@@ -144,11 +144,17 @@ fn locality_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Locality
 /// grouping feature lands, within its group (the comparator is hierarchy-ready:
 /// section/group first, then this key). Oldest session first by creation time so
 /// a session keeps its slot for life and new ones land at the end; a tile with no
-/// recorded creation time sorts last (newest) until reconcile fills it in. The
-/// monotonic `handle` breaks ties (and stands in for missing times), so order is
-/// decoupled from how the host enumerated sessions and never reshuffles.
-fn tile_order_key(t: &Tile) -> (i64, u64) {
-    (t.created_at.unwrap_or(i64::MAX), t.handle)
+/// recorded creation time sorts last (newest) until reconcile fills it in.
+///
+/// The tie-break is the session name, not the tile's `handle`: `created_at` is
+/// millisecond-resolution but sessions spawned in the same millisecond (rapid
+/// scripted launches) still tie, and `handle` is assigned in `SessionList`
+/// enumeration order — which varies (directory-read order) and resets every time a
+/// fresh fleet is built (each F9 / dive-back). A handle tie-break therefore lets
+/// tied tiles swap slots between rebuilds; the globally-unique, stable name never
+/// does.
+fn tile_order_key(t: &Tile) -> (i64, &str) {
+    (t.created_at.unwrap_or(i64::MAX), t.id.as_str())
 }
 
 struct Tile {
@@ -726,7 +732,8 @@ impl FleetModel {
             let mut ts: Vec<&Tile> = self.tiles.iter().filter(|t| t.locality == loc).collect();
             // Stable spatial order within the section: a session keeps its slot
             // for life regardless of enumeration order (see [`tile_order_key`]).
-            ts.sort_by_key(|t| tile_order_key(t));
+            // `sort_by` (not `sort_by_key`) since the key borrows the tile's name.
+            ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
             (loc, ts)
         })
         .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
@@ -1583,6 +1590,40 @@ mod tests {
             info_at("c", 30),
         ]));
         assert_eq!(order(&m), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn tied_creation_times_break_the_tie_by_name_not_enumeration() {
+        // Sessions spawned in the same millisecond tie on `created_at`. The
+        // tiebreak must be deterministic — the session name — so the grid order is
+        // identical however the host happened to enumerate them. Every F9 /
+        // dive-back builds a *fresh* fleet, so a tiebreak that depends on
+        // enumeration (or a per-fleet handle assigned in enumeration order) lets
+        // the tied tiles swap slots between rebuilds.
+        //
+        // Mirrors the real report: four sessions where the middle two share a
+        // creation instant. The first and last (distinct times) stay put; the tied
+        // pair must not swap.
+        let build = |enumerated: &[(&str, i64)]| {
+            let mut m = fleet();
+            m.update(UiEvent::SessionList(
+                enumerated.iter().map(|(n, t)| info_at(n, *t)).collect(),
+            ));
+            order(&m)
+        };
+        let want = vec!["s1", "s2", "s3", "s4"];
+        // s2 and s3 share creation second 200; enumerated in creation order...
+        assert_eq!(
+            build(&[("s1", 100), ("s2", 200), ("s3", 200), ("s4", 300)]),
+            want
+        );
+        // ...and scrambled, as a different directory-read order would deliver them:
+        // the name tiebreak keeps s2 before s3 either way.
+        assert_eq!(
+            build(&[("s4", 300), ("s3", 200), ("s2", 200), ("s1", 100)]),
+            want,
+            "tied tiles must order by name, not by how the host listed them"
+        );
     }
 
     #[test]
