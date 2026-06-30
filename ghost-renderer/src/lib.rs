@@ -15,8 +15,8 @@ pub mod target;
 pub use target::{SurfaceTarget, Target};
 
 use ghost_render::{
-    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneId, SceneItem,
-    Selection, Style, Transform,
+    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
+    Style, Transform,
 };
 use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -646,11 +646,11 @@ enum Draw {
         scissor: [u32; 4],
         range: std::ops::Range<u32>,
     },
-    /// Blit cached preview `id`'s texture (quad `quad` of the preview buffer).
+    /// Blit cached preview texture for `session` (quad `quad` of the preview buffer).
     Preview {
         scissor: [u32; 4],
         quad: u32,
-        id: SceneId,
+        session: u64,
     },
 }
 
@@ -1199,8 +1199,11 @@ pub struct Renderer {
     /// Blit pipeline for cached preview textures — like `image_pipeline` but with
     /// the passthrough `fs_blit` (the texture is already premultiplied).
     preview_pipeline: wgpu::RenderPipeline,
-    /// Cached preview textures by tile id (see [`CachedPreview`]).
-    preview_cache: HashMap<SceneId, CachedPreview>,
+    /// Cached preview textures by [`session_key`] (see [`CachedPreview`]). Keying by
+    /// session — not the ephemeral [`SceneId`] role/handle — means a session's texture
+    /// follows it across roles and fleet rebuilds, so a role change re-rasterizes
+    /// nothing.
+    preview_cache: HashMap<u64, CachedPreview>,
     /// One blit quad per preview drawn this scene, parallel to the `Draw::Preview`
     /// quad indices.
     preview_instances: Option<wgpu::Buffer>,
@@ -1211,6 +1214,12 @@ pub struct Renderer {
     /// preview instead of re-rasterizing it. A test asserts a slide after a steady
     /// view reuses the on-screen pixels rather than rebuilding them.
     backbuffer_adoptions: u32,
+    /// The session whose complete full-window frame the backbuffer currently holds
+    /// (when [`Self::backbuffer_valid`]). The outgoing side of a slide is exactly that
+    /// session, so matching a terminal's `session` against this is how the outgoing
+    /// side claims the on-screen pixels — without the renderer knowing anything about
+    /// "slides". `None` until a steady single view has been presented.
+    backbuffer_session: Option<u64>,
     /// Uploaded image bind groups, keyed by image id; the blob is sent once and
     /// the bind group (which owns its texture) lives until eviction.
     image_bind_groups: HashMap<u32, wgpu::BindGroup>,
@@ -1506,6 +1515,7 @@ impl Renderer {
             preview_instances: None,
             preview_renders: 0,
             backbuffer_adoptions: 0,
+            backbuffer_session: None,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
             image_instances: None,
@@ -1726,7 +1736,7 @@ impl Renderer {
     /// that keeps fleet navigation cheap on a software rasterizer.
     fn ensure_preview(
         &mut self,
-        id: SceneId,
+        session: u64,
         frame: &Frame,
         rect: RectPx,
         font: FontRef,
@@ -1735,21 +1745,21 @@ impl Renderer {
         let size = Self::preview_size(frame, rect);
         if self
             .preview_cache
-            .get(&id)
+            .get(&session)
             .is_some_and(|c| c.size == size && c.frame == *frame)
         {
             return; // cache hit: blit the existing texture
         }
         let preview = self.render_preview_texture(frame, rect, font, size_px);
         self.preview_renders += 1;
-        self.preview_cache.insert(id, preview);
+        self.preview_cache.insert(session, preview);
     }
 
-    /// Adopt the steady-view backbuffer as preview `id`'s texture, if it holds a
-    /// complete `sw`×`sh` full-window frame — which it does whenever a slide follows a
-    /// steady single view, since the backbuffer is literally what was last on screen,
-    /// i.e. the outgoing session. Reuses those pixels instead of re-rasterizing the
-    /// outgoing side; the subsequent [`ensure_preview`](Self::ensure_preview) then hits
+    /// Adopt the steady-view backbuffer as `session`'s preview texture, if it holds a
+    /// complete `sw`×`sh` full-window frame. The caller only invokes this for the
+    /// session the backbuffer holds (the outgoing side of a slide is exactly the
+    /// session that was last on screen), so the pixels are reused instead of being
+    /// re-rasterized; the subsequent [`ensure_preview`](Self::ensure_preview) then hits
     /// this entry. No-op (so the caller rasters normally) if there's already a cached
     /// texture, the backbuffer is invalid, or its size doesn't match.
     ///
@@ -1761,13 +1771,13 @@ impl Renderer {
     /// so it was about to go stale regardless.
     fn adopt_backbuffer_as_preview(
         &mut self,
-        id: SceneId,
+        session: u64,
         frame: &Frame,
         src: RectPx,
         sw: u32,
         sh: u32,
     ) {
-        if self.preview_cache.contains_key(&id) || !self.backbuffer_valid {
+        if self.preview_cache.contains_key(&session) || !self.backbuffer_valid {
             return;
         }
         let bb = match self.backbuffer.take() {
@@ -1778,7 +1788,7 @@ impl Renderer {
             }
         };
         self.preview_cache.insert(
-            id,
+            session,
             CachedPreview {
                 _texture: bb.texture,
                 bind_group: bb.bind_group,
@@ -2458,12 +2468,19 @@ impl Renderer {
         let single_eligible = scene.layers.len() == 1
             && scene.layers[0].items.len() == 1
             && scene.layers[0].transform == Transform::IDENTITY;
+        // A scene that shows more than one terminal at once is mid-animation (a slide
+        // composites two sides, a future split shows several): every terminal in it is
+        // texture-backed even on a frame its own transform is momentarily identity, so
+        // it composites smoothly rather than popping between an inline and a blitted
+        // render. A lone terminal stays on the cheap inline path unless it's shrunk or
+        // its layer is moving.
+        let multi_terminal = scene.terminals().take(2).count() > 1;
         let mut single_ri: Option<RowIndex> = None;
         let mut all: Vec<Instance> = Vec::new();
         let mut draws: Vec<Draw> = Vec::new();
         let mut images: Vec<ImageDraw> = Vec::new();
         let mut blits: Vec<RectPx> = Vec::new();
-        let mut seen: HashSet<SceneId> = HashSet::new();
+        let mut seen: HashSet<u64> = HashSet::new();
         let mut order: Vec<&Layer> = scene.layers.iter().collect();
         order.sort_by_key(|l| l.z); // stable: keeps insertion order within a z
 
@@ -2504,7 +2521,7 @@ impl Renderer {
                 }
                 match item {
                     SceneItem::Terminal {
-                        id,
+                        session,
                         rect,
                         frame,
                         selection,
@@ -2520,15 +2537,15 @@ impl Renderer {
                         // transform, preview_scale == 1.0) still builds glyphs inline,
                         // keeping its damaged-band fast path.
                         //
-                        // A slide side is always texture-backed, even on the frame its
-                        // transform is momentarily identity (p = 0 or p = 1): otherwise
-                        // it would render inline-crisp that one frame and switch to a
-                        // blit the next — a visible pop — and would raster twice. Keying
-                        // off the id (not the transform) also lets the outgoing side
-                        // adopt the backbuffer below before it has moved.
+                        // A mid-animation terminal (multi_terminal) is always
+                        // texture-backed, even on the frame its own transform is
+                        // momentarily identity (a slide side at p = 0 or p = 1):
+                        // otherwise it would render inline-crisp that one frame and
+                        // switch to a blit the next — a visible pop — and would raster
+                        // twice. It also lets the outgoing side adopt the backbuffer
+                        // below before it has moved.
                         let animated = layer.transform != Transform::IDENTITY;
-                        let is_slide = matches!(id, SceneId::Slide(_));
-                        if preview_scale(frame, *rect) < 1.0 || animated || is_slide {
+                        if preview_scale(frame, *rect) < 1.0 || animated || multi_terminal {
                             // Preview: blit a cached texture (re-rendered only when
                             // its content or size changes) instead of re-rasterizing
                             // the glyphs every frame. Selection isn't shown in the
@@ -2539,20 +2556,22 @@ impl Renderer {
                             // every frame. The blit (below) carries the transform, so
                             // the terminal still moves/zooms; the texture stays put.
                             let src = preview_source_rect(frame, *rect);
-                            // The outgoing slide side is exactly what was last on screen
-                            // full-window — and the backbuffer still holds those pixels.
-                            // Adopt them as its texture (no raster); `ensure_preview`
-                            // then hits the adopted entry. Only the incoming side, new
-                            // content, actually rasters.
-                            if matches!(id, SceneId::Slide(0)) {
-                                self.adopt_backbuffer_as_preview(*id, frame, src, sw, sh);
+                            // When this terminal IS the session the backbuffer holds (the
+                            // outgoing side of a slide is exactly what was last on screen
+                            // full-window), adopt those pixels as its texture instead of
+                            // re-rasterizing them; `ensure_preview` then hits the adopted
+                            // entry. Scoped to a multi-terminal scene so a lone shrinking
+                            // tile (a dive-out) still rasters at native preview size
+                            // rather than adopting a full-window texture to downscale.
+                            if multi_terminal && self.backbuffer_session == Some(*session) {
+                                self.adopt_backbuffer_as_preview(*session, frame, src, sw, sh);
                             }
-                            self.ensure_preview(*id, frame, src, font, size_px);
-                            seen.insert(*id);
+                            self.ensure_preview(*session, frame, src, font, size_px);
+                            seen.insert(*session);
                             draws.push(Draw::Preview {
                                 scissor,
                                 quad: blits.len() as u32,
-                                id: *id,
+                                session: *session,
                             });
                             blits.push(*rect);
                             if *dim {
@@ -2634,8 +2653,9 @@ impl Renderer {
                 &mut images[img0..],
             );
         }
-        // Drop textures for tiles no longer on screen, bounding cache memory.
-        self.preview_cache.retain(|id, _| seen.contains(id));
+        // Drop textures for sessions no longer on screen, bounding cache memory.
+        self.preview_cache
+            .retain(|session, _| seen.contains(session));
         self.single_row_index = single_ri;
         (all, draws, images, blits)
     }
@@ -2784,12 +2804,16 @@ impl Renderer {
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
                         pass.draw(0..6, range.clone());
                     }
-                    Draw::Preview { scissor, quad, id } => {
+                    Draw::Preview {
+                        scissor,
+                        quad,
+                        session,
+                    } => {
                         if scissor[2] == 0 || scissor[3] == 0 {
                             continue;
                         }
                         let (Some(buf), Some(cached)) =
-                            (&self.preview_instances, self.preview_cache.get(id))
+                            (&self.preview_instances, self.preview_cache.get(session))
                         else {
                             continue; // texture evicted/missing: skip rather than err
                         };
@@ -2862,13 +2886,17 @@ impl Renderer {
                         pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
                         pass.draw(0..6, range.clone());
                     }
-                    Draw::Preview { scissor, quad, id } => {
+                    Draw::Preview {
+                        scissor,
+                        quad,
+                        session,
+                    } => {
                         let sc = intersect_scissor(*scissor, band);
                         if sc[2] == 0 || sc[3] == 0 {
                             continue;
                         }
                         let (Some(buf), Some(cached)) =
-                            (&self.preview_instances, self.preview_cache.get(id))
+                            (&self.preview_instances, self.preview_cache.get(session))
                         else {
                             continue;
                         };
@@ -3252,6 +3280,14 @@ impl Renderer {
         self.gpu.queue.submit([cb]);
         self.backbuffer = Some(bb);
         self.backbuffer_valid = true;
+        // Record whose frame the backbuffer now holds, so the next scene's matching
+        // terminal (a slide's outgoing side) can adopt these pixels rather than
+        // re-rasterizing them. The banded path only ever runs for a steady single view,
+        // so there is exactly one terminal to read.
+        self.backbuffer_session = match scene.terminals().next() {
+            Some(SceneItem::Terminal { session, .. }) => Some(*session),
+            _ => None,
+        };
     }
 
     /// Redraw just `band` into the backbuffer view, building + uploading ONLY the
@@ -3724,7 +3760,9 @@ mod tests {
         // terminal mid-dive/slide) renders through the texture-cache PREVIEW path. That
         // path must paint the SAME content the inline path does — including kitty
         // images — otherwise images blink out the moment a session becomes a tile or
-        // animates. Force the preview path with a `Slide` id at full-window size, so the
+        // animates. Route the image session through the preview path by adding a second,
+        // fully off-screen terminal (which makes the scene "animating" — multi-terminal,
+        // exactly as a slide is); the image session stays full-window at identity so the
         // blit is 1:1 and the image lands at the same cells as the inline render.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let mut v = Vt::new(20, 4);
@@ -3741,24 +3779,28 @@ mod tests {
         r.upload_image(7, img.width, img.height, &img.pixels);
 
         let (w, h) = Renderer::frame_size(&f);
+        let full = |x: f32, session| SceneItem::Terminal {
+            id: SceneId::Root,
+            session,
+            rect: RectPx {
+                x,
+                y: 0.0,
+                w: w as f32,
+                h: h as f32,
+            },
+            frame: f.clone(),
+            selection: None,
+            dim: false,
+        };
         let scene = Scene {
             size_px: (w, h),
-            layers: vec![Layer::new(
-                0,
-                vec![SceneItem::Terminal {
-                    id: SceneId::Slide(0), // routes through render_preview_texture
-                    session: 0,
-                    rect: RectPx {
-                        x: 0.0,
-                        y: 0.0,
-                        w: w as f32,
-                        h: h as f32,
-                    },
-                    frame: f.clone(),
-                    selection: None,
-                    dim: false,
-                }],
-            )],
+            layers: vec![
+                // The image session, full-window at the origin (preview path, 1:1).
+                Layer::new(0, vec![full(0.0, session_key("image"))]),
+                // A second terminal shoved entirely off the right edge (culled), present
+                // only so the scene is multi-terminal and the first routes via a texture.
+                Layer::new(0, vec![full(w as f32, session_key("offscreen"))]),
+            ],
         };
         let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
 
@@ -4173,8 +4215,9 @@ mod tests {
     }
 
     /// A two-terminal slide scene as the model composes it: the outgoing terminal
-    /// (`Slide(0)`) translated by `out_dx`, the incoming (`Slide(1)`) by `in_dx`,
-    /// both full-window, each in its own translated layer.
+    /// translated by `out_dx`, the incoming by `in_dx`, both full-window, each in its
+    /// own translated layer. Both carry the single view's `SceneId::Root` (as
+    /// `live_scene` produces) and are told apart only by their distinct sessions.
     fn slide_scene(out: Frame, inc: Frame, out_dx: f32, in_dx: f32, w: u32, h: u32) -> Scene {
         let side = |id, session, f: Frame, dx: f32| {
             Layer::new(
@@ -4202,10 +4245,63 @@ mod tests {
         Scene {
             size_px: (w, h),
             layers: vec![
-                side(SceneId::Slide(0), session_key("single"), out, out_dx),
-                side(SceneId::Slide(1), session_key("incoming"), inc, in_dx),
+                side(SceneId::Root, session_key("single"), out, out_dx),
+                side(SceneId::Root, session_key("incoming"), inc, in_dx),
             ],
         }
+    }
+
+    #[test]
+    fn a_sessions_preview_texture_follows_it_across_a_scene_id_change() {
+        // The renderer caches a terminal's rendered texture by its SESSION, not by
+        // the item's SceneId. A fleet rebuild reassigns tile handles (Tile(n)) every
+        // time, and a session moves between roles (a tile, a slide side, the root); so
+        // keying by session is what lets the texture follow the session across any of
+        // those — a rebuild or role change must re-rasterize nothing.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let f = frame(cols, rows, "a session shown as a tile");
+        // A quarter-size tile (preview_scale < 1) so the texture-cache preview path is
+        // taken; the same session under a different tile handle each render.
+        let rect = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: w as f32 / 4.0,
+            h: h as f32 / 4.0,
+        };
+        let sess = session_key("the-session");
+        let tile = |id| Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id,
+                    session: sess,
+                    rect,
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            )],
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let _ = r.render_offscreen_scene(&tile(SceneId::Tile(1)), font, SIZE_PX);
+        assert_eq!(
+            r.preview_renders(),
+            1,
+            "the first paint rasters the preview"
+        );
+
+        // Re-render the SAME session under a DIFFERENT SceneId, as a fleet rebuild
+        // (which reassigns the handle) would. Keyed by session, the texture is reused.
+        let _ = r.render_offscreen_scene(&tile(SceneId::Tile(7)), font, SIZE_PX);
+        assert_eq!(
+            r.preview_renders(),
+            1,
+            "the texture follows the session across the id change — no re-raster"
+        );
     }
 
     #[test]
@@ -4243,8 +4339,9 @@ mod tests {
     fn a_slide_after_a_steady_view_reuses_the_backbuffer_for_the_outgoing_side() {
         // The outgoing session is exactly what was just on screen, and the backbuffer
         // still holds those pixels. A slide that follows a steady single view must
-        // REUSE the backbuffer for the outgoing side (Slide(0)) instead of
-        // re-rasterizing it; only the incoming side, genuinely new content, rasters.
+        // REUSE the backbuffer for the outgoing side (the session the backbuffer holds)
+        // instead of re-rasterizing it; only the incoming side, genuinely new content,
+        // rasters.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let (cols, rows) = (40usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);

@@ -14,8 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{
-    CellMetrics, Cmd, FleetModel, Scene, SceneId, SceneItem, SessionId, TerminalModel, Transform,
-    UiEvent,
+    CellMetrics, Cmd, FleetModel, Scene, SceneItem, SessionId, TerminalModel, Transform, UiEvent,
 };
 
 enum Mode {
@@ -92,14 +91,12 @@ impl Anim {
 
     /// A horizontal slide between two single-view sessions: the outgoing leaves one
     /// edge (`+1` dir → incoming arrives from the right, the "next" direction) as the
-    /// incoming arrives from the other. Both scenes are re-ided to distinct slide ids
-    /// so the renderer caches each side's texture independently (the single view's lone
-    /// terminal is [`SceneId::Root`] for both, which would otherwise collide).
-    fn slide(mut outgoing: Scene, mut incoming: Scene, dir: f32, dur_ms: u64) -> Self {
+    /// incoming arrives from the other. Both sides are full-window [`SceneId::Root`]
+    /// terminals, but they carry distinct sessions, so the renderer caches each side's
+    /// texture independently (keyed by session, not role).
+    fn slide(outgoing: Scene, incoming: Scene, dir: f32, dur_ms: u64) -> Self {
         let size_px = outgoing.size_px;
         let w = size_px.0 as f32;
-        reid_terminals(&mut outgoing, SceneId::Slide(0));
-        reid_terminals(&mut incoming, SceneId::Slide(1));
         let translate = |tx| Transform {
             scale: 1.0,
             tx,
@@ -207,20 +204,6 @@ fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
         }
     }
     scene
-}
-
-/// Stamp every terminal in `scene` with `id` so a composited copy caches separately
-/// from the original. The renderer keys a terminal's rastered texture by its
-/// [`SceneId`]; a slide's two single-view sides are both [`SceneId::Root`] otherwise
-/// and would evict each other.
-fn reid_terminals(scene: &mut Scene, id: SceneId) {
-    for layer in &mut scene.layers {
-        for item in &mut layer.items {
-            if let SceneItem::Terminal { id: tid, .. } = item {
-                *tid = id;
-            }
-        }
-    }
 }
 
 pub struct RootModel {
@@ -1954,19 +1937,30 @@ mod tests {
     }
 
     #[test]
-    fn slide_terminals_carry_distinct_ids_so_the_texture_cache_wont_collide() {
-        // The renderer caches each terminal's rastered texture by SceneId; if the
-        // two sliding terminals shared an id they'd evict each other every frame
-        // (defeating the render-once-composite-many win). They must be distinct.
+    fn slide_terminals_carry_distinct_sessions_so_the_texture_cache_wont_collide() {
+        // The renderer caches each terminal's rastered texture by SESSION. Both sliding
+        // terminals are SceneId::Root (the single view's id), so if they didn't carry
+        // distinct sessions they'd evict each other every frame (defeating the
+        // render-once-composite-many win). Their sessions must differ.
         let mut r = root();
         with_three(&mut r);
         ctrl_tab(&mut r, false);
         let scene = r.view();
-        let ids: Vec<_> = scene.terminals().map(|t| t.id()).collect();
-        assert_eq!(ids.len(), 2, "both sessions are drawn during the slide");
+        let sessions: Vec<u64> = scene
+            .terminals()
+            .filter_map(|t| match t {
+                SceneItem::Terminal { session, .. } => Some(*session),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "both sessions are drawn during the slide"
+        );
         assert_ne!(
-            ids[0], ids[1],
-            "the outgoing and incoming terminals need distinct cache ids"
+            sessions[0], sessions[1],
+            "the outgoing and incoming terminals need distinct cache sessions"
         );
     }
 
@@ -2012,25 +2006,38 @@ mod tests {
             now_ms: base + ANIM_MS / 2,
         });
 
-        let mut sides: Vec<(SceneId, f32)> = r
+        // Identify the sides by where they slid: the outgoing moves left (negative tx),
+        // the incoming sits to its right. Both are SceneId::Root now — they are told
+        // apart only by their distinct sessions, which is exactly how the renderer
+        // caches each side's texture independently.
+        let mut sides: Vec<(u64, f32)> = r
             .view()
             .layers
             .iter()
             .flat_map(|l| l.items.iter().map(move |it| (l.transform.tx, it)))
             .filter_map(|(tx, it)| match it {
-                SceneItem::Terminal { id, .. } => Some((*id, tx)),
+                SceneItem::Terminal { session, .. } => Some((*session, tx)),
                 _ => None,
             })
             .collect();
-        sides.sort_by_key(|(id, _)| match id {
-            SceneId::Slide(n) => *n,
-            _ => u8::MAX,
-        });
+        sides.sort_by(|a, b| a.1.total_cmp(&b.1)); // ascending tx: outgoing (left) first
         assert_eq!(sides.len(), 2, "both sides are on screen mid-slide");
-        let (out_id, out_tx) = sides[0];
-        let (in_id, in_tx) = sides[1];
-        assert_eq!(out_id, SceneId::Slide(0), "side 0 is the outgoing session");
-        assert_eq!(in_id, SceneId::Slide(1), "side 1 is the incoming session");
+        let (out_session, out_tx) = sides[0];
+        let (in_session, in_tx) = sides[1];
+        assert_ne!(
+            out_session, in_session,
+            "the two sides carry distinct sessions"
+        );
+        assert_eq!(
+            out_session,
+            ghost_render::session_key("gamma"),
+            "the left side is the outgoing (foreground) session"
+        );
+        assert_eq!(
+            in_session,
+            ghost_render::session_key("alpha"),
+            "the right side is the incoming session"
+        );
         assert!(
             (out_tx + w / 2.0).abs() < 0.5,
             "the outgoing side slid half a width left, got tx={out_tx}"
