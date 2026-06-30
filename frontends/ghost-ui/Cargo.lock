@@ -721,6 +721,9 @@ dependencies = [
  "ghost-shaper",
  "ghost-ui-core",
  "ghost-vt",
+ "pollster",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]

@@ -17,11 +17,18 @@
 
 pub mod framestats;
 
+use std::time::Duration;
+
 use ghost_render::{CellMetrics, Scene};
-use ghost_renderer::{Damage, Rendered, Renderer, SceneCache, Theme};
+use ghost_renderer::{Rendered, Renderer, SceneCache, Theme};
 use ghost_shaper::FontRef;
 use ghost_ui_core::{Cmd, RootModel, SessionId, TerminalModel, UiEvent};
 use ghost_vt::session::SessionInfo;
+
+/// The swappable render target (re-exported from the renderer): a real window
+/// surface or the offscreen default. A windowed test builds a [`Target::Surface`]
+/// and hands it to [`Harness::set_surface`].
+pub use ghost_renderer::{SurfaceTarget, Target};
 
 /// Bundled monospace font, so offscreen rendering is deterministic and self-contained.
 const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
@@ -50,6 +57,12 @@ pub struct Harness {
     clock_ms: u64,
     /// Set once the model returns `Cmd::Quit`/`Cmd::CloseWindow`.
     quit: bool,
+    /// Where [`present`](Self::present) draws: offscreen by default, or a real window
+    /// surface swapped in via [`set_surface`](Self::set_surface).
+    target: Target,
+    /// Runs just before each surface present (e.g. winit's `pre_present_notify`);
+    /// no-op for the offscreen target.
+    pre_present: Box<dyn Fn()>,
 }
 
 impl Harness {
@@ -95,7 +108,27 @@ impl Harness {
             next_tick_ms: None,
             clock_ms: 0,
             quit: false,
+            target: Target::Offscreen,
+            pre_present: Box::new(|| {}),
         }
+    }
+
+    /// Swap the render target for a real window surface (the default is offscreen), so
+    /// a test or benchmark drives the live acquire→present path instead of an offscreen
+    /// texture. `renderer` **must** be built (`Renderer::new`) on the *same*
+    /// `wgpu::Device` as the surface — the swapchain texture and the draw commands
+    /// share a device — which is why the windowed renderer is supplied here rather than
+    /// lazily created. `pre_present` runs just before each present (e.g. winit's
+    /// `pre_present_notify`). The caller owns the window and keeps it alive.
+    pub fn set_surface(
+        &mut self,
+        renderer: Renderer,
+        target: Target,
+        pre_present: impl Fn() + 'static,
+    ) {
+        self.renderer = Some(renderer);
+        self.target = target;
+        self.pre_present = Box::new(pre_present);
     }
 
     /// Set the synthetic session list that answers `Cmd::ListSessions` (and feed it
@@ -190,21 +223,24 @@ impl Harness {
         self.renderer().render_offscreen_scene(&scene, font, px)
     }
 
-    /// Render the current scene through the live damage path into the renderer's
-    /// cached target (no pixel read-back), returning the [`Damage`] the shell would
-    /// have acted on — the faithful per-frame work a benchmark measures. Needs a GPU.
-    pub fn present(&mut self) -> Damage {
+    /// Produce one frame through the real damage→draw→present glue
+    /// ([`Target::render_frame`]) — the exact code the windowed shell runs — against
+    /// the current target (offscreen by default, or a surface from
+    /// [`set_surface`](Self::set_surface)). Returns the `(build, present)` split when a
+    /// frame was drawn, or `None` for an unchanged scene / lost surface. This is the
+    /// faithful per-frame work a benchmark measures. Needs a GPU.
+    pub fn present(&mut self) -> Option<(Duration, Duration)> {
         let scene = self.root.view();
         let px = self.render_px();
         let font = self.font;
-        let damage = self.cache.damage(&scene, px);
-        let band = match damage {
-            Damage::Band(b) => Some(b),
-            _ => None,
-        };
-        self.renderer()
-            .render_to_cached_target(&scene, font, px, band);
-        damage
+        self.renderer
+            .get_or_insert_with(|| Renderer::headless(Theme::default()));
+        // Disjoint field borrows: renderer, cache, target, and the present hook
+        // (`&Box<dyn Fn()>` is itself `FnOnce`, so it passes straight through).
+        let renderer = self.renderer.as_mut().expect("just inserted");
+        let pre = &self.pre_present;
+        self.target
+            .render_frame(renderer, &mut self.cache, &scene, font, px, pre)
     }
 
     /// Count of preview textures the renderer has (re)rasterised — a benchmark/test

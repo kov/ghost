@@ -12,3 +12,11 @@ ghost-renderer = { path = "../renderer" }
 ghost-shaper = { path = "../shaper" }
 ghost-render = { path = "../../../ghost-render" }
 ghost-vt = { path = "../../../ghost-vt" }
+
+[dev-dependencies]
+# Only the optional windowed test (tests/windowed.rs) needs a real window + surface.
+# winit resolves to the workspace's vendored copy via [patch.crates-io]; wgpu/pollster
+# match the app so the surface device and the renderer device are the same wgpu.
+winit = "0.30"
+wgpu = "29"
+pollster = "0.4"

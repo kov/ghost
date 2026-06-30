@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
+pub mod target;
+pub use target::{SurfaceTarget, Target};
+
 use ghost_render::{
     BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneId, SceneItem,
     Selection, Style, Transform,

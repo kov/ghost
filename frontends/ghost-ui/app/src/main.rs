@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{Damage, Gpu, Rendered, Renderer, SceneCache};
+use ghost_renderer::{Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
     TerminalModel, UiEvent,
@@ -385,20 +385,17 @@ fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat
         .unwrap_or(formats[0])
 }
 
-/// Per-window GPU state, valid only once the window (and surface) exist.
+/// Per-window GPU state, valid only once the window (and surface) exist. The frame
+/// production itself lives in [`Target`] (shared with the headless harness); this
+/// just owns the window, the surface target, and the per-window render state.
 struct Graphics {
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    config: wgpu::SurfaceConfiguration,
+    /// The window's swapchain surface, wrapped as a swappable render target.
+    target: Target,
     renderer: Renderer,
     /// Skips re-drawing a scene identical to the last presented, and computes the
     /// changed band for a partial redraw.
     scene_cache: SceneCache,
-    /// Whether the window is opaque. Partial (damaged) redraws only apply to opaque
-    /// windows — a translucent background band would blend with the preserved pixels
-    /// instead of replacing them — so a translucent window always redraws in full.
-    opaque: bool,
 }
 
 impl Graphics {
@@ -454,108 +451,64 @@ impl Graphics {
 
         Graphics {
             window,
-            surface,
-            device,
-            config,
+            target: Target::Surface(SurfaceTarget::new(
+                surface,
+                config,
+                device,
+                !want_transparent,
+            )),
             renderer,
             scene_cache: SceneCache::default(),
-            opaque: !want_transparent,
+        }
+    }
+
+    /// Physical pixel size of the window surface. (App windows are always
+    /// surface-backed; the offscreen variant exists only for the headless harness.)
+    fn size(&self) -> (u32, u32) {
+        match &self.target {
+            Target::Surface(s) => s.size(),
+            Target::Offscreen => (0, 0),
         }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
+        if let Target::Surface(s) = &mut self.target {
+            s.resize(w, h);
         }
-        self.config.width = w;
-        self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
         // The reconfigured surface holds no drawn frame; force the next redraw.
         self.scene_cache.invalidate();
     }
 
-    /// Stretch-blit the renderer's held resize snapshot to the (already
-    /// reconfigured) surface — immediate feedback during an interactive resize,
-    /// without the relayout/re-raster of a full scene render. No-op if the
-    /// renderer holds no snapshot.
+    /// Stretch-blit the renderer's held resize snapshot to the surface — immediate
+    /// feedback during an interactive resize, without the relayout/re-raster of a
+    /// full scene render. No-op if the renderer holds no snapshot.
     fn blit_snapshot(&mut self) {
-        if !self.renderer.has_snapshot() {
+        let Target::Surface(s) = &mut self.target else {
             return;
-        }
-        let frame_tex = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            _ => return,
         };
-        let target = frame_tex
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer
-            .blit_snapshot_to_view(&target, self.config.width, self.config.height);
-        self.window.pre_present_notify();
-        frame_tex.present();
-        // What's on screen is the stretched snapshot, not a model scene; keep the
-        // scene cache invalid so the eventual crisp commit always redraws.
-        self.scene_cache.invalidate();
+        if s.blit_snapshot(&mut self.renderer, || self.window.pre_present_notify()) {
+            // What's on screen is the stretched snapshot, not a model scene; keep the
+            // scene cache invalid so the eventual crisp commit always redraws.
+            self.scene_cache.invalidate();
+        }
     }
 
-    /// Draw a scene into the surface. `scene.size_px` must equal the surface
-    /// size, and `font_px` the glyph size the scene was laid out for (the model
-    /// keeps both in sync via `UiEvent::Resize` and its render scale).
-    /// Returns `Some((build, present))` durations when a frame was presented —
-    /// `build` is the damage check + scene build + submit, `present` the (Fifo
-    /// vsync-blocking) present — or `None` when nothing was drawn (identical scene
-    /// or a lost surface). [`FrameStats`](framestats::FrameStats) consumes the split.
+    /// Draw a scene to the window. `scene.size_px` must equal the surface size, and
+    /// `font_px` the glyph size the scene was laid out for (the model keeps both in
+    /// sync via `UiEvent::Resize` and its render scale). Delegates the damage→draw→
+    /// present glue to [`Target::render_frame`] — the same code the headless harness
+    /// runs — and returns its `Some((build, present))` split (or `None` when nothing
+    /// was drawn). [`FrameStats`](framestats::FrameStats) consumes the split.
     fn render(&mut self, scene: &Scene, font_px: f32) -> Option<(Duration, Duration)> {
-        let t_build = Instant::now();
-        // Decide what to redraw vs the last presented frame: skip an identical scene
-        // (leave it on screen), redraw only the changed band for a steady single
-        // view, or repaint the whole surface.
-        let band = match self.scene_cache.damage(scene, font_px) {
-            Damage::None => return None,
-            Damage::Full => None,
-            Damage::Band(b) if self.opaque => Some(b),
-            Damage::Band(_) => None, // translucent window: always full (see `opaque`)
-        };
-        let frame_tex = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                // We accepted this scene above but didn't present it; forget it so the
-                // next request fully redraws onto the freshly reconfigured surface.
-                self.scene_cache.invalidate();
-                return None;
-            }
-            _ => {
-                self.scene_cache.invalidate();
-                return None;
-            }
-        };
-        let target = frame_tex
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-        // Render into our own backbuffer (a banded redraw is only valid against a
-        // target whose old contents survive), then blit the whole backbuffer onto the
-        // acquired swapchain image — whose prior contents Vulkan leaves undefined.
-        self.renderer.present_scene(
-            &target,
-            (self.config.width, self.config.height),
+        self.target.render_frame(
+            &mut self.renderer,
+            &mut self.scene_cache,
             scene,
             font,
             font_px,
-            band,
-        );
-        let build = t_build.elapsed();
-        let t_present = Instant::now();
-        self.window.pre_present_notify();
-        frame_tex.present();
-        Some((build, t_present.elapsed()))
+            || self.window.pre_present_notify(),
+        )
     }
 }
 
@@ -957,7 +910,7 @@ impl App {
         let gfx = Graphics::new(event_loop, cfg.theme());
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
-        let (w, h) = (gfx.config.width, gfx.config.height);
+        let (w, h) = gfx.size();
         let (mut root, init) = RootModel::fleet(METRICS, (w, h), scale as f32);
         apply_dive_ms(&mut root);
         self.windows.insert(
@@ -1010,7 +963,8 @@ impl App {
         let gfx = Graphics::new(event_loop, cfg.theme());
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
-        let (cols, rows) = grid_from_pixels(gfx.config.width, gfx.config.height, scale as f32);
+        let (w, h) = gfx.size();
+        let (cols, rows) = grid_from_pixels(w, h, scale as f32);
         let session = match attach(name, cols, rows) {
             Ok(session) => session,
             Err(e) => {
@@ -1019,9 +973,8 @@ impl App {
             }
         };
         let model = TerminalModel::new(name.to_string(), cols, rows, METRICS);
-        let mut root = RootModel::single(model, METRICS, (gfx.config.width, gfx.config.height));
+        let mut root = RootModel::single(model, METRICS, (w, h));
         apply_dive_ms(&mut root);
-        let (w, h) = (gfx.config.width, gfx.config.height);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);
         self.windows.insert(
