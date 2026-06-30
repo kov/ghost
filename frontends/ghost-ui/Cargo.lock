@@ -666,6 +666,7 @@ dependencies = [
  "ghost-renderer",
  "ghost-shaper",
  "ghost-ui-core",
+ "ghost-ui-harness",
  "ghost-vt",
  "rustix 1.1.4",
 ]
@@ -691,6 +692,7 @@ dependencies = [
  "ghost-shaper",
  "ghost-term",
  "ghost-ui-core",
+ "ghost-ui-harness",
  "ghost-vt",
  "png",
  "pollster",
@@ -707,6 +709,17 @@ version = "0.1.0"
 dependencies = [
  "ghost-render",
  "ghost-term",
+ "ghost-vt",
+]
+
+[[package]]
+name = "ghost-ui-harness"
+version = "0.1.0"
+dependencies = [
+ "ghost-render",
+ "ghost-renderer",
+ "ghost-shaper",
+ "ghost-ui-core",
  "ghost-vt",
 ]
 

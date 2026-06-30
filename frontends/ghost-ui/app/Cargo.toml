@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ghost-ui-core = { path = "../core" }
+ghost-ui-harness = { path = "../harness" }
 ghost-renderer = { path = "../renderer" }
 ghost-render = { path = "../../../ghost-render" }
 ghost-shaper = { path = "../shaper" }

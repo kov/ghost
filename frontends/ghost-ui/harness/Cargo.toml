@@ -1,17 +1,14 @@
 [package]
-name = "ghost-shot"
+name = "ghost-ui-harness"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Headless render tool: draw ghost-ui scenes (fleet, single) to PNG for visual debugging."
+description = "Headless driver of the real ghost-ui frontend (model + renderer + damage) for tests and benchmarks, plus shared frame-pacing instrumentation."
 publish = false
 
 [dependencies]
 ghost-ui-core = { path = "../core" }
-ghost-ui-harness = { path = "../harness" }
 ghost-renderer = { path = "../renderer" }
 ghost-shaper = { path = "../shaper" }
 ghost-render = { path = "../../../ghost-render" }
 ghost-vt = { path = "../../../ghost-vt" }
-# Terminal size query for the live `calib-tui` mode (same version as the workspace).
-rustix = { version = "1.1.4", features = ["termios", "stdio"] }

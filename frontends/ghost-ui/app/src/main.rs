@@ -20,7 +20,6 @@
 
 mod bench;
 mod config;
-mod framestats;
 mod from_winit;
 mod pacer;
 mod resize;
@@ -36,6 +35,7 @@ use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
     TerminalModel, UiEvent,
 };
+use ghost_ui_harness::framestats;
 use ghost_vt::client::Session;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};

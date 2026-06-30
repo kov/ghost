@@ -4,7 +4,7 @@
 # the root crates (ghost-render, ghost-term) by path.
 [workspace]
 resolver = "3"
-members = ["core", "shaper", "renderer", "app", "shot"]
+members = ["core", "shaper", "renderer", "harness", "app", "shot"]
 exclude = ["vendor/winit"]
 
 # Vendored winit 0.30.13 carrying a one-line patch to `is_stateless()` (recognise
