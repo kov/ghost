@@ -1813,6 +1813,25 @@ impl Renderer {
             scale_instances(&mut insts, s);
         }
 
+        // Collect the frame's kitty images at the same scale as the glyphs, so the
+        // preview paints the COMPLETE session — not just text. The inline full-window
+        // path does this too (`collect_image_draws` in `build_scene`); without it an
+        // image blinks out the moment its session becomes a tile or animates, because
+        // the preview was a second, text-only reimplementation of the session render.
+        // Texture-space origin, clipped to the texture, z-sorted to match the inline
+        // painter order.
+        let mut img_draws: Vec<ImageDraw> = Vec::new();
+        self.collect_image_draws(frame, 0.0, 0.0, s, [0, 0, tw, th], &mut img_draws);
+        img_draws.sort_by_key(|d| d.z);
+        let img_insts: Vec<Instance> = img_draws
+            .iter()
+            .map(|d| Instance {
+                rect: d.rect,
+                uv: d.uv,
+                color: [1.0, 1.0, 1.0, 1.0],
+            })
+            .collect();
+
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("preview"),
             size: wgpu::Extent3d {
@@ -1844,6 +1863,15 @@ impl Renderer {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("preview instances"),
                     contents: bytemuck::cast_slice(&insts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let img_buf = (!img_insts.is_empty()).then(|| {
+            self.gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("preview image instances"),
+                    contents: bytemuck::cast_slice(&img_insts),
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
@@ -1879,6 +1907,21 @@ impl Renderer {
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..insts.len() as u32);
+            }
+            // Images over the glyphs, each bound to its own texture (mirrors
+            // `draw_images` in the main pass, but into this texture's own buffer).
+            if let Some(buf) = &img_buf {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                for (i, d) in img_draws.iter().enumerate() {
+                    let Some(bg) = self.image_bind_groups.get(&d.image_id) else {
+                        continue;
+                    };
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.set_scissor_rect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+                    let i = i as u32;
+                    pass.draw(0..6, i..i + 1);
+                }
             }
         }
         self.gpu.queue.submit([encoder.finish()]);
@@ -3667,6 +3710,59 @@ mod tests {
         assert!(
             !is_red(below) && !is_green(below),
             "below the image is background"
+        );
+    }
+
+    #[test]
+    fn a_preview_renders_the_sessions_kitty_image() {
+        // A session shown anywhere but the lone full-window view (a fleet tile, or a
+        // terminal mid-dive/slide) renders through the texture-cache PREVIEW path. That
+        // path must paint the SAME content the inline path does — including kitty
+        // images — otherwise images blink out the moment a session becomes a tile or
+        // animates. Force the preview path with a `Slide` id at full-window size, so the
+        // blit is 1:1 and the image lands at the same cells as the inline render.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut v = Vt::new(20, 4);
+        v.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        let f = layout_frame(&v, TM);
+        assert_eq!(
+            f.images.len(),
+            1,
+            "the placement is laid out into the frame"
+        );
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = v.graphics_image(7).expect("image stored");
+        r.upload_image(7, img.width, img.height, &img.pixels);
+
+        let (w, h) = Renderer::frame_size(&f);
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Slide(0), // routes through render_preview_texture
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: f.clone(),
+                    selection: None,
+                    dim: false,
+                }],
+            )],
+        };
+        let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
+
+        assert!(
+            is_red(px(&out, 4, 9)),
+            "the preview shows the image's left (red) pixel"
+        );
+        assert!(
+            is_green(px(&out, 13, 9)),
+            "the preview shows the image's right (green) pixel"
         );
     }
 
