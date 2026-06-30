@@ -9,7 +9,7 @@ use ghost_render::{
 use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
 
-const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
+const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
 
 const METRICS: CellMetrics = CellMetrics {
     advance: 9.0,

@@ -7,11 +7,11 @@ description = "Headless render tool: draw ghost-ui scenes (fleet, single) to PNG
 publish = false
 
 [dependencies]
-ghost-ui-core = { path = "../core" }
-ghost-ui-harness = { path = "../harness" }
-ghost-renderer = { path = "../renderer" }
-ghost-shaper = { path = "../shaper" }
-ghost-render = { path = "../../../ghost-render" }
-ghost-vt = { path = "../../../ghost-vt" }
+ghost-ui-core = { path = "../ghost-ui-core" }
+ghost-ui-harness = { path = "../ghost-ui-harness" }
+ghost-renderer = { path = "../ghost-renderer" }
+ghost-shaper = { path = "../ghost-shaper" }
+ghost-render = { path = "../ghost-render" }
+ghost-vt = { path = "../ghost-vt" }
 # Terminal size query for the live `calib-tui` mode (same version as the workspace).
 rustix = { version = "1.1.4", features = ["termios", "stdio"] }

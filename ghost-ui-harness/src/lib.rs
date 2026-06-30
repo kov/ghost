@@ -31,7 +31,7 @@ use ghost_vt::session::SessionInfo;
 pub use ghost_renderer::{SurfaceTarget, Target};
 
 /// Bundled monospace font, so offscreen rendering is deterministic and self-contained.
-const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
+const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
 
 /// Base font size in px (device scale is applied on top via `render_scale`),
 /// matching the windowed shell's `SIZE_PX`.

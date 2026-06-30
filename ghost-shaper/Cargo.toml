@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 # The pure layout model: we shape its `Run`s into glyphs.
-ghost-render = { path = "../../../ghost-render" }
+ghost-render = { path = "../ghost-render" }
 # Pure-Rust OpenType shaping (applies ligatures) + deterministic outline raster.
 swash = "0.2"
 

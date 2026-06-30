@@ -7,11 +7,11 @@ description = "Offscreen/windowed GPU renderer for ghost-render frames (wgpu)."
 publish = false
 
 [dependencies]
-ghost-render = { path = "../../../ghost-render" }
-ghost-shaper = { path = "../shaper" }
+ghost-render = { path = "../ghost-render" }
+ghost-shaper = { path = "../ghost-shaper" }
 # The terminal core: we resolve cell colors (ghost_term::Color) and, in tests,
 # drive a real Vt through the whole stack.
-ghost-term = { path = "../../../ghost-term" }
+ghost-term = { path = "../ghost-term" }
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

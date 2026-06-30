@@ -22,7 +22,7 @@ use ghost_ui_core::{
 use ghost_vt::session::SessionInfo;
 
 /// A bundled font so the tool needs no system font lookup.
-const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
+const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
 
 /// Proven metrics/size pairing from the renderer's golden tests (FiraCode at
 /// `SIZE_PX` advances ~9px and is ~18px tall).

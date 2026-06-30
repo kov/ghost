@@ -3338,7 +3338,7 @@ mod tests {
     use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, layout_frame};
     use ghost_term::Vt;
 
-    const FIRA: &[u8] = include_bytes!("../../shaper/tests/assets/FiraCode-Regular.ttf");
+    const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
     const SIZE_PX: f32 = 15.0;
     const TM: CellMetrics = CellMetrics {
         advance: 9.0,

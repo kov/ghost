@@ -11,13 +11,13 @@ name = "ghost-ui"
 path = "src/main.rs"
 
 [dependencies]
-ghost-ui-core = { path = "../core" }
-ghost-ui-harness = { path = "../harness" }
-ghost-renderer = { path = "../renderer" }
-ghost-render = { path = "../../../ghost-render" }
-ghost-shaper = { path = "../shaper" }
-ghost-vt = { path = "../../../ghost-vt" }
-ghost-term = { path = "../../../ghost-term" }
+ghost-ui-core = { path = "../ghost-ui-core" }
+ghost-ui-harness = { path = "../ghost-ui-harness" }
+ghost-renderer = { path = "../ghost-renderer" }
+ghost-render = { path = "../ghost-render" }
+ghost-shaper = { path = "../ghost-shaper" }
+ghost-vt = { path = "../ghost-vt" }
+ghost-term = { path = "../ghost-term" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 winit = "0.30"

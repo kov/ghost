@@ -1,6 +1,21 @@
 [workspace]
 resolver = "3"
-members = ["ghost-term", "ghost-vt", "ghost-render", "ghost-cli"]
+members = [
+    "ghost-term",
+    "ghost-vt",
+    "ghost-render",
+    "ghost-cli",
+    # The custom GPU frontend (winit/wgpu/swash). First-class workspace members:
+    # `ghost` (the GUI binary) is the headline product; the rest are its crates.
+    "ghost-ui-core",
+    "ghost-shaper",
+    "ghost-renderer",
+    "ghost-ui-harness",
+    "ghost-ui",
+    "ghost-shot",
+]
+# The vendored winit (see the patch below) is its own package, not a member.
+exclude = ["vendor/winit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,3 +27,10 @@ license = "MIT OR Apache-2.0"
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Vendored winit 0.30.13 carrying a one-line patch to `is_stateless()` (recognise
+# partially-tiled / snapped windows) so the window restores to its pre-snap size on
+# Wayland/GNOME — see vendor/winit/.../linux/wayland/window/state.rs. To be reported
+# upstream (winit + smithay-client-toolkit), then dropped.
+[patch.crates-io]
+winit = { path = "vendor/winit" }

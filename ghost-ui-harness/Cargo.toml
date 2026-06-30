@@ -7,11 +7,11 @@ description = "Headless driver of the real ghost-ui frontend (model + renderer +
 publish = false
 
 [dependencies]
-ghost-ui-core = { path = "../core" }
-ghost-renderer = { path = "../renderer" }
-ghost-shaper = { path = "../shaper" }
-ghost-render = { path = "../../../ghost-render" }
-ghost-vt = { path = "../../../ghost-vt" }
+ghost-ui-core = { path = "../ghost-ui-core" }
+ghost-renderer = { path = "../ghost-renderer" }
+ghost-shaper = { path = "../ghost-shaper" }
+ghost-render = { path = "../ghost-render" }
+ghost-vt = { path = "../ghost-vt" }
 
 [dev-dependencies]
 # Only the optional windowed test (tests/windowed.rs) needs a real window + surface.

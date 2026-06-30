@@ -7,6 +7,6 @@ description = "ghost's pure UI core: input/effect/scene model, no winit or GPU."
 publish = false
 
 [dependencies]
-ghost-term = { path = "../../../ghost-term" }
-ghost-render = { path = "../../../ghost-render" }
-ghost-vt = { path = "../../../ghost-vt" }
+ghost-term = { path = "../ghost-term" }
+ghost-render = { path = "../ghost-render" }
+ghost-vt = { path = "../ghost-vt" }
