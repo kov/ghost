@@ -1207,6 +1207,12 @@ impl ApplicationHandler for App {
                             );
                         }
                         if let Some((build, present)) = win.gfx.render(&scene, font_px) {
+                            // The foreground was just composited: reset its per-session
+                            // damage baseline so the next `view` measures change from here
+                            // (a skipped/no-op frame returns `None` and leaves the pending
+                            // damage to fold into the next real present). See
+                            // `RootModel::mark_presented`.
+                            win.root.mark_presented();
                             // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
                             // this frame and print a summary when a dive ends.
                             if let Some(summary) = win.stats.record(

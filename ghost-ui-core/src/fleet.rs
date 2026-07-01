@@ -15,6 +15,8 @@
 
 use std::collections::HashSet;
 
+use std::rc::Rc;
+
 use ghost_render::{
     BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Style,
     Transform, layout_frame,
@@ -179,10 +181,12 @@ struct Tile {
     /// preview.
     fed: bool,
     /// Cached laid-out preview, rebuilt only when this tile's content or size
-    /// changes (see [`FleetModel::refresh_dirty_frames`]); `view` clones it rather
-    /// than re-running `layout_frame` for every tile every frame. `None` until the
-    /// first refresh.
-    frame: Option<Frame>,
+    /// changes (see [`FleetModel::refresh_dirty_frames`]); `view` clones the `Rc`
+    /// rather than re-running `layout_frame` for every tile every frame. Sharing the
+    /// SAME `Rc` across presents is what lets the renderer skip re-rastering an
+    /// unchanged tile's Surface (an `Rc::ptr_eq` cache hit). `None` until the first
+    /// refresh.
+    frame: Option<Rc<Frame>>,
     /// Set when `frame` is stale (the tile got output or was resized) so the next
     /// refresh rebuilds it. Focus/bell/activity changes do not set this — they
     /// affect only the border/badge/selection, which `view` composes separately.
@@ -619,7 +623,7 @@ impl FleetModel {
         let mut builds = 0;
         for tile in &mut self.tiles {
             if tile.frame_dirty {
-                tile.frame = Some(layout_frame(tile.model.screen().vt(), metrics));
+                tile.frame = Some(Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
                 tile.frame_dirty = false;
                 builds += 1;
             }
@@ -1213,23 +1217,30 @@ impl FleetModel {
             // Preview area: a live, scaled terminal, or a placeholder + hint.
             if tile.fed {
                 // Laid out at the session's real size; the renderer scales it to
-                // the preview rect. The cache fallback only fires before the first
-                // refresh.
+                // the preview rect. Cloning the cached `Rc` (not re-wrapping a fresh
+                // one) preserves pointer identity across presents, so an unchanged
+                // tile is an `Rc::ptr_eq` cache hit in the renderer. The fallback only
+                // fires before the first refresh.
                 let frame = tile
                     .frame
                     .clone()
-                    .unwrap_or_else(|| layout_frame(tile.model.screen().vt(), metrics));
+                    .unwrap_or_else(|| Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
                 items.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
                     session: ghost_render::session_key(&tile.id),
                     rect: preview,
-                    frame: std::rc::Rc::new(frame),
+                    frame,
                     selection: if focused {
                         tile.model.selection()
                     } else {
                         None
                     },
                     dim: !focused,
+                    // A preview is downscaled (contain_scale < 1), so when its cached
+                    // frame DOES change the renderer re-rasters the whole Surface (no
+                    // row band applies); an UNCHANGED tile short-circuits on `Rc`
+                    // identity before this is consulted.
+                    damage: ghost_render::TermDamage::All,
                 });
             } else {
                 items.push(SceneItem::Rect {

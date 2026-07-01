@@ -73,8 +73,9 @@ struct AnimLayer {
 impl Anim {
     /// A fleet zoom: the frozen `world` under a camera lerped `from`→`to`, chrome
     /// fading toward the zoomed-in end so a card resolves into a clean terminal.
-    fn dive(world: Scene, from: Transform, to: Transform, dur_ms: u64) -> Self {
+    fn dive(mut world: Scene, from: Transform, to: Transform, dur_ms: u64) -> Self {
         let size_px = world.size_px;
+        freeze_damage(&mut world);
         Anim {
             layers: vec![AnimLayer {
                 content: world,
@@ -94,8 +95,10 @@ impl Anim {
     /// incoming arrives from the other. Both sides are full-window [`SceneId::Root`]
     /// terminals, but they carry distinct sessions, so the renderer caches each side's
     /// texture independently (keyed by session, not role).
-    fn slide(outgoing: Scene, incoming: Scene, dir: f32, dur_ms: u64) -> Self {
+    fn slide(mut outgoing: Scene, mut incoming: Scene, dir: f32, dur_ms: u64) -> Self {
         let size_px = outgoing.size_px;
+        freeze_damage(&mut outgoing);
+        freeze_damage(&mut incoming);
         let w = size_px.0 as f32;
         let translate = |tx| Transform {
             scale: 1.0,
@@ -155,6 +158,21 @@ impl Anim {
                 .extend(with_camera(layer.content.clone(), camera, chrome).layers);
         }
         out
+    }
+}
+
+/// Freeze a scene's terminals as unchanged for an animation: the SAME frozen content
+/// replays every tick, so each session's Surface must be rendered once (when it first
+/// appears) and then reused, never re-rastered per frame. `TermDamage::None` tells the
+/// renderer exactly that; a not-yet-rendered session's Surface is still absent, so the
+/// renderer falls back to a full render for its first frame regardless.
+fn freeze_damage(scene: &mut Scene) {
+    for layer in &mut scene.layers {
+        for item in &mut layer.items {
+            if let SceneItem::Terminal { damage, .. } = item {
+                *damage = crate::TermDamage::None;
+            }
+        }
     }
 }
 
@@ -713,6 +731,21 @@ impl RootModel {
         }
 
         self.live_scene()
+    }
+
+    /// Tell the live foreground session its view was just composited, so its next
+    /// [`view`](Self::view) measures [`TermDamage`](crate::TermDamage) from here (see
+    /// [`TerminalModel::mark_presented`]). The shell calls this after a successful
+    /// present. A no-op during an animation (frozen textures, not a live model, are on
+    /// screen) and in the fleet (downscaled previews carry no row-localized damage), so
+    /// on returning to a single view the foreground repaints in full once and resumes.
+    pub fn mark_presented(&mut self) {
+        if self.anim.is_some() {
+            return;
+        }
+        if let Mode::Single(m) = &mut self.mode {
+            m.mark_presented();
+        }
     }
 
     /// Combined render scale (device × zoom) of the active view, so the shell

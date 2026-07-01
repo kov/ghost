@@ -36,5 +36,5 @@ pub type SessionId = String;
 // it from one place (the core) rather than reaching into ghost-render directly.
 pub use ghost_render::{
     BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Selection,
-    Style, Transform,
+    Style, TermDamage, Transform,
 };

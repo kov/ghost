@@ -76,6 +76,33 @@ pub fn session_key(id: &str) -> u64 {
 }
 
 /// One drawable primitive. Every variant carries `id` and `rect`.
+/// Which rows of a terminal's Surface changed since it was last composited — the
+/// renderer's cue for how much to re-raster. The model derives it from the core's
+/// per-feed dirty-row hint (`ghost_vt`'s `Screen::feed`), never from a frame diff, so
+/// the [`Frame`] is a pure render input.
+///
+/// Its [`PartialEq`] is deliberately CONSTANT (`true`): damage is per-present metadata
+/// that changes even when the rendered content does not, so it must NOT perturb `Scene`
+/// equality. The idle-skip (`SceneCache` in `ghost-renderer`) compares scenes to skip
+/// identical repaints; a differing damage tag on otherwise-identical content must still
+/// compare equal and skip.
+#[derive(Clone, Copy, Debug)]
+pub enum TermDamage {
+    /// Re-render the whole Surface: a first frame, a scroll, a resize/zoom, a selection
+    /// change, or any change the model couldn't localize to a contiguous row range.
+    All,
+    /// Only rows `lo..=hi` changed since the last composite.
+    Rows { lo: usize, hi: usize },
+    /// Nothing changed since the last composite — the Surface is already current.
+    None,
+}
+
+impl PartialEq for TermDamage {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneItem {
     /// A solid (optionally rounded) fill.
@@ -110,6 +137,9 @@ pub enum SceneItem {
         frame: Rc<Frame>,
         selection: Option<Selection>,
         dim: bool,
+        /// Which rows changed since this session was last composited — the renderer's
+        /// cue for how much of its Surface to re-raster (see [`TermDamage`]).
+        damage: TermDamage,
     },
     /// A rectangular outline (e.g. the focused-tile border).
     Border {
@@ -381,6 +411,7 @@ mod tests {
             }),
             selection: None,
             dim: false,
+            damage: TermDamage::All,
         }
     }
 

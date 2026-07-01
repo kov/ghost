@@ -4,8 +4,8 @@
 //! and dumping PNGs to eyeball. Runs headless on lavapipe.
 
 use ghost_render::{
-    CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, Transform, layout_frame,
-    session_key,
+    CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, Transform,
+    layout_frame, session_key,
 };
 use ghost_renderer::{Rendered, Renderer, Theme, render_frame};
 use ghost_term::Vt;
@@ -326,6 +326,7 @@ fn scales_a_large_surface_frame_to_fit_its_tile() {
             frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
+            damage: TermDamage::All,
         }],
     ));
     let mut renderer = Renderer::headless(Theme::default());
@@ -368,6 +369,9 @@ fn an_unchanged_surface_is_not_re_rasterized() {
         frame: std::rc::Rc::new(frame.clone()),
         selection: None,
         dim: false,
+        // Downscaled tile; an unchanged repaint hits the Rc-identity cache first,
+        // so this stamp only matters if the cached frame actually changes.
+        damage: TermDamage::All,
     };
     let mut scene = Scene::new((800, 240));
     scene.layers.push(Layer::new(
@@ -418,6 +422,9 @@ fn an_animated_dive_camera_does_not_re_rasterize_surfaces_each_frame() {
         frame: std::rc::Rc::new(frame.clone()),
         selection: None,
         dim: false,
+        // The frozen dive world flows through as the same Rc every frame, so the
+        // Rc-identity cache — not this stamp — is what avoids the per-frame re-raster.
+        damage: TermDamage::All,
     };
     let mut scene = Scene::new((1920, 1080));
     scene.layers.push(Layer::new(
@@ -493,6 +500,7 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
             frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
+            damage: TermDamage::All,
         }],
     ));
 
@@ -558,6 +566,7 @@ fn an_identical_repaint_reshapes_nothing() {
             frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
+            damage: TermDamage::All,
         }],
     ));
 

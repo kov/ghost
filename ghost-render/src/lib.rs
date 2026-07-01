@@ -18,7 +18,7 @@ use ghost_term::{Color, Line, Pen, Vt};
 
 pub mod scene;
 pub use scene::{
-    BadgeKind, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, Transform, session_key,
+    BadgeKind, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, TermDamage, Transform, session_key,
 };
 
 /// The monospace cell box. The sole metric input the layout needs; pixel

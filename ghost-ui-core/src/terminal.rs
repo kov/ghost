@@ -13,7 +13,9 @@
 //! and child output arrives as `UiEvent::SessionData`. The pure protocol helpers
 //! (`query_replies`, `bracket_paste`, `selection_text`) live here too.
 
-use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, Selection, layout_frame_at};
+use ghost_render::{
+    Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
+};
 use ghost_term::{Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
@@ -164,6 +166,25 @@ pub struct TerminalModel {
     /// viewport) for placeholder ids to upload.
     last_image_count: usize,
     ended: bool,
+    /// Viewport rows dirtied by feeds since the last present, from the core's per-feed
+    /// hint (`Screen::feed`) — the localizable part of the [`TermDamage`] `view` reports.
+    /// `None` = no feed changed the viewport; a range accumulates across coalesced feeds.
+    feed_dirty: Option<(usize, usize)>,
+    /// The view-shaping state at the last present. `view` reports `TermDamage::All` when
+    /// any of it moved (scroll, selection, resize, zoom, HiDPI scale) — changes a per-row
+    /// feed hint can't localize — and otherwise reports just `feed_dirty`. `None` until
+    /// the first present, so the first frame is always `All`.
+    presented: Option<Presented>,
+}
+
+/// Snapshot of the view-shaping state at a present (see [`TerminalModel::presented`]).
+#[derive(Clone, PartialEq)]
+struct Presented {
+    scroll: usize,
+    selection: Option<Selection>,
+    size: (u32, u32),
+    zoom: f32,
+    scale: f32,
 }
 
 impl TerminalModel {
@@ -194,7 +215,49 @@ impl TerminalModel {
             uploaded_images: HashSet::new(),
             last_image_count: 0,
             ended: false,
+            feed_dirty: None,
+            presented: None,
         }
+    }
+
+    /// The [`TermDamage`] to stamp on this session's scene item: `All` on the first
+    /// frame or when any view-shaping state moved since the last present (scroll,
+    /// selection, resize, zoom, scale), otherwise the feed-dirtied rows (`None` if a
+    /// present was requested but nothing on screen changed). See [`Self::presented`].
+    fn damage(&self) -> TermDamage {
+        let moved = match &self.presented {
+            None => true,
+            Some(p) => {
+                p.scroll != self.scroll_offset
+                    || p.selection != self.selection
+                    || p.size != self.size_px
+                    || p.zoom != self.zoom
+                    || p.scale != self.scale
+            }
+        };
+        if moved {
+            TermDamage::All
+        } else {
+            match self.feed_dirty {
+                Some((lo, hi)) => TermDamage::Rows { lo, hi },
+                None => TermDamage::None,
+            }
+        }
+    }
+
+    /// Record that the current view was just composited: snapshot the view-shaping state
+    /// and drop the accumulated feed damage, so the next [`Self::damage`] measures from
+    /// here. Driven by the shell after a successful present (never from `view`, which is
+    /// called more than once per frame), so damage is never cleared before it is applied.
+    pub fn mark_presented(&mut self) {
+        self.presented = Some(Presented {
+            scroll: self.scroll_offset,
+            selection: self.selection,
+            size: self.size_px,
+            zoom: self.zoom,
+            scale: self.scale,
+        });
+        self.feed_dirty = None;
     }
 
     pub fn screen(&self) -> &Screen {
@@ -317,9 +380,18 @@ impl TerminalModel {
                 frame,
                 selection: self.selection,
                 dim: false,
+                damage: self.damage(),
             }],
         ));
         scene
+    }
+
+    /// Widen the pending feed-dirty row range to cover `lo..=hi`.
+    fn accumulate_dirty(&mut self, lo: usize, hi: usize) {
+        self.feed_dirty = Some(match self.feed_dirty {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
     }
 
     fn send(&self, bytes: Vec<u8>) -> Vec<Cmd> {
@@ -586,8 +658,15 @@ impl TerminalModel {
             // slice means nothing on screen moved (a mode set, a query that only
             // produced a reply, an incomplete UTF-8 tail). That is the "backing
             // buffer modified since last composition" signal — gate the repaint on
-            // it so a no-op feed doesn't drive a present.
-            let viewport_changed = !self.screen.feed(bytes).is_empty();
+            // it so a no-op feed doesn't drive a present, and carry the dirtied row
+            // range into `view`'s per-session `TermDamage` (see [`Self::damage`]).
+            let (viewport_changed, dirty) = {
+                let d = self.screen.feed(bytes);
+                (
+                    !d.is_empty(),
+                    d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
+                )
+            };
             // Keep a scrolled-up view pinned to its content: advance the offset by
             // the GROSS lines that scrolled off the top this feed. That count
             // survives scrollback trimming (unlike the net scrollback_len delta,
@@ -639,6 +718,15 @@ impl TerminalModel {
             let images_before = cmds.len();
             self.upload_new_images(&mut cmds);
             let images_added = cmds.len() > images_before;
+            // Fold this feed's dirty rows into the pending damage. A new image gets the
+            // whole viewport (its footprint may sit outside the row hint); a dropped
+            // selection needs no range — `view`'s structural check reports it as `All`.
+            if let Some((lo, hi)) = dirty {
+                self.accumulate_dirty(lo, hi);
+            }
+            if images_added {
+                self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
+            }
             if viewport_changed || selection_dropped || images_added {
                 cmds.push(Cmd::Redraw);
             }
@@ -1916,6 +2004,73 @@ mod tests {
         assert!(
             !cmds.contains(&Cmd::Redraw),
             "a feed that changes no viewport row must not repaint: {cmds:?}"
+        );
+    }
+
+    /// The per-session [`TermDamage`] the model stamps on its scene item — the cue the
+    /// renderer uses to decide how much of the Surface to re-raster.
+    fn view_damage(m: &TerminalModel) -> TermDamage {
+        match m.view().terminals().next().expect("a single terminal item") {
+            SceneItem::Terminal { damage, .. } => *damage,
+            other => panic!("the single view is one terminal item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feed_damage_localizes_and_accumulates_until_presented() {
+        let mut m = model();
+        // No present has happened yet, so the first frame is a full repaint, and the
+        // first feed carries the terminal's initial all-rows paint (a full band).
+        assert!(
+            matches!(view_damage(&m), TermDamage::All),
+            "the first frame is always full"
+        );
+        feed(&mut m, b"ready> ");
+
+        // Compositing establishes the baseline: with nothing fed since, there is no
+        // damage — the renderer keeps the Surface it already holds.
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // Steady output now: one more line dirties exactly its row; the scene carries
+        // that band, so the renderer updates only those rows in place, not the whole
+        // Surface. (The cursor sits on row 0 after "ready> ".)
+        feed(&mut m, b"hello");
+        assert!(
+            matches!(view_damage(&m), TermDamage::Rows { lo: 0, hi: 0 }),
+            "a one-row feed localizes to its row, got {:?}",
+            view_damage(&m)
+        );
+
+        // Damage accumulates across coalesced feeds until the next present: a later
+        // feed on a different row widens the band to cover both.
+        feed(&mut m, b"\r\nworld");
+        assert!(
+            matches!(view_damage(&m), TermDamage::Rows { lo: 0, hi: 1 }),
+            "coalesced feeds widen the dirty band, got {:?}",
+            view_damage(&m)
+        );
+
+        // Presenting clears the accumulated damage; the same view is unchanged again.
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+    }
+
+    #[test]
+    fn a_scroll_is_a_full_repaint_no_feed_hint_can_localize() {
+        let mut m = model();
+        feed_lines(&mut m, 100); // build scrollback to scroll into
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // Scrolling up moves the viewport — a change the per-row feed hint can't
+        // express as a band — so the whole view repaints.
+        let cmds = m.update(wheel(1.0));
+        assert!(cmds.contains(&Cmd::Redraw), "a scroll repaints");
+        assert!(
+            matches!(view_damage(&m), TermDamage::All),
+            "a scroll is a full repaint, got {:?}",
+            view_damage(&m)
         );
     }
 

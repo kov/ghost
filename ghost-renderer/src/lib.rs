@@ -16,7 +16,7 @@ pub use target::{SurfaceTarget, Target};
 
 use ghost_render::{
     BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
-    Style, Transform,
+    Style, TermDamage, Transform,
 };
 use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -667,8 +667,12 @@ struct Surface {
     /// Samples `texture` in the main pass (uniform + view + sampler). A banded update
     /// renders into the same texture, so this stays valid without rebuilding.
     bind_group: wgpu::BindGroup,
-    /// The frame the texture currently holds; the next frame is diffed against it to
-    /// decide a band (or, on a size/metrics change, a full re-render).
+    /// The frame the texture currently holds — kept only for O(1) POINTER IDENTITY
+    /// (`Rc::ptr_eq`), never a content walk: a session compositing the SAME `Rc` again
+    /// (a fleet tile whose cached frame didn't change, a frozen animation tick) is an
+    /// instant cache hit. HOW MUCH re-rastered when it DID change comes from the model's
+    /// [`TermDamage`], not a diff of this. Its `images` also gate banding: a surface that
+    /// HELD an image can't be band-updated (the banded path has no image pass).
     frame: Rc<Frame>,
     /// The selection baked into the texture. A selection change with no frame change must
     /// still re-render (it can't be diffed as a row band), so it's part of the cache key.
@@ -943,10 +947,10 @@ enum RawDamage {
 }
 
 /// The lone full-window terminal a steady single view presents: exactly one layer,
-/// one item, identity transform, a `Terminal`. Its session, frame, and selection are
-/// what the foreground Surface renders. `None` for anything else (chrome, a slide, a
-/// fleet grid), which never reaches the banded present path.
-fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>)> {
+/// one item, identity transform, a `Terminal`. Its session, frame, selection, and
+/// damage are what the foreground Surface renders. `None` for anything else (chrome, a
+/// slide, a fleet grid), which composites through `build_scene` instead.
+fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>, TermDamage)> {
     if scene.layers.len() != 1
         || scene.layers[0].items.len() != 1
         || scene.layers[0].transform != Transform::IDENTITY
@@ -958,8 +962,9 @@ fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>)> 
             session,
             frame,
             selection,
+            damage,
             ..
-        } => Some((*session, frame, *selection)),
+        } => Some((*session, frame, *selection, *damage)),
         _ => None,
     }
 }
@@ -989,54 +994,6 @@ fn scene_damage(prev: Option<&(Scene, f32)>, new: &Scene, font_px: f32) -> RawDa
     } else {
         RawDamage::Full
     }
-}
-
-/// Whether two shared frames are the same content. Pointer identity is the fast path
-/// that makes an animation flat: the frozen content flows through every tick as the SAME
-/// `Rc`, so a composited-but-unchanged session is a one-instruction hit, never a deep
-/// walk of its rows/runs/strings. A distinct `Rc` (a fresh layout — steady typing, a
-/// re-fed tile) falls back to the structural compare, so correctness never depends on
-/// sharing.
-fn frames_eq(a: &Rc<Frame>, b: &Rc<Frame>) -> bool {
-    Rc::ptr_eq(a, b) || **a == **b
-}
-
-/// The TIGHT (un-expanded) inclusive row range `[lo, hi]` that differs between two
-/// frames of the same session — the rows a banded surface update repaints. `None` means
-/// a band can't be used and the caller must re-render in full: a layout change
-/// (cols/rows/metrics) or a frame carrying images (the banded path has no image pass,
-/// mirroring [`scene_damage`]'s full-redraw triggers). A cursor move with no rows_layout
-/// change folds in the cursor's old and new rows, exactly as [`scene_damage`] does.
-fn changed_rows(old: &Frame, new: &Frame) -> Option<(usize, usize)> {
-    if old.cols != new.cols
-        || old.rows != new.rows
-        || old.metrics != new.metrics
-        || !old.images.is_empty()
-        || !new.images.is_empty()
-    {
-        return None;
-    }
-    let (mut lo, mut hi) = (usize::MAX, 0usize);
-    let mut bump = |row: usize| {
-        lo = lo.min(row);
-        hi = hi.max(row);
-    };
-    let n = old.rows_layout.len().max(new.rows_layout.len());
-    for row in 0..n {
-        if old.rows_layout.get(row) != new.rows_layout.get(row) {
-            bump(row);
-        }
-    }
-    if old.cursor != new.cursor {
-        for cur in [old.cursor.as_ref(), new.cursor.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            bump(cur.row);
-        }
-    }
-    // Nothing localizable changed (e.g. an unreachable equal-frames case) ⇒ full redraw.
-    (lo != usize::MAX).then_some((lo, hi))
 }
 
 /// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
@@ -1682,41 +1639,57 @@ impl Renderer {
     /// (re)rendering only on a content or size change. The caller then blits the
     /// cached texture, so an unchanged session re-rasterizes nothing — the win that
     /// keeps fleet navigation (and the steady foreground) cheap on a software rasterizer.
+    // The seven inputs (session identity, frame, selection, damage, target rect, font,
+    // size) are all irreducible render inputs; bundling them into a single-use struct
+    // purely to satisfy the arg-count lint would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_surface(
         &mut self,
         session: u64,
         frame: &Rc<Frame>,
         selection: Option<Selection>,
+        damage: TermDamage,
         rect: RectPx,
         font: FontRef,
         size_px: f32,
     ) {
         let size = Self::surface_size(frame, rect);
         // Decide against the cached surface up front, copying out a plan so no borrow of
-        // the cache is held while we mutate it below.
+        // the cache is held while we mutate it below. The model tells us WHAT changed
+        // (`damage`) — this only decides whether that change is bandable against THIS
+        // surface (same size, same selection, rendered 1:1, no images either side).
         enum Plan {
-            Current,            // identical frame + selection: the texture is already right
+            Current,            // nothing changed: the texture is already right
             Band(usize, usize), // localized change: re-render just rows [lo, hi] in place
             Full, // no surface, a resize, a selection change, or an un-bandable change
         }
         let plan = match self.surfaces.get(&session) {
-            // `frames_eq` is pointer-identity-first: a composited-but-unchanged session
-            // (every animation tick after the first) hits here in one instruction, never
-            // deep-walking its rows — the flat-cost invariant of the compositor.
-            Some(c) if c.size == size && frames_eq(&c.frame, frame) && c.selection == selection => {
-                Plan::Current
-            }
-            // Band only when the texture size AND selection are unchanged and the surface
-            // is rendered 1:1 (un-downscaled), so a frame row maps to the texture at
-            // native lh. A selection change re-renders in full (it isn't a row band).
-            Some(c)
-                if c.size == size
-                    && c.selection == selection
-                    && contain_scale(frame, rect) >= 1.0 =>
-            {
-                match changed_rows(&c.frame, frame) {
-                    Some((lo, hi)) => Plan::Band(lo, hi),
-                    None => Plan::Full,
+            Some(c) if c.size == size && c.selection == selection => {
+                if Rc::ptr_eq(&c.frame, frame) {
+                    // The SAME frame allocation re-composited: a fleet tile whose cached
+                    // frame didn't change, a frozen animation tick. An O(1) identity hit —
+                    // the flat-cost invariant of the compositor, no re-raster, no deep walk.
+                    Plan::Current
+                } else {
+                    match damage {
+                        // A distinct frame the model marked unchanged: an idle foreground
+                        // re-lays-out a fresh `Rc` every view, and a frozen slide side is a
+                        // fresh `Rc` too — both say "nothing moved". Reuse the texture.
+                        TermDamage::None => Plan::Current,
+                        // Band only when the surface is rendered 1:1 (un-downscaled), so a
+                        // frame row maps to the texture at native line-height, and neither
+                        // the new frame nor the surface carries images (the banded path has
+                        // no image pass, so an image on either side forces a full render).
+                        TermDamage::Rows { lo, hi }
+                            if contain_scale(frame, rect) >= 1.0
+                                && c.frame.images.is_empty()
+                                && frame.images.is_empty() =>
+                        {
+                            Plan::Band(lo, hi)
+                        }
+                        // `All`, an image on either side, or a downscaled surface: whole.
+                        _ => Plan::Full,
+                    }
                 }
             }
             _ => Plan::Full,
@@ -2547,6 +2520,7 @@ impl Renderer {
                         frame,
                         selection,
                         dim,
+                        damage,
                         ..
                     } => {
                         // Composite a cached texture instead of re-rasterizing glyphs
@@ -2579,7 +2553,9 @@ impl Renderer {
                             // transform, so the terminal still moves/zooms; the texture
                             // stays put.
                             let src = surface_src(frame, *rect);
-                            self.ensure_surface(*session, frame, *selection, src, font, size_px);
+                            self.ensure_surface(
+                                *session, frame, *selection, *damage, src, font, size_px,
+                            );
                             seen.insert(*session);
                             draws.push(Draw::Surface {
                                 scissor,
@@ -2966,7 +2942,7 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) {
-        let Some((session, frame, selection)) = lone_terminal(scene) else {
+        let Some((session, frame, selection, damage)) = lone_terminal(scene) else {
             // A multi-terminal / chrome scene: build_scene composites any per-session
             // Surfaces itself.
             self.render_scene_to_view(view, scene, font, size_px);
@@ -2990,7 +2966,7 @@ impl Renderer {
         // size, so the blit below is 1:1. `ensure_surface` diffs the new frame against
         // the Surface's held frame and updates only the changed rows in place.
         let src = surface_src(frame, win);
-        self.ensure_surface(session, frame, selection, src, font, size_px);
+        self.ensure_surface(session, frame, selection, damage, src, font, size_px);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
         // Blit the whole Surface onto the swapchain (resets the uniform, which the render
@@ -3355,6 +3331,7 @@ mod tests {
                     frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
+                    damage: TermDamage::All,
                 }],
             )],
         };
@@ -3413,6 +3390,7 @@ mod tests {
             frame: std::rc::Rc::new(f.clone()),
             selection: None,
             dim: false,
+            damage: TermDamage::All,
         };
         let scene = Scene {
             size_px: (w, h),
@@ -3472,6 +3450,7 @@ mod tests {
                     frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
+                    damage: TermDamage::All,
                 }],
             )],
         };
@@ -3622,6 +3601,7 @@ mod tests {
                     frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
+                    damage: TermDamage::All,
                 }],
             )],
         };
@@ -3660,6 +3640,7 @@ mod tests {
                     frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
+                    damage: TermDamage::All,
                 }],
             )],
         };
@@ -3701,6 +3682,7 @@ mod tests {
                     frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
+                    damage: TermDamage::All,
                 }],
             )],
         };
@@ -3813,8 +3795,16 @@ mod tests {
         assert!(!is_lavapipe_manifest("lvp_icd.json.bak")); // not a manifest
     }
 
-    /// A full-window single-`Terminal` scene for `f`, at `w`×`h` px.
+    /// A full-window single-`Terminal` scene for `f`, at `w`×`h` px. Defaults to
+    /// `TermDamage::All` (a full render) — the band tests use [`single_scene_damage`]
+    /// to drive a localized in-place update.
     fn single_scene(f: Frame, w: u32, h: u32) -> Scene {
+        single_scene_damage(f, w, h, TermDamage::All)
+    }
+
+    /// [`single_scene`] with an explicit [`TermDamage`], so a test can exercise the
+    /// renderer's banded (in-place) Surface update the same per-row hint the model feeds.
+    fn single_scene_damage(f: Frame, w: u32, h: u32, damage: TermDamage) -> Scene {
         Scene {
             size_px: (w, h),
             layers: vec![Layer::new(
@@ -3831,6 +3821,7 @@ mod tests {
                     frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
+                    damage,
                 }],
             )],
         }
@@ -3856,6 +3847,10 @@ mod tests {
                     frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
+                    // A slide's content is frozen for the whole animation (as
+                    // `RootModel`'s `freeze_damage` marks it): each side rasters once
+                    // when it first appears, then its Surface is reused every tick.
+                    damage: TermDamage::None,
                 }],
             )
             .with_transform(Transform {
@@ -3904,6 +3899,9 @@ mod tests {
                     frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
+                    // The SAME content re-rendered under a different SceneId: nothing
+                    // changed, so the session-keyed Surface is reused (no re-raster).
+                    damage: TermDamage::None,
                 }],
             )],
         };
@@ -3954,6 +3952,9 @@ mod tests {
                     frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
+                    // Frame b differs from a only in row 3 — the per-row hint the model
+                    // would feed; the renderer bands exactly that row in place.
+                    damage: TermDamage::Rows { lo: 3, hi: 3 },
                 }],
             )],
         };
@@ -4023,6 +4024,7 @@ mod tests {
             frame: std::rc::Rc::new(f.clone()),
             selection,
             dim: false,
+            damage: TermDamage::All,
         };
 
         // Inline: a lone full-window terminal with a selection.
@@ -4289,7 +4291,9 @@ mod tests {
         let (cols, rows) = (20usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);
         // Cumulative single-row edits: A base, B changes row 11, C changes row 12.
-        let scene_of = |changed: &[usize]| {
+        // `damage` is the per-present hint the model would feed (the rows THIS present
+        // newly dirtied) — the renderer bands exactly that range in place.
+        let scene_of = |changed: &[usize], damage: TermDamage| {
             let mut s = String::new();
             for row in 0..rows {
                 if row > 0 {
@@ -4301,7 +4305,7 @@ mod tests {
                     "static line"
                 });
             }
-            single_scene(frame(cols, rows, &s), w, h)
+            single_scene_damage(frame(cols, rows, &s), w, h, damage)
         };
 
         let mut r = Renderer::headless(Theme::default());
@@ -4311,14 +4315,26 @@ mod tests {
         // A: full present — composites the whole frame into a fresh foreground Surface.
         // B, C: steady single-row edits — each updates the now-valid Surface IN PLACE (a
         // band update building only its row), never re-rendering the whole Surface.
-        r.present_scene(&v, (w, h), &scene_of(&[]), font, SIZE_PX);
+        r.present_scene(&v, (w, h), &scene_of(&[], TermDamage::All), font, SIZE_PX);
         assert_eq!(
             r.surface_renders(),
             1,
             "A composites the frame into a fresh Surface"
         );
-        r.present_scene(&v, (w, h), &scene_of(&[11]), font, SIZE_PX);
-        r.present_scene(&v, (w, h), &scene_of(&[11, 12]), font, SIZE_PX);
+        r.present_scene(
+            &v,
+            (w, h),
+            &scene_of(&[11], TermDamage::Rows { lo: 11, hi: 11 }),
+            font,
+            SIZE_PX,
+        );
+        r.present_scene(
+            &v,
+            (w, h),
+            &scene_of(&[11, 12], TermDamage::Rows { lo: 12, hi: 12 }),
+            font,
+            SIZE_PX,
+        );
         assert_eq!(
             r.surface_band_updates(),
             2,
@@ -4332,7 +4348,7 @@ mod tests {
         let incremental = r.band_instances();
 
         // A full build of the same frame, for the reference count.
-        let _ = r.render_offscreen_scene(&scene_of(&[11, 12]), font, SIZE_PX);
+        let _ = r.render_offscreen_scene(&scene_of(&[11, 12], TermDamage::All), font, SIZE_PX);
         let full = r.instance_count();
         assert!(incremental > 0, "the band still builds its rows");
         assert!(
