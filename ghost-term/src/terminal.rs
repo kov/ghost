@@ -10,8 +10,8 @@ use crate::graphics::{GraphicsState, Image, Placement};
 use crate::line::Line;
 use crate::links::Links;
 use crate::parser::{
-    AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function, SgrOp,
-    SgrOps, TbcScope, XtwinopsOp,
+    AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function,
+    Progress, SgrOp, SgrOps, TbcScope, XtwinopsOp,
 };
 use crate::pen::{Intensity, Pen};
 use crate::tabs::Tabs;
@@ -98,6 +98,9 @@ pub struct Terminal {
     /// default foreground, default background, cursor color. `None` = the
     /// frontend's theme default applies.
     dynamic_colors: [Option<[u8; 3]>; 3],
+    /// OSC 9;4 taskbar progress, the running task's own report. Dumped, so a
+    /// long task's progress survives detach/reattach.
+    progress: Option<Progress>,
 }
 
 /// Cap on retained prompt marks; the oldest fall off first (they are also the
@@ -203,6 +206,7 @@ impl Terminal {
             command_running: false,
             last_exit: None,
             dynamic_colors: [None; 3],
+            progress: None,
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -634,6 +638,10 @@ impl Terminal {
                 self.dynamic_colors[target as usize] = rgb;
             }
 
+            SetProgress(progress) => {
+                self.progress = progress;
+            }
+
             SetClipboard(selection, payload) => {
                 // The "?" query form is deliberately unanswered: replying
                 // would hand any program running in any session the user's
@@ -1010,6 +1018,7 @@ impl Terminal {
         self.command_running = false;
         self.last_exit = None;
         self.dynamic_colors = [None; 3];
+        self.progress = None;
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -1119,6 +1128,11 @@ impl Terminal {
     /// one (`None` = the frontend's theme default applies).
     pub fn dynamic_color(&self, target: DynamicColor) -> Option<[u8; 3]> {
         self.dynamic_colors[target as usize]
+    }
+
+    /// The task progress the app last reported (OSC 9;4), if any.
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress
     }
 
     /// Absolute rows (same space as [`lines_scrolled_off`]) of OSC 133;A
@@ -2173,7 +2187,12 @@ impl Terminal {
             funs.push(Function::SetTitle(self.title.clone()));
         }
 
-        // 17. restore dynamic-color overrides (OSC 10/11/12).
+        // 17. restore the reported task progress (OSC 9;4), if any.
+        if self.progress.is_some() {
+            funs.push(Function::SetProgress(self.progress));
+        }
+
+        // 18. restore dynamic-color overrides (OSC 10/11/12).
         for (i, target) in [
             DynamicColor::Foreground,
             DynamicColor::Background,

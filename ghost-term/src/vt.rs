@@ -1,6 +1,6 @@
 use crate::graphics::{Image, Placement};
 use crate::line::Line;
-use crate::parser::{self, DecMode, DynamicColor, Parser};
+use crate::parser::{self, DecMode, DynamicColor, Parser, Progress};
 use crate::terminal::{ClipboardSelection, Cursor, Terminal};
 
 /// The active mouse-reporting protocol (DEC private modes 1000/1002/1003),
@@ -124,6 +124,11 @@ impl Vt {
     /// The app-set cursor color (OSC 12), if any.
     pub fn dynamic_cursor_color(&self) -> Option<[u8; 3]> {
         self.terminal.dynamic_color(DynamicColor::Cursor)
+    }
+
+    /// The task progress the app last reported (OSC 9;4), if any.
+    pub fn progress(&self) -> Option<Progress> {
+        self.terminal.progress()
     }
 
     /// Absolute rows (same space as [`lines_scrolled_off`](Self::lines_scrolled_off))
@@ -944,6 +949,46 @@ mod tests {
         assert_eq!(vt.dynamic_foreground(), None);
         assert_eq!(vt.dynamic_background(), None);
         assert_eq!(vt.dynamic_cursor_color(), None);
+    }
+
+    #[test]
+    fn osc_9_4_tracks_task_progress() {
+        use super::Progress::*;
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.progress(), None);
+
+        vt.feed_str("\x1b]9;4;1;42\x07");
+        assert_eq!(vt.progress(), Some(Normal(42)));
+        vt.feed_str("\x1b]9;4;2;90\x1b\\");
+        assert_eq!(vt.progress(), Some(Error(90)));
+        vt.feed_str("\x1b]9;4;3\x07");
+        assert_eq!(vt.progress(), Some(Indeterminate));
+        vt.feed_str("\x1b]9;4;4;10\x07");
+        assert_eq!(vt.progress(), Some(Paused(10)));
+        // Out-of-range percentages clamp.
+        vt.feed_str("\x1b]9;4;1;150\x07");
+        assert_eq!(vt.progress(), Some(Normal(100)));
+        // st=0 removes the progress indication.
+        vt.feed_str("\x1b]9;4;0\x07");
+        assert_eq!(vt.progress(), None);
+
+        // Unknown states and the other OSC 9 sub-commands are ignored.
+        vt.feed_str("\x1b]9;4;7;10\x07");
+        vt.feed_str("\x1b]9;notification text\x07");
+        assert_eq!(vt.progress(), None);
+    }
+
+    #[test]
+    fn progress_survives_a_dump_roundtrip_and_ris_clears_it() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]9;4;1;42\x07");
+
+        let mut vt2 = Vt::new(20, 5);
+        vt2.feed_str(&vt.dump());
+        assert_eq!(vt2.progress(), Some(super::Progress::Normal(42)));
+
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.progress(), None);
     }
 
     #[test]

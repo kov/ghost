@@ -192,6 +192,9 @@ struct Tile {
     /// refresh rebuilds it. Focus/bell/activity changes do not set this — they
     /// affect only the border/badge/selection, which `view` composes separately.
     frame_dirty: bool,
+    /// The OSC 9;4 progress shown in the card header at the last feed, so a
+    /// pure progress report (which dirties no screen rows) still repaints.
+    progress: Option<ghost_term::Progress>,
 }
 
 pub struct FleetModel {
@@ -393,6 +396,7 @@ impl FleetModel {
             fed: false,
             frame: None,
             frame_dirty: true,
+            progress: None,
         });
     }
 
@@ -951,11 +955,20 @@ impl FleetModel {
                 tile.activity = tile.activity.saturating_add(1);
             }
         }
+        // A progress report dirties no screen rows, so the model won't ask for
+        // a redraw — but the card header shows it, so a change repaints here.
+        let progress = tile.model.screen().vt().progress();
+        let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
         // The overview doesn't drive the window title; a tile changing its OSC
         // title must not retitle the window out from under the single view.
-        cmds.into_iter()
+        let mut cmds: Vec<Cmd> = cmds
+            .into_iter()
             .filter(|c| !matches!(c, Cmd::SetTitle(_)))
-            .collect()
+            .collect();
+        if progress_changed && !cmds.contains(&Cmd::Redraw) {
+            cmds.push(Cmd::Redraw);
+        }
+        cmds
     }
 
     /// Tab/Shift+Tab: step linearly through tiles in layout order, wrapping.
@@ -1235,7 +1248,12 @@ impl FleetModel {
             // Metadata header — or the live buffer of an in-progress rename.
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
                 Some(r) => format!("{}\u{2588}", r.buffer), // trailing caret block
-                None => card_meta(&tile.id, &tile.command, tile.pid),
+                None => card_meta(
+                    &tile.id,
+                    &tile.command,
+                    tile.pid,
+                    tile.model.screen().vt().progress(),
+                ),
             };
             items.push(SceneItem::Text {
                 id: SceneId::Label(handle),
@@ -1413,7 +1431,12 @@ fn placeholder_hint(loc: Locality) -> &'static str {
 /// One-line card metadata: `name · command · pid`. The command is omitted when
 /// the session just runs the user's `$SHELL` (an empty command) — it's always the
 /// shell there, so it's noise; the pid is omitted when unknown.
-fn card_meta(id: &str, command: &[String], pid: i32) -> String {
+fn card_meta(
+    id: &str,
+    command: &[String],
+    pid: i32,
+    progress: Option<ghost_term::Progress>,
+) -> String {
     let mut s = id.to_string();
     if !command.is_empty() {
         s.push_str(" \u{b7} ");
@@ -1422,6 +1445,18 @@ fn card_meta(id: &str, command: &[String], pid: i32) -> String {
     if pid > 0 {
         s.push_str(" \u{b7} ");
         s.push_str(&pid.to_string());
+    }
+    // The task's own OSC 9;4 progress report, tail position so it reads as
+    // status: percentage, ✗ = error, … = busy, ⏸ = paused.
+    if let Some(p) = progress {
+        use ghost_term::Progress::*;
+        s.push_str(" \u{b7} ");
+        match p {
+            Normal(pct) => s.push_str(&format!("{pct}%")),
+            Error(pct) => s.push_str(&format!("\u{2717} {pct}%")),
+            Indeterminate => s.push('\u{2026}'),
+            Paused(pct) => s.push_str(&format!("\u{23f8} {pct}%")),
+        }
     }
     s
 }
@@ -2259,14 +2294,68 @@ mod tests {
     #[test]
     fn card_metadata_omits_the_shell_command() {
         // A shell session (empty command) shows just name · pid — no "$SHELL".
-        assert_eq!(card_meta("build", &[], 4012), "build \u{b7} 4012");
+        assert_eq!(card_meta("build", &[], 4012, None), "build \u{b7} 4012");
         // A real command is shown.
         assert_eq!(
-            card_meta("edit", &["nvim".into(), "x.rs".into()], 40),
+            card_meta("edit", &["nvim".into(), "x.rs".into()], 40, None),
             "edit \u{b7} nvim x.rs \u{b7} 40"
         );
         // Unknown pid is omitted too.
-        assert_eq!(card_meta("s", &[], 0), "s");
+        assert_eq!(card_meta("s", &[], 0, None), "s");
+    }
+
+    #[test]
+    fn card_metadata_shows_reported_progress() {
+        use ghost_term::Progress;
+        // The suffix formats per OSC 9;4 state.
+        assert_eq!(
+            card_meta("b", &[], 0, Some(Progress::Normal(42))),
+            "b \u{b7} 42%"
+        );
+        assert_eq!(
+            card_meta("b", &[], 0, Some(Progress::Error(90))),
+            "b \u{b7} \u{2717} 90%"
+        );
+        assert_eq!(
+            card_meta("b", &[], 0, Some(Progress::Indeterminate)),
+            "b \u{b7} \u{2026}"
+        );
+        assert_eq!(
+            card_meta("b", &[], 0, Some(Progress::Paused(10))),
+            "b \u{b7} \u{23f8} 10%"
+        );
+
+        // End to end: a session reporting progress shows it on its card;
+        // clearing the report removes it.
+        let texts = |m: &FleetModel| -> Vec<String> {
+            m.view().layers[0]
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    SceneItem::Text { runs, .. } => {
+                        Some(runs.iter().map(|r| r.text.as_str()).collect())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let cmds = data(&mut m, "a", b"\x1b]9;4;1;42\x07");
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "a pure progress report (no printable output) must repaint the card"
+        );
+        assert!(
+            texts(&m).iter().any(|t| t.contains("42%")),
+            "progress missing from the card: {:?}",
+            texts(&m)
+        );
+        data(&mut m, "a", b"\x1b]9;4;0\x07");
+        assert!(
+            !texts(&m).iter().any(|t| t.contains("42%")),
+            "cleared progress still shown"
+        );
     }
 
     #[test]

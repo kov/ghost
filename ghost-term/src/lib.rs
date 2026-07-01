@@ -23,6 +23,7 @@ pub use charset::Charset;
 pub use color::Color;
 pub use graphics::{encode_transmit, Image, Placement};
 pub use line::Line;
+pub use parser::Progress;
 pub use pen::Pen;
 pub use terminal::{ClipboardSelection, CursorShape};
 pub use vt::{MouseProtocol, Vt};

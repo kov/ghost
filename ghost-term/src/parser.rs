@@ -127,6 +127,8 @@ pub enum Function {
     /// OSC 10/11/12 dynamic-color set (spec already parsed to 8-bit RGB) or
     /// the matching OSC 110/111/112 reset (`None`) back to the theme default.
     SetDynamicColor(DynamicColor, Option<[u8; 3]>),
+    /// OSC 9;4 taskbar progress; `None` (state 0) removes it.
+    SetProgress(Option<Progress>),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
     /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
     SetCursorStyle(u8),
@@ -195,6 +197,20 @@ impl DecMode {
                 | ColorSchemeReport
         )
     }
+}
+
+/// ConEmu/Windows Terminal taskbar progress (OSC 9;4): what a long-running
+/// task reports about itself. `None` (state 0) removes the indication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// State 1: a determinate task at `percent` (0..=100).
+    Normal(u8),
+    /// State 2: the task hit an error at `percent`.
+    Error(u8),
+    /// State 3: busy, no measurable progress.
+    Indeterminate,
+    /// State 4: paused/warning at `percent`.
+    Paused(u8),
 }
 
 /// The three xterm "dynamic colors" an application can override at runtime:
@@ -1079,6 +1095,31 @@ impl Parser {
                 (payload.len() <= MAX_CLIPBOARD_B64)
                     .then(|| Function::SetClipboard(selection.to_string(), payload.to_string()))
             }
+            // OSC 9;4 — ConEmu/Windows Terminal taskbar progress. The other
+            // OSC 9 sub-commands (desktop notifications, ConEmu extras) are
+            // not implemented; dropped whole. A missing percentage reads as 0,
+            // an out-of-range one clamps to 100, unknown states are ignored.
+            "9" => {
+                let mut parts = rest.split(';');
+                if parts.next() != Some("4") {
+                    return None;
+                }
+                let st = parts.next().unwrap_or("");
+                let pct = parts
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .map(|p| p.min(100) as u8)
+                    .unwrap_or(0);
+                let progress = match st {
+                    "0" => None,
+                    "1" => Some(Progress::Normal(pct)),
+                    "2" => Some(Progress::Error(pct)),
+                    "3" => Some(Progress::Indeterminate),
+                    "4" => Some(Progress::Paused(pct)),
+                    _ => return None,
+                };
+                Some(Function::SetProgress(progress))
+            }
             // OSC 10/11/12 — set a dynamic color. Only the first spec is
             // taken (xterm's consecutive-code form is rare); the "?" query
             // form is the host's to answer, and specs we can't parse
@@ -1484,6 +1525,17 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push(';');
             seq.push_str(payload);
             seq.push('\u{07}');
+        }
+
+        SetProgress(progress) => {
+            let (st, pct) = match progress {
+                None => (0, 0),
+                Some(Progress::Normal(p)) => (1, *p),
+                Some(Progress::Error(p)) => (2, *p),
+                Some(Progress::Indeterminate) => (3, 0),
+                Some(Progress::Paused(p)) => (4, *p),
+            };
+            seq.push_str(&format!("\u{1b}]9;4;{st};{pct}\u{7}"));
         }
 
         SetDynamicColor(target, rgb) => {
