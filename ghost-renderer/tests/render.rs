@@ -299,6 +299,64 @@ fn translucent_theme_makes_default_background_see_through() {
 }
 
 #[test]
+fn a_translucent_lone_terminal_composites_see_through() {
+    // The test above drives the INLINE path (`render_frame`). The live single-terminal
+    // WINDOW instead composites the session's premultiplied Surface over a TRANSPARENT
+    // swapchain clear (`present_scene` -> `encode_surface_blit`) — a different code path
+    // with its own clear. A half-opaque theme must stay see-through through it too:
+    // blank default-background pixels keep ~half alpha (the Surface's own translucent
+    // clear, blitted 1:1 over transparent), while an SGR-coloured cell stays opaque.
+    // This guards the exact path a user's translucent terminal is drawn by.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18); // 40 cols * 9px advance, 1 row * 18px line height
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("a"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: w as f32,
+                    h: h as f32,
+                },
+                frame: std::rc::Rc::new(frame),
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        )],
+    };
+    let theme = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+    let img = Renderer::headless(theme).present_offscreen(&scene, font, 15.0);
+
+    // A blank far-right cell (col ~10, x=94) carries only the composited clear: ~half
+    // alpha, proving the Surface's translucency survived the blit onto a transparent
+    // swapchain rather than being flattened opaque.
+    let blank = px(&img, 94, 9);
+    assert!(
+        (100..=160).contains(&(blank[3] as u32)),
+        "live composite should keep the default background ~half transparent, got alpha {}",
+        blank[3]
+    );
+    // The blue-background cell (col 0) stays fully opaque.
+    let colored = px(&img, 4, 9);
+    assert_eq!(
+        colored[3], 255,
+        "an SGR background must stay opaque through the surface path, got alpha {}",
+        colored[3]
+    );
+}
+
+#[test]
 fn scales_a_large_surface_frame_to_fit_its_tile() {
     // A real-size session frame drawn into a tile smaller than itself must be
     // scaled to "contain", not clipped. Mark the bottom-right cell blue: at 1:1

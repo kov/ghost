@@ -3344,6 +3344,34 @@ impl Renderer {
         self.bench_target = Some((tw, th, tex));
     }
 
+    /// Render `scene` through the live present/composite path (`present_scene`) into an
+    /// offscreen target and read the pixels back — the windowless twin of a surface
+    /// present. Unlike [`Self::render_offscreen_scene`] (which draws via `encode_scene`,
+    /// clearing to the theme background), this reproduces exactly what the on-screen
+    /// window composites: a lone terminal is blitted from its premultiplied Surface over
+    /// a transparent clear, so a translucent theme stays see-through. For tests and tools
+    /// (e.g. `ghost-shot`) that must capture the real composited frame, translucency
+    /// included.
+    pub fn present_offscreen<'f>(
+        &mut self,
+        scene: &Scene,
+        font: impl Into<FontSet<'f>>,
+        size_px: f32,
+    ) -> Rendered {
+        let font = font.into();
+        let w = scene.size_px.0.max(1);
+        let h = scene.size_px.1.max(1);
+        let target = offscreen_target(&self.gpu.device, w, h, self.format);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.present_scene(&view, (w, h), scene, font, size_px);
+        let rgba = read_back(&self.gpu, &target, w, h);
+        Rendered {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+
     /// Point the shared uniform at `w`×`h` and (re)build the fullscreen quad that
     /// blits the foreground Surface onto the swapchain.
     fn prepare_blit_quad(&mut self, w: u32, h: u32) {
