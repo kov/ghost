@@ -217,6 +217,10 @@ struct Presented {
     size: (u32, u32),
     zoom: f32,
     scale: f32,
+    /// App-set dynamic colors (OSC 10/11/12) at the present. A change dirties
+    /// no rows — the default bg is every otherwise-untouched pixel — so it
+    /// must force whole-view damage the way a resize does.
+    colors: [Option<[u8; 3]>; 3],
 }
 
 impl TerminalModel {
@@ -282,6 +286,7 @@ impl TerminalModel {
                     || p.size != self.size_px
                     || p.zoom != self.zoom
                     || p.scale != self.scale
+                    || p.colors != self.render_colors()
             }
         };
         if moved {
@@ -305,8 +310,20 @@ impl TerminalModel {
             size: self.size_px,
             zoom: self.zoom,
             scale: self.scale,
+            colors: self.render_colors(),
         });
         self.feed_dirty = None;
+    }
+
+    /// The app-set dynamic colors (OSC 10/11/12) the renderer paints with —
+    /// the view-shaping color state [`Presented`] snapshots.
+    fn render_colors(&self) -> [Option<[u8; 3]>; 3] {
+        let vt = self.screen.vt();
+        [
+            vt.dynamic_foreground(),
+            vt.dynamic_background(),
+            vt.dynamic_cursor_color(),
+        ]
     }
 
     pub fn screen(&self) -> &Screen {
@@ -803,6 +820,7 @@ impl TerminalModel {
         let mut cmds = Vec::new();
         if !bytes.is_empty() {
             let before = self.screen.vt().lines_scrolled_off();
+            let colors_before = self.render_colors();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
             // slice means nothing on screen moved (a mode set, a query that only
             // produced a reply, an incomplete UTF-8 tail). That is the "backing
@@ -892,7 +910,12 @@ impl TerminalModel {
             if images_added {
                 self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
             }
-            let want_redraw = viewport_changed || selection_dropped || images_added;
+            // App-set dynamic colors (OSC 10/11/12) dirty no rows, but they
+            // recolor everything; `damage` reports All via the `Presented`
+            // snapshot — this only makes sure a repaint is actually requested.
+            let colors_changed = colors_before != self.render_colors();
+            let want_redraw =
+                viewport_changed || selection_dropped || images_added || colors_changed;
             // Synchronized output (DEC 2026): between set and reset the app is
             // composing one atomic frame, so hold the repaint (damage keeps
             // accumulating above) and schedule a release tick as the backstop.
@@ -3187,6 +3210,34 @@ mod tests {
             )),
             "dynamic color not preferred: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn dynamic_color_changes_repaint_and_damage_the_whole_view() {
+        let term_damage = |m: &TerminalModel| {
+            let scene = m.view();
+            match scene.terminals().next().unwrap() {
+                SceneItem::Terminal { damage, .. } => *damage,
+                _ => unreachable!(),
+            }
+        };
+        let mut m = model();
+        feed(&mut m, b"hello");
+        m.mark_presented();
+
+        // A color-only feed dirties no rows, but the default bg is every
+        // pixel: it must repaint and report whole-view damage.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]11;#204060\x07".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::Redraw), "no repaint: {cmds:?}");
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::All);
+
+        // Once presented, the view settles again.
+        m.mark_presented();
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::None);
     }
 
     #[test]

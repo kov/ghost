@@ -1113,6 +1113,15 @@ pub struct Renderer {
     uniform_buf: wgpu::Buffer,
     atlas: wgpu::Texture,
     theme: Theme,
+    /// The app-set default bg (OSC 11) of the frame last passed to `prepare`,
+    /// so `encode`'s pass clear matches the frame it draws (the frame path has
+    /// no other channel from the frame to the clear).
+    frame_bg: Option<[u8; 3]>,
+    /// Effective default bg of a viewport-covering inline terminal in the scene
+    /// last built by `build_scene`, if any: `encode_scene` clears to it so the
+    /// app-set bg is exact (not blended over the configured theme's clear) at
+    /// any `bg_alpha`. `None` = clear to the configured theme.
+    scene_bg: Option<[u8; 3]>,
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
     /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
@@ -1516,6 +1525,8 @@ impl Renderer {
             uniform_buf,
             atlas,
             theme,
+            frame_bg: None,
+            scene_bg: None,
             format,
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
@@ -1750,30 +1761,53 @@ impl Renderer {
         ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
     }
 
-    /// The premultiplied theme background as a render-pass clear colour: `bg·α` in the
+    /// The configured theme with `frame`'s app-set dynamic colors (OSC 10/11)
+    /// substituted in — what every frame-scoped color resolution uses, so an
+    /// app-recolored session paints its own defaults while the rest of the
+    /// window keeps the configured scheme. `bg_alpha` is untouched: an app-set
+    /// bg is still *the default background*, so the user's translucency
+    /// preference keeps applying to it.
+    fn frame_theme(&self, frame: &Frame) -> Theme {
+        let mut theme = self.theme;
+        if let Some(fg) = frame.default_fg {
+            theme.fg = fg;
+        }
+        if let Some(bg) = frame.default_bg {
+            theme.bg = bg;
+        }
+        theme
+    }
+
+    /// The premultiplied default background as a render-pass clear colour: `bg·α` in the
     /// colour channels, `α` straight — an opaque theme clears opaque, a translucent one
-    /// stays see-through. This is the session's OWN background, the same value the main
-    /// pass clears to, so a session's texture holds its true appearance and composites
-    /// identically wherever it lands (foreground, tile, slide), translucency included.
-    fn clear_color(&self) -> wgpu::Color {
+    /// stays see-through. This is the session's OWN background (the app-set OSC 11 color
+    /// when the frame carries one), the same value the main pass clears to, so a
+    /// session's texture holds its true appearance and composites identically wherever
+    /// it lands (foreground, tile, slide), translucency included.
+    fn clear_color(&self, frame: &Frame) -> wgpu::Color {
+        let bg = self.frame_theme(frame).bg;
         let a = f64::from(self.theme.bg_alpha);
         wgpu::Color {
-            r: f64::from(self.theme.bg[0]) / 255.0 * a,
-            g: f64::from(self.theme.bg[1]) / 255.0 * a,
-            b: f64::from(self.theme.bg[2]) / 255.0 * a,
+            r: f64::from(bg[0]) / 255.0 * a,
+            g: f64::from(bg[1]) / 255.0 * a,
+            b: f64::from(bg[2]) / 255.0 * a,
             a,
         }
     }
 
-    /// The same premultiplied theme background as an instance colour — for a banded
-    /// redraw's background fill / erase-replace quad.
-    fn bg_fill_color(&self) -> [f32; 4] {
-        let a = self.theme.bg_alpha;
+    /// The default background as a STRAIGHT-alpha instance colour — for a banded
+    /// redraw's erase-replace quad and placeholder fills. Instance colors are
+    /// straight alpha by contract (the fragment shader premultiplies rgb by
+    /// coverage·alpha); handing it a premultiplied color would scale rgb by α
+    /// twice, rendering band-updated rows darker than the pass clear whenever
+    /// `bg_alpha < 1`.
+    fn bg_fill_color(&self, frame: &Frame) -> [f32; 4] {
+        let bg = self.frame_theme(frame).bg;
         [
-            f32::from(self.theme.bg[0]) / 255.0 * a,
-            f32::from(self.theme.bg[1]) / 255.0 * a,
-            f32::from(self.theme.bg[2]) / 255.0 * a,
-            a,
+            f32::from(bg[0]) / 255.0,
+            f32::from(bg[1]) / 255.0,
+            f32::from(bg[2]) / 255.0,
+            self.theme.bg_alpha,
         ]
     }
 
@@ -2044,7 +2078,7 @@ impl Renderer {
 
         // The bg-replace quad (replace-blend, so it overwrites at any alpha) and the band
         // glyphs/selection (alpha-blend over it).
-        let erase = [solid(band, self.bg_fill_color())];
+        let erase = [solid(band, self.bg_fill_color(frame))];
         let erase_buf = self
             .gpu
             .device
@@ -2224,7 +2258,7 @@ impl Renderer {
                         // same value the main pass clears to — so the texture holds the
                         // session's true appearance and composites identically wherever it
                         // lands (a translucent session yields a translucent surface).
-                        load: wgpu::LoadOp::Clear(self.clear_color()),
+                        load: wgpu::LoadOp::Clear(self.clear_color(frame)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2565,6 +2599,10 @@ impl Renderer {
         selection: Option<Selection>,
         rows: std::ops::Range<usize>,
     ) -> Vec<Instance> {
+        // The frame's own defaults (app-set OSC 10/11/12 over the configured
+        // theme) drive every color resolution below.
+        let theme = self.frame_theme(frame);
+        let cursor_rgba = frame.cursor_color.map(to_rgba);
         let metrics = frame.metrics;
         let baseline = metrics.line_height * 0.8;
         let cursor = frame.cursor;
@@ -2616,7 +2654,7 @@ impl Renderer {
             let baseline_y = row_y + baseline;
             for run in &layout.runs {
                 let cursor_here = cursor.filter(|c| c.row == row && c.col == run.start_col);
-                let (fg, bg_opt) = run_colors(&run.style, self.theme);
+                let (fg, bg_opt) = run_colors(&run.style, theme);
                 let x = run.start_col as f32 * metrics.advance;
                 let w = run.width_cols as f32 * metrics.advance;
 
@@ -2625,11 +2663,15 @@ impl Renderer {
                 // `fg`/`bg_opt` are already post-inverse and post-faint, so on an
                 // inverse or faint cell the cursor reflects that — the standard
                 // xterm behaviour where the cursor reverses whatever is shown.
+                // An app-set cursor color (OSC 12) replaces the fill instead.
                 // Underline and bar cursors leave the glyph in its normal colour
                 // and instead get a thin rule drawn after the glyphs (below).
                 let block_cursor = matches!(cursor_here.map(|c| c.shape), Some(CursorShape::Block));
                 let (block, glyph_color) = if block_cursor {
-                    (Some(fg), bg_opt.unwrap_or(to_rgba(self.theme.bg)))
+                    (
+                        Some(cursor_rgba.unwrap_or(fg)),
+                        bg_opt.unwrap_or(to_rgba(theme.bg)),
+                    )
                 } else {
                     (bg_opt, fg)
                 };
@@ -2702,9 +2744,10 @@ impl Renderer {
                 }
 
                 // Underline / bar cursor: a solid rule in the foreground colour
-                // over the unmodified glyph (the block path above handles its own
-                // fill). Underline = a thick rule along the cell bottom; bar = a
-                // thin rule down the cell's leading edge.
+                // (the app-set OSC 12 color when there is one) over the
+                // unmodified glyph (the block path above handles its own fill).
+                // Underline = a thick rule along the cell bottom; bar = a thin
+                // rule down the cell's leading edge.
                 match cursor_here.map(|c| c.shape) {
                     Some(CursorShape::Underline) => {
                         let thickness = (metrics.line_height / 8.0).max(2.0);
@@ -2715,7 +2758,7 @@ impl Renderer {
                                 w,
                                 h: thickness,
                             },
-                            fg,
+                            cursor_rgba.unwrap_or(fg),
                         ));
                     }
                     Some(CursorShape::Bar) => {
@@ -2727,7 +2770,7 @@ impl Renderer {
                                 w: width,
                                 h: metrics.line_height,
                             },
-                            fg,
+                            cursor_rgba.unwrap_or(fg),
                         ));
                     }
                     _ => {}
@@ -2791,6 +2834,7 @@ impl Renderer {
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
     fn prepare(&mut self, frame: &Frame, font: FontSet, size_px: f32, vw: u32, vh: u32) {
+        self.frame_bg = frame.default_bg;
         let instances = self.build_instances(
             frame,
             font,
@@ -2838,9 +2882,13 @@ impl Renderer {
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             // Premultiplied clear: RGB scaled by the bg opacity.
-                            r: f64::from(self.theme.bg[0]) / 255.0 * f64::from(self.theme.bg_alpha),
-                            g: f64::from(self.theme.bg[1]) / 255.0 * f64::from(self.theme.bg_alpha),
-                            b: f64::from(self.theme.bg[2]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            // The frame's app-set bg (OSC 11) wins over the theme.
+                            r: f64::from(self.frame_bg.unwrap_or(self.theme.bg)[0]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
+                            g: f64::from(self.frame_bg.unwrap_or(self.theme.bg)[1]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
+                            b: f64::from(self.frame_bg.unwrap_or(self.theme.bg)[2]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
                             a: f64::from(self.theme.bg_alpha),
                         }),
                         store: wgpu::StoreOp::Store,
@@ -2990,6 +3038,7 @@ impl Renderer {
         // render. A lone terminal stays on the cheap inline path unless it's shrunk or
         // its layer is moving.
         let multi_terminal = scene.terminals().take(2).count() > 1;
+        self.scene_bg = None;
         let mut all: Vec<Instance> = Vec::new();
         let mut draws: Vec<Draw> = Vec::new();
         let mut images: Vec<ImageDraw> = Vec::new();
@@ -3110,7 +3159,7 @@ impl Renderer {
                                     // a background-coloured placeholder until `warm_next`
                                     // rasters it (a frame or two). Its own bg, camera-
                                     // transformed with the tile by `apply_layer` below.
-                                    let bg = self.bg_fill_color();
+                                    let bg = self.bg_fill_color(frame);
                                     push_glyphs(
                                         &mut all,
                                         &mut draws,
@@ -3129,6 +3178,26 @@ impl Renderer {
                                 0..frame.rows_layout.len(),
                             );
                             translate(&mut insts, rect.x, rect.y);
+                            // An app-set default bg differs from the pass clear
+                            // (the configured theme). The steady case — this
+                            // inline terminal covering the whole viewport at
+                            // identity — makes ITS bg the pass clear (exact for
+                            // any bg_alpha, byte-identical to the Surface and
+                            // frame paths). A rarer partial/dimmed inline
+                            // terminal gets a straight-alpha quad instead: an
+                            // approximation under a translucent theme (it
+                            // blends over the theme clear), exact when opaque.
+                            let covers = rect.x <= 0.0
+                                && rect.y <= 0.0
+                                && rect.x + rect.w >= sw as f32
+                                && rect.y + rect.h >= sh as f32;
+                            if frame.default_bg.is_some() {
+                                if covers && !*dim && layer.opacity >= 1.0 {
+                                    self.scene_bg = Some(self.frame_theme(frame).bg);
+                                } else {
+                                    insts.insert(0, solid(*rect, self.bg_fill_color(frame)));
+                                }
+                            }
                             if *dim {
                                 dim_colors(&mut insts);
                             }
@@ -3308,9 +3377,14 @@ impl Renderer {
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             // Premultiplied clear: RGB scaled by the bg opacity.
-                            r: f64::from(self.theme.bg[0]) / 255.0 * f64::from(self.theme.bg_alpha),
-                            g: f64::from(self.theme.bg[1]) / 255.0 * f64::from(self.theme.bg_alpha),
-                            b: f64::from(self.theme.bg[2]) / 255.0 * f64::from(self.theme.bg_alpha),
+                            // A viewport-covering inline terminal's app-set bg
+                            // (see `scene_bg`) wins over the configured theme.
+                            r: f64::from(self.scene_bg.unwrap_or(self.theme.bg)[0]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
+                            g: f64::from(self.scene_bg.unwrap_or(self.theme.bg)[1]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
+                            b: f64::from(self.scene_bg.unwrap_or(self.theme.bg)[2]) / 255.0
+                                * f64::from(self.theme.bg_alpha),
                             a: f64::from(self.theme.bg_alpha),
                         }),
                         store: wgpu::StoreOp::Store,

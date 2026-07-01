@@ -190,6 +190,15 @@ pub struct Frame {
     pub cursor: Option<CursorLayout>,
     /// kitty-graphics images overlapping the viewport, in ascending `z`.
     pub images: Vec<ImagePlacement>,
+    /// App-set default foreground (OSC 10): overrides the renderer theme's
+    /// `fg` when resolving cells whose pen leaves the foreground unset.
+    pub default_fg: Option<[u8; 3]>,
+    /// App-set default background (OSC 11): overrides the theme's `bg` for
+    /// unset-background cells and the frame's cleared background area.
+    pub default_bg: Option<[u8; 3]>,
+    /// App-set cursor color (OSC 12): colors the cursor block/rule instead of
+    /// the reverse-video / foreground default.
+    pub cursor_color: Option<[u8; 3]>,
 }
 
 /// Lay out a single line into style- and cursor-delimited [`Run`]s.
@@ -311,6 +320,9 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
         rows_layout,
         cursor: cursor_layout,
         images,
+        default_fg: vt.dynamic_foreground(),
+        default_bg: vt.dynamic_background(),
+        cursor_color: vt.dynamic_cursor_color(),
     }
 }
 
@@ -457,6 +469,32 @@ fn cells_for(px: f32, cell: f32) -> usize {
 mod tests {
     use super::*;
     use ghost_term::Vt;
+
+    #[test]
+    fn dynamic_colors_are_captured_on_the_frame() {
+        let m = CellMetrics {
+            advance: 9.0,
+            line_height: 18.0,
+        };
+        let mut vt = Vt::new(10, 3);
+        let f = layout_frame(&vt, m);
+        assert_eq!(f.default_fg, None);
+        assert_eq!(f.default_bg, None);
+        assert_eq!(f.cursor_color, None);
+
+        vt.feed_str("\x1b]10;#ff0000\x07\x1b]11;#001020\x07\x1b]12;#00ff00\x07");
+        let f = layout_frame(&vt, m);
+        assert_eq!(f.default_fg, Some([0xff, 0x00, 0x00]));
+        assert_eq!(f.default_bg, Some([0x00, 0x10, 0x20]));
+        assert_eq!(f.cursor_color, Some([0x00, 0xff, 0x00]));
+
+        // The reset forms drop the overrides again.
+        vt.feed_str("\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+        let f = layout_frame(&vt, m);
+        assert_eq!(f.default_fg, None);
+        assert_eq!(f.default_bg, None);
+        assert_eq!(f.cursor_color, None);
+    }
 
     #[test]
     fn selection_row_span_covers_linear_range() {

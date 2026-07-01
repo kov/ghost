@@ -114,6 +114,160 @@ fn renders_ligature_line_to_image() {
 }
 
 #[test]
+fn app_set_dynamic_colors_change_the_rendered_pixels() {
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    // OSC 10/11/12: red default fg, navy default bg, green cursor. An inverse
+    // (SGR 7) blank cell paints a quad in the *default foreground*, so the fg
+    // override is observable without depending on glyph coverage; the block
+    // cursor lands on the next cell; everything else shows the default bg.
+    let mut vt = Vt::new(10, 2);
+    vt.feed_str("\x1b]10;#ff0000\x07\x1b]11;#000080\x07\x1b]12;#00ff00\x07");
+    vt.feed_str("\x1b[7m \x1b[27m");
+    let frame = layout_frame(&vt, METRICS);
+    let img = render_frame(&frame, font, 15.0, Theme::default());
+
+    // Cell (0,0): inverse blank = app-set foreground.
+    assert!(
+        strong_red(px(&img, 4, 4)),
+        "inverse cell not app-fg: {:?}",
+        px(&img, 4, 4)
+    );
+    // Cell (0,1): the block cursor, filled with the app-set cursor color.
+    let cursor = px(&img, 13, 9);
+    assert!(
+        cursor[1] > 100 && cursor[0] < 60 && cursor[2] < 60,
+        "cursor not app-colored: {cursor:?}"
+    );
+    // A far default cell (row 1): the app-set background, not the theme's.
+    assert_eq!(
+        px(&img, 80, 27),
+        [0x00, 0x00, 0x80, 0xff],
+        "default bg not overridden"
+    );
+}
+
+#[test]
+fn app_set_bg_is_exact_on_translucent_themes_across_render_paths() {
+    // bg_alpha < 1 regression: the scene path used to alpha-blend the app-set
+    // bg (double-premultiplied) over the configured theme's clear, so the
+    // window background visibly shifted whenever chrome (a hover underline)
+    // joined the scene, and a band-updated row came out darker than the clear.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut vt = Vt::new(10, 2);
+    vt.feed_str("\x1b[?25l\x1b]11;#ffffff\x07hi");
+    let frame = layout_frame(&vt, METRICS);
+    let theme = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+
+    // Frame path: premultiplied app bg at the theme's alpha = 255·0.5.
+    let by_frame = render_frame(&frame, font, 15.0, theme);
+    assert_eq!(px(&by_frame, 80, 27), [128, 128, 128, 128]);
+
+    // Scene path (inline full-window terminal): byte-identical to the frame path.
+    let term = SceneItem::Terminal {
+        id: SceneId::Root,
+        session: session_key("s"),
+        rect: RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 90.0,
+            h: 36.0,
+        },
+        frame: std::rc::Rc::new(frame.clone()),
+        selection: None,
+        dim: false,
+        damage: TermDamage::All,
+    };
+    let mut scene = Scene::new((90, 36));
+    scene.layers.push(Layer::new(0, vec![term]));
+    let mut r = Renderer::headless(theme);
+    let lone = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        lone.rgba, by_frame.rgba,
+        "translucent scene path diverged from the frame path"
+    );
+
+    // With a chrome Rect riding along (a hyperlink hover underline), the
+    // terminal background must not shift toward the theme or gain opacity.
+    scene.layers[0].items.push(SceneItem::Rect {
+        id: SceneId::Root,
+        rect: RectPx {
+            x: 0.0,
+            y: 16.0,
+            w: 18.0,
+            h: 1.5,
+        },
+        color: [1.0, 1.0, 1.0, 0.9],
+        radius: 0.0,
+    });
+    let mut r = Renderer::headless(theme);
+    let hovered = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        px(&hovered, 80, 27),
+        [128, 128, 128, 128],
+        "bg shifted when chrome joined the scene"
+    );
+}
+
+#[test]
+fn banded_updates_match_the_full_raster_on_translucent_themes() {
+    // A band update erases with a replace quad; its color must come out equal
+    // to the pass clear (straight-alpha instance color, premultiplied once by
+    // the shader) or every typed-on row turns into a darker stripe when
+    // bg_alpha < 1.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let theme = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+    let mut vt = Vt::new(10, 2);
+    vt.feed_str("\x1b[?25l\x1b]11;#ffffff\x07hi");
+
+    let scene_of = |vt: &Vt, damage: TermDamage| {
+        let mut scene = Scene::new((90, 36));
+        scene.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("s"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 90.0,
+                    h: 36.0,
+                },
+                frame: std::rc::Rc::new(layout_frame(vt, METRICS)),
+                selection: None,
+                dim: false,
+                damage,
+            }],
+        ));
+        scene
+    };
+
+    // Full raster, then a one-row band update after new output on row 0.
+    let mut r = Renderer::headless(theme);
+    let _ = r.present_offscreen(&scene_of(&vt, TermDamage::All), font, 15.0);
+    vt.feed_str("\x1b[1;1Hho");
+    let banded = r.present_offscreen(
+        &scene_of(&vt, TermDamage::Rows { lo: 0, hi: 0 }),
+        font,
+        15.0,
+    );
+    assert_eq!(r.surface_band_updates(), 1, "band path not exercised");
+
+    // A fresh full raster of the same content is the reference.
+    let mut fresh = Renderer::headless(theme);
+    let full = fresh.present_offscreen(&scene_of(&vt, TermDamage::All), font, 15.0);
+    assert_eq!(
+        banded.rgba, full.rgba,
+        "band-updated pixels diverge from a full raster"
+    );
+}
+
+#[test]
 fn resolves_ansi_colors_and_backgrounds() {
     // Hide the cursor (?25l) so a cursor block can't perturb the sampled bands,
     // then: "AB" red fg, a blank, "CD" on a blue background.
