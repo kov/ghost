@@ -592,7 +592,7 @@ fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(texel.rgb * a, a);
 }
 
-// Blit variant for cached previews: the bound texture was rendered with the glyph
+// Blit variant for cached surfaces: the bound texture was rendered with the glyph
 // pipeline, so it is *already* premultiplied — composite it as-is (scaled by the
 // instance alpha, which stays valid premultiplied) rather than premultiplying again.
 @fragment
@@ -636,18 +636,18 @@ const OPAQUE_UV: [f32; 4] = [
 /// A contiguous run of instances and the scissor rect (`x, y, w, h`, framebuffer
 /// pixels) it must be clipped to when drawn.
 /// One unit of the scene's main render pass, in painter order. Glyph/solid
-/// content draws from the shared instance buffer; a preview blits its cached
+/// content draws from the shared instance buffer; a surface blits its cached
 /// texture. Walking these in order (rather than all glyphs then all images) keeps
 /// z-order correct — e.g. the take-over overlay and focus border, emitted after a
-/// tile, draw over its preview.
+/// tile, draw over its surface.
 enum Draw {
     /// A run of glyph/solid instances (chrome, the single view, dim overlays).
     Glyphs {
         scissor: [u32; 4],
         range: std::ops::Range<u32>,
     },
-    /// Blit cached preview texture for `session` (quad `quad` of the preview buffer).
-    Preview {
+    /// Blit cached surface texture for `session` (quad `quad` of the surface buffer).
+    Surface {
         scissor: [u32; 4],
         quad: u32,
         session: u64,
@@ -659,7 +659,7 @@ enum Draw {
 /// and then composited (blitted) wherever the session appears (the foreground, a tile, a
 /// slide side, a dive). It persists across frames: when the session's frame changes in
 /// only some rows, those rows are re-rendered IN PLACE (a banded update), so a live
-/// preview re-rasterizes just what changed — the on-texture analog of the steady single
+/// surface re-rasterizes just what changed — the on-texture analog of the steady single
 /// view's damaged redraw. One renderer, one texture, composited everywhere.
 struct Surface {
     /// The native-res texture, rendered into (full or banded) and sampled by `bind_group`.
@@ -720,7 +720,7 @@ fn translate(insts: &mut [Instance], dx: f32, dy: f32) {
 }
 
 /// Scale instance geometry (position and size) about the origin. Used to shrink
-/// a real-size preview frame so it fits a smaller tile before translating it.
+/// a real-size frame so it fits a smaller tile before translating it.
 fn scale_instances(insts: &mut [Instance], s: f32) {
     for i in insts {
         for v in &mut i.rect {
@@ -732,7 +732,7 @@ fn scale_instances(insts: &mut [Instance], s: f32) {
 /// Bring a layer's emitted geometry into screen space and fade it as one unit:
 /// scale + translate every instance/blit/image rect by the camera, and multiply
 /// each instance's alpha by the layer opacity. Identity + full opacity is a no-op
-/// (the common case), so untransformed layers pay nothing. Textured previews and
+/// (the common case), so untransformed layers pay nothing. Textured surfaces and
 /// images aren't faded — the spatial-nav camera zooms tiles, it doesn't dissolve
 /// them; only instance-based chrome (rects/text/borders/badges) carries opacity.
 fn apply_layer(
@@ -771,18 +771,18 @@ fn apply_layer(
     }
 }
 
-/// The camera-independent rect to size a tile's preview texture from. A dive zooms
+/// The camera-independent rect to size a tile's surface texture from. A dive zooms
 /// a tile by animating its layer's camera every frame; sizing the texture to the
 /// live *on-screen* rect re-renders it on every frame (O(tiles) texture rebuilds
 /// per frame — the cost that made the dive sluggish with more than one live
-/// preview). Instead, size it once: the tile's world `rect` scaled up uniformly
+/// surface). Instead, size it once: the tile's world `rect` scaled up uniformly
 /// until the frame lands at its native resolution inside it — the most detail any
-/// zoom can show (a larger on-screen rect is [`Renderer::preview_size`]-capped to
+/// zoom can show (a larger on-screen rect is [`Renderer::surface_size`]-capped to
 /// native anyway). The blit quad still carries the live camera, so the tile
 /// visually zooms; only the texture is stable, so a whole dive (re)rasterizes each
-/// preview at most once. Uniform scaling preserves the world rect's aspect, so the
+/// surface at most once. Uniform scaling preserves the world rect's aspect, so the
 /// contain-fit/letterbox the blit reproduces is exactly the steady single-view's.
-fn preview_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
+fn native_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
     let nw = frame.cols as f32 * frame.metrics.advance;
     let nh = frame.rows as f32 * frame.metrics.line_height;
     let k = (nw / rect.w.max(1.0)).max(nh / rect.h.max(1.0));
@@ -795,17 +795,17 @@ fn preview_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
 
 /// The camera-independent source rect that sizes a session's [`Surface`] texture,
 /// splitting the two cases the one session renderer serves:
-/// - A genuinely SHRUNK terminal (a fleet/dive tile, `preview_scale < 1`) renders at
-///   native resolution (`preview_source_rect`) so the blit that minifies it stays
+/// - A genuinely SHRUNK terminal (a fleet/dive tile, `contain_scale < 1`) renders at
+///   native resolution (`native_source_rect`) so the blit that minifies it stays
 ///   crisp and the texture is stable while the camera moves.
-/// - A FULL-SIZE terminal (the foreground or a slide side, `preview_scale == 1`)
+/// - A FULL-SIZE terminal (the foreground or a slide side, `contain_scale == 1`)
 ///   renders at its on-screen rect, so the texture is window-exact: a 1:1 blit
 ///   reproduces the inline render byte-for-byte (background sliver past the last cell
 ///   included) and the very same Surface serves the foreground and, unchanged, the
 ///   slide's outgoing side — no re-raster across the role change.
 fn surface_src(frame: &Frame, rect: RectPx) -> RectPx {
-    if preview_scale(frame, rect) < 1.0 {
-        preview_source_rect(frame, rect)
+    if contain_scale(frame, rect) < 1.0 {
+        native_source_rect(frame, rect)
     } else {
         rect
     }
@@ -814,7 +814,7 @@ fn surface_src(frame: &Frame, rect: RectPx) -> RectPx {
 /// "Contain" downscale to fit `frame`'s true pixel size inside `rect`, clamped
 /// to 1.0 so a frame no larger than its rect (e.g. the full-window single view)
 /// is never magnified. Returns 1.0 for a degenerate (zero-size) frame.
-fn preview_scale(frame: &Frame, rect: RectPx) -> f32 {
+fn contain_scale(frame: &Frame, rect: RectPx) -> f32 {
     let fw = frame.cols as f32 * frame.metrics.advance;
     let fh = frame.rows as f32 * frame.metrics.line_height;
     if fw <= 0.0 || fh <= 0.0 {
@@ -823,7 +823,7 @@ fn preview_scale(frame: &Frame, rect: RectPx) -> f32 {
     (rect.w / fw).min(rect.h / fh).min(1.0)
 }
 
-/// Translucent black overlaid on an unfocused preview tile to dim it. The alpha
+/// Translucent black overlaid on an unfocused tile to dim it. The alpha
 /// matches [`dim_colors`]' 0.55 RGB factor (a `1.0 - 0.55` black "over"); colors
 /// are straight-alpha here (the fragment shader premultiplies).
 const DIM_OVERLAY: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
@@ -1160,7 +1160,7 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
 }
 
 /// The TIGHT (un-expanded) inclusive row range `[lo, hi]` that differs between two
-/// frames of the same session — the rows a banded preview update repaints. `None` means
+/// frames of the same session — the rows a banded surface update repaints. `None` means
 /// a band can't be used and the caller must re-render in full: a layout change
 /// (cols/rows/metrics) or a frame carrying images (the banded path has no image pass,
 /// mirroring [`scene_damage`]'s full-redraw triggers). A cursor move with no rows_layout
@@ -1263,9 +1263,9 @@ pub struct Renderer {
     /// RGBA pipeline for kitty-graphics image quads (samples `.rgba`, unlike the
     /// glyph pipeline which reads the `.r` coverage atlas).
     image_pipeline: wgpu::RenderPipeline,
-    /// Blit pipeline for cached preview textures — like `image_pipeline` but with
+    /// Blit pipeline for cached surface textures — like `image_pipeline` but with
     /// the passthrough `fs_blit` (the texture is already premultiplied).
-    preview_pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
     /// The glyph pipeline with blending DISABLED (`blend: None` ⇒ the fragment replaces
     /// the destination). A banded update draws one background-coloured quad with it to
     /// REPLACE the band's old pixels at any alpha before repainting — the only way to
@@ -1276,17 +1276,17 @@ pub struct Renderer {
     /// session — not the ephemeral [`SceneId`] role/handle — means a session's texture
     /// follows it across roles and fleet rebuilds, so a role change re-rasterizes
     /// nothing.
-    preview_cache: HashMap<u64, Surface>,
-    /// One blit quad per preview drawn this scene, parallel to the `Draw::Preview`
+    surfaces: HashMap<u64, Surface>,
+    /// One blit quad per surface drawn this scene, parallel to the `Draw::Surface`
     /// quad indices.
-    preview_instances: Option<wgpu::Buffer>,
-    /// Count of preview textures actually (re)rendered in full — a cache miss. A test
+    surface_quads: Option<wgpu::Buffer>,
+    /// Count of surface textures actually (re)rendered in full — a cache miss. A test
     /// asserts an unchanged repaint re-renders none.
-    preview_renders: u32,
-    /// Count of in-place banded preview updates: a live session whose frame changed in
+    surface_renders: u32,
+    /// Count of in-place banded surface updates: a live session whose frame changed in
     /// only some rows re-rasterizes just those rows into its persistent texture instead
     /// of a full re-render. A test asserts a one-row change band-updates, not re-renders.
-    preview_band_updates: u32,
+    surface_band_updates: u32,
     /// The session whose `Surface` is the current foreground (the last steady single view
     /// presented through the banded path). A foreground switch always passes through a
     /// full redraw (a slide), so it's only read to defensively force a full re-render if
@@ -1300,7 +1300,7 @@ pub struct Renderer {
     image_draws: Vec<ImageDraw>,
     image_instances: Option<wgpu::Buffer>,
     /// Linear sampler for the resize snapshot blit, so stretching the last crisp
-    /// frame while dragging looks smooth (the glyph/preview sampler is nearest).
+    /// frame while dragging looks smooth (the glyph/surface sampler is nearest).
     linear_sampler: wgpu::Sampler,
     /// The crisp scene captured for an in-flight interactive resize, if any (see
     /// [`Snapshot`]); stretch-blitted each drag step until the resize commits.
@@ -1519,13 +1519,13 @@ impl Renderer {
                 cache: None,
             });
 
-        // The preview-blit pipeline: identical to the image pipeline but with the
-        // passthrough fragment, since a cached preview texture is already
+        // The surface-blit pipeline: identical to the image pipeline but with the
+        // passthrough fragment, since a cached surface texture is already
         // premultiplied (rendered through the glyph pipeline).
-        let preview_pipeline = gpu
+        let blit_pipeline = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("preview pipeline"),
+                label: Some("blit pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -1556,7 +1556,7 @@ impl Renderer {
 
         // The erase pipeline: the glyph pipeline with blending OFF, so a solid quad's
         // colour REPLACES the destination instead of blending over it. Used only to
-        // clear a band to transparent before a banded preview repaint.
+        // clear a band to transparent before a banded surface repaint.
         let erase_pipeline = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1616,12 +1616,12 @@ impl Renderer {
             bind_layout,
             sampler,
             image_pipeline,
-            preview_pipeline,
+            blit_pipeline,
             erase_pipeline,
-            preview_cache: HashMap::new(),
-            preview_instances: None,
-            preview_renders: 0,
-            preview_band_updates: 0,
+            surfaces: HashMap::new(),
+            surface_quads: None,
+            surface_renders: 0,
+            surface_band_updates: 0,
             foreground_session: None,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
@@ -1819,12 +1819,12 @@ impl Renderer {
 
     /// Pixel size of a session's Surface texture for the source `rect` the caller
     /// chose via [`surface_src`]: a shrunk tile is upscaled to native resolution
-    /// (`preview_source_rect`) so the minifying blit stays crisp, while a full-size
+    /// (`native_source_rect`) so the minifying blit stays crisp, while a full-size
     /// terminal keeps its on-screen rect so the texture is window-exact (the sliver
     /// of background past the last cell included, a 1:1 blit reproducing the inline
     /// render). Either way the texture is simply the rect, ceiled to whole pixels —
     /// `surface_src` has already applied the native cap where it belongs.
-    fn preview_size(_frame: &Frame, rect: RectPx) -> (u32, u32) {
+    fn surface_size(_frame: &Frame, rect: RectPx) -> (u32, u32) {
         ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
     }
 
@@ -1855,11 +1855,11 @@ impl Renderer {
         ]
     }
 
-    /// Ensure tile `id`'s preview texture is current for `frame` at `rect`,
-    /// (re)rendering only on a content or size change. The main pass then blits
-    /// the cached texture, so an unchanged tile re-rasterizes nothing — the win
-    /// that keeps fleet navigation cheap on a software rasterizer.
-    fn ensure_preview(
+    /// Ensure `session`'s surface texture is current for `frame` at `rect`,
+    /// (re)rendering only on a content or size change. The caller then blits the
+    /// cached texture, so an unchanged session re-rasterizes nothing — the win that
+    /// keeps fleet navigation (and the steady foreground) cheap on a software rasterizer.
+    fn ensure_surface(
         &mut self,
         session: u64,
         frame: &Frame,
@@ -1868,7 +1868,7 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) {
-        let size = Self::preview_size(frame, rect);
+        let size = Self::surface_size(frame, rect);
         // Decide against the cached surface up front, copying out a plan so no borrow of
         // the cache is held while we mutate it below.
         enum Plan {
@@ -1876,17 +1876,17 @@ impl Renderer {
             Band(usize, usize), // localized change: re-render just rows [lo, hi] in place
             Full, // no surface, a resize, a selection change, or an un-bandable change
         }
-        let plan = match self.preview_cache.get(&session) {
+        let plan = match self.surfaces.get(&session) {
             Some(c) if c.size == size && c.frame == *frame && c.selection == selection => {
                 Plan::Current
             }
-            // Band only when the texture size AND selection are unchanged and the preview
+            // Band only when the texture size AND selection are unchanged and the surface
             // is rendered 1:1 (un-downscaled), so a frame row maps to the texture at
             // native lh. A selection change re-renders in full (it isn't a row band).
             Some(c)
                 if c.size == size
                     && c.selection == selection
-                    && preview_scale(frame, rect) >= 1.0 =>
+                    && contain_scale(frame, rect) >= 1.0 =>
             {
                 match changed_rows(&c.frame, frame) {
                     Some((lo, hi)) => Plan::Band(lo, hi),
@@ -1898,15 +1898,15 @@ impl Renderer {
         match plan {
             Plan::Current => {} // cache hit: blit the existing texture
             Plan::Band(lo, hi) => {
-                let mut surface = self.preview_cache.remove(&session).expect("present above");
-                self.update_preview_band(&mut surface, frame, selection, (lo, hi), font, size_px);
-                self.preview_cache.insert(session, surface);
-                self.preview_band_updates += 1;
+                let mut surface = self.surfaces.remove(&session).expect("present above");
+                self.update_surface_band(&mut surface, frame, selection, (lo, hi), font, size_px);
+                self.surfaces.insert(session, surface);
+                self.surface_band_updates += 1;
             }
             Plan::Full => {
-                let preview = self.render_preview_texture(frame, selection, rect, font, size_px);
-                self.preview_renders += 1;
-                self.preview_cache.insert(session, preview);
+                let surface = self.render_surface(frame, selection, rect, font, size_px);
+                self.surface_renders += 1;
+                self.surfaces.insert(session, surface);
             }
         }
     }
@@ -1918,9 +1918,9 @@ impl Renderer {
     /// (`LoadOp::Load`). The on-texture analog of the steady single view's damaged redraw.
     /// The band's bg is written with the blend-disabled `erase_pipeline` (REPLACE), so it
     /// overwrites the old pixels at ANY alpha — opaque covers, translucent replaces cleanly
-    /// (a plain blended fill would ghost). Only reached for a 1:1 preview (no downscale),
+    /// (a plain blended fill would ghost). Only reached for a 1:1 surface (no downscale),
     /// so rows map to the texture at native line-height with no scaling.
-    fn update_preview_band(
+    fn update_surface_band(
         &mut self,
         surface: &mut Surface,
         frame: &Frame,
@@ -1964,7 +1964,7 @@ impl Renderer {
             .gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("preview erase"),
+                label: Some("surface erase"),
                 contents: bytemuck::cast_slice(&erase),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -1972,14 +1972,14 @@ impl Renderer {
             self.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("preview band instances"),
+                    label: Some("surface band instances"),
                     contents: bytemuck::cast_slice(&insts),
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
 
         // Point the shared viewport uniform at the texture for this sub-pass (reset to
-        // the scene size before the main pass, as `render_preview_texture` relies on).
+        // the scene size before the main pass, as `render_surface` relies on).
         let uniforms = Uniforms {
             viewport: [tw as f32, th as f32],
             _pad: [0.0, 0.0],
@@ -1995,11 +1995,11 @@ impl Renderer {
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("preview band"),
+                label: Some("surface band"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("preview band"),
+                label: Some("surface band"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -2034,8 +2034,8 @@ impl Renderer {
     /// Render `frame` (scaled to "contain" within `rect`) to its own texture and
     /// build the bind group that samples it. The shared viewport uniform is set to
     /// the texture size for this sub-pass; `prepare_scene` resets it to the scene
-    /// size before the main pass, which always runs after every preview sub-pass.
-    fn render_preview_texture(
+    /// size before the main pass, which always runs after every surface sub-pass.
+    fn render_surface(
         &mut self,
         frame: &Frame,
         selection: Option<Selection>,
@@ -2043,26 +2043,26 @@ impl Renderer {
         font: FontRef,
         size_px: f32,
     ) -> Surface {
-        let size = Self::preview_size(frame, rect);
+        let size = Self::surface_size(frame, rect);
         let (tw, th) = size;
 
         // Full-size glyphs scaled to the texture (the same GPU minification the
-        // inline preview used), left at the texture origin; the blit applies the
+        // inline path used), left at the texture origin; the blit applies the
         // offset. `rect` is the camera-independent native-resolution source rect
-        // (see `preview_source_rect`), so `preview_scale` lands the frame at 1:1 and
+        // (see `native_source_rect`), so `contain_scale` lands the frame at 1:1 and
         // the texture holds crisp glyphs the blit then minifies to the on-screen tile.
         let (mut insts, _) =
             self.build_instances(frame, font, size_px, selection, 0..frame.rows_layout.len());
-        let s = preview_scale(frame, rect);
+        let s = contain_scale(frame, rect);
         if s < 1.0 {
             scale_instances(&mut insts, s);
         }
 
         // Collect the frame's kitty images at the same scale as the glyphs, so the
-        // preview paints the COMPLETE session — not just text. The inline full-window
+        // surface paints the COMPLETE session — not just text. The inline full-window
         // path does this too (`collect_image_draws` in `build_scene`); without it an
         // image blinks out the moment its session becomes a tile or animates, because
-        // the preview was a second, text-only reimplementation of the session render.
+        // the surface was a second, text-only reimplementation of the session render.
         // Texture-space origin, clipped to the texture, z-sorted to match the inline
         // painter order.
         let mut img_draws: Vec<ImageDraw> = Vec::new();
@@ -2078,7 +2078,7 @@ impl Renderer {
             .collect();
 
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("preview"),
+            label: Some("surface"),
             size: wgpu::Extent3d {
                 width: tw,
                 height: th,
@@ -2106,7 +2106,7 @@ impl Renderer {
             self.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("preview instances"),
+                    label: Some("surface instances"),
                     contents: bytemuck::cast_slice(&insts),
                     usage: wgpu::BufferUsages::VERTEX,
                 })
@@ -2115,7 +2115,7 @@ impl Renderer {
             self.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("preview image instances"),
+                    label: Some("surface image instances"),
                     contents: bytemuck::cast_slice(&img_insts),
                     usage: wgpu::BufferUsages::VERTEX,
                 })
@@ -2125,11 +2125,11 @@ impl Renderer {
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("preview"),
+                label: Some("surface"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("preview"),
+                label: Some("surface"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -2138,7 +2138,7 @@ impl Renderer {
                         // Clear to the session's OWN background at its true alpha — the
                         // same value the main pass clears to — so the texture holds the
                         // session's true appearance and composites identically wherever it
-                        // lands (a translucent session yields a translucent preview).
+                        // lands (a translucent session yields a translucent surface).
                         load: wgpu::LoadOp::Clear(self.clear_color()),
                         store: wgpu::StoreOp::Store,
                     },
@@ -2176,7 +2176,7 @@ impl Renderer {
             .gpu
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("preview bind group"),
+                label: Some("surface bind group"),
                 layout: &self.bind_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -2203,17 +2203,17 @@ impl Renderer {
         }
     }
 
-    /// Count of preview textures (re)rendered (cache misses). A test asserts an
+    /// Count of surface textures (re)rendered (cache misses). A test asserts an
     /// unchanged repaint re-renders none.
-    pub fn preview_renders(&self) -> u32 {
-        self.preview_renders
+    pub fn surface_renders(&self) -> u32 {
+        self.surface_renders
     }
 
-    /// Count of in-place banded preview updates (see
-    /// [`Self::preview_band_updates`](Self::preview_band_updates) field). A test asserts
+    /// Count of in-place banded surface updates (see
+    /// [`Self::surface_band_updates`](Self::surface_band_updates) field). A test asserts
     /// a live session's one-row change band-updates rather than fully re-rastering.
-    pub fn preview_band_updates(&self) -> u32 {
-        self.preview_band_updates
+    pub fn surface_band_updates(&self) -> u32 {
+        self.surface_band_updates
     }
 
     /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
@@ -2684,11 +2684,11 @@ impl Renderer {
 
     /// Build a scene's draws in painter order. Glyph/solid content accumulates in
     /// one instance list (returned, drawn by range); a scaled `Terminal` (a fleet
-    /// preview) instead renders to a cached texture and emits a blit, whose tile
+    /// surface) instead renders to a cached texture and emits a blit, whose tile
     /// rect is collected into `blits`. Layers are walked low `z` to high, items in
     /// insertion order within a layer. Terminals clip to their rect (so neighbours
     /// don't bleed); chrome may draw anywhere. The full-window single view
-    /// (`preview_scale == 1.0`) still builds glyphs inline, byte-identical to before.
+    /// (`contain_scale == 1.0`) still builds glyphs inline, byte-identical to before.
     fn build_scene(
         &mut self,
         scene: &Scene,
@@ -2764,11 +2764,11 @@ impl Renderer {
                     } => {
                         // Composite a cached texture instead of re-rasterizing glyphs
                         // every frame when the terminal is EITHER shrunk (a fleet
-                        // preview) OR being moved/scaled by an animation (the slide):
+                        // surface) OR being moved/scaled by an animation (the slide):
                         // in both cases the glyphs are frozen frame-to-frame, so render
                         // once and let the blit carry the transform — accelerated-
                         // compositing style. A steady full-window terminal (identity
-                        // transform, preview_scale == 1.0) still builds glyphs inline,
+                        // transform, contain_scale == 1.0) still builds glyphs inline,
                         // keeping its damaged-band fast path.
                         //
                         // A mid-animation terminal (multi_terminal) is always
@@ -2780,8 +2780,8 @@ impl Renderer {
                         // is exactly the foreground's (same session, same window size) —
                         // a plain cache hit, no re-raster, no special adoption path.
                         let animated = layer.transform != Transform::IDENTITY;
-                        if preview_scale(frame, *rect) < 1.0 || animated || multi_terminal {
-                            // Preview: blit a cached texture (re-rendered only when its
+                        if contain_scale(frame, *rect) < 1.0 || animated || multi_terminal {
+                            // Surface: blit a cached texture (re-rendered only when its
                             // content, selection, or size changes) instead of re-
                             // rasterizing the glyphs every frame — the SAME session
                             // renderer as the inline path, just into a texture.
@@ -2792,9 +2792,9 @@ impl Renderer {
                             // transform, so the terminal still moves/zooms; the texture
                             // stays put.
                             let src = surface_src(frame, *rect);
-                            self.ensure_preview(*session, frame, *selection, src, font, size_px);
+                            self.ensure_surface(*session, frame, *selection, src, font, size_px);
                             seen.insert(*session);
-                            draws.push(Draw::Preview {
+                            draws.push(Draw::Surface {
                                 scissor,
                                 quad: blits.len() as u32,
                                 session: *session,
@@ -2880,8 +2880,7 @@ impl Renderer {
             );
         }
         // Drop textures for sessions no longer on screen, bounding cache memory.
-        self.preview_cache
-            .retain(|session, _| seen.contains(session));
+        self.surfaces.retain(|session, _| seen.contains(session));
         self.single_row_index = single_ri;
         (all, draws, images, blits)
     }
@@ -2928,38 +2927,38 @@ impl Renderer {
         out
     }
 
-    /// One blit quad per preview, parallel to the `Draw::Preview` quad indices.
-    fn build_preview_instances(&mut self, blits: &[RectPx]) {
+    /// One blit quad per surface, parallel to the `Draw::Surface` quad indices.
+    fn build_surface_quads(&mut self, blits: &[RectPx]) {
         if blits.is_empty() {
-            self.preview_instances = None;
+            self.surface_quads = None;
             return;
         }
         let insts: Vec<Instance> = blits
             .iter()
             .map(|r| Instance {
                 rect: [r.x, r.y, r.w, r.h],
-                uv: [0.0, 0.0, 1.0, 1.0], // sample the whole preview texture
+                uv: [0.0, 0.0, 1.0, 1.0], // sample the whole surface texture
                 color: [1.0, 1.0, 1.0, 1.0],
             })
             .collect();
         Self::upload_instances(
             &self.gpu.device,
             &self.gpu.queue,
-            &mut self.preview_instances,
+            &mut self.surface_quads,
             &mut self.buffer_allocs,
-            "preview blits",
+            "surface blits",
             &insts,
         );
     }
 
     /// Upload a scene's instances and viewport uniform; return the ordered draws.
-    /// `build_scene` runs every preview sub-pass first (each repointing the shared
+    /// `build_scene` runs every surface sub-pass first (each repointing the shared
     /// uniform), so the scene-size uniform write here must come last.
     fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<Draw> {
         let (instances, draws, images, blits) = self.build_scene(scene, font, size_px);
         self.image_draws = images;
         self.build_image_instances();
-        self.build_preview_instances(&blits);
+        self.build_surface_quads(&blits);
         self.instance_count = instances.len() as u32;
         Self::upload_instances(
             &self.gpu.device,
@@ -2981,8 +2980,8 @@ impl Renderer {
     }
 
     /// Clear once, then walk `draws` in painter order, switching pipeline as each
-    /// glyph run or preview blit requires (so chrome drawn after a tile — focus
-    /// border, take-over overlay — composites over its preview). Kitty images draw
+    /// glyph run or surface blit requires (so chrome drawn after a tile — focus
+    /// border, take-over overlay — composites over its surface). Kitty images draw
     /// last, as before.
     fn encode_scene(&self, view: &wgpu::TextureView, draws: &[Draw]) -> wgpu::CommandBuffer {
         let mut encoder = self
@@ -3030,7 +3029,7 @@ impl Renderer {
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
                         pass.draw(0..6, range.clone());
                     }
-                    Draw::Preview {
+                    Draw::Surface {
                         scissor,
                         quad,
                         session,
@@ -3039,11 +3038,11 @@ impl Renderer {
                             continue;
                         }
                         let (Some(buf), Some(cached)) =
-                            (&self.preview_instances, self.preview_cache.get(session))
+                            (&self.surface_quads, self.surfaces.get(session))
                         else {
                             continue; // texture evicted/missing: skip rather than err
                         };
-                        pass.set_pipeline(&self.preview_pipeline);
+                        pass.set_pipeline(&self.blit_pipeline);
                         pass.set_bind_group(0, &cached.bind_group, &[]);
                         pass.set_vertex_buffer(0, buf.slice(..));
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
@@ -3112,7 +3111,7 @@ impl Renderer {
                         pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
                         pass.draw(0..6, range.clone());
                     }
-                    Draw::Preview {
+                    Draw::Surface {
                         scissor,
                         quad,
                         session,
@@ -3122,11 +3121,11 @@ impl Renderer {
                             continue;
                         }
                         let (Some(buf), Some(cached)) =
-                            (&self.preview_instances, self.preview_cache.get(session))
+                            (&self.surface_quads, self.surfaces.get(session))
                         else {
                             continue;
                         };
-                        pass.set_pipeline(&self.preview_pipeline);
+                        pass.set_pipeline(&self.blit_pipeline);
                         pass.set_bind_group(0, &cached.bind_group, &[]);
                         pass.set_vertex_buffer(0, buf.slice(..));
                         pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
@@ -3173,7 +3172,7 @@ impl Renderer {
     /// `ranges` directly: preserve the attachment (`LoadOp::Load`), repaint the band's
     /// background (default-bg cells emit no quad of their own), then draw only those
     /// ranges from the scene instance buffer — all under the one band scissor. No
-    /// previews/images: the banded path is single-view only.
+    /// surfaces/images: the banded path is single-view only.
     fn encode_scene_banded_rows(
         &self,
         view: &wgpu::TextureView,
@@ -3384,7 +3383,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let Some(buf) = &self.blit_quad {
-                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_pipeline(&self.blit_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
@@ -3438,23 +3437,23 @@ impl Renderer {
             h: surf.1.max(1) as f32,
         };
         // If the Surface is stale (the last present went straight to the swapchain, not
-        // into it) or holds a different session, drop it so `ensure_preview` re-renders
+        // into it) or holds a different session, drop it so `ensure_surface` re-renders
         // it in full: a band would otherwise land on rows the swapchain — not the
         // Surface — last updated.
         if !self.foreground_valid || self.foreground_session != Some(session) {
-            self.preview_cache.remove(&session);
+            self.surfaces.remove(&session);
         }
         // Window-sized source (see `surface_src`): the Surface is exactly the swapchain
-        // size, so the blit below is 1:1. `ensure_preview` diffs the new frame against
+        // size, so the blit below is 1:1. `ensure_surface` diffs the new frame against
         // the Surface's held frame and updates only the changed rows in place.
         let src = surface_src(frame, win);
-        self.ensure_preview(session, frame, selection, src, font, size_px);
+        self.ensure_surface(session, frame, selection, src, font, size_px);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
         // Blit the whole Surface onto the swapchain (resets the uniform, which the render
         // above set to the texture size, to the surface size for the fullscreen quad).
         self.prepare_blit_quad(surf.0, surf.1);
-        if let Some(s) = self.preview_cache.get(&session) {
+        if let Some(s) = self.surfaces.get(&session) {
             let cb = self.encode_surface_blit(view, &s.bind_group);
             self.gpu.queue.submit([cb]);
         }
@@ -3614,7 +3613,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let (Some(snap), Some(buf)) = (&self.snapshot, &self.snapshot_instances) {
-                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_pipeline(&self.blit_pipeline);
                 pass.set_bind_group(0, &snap.bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
@@ -3835,12 +3834,12 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_renders_the_sessions_kitty_image() {
+    fn a_surface_renders_the_sessions_kitty_image() {
         // A session shown anywhere but the lone full-window view (a fleet tile, or a
-        // terminal mid-dive/slide) renders through the texture-cache PREVIEW path. That
+        // terminal mid-dive/slide) renders through the texture-cache SURFACE path. That
         // path must paint the SAME content the inline path does — including kitty
         // images — otherwise images blink out the moment a session becomes a tile or
-        // animates. Route the image session through the preview path by adding a second,
+        // animates. Route the image session through the surface path by adding a second,
         // fully off-screen terminal (which makes the scene "animating" — multi-terminal,
         // exactly as a slide is); the image session stays full-window at identity so the
         // blit is 1:1 and the image lands at the same cells as the inline render.
@@ -3875,7 +3874,7 @@ mod tests {
         let scene = Scene {
             size_px: (w, h),
             layers: vec![
-                // The image session, full-window at the origin (preview path, 1:1).
+                // The image session, full-window at the origin (surface path, 1:1).
                 Layer::new(0, vec![full(0.0, session_key("image"))]),
                 // A second terminal shoved entirely off the right edge (culled), present
                 // only so the scene is multi-terminal and the first routes via a texture.
@@ -3886,11 +3885,11 @@ mod tests {
 
         assert!(
             is_red(px(&out, 4, 9)),
-            "the preview shows the image's left (red) pixel"
+            "the surface shows the image's left (red) pixel"
         );
         assert!(
             is_green(px(&out, 13, 9)),
-            "the preview shows the image's right (green) pixel"
+            "the surface shows the image's right (green) pixel"
         );
     }
 
@@ -4332,7 +4331,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sessions_preview_texture_follows_it_across_a_scene_id_change() {
+    fn a_sessions_surface_texture_follows_it_across_a_scene_id_change() {
         // The renderer caches a terminal's rendered texture by its SESSION, not by
         // the item's SceneId. A fleet rebuild reassigns tile handles (Tile(n)) every
         // time, and a session moves between roles (a tile, a slide side, the root); so
@@ -4342,7 +4341,7 @@ mod tests {
         let (cols, rows) = (40usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);
         let f = frame(cols, rows, "a session shown as a tile");
-        // A quarter-size tile (preview_scale < 1) so the texture-cache preview path is
+        // A quarter-size tile (contain_scale < 1) so the texture-cache surface path is
         // taken; the same session under a different tile handle each render.
         let rect = RectPx {
             x: 0.0,
@@ -4369,23 +4368,23 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let _ = r.render_offscreen_scene(&tile(SceneId::Tile(1)), font, SIZE_PX);
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             1,
-            "the first paint rasters the preview"
+            "the first paint rasters the surface"
         );
 
         // Re-render the SAME session under a DIFFERENT SceneId, as a fleet rebuild
         // (which reassigns the handle) would. Keyed by session, the texture is reused.
         let _ = r.render_offscreen_scene(&tile(SceneId::Tile(7)), font, SIZE_PX);
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             1,
             "the texture follows the session across the id change — no re-raster"
         );
     }
 
     #[test]
-    fn a_live_previews_changed_row_band_updates_in_place() {
+    fn a_live_surfaces_changed_row_band_updates_in_place() {
         // A live fleet tile keeps producing output. Re-rasterizing its whole (native-
         // res) texture on every change is the cost a banded update removes: only the
         // rows that changed re-render into the persistent texture, and the result is
@@ -4393,7 +4392,7 @@ mod tests {
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let (cols, rows) = (40usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);
-        // A quarter-size tile → the preview path (native-res texture, blitted down).
+        // A quarter-size tile → the surface path (native-res texture, blitted down).
         let rect = RectPx {
             x: 0.0,
             y: 0.0,
@@ -4428,22 +4427,22 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let _ = r.render_offscreen_scene(&tile(fa), font, SIZE_PX);
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             1,
             "the first paint full-rasters the texture"
         );
-        assert_eq!(r.preview_band_updates(), 0);
+        assert_eq!(r.surface_band_updates(), 0);
 
         let banded = r
             .render_offscreen_scene(&tile(fb.clone()), font, SIZE_PX)
             .rgba;
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             1,
             "a one-row change does NOT re-raster the whole texture"
         );
         assert_eq!(
-            r.preview_band_updates(),
+            r.surface_band_updates(),
             1,
             "it band-updates the changed row in place"
         );
@@ -4454,17 +4453,17 @@ mod tests {
             .rgba;
         assert_eq!(
             banded, full,
-            "a banded preview update reproduces a full re-raster exactly"
+            "a banded surface update reproduces a full re-raster exactly"
         );
     }
 
     #[test]
-    fn a_full_window_preview_renders_identically_to_the_inline_path() {
-        // The preview path and the inline full-window path are ONE session renderer: for
+    fn a_full_window_surface_renders_identically_to_the_inline_path() {
+        // The surface path and the inline full-window path are ONE session renderer: for
         // the same frame AND selection they must produce identical pixels — background,
-        // glyphs, and the selection tint. The inline path renders selection; the preview
+        // glyphs, and the selection tint. The inline path renders selection; the surface
         // path must too (it is not a read-only second renderer). A second, off-screen
-        // terminal forces the visible one through the texture/preview path at 1:1.
+        // terminal forces the visible one through the texture/surface path at 1:1.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let f = frame(20, 4, "hello world\r\nsecond line\r\nthird row\r\nfourth");
         let sel = Some(Selection::new((0, 0), (1, 6))); // spans rows 0-1
@@ -4493,9 +4492,9 @@ mod tests {
                 .render_offscreen_scene(&scene, font, SIZE_PX)
                 .rgba
         };
-        // Preview: the same terminal forced through the texture path by a second,
+        // Surface: the same terminal forced through the texture path by a second,
         // off-screen (culled) terminal, blitted 1:1 over the full window.
-        let preview = {
+        let surface = {
             let scene = Scene {
                 size_px: (w, h),
                 layers: vec![
@@ -4508,8 +4507,8 @@ mod tests {
                 .rgba
         };
         assert_eq!(
-            inline, preview,
-            "the preview path must render the session identically to the inline path"
+            inline, surface,
+            "the surface path must render the session identically to the inline path"
         );
     }
 
@@ -4520,7 +4519,7 @@ mod tests {
         // texture ONCE and then composite (blit) it under the moving transform — not
         // rebuild its glyphs every frame (the cost that pegged the CPU). A full-window
         // terminal is the case that, untransformed, renders glyphs inline; the moving
-        // layer is what routes it through the texture cache. `preview_renders` counts
+        // layer is what routes it through the texture cache. `surface_renders` counts
         // only real texture (re)rasters, so it must land at 2 across the whole slide.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let (cols, rows) = (40usize, 24usize);
@@ -4538,7 +4537,7 @@ mod tests {
             let _ = r.render_offscreen_scene(&scene, font, SIZE_PX);
         }
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             2,
             "each side rasters exactly once for the whole slide, then composites"
         );
@@ -4631,14 +4630,14 @@ mod tests {
             Some(band),
         );
 
-        let before = r.preview_renders();
+        let before = r.surface_renders();
         // First slide frame: the outgoing fills the window (identity), the incoming
         // sits fully off the right edge (culled). The outgoing is the foreground
         // session at the same window size, so its Surface is a cache hit — no raster.
         let f0 = slide_scene(a2.clone(), inc.clone(), 0.0, w as f32, w, h);
         r.present_scene(&v, (w, h), &f0, font, SIZE_PX, None);
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             before,
             "the outgoing side reuses the foreground Surface — nothing rasters (the incoming is off-screen)"
         );
@@ -4656,7 +4655,7 @@ mod tests {
         let f1 = slide_scene(a2, inc, -(w as f32) / 2.0, (w as f32) / 2.0, w, h);
         r.present_scene(&v, (w, h), &f1, font, SIZE_PX, None);
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             before + 1,
             "only the incoming side rasters"
         );
@@ -4850,7 +4849,7 @@ mod tests {
         let v = img.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A: full present (straight to swapchain, foreground Surface left stale).
-        // B: band, but the Surface is stale, so it re-renders in full (a preview render).
+        // B: band, but the Surface is stale, so it re-renders in full (a surface render).
         // C: band on a now-valid Surface — a true in-place band update.
         r.present_scene(&v, (w, h), &scene_of(&[]), font, SIZE_PX, None);
         r.present_scene(
@@ -4861,7 +4860,7 @@ mod tests {
             SIZE_PX,
             Some(band_of(11)),
         );
-        let renders_before_c = r.preview_renders();
+        let renders_before_c = r.surface_renders();
         r.present_scene(
             &v,
             (w, h),
@@ -4871,12 +4870,12 @@ mod tests {
             Some(band_of(12)),
         );
         assert_eq!(
-            r.preview_band_updates(),
+            r.surface_band_updates(),
             1,
             "the steady band (C) updates the Surface in place"
         );
         assert_eq!(
-            r.preview_renders(),
+            r.surface_renders(),
             renders_before_c,
             "and does NOT re-render the whole Surface"
         );

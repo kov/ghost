@@ -299,7 +299,7 @@ fn translucent_theme_makes_default_background_see_through() {
 }
 
 #[test]
-fn scales_a_large_preview_frame_to_fit_its_tile() {
+fn scales_a_large_surface_frame_to_fit_its_tile() {
     // A real-size session frame drawn into a tile smaller than itself must be
     // scaled to "contain", not clipped. Mark the bottom-right cell blue: at 1:1
     // it lands outside the tile (scissored away); scaled, it appears inside the
@@ -330,7 +330,7 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
     ));
     let mut renderer = Renderer::headless(Theme::default());
     let img = renderer.render_offscreen_scene(&scene, font, 15.0);
-    let path = write_png("ghost_scaled_preview_sample.png", &img);
+    let path = write_png("ghost_scaled_surface_sample.png", &img);
     eprintln!("WROTE PNG: {}", path.display());
 
     // The blue marker (frame cell at 81,54) maps to ~(40,27) at 0.5x: inside the
@@ -338,22 +338,22 @@ fn scales_a_large_preview_frame_to_fit_its_tile() {
     let (inside, _) = rect(&img, 36, 45, 27, 36, strong_blue);
     assert!(
         inside > 0,
-        "scaled preview should bring the bottom-right cell inside the tile"
+        "scaled surface should bring the bottom-right cell inside the tile"
     );
     // Nothing draws outside the tile rect (x>=45 or y>=36 stays clear).
     let (outside, _) = rect(&img, 45, 90, 0, 72, strong_blue);
-    assert_eq!(outside, 0, "preview must stay within its tile ({outside})");
+    assert_eq!(outside, 0, "surface must stay within its tile ({outside})");
 }
 
 #[test]
-fn an_unchanged_preview_is_not_re_rasterized() {
-    // Two scaled previews (a real-size frame shrunk into a small tile). Rendering
-    // the scene twice must re-render zero preview textures the second time — the
+fn an_unchanged_surface_is_not_re_rasterized() {
+    // Two scaled surfaces (a real-size frame shrunk into a small tile). Rendering
+    // the scene twice must re-render zero surface textures the second time — the
     // cache turns fleet nav and idle tiles into cheap blits, the whole point of RTT.
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
     let frame = {
         let mut vt = Vt::new(80, 24); // 720x432 px at METRICS
-        vt.feed_str("preview content => fn main() { let answer = 42; }");
+        vt.feed_str("surface content => fn main() { let answer = 42; }");
         layout_frame(&vt, METRICS)
     };
     let tile = |id, x: f32| SceneItem::Terminal {
@@ -364,7 +364,7 @@ fn an_unchanged_preview_is_not_re_rasterized() {
             y: 0.0,
             w: 360.0,
             h: 216.0,
-        }, // 0.5x: preview_scale < 1
+        }, // 0.5x: contain_scale < 1
         frame: frame.clone(),
         selection: None,
         dim: false,
@@ -378,34 +378,34 @@ fn an_unchanged_preview_is_not_re_rasterized() {
     let mut r = Renderer::headless(Theme::default());
     let _ = r.render_offscreen_scene(&scene, font, 15.0);
     assert_eq!(
-        r.preview_renders(),
+        r.surface_renders(),
         2,
-        "the first paint renders both preview textures"
+        "the first paint renders both surface textures"
     );
     let _ = r.render_offscreen_scene(&scene, font, 15.0);
     assert_eq!(
-        r.preview_renders(),
+        r.surface_renders(),
         2,
         "an unchanged repaint blits the cache, re-rasterizing nothing"
     );
 }
 
 #[test]
-fn an_animated_dive_camera_does_not_re_rasterize_previews_each_frame() {
+fn an_animated_dive_camera_does_not_re_rasterize_surfaces_each_frame() {
     // The single<->fleet dive zooms by animating each layer's camera transform every
-    // frame (the world is frozen; only the camera moves). A tile's preview TEXTURE
+    // frame (the world is frozen; only the camera moves). A tile's surface TEXTURE
     // must not depend on the live camera scale — otherwise a continuously-zooming
     // dive re-renders every tile's texture on every frame, the O(sessions x frames)
-    // cost that makes the dive sluggish with more than one live preview. Each tile
+    // cost that makes the dive sluggish with more than one live surface. Each tile
     // must (re-)rasterize at most once for the whole dive, not once per frame.
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
     let frame = {
         let mut vt = Vt::new(80, 24); // 720x432 px native at METRICS
-        vt.feed_str("preview content => fn main() { let answer = 42; }");
+        vt.feed_str("surface content => fn main() { let answer = 42; }");
         layout_frame(&vt, METRICS)
     };
-    // Two tiles at a fixed WORLD rect a quarter of native (preview_scale < 1, so the
-    // RTT preview path is taken); the camera — not the rect — is what animates.
+    // Two tiles at a fixed WORLD rect a quarter of native (contain_scale < 1, so the
+    // RTT surface path is taken); the camera — not the rect — is what animates.
     let tile = |id, x: f32| SceneItem::Terminal {
         id,
         session: session_key(&format!("{id:?}")),
@@ -440,11 +440,11 @@ fn an_animated_dive_camera_does_not_re_rasterize_previews_each_frame() {
         let _ = r.render_offscreen_scene(&scene, font, 15.0);
     }
     assert_eq!(
-        r.preview_renders(),
+        r.surface_renders(),
         tiles,
-        "each tile's preview must render once for the whole dive, not once per \
+        "each tile's surface must render once for the whole dive, not once per \
          frame: got {} re-renders for {tiles} tiles over {frames} animated frames",
-        r.preview_renders(),
+        r.surface_renders(),
     );
 }
 
@@ -511,9 +511,9 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
         "a snapshot blit re-shapes nothing"
     );
     assert_eq!(
-        r.preview_renders(),
+        r.surface_renders(),
         0,
-        "a snapshot blit renders no previews"
+        "a snapshot blit renders no surfaces"
     );
 
     // The green backdrop survives the scaled blit: sample a lower row (the text
@@ -537,7 +537,7 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
 #[test]
 fn an_identical_repaint_reshapes_nothing() {
     // Shaping dominates per-frame CPU. The cache must make a repaint of unchanged
-    // text re-shape nothing, so fleet navigation and idle previews stay cheap.
+    // text re-shape nothing, so fleet navigation and idle surfaces stay cheap.
     let mut vt = Vt::new(40, 6);
     vt.feed_str("fn main() != ok { let x = 1; }\r\nsecond line of text => here");
     let frame = layout_frame(&vt, METRICS);

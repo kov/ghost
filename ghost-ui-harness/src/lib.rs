@@ -243,9 +243,9 @@ impl Harness {
             .render_frame(renderer, &mut self.cache, &scene, font, px, pre)
     }
 
-    /// Count of preview textures the renderer has (re)rasterised — a benchmark/test
-    /// hook for the fleet preview cache. Zero until something has rendered.
-    pub fn preview_renders(&self) -> u32 {
-        self.renderer.as_ref().map_or(0, Renderer::preview_renders)
+    /// Count of session surfaces the renderer has (re)rasterised — a benchmark/test
+    /// hook for the session surface cache. Zero until something has rendered.
+    pub fn surface_renders(&self) -> u32 {
+        self.renderer.as_ref().map_or(0, Renderer::surface_renders)
     }
 }
