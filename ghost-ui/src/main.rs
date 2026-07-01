@@ -1237,6 +1237,9 @@ impl ApplicationHandler for App {
                             // damage to fold into the next real present). See
                             // `RootModel::mark_presented`.
                             win.root.mark_presented();
+                            // Model-side cache line (fleet preview frames) under
+                            // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
+                            win.root.emit_cache_trace();
                             // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
                             // this frame and print a summary when a dive ends.
                             if let Some(summary) = win.stats.record(

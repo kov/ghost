@@ -10,3 +10,6 @@ publish = false
 ghost-term = { path = "../ghost-term" }
 ghost-render = { path = "../ghost-render" }
 ghost-vt = { path = "../ghost-vt" }
+# Cache-efficiency instrumentation is emitted via `tracing`; free unless a
+# subscriber (installed by the binary) enables the target under `RUST_LOG`.
+tracing = "0.1.44"

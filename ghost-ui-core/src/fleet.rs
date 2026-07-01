@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use ghost_render::{
-    BadgeKind, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId, SceneItem, Style,
-    Transform, layout_frame,
+    BadgeKind, CacheCounters, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId,
+    SceneItem, Style, Transform, layout_frame,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -203,9 +203,10 @@ pub struct FleetModel {
     size_px: (u32, u32),
     mine: HashSet<SessionId>,
     next_handle: u64,
-    /// Count of tile-frame (re)builds — bumped only when a dirty tile is actually
-    /// laid out, never on a cache hit. Lets a test prove unchanged tiles are reused.
-    frame_builds: u32,
+    /// Hit/miss tallies for the per-tile preview-frame cache: a dirty tile re-lays-out
+    /// (miss + insert), an unchanged tile keeps its `Rc<Frame>` (hit). Lets a test — and
+    /// the `RUST_LOG=ghost::cache` view — prove unchanged tiles are reused, not rebuilt.
+    frames: CacheCounters,
     /// An action awaiting confirmation (kill, or stealing a session held
     /// elsewhere); drives a modal confirm overlay and swallows input until resolved.
     pending: Option<Pending>,
@@ -296,7 +297,7 @@ impl FleetModel {
             size_px,
             mine,
             next_handle: 0,
-            frame_builds: 0,
+            frames: CacheCounters::default(),
             pending: None,
             renaming: None,
             scroll_y: 0.0,
@@ -620,20 +621,27 @@ impl FleetModel {
     /// are the same for every tile, so they're computed once.
     fn refresh_dirty_frames(&mut self) {
         let metrics = self.effective_metrics();
-        let mut builds = 0;
         for tile in &mut self.tiles {
             if tile.frame_dirty {
                 tile.frame = Some(Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
                 tile.frame_dirty = false;
-                builds += 1;
+                self.frames.miss();
+                self.frames.insert();
+            } else {
+                // Unchanged tile: its cached `Rc<Frame>` is reused as-is.
+                self.frames.hit();
             }
         }
-        self.frame_builds += builds;
     }
 
-    /// Total tile-frame (re)builds — see [`FleetModel::frame_builds`](Self::frame_builds).
+    /// Total tile-frame (re)builds (cache misses); an unchanged tile adds none.
     pub fn frame_builds(&self) -> u32 {
-        self.frame_builds
+        self.frames.misses as u32
+    }
+
+    /// Hit/miss tallies for the per-tile preview-frame cache.
+    pub fn frame_cache(&self) -> CacheCounters {
+        self.frames
     }
 
     fn reconcile(&mut self, infos: Vec<SessionInfo>) -> Vec<Cmd> {
@@ -1737,6 +1745,36 @@ mod tests {
         // Output to the other tile rebuilds only it.
         data(&mut m, "b", b"world");
         assert_eq!(m.frame_builds(), base + 2);
+    }
+
+    #[test]
+    fn an_unchanged_tile_is_a_frame_cache_hit_not_a_rebuild() {
+        // The frame cache expressed on hit/miss counters (the `RUST_LOG=ghost::cache`
+        // view and the general regression guard): when one tile changes, the others
+        // must register as hits, not rebuilds. A change that over-invalidates the
+        // fleet — re-laying-out unchanged tiles — shows up here as misses > 1.
+        let mut m = fleet();
+        list(&mut m, &["a", "b", "c"]);
+        let base = m.frame_cache();
+
+        data(&mut m, "a", b"hello");
+        let d = m.frame_cache().since(base);
+        assert_eq!(
+            d.misses, 1,
+            "only the changed tile re-lays-out (misses={})",
+            d.misses
+        );
+        assert!(
+            d.hits >= 2,
+            "the two unchanged tiles are cache hits, not rebuilds (hits={})",
+            d.hits
+        );
+        // For that one-tile change, most tile lookups were served from cache.
+        assert!(
+            d.hit_rate() > 0.5,
+            "a one-tile change should be mostly hits, got {:.2}",
+            d.hit_rate()
+        );
     }
 
     #[test]

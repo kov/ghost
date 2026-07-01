@@ -332,6 +332,28 @@ impl RootModel {
         matches!(self.mode, Mode::Fleet(_))
     }
 
+    /// The fleet's per-tile preview-frame cache stats, if a fleet is present (`None`
+    /// in the single view). Read by tests and emitted by [`Self::emit_cache_trace`].
+    pub fn fleet_frame_cache(&self) -> Option<ghost_render::CacheCounters> {
+        match &self.mode {
+            Mode::Fleet(f) => Some(f.frame_cache()),
+            Mode::Single(_) => None,
+        }
+    }
+
+    /// Emit the model-side cache hit-rates to `tracing` (target `ghost::cache`), to sit
+    /// alongside the renderer's line under `RUST_LOG=ghost::cache=trace`. Free unless
+    /// the target is enabled. Call once per presented frame.
+    pub fn emit_cache_trace(&self) {
+        if let Some(frames) = self.fleet_frame_cache() {
+            tracing::trace!(
+                target: "ghost::cache",
+                fleet_frame_hit_rate = frames.hit_rate(),
+                "fleet frames {frames}",
+            );
+        }
+    }
+
     /// The window's terminal grid in cells at its current pixel size and device
     /// scale — the size a session this window shows is laid out at, and the size
     /// the shell must complete an attach handshake at.
