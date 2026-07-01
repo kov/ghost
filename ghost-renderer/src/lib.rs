@@ -2797,6 +2797,27 @@ impl Renderer {
         }
     }
 
+    /// Build one frame's draw instances (layout → shape → instances) and return the
+    /// count. No render pass, no instance-buffer upload, no readback — the only GPU
+    /// touch is `ensure_glyph` uploading each *cold* glyph's coverage into the atlas
+    /// (`queue.write_texture`), which is tiny and one-time (bounded by the distinct
+    /// glyph set, not the run count). The dominant cost — shaping the distinct runs —
+    /// is pure CPU, so this is what the shape cache and parallel pre-shaping target and
+    /// what a build/shape perf guard should time; the count is returned only so the
+    /// build can't be optimized away. A test that inspects pixels wants
+    /// [`Self::render_offscreen`] instead (which additionally reads ~w·h·4 bytes back
+    /// off the GPU — that copy, not the build, dominates its wall-clock at 4K).
+    pub fn build_frame_cpu(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> usize {
+        self.build_instances(
+            frame,
+            font,
+            size_px,
+            self.selection,
+            0..frame.rows_layout.len(),
+        )
+        .len()
+    }
+
     /// Build a scene's draws in painter order. Glyph/solid content accumulates in
     /// one instance list (returned, drawn by range); a scaled `Terminal` (a fleet
     /// surface) instead renders to a cached texture and emits a blit, whose tile

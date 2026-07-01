@@ -942,3 +942,92 @@ fn a_layer_opacity_fades_its_content() {
         "opacity 0 fades the fill away to the background"
     );
 }
+
+// A screen packed with distinct short colored tokens, mirroring `ls --color`
+// (unique filenames in columns): every ~9-cell token is its own SGR-colored run,
+// all distinct, so a cold build must shape every one of them. Sizing it to a HiDPI
+// 4K grid (213x60 logical cells) reproduces a real full-screen `ls /lib64` at 4K:
+// ~1359 distinct cold runs — the heavy first paint the shape cache + parallel
+// pre-shaping exist to absorb (a warm re-raster then serves it all from cache).
+fn dense_ls_screen(cols: usize, rows: usize) -> Vt {
+    let mut vt = Vt::new(cols, rows);
+    let mut s = String::new();
+    let mut idx = 0usize;
+    for _ in 0..rows {
+        let mut c = 0usize;
+        while c + 9 <= cols {
+            let color = 16 + (idx % 216);
+            s.push_str(&format!("\x1b[38;5;{color}mf{idx:06} "));
+            idx += 1;
+            c += 9;
+        }
+        s.push_str("\r\n");
+    }
+    vt.feed_str(&s);
+    vt
+}
+
+#[test]
+fn cold_full_screen_build_stays_within_budget() {
+    // Regression guard on the one-time cost this stack targets: cold-building a full
+    // 4K screen of dense distinct colored runs (a `ls /lib64` first paint). It times
+    // `build_frame_cpu` — layout+shape, no render pass and no readback (the readback
+    // render_offscreen adds is a pixel-test need that would only pile ~33MB of copy
+    // noise onto this). The build's one GPU touch is cold-glyph atlas uploads, tiny
+    // here: the fixture's `fNNNNNN` tokens use ~11 distinct glyphs, so the timed cost
+    // is the CPU shaping of the distinct runs. Fresh Renderer per sample = cold cache.
+    //
+    // The budget is enforced only in release: unoptimized swash shaping runs ~18x
+    // slower, so a debug `cargo test` gets a loose catastrophe bound instead of the
+    // real number. Measured baselines (4 cores): ~5.0ms release / ~91ms debug; the
+    // ceilings are ~1.6x that. The 8ms release ceiling also sits below the inline
+    // baseline (~18ms), so this fails too if parallel pre-shaping silently regresses.
+    let vt = dense_ls_screen(213, 60); // HiDPI 4K
+    let frame = layout_frame(&vt, METRICS);
+
+    let mut distinct = std::collections::HashSet::new();
+    for row in &frame.rows_layout {
+        for run in &row.runs {
+            distinct.insert(run.text.clone());
+        }
+    }
+    let distinct = distinct.len();
+    assert!(
+        distinct >= 1000,
+        "fixture must stay dense to be a meaningful guard, got {distinct} distinct runs"
+    );
+
+    // A cold build shapes each distinct run exactly once — so the time below is real
+    // shaping work, not a no-op over an already-warm cache.
+    let mut probe = Renderer::headless(Theme::default());
+    probe.build_frame_cpu(&frame, ghost_shaper::font_from_bytes(FIRA).unwrap(), 15.0);
+    assert_eq!(
+        probe.shape_misses() as usize,
+        distinct,
+        "cold build must shape every distinct run once"
+    );
+
+    let mut samples: Vec<std::time::Duration> = Vec::new();
+    for _ in 0..5 {
+        let mut r = Renderer::headless(Theme::default());
+        let t = std::time::Instant::now();
+        let n = r.build_frame_cpu(&frame, ghost_shaper::font_from_bytes(FIRA).unwrap(), 15.0);
+        let e = t.elapsed();
+        std::hint::black_box(n);
+        samples.push(e);
+    }
+    samples.sort();
+    let median = samples[samples.len() / 2];
+
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(160)
+    } else {
+        std::time::Duration::from_millis(8)
+    };
+    assert!(
+        median < budget,
+        "cold build of {distinct} distinct runs took {median:?} (median of 5), over the \
+         {budget:?} budget — cold shaping regressed (parallel pre-shaping off, or per-run \
+         shaping got slower)"
+    );
+}
