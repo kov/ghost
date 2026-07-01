@@ -29,6 +29,9 @@ pub enum Query {
     PrimaryDeviceAttributes,
     /// `CSI > c` / `CSI > 0 c` — secondary device attributes.
     SecondaryDeviceAttributes,
+    /// `CSI = c` / `CSI = 0 c` — tertiary device attributes (unit id). Reply:
+    /// DECRPTUI `DCS ! | 00000000 ST` (xterm's anonymous default).
+    TertiaryDeviceAttributes,
     /// `CSI 18 t` — report text-area size in characters. Reply: `CSI 8 ; rows ; cols t`.
     TextAreaSize,
     /// `CSI ? u` — kitty keyboard protocol flags query. Reply: `CSI ? flags u`
@@ -128,6 +131,7 @@ impl Query {
             Query::DeviceStatus => b"\x1b[0n".to_vec(),
             Query::PrimaryDeviceAttributes => b"\x1b[?61;1;21;22;28c".to_vec(),
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
+            Query::TertiaryDeviceAttributes => b"\x1bP!|00000000\x1b\\".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
             Query::KittyKeyboardFlags => format!("\x1b[?{}u", ctx.kitty_flags).into_bytes(),
             Query::TerminalVersion => {
@@ -327,10 +331,12 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
             b"?996" => Some(Query::ColorScheme),
             _ => None,
         },
-        // DA — device attributes. `>` marks the secondary request.
+        // DA — device attributes. `>` marks the secondary request, `=` the
+        // tertiary (unit id).
         b'c' => match params {
             b"" | b"0" => Some(Query::PrimaryDeviceAttributes),
             b">" | b">0" => Some(Query::SecondaryDeviceAttributes),
+            b"=" | b"=0" => Some(Query::TertiaryDeviceAttributes),
             _ => None,
         },
         // Window ops — only the text-area-size request (18) is a query we answer.
@@ -381,6 +387,8 @@ mod tests {
         assert_eq!(scan_all(b"\x1b[0c"), [Query::PrimaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[>c"), [Query::SecondaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[>0c"), [Query::SecondaryDeviceAttributes]);
+        assert_eq!(scan_all(b"\x1b[=c"), [Query::TertiaryDeviceAttributes]);
+        assert_eq!(scan_all(b"\x1b[=0c"), [Query::TertiaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[18t"), [Query::TextAreaSize]);
         assert_eq!(scan_all(b"\x1b[?u"), [Query::KittyKeyboardFlags]);
         assert_eq!(scan_all(b"\x1b[>q"), [Query::TerminalVersion]);
@@ -486,6 +494,11 @@ mod tests {
         assert_eq!(
             Query::SecondaryDeviceAttributes.reply(&ctx()),
             b"\x1b[>61;8400;1c"
+        );
+        // DA3: DECRPTUI with xterm's all-zero site/serial unit id.
+        assert_eq!(
+            Query::TertiaryDeviceAttributes.reply(&ctx()),
+            b"\x1bP!|00000000\x1b\\"
         );
         assert_eq!(
             Query::TextAreaSize.reply(&ctx()),
