@@ -14,9 +14,10 @@
 #     an alias.
 #   * added   Tc (24-bit colour via SGR 38;2/48;2), fullkbd (kitty keyboard
 #     protocol), km (Alt sends ESC prefix).
-#   * removed Ms (OSC 52 clipboard), ccc/initc/oc (OSC 4/104 palette),
-#     Cs/Cr (OSC 12/112 cursor colour), Smulx (styled underlines),
-#     flash (visual bell) — not implemented yet; re-add as they land.
+#   * removed ccc/initc/oc (OSC 4/104 palette), Cs/Cr (OSC 12/112 cursor
+#     colour), Smulx (styled underlines), flash (visual bell) — not
+#     implemented yet; re-add as they land. Ms (OSC 52 clipboard write) is
+#     implemented and advertised.
 #   * removed rv/xr (they pattern-match kitty's own DA2/XTVERSION replies,
 #     which ghost's differ from; RV/XR, the query strings, stay).
 xterm-kitty|kitty|KovId's TTY,
@@ -70,6 +71,7 @@ xterm-kitty|kitty|KovId's TTY,
 	smul=\E[4m, tbc=\E[3g, tsl=\E]2;, u6=\E[%i%d;%dR, u7=\E[6n,
 	u8=\E[?%[;0123456789]c, u9=\E[c, vpa=\E[%i%p1%dd,
 	BD=\E[?2004l, BE=\E[?2004h,
+	Ms=\E]52;%p1%s;%p2%s\007,
 	PE=\E[201~, PS=\E[200~, RV=\E[>c, Se=\E[2 q,
 	Ss=\E[%p1%d q, TS=\E]2;,
 	XM=\E[?1006;1000%?%p1%{1}%=%th%el%;, XR=\E[>0q,

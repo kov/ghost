@@ -1,7 +1,7 @@
 use crate::graphics::{Image, Placement};
 use crate::line::Line;
 use crate::parser::{self, DecMode, Parser};
-use crate::terminal::{Cursor, Terminal};
+use crate::terminal::{ClipboardSelection, Cursor, Terminal};
 
 /// The active mouse-reporting protocol (DEC private modes 1000/1002/1003),
 /// which governs whether — and for which events — a frontend should send mouse
@@ -104,6 +104,11 @@ impl Vt {
     /// carries in `Pen::link_id`.
     pub fn hyperlink(&self, id: u16) -> Option<&str> {
         self.terminal.hyperlink(id)
+    }
+
+    /// Drain the decoded OSC 52 clipboard writes queued while feeding output.
+    pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
+        self.terminal.take_clipboard_writes()
     }
 
     pub fn title(&self) -> &str {
@@ -706,6 +711,51 @@ mod tests {
         // But printed cells keep linking.
         vt.feed_str("C");
         assert!(vt.line(0)[2].pen().link_id().is_some());
+    }
+
+    #[test]
+    fn osc52_queues_clipboard_writes() {
+        use super::ClipboardSelection::{Clipboard, Primary};
+        let mut vt = Vt::new(20, 5);
+        assert!(vt.take_clipboard_writes().is_empty());
+
+        // BEL- and ST-terminated; base64 payloads decode to the text.
+        vt.feed_str("\x1b]52;c;aGVsbG8=\x07"); // "hello"
+        vt.feed_str("\x1b]52;p;cHJpbWFyeQ==\x1b\\"); // "primary"
+                                                     // An empty selection defaults to the clipboard.
+        vt.feed_str("\x1b]52;;Zm9v\x07"); // "foo"
+        let writes = vt.take_clipboard_writes();
+        assert_eq!(
+            writes,
+            [
+                (Clipboard, "hello".to_string()),
+                (Primary, "primary".to_string()),
+                (Clipboard, "foo".to_string()),
+            ]
+        );
+        assert!(vt.take_clipboard_writes().is_empty(), "drained once");
+
+        // Ignored: the query form (clipboard *read* is a privacy hole),
+        // invalid base64, and payloads that aren't UTF-8 text.
+        vt.feed_str("\x1b]52;c;?\x07");
+        vt.feed_str("\x1b]52;c;!not-base64!\x07");
+        vt.feed_str("\x1b]52;c;/w==\x07"); // a lone 0xFF byte
+        assert!(vt.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn osc52_targets_both_selections_when_asked() {
+        use super::ClipboardSelection::{Clipboard, Primary};
+        let mut vt = Vt::new(20, 5);
+        // Pc lists targets; "pc" writes primary and clipboard alike.
+        vt.feed_str("\x1b]52;pc;Ym90aA==\x07"); // "both"
+        assert_eq!(
+            vt.take_clipboard_writes(),
+            [
+                (Primary, "both".to_string()),
+                (Clipboard, "both".to_string())
+            ]
+        );
     }
 
     #[test]

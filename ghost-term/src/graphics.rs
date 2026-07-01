@@ -716,7 +716,7 @@ impl Control {
     }
 }
 
-fn decode_base64(s: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn decode_base64(s: &str) -> Result<Vec<u8>, ()> {
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
         .map_err(|_| ())

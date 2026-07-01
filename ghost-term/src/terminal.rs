@@ -79,6 +79,18 @@ pub struct Terminal {
     graphics: GraphicsState,
     /// OSC 8 hyperlink URIs, interned; cells reference them via `Pen::link`.
     links: Links,
+    /// Decoded OSC 52 clipboard writes queued for the frontend to apply.
+    /// Ephemeral: drained per feed, never dumped; the detached host discards
+    /// them (there is no user clipboard to write while nobody is attached).
+    clipboard_writes: Vec<(ClipboardSelection, String)>,
+}
+
+/// The selection an OSC 52 write targets (xterm's `Pc`: `c` = clipboard,
+/// `p` = primary; `s` is treated as the clipboard).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ClipboardSelection {
+    Clipboard,
+    Primary,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -167,6 +179,7 @@ impl Terminal {
             tracked_modes: BTreeSet::new(),
             title: String::new(),
             links: Links::default(),
+            clipboard_writes: Vec::new(),
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -565,6 +578,31 @@ impl Terminal {
                 self.pen.link = uri.and_then(|u| self.links.intern(&u));
             }
 
+            SetClipboard(selection, payload) => {
+                // The "?" query form is deliberately unanswered: replying
+                // would hand any program running in any session the user's
+                // clipboard. Writes must decode to UTF-8 text to apply.
+                let text = (payload.trim() != "?")
+                    .then(|| crate::graphics::decode_base64(&payload).ok())
+                    .flatten()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                if let Some(text) = text {
+                    let targets = if selection.is_empty() {
+                        "c"
+                    } else {
+                        &selection
+                    };
+                    for target in targets.chars() {
+                        let target = match target {
+                            'c' | 's' => ClipboardSelection::Clipboard,
+                            'p' => ClipboardSelection::Primary,
+                            _ => continue,
+                        };
+                        self.clipboard_writes.push((target, text.clone()));
+                    }
+                }
+            }
+
             SetTitle(title) => {
                 self.title = title;
             }
@@ -911,6 +949,7 @@ impl Terminal {
         self.title.clear();
         self.graphics.reset();
         self.links.clear();
+        self.clipboard_writes.clear();
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -1008,6 +1047,12 @@ impl Terminal {
     /// The URI behind an interned OSC 8 hyperlink id (see `Pen::link_id`).
     pub fn hyperlink(&self, id: u16) -> Option<&str> {
         self.links.get(id)
+    }
+
+    /// Drain the decoded OSC 52 clipboard writes queued while feeding output.
+    /// The attached frontend applies them; the detached host discards them.
+    pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
+        mem::take(&mut self.clipboard_writes)
     }
 
     #[cfg(test)]

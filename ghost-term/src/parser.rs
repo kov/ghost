@@ -119,6 +119,9 @@ pub enum Function {
     Scorc,
     Scosc,
     Sd(u16),
+    /// OSC 52 clipboard write: the raw `Pc` selection list and the base64
+    /// `Pd` payload, decoded and dispatched by the terminal.
+    SetClipboard(String, String),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
     /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
     SetCursorStyle(u8),
@@ -1040,6 +1043,14 @@ impl Parser {
                     (!uri.is_empty() && uri.len() <= MAX_HYPERLINK_LEN).then(|| uri.to_string()),
                 ))
             }
+            // OSC 52 ; Pc ; Pd — clipboard write (Pd = base64). Kept syntactic
+            // here: the terminal decodes, picks targets from Pc, and ignores
+            // the "?" query form. Oversized payloads are dropped whole.
+            "52" => {
+                let (selection, payload) = rest.split_once(';')?;
+                (payload.len() <= MAX_CLIPBOARD_B64)
+                    .then(|| Function::SetClipboard(selection.to_string(), payload.to_string()))
+            }
             _ => None,
         }
     }
@@ -1395,6 +1406,14 @@ fn dump_function(seq: &mut String, fun: &Function) {
                 seq.push_str(uri);
             }
             seq.push_str("\u{1b}\\");
+        }
+
+        SetClipboard(selection, payload) => {
+            seq.push_str("\u{1b}]52;");
+            seq.push_str(selection);
+            seq.push(';');
+            seq.push_str(payload);
+            seq.push('\u{07}');
         }
 
         Sgr(ops) => {
@@ -1790,6 +1809,9 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
 /// Upper bound on an accepted OSC 8 URI. Generous (browsers cap around 2k;
 /// kitty at 2083) while keeping a hostile stream from interning megabytes.
 const MAX_HYPERLINK_LEN: usize = 4096;
+
+/// Upper bound on an accepted OSC 52 base64 payload (kitty caps at 8 MiB).
+const MAX_CLIPBOARD_B64: usize = 8 * 1024 * 1024;
 
 const MAX_PARAM_LEN: usize = 6;
 
@@ -2301,9 +2323,20 @@ mod tests {
         assert_eq!(parse("\x1b]2;a;b;c\x07"), [SetTitle("a;b;c".to_string())]);
         // An empty title clears it.
         assert_eq!(parse("\x1b]2;\x07"), [SetTitle(String::new())]);
-        // Other OSC codes (e.g. OSC 1 icon name, OSC 52 clipboard) are ignored.
+        // Other OSC codes (e.g. OSC 1 icon name, OSC 4 palette) are ignored.
         assert_eq!(parse("\x1b]1;icon\x07"), []);
-        assert_eq!(parse("\x1b]52;c;Zm9v\x07"), []);
+        assert_eq!(parse("\x1b]4;1;rgb:00/00/00\x07"), []);
+    }
+
+    #[test]
+    fn parse_osc_clipboard() {
+        let set = |sel: &str, b64: &str| SetClipboard(sel.to_string(), b64.to_string());
+        assert_eq!(parse("\x1b]52;c;Zm9v\x07"), [set("c", "Zm9v")]);
+        assert_eq!(parse("\x1b]52;;Zm9v\x1b\\"), [set("", "Zm9v")]);
+        // The query form is carried through; the terminal ignores it.
+        assert_eq!(parse("\x1b]52;c;?\x07"), [set("c", "?")]);
+        // No Pc/Pd separator is malformed.
+        assert_eq!(parse("\x1b]52;Zm9v\x07"), []);
     }
 
     #[test]

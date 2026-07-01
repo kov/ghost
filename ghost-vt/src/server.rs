@@ -496,6 +496,11 @@ fn host_main(
                         let mut w: &pty_process::blocking::Pty = &pty;
                         let _ = w.write_all(&graphics_reply);
                     }
+                    // OSC 52 clipboard writes are applied by an attached
+                    // frontend (which feeds its own emulator from the same
+                    // stream); the host just drains its copy so they never
+                    // accumulate — detached, there is no clipboard to write.
+                    let _ = screen.take_clipboard_writes();
                     // Refresh the discoverable title when the child changes it
                     // (coalesced — only an actual change rewrites the meta file).
                     if screen.title() != meta.title {

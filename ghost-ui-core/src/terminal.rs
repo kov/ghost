@@ -16,7 +16,7 @@
 use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
-use ghost_term::{Line, MouseProtocol};
+use ghost_term::{ClipboardSelection, Line, MouseProtocol};
 use ghost_vt::query::QueryScanner;
 use ghost_vt::screen::{self, Screen};
 
@@ -731,6 +731,15 @@ impl TerminalModel {
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
                     bytes: graphics_replies,
+                });
+            }
+            // OSC 52: apply the app's clipboard writes (copy-over-ssh, tmux
+            // set-clipboard). The emulator already decoded, size-capped, and
+            // refused the read form; route each write to its selection.
+            for (target, text) in self.screen.take_clipboard_writes() {
+                cmds.push(match target {
+                    ClipboardSelection::Clipboard => Cmd::WriteClipboard(text),
+                    ClipboardSelection::Primary => Cmd::WritePrimary(text),
                 });
             }
             // At the live bottom, new output replaces the viewport, so a
@@ -2301,6 +2310,39 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::OpenUrl(_))),
             "unsafe scheme opened: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn osc52_writes_reach_the_system_clipboard_cmds() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]52;c;aGVsbG8=\x07".to_vec(), // "hello"
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::WriteClipboard("hello".to_string())),
+            "no clipboard write: {cmds:?}"
+        );
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]52;p;cHJpbWFyeQ==\x07".to_vec(), // "primary"
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::WritePrimary("primary".to_string())),
+            "no primary write: {cmds:?}"
+        );
+        // The read form gets no reply — nothing goes back to the app.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]52;c;?\x07".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "clipboard query must stay unanswered: {cmds:?}"
         );
     }
 

@@ -164,6 +164,13 @@ impl Screen {
         self.vt.take_graphics_responses()
     }
 
+    /// Drain the decoded OSC 52 clipboard writes queued while feeding child
+    /// output. The attached frontend applies them to the system clipboard; the
+    /// detached host drains and discards (nobody's clipboard to write).
+    pub fn take_clipboard_writes(&mut self) -> Vec<(ghost_term::ClipboardSelection, String)> {
+        self.vt.take_clipboard_writes()
+    }
+
     /// Cursor position as 1-based `(col, row)` — the form a cursor-position
     /// report (CPR) carries. `avt` tracks the cursor 0-based.
     pub fn cursor(&self) -> (u16, u16) {
