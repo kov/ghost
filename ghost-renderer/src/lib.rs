@@ -697,6 +697,24 @@ struct Surface {
 /// the least-recently-used ages out, bounding memory without evicting an active role.
 const MAX_SURFACES_PER_SESSION: usize = 4;
 
+/// A session Surface a deferred (mid-animation) render decided NOT to rasterize on the
+/// frame loop — it needs a full raster (missing, or a rebuilt tile the model can't confirm
+/// unchanged) that would stall the animation. Instead the render blits the best already-
+/// cached surface as a placeholder and stashes this, and [`Renderer::warm_next`] rasters
+/// one per frame off the critical path (see the module's decouple: an animation never
+/// waits on any session's raster, however slow). The frozen `frame`/`rect` are stable
+/// across the animation's ticks, so a request stays valid until it is warmed.
+struct WarmRequest {
+    session: u64,
+    frame: Rc<Frame>,
+    selection: Option<Selection>,
+    /// The camera-independent source rect (`surface_src` output) that sizes the texture.
+    rect: RectPx,
+    /// Texture pixel size (`surface_size(frame, rect)`), cached for dedup.
+    size: (u32, u32),
+    size_px: f32,
+}
+
 /// The last fully-rendered scene, captured to a texture so an interactive resize
 /// can stretch-blit it to the changing surface instead of re-laying-out and
 /// re-rasterizing the whole window at every drag step — ruinous in the fleet view
@@ -1086,6 +1104,13 @@ pub struct Renderer {
     /// Monotonic counter stamped onto a surface's `used_tick` on each cache access, for
     /// least-recently-used eviction when a session exceeds [`MAX_SURFACES_PER_SESSION`].
     surface_tick: u64,
+    /// When set (by the shell during a dive/slide), a full surface raster is DEFERRED
+    /// rather than run on the animation's frame loop: the render blits the best cached
+    /// surface as a placeholder and enqueues the raster (see [`WarmRequest`]). Off (the
+    /// default) for the steady foreground and the static fleet, which raster eagerly.
+    deferring: bool,
+    /// Deferred surface rasters awaiting a `warm_next` slot (see [`WarmRequest`]).
+    warm_queue: Vec<WarmRequest>,
     /// One blit quad per surface drawn this scene, parallel to the `Draw::Surface`
     /// quad indices.
     surface_quads: Option<wgpu::Buffer>,
@@ -1420,6 +1445,8 @@ impl Renderer {
             erase_pipeline,
             surfaces: HashMap::new(),
             surface_tick: 0,
+            deferring: false,
+            warm_queue: Vec::new(),
             surface_quads: None,
             surface_renders: 0,
             surface_band_updates: 0,
@@ -1675,7 +1702,8 @@ impl Renderer {
         rect: RectPx,
         font: FontRef,
         size_px: f32,
-    ) -> (u32, u32) {
+        deferring: bool,
+    ) -> Option<(u32, u32)> {
         let size = Self::surface_size(frame, rect);
         let key = (session, size);
         self.surface_tick += 1;
@@ -1721,6 +1749,16 @@ impl Renderer {
             }
             _ => Plan::Full,
         };
+        // Mid-animation, a full raster is DEFERRED: it would stall the frame loop, so
+        // enqueue it and blit the best already-cached surface (this exact size if we have
+        // it — same content, maybe a tick stale — else any size, stretched) as a
+        // placeholder. `None` = the session has no surface at all yet; the caller draws a
+        // background quad and the warm fills it in a frame or two. A cache hit
+        // (Current/Band) still runs inline — it is already cheap.
+        if deferring && matches!(plan, Plan::Full) {
+            self.enqueue_warm(session, frame, selection, rect, size, size_px);
+            return self.placeholder_for(session, size, tick);
+        }
         match plan {
             Plan::Current => {
                 // cache hit: blit the existing texture; mark it most-recently-used.
@@ -1743,7 +1781,99 @@ impl Renderer {
                 self.prune_session_surfaces(session);
             }
         }
-        size
+        Some(size)
+    }
+
+    /// The size half of the best cached surface to blit as a placeholder for `session`
+    /// while its `want`-sized texture warms: the exact `want` size if cached (right size,
+    /// content at most a tick stale), otherwise the most-recently-used size (stretched).
+    /// `None` if the session has no cached surface yet. Bumps the chosen surface's
+    /// `used_tick` so it is not LRU-evicted while standing in.
+    fn placeholder_for(&mut self, session: u64, want: (u32, u32), tick: u64) -> Option<(u32, u32)> {
+        let pick = if self.surfaces.contains_key(&(session, want)) {
+            Some(want)
+        } else {
+            self.surfaces
+                .iter()
+                .filter(|((s, _), _)| *s == session)
+                .max_by_key(|(_, surf)| surf.used_tick)
+                .map(|((_, sz), _)| *sz)
+        };
+        if let Some(sz) = pick
+            && let Some(surf) = self.surfaces.get_mut(&(session, sz))
+        {
+            surf.used_tick = tick;
+        }
+        pick
+    }
+
+    /// Stash a deferred surface raster for `warm_next`, unless the same `(session, size)`
+    /// is already queued (a tile that stays a placeholder across several animation frames
+    /// enqueues once, not once per frame).
+    fn enqueue_warm(
+        &mut self,
+        session: u64,
+        frame: &Rc<Frame>,
+        selection: Option<Selection>,
+        rect: RectPx,
+        size: (u32, u32),
+        size_px: f32,
+    ) {
+        if self
+            .warm_queue
+            .iter()
+            .any(|w| w.session == session && w.size == size)
+        {
+            return;
+        }
+        self.warm_queue.push(WarmRequest {
+            session,
+            frame: frame.clone(),
+            selection,
+            rect,
+            size,
+            size_px,
+        });
+    }
+
+    /// Set whether full surface rasters are deferred off the frame loop (see
+    /// [`Self::deferring`]). The shell turns this on for the duration of a dive/slide.
+    /// Turning it OFF drops any un-warmed requests: the animation is over, so the static
+    /// view that follows (a fleet, a single foreground) rasters what it shows eagerly, and
+    /// a stale queue would only re-raster it.
+    pub fn set_deferring(&mut self, on: bool) {
+        if !on {
+            self.warm_queue.clear();
+        }
+        self.deferring = on;
+    }
+
+    /// Rasterize ONE queued deferred surface (see [`WarmRequest`]), off the animation's
+    /// critical path; returns whether more remain (so the shell keeps requesting redraws
+    /// until the fleet is warm). A no-op returning `false` when the queue is empty.
+    pub fn warm_next(&mut self, font: FontRef) -> bool {
+        if self.warm_queue.is_empty() {
+            return false;
+        }
+        let w = self.warm_queue.remove(0);
+        // Force the raster (not deferring): render the frozen frame at its target size.
+        self.ensure_surface(
+            w.session,
+            &w.frame,
+            w.selection,
+            TermDamage::All,
+            w.rect,
+            font,
+            w.size_px,
+            false,
+        );
+        !self.warm_queue.is_empty()
+    }
+
+    /// Number of deferred surface rasters still awaiting a `warm_next` — the shell keeps
+    /// the frame loop alive (requests redraws) while this is non-zero.
+    pub fn warm_queue_len(&self) -> usize {
+        self.warm_queue.len()
     }
 
     /// Drop the least-recently-used cached surface(s) for `session` once it holds more
@@ -2611,26 +2741,51 @@ impl Renderer {
                             // transform, so the terminal still moves/zooms; the texture
                             // stays put.
                             let src = surface_src(frame, *rect);
-                            let size = self.ensure_surface(
-                                *session, frame, *selection, *damage, src, font, size_px,
+                            let blit = self.ensure_surface(
+                                *session,
+                                frame,
+                                *selection,
+                                *damage,
+                                src,
+                                font,
+                                size_px,
+                                self.deferring,
                             );
                             seen.insert(*session);
-                            draws.push(Draw::Surface {
-                                scissor,
-                                quad: blits.len() as u32,
-                                key: (*session, size),
-                            });
-                            blits.push(*rect);
-                            if *dim {
-                                // Darken the unfocused tile with a translucent
-                                // overlay over the blit (matches `dim_colors`'
-                                // 0.55 RGB factor: black at 1.0 - 0.55 alpha).
-                                push_glyphs(
-                                    &mut all,
-                                    &mut draws,
-                                    scissor,
-                                    vec![solid(*rect, DIM_OVERLAY)],
-                                );
+                            match blit {
+                                Some(size) => {
+                                    // The real (or, mid-animation, a placeholder) surface.
+                                    draws.push(Draw::Surface {
+                                        scissor,
+                                        quad: blits.len() as u32,
+                                        key: (*session, size),
+                                    });
+                                    blits.push(*rect);
+                                    if *dim {
+                                        // Darken the unfocused tile with a translucent
+                                        // overlay over the blit (matches `dim_colors`'
+                                        // 0.55 RGB factor: black at 1.0 - 0.55 alpha).
+                                        push_glyphs(
+                                            &mut all,
+                                            &mut draws,
+                                            scissor,
+                                            vec![solid(*rect, DIM_OVERLAY)],
+                                        );
+                                    }
+                                }
+                                None => {
+                                    // Deferred, and the session has no cached surface yet:
+                                    // a background-coloured placeholder until `warm_next`
+                                    // rasters it (a frame or two). Its own bg, camera-
+                                    // transformed with the tile by `apply_layer` below.
+                                    let bg = self.bg_fill_color();
+                                    push_glyphs(
+                                        &mut all,
+                                        &mut draws,
+                                        scissor,
+                                        vec![solid(*rect, bg)],
+                                    );
+                                }
                             }
                         } else {
                             // Full-window single view: glyphs inline, as before.
@@ -3028,7 +3183,9 @@ impl Renderer {
         if !self.foreground_valid || self.foreground_session != Some(session) {
             self.surfaces.remove(&win_key);
         }
-        self.ensure_surface(session, frame, selection, damage, src, font, size_px);
+        // The steady foreground never defers — it is not an animation, and the whole point
+        // is a crisp 1:1 composite this frame.
+        let _ = self.ensure_surface(session, frame, selection, damage, src, font, size_px, false);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
         // Blit the whole Surface onto the swapchain (resets the uniform, which the render
@@ -4274,6 +4431,114 @@ mod tests {
             2,
             "the foreground present did not evict the tile surface"
         );
+    }
+
+    #[test]
+    fn a_deferred_animation_render_blits_a_placeholder_and_warms_off_the_frame_loop() {
+        // During an animation the compositor must NOT rasterize a session's surface on the
+        // frame loop (that is the stall). Instead it blits the best already-cached surface
+        // as a placeholder, enqueues the raster, and `warm_next` runs one per frame off the
+        // critical path. So an animation never waits on a session's raster, however slow.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9 + 60, rows as u32 * 18 + 40);
+        let sess = session_key("deferred-dive");
+        let fg_frame = std::rc::Rc::new(frame(cols, rows, "the foreground content"));
+        // The frozen dive tile — the SAME Rc every tick (as `Anim::scene` clones it).
+        let tile_frame = std::rc::Rc::new(frame(cols, rows, "the foreground content"));
+        let fg = || Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    session: sess,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: fg_frame.clone(),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::All,
+                }],
+            )],
+        };
+        // A quarter-window tile (native-res surface path), the frozen dive frame.
+        let tile = || Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Tile(1),
+                    session: sess,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32 / 4.0,
+                        h: h as f32 / 4.0,
+                    },
+                    frame: tile_frame.clone(),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::None,
+                }],
+            )],
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Single view: the foreground rasters its window-res surface (the placeholder the
+        // dive-out will blit).
+        r.present_scene(&v, (w, h), &fg(), font, SIZE_PX);
+        assert_eq!(r.surface_renders(), 1);
+
+        // Dive out (deferring on): the tile has no native-res surface, so a normal render
+        // would rasterize it here. Deferred, it must NOT — it enqueues and blits the
+        // foreground surface as a placeholder.
+        r.set_deferring(true);
+        let _ = r.render_offscreen_scene(&tile(), font, SIZE_PX);
+        assert_eq!(
+            r.surface_renders(),
+            1,
+            "a deferred animation frame rasterizes nothing on the frame loop"
+        );
+        assert_eq!(r.warm_queue_len(), 1, "the tile raster is enqueued to warm");
+
+        // Re-rendering the same deferred frame does NOT enqueue a second copy.
+        let _ = r.render_offscreen_scene(&tile(), font, SIZE_PX);
+        assert_eq!(
+            r.warm_queue_len(),
+            1,
+            "an already-queued raster is not re-enqueued"
+        );
+        assert_eq!(r.surface_renders(), 1);
+
+        // Warm one off the frame loop: NOW the native tile surface rasters.
+        assert!(
+            !r.warm_next(font),
+            "one entry, so no more remain after warming it"
+        );
+        assert_eq!(
+            r.surface_renders(),
+            2,
+            "warm_next rasters the deferred surface"
+        );
+        assert_eq!(r.warm_queue_len(), 0);
+
+        // Next dive frame: the tile's surface is warm (same frozen Rc), so it blits the
+        // real texture — a cache hit, no raster, nothing enqueued.
+        let _ = r.render_offscreen_scene(&tile(), font, SIZE_PX);
+        assert_eq!(
+            r.surface_renders(),
+            2,
+            "once warm, the tile is a cache hit — no re-raster"
+        );
+        assert_eq!(r.warm_queue_len(), 0);
     }
 
     #[test]

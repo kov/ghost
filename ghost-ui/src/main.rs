@@ -1196,6 +1196,12 @@ impl ApplicationHandler for App {
                         let t_model = Instant::now();
                         let scene = win.root.view();
                         let model = t_model.elapsed();
+                        // During a dive/slide, DEFER session surface rasters off the frame
+                        // loop: a mid-animation tile that needs a full raster blits the best
+                        // cached surface as a placeholder and is warmed one-per-frame below,
+                        // so the animation never stalls on a slow session's raster.
+                        let animating = win.root.is_animating();
+                        win.gfx.renderer.set_deferring(animating);
                         // Rasterize at the model's render scale (device × zoom) so
                         // glyph size matches the grid the scene was laid out for.
                         let font_px = SIZE_PX * win.root.render_scale();
@@ -1233,6 +1239,14 @@ impl ApplicationHandler for App {
                             {
                                 event_loop.exit();
                             }
+                        }
+                        // Warm ONE deferred surface off the just-finished frame's slack, so
+                        // the fleet fills in over the animation's frames without any single
+                        // frame rasterizing a heavy session inline. The animation's own
+                        // ticks drive the redraws that keep draining this.
+                        if animating {
+                            let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+                            win.gfx.renderer.warm_next(font);
                         }
                     }
                 }
