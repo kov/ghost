@@ -19,7 +19,7 @@
 //! same answers whether the session is attached or detached.
 
 /// A query the host knows how to answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// `CSI 6 n` — cursor position report. Reply: `CSI row ; col R` (1-based).
     CursorPosition,
@@ -58,6 +58,17 @@ pub enum Query {
     /// extension, mode 2031's query form). Reply: `CSI ? 997 ; Ps n` with
     /// Ps 1 = dark, 2 = light.
     ColorScheme,
+    /// XTGETTCAP `DCS + q Pt ST` — termcap/terminfo capability query; `Pt` is
+    /// a `;`-separated list of hex-encoded capability names (decoded here).
+    /// Answered per cap, kitty-style: `DCS 1 + r <hexname>[=<hexvalue>] ST`
+    /// for a known cap (no `=value` for a true boolean), `DCS 0 + r <hexname>
+    /// ST` for an unknown one.
+    Termcap(Vec<String>),
+    /// DECRQSS `DCS $ q <selector> ST` — request a control-function setting.
+    /// Only DECSCUSR (`" q"`, the cursor style — vim's t_RS probe) is
+    /// reported; everything else gets the well-formed invalid reply
+    /// `DCS 0 $ r ST`.
+    Setting(String),
 }
 
 /// The default fg/bg an OSC 10/11 color query is answered with. The attached
@@ -103,6 +114,9 @@ pub struct ReplyCtx<'a> {
     pub size: (u16, u16),
     /// Current kitty-keyboard progressive-enhancement flags.
     pub kitty_flags: u8,
+    /// The cursor style as a steady DECSCUSR digit (2 block, 4 underline,
+    /// 6 bar — see [`decscusr_digit`]), for DECRQSS `" q"`.
+    pub cursor_style: u8,
     /// Default fg/bg for the OSC color queries.
     pub colors: ThemeColors,
     /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
@@ -114,6 +128,47 @@ pub struct ReplyCtx<'a> {
 /// (each 8-bit channel doubled into 16 bits).
 fn xterm_rgb([r, g, b]: [u8; 3]) -> String {
     format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+/// The steady DECSCUSR digit for a cursor shape (blink is not tracked):
+/// block 2, underline 4, bar 6.
+pub fn decscusr_digit(shape: ghost_term::CursorShape) -> u8 {
+    match shape {
+        ghost_term::CursorShape::Block => 2,
+        ghost_term::CursorShape::Underline => 4,
+        ghost_term::CursorShape::Bar => 6,
+    }
+}
+
+/// Lowercase-hex encode (XTGETTCAP carries names and values hex-encoded).
+fn hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode a hex-encoded XTGETTCAP capability name; `None` on bad hex/UTF-8.
+fn unhex(s: &str) -> Option<String> {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect();
+    String::from_utf8(bytes?).ok()
+}
+
+/// The value ghost reports for a termcap/terminfo capability name:
+/// `Some(Some(v))` = string/number cap, `Some(None)` = true boolean cap,
+/// `None` = not a capability we advertise. Kept consistent with the shipped
+/// xterm-kitty terminfo entry.
+fn termcap_value(name: &str) -> Option<Option<String>> {
+    match name {
+        "TN" | "name" => Some(Some("xterm-kitty".to_string())),
+        "Co" | "colors" => Some(Some("256".to_string())),
+        // 24-bit color, both spellings (tmux checks either).
+        "RGB" | "Tc" => Some(None),
+        _ => None,
+    }
 }
 
 impl Query {
@@ -155,6 +210,23 @@ impl Query {
                 format!("\x1b]12;{}\x1b\\", xterm_rgb(ctx.colors.cursor)).into_bytes()
             }
             Query::ColorScheme => color_scheme_report(&ctx.colors),
+            Query::Termcap(names) => {
+                let mut out = String::new();
+                for name in names {
+                    match termcap_value(name) {
+                        Some(Some(value)) => {
+                            out.push_str(&format!("\x1bP1+r{}={}\x1b\\", hex(name), hex(&value)));
+                        }
+                        Some(None) => out.push_str(&format!("\x1bP1+r{}\x1b\\", hex(name))),
+                        None => out.push_str(&format!("\x1bP0+r{}\x1b\\", hex(name))),
+                    }
+                }
+                out.into_bytes()
+            }
+            Query::Setting(selector) => match selector.as_str() {
+                " q" => format!("\x1bP1$r{} q\x1b\\", ctx.cursor_style).into_bytes(),
+                _ => b"\x1bP0$r\x1b\\".to_vec(),
+            },
         }
     }
 }
@@ -167,6 +239,11 @@ const MAX_CSI_PARAMS: usize = 32;
 /// "11;?") are tiny; anything longer is a title/clipboard/other string, marked
 /// overflowed and never classified — so a truncation can't masquerade as one.
 const MAX_OSC_PAYLOAD: usize = 16;
+
+/// Upper bound on a collected DCS payload. XTGETTCAP requests carry a short
+/// hex-encoded cap-name list; anything longer (sixel data, big DECRQSS-style
+/// blobs) is marked overflowed and never classified.
+const MAX_DCS_PAYLOAD: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -181,7 +258,12 @@ enum State {
     Osc,
     /// Saw `ESC` inside an OSC string — maybe the start of an ST (`ESC \`).
     OscEsc,
-    /// Inside a DCS/SOS/PM/APC string, skipping until its terminator.
+    /// Inside a DCS string (`ESC P`), collecting a small payload (XTGETTCAP
+    /// and DECRQSS live here) until its ST terminator.
+    Dcs,
+    /// Saw `ESC` inside a DCS string — maybe the start of an ST (`ESC \`).
+    DcsEsc,
+    /// Inside a SOS/PM/APC string, skipping until its terminator.
     Str,
     /// Saw `ESC` inside such a string — maybe the start of an ST.
     StrEsc,
@@ -199,6 +281,12 @@ pub struct QueryScanner {
     /// The current OSC outgrew [`MAX_OSC_PAYLOAD`] (or carried an embedded
     /// escape): whatever terminates it, it is not a query.
     osc_overflow: bool,
+    /// Payload of the DCS currently being collected (bounded; see
+    /// [`MAX_DCS_PAYLOAD`]).
+    dcs: Vec<u8>,
+    /// The current DCS outgrew [`MAX_DCS_PAYLOAD`] (or carried an embedded
+    /// escape): whatever terminates it, it is not a query.
+    dcs_overflow: bool,
 }
 
 impl Default for QueryScanner {
@@ -214,6 +302,8 @@ impl QueryScanner {
             params: Vec::new(),
             osc: Vec::new(),
             osc_overflow: false,
+            dcs: Vec::new(),
+            dcs_overflow: false,
         }
     }
 
@@ -229,6 +319,21 @@ impl QueryScanner {
             b"12;?" => Some(Query::CursorColor),
             _ => None,
         }
+    }
+
+    /// Classify the just-terminated DCS, if it stayed small enough to be one
+    /// of the queries we answer (XTGETTCAP `+q`, DECRQSS `$q`).
+    fn dcs_query(&self) -> Option<Query> {
+        if self.dcs_overflow {
+            return None;
+        }
+        let s = std::str::from_utf8(&self.dcs).ok()?;
+        if let Some(names) = s.strip_prefix("+q") {
+            let names: Vec<String> = names.split(';').filter_map(unhex).collect();
+            return (!names.is_empty()).then_some(Query::Termcap(names));
+        }
+        s.strip_prefix("$q")
+            .map(|sel| Query::Setting(sel.to_string()))
     }
 
     /// Feed the next chunk of output; returns the queries it contained, in order.
@@ -251,8 +356,14 @@ impl QueryScanner {
                         self.osc_overflow = false;
                         self.state = State::Osc;
                     }
-                    // DCS, SOS, PM, APC: string controls terminated by ST.
-                    b'P' | b'X' | b'^' | b'_' => self.state = State::Str,
+                    // DCS: collected (XTGETTCAP/DECRQSS ride in it).
+                    b'P' => {
+                        self.dcs.clear();
+                        self.dcs_overflow = false;
+                        self.state = State::Dcs;
+                    }
+                    // SOS, PM, APC: string controls skipped until their ST.
+                    b'X' | b'^' | b'_' => self.state = State::Str,
                     // ESC ESC: stay primed for the real introducer.
                     0x1b => {}
                     // Any other short escape sequence: nothing we answer.
@@ -299,6 +410,24 @@ impl QueryScanner {
                     } else {
                         self.osc_overflow = true;
                         self.state = State::Osc;
+                    }
+                }
+                State::Dcs => match b {
+                    0x1b => self.state = State::DcsEsc,
+                    _ if self.dcs.len() < MAX_DCS_PAYLOAD => self.dcs.push(b),
+                    _ => self.dcs_overflow = true,
+                },
+                State::DcsEsc => {
+                    // `ESC \` is ST; any other byte is still DCS payload (and
+                    // an embedded escape disqualifies it as a query).
+                    if b == b'\\' {
+                        if let Some(q) = self.dcs_query() {
+                            out.push(q);
+                        }
+                        self.state = State::Ground;
+                    } else {
+                        self.dcs_overflow = true;
+                        self.state = State::Dcs;
                     }
                 }
                 State::Str => match b {
@@ -450,6 +579,7 @@ mod tests {
             cursor: (1, 1),
             size: (80, 24),
             kitty_flags: 0,
+            cursor_style: 2,
             colors: ThemeColors::default(),
             mode_state: &no_modes,
         }
@@ -574,6 +704,46 @@ mod tests {
             s.starts_with("\x1bP>|ghost ") && s.ends_with("\x1b\\"),
             "malformed XTVERSION reply: {s:?}"
         );
+    }
+
+    #[test]
+    fn xtgettcap_answers_per_cap_with_hex_encoding() {
+        // "TN"=544e (name string), "RGB"=524742 (boolean), "Co"=436f
+        // (number), "XX"=5858 (unknown). One DCS reply per cap, kitty-style.
+        let qs = scan_all(b"\x1bP+q544e;524742;436f;5858\x1b\\");
+        assert_eq!(qs.len(), 1);
+        let reply = String::from_utf8(qs[0].reply(&ctx())).unwrap();
+        assert_eq!(
+            reply,
+            concat!(
+                "\x1bP1+r544e=787465726d2d6b69747479\x1b\\", // TN=xterm-kitty
+                "\x1bP1+r524742\x1b\\",                      // RGB (boolean true)
+                "\x1bP1+r436f=323536\x1b\\",                 // Co=256
+                "\x1bP0+r5858\x1b\\",                        // XX: unknown
+            )
+        );
+        // Split across feeds still recognized; garbage hex is dropped.
+        let mut s = QueryScanner::new();
+        assert!(s.scan(b"\x1bP+q54").is_empty());
+        assert_eq!(s.scan(b"63\x1b\\").len(), 1); // "Tc"
+        assert!(scan_all(b"\x1bP+qZZ\x1b\\").is_empty());
+    }
+
+    #[test]
+    fn decrqss_reports_the_cursor_style_and_rejects_the_rest() {
+        // DECRQSS for DECSCUSR (selector " q") answers the current style.
+        let qs = scan_all(b"\x1bP$q q\x1b\\");
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].reply(&ctx()), b"\x1bP1$r2 q\x1b\\");
+        let bar = ReplyCtx {
+            cursor_style: 6,
+            ..ctx()
+        };
+        assert_eq!(qs[0].reply(&bar), b"\x1bP1$r6 q\x1b\\");
+        // Settings we do not report get the well-formed invalid reply
+        // (validity 0), not silence — the prober can move on immediately.
+        let qs = scan_all(b"\x1bP$qm\x1b\\");
+        assert_eq!(qs[0].reply(&ctx()), b"\x1bP0$r\x1b\\");
     }
 
     #[test]

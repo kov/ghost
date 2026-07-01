@@ -482,6 +482,7 @@ fn host_main(
                             cursor: screen.cursor(),
                             size: screen.dimensions(),
                             kitty_flags: screen.kitty_keyboard_flags(),
+                            cursor_style: crate::query::decscusr_digit(screen.vt().cursor().shape),
                             // Detached, nobody sees the live scheme; answer
                             // with the last-attached client's colors (ghost's
                             // default if none ever attached), under any

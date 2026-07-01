@@ -831,6 +831,7 @@ impl TerminalModel {
                 cursor: screen.cursor(),
                 size: screen.dimensions(),
                 kitty_flags: screen.kitty_keyboard_flags(),
+                cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
                 colors: screen.effective_colors(self.theme),
                 mode_state: &mode_state,
             };
@@ -3117,6 +3118,7 @@ mod tests {
             cursor: (1, 1),
             size: (80, 24),
             kitty_flags: 0,
+            cursor_style: 2,
             colors: ThemeColors::default(),
             mode_state: &no_modes,
         }
