@@ -111,6 +111,8 @@ pub enum Function {
     /// report the well-known C0 keys (Ctrl+letter, Tab, Enter, Esc, …).
     ModifyOtherKeys(u8),
     Nel,
+    /// OSC 133 shell integration (FinalTerm semantic prompts).
+    PromptMark(PromptMark),
     Print(char),
     Rep(u16),
     Ri,
@@ -188,6 +190,17 @@ impl DecMode {
                 | SynchronizedOutput
         )
     }
+}
+
+/// The OSC 133 semantic marks (FinalTerm shell integration): where a prompt
+/// begins, where the user's command line begins, where its output begins, and
+/// that it finished (with an exit code when reported).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PromptMark {
+    PromptStart,
+    CommandStart,
+    OutputStart,
+    CommandDone(Option<i32>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -1051,6 +1064,28 @@ impl Parser {
                 (payload.len() <= MAX_CLIPBOARD_B64)
                     .then(|| Function::SetClipboard(selection.to_string(), payload.to_string()))
             }
+            // OSC 133 — FinalTerm shell integration. The letter picks the
+            // mark; anything after a `;` is extension parameters (kitty's
+            // `k=s` and friends), accepted and dropped — except D's first
+            // field, the command's exit code.
+            "133" => {
+                let (mark, params) = match rest.split_once(';') {
+                    Some((m, p)) => (m, Some(p)),
+                    None => (rest, None),
+                };
+                let mark = match mark {
+                    "A" => PromptMark::PromptStart,
+                    "B" => PromptMark::CommandStart,
+                    "C" => PromptMark::OutputStart,
+                    "D" => PromptMark::CommandDone(
+                        params
+                            .and_then(|p| p.split(';').next())
+                            .and_then(|c| c.parse().ok()),
+                    ),
+                    _ => return None,
+                };
+                Some(Function::PromptMark(mark))
+            }
             _ => None,
         }
     }
@@ -1413,6 +1448,23 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push_str(selection);
             seq.push(';');
             seq.push_str(payload);
+            seq.push('\u{07}');
+        }
+
+        PromptMark(mark) => {
+            seq.push_str("\u{1b}]133;");
+            match mark {
+                crate::parser::PromptMark::PromptStart => seq.push('A'),
+                crate::parser::PromptMark::CommandStart => seq.push('B'),
+                crate::parser::PromptMark::OutputStart => seq.push('C'),
+                crate::parser::PromptMark::CommandDone(code) => {
+                    seq.push('D');
+                    if let Some(code) = code {
+                        seq.push(';');
+                        seq.push_str(&code.to_string());
+                    }
+                }
+            }
             seq.push('\u{07}');
         }
 

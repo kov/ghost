@@ -495,6 +495,41 @@ impl TerminalModel {
         }
     }
 
+    /// A Ctrl/Cmd+Shift+arrow that jumps between OSC 133 prompt marks, if it
+    /// is one. `true` = back into history (Up), `false` = forward (Down).
+    fn prompt_jump_key(&self, key: &Key, mods: Mods) -> Option<bool> {
+        if !mods.shift || !(mods.ctrl || mods.sup) || mods.alt {
+            return None;
+        }
+        match key {
+            Key::Named(NamedKey::ArrowUp) => Some(true),
+            Key::Named(NamedKey::ArrowDown) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Scroll so the nearest prompt mark above (`back`) or below the current
+    /// viewport top lands at the top. The chord is always consumed; with no
+    /// prompt to jump to the view just stays put.
+    fn jump_to_prompt(&mut self, back: bool) -> Vec<Cmd> {
+        let vt = self.screen.vt();
+        let scrolled_off = vt.lines_scrolled_off();
+        let top = scrolled_off - self.scroll_offset;
+        let target = if back {
+            vt.prompt_rows().filter(|&r| r < top).last()
+        } else {
+            vt.prompt_rows().find(|&r| r > top)
+        };
+        let Some(row) = target else {
+            return Vec::new();
+        };
+        if self.set_scroll(scrolled_off.saturating_sub(row)) {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn key(
         &mut self,
         key: &Key,
@@ -552,6 +587,14 @@ impl TerminalModel {
                 }
                 Scroll::Bottom => self.snap_to_bottom(),
             };
+        }
+        if let Some(back) = self.prompt_jump_key(key, mods) {
+            // Same drag guard as scroll_key: a moving viewport would retarget
+            // an in-progress window-relative selection.
+            if self.held.is_some() {
+                return Vec::new();
+            }
+            return self.jump_to_prompt(back);
         }
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
@@ -2703,6 +2746,58 @@ mod tests {
             m.update(wheel(1.0)); // scroll far past the top
         }
         assert_eq!(top_row_text(&m), "L0", "clamps at the oldest retained line");
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_jump_between_prompts() {
+        const CTRL_SHIFT: Mods = Mods {
+            shift: true,
+            ctrl: true,
+            alt: false,
+            sup: false,
+        };
+        let mut m = model();
+        // Three OSC 133;A-marked prompts with enough output between them to
+        // push the early ones into scrollback (24-row viewport).
+        let mut s = String::from("\x1b]133;A\x07P0");
+        for i in 1..40 {
+            s.push_str(&format!("\r\nA{i}"));
+        }
+        s.push_str("\r\n\x1b]133;A\x07P1");
+        for i in 1..40 {
+            s.push_str(&format!("\r\nB{i}"));
+        }
+        s.push_str("\r\n\x1b]133;A\x07P2");
+        feed(&mut m, s.as_bytes());
+        assert_eq!(top_row_text(&m), "B17", "starts at the live bottom");
+
+        // Up walks back through prompt history, landing each prompt at the top.
+        let cmds = key(&mut m, Key::Named(NamedKey::ArrowUp), CTRL_SHIFT);
+        assert_eq!(top_row_text(&m), "P1");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "the jump chord never reaches the child"
+        );
+        key(&mut m, Key::Named(NamedKey::ArrowUp), CTRL_SHIFT);
+        assert_eq!(top_row_text(&m), "P0");
+        key(&mut m, Key::Named(NamedKey::ArrowUp), CTRL_SHIFT);
+        assert_eq!(top_row_text(&m), "P0", "no prompt above: stays put");
+
+        // Down walks forward again, then back to the live view.
+        key(&mut m, Key::Named(NamedKey::ArrowDown), CTRL_SHIFT);
+        assert_eq!(top_row_text(&m), "P1");
+        key(&mut m, Key::Named(NamedKey::ArrowDown), CTRL_SHIFT);
+        assert_eq!(
+            top_row_text(&m),
+            "B17",
+            "last prompt is on-screen: live view"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::ArrowDown), CTRL_SHIFT);
+        assert_eq!(top_row_text(&m), "B17", "no prompt below: stays put");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "the chord is consumed even when there is nowhere to jump"
+        );
     }
 
     #[test]

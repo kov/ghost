@@ -16,7 +16,7 @@ use crate::parser::{
 use crate::pen::{Intensity, Pen};
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::mem;
 use unicode_width::UnicodeWidthChar;
 
@@ -83,7 +83,22 @@ pub struct Terminal {
     /// Ephemeral: drained per feed, never dumped; the detached host discards
     /// them (there is no user clipboard to write while nobody is attached).
     clipboard_writes: Vec<(ClipboardSelection, String)>,
+    /// OSC 133;A prompt starts as absolute primary-buffer rows (the numbering
+    /// [`lines_scrolled_off`] uses), oldest first — what prompt-jump scrollback
+    /// navigation walks. Bounded; marks that scroll beyond retained history
+    /// are pruned. Like the graphics placements' anchors, positions predate
+    /// any later reflow.
+    prompt_marks: VecDeque<usize>,
+    /// Whether an OSC 133 C..D command is mid-flight. Transient (not dumped),
+    /// like `last_exit`.
+    command_running: bool,
+    /// The exit code the last OSC 133;D reported, if any.
+    last_exit: Option<i32>,
 }
+
+/// Cap on retained prompt marks; the oldest fall off first (they are also the
+/// first to leave retained scrollback).
+const MAX_PROMPT_MARKS: usize = 1024;
 
 /// The selection an OSC 52 write targets (xterm's `Pc`: `c` = clipboard,
 /// `p` = primary; `s` is treated as the clipboard).
@@ -180,6 +195,9 @@ impl Terminal {
             title: String::new(),
             links: Links::default(),
             clipboard_writes: Vec::new(),
+            prompt_marks: VecDeque::new(),
+            command_running: false,
+            last_exit: None,
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -578,6 +596,35 @@ impl Terminal {
                 self.pen.link = uri.and_then(|u| self.links.intern(&u));
             }
 
+            PromptMark(mark) => {
+                use crate::parser::PromptMark::*;
+                match mark {
+                    PromptStart => {
+                        // Marks belong to the primary buffer's history; a
+                        // prompt printed while the alternate screen is active
+                        // has no stable row to anchor to.
+                        if self.active_buffer_type == BufferType::Primary {
+                            let row = self.buffer.lines_scrolled_off() + self.cursor.row;
+                            if self.prompt_marks.back() != Some(&row) {
+                                if self.prompt_marks.len() == MAX_PROMPT_MARKS {
+                                    self.prompt_marks.pop_front();
+                                }
+                                self.prompt_marks.push_back(row);
+                            }
+                        }
+                    }
+                    CommandStart => {}
+                    OutputStart => {
+                        self.command_running = true;
+                        self.last_exit = None;
+                    }
+                    CommandDone(code) => {
+                        self.command_running = false;
+                        self.last_exit = code;
+                    }
+                }
+            }
+
             SetClipboard(selection, payload) => {
                 // The "?" query form is deliberately unanswered: replying
                 // would hand any program running in any session the user's
@@ -950,6 +997,9 @@ impl Terminal {
         self.graphics.reset();
         self.links.clear();
         self.clipboard_writes.clear();
+        self.prompt_marks.clear();
+        self.command_running = false;
+        self.last_exit = None;
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -1053,6 +1103,28 @@ impl Terminal {
     /// The attached frontend applies them; the detached host discards them.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
         mem::take(&mut self.clipboard_writes)
+    }
+
+    /// Absolute rows (same space as [`lines_scrolled_off`]) of OSC 133;A
+    /// prompt starts still reachable through the retained scrollback,
+    /// oldest first.
+    pub fn prompt_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        let buffer = self.primary_buffer();
+        let oldest = buffer.lines_scrolled_off() - buffer.scrollback_len();
+        self.prompt_marks
+            .iter()
+            .copied()
+            .filter(move |&r| r >= oldest)
+    }
+
+    /// Whether an OSC 133;C command is running (no `;D` seen yet).
+    pub fn command_running(&self) -> bool {
+        self.command_running
+    }
+
+    /// Exit status from the most recent OSC 133;D, if it carried one.
+    pub fn last_exit_status(&self) -> Option<i32> {
+        self.last_exit
     }
 
     #[cfg(test)]
@@ -1775,10 +1847,20 @@ impl Terminal {
         // 1. dump primary screen buffer
 
         let mut funs = Vec::new();
+        // Prompt marks re-emitted as buffer-relative line indices so the
+        // replaying terminal re-records them at matching depths.
+        let base =
+            self.primary_buffer().lines_scrolled_off() - self.primary_buffer().scrollback_len();
+        let marks: Vec<usize> = self
+            .prompt_marks
+            .iter()
+            .filter_map(|&r| r.checked_sub(base))
+            .collect();
         dump_buffer_lines(
             self.primary_buffer(),
             &self.links,
             include_scrollback,
+            &marks,
             &mut funs,
         );
 
@@ -2080,7 +2162,7 @@ impl Terminal {
 }
 
 fn dump_buffer(buffer: &Buffer, links: &Links, funs: &mut Vec<Function>) {
-    dump_buffer_lines(buffer, links, false, funs);
+    dump_buffer_lines(buffer, links, false, &[], funs);
 }
 
 /// Dump a buffer's lines as a redraw sequence. With `include_scrollback`, the
@@ -2094,6 +2176,7 @@ fn dump_buffer_lines(
     buffer: &Buffer,
     links: &Links,
     include_scrollback: bool,
+    marks: &[usize],
     funs: &mut Vec<Function>,
 ) {
     let skip = if include_scrollback {
@@ -2116,8 +2199,16 @@ fn dump_buffer_lines(
 
     let last = total - 1;
     let mut pen = Pen::default();
+    // `marks` holds buffer-relative line indices (ascending) of prompt starts;
+    // re-emit each mark just before its line so replay re-records it there.
+    let mut marks = marks.iter().copied().skip_while(|&m| m < skip).peekable();
 
     for (i, line) in buffer.lines().skip(skip).take(cutoff).enumerate() {
+        while marks.peek() == Some(&(i + skip)) {
+            funs.push(Function::PromptMark(crate::parser::PromptMark::PromptStart));
+            marks.next();
+        }
+
         // Chunks split on any pen difference, links included, so a link
         // transition is always a chunk boundary.
         for cells in line.chunks(|c1, c2| c1.pen() != c2.pen()) {

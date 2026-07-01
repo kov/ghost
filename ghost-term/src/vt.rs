@@ -111,6 +111,24 @@ impl Vt {
         self.terminal.take_clipboard_writes()
     }
 
+    /// Absolute rows (same space as [`lines_scrolled_off`](Self::lines_scrolled_off))
+    /// of OSC 133;A prompt starts still reachable through the retained
+    /// scrollback, oldest first.
+    pub fn prompt_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.terminal.prompt_rows()
+    }
+
+    /// Whether an OSC 133 shell-integration command is currently running
+    /// (`;C` seen, no `;D` yet).
+    pub fn command_running(&self) -> bool {
+        self.terminal.command_running()
+    }
+
+    /// Exit status reported by the most recent OSC 133;D, if it carried one.
+    pub fn last_exit_status(&self) -> Option<i32> {
+        self.terminal.last_exit_status()
+    }
+
     pub fn title(&self) -> &str {
         self.terminal.title()
     }
@@ -711,6 +729,76 @@ mod tests {
         // But printed cells keep linking.
         vt.feed_str("C");
         assert!(vt.line(0)[2].pen().link_id().is_some());
+    }
+
+    #[test]
+    fn osc133_prompt_marks_record_absolute_rows() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]133;A\x07$ one\r\n");
+        vt.feed_str("out\r\nout\r\n");
+        // ST-terminated, and kitty-style params after the letter are accepted.
+        vt.feed_str("\x1b]133;A;k=s\x1b\\$ two\r\n");
+        assert_eq!(vt.prompt_rows().collect::<Vec<_>>(), [0, 3]);
+
+        // A duplicate mark on the same row records once.
+        vt.feed_str("\x1b]133;A\x07\x1b]133;A\x07$ dup");
+        assert_eq!(vt.prompt_rows().collect::<Vec<_>>(), [0, 3, 4]);
+
+        // Rows are absolute: scrolling doesn't move recorded marks.
+        vt.feed_str("\r\nx\r\nx\r\nx\r\n");
+        assert_eq!(vt.prompt_rows().collect::<Vec<_>>(), [0, 3, 4]);
+    }
+
+    #[test]
+    fn osc133_marks_beyond_retained_history_are_pruned() {
+        let mut vt = Vt::builder().size(10, 3).scrollback_limit(2).build();
+        vt.feed_str("\x1b]133;A\x07$ old\r\n");
+        // Push the mark far past the 2-line scrollback.
+        for _ in 0..10 {
+            vt.feed_str("x\r\n");
+        }
+        assert_eq!(vt.prompt_rows().count(), 0, "unreachable mark pruned");
+    }
+
+    #[test]
+    fn osc133_tracks_command_exit() {
+        let mut vt = Vt::new(20, 5);
+        assert!(!vt.command_running());
+        assert_eq!(vt.last_exit_status(), None);
+
+        vt.feed_str("\x1b]133;A\x07$ \x1b]133;B\x07make\x1b]133;C\x07");
+        assert!(vt.command_running(), "output began (C): command runs");
+        vt.feed_str("building...\r\n\x1b]133;D;2\x07");
+        assert!(!vt.command_running());
+        assert_eq!(vt.last_exit_status(), Some(2));
+
+        // A bare D (no code) still ends the command.
+        vt.feed_str("\x1b]133;C\x07\x1b]133;D\x07");
+        assert!(!vt.command_running());
+        assert_eq!(vt.last_exit_status(), None);
+    }
+
+    #[test]
+    fn prompt_marks_survive_a_dump_roundtrip() {
+        let mut vt = Vt::builder().size(20, 4).scrollback_limit(50).build();
+        vt.feed_str("\x1b]133;A\x07$ one\r\nout\r\nout\r\n");
+        vt.feed_str("\x1b]133;A\x07$ two\r\nmore\r\n");
+
+        let mut vt2 = Vt::builder().size(20, 4).scrollback_limit(50).build();
+        vt2.feed_str(&vt.dump_with_scrollback());
+
+        // The two terminals may number history differently (trimming), so
+        // compare each mark's depth below the live viewport top.
+        let depths = |vt: &Vt| {
+            vt.prompt_rows()
+                .map(|r| vt.lines_scrolled_off() as i64 - r as i64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(depths(&vt), depths(&vt2));
+
+        // Reset clears marks and command state.
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.prompt_rows().count(), 0);
     }
 
     #[test]
