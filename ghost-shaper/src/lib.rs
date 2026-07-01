@@ -50,6 +50,25 @@ pub fn font_from_index(data: &[u8], index: usize) -> Option<FontRef<'_>> {
     FontRef::from_index(data, index)
 }
 
+/// A face's PostScript name (OpenType name id 6), if it declares one.
+fn postscript_name(font: FontRef) -> Option<String> {
+    font.localized_strings()
+        .find(|s| s.id() == swash::StringId::PostScript)
+        .map(|s| s.to_string())
+}
+
+/// Within a font file that may be a `.ttc` collection, the index of the face whose
+/// PostScript name is `postscript`. macOS's CoreText resolves a family+style to a
+/// file URL plus the matched face's PostScript name, but not its index within a
+/// collection (Menlo, SF Mono, … all ship as collections); this recovers that index
+/// so the exact face is loaded. `None` if no face in the file matches.
+pub fn face_index_by_postscript(data: &[u8], postscript: &str) -> Option<usize> {
+    (0usize..)
+        .map_while(|i| FontRef::from_index(data, i).map(|f| (i, f)))
+        .find(|(_, f)| postscript_name(*f).as_deref() == Some(postscript))
+        .map(|(i, _)| i)
+}
+
 /// A font family's faces for the four terminal styles. `regular` always exists; the
 /// bold/italic/bold-italic slots are `Some` only when a real face was found, so a
 /// missing style is synthesized from the nearest face we do have. `Copy` — it is
@@ -218,4 +237,22 @@ pub fn rasterize(font: FontRef, glyph: u16, size_px: f32, synth: Synthesis) -> O
         height: image.placement.height,
         coverage: image.data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The bundled Fira Code fixture: a single face at index 0 (see the tests dir).
+    const FIRA: &[u8] = include_bytes!("../tests/assets/FiraCode-Regular.ttf");
+
+    #[test]
+    fn finds_a_face_by_its_postscript_name() {
+        // Read the fixture's own PostScript name, then look it back up: a single-face
+        // file resolves to index 0, and an unknown name resolves to nothing. This is
+        // the lookup CoreText leans on to recover a face's index inside a `.ttc`.
+        let name = postscript_name(font_from_bytes(FIRA).unwrap()).expect("Fira has a PS name");
+        assert_eq!(face_index_by_postscript(FIRA, &name), Some(0));
+        assert_eq!(face_index_by_postscript(FIRA, "No-Such-Face"), None);
+    }
 }

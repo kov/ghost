@@ -38,14 +38,19 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Resolve a configured `[font] family` to a font file. fontconfig is the Linux font
-# database, so this is Linux-only; other targets fall back to the bundled font.
+# database; macOS uses CoreText instead (below). Other targets fall back to the
+# bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
 
-# The native macOS menu bar (see src/menu.rs). These objc2 crates are already in
-# the tree via the vendored winit, so this pulls in no new compiled crate; pinned
-# to winit's 0.5/0.2 line to share its runtime types (Retained, MainThreadMarker).
+# The native macOS menu bar (see src/menu.rs) and CoreText font resolution (see
+# src/font.rs). The objc2 crates are already in the tree via the vendored winit, so
+# they pull in no new compiled crate; pinned to winit's 0.5/0.2 line to share its
+# runtime types (Retained, MainThreadMarker). core-text 20 matches the core-foundation
+# 0.9 / core-graphics 0.23 line wgpu's Metal backend already pulls in, so nothing is
+# duplicated; we only touch its high-level API (std types out), so no direct CF dep.
 [target.'cfg(target_os = "macos")'.dependencies]
+core-text = "20.1"
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = [
     "NSApplication",

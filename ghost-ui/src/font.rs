@@ -3,20 +3,24 @@
 //! implies at the chosen size.
 //!
 //! An unset `[font] family` uses the bundled Fira Code as a single face (bold and
-//! italic synthesized). A named family is resolved through fontconfig (Linux only —
-//! fontconfig is the Linux font database): we resolve each style and keep only the
-//! faces fontconfig returns a *distinct* file for, because it always returns
-//! something (falling back to a nearby face when the exact style is absent). Each
-//! kept face's file is read and leaked to `'static`, exactly as the bundled bytes
-//! are, so the per-window `FontSet` borrows them for the whole run. Any failure —
-//! fontconfig unavailable, no match, unreadable file, non-Linux — falls back to the
-//! bundle with a log, never fatal.
+//! italic synthesized). A named family is resolved through the platform's font
+//! database — fontconfig on Linux, CoreText on macOS — into up to four real faces.
+//! Both backends resolve each style and keep only the ones that map to a *distinct*
+//! face, because both hand back *something* even for an absent style (a nearby face);
+//! a repeat means "synthesize this one". They converge on a common shape
+//! ([`ResolvedFaces`]): a `(file, index-in-file)` per slot, which [`load_and_assemble`]
+//! reads, leaks to `'static` (exactly as the bundled bytes are, so the per-window
+//! `FontSet` borrows them for the whole run), and turns into a `FontSet`. Any failure
+//! — backend unavailable, no match, unreadable file, unsupported OS — falls back to
+//! the bundle with a log, never fatal.
 
 use ghost_render::CellMetrics;
 use ghost_shaper::FontSet;
-// `FontRef` only names types in the fontconfig (Linux) resolution path.
-#[cfg(target_os = "linux")]
+// `FontRef` and file paths only appear in the family-resolution paths (Linux/macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ghost_shaper::FontRef;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::PathBuf;
 
 /// The bundled default face: Fira Code Regular (SIL OFL-1.1), which carries the
 /// programming ligatures. Same asset the shaper's tests use.
@@ -50,9 +54,10 @@ fn bundled() -> FontSet<'static> {
 }
 
 /// Read a font file and leak its bytes to `'static`, then parse the `idx`-th face.
-/// Only the fontconfig path uses this; off Linux there is no family resolution, so
-/// gate it out to stay `-D dead_code` clean now that macOS is a built target.
-#[cfg(target_os = "linux")]
+/// Only the family-resolution paths use this, so it is gated to those targets to stay
+/// `-D dead_code` clean where there is no resolution (e.g. Windows falls back to the
+/// bundle without ever reading a file).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load(path: &std::path::Path, idx: usize) -> Option<FontRef<'static>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -65,25 +70,83 @@ fn load(path: &std::path::Path, idx: usize) -> Option<FontRef<'static>> {
     ghost_shaper::font_from_index(leaked, idx)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The face files resolved for a family: the mandatory regular face plus the
+/// bold/italic/bold-italic slots that resolved to a *distinct* real face (a repeat
+/// means the style is absent and gets synthesized). Each entry is a file path and the
+/// face index within it — 0 unless the file is a `.ttc` collection. Produced per
+/// platform (fontconfig / CoreText) and consumed by [`load_and_assemble`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ResolvedFaces {
+    regular: (PathBuf, usize),
+    bold: Option<(PathBuf, usize)>,
+    italic: Option<(PathBuf, usize)>,
+    bold_italic: Option<(PathBuf, usize)>,
+}
+
+/// Read the resolved face files into a [`FontSet`], logging a per-style real/synth
+/// summary. Falls back to the bundled face if even the regular face can't be read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn load_and_assemble(family: &str, faces: ResolvedFaces) -> FontSet<'static> {
+    let Some(regular) = load(&faces.regular.0, faces.regular.1) else {
+        return bundled();
+    };
+    let slot = |s: Option<(PathBuf, usize)>| s.and_then(|(p, i)| load(&p, i));
+    let bold = slot(faces.bold);
+    let italic = slot(faces.italic);
+    let bold_italic = slot(faces.bold_italic);
+
+    // "real" = a distinct face the backend found; "synth" = none, so the style is
+    // synthesized from the nearest face we do have.
+    let tag = |f: &Option<FontRef<'static>>| if f.is_some() { "real" } else { "synth" };
+    eprintln!(
+        "ghost-ui: font family {family:?} -> {} (bold {}, italic {}, bold-italic {})",
+        faces.regular.0.display(),
+        tag(&bold),
+        tag(&italic),
+        tag(&bold_italic),
+    );
+
+    FontSet {
+        regular,
+        bold,
+        italic,
+        bold_italic,
+    }
+}
+
+// No fontconfig, no CoreText (Windows, the BSDs, …): a configured family can't be
+// resolved, so serve the bundled face.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
     if family.is_some() {
-        eprintln!("ghost-ui: [font] family needs fontconfig (Linux only); using bundled Fira Code");
+        eprintln!(
+            "ghost-ui: [font] family resolution is unsupported on this OS; using bundled Fira Code"
+        );
     }
     bundled()
 }
 
 #[cfg(target_os = "linux")]
 fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
-    use std::path::PathBuf;
-
     let Some(family) = family else {
         return bundled();
     };
-    let Some(fc) = fontconfig::Fontconfig::new() else {
+    match fontconfig_faces(family) {
+        Some(faces) => load_and_assemble(family, faces),
+        None => {
+            eprintln!("ghost-ui: no font for family {family:?}; using bundled Fira Code");
+            bundled()
+        }
+    }
+}
+
+/// Resolve `family` to face files through fontconfig, the Linux font database.
+#[cfg(target_os = "linux")]
+fn fontconfig_faces(family: &str) -> Option<ResolvedFaces> {
+    let fc = fontconfig::Fontconfig::new().or_else(|| {
         eprintln!("ghost-ui: fontconfig unavailable; using bundled Fira Code");
-        return bundled();
-    };
+        None
+    })?;
 
     // (file, face-index) for `family` in `style`, or None if fontconfig can't match.
     let query = |style: Option<&str>| -> Option<(PathBuf, usize)> {
@@ -91,14 +154,8 @@ fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
         Some((font.path, font.index.unwrap_or(0) as usize))
     };
 
-    // Regular is the yardstick; without it, fall back to the bundle entirely.
-    let Some((reg_path, reg_idx)) = query(None) else {
-        eprintln!("ghost-ui: no font for family {family:?}; using bundled Fira Code");
-        return bundled();
-    };
-    let Some(regular) = load(&reg_path, reg_idx) else {
-        return bundled();
-    };
+    // Regular is the yardstick; without it, there is nothing to resolve against.
+    let (reg_path, reg_idx) = query(None)?;
 
     // Each style slot tries its aliases in order and takes the first file that differs
     // from every face already chosen — fontconfig always returns *something*, so a hit
@@ -112,39 +169,107 @@ fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
         })
     };
 
-    let bold_q = resolve_slot(&["Bold"], &[&reg_path]);
-    let italic_q = resolve_slot(&["Italic", "Oblique"], &[&reg_path]);
+    let bold = resolve_slot(&["Bold"], &[&reg_path]);
+    let italic = resolve_slot(&["Italic", "Oblique"], &[&reg_path]);
     // Bold-italic must differ from regular AND from whatever bold/italic resolved to.
     let mut bi_reused = vec![&reg_path];
-    if let Some((p, _)) = &bold_q {
+    if let Some((p, _)) = &bold {
         bi_reused.push(p);
     }
-    if let Some((p, _)) = &italic_q {
+    if let Some((p, _)) = &italic {
         bi_reused.push(p);
     }
-    let bold_italic_q = resolve_slot(&["Bold Italic", "Bold Oblique"], &bi_reused);
+    let bold_italic = resolve_slot(&["Bold Italic", "Bold Oblique"], &bi_reused);
 
-    let bold = bold_q.and_then(|(p, i)| load(&p, i));
-    let italic = italic_q.and_then(|(p, i)| load(&p, i));
-    let bold_italic = bold_italic_q.and_then(|(p, i)| load(&p, i));
-
-    // A per-face summary: "real" = a distinct file fontconfig found, "synth" = none, so
-    // the style is synthesized from the nearest face.
-    let tag = |f: &Option<FontRef<'static>>| if f.is_some() { "real" } else { "synth" };
-    eprintln!(
-        "ghost-ui: font family {family:?} -> {} (bold {}, italic {}, bold-italic {})",
-        reg_path.display(),
-        tag(&bold),
-        tag(&italic),
-        tag(&bold_italic),
-    );
-
-    FontSet {
-        regular,
+    Some(ResolvedFaces {
+        regular: (reg_path, reg_idx),
         bold,
         italic,
         bold_italic,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
+    let Some(family) = family else {
+        return bundled();
+    };
+    match coretext_faces(family) {
+        Some(faces) => load_and_assemble(family, faces),
+        None => {
+            eprintln!("ghost-ui: no font for family {family:?}; using bundled Fira Code");
+            bundled()
+        }
     }
+}
+
+/// The point size CoreText realizes descriptors at. Only the resolved file URL and
+/// face names matter here, never the size, so any nonzero value works.
+#[cfg(target_os = "macos")]
+const CORETEXT_RESOLVE_PT: f64 = 16.0;
+
+/// Resolve `family` to face files through CoreText, macOS's font database. `None`
+/// when the family isn't installed — CoreText substitutes a system font for an
+/// unknown name, so we verify the realized family — or has no readable file.
+#[cfg(target_os = "macos")]
+fn coretext_faces(family: &str) -> Option<ResolvedFaces> {
+    use core_text::font;
+    use core_text::font_descriptor::{kCTFontBoldTrait, kCTFontItalicTrait};
+
+    // A face's (file, PostScript name, index-in-file). CoreText hands us the file URL
+    // and the matched face's PostScript name; the shaper recovers the face's index
+    // within a `.ttc` from that name (macOS system fonts are collections). `None` if
+    // the font has no on-disk file (e.g. a system font baked into the shared cache).
+    let locate = |f: &font::CTFont| -> Option<(PathBuf, String, usize)> {
+        let path = f.copy_descriptor().font_path()?;
+        let ps = f.postscript_name();
+        let idx = ghost_shaper::face_index_by_postscript(&std::fs::read(&path).ok()?, &ps)?;
+        Some((path, ps, idx))
+    };
+
+    // CTFontCreateWithName substitutes a system font for an unknown family, so trust
+    // the result only when the realized family actually matches what was asked for.
+    let base = font::new_from_name(family, CORETEXT_RESOLVE_PT).ok()?;
+    if !base.family_name().eq_ignore_ascii_case(family) {
+        return None;
+    }
+    let (reg_path, reg_ps, reg_idx) = locate(&base)?;
+
+    // Ask CoreText for each styled variant. It returns a distinct real face when the
+    // family ships one, and either nothing or the same face when it doesn't — in which
+    // case the style is synthesized. This mirrors the Linux distinct-file check, keyed
+    // on the PostScript name: a `.ttc` shares one file across styles, so the *name*,
+    // not the path, is a face's identity.
+    let styled = |value| locate(&base.clone_with_symbolic_traits(value, value)?);
+    let bold_s = styled(kCTFontBoldTrait);
+    let italic_s = styled(kCTFontItalicTrait);
+    let bold_italic_s = styled(kCTFontBoldTrait | kCTFontItalicTrait);
+
+    // Keep a styled slot only when its PostScript name differs from every face already
+    // chosen (an equal name is CoreText handing back a face we already have).
+    let distinct = |cand: &Option<(PathBuf, String, usize)>, taken: &[&str]| {
+        cand.as_ref()
+            .filter(|(_, ps, _)| !taken.contains(&ps.as_str()))
+            .map(|(p, _, i)| (p.clone(), *i))
+    };
+    let bold = distinct(&bold_s, &[reg_ps.as_str()]);
+    let italic = distinct(&italic_s, &[reg_ps.as_str()]);
+    // Bold-italic must differ from regular AND from whatever bold/italic resolved to.
+    let mut bi_taken = vec![reg_ps.as_str()];
+    if let Some((_, ps, _)) = &bold_s {
+        bi_taken.push(ps);
+    }
+    if let Some((_, ps, _)) = &italic_s {
+        bi_taken.push(ps);
+    }
+    let bold_italic = distinct(&bold_italic_s, &bi_taken);
+
+    Some(ResolvedFaces {
+        regular: (reg_path, reg_idx),
+        bold,
+        italic,
+        bold_italic,
+    })
 }
 
 #[cfg(test)]
@@ -171,6 +296,33 @@ mod tests {
         // this exercises the lookup → load → metrics path and must yield a usable
         // regular face at whole-pixel cell dimensions — never a panic.
         let setup = FontSetup::resolve(Some("monospace"), 15.0);
+        assert!(setup.metrics.advance > 0.0 && setup.metrics.advance.fract() == 0.0);
+        assert!(setup.metrics.line_height > 0.0);
+        assert_eq!(setup.size, 15.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolving_a_system_family_yields_real_bold_and_italic() {
+        // Menlo ships on every macOS as a single `.ttc` carrying distinct Regular,
+        // Bold, Italic, and Bold-Italic faces. CoreText resolution must return each
+        // as a *real* face (not a synthesized one), which exercises the whole path:
+        // family+trait lookup → file URL → recovering the right index within the
+        // collection → load → metrics. A bundled-only fallback would leave the
+        // bold/italic slots `None`, so this pins that macOS gets real faces.
+        let setup = FontSetup::resolve(Some("Menlo"), 15.0);
+        assert!(
+            setup.fonts.bold.is_some(),
+            "Menlo bold should be a real face"
+        );
+        assert!(
+            setup.fonts.italic.is_some(),
+            "Menlo italic should be a real face"
+        );
+        assert!(
+            setup.fonts.bold_italic.is_some(),
+            "Menlo bold-italic should be a real face"
+        );
         assert!(setup.metrics.advance > 0.0 && setup.metrics.advance.fract() == 0.0);
         assert!(setup.metrics.line_height > 0.0);
         assert_eq!(setup.size, 15.0);
