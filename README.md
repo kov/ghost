@@ -122,7 +122,14 @@ macOS (no `signalfd`/`kqueue` split).
 - **Reusing a session name overwrites its prior recording** (no timestamping
   yet).
 - **No built-in `ghost play`** — use `ghost export` + `asciinema play`.
-- **`TERM` is inherited** from the `ghost new` environment; it is not normalized.
+
+Sessions are spawned with `TERM=xterm-kitty` (ghost's emulator implements the
+kitty feature profile, and apps enable modern features — kitty keyboard
+protocol, synchronized output — based on the TERM name). ghost provides the
+terminfo entry itself: precompiled in the macOS `.app` bundle, or compiled on
+first use into `$XDG_DATA_HOME/ghost/terminfo` with the system `tic`, handed
+to children via `TERMINFO_DIRS`. Set `GHOST_TERM` to override the advertised
+`TERM`.
 
 ## Development
 

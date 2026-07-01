@@ -38,6 +38,10 @@ struct BundleOpts {
     version: String,
     /// `.icns` app icon to embed in `Resources/`, if one exists.
     icon: Option<PathBuf>,
+    /// Compiled terminfo database to embed as `Resources/terminfo` — ghost
+    /// advertises `TERM=xterm-kitty` and ships the entry to back it (see
+    /// `ghost-vt`'s `terminfo` module, which looks for this directory).
+    terminfo: Option<PathBuf>,
 }
 
 fn main() {
@@ -84,12 +88,29 @@ fn bundle() -> R<PathBuf> {
     let icon = manifest_dir().join("assets").join(ICON_NAME);
     let opts = BundleOpts {
         binary,
+        terminfo: Some(compile_terminfo(&ws)?),
         out_dir: ws.join("target/release"),
         version: read_version(&ws.join("ghost-ui/Cargo.toml")),
         // A missing `.icns` just omits the icon; the bundle still builds.
         icon: icon.exists().then_some(icon),
     };
     assemble_bundle(&opts)
+}
+
+/// Compile ghost's vendored terminfo entry (`ghost-vt/assets`) into a fresh
+/// database directory with the system `tic`, for embedding in the bundle.
+fn compile_terminfo(ws: &Path) -> R<PathBuf> {
+    let db = ws.join("target/release/bundle-terminfo");
+    if db.exists() {
+        fs::remove_dir_all(&db)?;
+    }
+    fs::create_dir_all(&db)?;
+    let src = ws.join("ghost-vt/assets/xterm-kitty.terminfo");
+    run_cmd(
+        "tic",
+        &["-x", "-o", &db.to_string_lossy(), &src.to_string_lossy()],
+    )?;
+    Ok(db)
 }
 
 /// (Re)generate `assets/ghost.icns` from `assets/ghost-icon.svg` via
@@ -179,6 +200,10 @@ fn assemble_bundle(opts: &BundleOpts) -> R<PathBuf> {
 
     if let Some(icon) = &opts.icon {
         fs::copy(icon, resources.join(ICON_NAME))?;
+    }
+
+    if let Some(terminfo) = &opts.terminfo {
+        copy_dir(terminfo, &resources.join("terminfo"))?;
     }
 
     fs::write(app.join("Contents/Info.plist"), info_plist(opts))?;
@@ -330,11 +355,39 @@ mod tests {
             out_dir: dir.join("out"),
             version: "1.2.3".into(),
             icon,
+            terminfo: None,
         };
         let app = assemble_bundle(&opts).unwrap();
         // Idempotent: a second run over an existing bundle succeeds.
         assert!(assemble_bundle(&opts).is_ok());
         (dir, app)
+    }
+
+    #[test]
+    fn embeds_a_terminfo_database_into_resources() {
+        let dir = scratch();
+        let stub = dir.join("ghost");
+        fs::write(&stub, b"#!/bin/sh\necho stub\n").unwrap();
+        set_executable(&stub).unwrap();
+        // A stand-in compiled database (assemble only copies; `tic` runs in
+        // `bundle()`), shaped like the layout macOS's tic produces.
+        let db = dir.join("db");
+        fs::create_dir_all(db.join("78")).unwrap();
+        fs::write(db.join("78").join("xterm-kitty"), b"compiled-stub").unwrap();
+
+        let opts = BundleOpts {
+            binary: stub,
+            out_dir: dir.join("out"),
+            version: "1.2.3".into(),
+            icon: None,
+            terminfo: Some(db),
+        };
+        let app = assemble_bundle(&opts).unwrap();
+        let entry = app.join("Contents/Resources/terminfo/78/xterm-kitty");
+        assert!(entry.is_file(), "terminfo entry copied into Resources");
+        assert_eq!(fs::read(&entry).unwrap(), b"compiled-stub");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn plutil_lint(plist: &Path) -> bool {

@@ -64,7 +64,8 @@ impl Drop for KillOnDrop<'_> {
 fn child_env(xdg: &Path, name: &str, extra_env: &[(&str, &str)]) -> String {
     let sentinel = xdg.join(format!("child-env-{name}"));
     let script = format!(
-        "printf 'TERM=%s\\nCOLORTERM=%s\\n' \"$TERM\" \"$COLORTERM\" > '{}'; exec sleep 60",
+        "printf 'TERM=%s\\nCOLORTERM=%s\\nTERMINFO_DIRS=%s\\n' \
+         \"$TERM\" \"$COLORTERM\" \"$TERMINFO_DIRS\" > '{}'; exec sleep 60",
         sentinel.display()
     );
     let mut cmd = ghost(xdg);
@@ -95,18 +96,14 @@ fn child_sees_a_usable_term_regardless_of_launch_environment() {
     let _guard = KillOnDrop { xdg, name };
 
     let env = child_env(xdg, name, &[]);
-    // What ghost should pick depends on this host's terminfo database: the
-    // kitty name when its entry is installed, the safe xterm fallback
-    // otherwise. The probe itself is unit-tested in ghost-vt; here we assert
-    // the spawn path actually consults it and overrides the launcher's TERM.
-    let expected = if ghost_vt::terminfo::available("xterm-kitty") {
-        "TERM=xterm-kitty"
-    } else {
-        "TERM=xterm-256color"
-    };
+    // ghost provisions its own xterm-kitty entry (compiling the embedded
+    // source with `tic` on first use), so the kitty name is what children see
+    // wherever a `tic` exists — which is every supported dev platform. Hosts
+    // without `tic` fall back to the system database probe, unit-tested in
+    // ghost-vt.
     assert!(
-        env.contains(expected),
-        "child did not get ghost's TERM (wanted {expected}); saw:\n{env}"
+        env.contains("TERM=xterm-kitty"),
+        "child did not get ghost's TERM; saw:\n{env}"
     );
     assert!(
         env.contains("COLORTERM=truecolor"),
@@ -115,22 +112,32 @@ fn child_sees_a_usable_term_regardless_of_launch_environment() {
 }
 
 #[test]
-fn child_gets_xterm_kitty_when_terminfo_entry_exists() {
+fn child_gets_ghost_provisioned_terminfo() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
-    let name = "child-term-kitty";
+    let name = "child-term-provision";
     let _guard = KillOnDrop { xdg, name };
 
-    // Force the probe deterministically: $TERMINFO pointing at a database that
-    // has an xterm-kitty entry must yield TERM=xterm-kitty on any machine.
-    let ti = xdg.join("terminfo");
-    std::fs::create_dir_all(ti.join("x")).unwrap();
-    std::fs::write(ti.join("x").join("xterm-kitty"), b"").unwrap();
-
-    let env = child_env(xdg, name, &[("TERMINFO", ti.to_str().unwrap())]);
+    // A fresh XDG data dir has no terminfo: ghost must compile its embedded
+    // xterm-kitty entry into <data>/ghost/terminfo and point the child at it
+    // via TERMINFO_DIRS (with a trailing empty entry so the compiled-in
+    // system defaults still resolve every other TERM).
+    let env = child_env(xdg, name, &[]);
+    let provisioned = xdg.join("data").join("ghost").join("terminfo");
     assert!(
-        env.contains("TERM=xterm-kitty"),
-        "child did not get xterm-kitty despite terminfo entry; saw:\n{env}"
+        env.lines().any(|l| {
+            l.strip_prefix("TERMINFO_DIRS=").is_some_and(|v| {
+                v.split(':').any(|d| d == provisioned.to_str().unwrap())
+                    && v.split(':').any(str::is_empty)
+            })
+        }),
+        "child's TERMINFO_DIRS does not include ghost's dir plus the default; saw:\n{env}"
+    );
+    let entry = provisioned.join("x").join("xterm-kitty");
+    assert!(
+        entry.is_file(),
+        "no compiled entry at {}; contents:\n{env}",
+        entry.display()
     );
 }
 

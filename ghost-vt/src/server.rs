@@ -840,11 +840,14 @@ fn spawn_child(
     // the emulator's capabilities so tools don't fall back to "not fully
     // functional": apps gate modern features (kitty keyboard protocol,
     // synchronized output) on the TERM name, so `terminfo::session_term()`
-    // advertises the kitty profile our emulator implements whenever the host
-    // terminfo database can resolve it.
-    cmd = cmd
-        .env("TERM", crate::terminfo::session_term())
-        .env("COLORTERM", "truecolor");
+    // advertises the kitty profile our emulator implements, providing the
+    // terminfo entry itself (bundled or compiled on first use) and handing
+    // the child that database via TERMINFO_DIRS.
+    let term = crate::terminfo::session_term();
+    cmd = cmd.env("TERM", &term.term).env("COLORTERM", "truecolor");
+    if let Some(dirs) = &term.terminfo_dirs {
+        cmd = cmd.env("TERMINFO_DIRS", dirs);
+    }
     if let Some(dir) = launch_dir {
         cmd = cmd.current_dir(dir);
     }
