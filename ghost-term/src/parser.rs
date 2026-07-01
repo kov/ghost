@@ -85,6 +85,10 @@ pub enum Function {
     Gzd4(Charset),
     Ht,
     Hts,
+    /// OSC 8 hyperlink: `Some(uri)` opens a link (subsequent prints carry it),
+    /// `None` (the empty-URI form) closes it. The optional `params` field
+    /// (`id=…`) is accepted on input and dropped — ghost groups by URI.
+    Hyperlink(Option<String>),
     Ich(u16),
     Il(u16),
     /// kitty keyboard protocol — push the current flags and make `flags` current
@@ -1026,6 +1030,16 @@ impl Parser {
 
         match ps {
             "0" | "2" => Some(Function::SetTitle(rest.to_string())),
+            // OSC 8 ; params ; URI — a URI may itself contain `;`, so only the
+            // params/URI split is taken here; an absent or empty URI closes
+            // the link. Absurdly long URIs are dropped (the sequence is still
+            // consumed) so hostile output can't bloat the intern table.
+            "8" => {
+                let uri = rest.split_once(';').map(|(_params, uri)| uri)?;
+                Some(Function::Hyperlink(
+                    (!uri.is_empty() && uri.len() <= MAX_HYPERLINK_LEN).then(|| uri.to_string()),
+                ))
+            }
             _ => None,
         }
     }
@@ -1373,6 +1387,14 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push_str("\u{1b}]2;");
             seq.push_str(title);
             seq.push('\u{07}');
+        }
+
+        Hyperlink(uri) => {
+            seq.push_str("\u{1b}]8;;");
+            if let Some(uri) = uri {
+                seq.push_str(uri);
+            }
+            seq.push_str("\u{1b}\\");
         }
 
         Sgr(ops) => {
@@ -1764,6 +1786,10 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         _ => None,
     }
 }
+
+/// Upper bound on an accepted OSC 8 URI. Generous (browsers cap around 2k;
+/// kitty at 2083) while keeping a hostile stream from interning megabytes.
+const MAX_HYPERLINK_LEN: usize = 4096;
 
 const MAX_PARAM_LEN: usize = 6;
 
@@ -2278,6 +2304,28 @@ mod tests {
         // Other OSC codes (e.g. OSC 1 icon name, OSC 52 clipboard) are ignored.
         assert_eq!(parse("\x1b]1;icon\x07"), []);
         assert_eq!(parse("\x1b]52;c;Zm9v\x07"), []);
+    }
+
+    #[test]
+    fn parse_osc_hyperlink() {
+        let link = |uri: &str| Hyperlink(Some(uri.to_string()));
+        // ST- and BEL-terminated; params (id=…) accepted and dropped.
+        assert_eq!(parse("\x1b]8;;https://a\x1b\\"), [link("https://a")]);
+        assert_eq!(parse("\x1b]8;;https://a\x07"), [link("https://a")]);
+        assert_eq!(parse("\x1b]8;id=x;https://a\x07"), [link("https://a")]);
+        // A URI may contain ';' — only the params/URI split is taken.
+        assert_eq!(
+            parse("\x1b]8;;https://a?x=1;y=2\x07"),
+            [link("https://a?x=1;y=2")]
+        );
+        // The empty URI closes the link; a missing separator is malformed.
+        assert_eq!(parse("\x1b]8;;\x07"), [Hyperlink(None)]);
+        assert_eq!(parse("\x1b]8;id=x;\x07"), [Hyperlink(None)]);
+        assert_eq!(parse("\x1b]8;\x07"), []);
+        // An absurdly long URI is dropped, closing the link instead of
+        // interning a hostile payload.
+        let huge = format!("\x1b]8;;https://a/{}\x07", "x".repeat(5000));
+        assert_eq!(parse(&huge), [Hyperlink(None)]);
     }
 
     #[test]

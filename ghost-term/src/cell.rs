@@ -30,8 +30,10 @@ impl Cell {
         Cell(ch, occupancy, pen)
     }
 
+    /// An erased/fill cell: keeps the pen's colors (BCE) but never its OSC 8
+    /// hyperlink — blank space must not read as clickable.
     pub(crate) fn blank(pen: Pen) -> Self {
-        Cell(' ', Occupancy::Single, pen)
+        Cell(' ', Occupancy::Single, pen.without_link())
     }
 
     pub fn is_default(&self) -> bool {

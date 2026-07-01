@@ -72,6 +72,9 @@ pub enum Cmd {
         height: u32,
         rgba: Vec<u8>,
     },
+    /// Open a hyperlink (OSC 8, Ctrl+click) in the system handler. The URL's
+    /// scheme has already been allowlisted by the model.
+    OpenUrl(String),
     /// Repaint the window.
     Redraw,
     /// Set the window title.

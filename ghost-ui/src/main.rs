@@ -688,6 +688,28 @@ impl Graphics {
     }
 }
 
+/// Open a hyperlink in the system handler (`Cmd::OpenUrl` — the model has
+/// already allowlisted the scheme). Spawned detached, with a reaper thread so
+/// the handler process never lingers as a zombie.
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// Per-window state: the GPU surface and pure model, plus the input bookkeeping
 /// that is inherently per-window (focus modifiers, pointer position, click
 /// detection, and the model's scheduled tick).
@@ -916,6 +938,7 @@ impl App {
                         w.gfx.window.set_title(&t);
                     }
                 }
+                Cmd::OpenUrl(url) => open_url(&url),
                 Cmd::ScheduleTick { after_ms } => {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         // Keep the earliest pending deadline: two schedulers can

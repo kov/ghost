@@ -1,4 +1,5 @@
 use crate::color::Color;
+use std::num::NonZeroU16;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Pen {
@@ -6,6 +7,10 @@ pub struct Pen {
     pub(crate) background: Option<Color>,
     pub(crate) intensity: Intensity,
     pub(crate) attrs: u8,
+    /// OSC 8 hyperlink the pen is writing under, as an id interned on the
+    /// terminal (resolve with `Vt::hyperlink`). Not an SGR attribute: SGR 0
+    /// does not clear it, only OSC 8 with an empty URI (or a full reset) does.
+    pub(crate) link: Option<NonZeroU16>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -98,6 +103,27 @@ impl Pen {
         self.attrs &= !INVERSE_MASK;
     }
 
+    /// The interned id of the OSC 8 hyperlink this pen writes under, if any —
+    /// resolve to the URI with `Vt::hyperlink`.
+    pub fn link_id(&self) -> Option<u16> {
+        self.link.map(NonZeroU16::get)
+    }
+
+    /// This pen minus its hyperlink — what erase/fill operations use, so blank
+    /// cells never read as clickable.
+    pub(crate) fn without_link(&self) -> Pen {
+        Pen {
+            link: None,
+            ..*self
+        }
+    }
+
+    /// Whether the two pens agree on everything SGR can express (the link is
+    /// carried by OSC 8, not SGR — see `to_sgr_diff`).
+    pub(crate) fn same_style(&self, other: &Pen) -> bool {
+        self.without_link() == other.without_link()
+    }
+
     pub fn is_default(&self) -> bool {
         self.foreground.is_none()
             && self.background.is_none()
@@ -107,6 +133,7 @@ impl Pen {
             && !self.is_strikethrough()
             && !self.is_blink()
             && !self.is_inverse()
+            && self.link.is_none()
     }
 }
 
@@ -117,6 +144,7 @@ impl Default for Pen {
             background: None,
             intensity: Intensity::Normal,
             attrs: 0,
+            link: None,
         }
     }
 }

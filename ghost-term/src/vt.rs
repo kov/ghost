@@ -100,6 +100,12 @@ impl Vt {
         self.terminal.text()
     }
 
+    /// The URI behind an interned OSC 8 hyperlink id — the id a linked cell
+    /// carries in `Pen::link_id`.
+    pub fn hyperlink(&self, id: u16) -> Option<&str> {
+        self.terminal.hyperlink(id)
+    }
+
     pub fn title(&self) -> &str {
         self.terminal.title()
     }
@@ -632,6 +638,85 @@ mod tests {
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
+    }
+
+    #[test]
+    fn hyperlinks_attach_to_printed_cells() {
+        let mut vt = Vt::new(40, 5);
+        vt.feed_str("\x1b]8;;https://example.com/a\x1b\\LINK\x1b]8;;\x1b\\!");
+
+        let line = vt.line(0);
+        let id = line[0].pen().link_id().expect("first cell is linked");
+        assert_eq!(vt.hyperlink(id), Some("https://example.com/a"));
+        assert_eq!(vt.line(0)[3].pen().link_id(), Some(id), "whole run linked");
+        assert_eq!(vt.line(0)[4].pen().link_id(), None, "closed before '!'");
+
+        // BEL-terminated form, params (id=…) accepted and ignored; the same
+        // URI interns to the same id.
+        vt.feed_str("\x1b]8;id=x;https://example.com/a\x07S");
+        assert_eq!(vt.line(0)[5].pen().link_id(), Some(id));
+        // A different URI gets its own id.
+        vt.feed_str("\x1b]8;;https://other.example\x1b\\O");
+        let other = vt.line(0)[6].pen().link_id().expect("linked");
+        assert_ne!(other, id);
+        assert_eq!(vt.hyperlink(other), Some("https://other.example"));
+
+        // Unknown ids resolve to nothing.
+        assert_eq!(vt.hyperlink(9999), None);
+    }
+
+    #[test]
+    fn hyperlinks_survive_a_dump_roundtrip() {
+        let mut vt = Vt::new(40, 5);
+        // A styled link, plain text, then a second link left open (the live
+        // pen carries it at dump time).
+        vt.feed_str("\x1b[31m\x1b]8;;https://a.example\x1b\\AA\x1b]8;;\x1b\\bb");
+        vt.feed_str("\x1b]8;;https://b.example\x1b\\CC");
+
+        let mut vt2 = Vt::new(40, 5);
+        vt2.feed_str(&vt.dump());
+
+        let resolve = |vt: &Vt, i: usize| {
+            vt.line(0)[i]
+                .pen()
+                .link_id()
+                .and_then(|id| vt.hyperlink(id).map(str::to_owned))
+        };
+        for i in 0..6 {
+            assert_eq!(resolve(&vt, i), resolve(&vt2, i), "cell {i}");
+            assert_eq!(
+                vt.line(0)[i].pen().foreground(),
+                vt2.line(0)[i].pen().foreground(),
+                "cell {i} style intact"
+            );
+        }
+        // The live pen still carries the open link: new output stays linked.
+        vt2.feed_str("X");
+        assert_eq!(resolve(&vt2, 6).as_deref(), Some("https://b.example"));
+    }
+
+    #[test]
+    fn erased_cells_do_not_carry_the_open_hyperlink() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]8;;https://a.example\x1b\\AB");
+        // Erase to end of line while the link is open: blanks are not links
+        // (clicking empty space should never open anything).
+        vt.feed_str("\x1b[K");
+        assert_eq!(vt.line(0)[5].pen().link_id(), None);
+        // But printed cells keep linking.
+        vt.feed_str("C");
+        assert!(vt.line(0)[2].pen().link_id().is_some());
+    }
+
+    #[test]
+    fn reset_clears_hyperlinks() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]8;;https://a.example\x1b\\L");
+        let id = vt.line(0)[0].pen().link_id().unwrap();
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.hyperlink(id), None, "table cleared by RIS");
+        vt.feed_str("P");
+        assert_eq!(vt.line(0)[0].pen().link_id(), None, "pen link cleared");
     }
 
     #[test]

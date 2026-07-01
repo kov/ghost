@@ -11,6 +11,7 @@ mod charset;
 mod color;
 mod graphics;
 mod line;
+mod links;
 pub mod parser;
 mod pen;
 mod tabs;

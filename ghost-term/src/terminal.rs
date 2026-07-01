@@ -8,6 +8,7 @@ use crate::cell::{Cell, Occupancy, PLACEHOLDER};
 use crate::charset::Charset;
 use crate::graphics::{GraphicsState, Image, Placement};
 use crate::line::Line;
+use crate::links::Links;
 use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, EdScope, ElScope, Function, SgrOp, SgrOps,
     TbcScope, XtwinopsOp,
@@ -76,6 +77,8 @@ pub struct Terminal {
     /// kitty graphics protocol state: stored images, an in-progress chunked
     /// transfer, and acknowledgement bytes queued for the child's input.
     graphics: GraphicsState,
+    /// OSC 8 hyperlink URIs, interned; cells reference them via `Pen::link`.
+    links: Links,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -163,6 +166,7 @@ impl Terminal {
             xtwinops: false,
             tracked_modes: BTreeSet::new(),
             title: String::new(),
+            links: Links::default(),
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -554,6 +558,13 @@ impl Terminal {
                 }
             }
 
+            Hyperlink(uri) => {
+                // Open: subsequent prints carry the interned link (`None` if
+                // the table is full — the text still prints, unlinked).
+                // Close (empty URI): back to plain text.
+                self.pen.link = uri.and_then(|u| self.links.intern(&u));
+            }
+
             SetTitle(title) => {
                 self.title = title;
             }
@@ -899,6 +910,7 @@ impl Terminal {
         self.tracked_modes.clear();
         self.title.clear();
         self.graphics.reset();
+        self.links.clear();
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -991,6 +1003,11 @@ impl Terminal {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The URI behind an interned OSC 8 hyperlink id (see `Pen::link_id`).
+    pub fn hyperlink(&self, id: u16) -> Option<&str> {
+        self.links.get(id)
     }
 
     #[cfg(test)]
@@ -1713,7 +1730,12 @@ impl Terminal {
         // 1. dump primary screen buffer
 
         let mut funs = Vec::new();
-        dump_buffer_lines(self.primary_buffer(), include_scrollback, &mut funs);
+        dump_buffer_lines(
+            self.primary_buffer(),
+            &self.links,
+            include_scrollback,
+            &mut funs,
+        );
 
         // 2. setup tab stops
 
@@ -1779,7 +1801,7 @@ impl Terminal {
             funs.push(Function::Cup(1, 1));
 
             // dump alternate buffer
-            dump_buffer(self.alternate_buffer(), &mut funs);
+            dump_buffer(self.alternate_buffer(), &self.links, &mut funs);
         }
 
         // 5. configure saved context for alternate screen
@@ -1908,8 +1930,14 @@ impl Terminal {
             }
         }
 
-        // configure pen
+        // configure pen. The style travels as SGR; an open OSC 8 link is
+        // re-opened separately so post-resync output keeps linking. (The
+        // saved-context pens and the wide-char reprints above restore style
+        // only — a link there is an untracked edge.)
         funs.push(to_sgr(&self.pen));
+        if let Some(uri) = self.pen.link.and_then(|id| self.links.get(id.get())) {
+            funs.push(Function::Hyperlink(Some(uri.to_string())));
+        }
 
         if !self.cursor.visible {
             // hide cursor
@@ -2006,16 +2034,23 @@ impl Terminal {
     }
 }
 
-fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
-    dump_buffer_lines(buffer, false, funs);
+fn dump_buffer(buffer: &Buffer, links: &Links, funs: &mut Vec<Function>) {
+    dump_buffer_lines(buffer, links, false, funs);
 }
 
 /// Dump a buffer's lines as a redraw sequence. With `include_scrollback`, the
 /// retained scrollback above the viewport is emitted first (each line followed
 /// by CR/LF) so it scrolls into the target terminal's own scrollback; otherwise
 /// only the viewport is emitted. Pen state is tracked continuously across both
-/// regions, and trailing blank lines are trimmed.
-fn dump_buffer_lines(buffer: &Buffer, include_scrollback: bool, funs: &mut Vec<Function>) {
+/// regions — SGR diffs for the style, OSC 8 open/close around linked runs
+/// (closed again at the end, so nothing after the dump inherits a link) — and
+/// trailing blank lines are trimmed.
+fn dump_buffer_lines(
+    buffer: &Buffer,
+    links: &Links,
+    include_scrollback: bool,
+    funs: &mut Vec<Function>,
+) {
     let skip = if include_scrollback {
         0
     } else {
@@ -2038,10 +2073,20 @@ fn dump_buffer_lines(buffer: &Buffer, include_scrollback: bool, funs: &mut Vec<F
     let mut pen = Pen::default();
 
     for (i, line) in buffer.lines().skip(skip).take(cutoff).enumerate() {
+        // Chunks split on any pen difference, links included, so a link
+        // transition is always a chunk boundary.
         for cells in line.chunks(|c1, c2| c1.pen() != c2.pen()) {
             if cells[0].pen() != &pen {
                 if let Some(sgr) = to_sgr_diff(&pen, cells[0].pen()) {
                     funs.push(sgr);
+                }
+                if cells[0].pen().link != pen.link {
+                    let uri = cells[0]
+                        .pen()
+                        .link
+                        .and_then(|id| links.get(id.get()))
+                        .map(str::to_string);
+                    funs.push(Function::Hyperlink(uri));
                 }
 
                 pen = *cells[0].pen();
@@ -2055,10 +2100,15 @@ fn dump_buffer_lines(buffer: &Buffer, include_scrollback: bool, funs: &mut Vec<F
             funs.push(Function::Lf);
         }
     }
+
+    if pen.link.is_some() {
+        funs.push(Function::Hyperlink(None));
+    }
 }
 
 fn to_sgr_diff(from: &Pen, to: &Pen) -> Option<Function> {
-    if from == to {
+    // Style only: the hyperlink is carried by OSC 8, not SGR (see the caller).
+    if from.same_style(to) {
         return None;
     }
 

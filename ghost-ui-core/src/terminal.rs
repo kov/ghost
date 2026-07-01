@@ -862,6 +862,26 @@ impl TerminalModel {
         (col, row)
     }
 
+    /// The safe-to-open hyperlink URI under a pointer position, honoring the
+    /// scrollback offset. `None` on unlinked cells and disallowed schemes.
+    fn link_under(&self, pos: PointPx) -> Option<String> {
+        let (col1, row1) = self.point_to_cell(pos);
+        let row = usize::from(row1.saturating_sub(1)).min((self.rows as usize).saturating_sub(1));
+        let col = usize::from(col1.saturating_sub(1)).min((self.cols as usize).saturating_sub(1));
+        let vt = self.screen.vt();
+        let line = vt.view_at(self.scroll_offset).nth(row)?;
+        let id = line.cells().get(col)?.pen().link_id()?;
+        let uri = vt.hyperlink(id)?;
+        // Only schemes whose handlers are safe to invoke on a click; anything
+        // else (javascript:, custom app schemes, …) stays inert.
+        let scheme = uri.split_once(':')?.0.to_ascii_lowercase();
+        matches!(
+            scheme.as_str(),
+            "http" | "https" | "file" | "mailto" | "ftp"
+        )
+        .then(|| uri.to_string())
+    }
+
     /// 0-based `(row, col)` cell under the pointer, clamped to the grid.
     fn pointer_cell0(&self) -> (usize, usize) {
         let (col1, row1) = self.cursor_cell.unwrap_or((1, 1));
@@ -1001,6 +1021,17 @@ impl TerminalModel {
                 let Some(b) = button.map(map_button) else {
                     return Vec::new();
                 };
+                // Ctrl+click (or Cmd+click) on an OSC 8 hyperlink opens it,
+                // consuming the press. Checked before mouse forwarding: apps
+                // like Claude Code hold any-motion tracking, so a forwarded
+                // Ctrl+click would otherwise make their links unreachable.
+                if b == mouse::Button::Left
+                    && (mods.ctrl || mods.sup)
+                    && let Some(url) = self.link_under(pos)
+                {
+                    self.gesture_report = false;
+                    return vec![Cmd::OpenUrl(url)];
+                }
                 self.held = Some(b);
                 self.gesture_report = self.report_to_app(mods);
                 if self.gesture_report {
@@ -2186,6 +2217,90 @@ mod tests {
         assert!(
             !cmds.contains(&Cmd::Redraw),
             "a feed that changes no viewport row must not repaint: {cmds:?}"
+        );
+    }
+
+    /// A left press at 0-based cell `(row, col)` carrying `mods`.
+    fn press_at_cell(row: usize, col: usize, mods: Mods) -> UiEvent {
+        UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(PointerButton::Left),
+            pos: PointPx {
+                x: (col as f64 + 0.5) * f64::from(METRICS.advance),
+                y: (row as f64 + 0.5) * f64::from(METRICS.line_height),
+            },
+            mods,
+            wheel_dy: 0.0,
+            clicks: 1,
+        }
+    }
+
+    const CTRL: Mods = Mods {
+        shift: false,
+        ctrl: true,
+        alt: false,
+        sup: false,
+    };
+
+    #[test]
+    fn ctrl_click_opens_a_hyperlink() {
+        let mut m = model();
+        feed(
+            &mut m,
+            b"\x1b]8;;https://example.com/doc\x1b\\LINK\x1b]8;;\x1b\\ plain",
+        );
+
+        // Ctrl+click on the linked run opens it, and starts no selection.
+        let cmds = m.update(press_at_cell(0, 1, CTRL));
+        assert!(
+            cmds.contains(&Cmd::OpenUrl("https://example.com/doc".to_string())),
+            "no OpenUrl: {cmds:?}"
+        );
+        assert!(m.selection().is_none(), "link click must not select");
+
+        // A plain click on the link selects as usual, opens nothing.
+        let cmds = m.update(press_at_cell(0, 1, Mods::NONE));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenUrl(_))),
+            "plain click opened a link: {cmds:?}"
+        );
+
+        // Ctrl+click on unlinked text opens nothing.
+        let cmds = m.update(press_at_cell(0, 6, CTRL));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenUrl(_))),
+            "unlinked cell opened a link: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_click_opens_links_even_when_the_app_grabs_the_mouse() {
+        let mut m = model();
+        // The app tracks all mouse motion (as Claude Code does) — Ctrl+click
+        // on a link must still open locally, not be forwarded.
+        feed(
+            &mut m,
+            b"\x1b[?1003h\x1b[?1006h\x1b]8;;https://example.com\x1b\\LINK",
+        );
+        let cmds = m.update(press_at_cell(0, 0, CTRL));
+        assert!(
+            cmds.contains(&Cmd::OpenUrl("https://example.com".to_string())),
+            "no OpenUrl under mouse grab: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "the consumed click leaked to the app: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_hyperlink_schemes_are_not_opened() {
+        let mut m = model();
+        feed(&mut m, b"\x1b]8;;javascript:alert(1)\x1b\\EVIL");
+        let cmds = m.update(press_at_cell(0, 0, CTRL));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenUrl(_))),
+            "unsafe scheme opened: {cmds:?}"
         );
     }
 
