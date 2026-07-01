@@ -16,6 +16,7 @@
 use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
+use ghost_term::terminal::Cursor;
 use ghost_term::{ClipboardSelection, Line, MouseProtocol};
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
@@ -202,6 +203,15 @@ pub struct TerminalModel {
     /// every visible run of it and the pointer shows a hand (see
     /// [`Cmd::PointerIcon`]). Updated on pointer motion.
     hovered_link: Option<u16>,
+    /// The text cursor (0-based, with visibility and shape) as of the previous feed.
+    /// Moving the cursor writes no cell, so a bare CUP/CUF — common in full-screen
+    /// apps whose differential renderers reposition without rewriting — leaves
+    /// `Screen::feed` reporting no dirty row. Diffing against this makes a cursor
+    /// change its own damage (the row it left + the row it entered) and repaint
+    /// trigger, so the block never lags the child (the "space doesn't advance the
+    /// cursor" jank). Visibility and shape count too: hiding or reshaping the cursor
+    /// changes the drawn frame without touching a cell.
+    prev_cursor: Cursor,
 }
 
 /// How long a synchronized-output hold may last before the scheduled tick
@@ -229,13 +239,15 @@ impl TerminalModel {
             (f32::from(cols) * metrics.advance) as u32,
             (f32::from(rows) * metrics.line_height) as u32,
         );
+        let screen = Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK);
+        let prev_cursor = screen.vt().cursor();
         TerminalModel {
             session,
             metrics,
             scale: 1.0,
             zoom: 1.0,
             size_px,
-            screen: Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK),
+            screen,
             scanner: QueryScanner::new(),
             cols,
             rows,
@@ -256,6 +268,7 @@ impl TerminalModel {
             sync_held: false,
             theme: ThemeColors::default(),
             hovered_link: None,
+            prev_cursor,
         }
     }
 
@@ -914,8 +927,46 @@ impl TerminalModel {
             // recolor everything; `damage` reports All via the `Presented`
             // snapshot — this only makes sure a repaint is actually requested.
             let colors_changed = colors_before != self.render_colors();
-            let want_redraw =
-                viewport_changed || selection_dropped || images_added || colors_changed;
+            // The cursor is part of the drawn frame, but moving it writes no cell, so a
+            // bare CUP/CUF (how full-screen apps like an editor or Claude Code reposition
+            // between keystrokes) leaves `Screen::feed` reporting no dirty row. Treat a
+            // change in the *drawn* cursor as its own damage so the block never lags the
+            // child: dirty the row it left and the row it entered, and force a repaint.
+            // Only matters at the live bottom — scrolled into history the cursor isn't
+            // drawn, and a scroll is already a full repaint. Visibility and shape count
+            // too: hiding or reshaping the cursor changes the frame without touching a
+            // cell. Always advance the baseline so the next feed measures from here.
+            let cursor_redrawn = if self.scroll_offset == 0 {
+                let now = self.screen.vt().cursor();
+                let prev = std::mem::replace(&mut self.prev_cursor, now);
+                if now != prev {
+                    // Clamp to the live viewport: `prev` can name a row past the bottom
+                    // after a shrink that reflowed the cursor up, and the band feeds the
+                    // renderer's row range directly.
+                    let max_row = self.rows.saturating_sub(1) as usize;
+                    if prev.visible {
+                        let r = prev.row.min(max_row);
+                        self.accumulate_dirty(r, r);
+                    }
+                    if now.visible {
+                        let r = now.row.min(max_row);
+                        self.accumulate_dirty(r, r);
+                    }
+                    // A repaint is only needed when the block was or is drawn; a move that
+                    // stays hidden the whole time paints nothing.
+                    prev.visible || now.visible
+                } else {
+                    false
+                }
+            } else {
+                self.prev_cursor = self.screen.vt().cursor();
+                false
+            };
+            let want_redraw = viewport_changed
+                || selection_dropped
+                || images_added
+                || colors_changed
+                || cursor_redrawn;
             // Synchronized output (DEC 2026): between set and reset the app is
             // composing one atomic frame, so hold the repaint (damage keeps
             // accumulating above) and schedule a release tick as the backstop.
@@ -2558,6 +2609,37 @@ mod tests {
     }
 
     #[test]
+    fn cursor_only_move_repaints_and_damages_both_rows() {
+        let mut m = model();
+        // Establish content and a known cursor (col 5, row 0 after "hello"), then
+        // composite so the damage baseline is clear.
+        feed(&mut m, b"hello");
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // A bare cursor move — CUP to row 3, col 1 — writes no cell, so `Screen::feed`
+        // reports no dirty row. But the drawn block still jumps from row 0 to row 2, so
+        // the frame changed: it must repaint and damage the row the cursor left (0) and
+        // the row it entered (2). This is the "cursor doesn't advance on space" jank in
+        // full-screen apps, whose differential renderers move the cursor without
+        // rewriting the cell.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[3;1H".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "a cursor-only move must repaint so the block isn't left stale: {cmds:?}"
+        );
+        assert!(
+            matches!(view_damage(&m), TermDamage::Rows { lo: 0, hi: 2 }),
+            "damage must cover the row the cursor left and the one it entered, got {:?}",
+            view_damage(&m)
+        );
+    }
+
+    #[test]
     fn synchronized_output_holds_redraw_until_reset() {
         let mut m = model();
         // An atomic frame opens (DEC 2026) and content lands: presentation is
@@ -2620,6 +2702,51 @@ mod tests {
         // With nothing held, a tick is a no-op.
         let cmds = m.update(UiEvent::Tick { now_ms: 2_000 });
         assert!(!cmds.contains(&Cmd::Redraw), "spurious redraw: {cmds:?}");
+    }
+
+    #[test]
+    fn hiding_the_cursor_repaints_its_row() {
+        let mut m = model();
+        feed(&mut m, b"hello"); // visible cursor on row 0
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // Hiding the cursor (DECTCEM reset) erases its block — a visible change on its
+        // row even though no cell content moved.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?25l".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "hiding the cursor must repaint to erase the block: {cmds:?}"
+        );
+        assert!(
+            matches!(view_damage(&m), TermDamage::Rows { lo: 0, hi: 0 }),
+            "hiding damages the cursor's row, got {:?}",
+            view_damage(&m)
+        );
+    }
+
+    #[test]
+    fn hidden_cursor_move_does_not_repaint() {
+        let mut m = model();
+        feed(&mut m, b"hello\x1b[?25l"); // draw, then hide the cursor
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // With the cursor hidden nothing is drawn at it, so a bare move paints no
+        // pixels and must not force a repaint.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[3;1H".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !cmds.contains(&Cmd::Redraw),
+            "moving a hidden cursor changes no pixels: {cmds:?}"
+        );
     }
 
     /// The per-session [`TermDamage`] the model stamps on its scene item — the cue the
