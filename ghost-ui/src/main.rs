@@ -180,11 +180,14 @@ fn menu_dump() {
 
 /// Grid cell count for a surface of `w`×`h` physical pixels at `scale` (cells
 /// are the base metrics scaled by the device factor, matching the model).
-fn grid_from_pixels(w: u32, h: u32, scale: f32) -> (u16, u16) {
+fn grid_from_pixels(w: u32, h: u32, scale: f32, pad: f32) -> (u16, u16) {
     let advance = metrics().advance * scale;
     let line_height = metrics().line_height * scale;
-    let cols = (w as f32 / advance).floor().max(1.0) as u16;
-    let rows = (h as f32 / line_height).floor().max(1.0) as u16;
+    // The grid fills the surface inset by the padding (logical px, DPI-scaled) on each
+    // side; the border is left for the terminal background. Matches `RootModel::grid`.
+    let pad_px = pad * scale;
+    let cols = ((w as f32 - 2.0 * pad_px) / advance).floor().max(1.0) as u16;
+    let rows = ((h as f32 - 2.0 * pad_px) / line_height).floor().max(1.0) as u16;
     (cols, rows)
 }
 
@@ -558,15 +561,18 @@ impl Graphics {
         option_as_meta: bool,
         cols: u16,
         rows: u16,
+        pad: f32,
     ) -> Self {
-        // Open sized to `cols`x`rows` cells at the base font. A LOGICAL size (not
-        // physical) so winit scales it by the monitor DPI — the grid then works out to
-        // exactly `cols`x`rows` at any scale (`grid_from_pixels` divides physical px by
-        // cell·scale), which a physical size would only get right at 1x.
+        // Open sized to `cols`x`rows` cells at the base font, plus the padding border on
+        // each side, so the configured grid fits inside it (padding surrounds, not eats
+        // into, the grid). A LOGICAL size (not physical) so winit scales it by the monitor
+        // DPI — the grid then works out to exactly `cols`x`rows` at any scale
+        // (`grid_from_pixels` divides physical px by cell·scale), which a physical size
+        // would only get right at 1x.
         let m = metrics();
         let size = LogicalSize::new(
-            f64::from(cols) * f64::from(m.advance),
-            f64::from(rows) * f64::from(m.line_height),
+            f64::from(cols) * f64::from(m.advance) + 2.0 * f64::from(pad),
+            f64::from(rows) * f64::from(m.line_height) + 2.0 * f64::from(pad),
         );
         // Request a transparent window only when the theme is translucent, so an
         // opaque setup never pays the compositor's alpha-blending cost.
@@ -759,6 +765,19 @@ struct WindowState {
     /// Per-frame timing during animations, printed on dive end when
     /// `GHOST_FRAME_STATS` is set (see [`framestats`]). Inert otherwise.
     stats: framestats::FrameStats,
+    /// A window created mid-run (File > New Window / Cmd-N / the Dock item) can have
+    /// its Metal drawable configured before the window is on screen, so its very first
+    /// present lands nowhere and it comes up blank until the user resizes it. Set true
+    /// at creation; the first `RedrawRequested` reconfigures the surface (now that the
+    /// window is realized) and clears it, so the opening frame is actually visible.
+    needs_surface_sync: bool,
+    /// Whether this window has ever presented a frame. Until it has, its drawable may
+    /// not be ready — `get_current_texture` returns nothing and the present is silently
+    /// dropped — so [`about_to_wait`](App::about_to_wait) keeps requesting redraws every
+    /// pass (not the pacer's single request) until one lands. Otherwise a window created
+    /// mid-run comes up blank (only its title bar) until an unrelated event forces a
+    /// redraw. Set once, on the first successful present.
+    presented_ok: bool,
 }
 
 impl WindowState {
@@ -1173,12 +1192,14 @@ impl App {
             cfg.option_as_meta(),
             cfg.columns(),
             cfg.rows(),
+            cfg.padding(),
         );
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         root.set_theme(theme_colors(&cfg.theme()));
+        root.set_padding(cfg.padding());
         apply_anim_ms(&mut root);
         self.windows.insert(
             wid,
@@ -1198,6 +1219,8 @@ impl App {
                     resize::DRAG_GAP_MS,
                 ),
                 stats: framestats::FrameStats::from_env(),
+                needs_surface_sync: true,
+                presented_ok: false,
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -1279,11 +1302,12 @@ impl App {
             cfg.option_as_meta(),
             cfg.columns(),
             cfg.rows(),
+            cfg.padding(),
         );
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
-        let (cols, rows) = grid_from_pixels(w, h, scale as f32);
+        let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
         let session = match attach(name, cols, rows) {
             Ok(session) => session,
             Err(e) => {
@@ -1294,6 +1318,7 @@ impl App {
         let model = TerminalModel::new(name.to_string(), cols, rows, metrics());
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
+        root.set_padding(cfg.padding());
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);
@@ -1315,6 +1340,8 @@ impl App {
                     resize::DRAG_GAP_MS,
                 ),
                 stats: framestats::FrameStats::from_env(),
+                needs_surface_sync: true,
+                presented_ok: false,
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -1476,7 +1503,14 @@ impl ApplicationHandler<UserEvent> for App {
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
         for w in self.windows.values_mut() {
-            if w.pacer.poll(now_ms) == pacer::Pace::PaintNow {
+            if !w.presented_ok {
+                // The opening frame hasn't landed yet: a window created mid-run can drop
+                // its first present(s) while macOS finishes compositing it (the drawable
+                // isn't acquirable, so the present is silently skipped). Keep asking every
+                // pass until one lands, rather than trusting the pacer's single request —
+                // else the window sits blank (title bar only) until an unrelated event.
+                w.gfx.window.request_redraw();
+            } else if w.pacer.poll(now_ms) == pacer::Pace::PaintNow {
                 w.gfx.window.request_redraw();
                 w.pacer.painted(now_ms);
             }
@@ -1519,6 +1553,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(win) = self.windows.get_mut(&id) {
+                    // First paint of a window created mid-run: recreate the swapchain
+                    // before drawing. The initial configure in `Graphics::new` can run
+                    // before the window is on screen, leaving a Metal drawable whose
+                    // contents never composite — the window shows only its title bar until
+                    // a resize. Reconfiguring to the SAME size here (SurfaceTarget::resize
+                    // configures unconditionally, so a fresh swapchain is created and the
+                    // cache invalidated) makes the opening frame visible. Same size keeps
+                    // the surface matching the model's layout, so no re-grid is needed.
+                    if win.needs_surface_sync {
+                        win.needs_surface_sync = false;
+                        let (w, h) = win.gfx.size();
+                        win.gfx.resize(w, h);
+                    }
                     if win.gfx.renderer.has_snapshot() {
                         // A resize is in flight: blit the snapshot to the current
                         // surface rather than render a scene whose size no longer
@@ -1545,6 +1592,8 @@ impl ApplicationHandler<UserEvent> for App {
                             );
                         }
                         if let Some((build, present)) = win.gfx.render(&scene, font_px) {
+                            // A frame landed: stop the first-present retry loop below.
+                            win.presented_ok = true;
                             // The foreground was just composited: reset its per-session
                             // damage baseline so the next `view` measures change from here
                             // (a skipped/no-op frame returns `None` and leaves the pending

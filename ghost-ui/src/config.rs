@@ -1,7 +1,7 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), the background opacity and initial grid size
-//! (`[window]`), the base font size + family (`[font]`), and how the macOS Option
+//! a persisted font zoom (`[zoom]`), the background opacity, initial grid size, and
+//! inner padding (`[window]`), the base font size + family (`[font]`), and how the macOS Option
 //! key behaves (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
@@ -113,6 +113,14 @@ const MAX_FONT_PX: f32 = 120.0;
 /// 80x24 the window opened at before it was configurable.
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+/// Inner padding (logical px, per side) between the terminal grid and the window
+/// edges when `[window] padding` is unset — a small, DPI-scaled breathing room so
+/// the bottom line doesn't crowd the window's rounded corners. Filled with the
+/// terminal background, so it blends rather than framing the content.
+const DEFAULT_PADDING: f32 = 4.0;
+/// Upper bound for the configured padding (logical px per side); a larger value
+/// clamps in so a typo can't swallow the whole window.
+const MAX_PADDING: f32 = 200.0;
 /// Sane bounds for the configured initial grid; a value outside these clamps in
 /// (never 0 — a zero-size grid has no cells — and not so large it asks the
 /// compositor for an absurd window).
@@ -161,6 +169,9 @@ struct Window {
     /// sized to hold this many columns/rows at the base font; it can be resized after.
     columns: u16,
     rows: u16,
+    /// Inner padding in logical px per side between the terminal grid and the window
+    /// edges (clamped on apply). DPI-scaled, filled with the terminal background.
+    padding: f32,
 }
 
 impl Default for Window {
@@ -169,6 +180,7 @@ impl Default for Window {
             opacity: 1.0,
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
+            padding: DEFAULT_PADDING,
         }
     }
 }
@@ -293,6 +305,18 @@ impl UiConfig {
     pub fn rows(&self) -> u16 {
         self.window.rows.clamp(MIN_GRID, MAX_ROWS)
     }
+
+    /// Inner padding in logical px per side between the terminal grid and the window
+    /// edges. Non-finite falls back to the default; otherwise clamped to a sane range
+    /// (0 opts out). The shell scales this by the device factor and hands it to the
+    /// model, which insets the grid and lets the terminal background fill the border.
+    pub fn padding(&self) -> f32 {
+        if self.window.padding.is_finite() {
+            self.window.padding.clamp(0.0, MAX_PADDING)
+        } else {
+            DEFAULT_PADDING
+        }
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +365,54 @@ mod tests {
         assert!(big.columns() <= MAX_COLUMNS && big.rows() <= MAX_ROWS);
         // opacity and the grid coexist in the same [window] table.
         let both = UiConfig::parse("[window]\nopacity = 0.9\ncolumns = 120\n").unwrap();
+        assert_eq!(both.columns(), 120);
+        assert_eq!(both.theme().bg_alpha, 0.9);
+    }
+
+    #[test]
+    fn window_padding_parses_defaults_and_clamps() {
+        // Default and empty both give the built-in breathing room.
+        assert_eq!(UiConfig::default().padding(), DEFAULT_PADDING);
+        assert_eq!(UiConfig::parse("").unwrap().padding(), DEFAULT_PADDING);
+        // A present [window] table without padding keeps the default.
+        assert_eq!(
+            UiConfig::parse("[window]\n").unwrap().padding(),
+            DEFAULT_PADDING
+        );
+        // A set value flows through.
+        assert_eq!(
+            UiConfig::parse("[window]\npadding = 12.0\n")
+                .unwrap()
+                .padding(),
+            12.0
+        );
+        // Zero is honored (opt out of padding entirely).
+        assert_eq!(
+            UiConfig::parse("[window]\npadding = 0.0\n")
+                .unwrap()
+                .padding(),
+            0.0
+        );
+        // Negative clamps to zero; an absurd value clamps to the cap.
+        assert_eq!(
+            UiConfig::parse("[window]\npadding = -5.0\n")
+                .unwrap()
+                .padding(),
+            0.0
+        );
+        assert_eq!(
+            UiConfig::parse("[window]\npadding = 9999.0\n")
+                .unwrap()
+                .padding(),
+            MAX_PADDING
+        );
+        // Non-finite falls back to the default.
+        let c = UiConfig::parse("[window]\npadding = nan\n").unwrap();
+        assert_eq!(c.padding(), DEFAULT_PADDING);
+        // Padding coexists with the rest of the [window] table.
+        let both =
+            UiConfig::parse("[window]\nopacity = 0.9\ncolumns = 120\npadding = 6.0\n").unwrap();
+        assert_eq!(both.padding(), 6.0);
         assert_eq!(both.columns(), 120);
         assert_eq!(both.theme().bg_alpha, 0.9);
     }

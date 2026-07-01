@@ -151,6 +151,12 @@ pub struct TerminalModel {
     /// scale, so a HiDPI display and a zoom level compose.
     zoom: f32,
     size_px: (u32, u32),
+    /// Inner padding in *logical* px per side between the grid and the window edges.
+    /// Scaled by the device factor (not zoom — it's a fixed window-space border) into
+    /// [`Self::pad_px`], which insets the grid, the scene item rect, pointer
+    /// hit-testing and the IME caret. The scene canvas stays the full window, so the
+    /// border is filled by the terminal background. 0 = flush to the edges.
+    pad: f32,
     screen: Screen,
     scanner: QueryScanner,
     cols: u16,
@@ -247,6 +253,7 @@ impl TerminalModel {
             scale: 1.0,
             zoom: 1.0,
             size_px,
+            pad: 0.0,
             screen,
             scanner: QueryScanner::new(),
             cols,
@@ -408,6 +415,19 @@ impl TerminalModel {
         self.scale * self.zoom
     }
 
+    /// Set the inner padding (logical px per side). The caller re-grids by resizing
+    /// afterwards; storing it here is enough for [`Self::view`] and hit-testing.
+    pub fn set_padding(&mut self, pad_logical: f32) {
+        self.pad = pad_logical.max(0.0);
+    }
+
+    /// Padding in physical px per side: the logical value scaled by the device factor
+    /// (device scale, not the zoom-inclusive render scale — the border is a fixed
+    /// window-space inset that must not grow when the font is zoomed).
+    fn pad_px(&self) -> f32 {
+        self.pad * self.scale
+    }
+
     /// Physical cell metrics: the logical metrics scaled by the combined render
     /// scale, so layout and hit-testing match what the renderer rasterizes.
     fn effective_metrics(&self) -> CellMetrics {
@@ -426,9 +446,10 @@ impl TerminalModel {
         }
         let (col1, row1) = self.screen.cursor();
         let m = self.effective_metrics();
+        let pad = self.pad_px();
         Some(RectPx {
-            x: f32::from(col1.saturating_sub(1)) * m.advance,
-            y: f32::from(row1.saturating_sub(1)) * m.line_height,
+            x: pad + f32::from(col1.saturating_sub(1)) * m.advance,
+            y: pad + f32::from(row1.saturating_sub(1)) * m.line_height,
             w: m.advance,
             h: m.line_height,
         })
@@ -445,18 +466,21 @@ impl TerminalModel {
         self.resize(w, h, self.scale)
     }
 
-    /// Render the current state to a single full-window terminal scene.
+    /// Render the current state to a single terminal scene. The canvas is the whole
+    /// window; the terminal item is inset by the padding, leaving a background-filled
+    /// border (see [`Self::pad`]).
     pub fn view(&self) -> Scene {
         let frame = std::rc::Rc::new(layout_frame_at(
             self.screen.vt(),
             self.effective_metrics(),
             self.scroll_offset,
         ));
+        let pad = self.pad_px();
         let rect = RectPx {
-            x: 0.0,
-            y: 0.0,
-            w: self.size_px.0 as f32,
-            h: self.size_px.1 as f32,
+            x: pad,
+            y: pad,
+            w: (self.size_px.0 as f32 - 2.0 * pad).max(0.0),
+            h: (self.size_px.1 as f32 - 2.0 * pad).max(0.0),
         };
         let mut items = vec![SceneItem::Terminal {
             id: SceneId::Root,
@@ -801,8 +825,13 @@ impl TerminalModel {
             self.scale = scale;
         }
         let m = self.effective_metrics();
-        let cols = (w_px as f32 / m.advance).floor().max(1.0) as u16;
-        let rows = (h_px as f32 / m.line_height).floor().max(1.0) as u16;
+        // The grid fills the window *inset by the padding* on each side; the border is
+        // left for the terminal background (see [`Self::pad`]).
+        let pad = self.pad_px();
+        let content_w = (w_px as f32 - 2.0 * pad).max(0.0);
+        let content_h = (h_px as f32 - 2.0 * pad).max(0.0);
+        let cols = (content_w / m.advance).floor().max(1.0) as u16;
+        let rows = (content_h / m.line_height).floor().max(1.0) as u16;
         if (cols, rows) == (self.cols, self.rows) {
             // Grid unchanged, but a scale change still needs a repaint at the new
             // (physical) glyph size.
@@ -1056,12 +1085,14 @@ impl TerminalModel {
         self.mouse_active() && !mods.shift
     }
 
-    /// 1-based `(col, row)` cell under a pointer position. Pointer coordinates
-    /// are physical pixels, so they divide by the physical (scaled) metrics.
+    /// 1-based `(col, row)` cell under a pointer position. Pointer coordinates are
+    /// physical pixels in window space; subtract the padding so the grid origin sits
+    /// at the inset content corner, then divide by the physical (scaled) metrics.
     fn point_to_cell(&self, pos: PointPx) -> (u16, u16) {
         let m = self.effective_metrics();
-        let col = (pos.x / f64::from(m.advance)).floor().max(0.0) as u16 + 1;
-        let row = (pos.y / f64::from(m.line_height)).floor().max(0.0) as u16 + 1;
+        let pad = f64::from(self.pad_px());
+        let col = ((pos.x - pad) / f64::from(m.advance)).floor().max(0.0) as u16 + 1;
+        let row = ((pos.y - pad) / f64::from(m.line_height)).floor().max(0.0) as u16 + 1;
         (col, row)
     }
 
@@ -2727,6 +2758,126 @@ mod tests {
             "hiding damages the cursor's row, got {:?}",
             view_damage(&m)
         );
+    }
+
+    /// The single terminal item's rect from a model's `view` (there is exactly one).
+    fn view_rect(m: &TerminalModel) -> RectPx {
+        match m.view().terminals().next().expect("a single terminal item") {
+            SceneItem::Terminal { rect, .. } => *rect,
+            other => panic!("expected one terminal item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn padding_insets_the_grid_and_scene_rect() {
+        let mut m = model();
+        // 720x432 at scale 1 with 9x18 cells is exactly 80x24, filling the window.
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        let base = view_rect(&m);
+        assert_eq!((base.x, base.y, base.w, base.h), (0.0, 0.0, 720.0, 432.0));
+        assert_eq!(m.screen().dimensions(), (80, 24));
+
+        // 18 logical px of padding (== two columns / one row here) insets the grid by
+        // a cell on each side and the item rect by the padding, while the scene canvas
+        // stays the full window — so the border is bg, not clipped content.
+        m.set_padding(18.0);
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        let scene = m.view();
+        assert_eq!(scene.size_px, (720, 432), "canvas stays the whole window");
+        let r = match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { rect, .. } => *rect,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            (r.x, r.y, r.w, r.h),
+            (18.0, 18.0, 720.0 - 36.0, 432.0 - 36.0)
+        );
+        // (720-36)/9 = 76 cols, (432-36)/18 = 22 rows.
+        assert_eq!(m.screen().dimensions(), (76, 22));
+    }
+
+    #[test]
+    fn padding_scales_with_the_device_factor() {
+        // Padding is logical px, so a 2x display doubles it in physical px: the inset
+        // rect and grid must reflect the physical border, matching the renderer.
+        let mut m = model();
+        m.set_padding(10.0);
+        m.update(UiEvent::Resize {
+            w_px: 1440,
+            h_px: 864,
+            scale: 2.0,
+        });
+        let r = view_rect(&m);
+        assert_eq!(
+            (r.x, r.y),
+            (20.0, 20.0),
+            "10 logical px -> 20 physical at 2x"
+        );
+        assert_eq!((r.w, r.h), (1440.0 - 40.0, 864.0 - 40.0));
+    }
+
+    #[test]
+    fn padding_offsets_the_ime_cursor_area() {
+        let mut m = model();
+        m.set_padding(18.0);
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        // A fresh cursor at cell (0,0) sits at the padding origin, not the corner.
+        let a = m.ime_cursor_area().unwrap();
+        assert_eq!((a.x, a.y), (18.0, 18.0));
+        // "abc" advances the cursor three cells: x = pad + 3*advance.
+        feed(&mut m, b"abc");
+        let a = m.ime_cursor_area().unwrap();
+        assert_eq!((a.x, a.y), (18.0 + 27.0, 18.0));
+    }
+
+    #[test]
+    fn padding_offsets_pointer_hit_testing() {
+        let mut m = model();
+        m.set_padding(18.0);
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        feed(&mut m, b"hello world");
+        // A press at the padding origin lands on cell (0,0) — the same pixel maps to a
+        // different cell without the inset, so this pins the offset.
+        m.update(ptr(PointerPhase::Motion, None, 18.0, 18.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            18.0,
+            18.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            18.0 + 9.0 * 3.0,
+            18.0,
+        ));
+        match m.view().terminals().next().unwrap() {
+            SceneItem::Terminal { selection, .. } => {
+                let sel = selection.expect("a drag selects");
+                assert_eq!(
+                    sel.start,
+                    (0, 0),
+                    "press at the padding origin is cell (0,0)"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

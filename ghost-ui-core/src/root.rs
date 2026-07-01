@@ -268,10 +268,17 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
+    /// Inner padding (logical px per side) for the foreground terminal — a small,
+    /// DPI-scaled border filled with the terminal background so content doesn't crowd
+    /// the window edges. Applied to the foreground/warm models and folded into
+    /// [`Self::grid`] so the attach handshake matches. 0 = flush (the historic look).
+    pad: f32,
 }
 
-/// Resize a model to the window (physical px + scale), returning its commands.
-fn resize_model(m: &mut TerminalModel, size_px: (u32, u32), scale: f32) -> Vec<Cmd> {
+/// Resize a model to the window (physical px + scale), first stamping the inner
+/// `pad` (logical px) so the model insets its grid, returning its commands.
+fn resize_model(m: &mut TerminalModel, size_px: (u32, u32), scale: f32, pad: f32) -> Vec<Cmd> {
+    m.set_padding(pad);
     m.update(UiEvent::Resize {
         w_px: size_px.0.max(1),
         h_px: size_px.1.max(1),
@@ -311,6 +318,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            pad: 0.0,
         }
     }
 
@@ -331,6 +339,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            pad: 0.0,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
@@ -391,9 +400,28 @@ impl RootModel {
     pub fn grid(&self) -> (u16, u16) {
         let advance = self.metrics.advance * self.scale;
         let line_height = self.metrics.line_height * self.scale;
-        let cols = (self.size_px.0 as f32 / advance).floor().max(1.0) as u16;
-        let rows = (self.size_px.1 as f32 / line_height).floor().max(1.0) as u16;
+        // Inset by the padding (physical px) so the handshake grid matches the
+        // foreground model, which lays out inside the same border.
+        let pad = self.pad * self.scale;
+        let content_w = (self.size_px.0 as f32 - 2.0 * pad).max(0.0);
+        let content_h = (self.size_px.1 as f32 - 2.0 * pad).max(0.0);
+        let cols = (content_w / advance).floor().max(1.0) as u16;
+        let rows = (content_h / line_height).floor().max(1.0) as u16;
         (cols, rows)
+    }
+
+    /// Set the foreground terminal's inner padding (logical px per side), propagating
+    /// it to the live foreground and every warm mirror so a Ctrl-Tab switch keeps the
+    /// border. The shell calls this once at construction from `[window] padding`; it
+    /// takes effect on the next resize (the shell always sizes a fresh window).
+    pub fn set_padding(&mut self, pad: f32) {
+        self.pad = pad.max(0.0);
+        if let Mode::Single(m) = &mut self.mode {
+            m.set_padding(self.pad);
+        }
+        for m in self.warm.values_mut() {
+            m.set_padding(self.pad);
+        }
     }
 
     /// Override the animation duration (ms) — e.g. the shell wiring `GHOST_ANIM_MS`
@@ -495,11 +523,11 @@ impl RootModel {
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
             let mut cmds = match &mut self.mode {
-                Mode::Single(m) => resize_model(m, self.size_px, self.scale),
+                Mode::Single(m) => resize_model(m, self.size_px, self.scale, self.pad),
                 Mode::Fleet(f) => return f.update(UiEvent::Resize { w_px, h_px, scale }),
             };
             for m in self.warm.values_mut() {
-                cmds.extend(resize_model(m, self.size_px, self.scale));
+                cmds.extend(resize_model(m, self.size_px, self.scale, self.pad));
             }
             return cmds;
         }
@@ -631,7 +659,7 @@ impl RootModel {
             }
         };
         // Size the (possibly restored or fresh) foreground to the window.
-        cmds.extend(resize_model(&mut model, self.size_px, self.scale));
+        cmds.extend(resize_model(&mut model, self.size_px, self.scale, self.pad));
         self.mode = Mode::Single(Box::new(model));
         self.mine.insert(id.clone());
         self.primary = Some(id);
@@ -682,7 +710,7 @@ impl RootModel {
                 m.set_theme(self.theme);
                 m
             });
-            let mut cmds = resize_model(&mut model, self.size_px, self.scale);
+            let mut cmds = resize_model(&mut model, self.size_px, self.scale, self.pad);
             self.mode = Mode::Single(Box::new(model));
             self.primary = Some(next);
             // Slide the next session in (forward, like a Ctrl-Tab) over the dead
@@ -1070,6 +1098,31 @@ mod tests {
             scale: 2.0,
         });
         assert_eq!(r.grid(), (88, 25));
+    }
+
+    #[test]
+    fn padding_insets_the_grid_and_the_foreground_model() {
+        use crate::SceneItem;
+        let mut r = root();
+        r.set_padding(18.0);
+        r.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        // The handshake grid folds in the border (== two cols / one row here), so it
+        // still matches the foreground model's own inset resize.
+        assert_eq!(r.grid(), (76, 22));
+        // The foreground lays out inside the same border: its item rect is inset while
+        // the canvas stays the whole window, leaving a bg-filled frame.
+        let scene = r.view();
+        assert_eq!(scene.size_px, (720, 432));
+        match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { rect, .. } => {
+                assert_eq!((rect.x, rect.y, rect.w, rect.h), (18.0, 18.0, 684.0, 396.0));
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

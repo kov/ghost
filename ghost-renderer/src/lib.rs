@@ -1096,7 +1096,11 @@ enum RawDamage {
 /// one item, identity transform, a `Terminal`. Its session, frame, selection, and
 /// damage are what the foreground Surface renders. `None` for anything else (chrome, a
 /// slide, a fleet grid), which composites through `build_scene` instead.
-fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>, TermDamage)> {
+/// The single terminal a lone-terminal scene carries: its session, laid-out frame,
+/// selection, damage, and (padding-inset) rect within the window.
+type LoneTerminal<'a> = (u64, &'a Rc<Frame>, Option<Selection>, TermDamage, RectPx);
+
+fn lone_terminal(scene: &Scene) -> Option<LoneTerminal<'_>> {
     if scene.layers.len() != 1
         || scene.layers[0].items.len() != 1
         || scene.layers[0].transform != Transform::IDENTITY
@@ -1109,8 +1113,9 @@ fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>, T
             frame,
             selection,
             damage,
+            rect,
             ..
-        } => Some((*session, frame, *selection, *damage)),
+        } => Some((*session, frame, *selection, *damage, *rect)),
         _ => None,
     }
 }
@@ -1227,6 +1232,11 @@ pub struct Renderer {
     /// Blit pipeline for cached surface textures — like `image_pipeline` but with
     /// the passthrough `fs_blit` (the texture is already premultiplied).
     blit_pipeline: wgpu::RenderPipeline,
+    /// The blit pipeline with blending DISABLED, used to composite the foreground Surface
+    /// into a padded window: the swapchain is cleared to the theme background (the
+    /// border) and the Surface REPLACES the inset region rather than blending over it
+    /// (which would double-count a translucent background). See [`Self::present_scene`].
+    blit_replace_pipeline: wgpu::RenderPipeline,
     /// The glyph pipeline with blending DISABLED (`blend: None` ⇒ the fragment replaces
     /// the destination). A banded update draws one background-coloured quad with it to
     /// REPLACE the band's old pixels at any alpha before repainting — the only way to
@@ -1530,6 +1540,44 @@ impl Renderer {
                 cache: None,
             });
 
+        // The blit pipeline with blending OFF, so the foreground Surface's premultiplied
+        // texels REPLACE the destination. Used when the foreground is inset by the window
+        // padding: the swapchain is cleared to the theme background (the border), and the
+        // Surface overwrites the inset — a plain "over" blit would double-count the
+        // background in a translucent theme. With no padding it writes the whole window,
+        // identical to clearing transparent and blitting "over".
+        let blit_replace_pipeline =
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("blit replace pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Instance>() as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &ATTRS,
+                        }],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_blit"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None, // replace, not blend
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
         // The erase pipeline: the glyph pipeline with blending OFF, so a solid quad's
         // colour REPLACES the destination instead of blending over it. Used only to
         // clear a band to transparent before a banded surface repaint.
@@ -1596,6 +1644,7 @@ impl Renderer {
             sampler,
             image_pipeline,
             blit_pipeline,
+            blit_replace_pipeline,
             erase_pipeline,
             surfaces: HashMap::new(),
             surface_tick: 0,
@@ -3639,16 +3688,19 @@ impl Renderer {
 
     /// Point the shared uniform at `w`×`h` and (re)build the fullscreen quad that
     /// blits the foreground Surface onto the swapchain.
-    fn prepare_blit_quad(&mut self, w: u32, h: u32) {
+    /// Prepare the quad that blits the foreground Surface onto the swapchain: `dst` is
+    /// where the Surface lands (the full window when unpadded, an inset rect when
+    /// padded), `surf` the swapchain size the vertex shader maps pixels against.
+    fn prepare_blit_quad(&mut self, dst: RectPx, surf: (u32, u32)) {
         let uniforms = Uniforms {
-            viewport: [w as f32, h as f32],
+            viewport: [surf.0 as f32, surf.1 as f32],
             _pad: [0.0, 0.0],
         };
         self.gpu
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         let quad = [Instance {
-            rect: [0.0, 0.0, w as f32, h as f32],
+            rect: [dst.x, dst.y, dst.w, dst.h],
             uv: [0.0, 0.0, 1.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
         }];
@@ -3662,14 +3714,21 @@ impl Renderer {
         );
     }
 
-    /// Clear `view` and blit the whole foreground Surface (sampled by `bind_group`) over
-    /// it. The Surface is premultiplied, so "over" a transparent clear reproduces it
-    /// exactly (keeping a translucent theme see-through); every pixel is written, so the
+    /// Clear `view` to the session's background and blit the foreground Surface (sampled
+    /// by `bind_group`) into its inset rect with REPLACE blending. The clear fills the
+    /// padding border with the frame's own background — the app-set OSC 11 color when it
+    /// carries one, else the theme's — at its true alpha (a translucent theme stays
+    /// see-through), so the border always blends with the terminal it surrounds; REPLACE
+    /// overwrites the inset with the Surface's own premultiplied pixels rather than
+    /// blending over the clear, so a translucent background isn't double-counted. With no
+    /// padding the quad covers the whole window, so this is byte-identical to clearing
+    /// transparent and blitting the Surface "over". Every pixel is written, so the
     /// swapchain holds a complete frame regardless of the acquired image's prior contents.
     fn encode_surface_blit(
         &self,
         view: &wgpu::TextureView,
         bind_group: &wgpu::BindGroup,
+        frame: &Frame,
     ) -> wgpu::CommandBuffer {
         let mut encoder = self
             .gpu
@@ -3685,7 +3744,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Clear(self.clear_color(frame)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3695,7 +3754,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let Some(buf) = &self.blit_quad {
-                pass.set_pipeline(&self.blit_pipeline);
+                pass.set_pipeline(&self.blit_replace_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
@@ -3706,12 +3765,15 @@ impl Renderer {
 
     /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
     ///
-    /// A lone opaque full-window terminal — the steady single view, and bulk output —
-    /// is rendered into the session's own [`Surface`] (which WE own, so `LoadOp::Load`
-    /// always sees the last complete frame) and the whole Surface is blitted onto the
-    /// swapchain. `ensure_surface` diffs the new frame against the Surface's held frame
-    /// and re-rasters only the changed rows, so steady typing touches a few rows while
-    /// bulk output re-rasters the screen; either way the blit is 1:1 and the composited
+    /// A lone opaque terminal — the steady single view, and bulk output — is rendered
+    /// into the session's own [`Surface`] (which WE own, so `LoadOp::Load` always sees
+    /// the last complete frame) and the Surface is blitted onto the swapchain at the
+    /// terminal's scene rect: the whole window when unpadded, or an inset rect when the
+    /// window padding leaves a background-filled border (the blit clears the swapchain to
+    /// the theme bg first, then REPLACEs the inset — see [`Self::encode_surface_blit`]).
+    /// `ensure_surface` diffs the new frame against the Surface's held frame and re-rasters
+    /// only the changed rows, so steady typing touches a few rows while bulk output
+    /// re-rasters the screen; either way the blit is 1:1 and, unpadded, the composited
     /// result is byte-identical to an inline render (pinned by
     /// `a_full_window_surface_renders_identically_to_the_inline_path`). This is the SAME
     /// per-session Surface the fleet and slide paths composite — one session renderer —
@@ -3731,23 +3793,26 @@ impl Renderer {
         size_px: f32,
     ) {
         let font = font.into();
-        let Some((session, frame, selection, damage)) = lone_terminal(scene) else {
+        let Some((session, frame, selection, damage, item_rect)) = lone_terminal(scene) else {
             // A multi-terminal / chrome scene: build_scene composites any per-session
             // Surfaces itself.
             self.render_scene_to_view(view, scene, font, size_px);
             self.foreground_valid = false;
             return;
         };
-        let win = RectPx {
-            x: 0.0,
-            y: 0.0,
-            w: surf.0.max(1) as f32,
-            h: surf.1.max(1) as f32,
+        // The terminal occupies its scene rect, which the model insets by the window
+        // padding (0 = flush to the edges). The Surface is sized to that rect and blitted
+        // there; the border around it is left to the background clear below.
+        let dst = RectPx {
+            x: item_rect.x.max(0.0),
+            y: item_rect.y.max(0.0),
+            w: item_rect.w.max(1.0),
+            h: item_rect.h.max(1.0),
         };
-        // Window-sized source (see `surface_src`): the Surface is exactly the swapchain
-        // size, so the blit below is 1:1. `ensure_surface` diffs the new frame against
-        // the Surface's held frame and updates only the changed rows in place.
-        let src = surface_src(frame, win);
+        // Content-sized source (see `surface_src`): the Surface is exactly the inset
+        // content size, so the blit into `dst` is 1:1. `ensure_surface` diffs the new
+        // frame against the Surface's held frame and updates only the changed rows.
+        let src = surface_src(frame, dst);
         let win_key = (session, Self::surface_size(frame, src));
         // If the foreground Surface is stale (the last present drew a non-lone scene, so
         // this session's WINDOW-res texture missed intermediate feeds) or held a different
@@ -3765,11 +3830,13 @@ impl Renderer {
         let _ = self.ensure_surface(session, frame, selection, damage, src, font, size_px, false);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
-        // Blit the whole Surface onto the swapchain (resets the uniform, which the render
-        // above set to the texture size, to the surface size for the fullscreen quad).
-        self.prepare_blit_quad(surf.0, surf.1);
+        // Blit the Surface onto the swapchain at its inset rect (resets the uniform, which
+        // the render above set to the texture size, to the surface size so `dst` maps to
+        // the right pixels). The clear inside fills the padding border with the frame's
+        // background (app-set OSC 11, else the theme's), so the border tracks the terminal.
+        self.prepare_blit_quad(dst, surf);
         if let Some(s) = self.surfaces.get(&win_key) {
-            let cb = self.encode_surface_blit(view, &s.bind_group);
+            let cb = self.encode_surface_blit(view, &s.bind_group, frame);
             self.gpu.queue.submit([cb]);
         }
     }
@@ -5197,6 +5264,83 @@ mod tests {
             r.surface_renders(),
             1,
             "a Full present composites the lone terminal via its Surface, not pass-through"
+        );
+    }
+
+    #[test]
+    fn a_padded_foreground_leaves_a_theme_background_border() {
+        // The model insets the terminal item by the window padding; the surface composite
+        // must then place the content inside that inset and leave the border filled with
+        // the terminal's own background — the "breathing room" that blends with the bg
+        // rather than framing it. Row 0 gets a red SGR background as a marker at the
+        // content's top-left; the rest keeps the default bg, which is the same clear the
+        // border is filled with — so the border and the default-bg content match exactly,
+        // and the red marker sits strictly inside the inset. All comparisons are between
+        // rendered pixels (no absolute colour), so they hold regardless of the surface
+        // format's transfer function.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (10usize, 4usize);
+        let (content_w, content_h) = (cols as u32 * 9, rows as u32 * 18);
+        let pad = 8u32;
+        let (w, h) = (content_w + 2 * pad, content_h + 2 * pad);
+        // A red bar across row 0, then default bg for the remaining rows.
+        let mut fill = String::from("\x1b[41m");
+        for _ in 0..cols {
+            fill.push(' ');
+        }
+        fill.push_str("\x1b[0m");
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    session: session_key("pad"),
+                    rect: RectPx {
+                        x: pad as f32,
+                        y: pad as f32,
+                        w: content_w as f32,
+                        h: content_h as f32,
+                    },
+                    frame: std::rc::Rc::new(frame(cols, rows, &fill)),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::All,
+                }],
+            )],
+        };
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+        r.present_scene(&v, (w, h), &scene, font, SIZE_PX);
+        let px = read_back(&r.gpu, &img, w, h);
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        // The four border corners are identical (a uniform border).
+        let border = at(pad / 2, pad / 2);
+        for (x, y) in [
+            (w - pad / 2, pad / 2),
+            (pad / 2, h - pad / 2),
+            (w - pad / 2, h - pad / 2),
+        ] {
+            assert_eq!(at(x, y), border, "border corner ({x},{y}) matches");
+        }
+        // A default-bg pixel deep inside the grid (below the red row) equals the border:
+        // the padding is the same background, blending rather than framing.
+        let default_bg = at(w / 2, h - pad - 9);
+        assert_eq!(
+            default_bg, border,
+            "the border is the terminal's default background"
+        );
+        // The red marker painted at the content's top-left lands one padding in, not at
+        // the window corner — so the content is inset. The corner itself stays border.
+        let marker = at(pad + 4, pad + 4);
+        assert_ne!(marker, border, "the content is inset by the padding");
+        assert!(
+            marker[0] > marker[2] && marker[3] == 255,
+            "the marker is the opaque red cell background, got {marker:?}"
         );
     }
 
