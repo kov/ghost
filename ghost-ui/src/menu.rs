@@ -24,7 +24,12 @@ use ghost_ui_core::input::{Key, Mods, NamedKey};
 
 /// A user event delivered to the winit event loop from outside the normal input
 /// stream. Today the only source is a native menu selection.
+///
+/// The `Menu` variant is only ever constructed by the macOS-only [`imp`] target;
+/// off macOS the type still names the event loop's user-event parameter but nothing
+/// posts it, so allow it to go unconstructed there without tripping `-D warnings`.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum UserEvent {
     Menu(MenuAction),
 }
@@ -32,7 +37,12 @@ pub enum UserEvent {
 /// A custom menu item that maps back onto a ghost command. The native window
 /// commands (Close / Minimize / Zoom / cycle) are handled by AppKit directly and
 /// are deliberately absent here.
+///
+/// Its variants and the `tag`/`from_tag` helpers below are exercised only by the
+/// macOS-only [`imp`] target (the cross-platform code merely maps an already-built
+/// action via [`menu_intent`]), so off macOS they are intentionally unused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum MenuAction {
     NewWindow,
     NewSession,
@@ -44,6 +54,7 @@ pub enum MenuAction {
     ToggleFleet,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl MenuAction {
     /// The stable tag stored on the `NSMenuItem`, so the target can recover the
     /// action from `[sender tag]`. Starts at 1 because 0 is `NSMenuItem`'s default
