@@ -32,6 +32,10 @@ wgpu = "29"
 pollster = "0.4"
 png = "0.18"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
+# Cache-efficiency (and any future) instrumentation is emitted via `tracing`; this
+# installs the subscriber that turns `RUST_LOG` into filtered stderr output. Off by
+# default (no target enabled), so instrumented code stays free in normal runs.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 # The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.

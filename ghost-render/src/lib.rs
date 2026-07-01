@@ -16,6 +16,9 @@ use std::collections::{HashMap, HashSet};
 pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
 
+pub mod cache;
+pub use cache::CacheCounters;
+
 pub mod scene;
 pub use scene::{
     BadgeKind, Layer, RectPx, Rgba, Scene, SceneId, SceneItem, TermDamage, Transform, session_key,

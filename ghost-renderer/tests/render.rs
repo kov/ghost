@@ -706,6 +706,94 @@ fn re_rasterizing_seen_text_allocates_no_probe_keys() {
 }
 
 #[test]
+fn warm_repaints_stay_fully_cached() {
+    // The general cache-regression guard, expressed on cache_stats(): once content is
+    // warm, repainting it — even with a fresh FontRef every frame, exactly as the app
+    // does — must be served entirely from the shape and glyph caches. A change that
+    // quietly breaks a cache key (as the swash-font-key bug did) surfaces here as
+    // misses > 0 while every pixel is still correct, which no golden test would catch.
+    let mut r = Renderer::headless(Theme::default());
+    let mut vt = Vt::new(60, 5);
+    vt.feed_str("fn main() { let xs = vec![1, 2, 3]; } // ls -la /lib64 => entries");
+    let frame = layout_frame(&vt, METRICS);
+
+    // Warm the shape + glyph caches.
+    let _ = r.render_offscreen(&frame, ghost_shaper::font_from_bytes(FIRA).unwrap(), 15.0);
+
+    let before = r.cache_stats();
+    for _ in 0..5 {
+        // A fresh FontRef of the same face each frame — the shape the app produces.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let _ = r.render_offscreen(&frame, font, 15.0);
+    }
+    let shape = r.cache_stats().shape.since(before.shape);
+    let glyph = r.cache_stats().glyph.since(before.glyph);
+    assert!(
+        shape.hits > 0 && glyph.hits > 0,
+        "the repaints did probe the caches (shape {shape:?}, glyph {glyph:?})"
+    );
+    assert_eq!(
+        (shape.misses, glyph.misses),
+        (0, 0),
+        "warm repaints must re-shape and re-rasterize nothing — shape hit-rate {:.3}, glyph hit-rate {:.3}",
+        shape.hit_rate(),
+        glyph.hit_rate(),
+    );
+    assert_eq!((shape.hit_rate(), glyph.hit_rate()), (1.0, 1.0));
+}
+
+#[test]
+fn an_idle_tiles_reblit_is_a_surface_cache_hit() {
+    // The per-session surface cache: re-presenting an unchanged tile (same frame `Rc`)
+    // must blit its cached texture, not re-raster it, and must not evict it. This is the
+    // guard against the dive-out eviction regression, where a single-keyed surface cache
+    // dropped a session's native tile and re-rastered it on every dive.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+    let frame = {
+        let mut vt = Vt::new(40, 6);
+        vt.feed_str("idle tile content => stays cached");
+        std::rc::Rc::new(layout_frame(&vt, METRICS))
+    };
+    let mut scene = Scene::new((400, 240));
+    scene.layers.push(Layer::new(
+        0,
+        vec![SceneItem::Terminal {
+            id: SceneId::Tile(0),
+            session: 7,
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 200.0,
+                h: 120.0,
+            }, // 0.5x → native-res surface
+            frame: frame.clone(),
+            selection: None,
+            dim: false,
+            damage: TermDamage::All,
+        }],
+    ));
+
+    // First present rasterizes the surface (a miss).
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(r.cache_stats().surface.misses, 1);
+
+    let before = r.cache_stats().surface;
+    // Re-present the identical scene (same `Rc`): a pure surface hit.
+    let _ = r.render_offscreen_scene(&scene, font, 15.0);
+    let s = r.cache_stats().surface.since(before);
+    assert_eq!(s.misses, 0, "an idle tile must not re-raster its surface");
+    assert_eq!(
+        s.evictions, 0,
+        "an on-screen tile's surface must not be evicted"
+    );
+    assert!(
+        s.hits >= 1,
+        "the idle tile blits its cached surface (a hit)"
+    );
+}
+
+#[test]
 fn a_layer_transform_moves_and_scales_its_content() {
     // A red square at layer-space (0,0,20,20) in a layer scaled 2x and shifted by
     // (40,40) must be drawn on screen at (40,40)..(80,80) — the camera the

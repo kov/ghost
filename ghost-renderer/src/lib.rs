@@ -15,8 +15,8 @@ pub mod target;
 pub use target::{SurfaceTarget, Target};
 
 use ghost_render::{
-    BadgeKind, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene, SceneItem, Selection,
-    Style, TermDamage, Transform,
+    BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene,
+    SceneItem, Selection, Style, TermDamage, Transform,
 };
 use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -111,6 +111,24 @@ fn stable_font_key(font: FontRef) -> u64 {
     h.write_usize(font.data.len());
     h.write_u32(font.offset);
     h.finish()
+}
+
+/// Running hit/miss tallies for the renderer's caches — a snapshot of
+/// [`Renderer::cache_stats`]. Always on (the counters are free integer adds on the
+/// single-threaded render path); read directly by cache-regression tests and
+/// emitted via `tracing` for the `RUST_LOG` view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderCacheStats {
+    /// Run shaping (swash GSUB/GPOS). Hit = a run whose text was already shaped;
+    /// miss = a genuine shape. A warm repaint of unchanged text must be all hits.
+    pub shape: CacheCounters,
+    /// Glyph-atlas rasterization. Hit = the glyph bitmap is already packed; miss =
+    /// a swash rasterize + atlas upload.
+    pub glyph: CacheCounters,
+    /// Per-session surface textures. Hit = an existing texture was reused (blitted,
+    /// or band-patched in place); miss = a full `render_surface` re-raster. Evictions
+    /// count textures dropped (LRU prune, foreground swap, off-screen session cull).
+    pub surface: CacheCounters,
 }
 
 /// An RGBA8 image read back from the GPU, tightly packed (`width * 4` per row).
@@ -1072,14 +1090,10 @@ pub struct Renderer {
     /// map is nested so a hit probes the inner map by borrowed `&str` and allocates
     /// nothing — building an owned key just to look it up cost ~half a heavy raster.
     shape_cache: ShapeCache,
-    /// Count of actual shaping calls (cache misses) — never bumped on a hit. Lets
-    /// a test prove a repaint of unchanged text re-shapes nothing.
-    shape_misses: u32,
-    /// Count of owned `String` cache keys allocated to populate `shape_cache` — one
-    /// per miss. A hit must NOT allocate (it probes by borrowed `&str`), so a test
-    /// can prove that re-rasterizing already-seen text (every cache-cold re-blit of
-    /// an unchanged heavy session) allocates no probe keys.
-    shape_key_allocs: u32,
+    /// Running hit/miss tallies for the shape, glyph-atlas, and surface caches. The
+    /// single source of truth behind [`Self::cache_stats`] and the back-compat
+    /// [`Self::shape_misses`]/[`Self::surface_renders`] accessors.
+    stats: RenderCacheStats,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -1144,9 +1158,6 @@ pub struct Renderer {
     /// One blit quad per surface drawn this scene, parallel to the `Draw::Surface`
     /// quad indices.
     surface_quads: Option<wgpu::Buffer>,
-    /// Count of surface textures actually (re)rendered in full — a cache miss. A test
-    /// asserts an unchanged repaint re-renders none.
-    surface_renders: u32,
     /// Count of in-place banded surface updates: a live session whose frame changed in
     /// only some rows re-rasterizes just those rows into its persistent texture instead
     /// of a full re-render. A test asserts a one-row change band-updates, not re-renders.
@@ -1456,8 +1467,7 @@ impl Renderer {
             format,
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
-            shape_misses: 0,
-            shape_key_allocs: 0,
+            stats: RenderCacheStats::default(),
             bench_target: None,
             foreground_valid: false,
             blit_quad: None,
@@ -1479,7 +1489,6 @@ impl Renderer {
             deferring: false,
             warm_queue: Vec::new(),
             surface_quads: None,
-            surface_renders: 0,
             surface_band_updates: 0,
             foreground_session: None,
             image_bind_groups: HashMap::new(),
@@ -1793,11 +1802,14 @@ impl Renderer {
         match plan {
             Plan::Current => {
                 // cache hit: blit the existing texture; mark it most-recently-used.
+                self.stats.surface.hit();
                 if let Some(c) = self.surfaces.get_mut(&key) {
                     c.used_tick = tick;
                 }
             }
             Plan::Band(lo, hi) => {
+                // The texture is reused (a hit) and patched in place, not re-created.
+                self.stats.surface.hit();
                 let mut surface = self.surfaces.remove(&key).expect("present above");
                 self.update_surface_band(&mut surface, frame, selection, (lo, hi), font, size_px);
                 surface.used_tick = tick;
@@ -1805,9 +1817,10 @@ impl Renderer {
                 self.surface_band_updates += 1;
             }
             Plan::Full => {
+                self.stats.surface.miss();
                 let mut surface = self.render_surface(frame, selection, rect, font, size_px);
                 surface.used_tick = tick;
-                self.surface_renders += 1;
+                self.stats.surface.insert();
                 self.surfaces.insert(key, surface);
                 self.prune_session_surfaces(session);
             }
@@ -1925,6 +1938,7 @@ impl Renderer {
                 break;
             };
             self.surfaces.remove(&victim);
+            self.stats.surface.evict(1);
         }
     }
 
@@ -2220,10 +2234,10 @@ impl Renderer {
         }
     }
 
-    /// Count of surface textures (re)rendered (cache misses). A test asserts an
-    /// unchanged repaint re-renders none.
+    /// Count of surface textures (re)rendered in full (cache misses). A test asserts
+    /// an unchanged repaint re-renders none.
     pub fn surface_renders(&self) -> u32 {
-        self.surface_renders
+        self.stats.surface.misses as u32
     }
 
     /// Count of in-place banded surface updates (see
@@ -2242,10 +2256,11 @@ impl Renderer {
         if let Some(inner) = self.shape_cache.get(&outer)
             && let Some(rc) = inner.get(text)
         {
+            self.stats.shape.hit();
             return Rc::clone(rc);
         }
         // Miss: shape once, then allocate the owned key exactly once to store it.
-        self.shape_misses += 1;
+        self.stats.shape.miss();
         let shaped = Rc::new(ghost_shaper::shape(font, text, size_px));
         let inner = self.shape_cache.entry(outer).or_default();
         // Bound long-term growth from scrollback churn; the working set (the
@@ -2253,21 +2268,46 @@ impl Renderer {
         if inner.len() > 8192 {
             inner.clear();
         }
-        self.shape_key_allocs += 1;
+        self.stats.shape.insert();
         inner.insert(text.to_string(), Rc::clone(&shaped));
         shaped
     }
 
-    /// Total shaping calls (cache misses) — see [`Self::shape_misses`](Self::shape_misses).
-    pub fn shape_misses(&self) -> u32 {
-        self.shape_misses
+    /// A snapshot of the renderer's cache hit/miss tallies (shape, glyph atlas,
+    /// per-session surfaces). Read the running totals, snapshot before/after a
+    /// window of work, and diff with [`CacheCounters::since`] to assert a change
+    /// didn't cost cache hits.
+    pub fn cache_stats(&self) -> RenderCacheStats {
+        self.stats
     }
 
-    /// Total owned cache-key `String`s allocated for `shape_cache` — see
-    /// [`Self::shape_key_allocs`](Self::shape_key_allocs). Equals the miss count; a
-    /// hit allocates nothing.
+    /// Emit the running cache hit-rates to `tracing` (target `ghost::cache`). Call
+    /// once per presented frame; it is free unless a subscriber enables the target
+    /// (`RUST_LOG=ghost::cache=trace`), so the increments cost nothing in normal runs
+    /// while a debugging run can watch shaping/glyph/surface efficiency live and spot
+    /// a cache going cold (misses climbing) the moment a change regresses it.
+    pub fn emit_cache_trace(&self) {
+        tracing::trace!(
+            target: "ghost::cache",
+            shape_hit_rate = self.stats.shape.hit_rate(),
+            glyph_hit_rate = self.stats.glyph.hit_rate(),
+            surface_hit_rate = self.stats.surface.hit_rate(),
+            "cache: shape {} | glyph {} | surface {}",
+            self.stats.shape,
+            self.stats.glyph,
+            self.stats.surface,
+        );
+    }
+
+    /// Total shaping calls (cache misses). A repaint of unchanged text must add none.
+    pub fn shape_misses(&self) -> u32 {
+        self.stats.shape.misses as u32
+    }
+
+    /// Total owned cache-key `String`s allocated for `shape_cache` — one per miss; a
+    /// hit allocates nothing (it probes by borrowed `&str`).
     pub fn shape_key_allocs(&self) -> u32 {
-        self.shape_key_allocs
+        self.stats.shape.inserts as u32
     }
 
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
@@ -2280,8 +2320,10 @@ impl Renderer {
     ) -> Option<Slot> {
         let key = (id, size_px.to_bits(), synth);
         if let Some(slot) = self.cache.get(&key) {
+            self.stats.glyph.hit();
             return *slot;
         }
+        self.stats.glyph.miss();
         let resolved = match ghost_shaper::rasterize(font, id, size_px, synth) {
             Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
                 if self.pack_x + bmp.width + 1 > ATLAS_DIM {
@@ -2330,6 +2372,7 @@ impl Renderer {
             }
             _ => None,
         };
+        self.stats.glyph.insert();
         self.cache.insert(key, resolved);
         resolved
     }
@@ -2895,8 +2938,12 @@ impl Renderer {
         // (its window-res foreground survives while it shows as a native-res tile, and vice
         // versa — the coexistence that makes a repeated dive free). Stale SIZES of a still-
         // present session are bounded separately by `prune_session_surfaces`.
+        let before = self.surfaces.len();
         self.surfaces
             .retain(|(session, _), _| seen.contains(session));
+        self.stats
+            .surface
+            .evict((before - self.surfaces.len()) as u64);
         (all, draws, images, blits)
     }
 
@@ -3222,8 +3269,10 @@ impl Renderer {
         // full — a band would otherwise land on rows it never received. Scoped to
         // `win_key`: the session's NATIVE-res tile Surface must survive, so a dive-out
         // straight after this present is a cache hit (not a re-raster).
-        if !self.foreground_valid || self.foreground_session != Some(session) {
-            self.surfaces.remove(&win_key);
+        if (!self.foreground_valid || self.foreground_session != Some(session))
+            && self.surfaces.remove(&win_key).is_some()
+        {
+            self.stats.surface.evict(1);
         }
         // The steady foreground never defers — it is not an animation, and the whole point
         // is a crisp 1:1 composite this frame.

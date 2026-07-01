@@ -314,6 +314,17 @@ fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) 
 }
 
 fn interactive() {
+    // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
+    // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
+    // instrumented code stays free in normal runs.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
     // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
@@ -517,14 +528,17 @@ impl Graphics {
     /// runs — and returns its `Some((build, present))` split (or `None` when nothing
     /// was drawn). [`FrameStats`](framestats::FrameStats) consumes the split.
     fn render(&mut self, scene: &Scene, font_px: f32) -> Option<(Duration, Duration)> {
-        self.target.render_frame(
+        let split = self.target.render_frame(
             &mut self.renderer,
             &mut self.scene_cache,
             scene,
             self.font,
             font_px,
             || self.window.pre_present_notify(),
-        )
+        );
+        // Per-frame cache-efficiency line under `RUST_LOG=ghost::cache=trace`; free otherwise.
+        self.renderer.emit_cache_trace();
+        split
     }
 }
 

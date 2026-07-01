@@ -22,3 +22,6 @@ unicode-width = "0.1.13"
 # PNG output is first-class: `Rendered::save_png` lets a test or a headless tool
 # dump exactly what the renderer drew, for eyeballing and visual debugging.
 png = "0.18"
+# Cache-efficiency instrumentation: emit hit/miss stats under `RUST_LOG`, free
+# when no subscriber enables the target. The binary installs the subscriber.
+tracing = "0.1.44"
