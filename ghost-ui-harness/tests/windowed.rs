@@ -114,6 +114,14 @@ impl ApplicationHandler for WindowedDive {
             compatible_surface: Some(&surface),
         }))
         .expect("surface-compatible adapter");
+        let adapter_info = adapter.get_info();
+        eprintln!(
+            "windowed adapter: {} / {} ({:?})",
+            adapter_info.name, adapter_info.driver, adapter_info.device_type
+        );
+        // The software rasterizer (lavapipe = a CPU device) tears down cleanly; a real
+        // driver (venus, on this VM) still SIGSEGVs at teardown — see the exit below.
+        let clean_teardown = adapter_info.device_type == wgpu::DeviceType::Cpu;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("request device");
@@ -194,15 +202,21 @@ impl ApplicationHandler for WindowedDive {
         eprintln!("windowed dive: presented {presented} frames to the swapchain");
 
         // The dive's goal (real frames presented to the surface) is verified above.
-        // Tearing the venus/Wayland surface + device down *inside libtest's harness*
-        // then SIGSEGVs — and only there: a standalone binary drops the identical
-        // resources cleanly on venus (main thread or a spawned one), as does lavapipe,
-        // so it is neither a device-drop bug nor a concern for the real app (whose
-        // event loop, and teardown, run on the main thread). Force-exit on success
-        // rather than crash on cleanup. A failed assertion panics first, so a real
-        // failure still reports (non-zero) — only a clean success reaches here.
-        let _ = event_loop;
-        std::process::exit(0);
+        // Ask winit to exit the loop so `run_app` returns and the test tears down.
+        event_loop.exit();
+
+        // On a real driver, tearing the venus/Wayland surface + device down *inside
+        // libtest's harness* then SIGSEGVs — and only there: a standalone binary drops
+        // the identical resources cleanly on venus, as does lavapipe (a CPU device,
+        // which reaches the clean return above), so it is neither a device-drop bug nor
+        // a concern for the real app (whose event loop and teardown run on the main
+        // thread). Retested 2026-07-01 on the rebuilt VM: venus still crashes at
+        // teardown, lavapipe still clean. Force-exit on success there rather than crash
+        // on cleanup; a failed assertion panics first, so a real failure still reports
+        // (non-zero) — only a clean success reaches here.
+        if !clean_teardown {
+            std::process::exit(0);
+        }
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
