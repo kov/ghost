@@ -16,6 +16,21 @@ pub fn mods(m: ModifiersState) -> Mods {
     }
 }
 
+/// Whether a key event is the macOS window-cycle chord: Cmd-` cycles forward
+/// (`Some(true)`), Cmd-Shift-` backward (`Some(false)`); anything else is `None`.
+/// Keyed off the *physical* Backquote rather than the logical key, so it survives
+/// dead-grave layouts (ABNT etc.) where `` ` `` arrives as a dead key. Cycling is
+/// inherently cross-window, so the shell owns it — the pure core, keyed on logical
+/// `Key` with no physical position, could not classify it robustly.
+pub fn window_cycle_dir(physical: PhysicalKey, mods: ModifiersState) -> Option<bool> {
+    let backquote = matches!(physical, PhysicalKey::Code(KeyCode::Backquote));
+    if backquote && mods.super_key() && !mods.control_key() && !mods.alt_key() {
+        Some(!mods.shift_key())
+    } else {
+        None
+    }
+}
+
 pub fn key(k: &WKey, physical: PhysicalKey) -> Key {
     match k {
         // Modifier keys are reported without a side in the logical key; the side
@@ -180,7 +195,7 @@ mod tests {
     //! be constructed in a unit test. Its downstream effect — the kitty
     //! report-alternate-keys encoding — is covered by `ghost-ui-core`'s `encode`
     //! tests; only the winit extraction is uncovered.
-    use super::{key, modifier_side, mods, named, us_layout_char};
+    use super::{key, modifier_side, mods, named, us_layout_char, window_cycle_dir};
     use ghost_ui_core::input::{Key, Mods, NamedKey};
     use winit::keyboard::{
         Key as WKey, KeyCode, ModifiersState, NamedKey as WNamed, NativeKey, NativeKeyCode,
@@ -326,6 +341,34 @@ mod tests {
         assert_eq!(named(WNamed::F12), NamedKey::F12);
         // Anything ghost doesn't special-case collapses to `Other`.
         assert_eq!(named(WNamed::CapsLock), NamedKey::Other);
+    }
+
+    #[test]
+    fn window_cycle_dir_matches_cmd_backquote_by_physical_key() {
+        let bq = code(KeyCode::Backquote);
+        // Cmd-` cycles forward; Cmd-Shift-` backward.
+        assert_eq!(window_cycle_dir(bq, ModifiersState::SUPER), Some(true));
+        assert_eq!(
+            window_cycle_dir(bq, ModifiersState::SUPER | ModifiersState::SHIFT),
+            Some(false)
+        );
+        // Needs Command; a bare backtick (and other modifier mixes) never cycles —
+        // Ctrl or Alt disqualify it so those chords still reach the child.
+        assert_eq!(window_cycle_dir(bq, ModifiersState::empty()), None);
+        assert_eq!(window_cycle_dir(bq, ModifiersState::SHIFT), None);
+        assert_eq!(
+            window_cycle_dir(bq, ModifiersState::SUPER | ModifiersState::CONTROL),
+            None
+        );
+        assert_eq!(
+            window_cycle_dir(bq, ModifiersState::SUPER | ModifiersState::ALT),
+            None
+        );
+        // A different physical key with Command held is not the cycle chord.
+        assert_eq!(
+            window_cycle_dir(code(KeyCode::KeyA), ModifiersState::SUPER),
+            None
+        );
     }
 
     #[test]

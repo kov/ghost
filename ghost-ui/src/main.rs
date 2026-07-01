@@ -22,6 +22,7 @@ mod bench;
 mod config;
 mod font;
 mod from_winit;
+mod menu;
 mod pacer;
 mod resize;
 
@@ -41,6 +42,7 @@ use ghost_vt::client::Session;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
+use menu::{MenuIntent, UserEvent};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -73,6 +75,48 @@ const COLS: u16 = 80;
 const ROWS: u16 = 24;
 const POLL: Duration = Duration::from_millis(8);
 
+/// Where a GUI-launched session should start. `server::spawn` captures the
+/// process's working directory for the child, but a bundled launch (launchd on
+/// macOS via the `.app`, a desktop file on Linux) starts us at `/` — so sessions
+/// would open in `/`. In that case (or with no cwd at all) fall back to `home`; a
+/// real working directory, e.g. when launched from a terminal, is kept. Returns
+/// the directory to switch to, or `None` to leave the cwd as-is.
+fn home_launch_dir(cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    match cwd {
+        Some(c) if c != Path::new("/") => None,
+        _ => home.map(Path::to_path_buf),
+    }
+}
+
+/// Map the `option_as_meta` preference to winit's macOS Option-key mode: `Both`
+/// (both Option keys report as Alt, so the encoder ESC-prefixes them into Meta)
+/// when on, `None` (let macOS compose accented characters) when off.
+#[cfg(target_os = "macos")]
+fn option_as_alt(option_as_meta: bool) -> winit::platform::macos::OptionAsAlt {
+    use winit::platform::macos::OptionAsAlt;
+    if option_as_meta {
+        OptionAsAlt::Both
+    } else {
+        OptionAsAlt::None
+    }
+}
+
+/// The index to cycle to among `count` windows from `current` — forward wraps to
+/// the next, backward to the previous. `None` when there is nothing to cycle to
+/// (fewer than two windows); a missing `current` starts from the first. Ported
+/// from the retired ghost-gtk frontend, which drove the same Cmd-` cycling.
+fn cycle_index(count: usize, current: Option<usize>, forward: bool) -> Option<usize> {
+    if count < 2 {
+        return None;
+    }
+    let idx = current.unwrap_or(0);
+    Some(if forward {
+        (idx + 1) % count
+    } else {
+        (idx + count - 1) % count
+    })
+}
+
 fn main() {
     // MUST be first: re-execs into the session host when invoked as one.
     server::run_host_if_invoked();
@@ -83,11 +127,55 @@ fn main() {
         return;
     }
 
+    // A bundled launch (Finder/launchd) lands us at `/`; point new GUI sessions at
+    // the user's home instead. `server::spawn` reads our cwd when it starts each
+    // session's child, so this must run before any session is spawned — and after
+    // the CLI early-return above, so `ghost <subcommand>` keeps the shell's cwd.
+    if let Some(dir) = home_launch_dir(
+        std::env::current_dir().ok().as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    ) {
+        let _ = std::env::set_current_dir(dir);
+    }
+
+    // `GHOST_MENU_DUMP` verifies the native macOS menu bar: install it against a
+    // running NSApplication (no window, no session), print its structure, and
+    // exit. A native menu can't be click-driven under the test sandbox, so this
+    // is how the menu is asserted end-to-end.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("GHOST_MENU_DUMP").is_some() {
+        menu_dump();
+        return;
+    }
+
     if let Some(path) = std::env::var_os("GHOST_CAPTURE") {
         capture(PathBuf::from(path));
     } else {
         interactive();
     }
+}
+
+/// Drive a minimal event loop just far enough to install and print the native
+/// macOS menu bar (the `GHOST_MENU_DUMP` probe). Installs against the shared
+/// application winit sets up — no window and no session are created.
+#[cfg(target_os = "macos")]
+fn menu_dump() {
+    struct DumpApp {
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    }
+    impl ApplicationHandler<UserEvent> for DumpApp {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            menu::install(self.proxy.clone());
+            menu::dump();
+            event_loop.exit();
+        }
+        fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    }
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("event loop");
+    let proxy = event_loop.create_proxy();
+    let _ = event_loop.run_app(&mut DumpApp { proxy });
 }
 
 /// Grid cell count for a surface of `w`×`h` physical pixels at `scale` (cells
@@ -362,8 +450,15 @@ fn interactive() {
         }
     };
 
-    let event_loop = EventLoop::new().expect("event loop");
+    // A user-event loop so the native macOS menu can post `UserEvent::Menu` back
+    // from AppKit's main thread (see [`menu`]). The type parameter is inert on
+    // platforms without a menu.
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
+    #[cfg(target_os = "macos")]
+    let proxy = event_loop.create_proxy();
     let mut app = App {
         windows: HashMap::new(),
         clipboard: None,
@@ -371,6 +466,9 @@ fn interactive() {
         initial_name,
         next_session_seq: 0,
         bench: harness,
+        focused: None,
+        #[cfg(target_os = "macos")]
+        proxy,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -440,7 +538,11 @@ struct Graphics {
 }
 
 impl Graphics {
-    fn new(event_loop: &ActiveEventLoop, theme: ghost_renderer::Theme) -> Self {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        theme: ghost_renderer::Theme,
+        option_as_meta: bool,
+    ) -> Self {
         let size = PhysicalSize::new(
             u32::from(COLS) * metrics().advance as u32,
             u32::from(ROWS) * metrics().line_height as u32,
@@ -458,6 +560,17 @@ impl Graphics {
             .with_transparent(want_transparent);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
+        // On macOS, optionally treat Option as Meta (ESC-prefix) rather than
+        // letting it compose accented characters — the terminal-standard
+        // behaviour, controlled by `[input] option_as_meta`. Off macOS, Alt is
+        // already Meta, so the preference is inert there.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowExtMacOS;
+            window.set_option_as_alt(option_as_alt(option_as_meta));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = option_as_meta;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
@@ -636,6 +749,14 @@ struct App {
     /// against the real render path and synthesises the session list. `None` in
     /// normal use.
     bench: Option<bench::Harness>,
+    /// The window that last gained focus — the target for menu actions that act on
+    /// "the current window" (New Session, Copy, Paste, Zoom, Toggle Fleet). Kept
+    /// across focus loss; a stale id is filtered out at use (see `focused_window`).
+    focused: Option<WindowId>,
+    /// Proxy for posting native-menu selections into the event loop from AppKit's
+    /// main thread. Held only to hand to [`menu::install`].
+    #[cfg(target_os = "macos")]
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 }
 
 impl App {
@@ -968,7 +1089,7 @@ impl App {
     /// spawns or takes over a session from there.
     fn open_fleet_window(&mut self, event_loop: &ActiveEventLoop) {
         let cfg = config::UiConfig::load();
-        let gfx = Graphics::new(event_loop, cfg.theme());
+        let gfx = Graphics::new(event_loop, cfg.theme(), cfg.option_as_meta());
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
@@ -1014,6 +1135,31 @@ impl App {
     fn close_window(&mut self, wid: WindowId) {
         self.windows.remove(&wid);
     }
+
+    /// The window a "current window" menu action should target: the last-focused
+    /// one if it still exists, otherwise any live window (so an action still lands
+    /// after the focused window closed). `None` only when no window is open.
+    fn focused_window(&self) -> Option<WindowId> {
+        self.focused
+            .filter(|w| self.windows.contains_key(w))
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
+    /// Cycle focus among the app's windows (Cmd-` forward, Cmd-Shift-` backward),
+    /// in a stable [`WindowId`] order so the cycle is deterministic. A lone window
+    /// has nothing to cycle to. On macOS this is a fallback for when the system's
+    /// own "cycle windows" shortcut is disabled — when it's on, AppKit consumes
+    /// the key first and this never runs, so the two never double up.
+    fn cycle_windows(&self, current: WindowId, forward: bool) {
+        let mut ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        ids.sort();
+        let cur = ids.iter().position(|w| *w == current);
+        if let Some(next) = cycle_index(ids.len(), cur, forward)
+            && let Some(w) = self.windows.get(&ids[next])
+        {
+            w.gfx.window.focus_window();
+        }
+    }
 }
 
 impl App {
@@ -1021,7 +1167,7 @@ impl App {
     /// false if the attach fails (the caller exits the app).
     fn open_single_window(&mut self, event_loop: &ActiveEventLoop, name: &str) -> bool {
         let cfg = config::UiConfig::load();
-        let gfx = Graphics::new(event_loop, cfg.theme());
+        let gfx = Graphics::new(event_loop, cfg.theme(), cfg.option_as_meta());
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
@@ -1079,7 +1225,37 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    /// A native menu selection posted from AppKit's main thread. Each action is
+    /// turned back into the effect a keystroke would have produced, so the pure
+    /// core stays the single source of truth (see [`menu::menu_intent`]).
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let UserEvent::Menu(action) = event;
+        match menu::menu_intent(action) {
+            // Opening a window needs no focused target — it always works.
+            MenuIntent::NewWindow => self.open_fleet_window(event_loop),
+            MenuIntent::FocusedCmd(cmd) => {
+                if let Some(wid) = self.focused_window() {
+                    self.exec(wid, vec![cmd], event_loop);
+                }
+            }
+            MenuIntent::FocusedKey(key, mods) => {
+                if let Some(wid) = self.focused_window() {
+                    self.dispatch(
+                        wid,
+                        UiEvent::Key {
+                            key,
+                            mods,
+                            kind: KeyEventKind::Press,
+                            alts: None,
+                        },
+                        event_loop,
+                    );
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.windows.is_empty() {
             return;
@@ -1095,6 +1271,11 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        // Install the native macOS menu bar once the app is running (it appends
+        // ghost's File / Edit / View / Window submenus to the App submenu winit
+        // set up in applicationDidFinishLaunching).
+        #[cfg(target_os = "macos")]
+        menu::install(self.proxy.clone());
         // Bench mode: populate the fleet and load every preview before any animation.
         if self.bench.is_some()
             && let Some(wid) = self.windows.keys().next().copied()
@@ -1300,6 +1481,18 @@ impl ApplicationHandler for App {
                 let Some(mods_state) = self.windows.get(&id).map(|w| w.mods) else {
                     return;
                 };
+                // Cmd-` / Cmd-Shift-` cycles the app's windows (the macOS
+                // convention). Handled here, not in the pure core: it is
+                // cross-window and keys off the physical Backquote so it survives
+                // dead-grave layouts. Swallow the whole transition (press, repeat
+                // and release) so no literal backtick ever leaks to the child.
+                if let Some(forward) = from_winit::window_cycle_dir(event.physical_key, mods_state)
+                {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        self.cycle_windows(id, forward);
+                    }
+                    return;
+                }
                 let key = from_winit::key(&event.logical_key, event.physical_key);
                 let mods = from_winit::mods(mods_state);
                 let alts = from_winit::alternates(&event, mods_state);
@@ -1333,6 +1526,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Ime(Ime::Enabled) => {}
             WindowEvent::Focused(focused) => {
+                // Remember the last-focused window as the target for menu actions;
+                // keep the previous one on blur (a stale id is filtered at use).
+                if focused {
+                    self.focused = Some(id);
+                }
                 self.dispatch(id, UiEvent::Focus(focused), event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1418,7 +1616,9 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupChoice, choose_alpha_mode, choose_surface_format, startup_choice};
+    use super::{
+        StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir, startup_choice,
+    };
     use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
     use wgpu::TextureFormat::{
@@ -1435,6 +1635,51 @@ mod tests {
             attached,
             bell: false,
         }
+    }
+
+    #[test]
+    fn gui_launch_falls_back_to_home_only_without_a_real_cwd() {
+        use std::path::{Path, PathBuf};
+
+        let home = Path::new("/Users/kov");
+        // Bundled launch (launchd/Finder) starts us at `/`: fall back to home.
+        assert_eq!(
+            home_launch_dir(Some(Path::new("/")), Some(home)),
+            Some(PathBuf::from("/Users/kov"))
+        );
+        // No cwd at all: also fall back to home.
+        assert_eq!(home_launch_dir(None, Some(home)), Some(PathBuf::from(home)));
+        // A real working directory (e.g. launched from a terminal) is kept as-is.
+        assert_eq!(
+            home_launch_dir(Some(Path::new("/Users/kov/Projects/ghost")), Some(home)),
+            None
+        );
+        // Nothing to fall back to: leave cwd untouched rather than guess.
+        assert_eq!(home_launch_dir(Some(Path::new("/")), None), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn option_as_alt_maps_the_meta_preference() {
+        use super::option_as_alt;
+        use winit::platform::macos::OptionAsAlt;
+        // Meta-on makes both Option keys report as Alt (so the encoder ESC-prefixes
+        // them); Meta-off leaves macOS to compose accented characters.
+        assert_eq!(option_as_alt(true), OptionAsAlt::Both);
+        assert_eq!(option_as_alt(false), OptionAsAlt::None);
+    }
+
+    #[test]
+    fn window_cycle_index_wraps_both_ways_and_needs_two() {
+        use super::cycle_index;
+        // Forward and backward wrap around.
+        assert_eq!(cycle_index(3, Some(2), true), Some(0));
+        assert_eq!(cycle_index(3, Some(0), false), Some(2));
+        // A missing current starts from the first (so forward lands on index 1).
+        assert_eq!(cycle_index(3, None, true), Some(1));
+        // Fewer than two windows: nothing to cycle to.
+        assert_eq!(cycle_index(1, Some(0), true), None);
+        assert_eq!(cycle_index(0, None, true), None);
     }
 
     #[test]

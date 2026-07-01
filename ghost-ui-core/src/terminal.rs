@@ -1740,6 +1740,79 @@ mod tests {
     }
 
     #[test]
+    fn cmd_copy_paste_use_super_while_bare_ctrl_stays_control() {
+        // Copy/paste are the stricter Cmd (macOS) / Ctrl+Shift combo so a bare
+        // Ctrl+C/Ctrl+V still reaches the child as a control byte. The native menu
+        // re-injects exactly these chords, so this pins the mapping it relies on.
+        let mut m = model();
+        assert_eq!(
+            key(&mut m, Key::Char("v".into()), Mods::SUPER),
+            vec![Cmd::ReadClipboard],
+            "Cmd+V pastes"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("v".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x16")],
+            "bare Ctrl+V is a literal control byte, not paste"
+        );
+
+        // Cmd+C copies the current selection; bare Ctrl+C stays 0x03 (SIGINT).
+        let mut m = model();
+        feed(&mut m, b"hello world");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            40.0,
+            1.0,
+        ));
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::SUPER),
+            vec![Cmd::WriteClipboard("hello".to_string())],
+            "Cmd+C copies the selection"
+        );
+        let mut m = model();
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x03")],
+            "bare Ctrl+C is SIGINT, not copy"
+        );
+    }
+
+    #[test]
+    fn cmd_n_and_w_are_window_management_while_bare_ctrl_stays_control() {
+        let mut m = model();
+        assert_eq!(
+            key(&mut m, Key::Char("n".into()), Mods::SUPER),
+            vec![Cmd::NewWindow],
+            "Cmd+N opens a new window"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("w".into()), Mods::SUPER),
+            vec![Cmd::CloseWindow],
+            "Cmd+W closes the window"
+        );
+        // Bare Ctrl+N / Ctrl+W stay ordinary terminal input (0x0e / 0x17), never
+        // window management — only the Cmd (or Ctrl+Shift) chord manages windows.
+        assert_eq!(
+            key(&mut m, Key::Char("n".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x0e")],
+            "bare Ctrl+N is terminal input"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("w".into()), Mods::CTRL),
+            vec![sent("alpha", b"\x17")],
+            "bare Ctrl+W is terminal input"
+        );
+    }
+
+    #[test]
     fn output_clears_selection_when_not_dragging() {
         let mut m = model();
         feed(&mut m, b"hello world");

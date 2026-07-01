@@ -1,7 +1,8 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), the background opacity (`[window]`), and the
-//! base font size + family (`[font]`).
+//! a persisted font zoom (`[zoom]`), the background opacity (`[window]`), the base
+//! font size + family (`[font]`), and how the macOS Option key behaves
+//! (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
 //! is pure and unit-tested. Scheme ids are inherited from the retired ghost-gtk
@@ -116,6 +117,7 @@ pub struct UiConfig {
     zoom: Zoom,
     window: Window,
     font: Font,
+    input: Input,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -167,6 +169,25 @@ impl Default for Font {
         Font {
             size: DEFAULT_FONT_PX,
             family: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Input {
+    /// macOS only: treat the Option (⌥) key as Meta, so Option+key sends an
+    /// ESC-prefixed byte (Alt-b word motion, readline Meta bindings, …) instead
+    /// of composing an accented character. On by default, matching a terminal's
+    /// usual behaviour; set to `false` to type é/ü/£/… via Option. No effect off
+    /// macOS, where Alt is already Meta.
+    option_as_meta: bool,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Input {
+            option_as_meta: true,
         }
     }
 }
@@ -236,6 +257,12 @@ impl UiConfig {
     /// The configured fontconfig family name, or `None` to use the bundled font.
     pub fn font_family(&self) -> Option<&str> {
         self.font.family.as_deref()
+    }
+
+    /// Whether the macOS Option key acts as Meta (ESC-prefix) rather than
+    /// composing accented characters. On by default; see [`Input`].
+    pub fn option_as_meta(&self) -> bool {
+        self.input.option_as_meta
     }
 }
 
@@ -309,6 +336,26 @@ mod tests {
         let c = UiConfig::parse("[window]\nopacity = nan\n").unwrap();
         assert!(c.theme().bg_alpha.is_finite());
         assert_eq!(c.theme().bg_alpha, 1.0);
+    }
+
+    #[test]
+    fn option_as_meta_defaults_on_and_parses() {
+        // Default, empty, and a present-but-empty [input] table all keep Option
+        // acting as Meta (the terminal-friendly default).
+        assert!(UiConfig::default().option_as_meta());
+        assert!(UiConfig::parse("").unwrap().option_as_meta());
+        assert!(UiConfig::parse("[input]\n").unwrap().option_as_meta());
+        // An explicit opt-out lets Option compose accented characters again.
+        assert!(
+            !UiConfig::parse("[input]\noption_as_meta = false\n")
+                .unwrap()
+                .option_as_meta()
+        );
+        assert!(
+            UiConfig::parse("[input]\noption_as_meta = true\n")
+                .unwrap()
+                .option_as_meta()
+        );
     }
 
     #[test]

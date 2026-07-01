@@ -130,12 +130,11 @@ impl QueryScanner {
                 State::Csi => match b {
                     // A new ESC aborts the (malformed) sequence.
                     0x1b => self.state = State::Esc,
-                    // Parameter and intermediate bytes.
-                    0x20..=0x3f => {
-                        if self.params.len() < MAX_CSI_PARAMS {
-                            self.params.push(b);
-                        }
+                    // Parameter and intermediate bytes (dropped past the cap).
+                    0x20..=0x3f if self.params.len() < MAX_CSI_PARAMS => {
+                        self.params.push(b);
                     }
+                    0x20..=0x3f => {}
                     // Final byte: classify and emit.
                     0x40..=0x7e => {
                         if let Some(q) = classify_csi(&self.params, b) {

@@ -42,6 +42,21 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
 
+# The native macOS menu bar (see src/menu.rs). These objc2 crates are already in
+# the tree via the vendored winit, so this pulls in no new compiled crate; pinned
+# to winit's 0.5/0.2 line to share its runtime types (Retained, MainThreadMarker).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
+    "NSEvent",
+    "NSWindow",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.2", features = ["NSString"] }
+
 [dev-dependencies]
 # The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.
 tempfile = "3"

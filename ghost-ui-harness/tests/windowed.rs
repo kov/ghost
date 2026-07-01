@@ -11,6 +11,12 @@
 //! GHOST_UI_WINDOWED=1 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u) \
 //!   cargo test -p ghost-ui-harness --test windowed -- --nocapture
 //! ```
+//!
+//! Linux-only: it uses the Wayland `EventLoopBuilderExtWayland` and runs the
+//! event loop off the main thread (`with_any_thread`), which winit only permits
+//! on Linux — on macOS the loop must own the main thread, so this whole target is
+//! compiled out there (keeping `cargo test --all-targets` green on macOS).
+#![cfg(target_os = "linux")]
 
 use std::sync::Arc;
 

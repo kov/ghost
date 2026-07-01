@@ -13,6 +13,7 @@ members = [
     "ghost-ui-harness",
     "ghost-ui",
     "ghost-shot",
+    "xtask",
 ]
 # The vendored winit (see the patch below) is its own package, not a member.
 exclude = ["vendor/winit"]
