@@ -127,18 +127,17 @@ impl Target {
         font_px: f32,
         pre_present: impl FnOnce(),
     ) -> Option<(Duration, Duration)> {
-        // Decide what to redraw vs the last presented frame: skip an identical scene,
-        // redraw only the changed band (opaque targets), or repaint in full.
-        let band = match cache.damage(scene, font_px) {
+        // Skip an identical scene; otherwise present it. The per-session Surface keeps
+        // the redraw cheap (it re-rasters only its changed rows), so the scene-level
+        // verdict is just skip-or-present.
+        match cache.damage(scene, font_px) {
             Damage::None => return None,
-            Damage::Full => None,
-            Damage::Band(b) if self.opaque() => Some(b),
-            Damage::Band(_) => None,
-        };
+            Damage::Full => {}
+        }
         match self {
             Target::Offscreen => {
                 let t = Instant::now();
-                renderer.render_to_cached_target(scene, font, font_px, band);
+                renderer.render_to_cached_target(scene, font, font_px);
                 Some((t.elapsed(), Duration::ZERO))
             }
             Target::Surface(s) => {
@@ -150,7 +149,7 @@ impl Target {
                 };
                 let size = (s.config.width, s.config.height);
                 let t_build = Instant::now();
-                renderer.present_scene(&view, size, scene, font, font_px, band);
+                renderer.present_scene(&view, size, scene, font, font_px);
                 let build = t_build.elapsed();
                 let t_present = Instant::now();
                 pre_present();

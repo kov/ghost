@@ -472,11 +472,10 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
 }
 
 /// Benchmark TYPING into the single view (one row changes per frame — the common
-/// interactive case) at `size`: full redraw of the whole surface every frame versus
-/// damage-aware partial redraw (only the changed band). Renders through the headless
-/// "present" path (`render_to_cached_target`, no per-frame alloc or readback) so the
-/// figure tracks the live cost. On lavapipe at 4K the full path repaints the whole
-/// surface each keystroke; the damaged path touches only a row.
+/// interactive case) at `size`. Renders through the headless "present" path
+/// (`render_to_cached_target`, no per-frame alloc or readback) so the figure tracks the
+/// live cost: the foreground composites through its per-session Surface, which re-rasters
+/// only the row that changed and blits the whole Surface.
 fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
     use std::time::Instant;
 
@@ -491,66 +490,49 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
     // One char written at (mid, cycling column) per frame — only row `mid` changes.
     let keystroke = |i: usize| format!("\x1b[{};{}Hx", mid, (i % cols) + 1).into_bytes();
 
-    let run = |damage_aware: bool| -> f64 {
-        let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
-        let mut root = RootModel::single(model, METRICS, size);
-        root.update(UiEvent::Resize {
-            w_px: size.0,
-            h_px: size.1,
-            scale: scale as f64,
-        });
+    let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
+    let mut root = RootModel::single(model, METRICS, size);
+    root.update(UiEvent::Resize {
+        w_px: size.0,
+        h_px: size.1,
+        scale: scale as f64,
+    });
+    root.update(UiEvent::SessionData {
+        name: name.to_string(),
+        bytes: dense_screen_sized(cols, rows).into_bytes(),
+        ended: false,
+    });
+    let px = SIZE_PX * root.render_scale();
+    let mut renderer = Renderer::headless(Theme::default());
+    let mut cache = SceneCache::default();
+
+    let feed = |root: &mut RootModel, renderer: &mut Renderer, cache: &mut SceneCache, i| {
         root.update(UiEvent::SessionData {
             name: name.to_string(),
-            bytes: dense_screen_sized(cols, rows).into_bytes(),
+            bytes: keystroke(i),
             ended: false,
         });
-        let px = SIZE_PX * root.render_scale();
-        let mut renderer = Renderer::headless(Theme::default());
-        let mut cache = SceneCache::default();
-
-        let feed =
-            |root: &mut RootModel, renderer: &mut Renderer, cache: &mut SceneCache, i: usize| {
-                root.update(UiEvent::SessionData {
-                    name: name.to_string(),
-                    bytes: keystroke(i),
-                    ended: false,
-                });
-                let scene = root.view();
-                let band = match cache.damage(&scene, px) {
-                    Damage::None => return,
-                    _ if !damage_aware => None,
-                    Damage::Full => None,
-                    Damage::Band(b) => Some(b),
-                };
-                renderer.render_to_cached_target(&scene, font, px, band);
-            };
-
-        // Warm the caches and let the damage window settle past the initial full frames.
-        for i in 0..16 {
-            feed(&mut root, &mut renderer, &mut cache, i);
+        let scene = root.view();
+        if cache.damage(&scene, px) == Damage::None {
+            return;
         }
-        let t = Instant::now();
-        for i in 0..frames {
-            feed(&mut root, &mut renderer, &mut cache, i);
-        }
-        (t.elapsed().as_nanos() as f64) / (frames as f64) / 1.0e6
+        renderer.render_to_cached_target(&scene, font, px);
     };
 
-    let full = run(false);
-    let damaged = run(true);
+    // Warm the caches before measuring.
+    for i in 0..16 {
+        feed(&mut root, &mut renderer, &mut cache, i);
+    }
+    let t = Instant::now();
+    for i in 0..frames {
+        feed(&mut root, &mut renderer, &mut cache, i);
+    }
+    let ms = (t.elapsed().as_nanos() as f64) / (frames as f64) / 1.0e6;
     println!(
         "bench type: {}x{} @ {scale}x ({cols}x{rows} grid), {frames} typing frames (1 row/frame)",
         size.0, size.1
     );
-    println!(
-        "  full redraw:   {full:.3} ms/frame  ({:.0} fps)",
-        1000.0 / full
-    );
-    println!(
-        "  damage-aware:  {damaged:.3} ms/frame  ({:.0} fps)",
-        1000.0 / damaged
-    );
-    println!("  speedup:       {:.1}x", full / damaged);
+    println!("  present: {ms:.3} ms/frame  ({:.0} fps)", 1000.0 / ms);
 }
 
 /// Benchmark the single↔fleet DIVE animation at a given window size: a fleet of
