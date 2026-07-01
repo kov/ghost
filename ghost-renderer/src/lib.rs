@@ -640,17 +640,24 @@ const OPAQUE_UV: [f32; 4] = [
 /// texture. Walking these in order (rather than all glyphs then all images) keeps
 /// z-order correct — e.g. the take-over overlay and focus border, emitted after a
 /// tile, draw over its surface.
+/// Key into the surface cache: a session AND the texture size it was rendered at. One
+/// session appears at two sizes under one identity — window-res as the foreground and
+/// native-res as a fleet tile — so keying by session alone makes each single↔fleet
+/// transition evict and re-raster the other role (the dive-out "hang"). Keyed by
+/// `(session, size)`, both roles coexist and a repeated dive is a cache hit.
+type SurfaceKey = (u64, (u32, u32));
+
 enum Draw {
     /// A run of glyph/solid instances (chrome, the single view, dim overlays).
     Glyphs {
         scissor: [u32; 4],
         range: std::ops::Range<u32>,
     },
-    /// Blit cached surface texture for `session` (quad `quad` of the surface buffer).
+    /// Blit the cached surface texture keyed by `key` (quad `quad` of the surface buffer).
     Surface {
         scissor: [u32; 4],
         quad: u32,
-        session: u64,
+        key: SurfaceKey,
     },
 }
 
@@ -677,9 +684,18 @@ struct Surface {
     /// The selection baked into the texture. A selection change with no frame change must
     /// still re-render (it can't be diffed as a row band), so it's part of the cache key.
     selection: Option<Selection>,
-    /// Texture pixel size; a resize/relayout re-renders in full.
+    /// Texture pixel size; also the size half of this surface's [`SurfaceKey`].
     size: (u32, u32),
+    /// Monotonic "last used" stamp (from `Renderer::surface_tick`), bumped on every
+    /// cache access. When a session accumulates more than [`MAX_SURFACES_PER_SESSION`]
+    /// sizes (a resized window's stale textures), the least-recently-used is evicted.
+    used_tick: u64,
 }
+
+/// Cap on cached surface textures per session. A session needs two live at once (window-
+/// res foreground + native-res tile); the slack absorbs a resize's in-flight sizes before
+/// the least-recently-used ages out, bounding memory without evicting an active role.
+const MAX_SURFACES_PER_SESSION: usize = 4;
 
 /// The last fully-rendered scene, captured to a texture so an interactive resize
 /// can stretch-blit it to the changing surface instead of re-laying-out and
@@ -1061,11 +1077,15 @@ pub struct Renderer {
     /// overwrite a sub-region of a texture (opaque covers, translucent replaces cleanly),
     /// since `LoadOp::Clear` is whole-target.
     erase_pipeline: wgpu::RenderPipeline,
-    /// Per-session rendered textures by [`session_key`] (see [`Surface`]). Keying by
-    /// session — not the ephemeral [`SceneId`] role/handle — means a session's texture
-    /// follows it across roles and fleet rebuilds, so a role change re-rasterizes
-    /// nothing.
-    surfaces: HashMap<u64, Surface>,
+    /// Per-session rendered textures keyed by [`SurfaceKey`] (`(session, size)`; the
+    /// session part is [`session_key`], see [`Surface`]). Keying by session — not the
+    /// ephemeral [`SceneId`] role/handle — means a texture follows the session across
+    /// roles and fleet rebuilds; keying ALSO by size lets a session's window-res
+    /// foreground and native-res tile coexist so a repeated dive re-rasters neither.
+    surfaces: HashMap<SurfaceKey, Surface>,
+    /// Monotonic counter stamped onto a surface's `used_tick` on each cache access, for
+    /// least-recently-used eviction when a session exceeds [`MAX_SURFACES_PER_SESSION`].
+    surface_tick: u64,
     /// One blit quad per surface drawn this scene, parallel to the `Draw::Surface`
     /// quad indices.
     surface_quads: Option<wgpu::Buffer>,
@@ -1399,6 +1419,7 @@ impl Renderer {
             blit_pipeline,
             erase_pipeline,
             surfaces: HashMap::new(),
+            surface_tick: 0,
             surface_quads: None,
             surface_renders: 0,
             surface_band_updates: 0,
@@ -1636,9 +1657,11 @@ impl Renderer {
     }
 
     /// Ensure `session`'s surface texture is current for `frame` at `rect`,
-    /// (re)rendering only on a content or size change. The caller then blits the
-    /// cached texture, so an unchanged session re-rasterizes nothing — the win that
-    /// keeps fleet navigation (and the steady foreground) cheap on a software rasterizer.
+    /// (re)rendering only on a content or size change. Returns the texture SIZE, which is
+    /// the size half of the [`SurfaceKey`] the caller blits (the session appears at more
+    /// than one size, so the caller needs it to look the texture up). An unchanged session
+    /// re-rasterizes nothing — the win that keeps fleet navigation and the steady
+    /// foreground cheap on a software rasterizer.
     // The seven inputs (session identity, frame, selection, damage, target rect, font,
     // size) are all irreducible render inputs; bundling them into a single-use struct
     // purely to satisfy the arg-count lint would add indirection without clarity.
@@ -1652,19 +1675,23 @@ impl Renderer {
         rect: RectPx,
         font: FontRef,
         size_px: f32,
-    ) {
+    ) -> (u32, u32) {
         let size = Self::surface_size(frame, rect);
+        let key = (session, size);
+        self.surface_tick += 1;
+        let tick = self.surface_tick;
         // Decide against the cached surface up front, copying out a plan so no borrow of
         // the cache is held while we mutate it below. The model tells us WHAT changed
         // (`damage`) — this only decides whether that change is bandable against THIS
-        // surface (same size, same selection, rendered 1:1, no images either side).
+        // surface (same selection, rendered 1:1, no images either side). Size is part of
+        // the key, so a lookup already matches size exactly.
         enum Plan {
             Current,            // nothing changed: the texture is already right
             Band(usize, usize), // localized change: re-render just rows [lo, hi] in place
             Full, // no surface, a resize, a selection change, or an un-bandable change
         }
-        let plan = match self.surfaces.get(&session) {
-            Some(c) if c.size == size && c.selection == selection => {
+        let plan = match self.surfaces.get(&key) {
+            Some(c) if c.selection == selection => {
                 if Rc::ptr_eq(&c.frame, frame) {
                     // The SAME frame allocation re-composited: a fleet tile whose cached
                     // frame didn't change, a frozen animation tick. An O(1) identity hit —
@@ -1695,18 +1722,48 @@ impl Renderer {
             _ => Plan::Full,
         };
         match plan {
-            Plan::Current => {} // cache hit: blit the existing texture
+            Plan::Current => {
+                // cache hit: blit the existing texture; mark it most-recently-used.
+                if let Some(c) = self.surfaces.get_mut(&key) {
+                    c.used_tick = tick;
+                }
+            }
             Plan::Band(lo, hi) => {
-                let mut surface = self.surfaces.remove(&session).expect("present above");
+                let mut surface = self.surfaces.remove(&key).expect("present above");
                 self.update_surface_band(&mut surface, frame, selection, (lo, hi), font, size_px);
-                self.surfaces.insert(session, surface);
+                surface.used_tick = tick;
+                self.surfaces.insert(key, surface);
                 self.surface_band_updates += 1;
             }
             Plan::Full => {
-                let surface = self.render_surface(frame, selection, rect, font, size_px);
+                let mut surface = self.render_surface(frame, selection, rect, font, size_px);
+                surface.used_tick = tick;
                 self.surface_renders += 1;
-                self.surfaces.insert(session, surface);
+                self.surfaces.insert(key, surface);
+                self.prune_session_surfaces(session);
             }
+        }
+        size
+    }
+
+    /// Drop the least-recently-used cached surface(s) for `session` once it holds more
+    /// than [`MAX_SURFACES_PER_SESSION`] sizes — a window resized many times would
+    /// otherwise leave a stale texture per size. The two active roles (window-res
+    /// foreground, native-res tile) are touched every dive, so they stay hottest and
+    /// survive; only genuinely idle stale sizes age out.
+    fn prune_session_surfaces(&mut self, session: u64) {
+        while self.surfaces.keys().filter(|(s, _)| *s == session).count() > MAX_SURFACES_PER_SESSION
+        {
+            let Some(victim) = self
+                .surfaces
+                .iter()
+                .filter(|((s, _), _)| *s == session)
+                .min_by_key(|(_, surf)| surf.used_tick)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            self.surfaces.remove(&victim);
         }
     }
 
@@ -1998,6 +2055,7 @@ impl Renderer {
             frame: frame.clone(),
             selection,
             size,
+            used_tick: 0, // stamped by `ensure_surface` on insert
         }
     }
 
@@ -2553,14 +2611,14 @@ impl Renderer {
                             // transform, so the terminal still moves/zooms; the texture
                             // stays put.
                             let src = surface_src(frame, *rect);
-                            self.ensure_surface(
+                            let size = self.ensure_surface(
                                 *session, frame, *selection, *damage, src, font, size_px,
                             );
                             seen.insert(*session);
                             draws.push(Draw::Surface {
                                 scissor,
                                 quad: blits.len() as u32,
-                                session: *session,
+                                key: (*session, size),
                             });
                             blits.push(*rect);
                             if *dim {
@@ -2635,8 +2693,13 @@ impl Renderer {
                 &mut images[img0..],
             );
         }
-        // Drop textures for sessions no longer on screen, bounding cache memory.
-        self.surfaces.retain(|session, _| seen.contains(session));
+        // Drop textures for sessions no longer on screen, bounding cache memory. Retain by
+        // the SESSION half of the key, so a session that is on screen keeps ALL its sizes
+        // (its window-res foreground survives while it shows as a native-res tile, and vice
+        // versa — the coexistence that makes a repeated dive free). Stale SIZES of a still-
+        // present session are bounded separately by `prune_session_surfaces`.
+        self.surfaces
+            .retain(|(session, _), _| seen.contains(session));
         (all, draws, images, blits)
     }
 
@@ -2784,16 +2847,12 @@ impl Renderer {
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
                         pass.draw(0..6, range.clone());
                     }
-                    Draw::Surface {
-                        scissor,
-                        quad,
-                        session,
-                    } => {
+                    Draw::Surface { scissor, quad, key } => {
                         if scissor[2] == 0 || scissor[3] == 0 {
                             continue;
                         }
                         let (Some(buf), Some(cached)) =
-                            (&self.surface_quads, self.surfaces.get(session))
+                            (&self.surface_quads, self.surfaces.get(key))
                         else {
                             continue; // texture evicted/missing: skip rather than err
                         };
@@ -2955,24 +3014,27 @@ impl Renderer {
             w: surf.0.max(1) as f32,
             h: surf.1.max(1) as f32,
         };
-        // If the Surface is stale (the last present drew a non-lone scene, leaving no
-        // valid foreground Surface) or holds a different session, drop it so
-        // `ensure_surface` re-renders it in full: a partial update would otherwise land
-        // on rows the Surface never received.
-        if !self.foreground_valid || self.foreground_session != Some(session) {
-            self.surfaces.remove(&session);
-        }
         // Window-sized source (see `surface_src`): the Surface is exactly the swapchain
         // size, so the blit below is 1:1. `ensure_surface` diffs the new frame against
         // the Surface's held frame and updates only the changed rows in place.
         let src = surface_src(frame, win);
+        let win_key = (session, Self::surface_size(frame, src));
+        // If the foreground Surface is stale (the last present drew a non-lone scene, so
+        // this session's WINDOW-res texture missed intermediate feeds) or held a different
+        // session, drop just that window-res entry so `ensure_surface` re-renders it in
+        // full — a band would otherwise land on rows it never received. Scoped to
+        // `win_key`: the session's NATIVE-res tile Surface must survive, so a dive-out
+        // straight after this present is a cache hit (not a re-raster).
+        if !self.foreground_valid || self.foreground_session != Some(session) {
+            self.surfaces.remove(&win_key);
+        }
         self.ensure_surface(session, frame, selection, damage, src, font, size_px);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
         // Blit the whole Surface onto the swapchain (resets the uniform, which the render
         // above set to the texture size, to the surface size for the fullscreen quad).
         self.prepare_blit_quad(surf.0, surf.1);
-        if let Some(s) = self.surfaces.get(&session) {
+        if let Some(s) = self.surfaces.get(&win_key) {
             let cb = self.encode_surface_blit(view, &s.bind_group);
             self.gpu.queue.submit([cb]);
         }
@@ -4115,6 +4177,102 @@ mod tests {
         assert_eq!(
             got, full,
             "a banded present must reproduce a full render of the frame"
+        );
+    }
+
+    #[test]
+    fn a_sessions_foreground_and_tile_surfaces_coexist_without_eviction() {
+        // A session shows at TWO sizes under one identity: window-res as the foreground
+        // (present_scene, contain_scale == 1) and native-res as a fleet tile (build_scene,
+        // contain_scale < 1). The cache must hold BOTH so neither role evicts the other:
+        // rendering the tile must not drop the foreground's texture, nor vice versa. This
+        // coexistence is the foundation the dive decouple builds on (it can blit the
+        // surviving texture as a placeholder while it warms the other size). A single-keyed
+        // cache evicts one role when the other renders — the C2 eviction that put a full
+        // re-raster of the heavy session on every dive. (Same-content re-access is a
+        // pointer-identity cache hit here — shared Rcs — isolating the SIZE key.)
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        // A window that is NOT an exact multiple of the cell box, so the window-res
+        // foreground surface and the native-res tile surface are genuinely different
+        // sizes (as they are in the real app).
+        let (w, h) = (cols as u32 * 9 + 60, rows as u32 * 18 + 40);
+        let sess = session_key("dual-role");
+        // Shared Rcs (as the single model / fleet tile cache reuse across presents), so a
+        // return to a role is a pointer-identity cache hit — isolating the SIZE key as the
+        // thing under test.
+        let fg_frame = std::rc::Rc::new(frame(cols, rows, "an idle heavy session"));
+        let tile_frame = std::rc::Rc::new(frame(cols, rows, "an idle heavy session"));
+        let fg = || Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    session: sess,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32,
+                        h: h as f32,
+                    },
+                    frame: fg_frame.clone(),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::All,
+                }],
+            )],
+        };
+        // A quarter-window tile (contain_scale < 1 → the native-res surface path).
+        let tile = || Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Tile(1),
+                    session: sess,
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: w as f32 / 4.0,
+                        h: h as f32 / 4.0,
+                    },
+                    frame: tile_frame.clone(),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::All,
+                }],
+            )],
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Single view: the foreground rasters its window-res surface once.
+        r.present_scene(&v, (w, h), &fg(), font, SIZE_PX);
+        assert_eq!(r.surface_renders(), 1, "the foreground rasters once");
+        // Dive out: the tile rasters its native-res surface — WITHOUT evicting the
+        // foreground's.
+        let _ = r.render_offscreen_scene(&tile(), font, SIZE_PX);
+        assert_eq!(
+            r.surface_renders(),
+            2,
+            "the tile adds a native-res surface, keeping the foreground's"
+        );
+        // Dive in: back to the foreground — its window-res surface is still cached.
+        r.present_scene(&v, (w, h), &fg(), font, SIZE_PX);
+        assert_eq!(
+            r.surface_renders(),
+            2,
+            "returning to the foreground reuses its surface (not a re-raster)"
+        );
+        // Dive out again: the native-res tile surface survived the foreground present.
+        let _ = r.render_offscreen_scene(&tile(), font, SIZE_PX);
+        assert_eq!(
+            r.surface_renders(),
+            2,
+            "the foreground present did not evict the tile surface"
         );
     }
 
