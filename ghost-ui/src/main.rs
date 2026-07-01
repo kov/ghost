@@ -403,6 +403,11 @@ struct Graphics {
     /// Skips re-drawing a scene identical to the last presented, and computes the
     /// changed band for a partial redraw.
     scene_cache: SceneCache,
+    /// The one `FontRef` for this window, built once from the embedded bytes. Built
+    /// per-frame it would mint a fresh swash `CacheKey` each time (a global atomic),
+    /// re-parse the font header, and — before the shape cache was keyed on stable
+    /// font data — silently defeat that cache. Reuse the same ref everywhere.
+    font: ghost_shaper::FontRef<'static>,
 }
 
 impl Graphics {
@@ -470,6 +475,7 @@ impl Graphics {
             )),
             renderer,
             scene_cache: SceneCache::default(),
+            font: ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads"),
         }
     }
 
@@ -511,12 +517,11 @@ impl Graphics {
     /// runs — and returns its `Some((build, present))` split (or `None` when nothing
     /// was drawn). [`FrameStats`](framestats::FrameStats) consumes the split.
     fn render(&mut self, scene: &Scene, font_px: f32) -> Option<(Duration, Duration)> {
-        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         self.target.render_frame(
             &mut self.renderer,
             &mut self.scene_cache,
             scene,
-            font,
+            self.font,
             font_px,
             || self.window.pre_present_notify(),
         )
@@ -904,8 +909,7 @@ impl App {
                     if !w.gfx.renderer.has_snapshot() {
                         let scene = w.root.view();
                         let font_px = SIZE_PX * w.root.render_scale();
-                        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-                        w.gfx.renderer.capture_snapshot(&scene, font, font_px);
+                        w.gfx.renderer.capture_snapshot(&scene, w.gfx.font, font_px);
                     }
                     w.gfx.resize(w_px, h_px);
                     w.gfx.blit_snapshot();
@@ -1245,8 +1249,7 @@ impl ApplicationHandler for App {
                         // frame rasterizing a heavy session inline. The animation's own
                         // ticks drive the redraws that keep draining this.
                         if animating {
-                            let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-                            win.gfx.renderer.warm_next(font);
+                            win.gfx.renderer.warm_next(win.gfx.font);
                         }
                     }
                 }
