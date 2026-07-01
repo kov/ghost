@@ -51,6 +51,18 @@ pub enum ServerMsg {
     RenameResult { ok: bool, message: String },
 }
 
+/// The protocol feature level this binary speaks. The host writes it to the
+/// session dir's `proto` file at startup so clients can tell what an already
+/// running host understands — hosts are long-lived daemons that keep executing
+/// the binary that spawned them, and one built before a message existed treats
+/// it as a connection error and drops the client. A missing file reads as
+/// level 0. Bump this when appending a message clients send unprompted, and
+/// add a `PROTO_*` gate constant for it.
+pub const PROTO_LEVEL: u32 = 1;
+
+/// Feature level at which the host understands [`ClientMsg::Theme`].
+pub const PROTO_THEME: u32 = 1;
+
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -98,28 +110,33 @@ impl FrameReader {
 
     /// Pull the next complete message, if one has fully arrived. Returns
     /// `Ok(None)` when more bytes are still needed.
+    ///
+    /// A message that cannot be decoded — a newer peer sent something this
+    /// binary predates — is skipped, not fatal: the length prefix bounds the
+    /// frame, so the stream stays in sync and the next message decodes
+    /// normally. Only a corrupt length prefix (oversized frame) errors, since
+    /// there is no way to resynchronize past it.
     pub fn next_msg<M: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<M>> {
-        if self.buf.len() < 4 {
-            return Ok(None);
+        loop {
+            if self.buf.len() < 4 {
+                return Ok(None);
+            }
+            let len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
+            if len > MAX_FRAME_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protocol frame exceeds maximum length",
+                ));
+            }
+            if self.buf.len() < 4 + len {
+                return Ok(None);
+            }
+            let msg = postcard::from_bytes(&self.buf[4..4 + len]);
+            self.buf.drain(..4 + len);
+            if let Ok(msg) = msg {
+                return Ok(Some(msg));
+            }
         }
-        let len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
-        if len > MAX_FRAME_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "protocol frame exceeds maximum length",
-            ));
-        }
-        if self.buf.len() < 4 + len {
-            return Ok(None);
-        }
-        let msg = postcard::from_bytes(&self.buf[4..4 + len]).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed protocol frame: {e}"),
-            )
-        })?;
-        self.buf.drain(..4 + len);
-        Ok(Some(msg))
     }
 }
 
@@ -207,6 +224,35 @@ mod tests {
         );
         assert_eq!(r.next_msg::<ClientMsg>().unwrap().unwrap(), ClientMsg::Kill);
         assert!(r.next_msg::<ClientMsg>().unwrap().is_none());
+    }
+
+    #[test]
+    fn unknown_message_is_skipped_not_fatal() {
+        // A decoder built before a message existed sees an unknown enum tag.
+        // The frame boundary is still known from the length prefix, so the
+        // reader must skip the message rather than poison the connection —
+        // hosts are long-lived daemons that routinely outlive the binary that
+        // talks to them.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum OldClientMsg {
+            Input(Vec<u8>),
+            Resize { cols: u16, rows: u16 },
+            Detach,
+            Kill,
+            Rename(String),
+            Repaint,
+        }
+
+        let mut bytes = encode(&ClientMsg::Theme(crate::query::ThemeColors::default()));
+        bytes.extend_from_slice(&encode(&ClientMsg::Input(b"still here".to_vec())));
+        let mut r = FrameReader::new();
+        r.push(&bytes);
+        assert_eq!(
+            r.next_msg::<OldClientMsg>().unwrap().unwrap(),
+            OldClientMsg::Input(b"still here".to_vec()),
+            "the unknown frame is skipped and the next one decodes"
+        );
+        assert!(r.next_msg::<OldClientMsg>().unwrap().is_none());
     }
 
     #[test]

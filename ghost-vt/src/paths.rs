@@ -98,6 +98,15 @@ pub fn bell_path(name: &str) -> PathBuf {
     session_dir(name).join("bell")
 }
 
+/// Path of the protocol capability marker for the named session. The host
+/// writes its [`crate::protocol::PROTO_LEVEL`] here at startup; a client reads
+/// it before sending optional messages an older host would treat as a
+/// connection error. Absent for hosts built before the marker existed, which
+/// clients read as level 0.
+pub fn proto_path(name: &str) -> PathBuf {
+    session_dir(name).join("proto")
+}
+
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
 /// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
 /// holds recordings, which are archival.

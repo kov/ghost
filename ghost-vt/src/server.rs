@@ -168,6 +168,14 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
         Err(e) => return Err(io::Error::from(e)),
     }
 
+    // Declare which protocol feature level this host speaks, so clients built
+    // later know which optional messages are safe to send it. Written before
+    // the socket binds so no client can connect without seeing it.
+    std::fs::write(
+        paths::proto_path(&opts.name),
+        crate::protocol::PROTO_LEVEL.to_string(),
+    )?;
+
     let sock = paths::socket_path(&opts.name);
     // Clear any stale socket left by a dead host, then claim the name.
     let _ = std::fs::remove_file(&sock);

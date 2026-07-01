@@ -35,6 +35,11 @@ use std::time::Duration;
 /// readable, or set a read timeout).
 pub struct Client {
     conn: Conn,
+    /// The host's declared protocol feature level, read from the session dir's
+    /// `proto` marker at connect time (0 when absent — a host built before the
+    /// marker existed). Optional messages are gated on it: an old host treats
+    /// a message it cannot decode as a connection error and drops us.
+    proto: u32,
 }
 
 impl Client {
@@ -47,8 +52,14 @@ impl Client {
 
     /// Connect to a session whose control socket is at `sock`.
     pub fn connect_path(sock: &Path) -> io::Result<Self> {
+        let proto = sock
+            .parent()
+            .and_then(|dir| std::fs::read_to_string(dir.join("proto")).ok())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         Ok(Client {
             conn: Conn::connect(sock)?,
+            proto,
         })
     }
 
@@ -173,7 +184,15 @@ impl Session {
     /// Report this client's theme colors. The host keeps them as the session's
     /// last-attached colors, answering the child's color queries with them
     /// while detached.
+    ///
+    /// Silently skipped when the host predates [`ClientMsg::Theme`] (it never
+    /// declared [`PROTO_THEME`](crate::protocol::PROTO_THEME)): the report is
+    /// advisory, and an old host would treat the unknown message as a
+    /// connection error and drop us right after attaching.
     pub fn report_theme(&mut self, colors: crate::query::ThemeColors) -> io::Result<()> {
+        if self.client.proto < crate::protocol::PROTO_THEME {
+            return Ok(());
+        }
         self.client.send(&ClientMsg::Theme(colors))
     }
 
