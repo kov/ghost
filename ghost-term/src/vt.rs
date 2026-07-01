@@ -191,6 +191,19 @@ impl Vt {
         self.terminal.mode_enabled(DecMode::BracketedPaste)
     }
 
+    /// Whether synchronized output (DEC mode 2026) is active — the app is mid
+    /// atomic frame and the frontend should hold presentation until the mode
+    /// resets (with a timeout guarding against an app that never resets it).
+    pub fn synchronized_output(&self) -> bool {
+        self.terminal.mode_enabled(DecMode::SynchronizedOutput)
+    }
+
+    /// The DECRPM state of a DEC private mode by raw number: `Some(true)` set,
+    /// `Some(false)` reset, `None` not a mode with queryable state here.
+    pub fn dec_mode_state(&self, mode: u16) -> Option<bool> {
+        self.terminal.mode_state(mode)
+    }
+
     pub fn dump(&self) -> String {
         let funs = self.terminal.dump();
         let mut seq = parser::dump(&funs);
@@ -619,6 +632,29 @@ mod tests {
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
+    }
+
+    #[test]
+    fn tracks_synchronized_output_mode() {
+        let mut vt = Vt::new(20, 5);
+        assert!(!vt.synchronized_output());
+
+        vt.feed_str("\x1b[?2026h");
+        assert!(vt.synchronized_output());
+        // Content keeps applying while sync is on; holding presentation is the
+        // frontend's business, not the emulator's.
+        vt.feed_str("hello");
+        assert_eq!(vt.text()[0].trim_end(), "hello");
+        vt.feed_str("\x1b[?2026l");
+        assert!(!vt.synchronized_output());
+
+        // Transient frame marker: a state dump must never re-emit it (a
+        // reattaching frontend would start with presentation held), and a full
+        // reset clears it.
+        vt.feed_str("\x1b[?2026h");
+        assert!(!vt.dump().contains("2026"), "dump leaked mode 2026");
+        vt.feed_str("\x1bc");
+        assert!(!vt.synchronized_output());
     }
 
     #[test]

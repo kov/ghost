@@ -189,7 +189,16 @@ pub struct TerminalModel {
     /// feed hint can't localize — and otherwise reports just `feed_dirty`. `None` until
     /// the first present, so the first frame is always `All`.
     presented: Option<Presented>,
+    /// A repaint is being held back because the app is mid synchronized-output
+    /// frame (DEC mode 2026). Released by the mode resetting, or by the tick
+    /// scheduled when the hold began (so a stuck app can't freeze the window).
+    sync_held: bool,
 }
+
+/// How long a synchronized-output hold may last before the scheduled tick
+/// releases it anyway. Generous for an atomic repaint burst, short enough that
+/// an app dying between BSU and ESU reads as a hiccup, not a hang.
+const SYNC_RELEASE_MS: u64 = 150;
 
 /// Snapshot of the view-shaping state at a present (see [`TerminalModel::presented`]).
 #[derive(Clone, PartialEq)]
@@ -231,6 +240,7 @@ impl TerminalModel {
             ended: false,
             feed_dirty: None,
             presented: None,
+            sync_held: false,
         }
     }
 
@@ -321,9 +331,18 @@ impl TerminalModel {
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
-            // A lone terminal ignores enumeration and the clock (no animation
-            // yet), and never sees `AdoptSession` — `RootModel` handles it.
-            UiEvent::SessionList(_) | UiEvent::Tick { .. } | UiEvent::AdoptSession(_) => Vec::new(),
+            // The clock only matters as the synchronized-output release
+            // backstop: present what accumulated if a hold is still open.
+            UiEvent::Tick { .. } => {
+                if std::mem::take(&mut self.sync_held) {
+                    vec![Cmd::Redraw]
+                } else {
+                    Vec::new()
+                }
+            }
+            // A lone terminal ignores enumeration, and never sees
+            // `AdoptSession` — `RootModel` handles it.
+            UiEvent::SessionList(_) | UiEvent::AdoptSession(_) => Vec::new(),
         }
     }
 
@@ -693,7 +712,10 @@ impl TerminalModel {
             let cursor = self.screen.cursor();
             let size = self.screen.dimensions();
             let kitty_flags = self.screen.kitty_keyboard_flags();
-            let replies = query_replies(&mut self.scanner, bytes, cursor, size, kitty_flags);
+            let screen = &self.screen;
+            let replies = query_replies(&mut self.scanner, bytes, cursor, size, kitty_flags, |m| {
+                screen.vt().dec_mode_state(m)
+            });
             if !replies.is_empty() {
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
@@ -741,7 +763,20 @@ impl TerminalModel {
             if images_added {
                 self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
             }
-            if viewport_changed || selection_dropped || images_added {
+            let want_redraw = viewport_changed || selection_dropped || images_added;
+            // Synchronized output (DEC 2026): between set and reset the app is
+            // composing one atomic frame, so hold the repaint (damage keeps
+            // accumulating above) and schedule a release tick as the backstop.
+            // Any tick releases the hold — an early animation tick just means
+            // one mid-frame paint, the status quo without the mode.
+            let sync = self.screen.vt().synchronized_output();
+            if sync && want_redraw && !self.sync_held {
+                self.sync_held = true;
+                cmds.push(Cmd::ScheduleTick {
+                    after_ms: SYNC_RELEASE_MS,
+                });
+            }
+            if !sync && (want_redraw || std::mem::take(&mut self.sync_held)) {
                 cmds.push(Cmd::Redraw);
             }
         }
@@ -1075,17 +1110,19 @@ fn is_word_char(c: char) -> bool {
 // ---- pure protocol helpers (shared with the shell) ----
 
 /// Scan child output for terminal queries and build the reply bytes from the
-/// 1-based `(col, row)` cursor and `(cols, rows)` size. Pure.
+/// 1-based `(col, row)` cursor and `(cols, rows)` size; `mode_state` answers
+/// DECRQM (a DEC private mode's set/reset state). Pure.
 pub fn query_replies(
     scanner: &mut QueryScanner,
     output: &[u8],
     cursor: (u16, u16),
     size: (u16, u16),
     kitty_flags: u8,
+    mode_state: impl Fn(u16) -> Option<bool>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for query in scanner.scan(output) {
-        out.extend_from_slice(&query.reply(cursor, size, kitty_flags));
+        out.extend_from_slice(&query.reply(cursor, size, kitty_flags, &mode_state));
     }
     out
 }
@@ -2152,6 +2189,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn synchronized_output_holds_redraw_until_reset() {
+        let mut m = model();
+        // An atomic frame opens (DEC 2026) and content lands: presentation is
+        // held — no redraw — and a release timeout is scheduled in case the
+        // app never closes the frame.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026hhello".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !cmds.contains(&Cmd::Redraw),
+            "redraw leaked mid-frame: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "no release timeout scheduled: {cmds:?}"
+        );
+
+        // More held content: still no redraw, and the timeout is not re-armed.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b" world".to_vec(),
+            ended: false,
+        });
+        assert!(!cmds.contains(&Cmd::Redraw), "redraw leaked: {cmds:?}");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "timeout re-armed mid-hold: {cmds:?}"
+        );
+
+        // The frame closes: one redraw presents the accumulated content, even
+        // though the closing feed itself changed no viewport row.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026l".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "no redraw on frame close: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn synchronized_output_hold_times_out() {
+        let mut m = model();
+        m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026hhello".to_vec(),
+            ended: false,
+        });
+        // The app never closes the frame: the scheduled tick releases the hold
+        // so a stuck client cannot freeze the window.
+        let cmds = m.update(UiEvent::Tick { now_ms: 1_000 });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "timeout did not release the hold: {cmds:?}"
+        );
+        // With nothing held, a tick is a no-op.
+        let cmds = m.update(UiEvent::Tick { now_ms: 2_000 });
+        assert!(!cmds.contains(&Cmd::Redraw), "spurious redraw: {cmds:?}");
+    }
+
     /// The per-session [`TermDamage`] the model stamps on its scene item — the cue the
     /// renderer uses to decide how much of the Surface to re-raster.
     fn view_damage(m: &TerminalModel) -> TermDamage {
@@ -2608,11 +2710,16 @@ mod tests {
 
     // ---- moved pure-helper tests ----
 
+    /// A `mode_state` for tests: nothing is recognized.
+    fn no_modes(_: u16) -> Option<bool> {
+        None
+    }
+
     #[test]
     fn query_replies_answers_cursor_position() {
         let mut s = QueryScanner::new();
         assert_eq!(
-            query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24), 0),
+            query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24), 0, no_modes),
             b"\x1b[5;3R"
         );
     }
@@ -2623,10 +2730,27 @@ mod tests {
         // `CSI ? u` is answered with the flags passed in (the model supplies the
         // live `kitty_keyboard_flags()`); a bare `CSI u` is not a query.
         assert_eq!(
-            query_replies(&mut s, b"\x1b[?u", (1, 1), (80, 24), 5),
+            query_replies(&mut s, b"\x1b[?u", (1, 1), (80, 24), 5, no_modes),
             b"\x1b[?5u"
         );
-        assert!(query_replies(&mut s, b"\x1b[u", (1, 1), (80, 24), 5).is_empty());
+        assert!(query_replies(&mut s, b"\x1b[u", (1, 1), (80, 24), 5, no_modes).is_empty());
+    }
+
+    #[test]
+    fn query_replies_answers_decrqm_from_the_live_screen() {
+        // Drive the whole model path: the app sets 2026 and queries it in the
+        // same feed — the reply must come from post-feed state (mode reported
+        // set), as `Cmd::SendInput` on the session.
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026h\x1b[?2026$p".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[?2026;1$y")),
+            "no DECRPM reply: {cmds:?}"
+        );
     }
 
     #[test]

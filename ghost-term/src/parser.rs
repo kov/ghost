@@ -162,6 +162,7 @@ pub enum DecMode {
     SaveCursor = 1048,                // xterm
     SaveCursorAltScreenBuffer = 1049, // xterm
     BracketedPaste = 2004,            // wrap pastes in ESC[200~ / ESC[201~
+    SynchronizedOutput = 2026,        // atomic frames: hold presentation between h..l
 }
 
 impl DecMode {
@@ -177,6 +178,7 @@ impl DecMode {
                 | FocusReport
                 | MouseSgr
                 | BracketedPaste
+                | SynchronizedOutput
         )
     }
 }
@@ -1235,6 +1237,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     SaveCursor => 1048,
                     SaveCursorAltScreenBuffer => 1049,
                     BracketedPaste => 2004,
+                    SynchronizedOutput => 2026,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1262,6 +1265,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     SaveCursor => 1048,
                     SaveCursorAltScreenBuffer => 1049,
                     BracketedPaste => 2004,
+                    SynchronizedOutput => 2026,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1734,9 +1738,14 @@ impl<'a> Iterator for SgrOpsDecoder<'a> {
 }
 
 fn dec_mode(param: &Param) -> Option<DecMode> {
+    dec_mode_from(param.as_u16())
+}
+
+/// The tracked [`DecMode`] for a raw DEC private-mode number, if any.
+pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
     use DecMode::*;
 
-    match param.as_u16() {
+    match param {
         1 => Some(CursorKeys),
         6 => Some(Origin),
         7 => Some(AutoWrap),
@@ -1751,6 +1760,7 @@ fn dec_mode(param: &Param) -> Option<DecMode> {
         1048 => Some(SaveCursor),
         1049 => Some(SaveCursorAltScreenBuffer),
         2004 => Some(BracketedPaste),
+        2026 => Some(SynchronizedOutput),
         _ => None,
     }
 }

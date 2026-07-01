@@ -35,18 +35,33 @@ pub enum Query {
     /// with the terminal's current progressive-enhancement flags. Answering it
     /// (before the DA reply) is how an app detects kitty-keyboard support.
     KittyKeyboardFlags,
+    /// `CSI > q` / `CSI > 0 q` — XTVERSION, report terminal name and version.
+    /// Reply: `DCS > | ghost <version> ST`. Claude Code sends it at startup.
+    TerminalVersion,
+    /// `CSI ? Ps $ p` — DECRQM, request a DEC private mode's state. Reply is
+    /// DECRPM `CSI ? Ps ; Pm $ y` with Pm 0 = unrecognized, 1 = set, 2 = reset.
+    /// Apps probe synchronized output (2026) this way before using it.
+    ReportMode(u16),
 }
 
 impl Query {
     /// The reply bytes to write back to the child's PTY. `cursor` is the 1-based
-    /// `(col, row)` cursor position, `size` is `(cols, rows)`, and `kitty_flags`
-    /// is the current kitty-keyboard flags (only the kitty query uses it).
+    /// `(col, row)` cursor position, `size` is `(cols, rows)`, `kitty_flags` is
+    /// the current kitty-keyboard flags (only the kitty query uses it), and
+    /// `mode_state` reports a DEC private mode's state for DECRQM (`Some(true)`
+    /// set, `Some(false)` reset, `None` unrecognized).
     ///
     /// The device-attribute strings mirror VTE's non-test replies: DA1 reports a
     /// VT100-level (61) terminal with 132-column mode (1), horizontal scrolling
     /// (21), colour (22) and rectangular editing (28); DA2 reports the same level
     /// with VTE's version encoding as the firmware field.
-    pub fn reply(&self, cursor: (u16, u16), size: (u16, u16), kitty_flags: u8) -> Vec<u8> {
+    pub fn reply(
+        &self,
+        cursor: (u16, u16),
+        size: (u16, u16),
+        kitty_flags: u8,
+        mode_state: impl Fn(u16) -> Option<bool>,
+    ) -> Vec<u8> {
         let (col, row) = cursor;
         let (cols, rows) = size;
         match self {
@@ -56,6 +71,17 @@ impl Query {
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
             Query::KittyKeyboardFlags => format!("\x1b[?{kitty_flags}u").into_bytes(),
+            Query::TerminalVersion => {
+                format!("\x1bP>|ghost {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
+            }
+            Query::ReportMode(mode) => {
+                let pm = match mode_state(*mode) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 0,
+                };
+                format!("\x1b[?{mode};{pm}$y").into_bytes()
+            }
         }
     }
 }
@@ -203,6 +229,23 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
             b"?" => Some(Query::KittyKeyboardFlags),
             _ => None,
         },
+        // XTVERSION: `CSI > q` / `CSI > 0 q`. DECSCUSR shares the final byte but
+        // carries a space intermediate, never the `>` marker.
+        b'q' => match params {
+            b">" | b">0" => Some(Query::TerminalVersion),
+            _ => None,
+        },
+        // DECRQM: `CSI ? Ps $ p` — the `?` and the `$` intermediate bracket a
+        // single mode number. `CSI ! p` (DECSTR) and the ANSI-mode form (no `?`)
+        // fall through.
+        b'p' => {
+            let mode = params.strip_prefix(b"?")?.strip_suffix(b"$")?;
+            std::str::from_utf8(mode)
+                .ok()?
+                .parse()
+                .ok()
+                .map(Query::ReportMode)
+        }
         _ => None,
     }
 }
@@ -225,6 +268,10 @@ mod tests {
         assert_eq!(scan_all(b"\x1b[>0c"), [Query::SecondaryDeviceAttributes]);
         assert_eq!(scan_all(b"\x1b[18t"), [Query::TextAreaSize]);
         assert_eq!(scan_all(b"\x1b[?u"), [Query::KittyKeyboardFlags]);
+        assert_eq!(scan_all(b"\x1b[>q"), [Query::TerminalVersion]);
+        assert_eq!(scan_all(b"\x1b[>0q"), [Query::TerminalVersion]);
+        assert_eq!(scan_all(b"\x1b[?2026$p"), [Query::ReportMode(2026)]);
+        assert_eq!(scan_all(b"\x1b[?25$p"), [Query::ReportMode(25)]);
     }
 
     #[test]
@@ -233,8 +280,10 @@ mod tests {
         assert!(scan_all(b"\x1b[31m\x1b[2J\x1b[H").is_empty()); // SGR, clear, home
         assert!(scan_all(b"\x1b[8;24;80t").is_empty()); // a resize op, not a query
         assert!(scan_all(b"\x1b[?6n").is_empty()); // DEC-private DSR, left alone
-        assert!(scan_all(b"\x1b[>q").is_empty()); // XTVERSION (not answered yet)
         assert!(scan_all(b"\x1b[u").is_empty()); // bare CSI u is SCO restore-cursor
+        assert!(scan_all(b"\x1b[0 q").is_empty()); // DECSCUSR shares `q`, not a query
+        assert!(scan_all(b"\x1b[!p").is_empty()); // DECSTR shares `p`, not a query
+        assert!(scan_all(b"\x1b[2026$p").is_empty()); // ANSI-mode DECRQM (no `?`)
     }
 
     #[test]
@@ -267,33 +316,73 @@ mod tests {
         );
     }
 
+    /// A `mode_state` for tests: nothing is recognized.
+    fn no_modes(_: u16) -> Option<bool> {
+        None
+    }
+
     #[test]
     fn reply_strings_match_vte() {
         assert_eq!(
-            Query::CursorPosition.reply((5, 3), (80, 24), 0),
+            Query::CursorPosition.reply((5, 3), (80, 24), 0, no_modes),
             b"\x1b[3;5R" // row;col, 1-based
         );
-        assert_eq!(Query::DeviceStatus.reply((1, 1), (80, 24), 0), b"\x1b[0n");
         assert_eq!(
-            Query::PrimaryDeviceAttributes.reply((1, 1), (80, 24), 0),
+            Query::DeviceStatus.reply((1, 1), (80, 24), 0, no_modes),
+            b"\x1b[0n"
+        );
+        assert_eq!(
+            Query::PrimaryDeviceAttributes.reply((1, 1), (80, 24), 0, no_modes),
             b"\x1b[?61;1;21;22;28c"
         );
         assert_eq!(
-            Query::SecondaryDeviceAttributes.reply((1, 1), (80, 24), 0),
+            Query::SecondaryDeviceAttributes.reply((1, 1), (80, 24), 0, no_modes),
             b"\x1b[>61;8400;1c"
         );
         assert_eq!(
-            Query::TextAreaSize.reply((1, 1), (80, 24), 0),
+            Query::TextAreaSize.reply((1, 1), (80, 24), 0, no_modes),
             b"\x1b[8;24;80t" // rows;cols
         );
         // The kitty query reports the current flags.
         assert_eq!(
-            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 0),
+            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 0, no_modes),
             b"\x1b[?0u"
         );
         assert_eq!(
-            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 5),
+            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 5, no_modes),
             b"\x1b[?5u"
+        );
+    }
+
+    #[test]
+    fn xtversion_reply_names_ghost() {
+        let reply = Query::TerminalVersion.reply((1, 1), (80, 24), 0, no_modes);
+        let s = String::from_utf8(reply).unwrap();
+        assert!(
+            s.starts_with("\x1bP>|ghost ") && s.ends_with("\x1b\\"),
+            "malformed XTVERSION reply: {s:?}"
+        );
+    }
+
+    #[test]
+    fn decrqm_reply_reports_mode_state() {
+        // DECRPM Pm: 1 = set, 2 = reset, 0 = unrecognized.
+        let state = |m: u16| match m {
+            2026 => Some(true),
+            2004 => Some(false),
+            _ => None,
+        };
+        assert_eq!(
+            Query::ReportMode(2026).reply((1, 1), (80, 24), 0, state),
+            b"\x1b[?2026;1$y"
+        );
+        assert_eq!(
+            Query::ReportMode(2004).reply((1, 1), (80, 24), 0, state),
+            b"\x1b[?2004;2$y"
+        );
+        assert_eq!(
+            Query::ReportMode(12345).reply((1, 1), (80, 24), 0, state),
+            b"\x1b[?12345;0$y"
         );
     }
 }

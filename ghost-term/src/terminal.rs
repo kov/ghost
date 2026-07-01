@@ -969,6 +969,26 @@ impl Terminal {
         self.tracked_modes.contains(&mode)
     }
 
+    /// The set/reset state of a DEC private mode by its raw number, for DECRPM
+    /// (`CSI ? Ps $ p` reports): `Some(true)` = set, `Some(false)` = reset,
+    /// `None` = not a mode this terminal recognizes as queryable state.
+    pub(crate) fn mode_state(&self, param: u16) -> Option<bool> {
+        use DecMode::*;
+        let mode = crate::parser::dec_mode_from(param)?;
+        Some(match mode {
+            CursorKeys => self.cursor_keys_mode == CursorKeysMode::Application,
+            Origin => self.origin_mode,
+            AutoWrap => self.auto_wrap_mode,
+            TextCursorEnable => self.cursor.visible,
+            AltScreenBuffer | SaveCursorAltScreenBuffer => {
+                self.active_buffer_type == BufferType::Alternate
+            }
+            // 1048 is a save/restore action, not a queryable state.
+            SaveCursor => return None,
+            m => self.tracked_modes.contains(&m),
+        })
+    }
+
     pub fn title(&self) -> &str {
         &self.title
     }
@@ -1967,7 +1987,13 @@ impl Terminal {
         // 15. re-enable non-display modes (mouse / focus / paste). Order is
         // deterministic (BTreeSet by discriminant) and these don't move the
         // cursor or touch the grid, so they are safe to emit last.
+        // Synchronized output (2026) is deliberately excluded: it frames one
+        // atomic update, and replaying it would hand a reattaching frontend a
+        // held presentation with no end marker in sight.
         for &mode in &self.tracked_modes {
+            if mode == DecMode::SynchronizedOutput {
+                continue;
+            }
             funs.push(Function::Decset(DecModes::one(mode)));
         }
 

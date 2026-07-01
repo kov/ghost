@@ -918,7 +918,15 @@ impl App {
                 }
                 Cmd::ScheduleTick { after_ms } => {
                     if let Some(w) = self.windows.get_mut(&wid) {
-                        w.next_tick = Some(Instant::now() + Duration::from_millis(after_ms));
+                        // Keep the earliest pending deadline: two schedulers can
+                        // coexist (animation frames vs the synchronized-output
+                        // release backstop), and models tolerate early ticks but
+                        // an overwritten-later one would stall the first caller.
+                        let due = Instant::now() + Duration::from_millis(after_ms);
+                        w.next_tick = Some(match w.next_tick {
+                            Some(t) if t < due => t,
+                            _ => due,
+                        });
                     }
                 }
                 Cmd::Quit => event_loop.exit(),

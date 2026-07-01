@@ -479,7 +479,9 @@ fn host_main(
                         let kitty_flags = screen.kitty_keyboard_flags();
                         let mut reply = Vec::new();
                         for q in asked {
-                            reply.extend_from_slice(&q.reply(cursor, size, kitty_flags));
+                            reply.extend_from_slice(&q.reply(cursor, size, kitty_flags, |m| {
+                                screen.vt().dec_mode_state(m)
+                            }));
                         }
                         let mut w: &pty_process::blocking::Pty = &pty;
                         let _ = w.write_all(&reply);

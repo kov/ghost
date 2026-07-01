@@ -75,6 +75,72 @@ fn detached_session_answers_cursor_position_query() {
 }
 
 #[test]
+fn detached_session_answers_decrqm_mode_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "decrqm-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The never-attached child enables synchronized output (2026), then asks
+    // DECRQM whether it is set. The DECRPM reply ends in `y`; it must report
+    // the mode as set (`?2026;1$`) — apps (neovim among them) only use 2026 if
+    // this query answers. Only the host could have replied.
+    let sentinel = xdg.join("decrqm-answered");
+    let script = format!(
+        "printf '\\033[?2026h\\033[?2026$p'; \
+         if IFS= read -r -s -d y -t 2 reply; then case \"$reply\" in *'?2026;1$'*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the DECRQM query"
+    );
+}
+
+#[test]
+fn detached_session_answers_xtversion_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "xtversion-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The never-attached child sends XTVERSION (CSI > 0 q); the DCS reply is
+    // ST-terminated (trailing backslash) and must name ghost.
+    let sentinel = xdg.join("xtversion-answered");
+    let script = format!(
+        "printf '\\033[>0q'; \
+         if IFS= read -r -s -d '\\' -t 2 reply; then case \"$reply\" in *ghost*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the XTVERSION query"
+    );
+}
+
+#[test]
 fn detached_session_answers_kitty_graphics_query() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
