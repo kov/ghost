@@ -25,3 +25,7 @@ png = "0.18"
 # Cache-efficiency instrumentation: emit hit/miss stats under `RUST_LOG`, free
 # when no subscriber enables the target. The binary installs the subscriber.
 tracing = "0.1.44"
+# Shape a cold frame's distinct runs in parallel — swash `shape` builds its own
+# context per call, so it fans out cleanly across runs (the one-time cold cost of
+# a dense colorized screen; warm re-rasters hit the cache and never reach it).
+rayon = "1.12.0"

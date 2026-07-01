@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
+use rayon::prelude::*;
+
 pub mod target;
 pub use target::{SurfaceTarget, Target};
 
@@ -738,6 +740,12 @@ struct Surface {
 /// the least-recently-used ages out, bounding memory without evicting an active role.
 const MAX_SURFACES_PER_SESSION: usize = 4;
 
+/// Minimum number of not-yet-cached distinct runs in one build before shaping them
+/// in parallel is worth the fan-out (below this, the inline path is cheaper). A plain
+/// screen (`cat` = one run per line) stays inline; a dense colorized one (`ls` =
+/// hundreds of short styled runs) fans out.
+const PARALLEL_SHAPE_MIN: usize = 48;
+
 /// A session Surface a deferred (mid-animation) render decided NOT to rasterize on the
 /// frame loop — it needs a full raster (missing, or a rebuilt tile the model can't confirm
 /// unchanged) that would stall the animation. Instead the render blits the best already-
@@ -1094,6 +1102,10 @@ pub struct Renderer {
     /// single source of truth behind [`Self::cache_stats`] and the back-compat
     /// [`Self::shape_misses`]/[`Self::surface_renders`] accessors.
     stats: RenderCacheStats,
+    /// Whether a cold build pre-shapes its distinct runs in parallel (see
+    /// [`Self::prewarm_shapes`]). On by default; a bench/test flips it off to A/B the
+    /// inline path. Correctness is identical either way.
+    parallel_shaping: bool,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -1468,6 +1480,7 @@ impl Renderer {
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
             stats: RenderCacheStats::default(),
+            parallel_shaping: true,
             bench_target: None,
             foreground_valid: false,
             blit_quad: None,
@@ -2247,6 +2260,56 @@ impl Renderer {
         self.surface_band_updates
     }
 
+    /// Pre-shape the distinct runs in `rows` of `frame` that aren't cached yet, in
+    /// parallel, and store them — so the per-run [`Self::shape_cached`] calls in the
+    /// build loop are all hits. swash `shape` builds its own context per call, so this
+    /// fans out across runs with no shared state. Purely an optimization: anything it
+    /// doesn't cache, `shape_cached` still shapes inline, so output is identical. Skips
+    /// (leaving the inline path) when disabled or when too few runs miss to pay for the
+    /// fan-out. Bumps the shape miss/insert counters exactly as the inline path would.
+    fn prewarm_shapes(
+        &mut self,
+        frame: &Frame,
+        font: FontRef,
+        size_px: f32,
+        rows: std::ops::Range<usize>,
+    ) {
+        if !self.parallel_shaping {
+            return;
+        }
+        let outer = (stable_font_key(font), size_px.to_bits());
+        // Distinct run texts not already cached — probed by borrowed `&str` (no alloc).
+        let cached = self.shape_cache.get(&outer);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut todo: Vec<&str> = Vec::new();
+        for row in &frame.rows_layout[rows] {
+            for run in &row.runs {
+                let uncached = cached.is_none_or(|m| !m.contains_key(run.text.as_str()));
+                if uncached && seen.insert(run.text.as_str()) {
+                    todo.push(run.text.as_str());
+                }
+            }
+        }
+        if todo.len() < PARALLEL_SHAPE_MIN {
+            return; // few enough that the inline path is cheaper than the fan-out
+        }
+        // Shape off-thread (owned `Vec<ShapedGlyph>` is `Send`; `Rc` is not, so wrap on
+        // the way back in), then store on this thread.
+        let shaped: Vec<(&str, Vec<ShapedGlyph>)> = todo
+            .par_iter()
+            .map(|t| (*t, ghost_shaper::shape(font, t, size_px)))
+            .collect();
+        let inner = self.shape_cache.entry(outer).or_default();
+        if inner.len() > 8192 {
+            inner.clear();
+        }
+        for (text, glyphs) in shaped {
+            self.stats.shape.miss();
+            self.stats.shape.insert();
+            inner.insert(text.to_string(), Rc::new(glyphs));
+        }
+    }
+
     /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
     /// is the dominant per-frame cost, and a run's text is identical across
     /// redraws, so the cache turns a repaint into a hash lookup + `Rc` clone.
@@ -2279,6 +2342,12 @@ impl Renderer {
     /// didn't cost cache hits.
     pub fn cache_stats(&self) -> RenderCacheStats {
         self.stats
+    }
+
+    /// Enable/disable parallel pre-shaping of a cold frame's runs (on by default).
+    /// Output is identical either way; a bench flips it off to measure the win.
+    pub fn set_parallel_shaping(&mut self, on: bool) {
+        self.parallel_shaping = on;
     }
 
     /// Emit the running cache hit-rates to `tracing` (target `ghost::cache`). Call
@@ -2409,6 +2478,12 @@ impl Renderer {
         let cursor = frame.cursor;
         let n = frame.rows_layout.len();
         let rows = rows.start.min(n)..rows.end.min(n);
+
+        // Shape this build's not-yet-cached distinct runs up front, in parallel, so the
+        // per-run loop below hits the cache single-threaded. This only bites on a cold
+        // frame (a warm re-raster finds everything cached and does nothing here); it's
+        // the one-time cost of a dense colorized screen.
+        self.prewarm_shapes(frame, font, size_px, rows.clone());
 
         let mut backgrounds: Vec<Instance> = Vec::new();
         let mut selection_rects: Vec<Instance> = Vec::new();

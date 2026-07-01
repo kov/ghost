@@ -706,6 +706,60 @@ fn re_rasterizing_seen_text_allocates_no_probe_keys() {
 }
 
 #[test]
+fn parallel_and_inline_cold_shaping_agree() {
+    // Parallel pre-shaping is a pure optimization: a cold frame must shape each
+    // distinct run exactly once and render byte-identically whether its runs are
+    // shaped in parallel (default) or inline. Dense colorized content (a fresh 2-char
+    // colored run per cell) crosses the fan-out threshold.
+    let mut s = String::new();
+    for row in 0..40usize {
+        for col in 0..40usize {
+            let a = char::from(b'!' + ((row * 7 + col * 3) % 90) as u8);
+            let b = char::from(b'!' + ((row * 11 + col * 5) % 90) as u8);
+            s.push_str(&format!("\x1b[38;5;{}m{a}{b}", 16 + ((row + col) % 200)));
+        }
+        s.push_str("\r\n");
+    }
+    let mut vt = Vt::new(120, 40);
+    vt.feed_str(&s);
+    let frame = layout_frame(&vt, METRICS);
+
+    let mut distinct = std::collections::HashSet::new();
+    for row in &frame.rows_layout {
+        for run in &row.runs {
+            distinct.insert(run.text.clone());
+        }
+    }
+    let unique = distinct.len() as u32;
+    assert!(
+        unique >= 48,
+        "need enough runs to hit the parallel path, got {unique}"
+    );
+
+    let render = |parallel: bool| {
+        let mut r = Renderer::headless(Theme::default());
+        r.set_parallel_shaping(parallel);
+        let img = r.render_offscreen(&frame, ghost_shaper::font_from_bytes(FIRA).unwrap(), 15.0);
+        (img.rgba, r.shape_misses())
+    };
+    let (par_px, par_miss) = render(true);
+    let (ser_px, ser_miss) = render(false);
+
+    assert_eq!(
+        par_miss, unique,
+        "parallel: each distinct run shaped exactly once"
+    );
+    assert_eq!(
+        ser_miss, unique,
+        "inline: each distinct run shaped exactly once"
+    );
+    assert!(
+        par_px == ser_px,
+        "parallel and inline shaping must render byte-identically"
+    );
+}
+
+#[test]
 fn warm_repaints_stay_fully_cached() {
     // The general cache-regression guard, expressed on cache_stats(): once content is
     // warm, repainting it — even with a fresh FontRef every frame, exactly as the app

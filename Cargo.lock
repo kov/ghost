@@ -909,6 +909,7 @@ dependencies = [
  "ghost-term",
  "png 0.18.1",
  "pollster",
+ "rayon",
  "tracing",
  "unicode-width",
  "wgpu",
