@@ -417,6 +417,13 @@ fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) 
     }
 }
 
+/// The startup decision for a window opened at runtime via File > New Window / Cmd-N.
+/// A new window "acts like the first one", but carries no `$GHOST_SESSION` request
+/// (that is a launch-only override), so it always takes the plain-launch decision.
+fn new_window_choice(sessions: &[session::SessionInfo]) -> StartupChoice {
+    startup_choice(None, sessions)
+}
+
 fn interactive() {
     // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
     // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
@@ -861,7 +868,7 @@ impl App {
                         }
                     }
                 }
-                Cmd::NewWindow => self.open_fleet_window(event_loop),
+                Cmd::NewWindow => self.open_launch_window(event_loop),
                 Cmd::CloseWindow => {
                     self.close_window(wid);
                     if self.windows.is_empty() {
@@ -1143,6 +1150,27 @@ impl App {
         self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
     }
 
+    /// Open a new window that behaves exactly like a fresh launch (File > New Window
+    /// / Cmd-N): reconnect through the fleet when any session is detached, otherwise
+    /// spawn a fresh session and show it as a single view. Runs in this same process,
+    /// so the new window shares the clipboard, clock, and menu with the others.
+    fn open_launch_window(&mut self, event_loop: &ActiveEventLoop) {
+        let sessions = session::list().unwrap_or_default();
+        match new_window_choice(&sessions) {
+            StartupChoice::Fleet => self.open_fleet_window(event_loop),
+            StartupChoice::Spawn => {
+                let name = self.unique_session_name();
+                spawn_session(&name, vec![]);
+                self.open_single_window(event_loop, &name);
+            }
+            // new_window_choice never asks to attach a specific session, but keep the
+            // match exhaustive: an explicit name would open that session's single view.
+            StartupChoice::Attach(name) => {
+                self.open_single_window(event_loop, &name);
+            }
+        }
+    }
+
     /// Remove a window; dropping its [`WindowState`] drops its session clients,
     /// which detaches them (the hosts keep the sessions running for reattach) —
     /// the "close = detach" default.
@@ -1253,7 +1281,7 @@ impl ApplicationHandler<UserEvent> for App {
         let UserEvent::Menu(action) = event;
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
-            MenuIntent::NewWindow => self.open_fleet_window(event_loop),
+            MenuIntent::NewWindow => self.open_launch_window(event_loop),
             MenuIntent::FocusedCmd(cmd) => {
                 if let Some(wid) = self.focused_window() {
                     self.exec(wid, vec![cmd], event_loop);
@@ -1637,7 +1665,8 @@ impl ApplicationHandler<UserEvent> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir, startup_choice,
+        StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir,
+        new_window_choice, startup_choice,
     };
     use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
@@ -1728,6 +1757,23 @@ mod tests {
         let attached_elsewhere = [info("a", true)];
         assert!(matches!(
             startup_choice(None, &attached_elsewhere),
+            StartupChoice::Spawn
+        ));
+    }
+
+    #[test]
+    fn new_window_mirrors_a_plain_launch() {
+        // File > New Window / Cmd-N opens a window that "acts like the first one":
+        // it carries no `$GHOST_SESSION` request, so it always takes the plain-launch
+        // decision — the fleet when anything is detached (reconnect), a fresh session
+        // otherwise — and never attaches to one specific session.
+        assert!(matches!(
+            new_window_choice(&[info("a", false)]),
+            StartupChoice::Fleet
+        ));
+        assert!(matches!(new_window_choice(&[]), StartupChoice::Spawn));
+        assert!(matches!(
+            new_window_choice(&[info("a", true)]),
             StartupChoice::Spawn
         ));
     }
