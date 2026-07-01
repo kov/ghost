@@ -31,6 +31,12 @@ pub enum ClientMsg {
     /// the client to heal its display after drawing a transient overlay such as
     /// the rename prompt.
     Repaint,
+    /// The client's theme colors (default fg/bg, cursor). The host keeps the
+    /// most recent report as the session's last-attached colors and answers
+    /// the child's color queries with them while detached, instead of ghost's
+    /// built-in defaults. Clients that know their scheme (the GUI) send it
+    /// right after attaching.
+    Theme(crate::query::ThemeColors),
 }
 
 /// Messages sent from the session host to an attach client.

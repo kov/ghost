@@ -403,6 +403,9 @@ fn host_main(
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
     let mut queries = crate::query::QueryScanner::new();
+    // The last theme a client reported (ClientMsg::Theme); detached color
+    // queries answer with it. Ghost's default scheme until someone attaches.
+    let mut last_theme = crate::query::ThemeColors::default();
 
     loop {
         // Build the poll set: fixed fds first, then the display client (if any),
@@ -479,11 +482,11 @@ fn host_main(
                             cursor: screen.cursor(),
                             size: screen.dimensions(),
                             kitty_flags: screen.kitty_keyboard_flags(),
-                            // Detached, nobody knows the live scheme; answer
-                            // with ghost's default (under any app-set dynamic
-                            // overrides) until last-attached colors are
-                            // persisted per session.
-                            colors: screen.effective_colors(crate::query::ThemeColors::default()),
+                            // Detached, nobody sees the live scheme; answer
+                            // with the last-attached client's colors (ghost's
+                            // default if none ever attached), under any
+                            // app-set dynamic overrides.
+                            colors: screen.effective_colors(last_theme),
                             mode_state: &mode_state,
                         };
                         let mut reply = Vec::new();
@@ -579,6 +582,7 @@ fn host_main(
                             &mut screen,
                             &mut recorder,
                             current_name,
+                            &mut last_theme,
                         )?;
                     }
                     Err(_) => disposition = Disposition::Drop,
@@ -618,6 +622,7 @@ fn host_main(
                         &mut screen,
                         &mut recorder,
                         current_name,
+                        &mut last_theme,
                     )?,
                     Err(_) => Disposition::Drop,
                 };
@@ -717,6 +722,7 @@ fn handle_client_messages(
     screen: &mut Screen,
     recorder: &mut Option<crate::record::FileRecorder>,
     current_name: &mut String,
+    last_theme: &mut crate::query::ThemeColors,
 ) -> io::Result<Disposition> {
     for msg in msgs {
         match msg {
@@ -749,6 +755,9 @@ fn handle_client_messages(
                 if c.resynced {
                     c.queue_output(screen.resync());
                 }
+            }
+            ClientMsg::Theme(colors) => {
+                *last_theme = colors;
             }
         }
     }

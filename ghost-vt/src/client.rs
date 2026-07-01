@@ -170,6 +170,13 @@ impl Session {
         self.client.send(&ClientMsg::Resize { cols, rows })
     }
 
+    /// Report this client's theme colors. The host keeps them as the session's
+    /// last-attached colors, answering the child's color queries with them
+    /// while detached.
+    pub fn report_theme(&mut self, colors: crate::query::ThemeColors) -> io::Result<()> {
+        self.client.send(&ClientMsg::Theme(colors))
+    }
+
     /// Drain whatever output is ready now, flattening protocol messages into
     /// bytes plus an end-of-session flag. Non-blocking when [`as_fd`](Session::as_fd)
     /// polls readable or a read timeout is set; see [`Client::recv_ready`].

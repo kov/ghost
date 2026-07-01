@@ -234,12 +234,21 @@ fn write_png(path: &Path, img: &Rendered) {
 
 /// Attach (deferred) to a named session and complete the handshake at
 /// `cols`×`rows` — the first resize promotes us to the display client and
-/// spawns the deferred child.
+/// spawns the deferred child. The configured theme rides along so the host
+/// answers color queries with it after we detach (last-attached colors).
 fn attach(name: &str, cols: u16, rows: u16) -> io::Result<Session> {
     let mut s = Session::attach_deferred(name)?;
     s.set_read_timeout(Some(Duration::from_millis(1)))?;
     s.resize(cols, rows)?;
+    s.report_theme(session_theme())?;
     Ok(s)
+}
+
+/// The theme reported to session hosts at attach; fixed at startup, so read
+/// from the config once.
+fn session_theme() -> ghost_ui_core::ThemeColors {
+    static THEME: std::sync::OnceLock<ghost_ui_core::ThemeColors> = std::sync::OnceLock::new();
+    *THEME.get_or_init(|| theme_colors(&config::UiConfig::load().theme()))
 }
 
 fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {

@@ -142,6 +142,61 @@ fn detached_session_answers_background_color_query() {
 }
 
 #[test]
+fn detached_color_replies_use_the_last_attached_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "theme-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The child waits for a marker (raised only after the client below has
+    // attached, reported its theme, and detached), then queries OSC 11. The
+    // sentinel is touched only if the reply carries the client's colors, not
+    // ghost's built-in default.
+    let marker = xdg.join("detach-done");
+    let sentinel = xdg.join("theme-answered");
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; \
+         printf '\\033]11;?\\033\\\\'; \
+         if IFS= read -r -s -d '\\' -t 2 reply; then case \"$reply\" in *'rgb:1212/3434/5656'*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        marker.display(),
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Attach as a display client, report a theme, and detach by dropping.
+    {
+        let sock = xdg.join("run/ghost").join(name).join("sock");
+        assert!(
+            wait_until(Duration::from_secs(5), || sock.exists()),
+            "session socket never appeared"
+        );
+        let mut s =
+            ghost_vt::client::Session::attach_path(&sock, name, 80, 24).expect("attach failed");
+        s.report_theme(ghost_vt::query::ThemeColors {
+            fg: [0xd0, 0xd0, 0xd0],
+            bg: [0x12, 0x34, 0x56],
+            cursor: [0xd0, 0xd0, 0xd0],
+        })
+        .expect("report_theme failed");
+    }
+    std::fs::write(&marker, b"").unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached reply did not use the last-attached background"
+    );
+}
+
+#[test]
 fn detached_session_answers_color_scheme_query() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

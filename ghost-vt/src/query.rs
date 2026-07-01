@@ -62,7 +62,7 @@ pub enum Query {
 /// `Default` — ghost's default scheme (`ghost-renderer`'s `Theme::default`,
 /// duplicated here because the layering points the other way) — until
 /// last-attached colors are persisted per session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThemeColors {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
