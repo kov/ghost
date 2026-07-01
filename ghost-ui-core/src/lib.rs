@@ -19,7 +19,7 @@ pub mod mouse;
 pub mod root;
 pub mod terminal;
 
-pub use cmd::Cmd;
+pub use cmd::{Cmd, PointerIcon};
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
 pub use fleet::{FleetModel, Locality};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.

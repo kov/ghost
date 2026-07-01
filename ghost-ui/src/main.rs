@@ -959,6 +959,18 @@ impl App {
                     }
                 }
                 Cmd::OpenUrl(url) => open_url(&url),
+                Cmd::PointerIcon(icon) => {
+                    if let Some(w) = self.windows.get(&wid) {
+                        w.gfx.window.set_cursor(match icon {
+                            ghost_ui_core::PointerIcon::Pointer => {
+                                winit::window::CursorIcon::Pointer
+                            }
+                            ghost_ui_core::PointerIcon::Default => {
+                                winit::window::CursorIcon::Default
+                            }
+                        });
+                    }
+                }
                 Cmd::ScheduleTick { after_ms } => {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         // Keep the earliest pending deadline: two schedulers can

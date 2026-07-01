@@ -24,7 +24,8 @@ use std::collections::HashSet;
 
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 use crate::{
-    CellMetrics, Cmd, PointPx, PointerButton, PointerPhase, SessionId, UiEvent, encode, mouse,
+    CellMetrics, Cmd, PointPx, PointerButton, PointerIcon, PointerPhase, SessionId, UiEvent,
+    encode, mouse,
 };
 
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
@@ -197,6 +198,10 @@ pub struct TerminalModel {
     /// and fzf theme detection). Defaults to ghost's default scheme; the shell
     /// overrides it when a scheme is configured (see `set_theme`).
     theme: ThemeColors,
+    /// The interned link id under a Ctrl/Cmd-hover, if any: `view` underlines
+    /// every visible run of it and the pointer shows a hand (see
+    /// [`Cmd::PointerIcon`]). Updated on pointer motion.
+    hovered_link: Option<u16>,
 }
 
 /// How long a synchronized-output hold may last before the scheduled tick
@@ -246,6 +251,7 @@ impl TerminalModel {
             presented: None,
             sync_held: false,
             theme: ThemeColors::default(),
+            hovered_link: None,
         }
     }
 
@@ -422,20 +428,68 @@ impl TerminalModel {
             w: self.size_px.0 as f32,
             h: self.size_px.1 as f32,
         };
+        let mut items = vec![SceneItem::Terminal {
+            id: SceneId::Root,
+            session: ghost_render::session_key(self.session()),
+            rect,
+            frame,
+            selection: self.selection,
+            dim: false,
+            damage: self.damage(),
+        }];
+        items.extend(self.hover_underlines());
         let mut scene = Scene::new(self.size_px);
-        scene.layers.push(Layer::new(
-            0,
-            vec![SceneItem::Terminal {
-                id: SceneId::Root,
-                session: ghost_render::session_key(self.session()),
-                rect,
-                frame,
-                selection: self.selection,
-                dim: false,
-                damage: self.damage(),
-            }],
-        ));
+        scene.layers.push(Layer::new(0, items));
         scene
+    }
+
+    /// Thin underline rects over every visible run of the Ctrl/Cmd-hovered
+    /// hyperlink (all runs of the same URI, VTE-style), in window pixels.
+    fn hover_underlines(&self) -> Vec<SceneItem> {
+        let Some(id) = self.hovered_link else {
+            return Vec::new();
+        };
+        let m = self.effective_metrics();
+        let [r, g, b] = self.theme.fg;
+        let color = [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            0.9,
+        ];
+        let mut items = Vec::new();
+        for (row, line) in self
+            .screen
+            .vt()
+            .view_at(self.scroll_offset)
+            .enumerate()
+            .take(self.rows as usize)
+        {
+            let cells = line.cells();
+            let mut col = 0;
+            while col < cells.len() {
+                if cells[col].pen().link_id() != Some(id) {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                while col < cells.len() && cells[col].pen().link_id() == Some(id) {
+                    col += 1;
+                }
+                items.push(SceneItem::Rect {
+                    id: SceneId::Root,
+                    rect: RectPx {
+                        x: start as f32 * m.advance,
+                        y: (row + 1) as f32 * m.line_height - 2.0,
+                        w: (col - start) as f32 * m.advance,
+                        h: 1.5,
+                    },
+                    color,
+                    radius: 0.0,
+                });
+            }
+        }
+        items
     }
 
     /// Widen the pending feed-dirty row range to cover `lo..=hi`.
@@ -936,9 +990,10 @@ impl TerminalModel {
         (col, row)
     }
 
-    /// The safe-to-open hyperlink URI under a pointer position, honoring the
-    /// scrollback offset. `None` on unlinked cells and disallowed schemes.
-    fn link_under(&self, pos: PointPx) -> Option<String> {
+    /// The safe-to-open hyperlink under a pointer position — its interned id
+    /// and URI — honoring the scrollback offset. `None` on unlinked cells and
+    /// disallowed schemes.
+    fn link_at(&self, pos: PointPx) -> Option<(u16, String)> {
         let (col1, row1) = self.point_to_cell(pos);
         let row = usize::from(row1.saturating_sub(1)).min((self.rows as usize).saturating_sub(1));
         let col = usize::from(col1.saturating_sub(1)).min((self.cols as usize).saturating_sub(1));
@@ -953,7 +1008,31 @@ impl TerminalModel {
             scheme.as_str(),
             "http" | "https" | "file" | "mailto" | "ftp"
         )
-        .then(|| uri.to_string())
+        .then(|| (id, uri.to_string()))
+    }
+
+    /// The safe-to-open hyperlink URI under a pointer position (see
+    /// [`link_at`](Self::link_at)).
+    fn link_under(&self, pos: PointPx) -> Option<String> {
+        self.link_at(pos).map(|(_, uri)| uri)
+    }
+
+    /// Track the Ctrl/Cmd-hover over hyperlinks: on a change, repaint (the
+    /// underline overlay) and switch the pointer between hand and default.
+    fn update_hover(&mut self, pos: PointPx, mods: Mods) -> Vec<Cmd> {
+        let hovered = ((mods.ctrl || mods.sup) && self.held.is_none())
+            .then(|| self.link_at(pos).map(|(id, _)| id))
+            .flatten();
+        if hovered == self.hovered_link {
+            return Vec::new();
+        }
+        self.hovered_link = hovered;
+        let icon = if hovered.is_some() {
+            PointerIcon::Pointer
+        } else {
+            PointerIcon::Default
+        };
+        vec![Cmd::PointerIcon(icon), Cmd::Redraw]
     }
 
     /// 0-based `(row, col)` cell under the pointer, clamped to the grid.
@@ -1069,12 +1148,13 @@ impl TerminalModel {
     ) -> Vec<Cmd> {
         match phase {
             PointerPhase::Motion => {
+                let mut cmds = self.update_hover(pos, mods);
                 let cell = self.point_to_cell(pos);
                 if self.cursor_cell == Some(cell) {
-                    return Vec::new();
+                    return cmds;
                 }
                 self.cursor_cell = Some(cell);
-                if let Some(b) = self.held {
+                cmds.extend(if let Some(b) = self.held {
                     if self.gesture_report {
                         self.mouse_report(mouse::Kind::Motion, Some(b), true, cell, mods)
                     } else if b == mouse::Button::Left
@@ -1089,7 +1169,8 @@ impl TerminalModel {
                     self.mouse_report(mouse::Kind::Motion, None, false, cell, mods)
                 } else {
                     Vec::new()
-                }
+                });
+                cmds
             }
             PointerPhase::Press => {
                 let Some(b) = button.map(map_button) else {
@@ -2307,6 +2388,55 @@ mod tests {
         alt: false,
         sup: false,
     };
+
+    #[test]
+    fn ctrl_hover_underlines_the_link_and_requests_a_pointer_cursor() {
+        let hover = |m: &mut TerminalModel, x: f64, y: f64, mods: Mods| {
+            m.update(UiEvent::Pointer {
+                phase: PointerPhase::Motion,
+                button: None,
+                pos: PointPx { x, y },
+                mods,
+                wheel_dy: 0.0,
+                clicks: 1,
+            })
+        };
+        let underlines = |m: &TerminalModel| {
+            m.view().layers[0]
+                .items
+                .iter()
+                .filter(|it| matches!(it, SceneItem::Rect { .. }))
+                .count()
+        };
+        let mut m = model();
+        feed(
+            &mut m,
+            b"\x1b]8;;https://example.com\x1b\\LINK\x1b]8;;\x1b\\ plain",
+        );
+        assert_eq!(underlines(&m), 0);
+
+        // Ctrl-hovering the link underlines its span and asks for a hand cursor.
+        let cmds = hover(&mut m, 13.0, 4.0, CTRL); // over the "I" of LINK
+        assert!(
+            cmds.contains(&Cmd::PointerIcon(PointerIcon::Pointer)),
+            "no pointer-cursor request: {cmds:?}"
+        );
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert_eq!(underlines(&m), 1, "one contiguous underline span");
+
+        // Moving off the link restores the cursor and drops the underline.
+        let cmds = hover(&mut m, 9.0 * 8.0 + 4.0, 4.0, CTRL); // over "plain"
+        assert!(
+            cmds.contains(&Cmd::PointerIcon(PointerIcon::Default)),
+            "cursor not restored: {cmds:?}"
+        );
+        assert_eq!(underlines(&m), 0);
+
+        // A plain hover (no modifier) over the link changes nothing.
+        let cmds = hover(&mut m, 13.0, 4.0, Mods::NONE);
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::PointerIcon(_))));
+        assert_eq!(underlines(&m), 0);
+    }
 
     #[test]
     fn ctrl_click_opens_a_hyperlink() {

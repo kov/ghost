@@ -75,6 +75,8 @@ pub enum Cmd {
     /// Open a hyperlink (OSC 8, Ctrl+click) in the system handler. The URL's
     /// scheme has already been allowlisted by the model.
     OpenUrl(String),
+    /// Set the window's pointer shape (hand over a Ctrl-hovered hyperlink).
+    PointerIcon(PointerIcon),
     /// Repaint the window.
     Redraw,
     /// Set the window title.
@@ -85,4 +87,13 @@ pub enum Cmd {
     },
     /// Exit the application.
     Quit,
+}
+
+/// The pointer shape a [`Cmd::PointerIcon`] asks the window to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerIcon {
+    /// The platform's normal arrow / text cursor.
+    Default,
+    /// The link-hover hand.
+    Pointer,
 }
