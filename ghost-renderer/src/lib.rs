@@ -669,7 +669,7 @@ struct Surface {
     bind_group: wgpu::BindGroup,
     /// The frame the texture currently holds; the next frame is diffed against it to
     /// decide a band (or, on a size/metrics change, a full re-render).
-    frame: Frame,
+    frame: Rc<Frame>,
     /// The selection baked into the texture. A selection change with no frame change must
     /// still re-render (it can't be diffed as a row band), so it's part of the cache key.
     selection: Option<Selection>,
@@ -1012,7 +1012,7 @@ enum RawDamage {
 /// one item, identity transform, a `Terminal`. Its session, frame, and selection are
 /// what the foreground Surface renders. `None` for anything else (chrome, a slide, a
 /// fleet grid), which never reaches the banded present path.
-fn lone_terminal(scene: &Scene) -> Option<(u64, &Frame, Option<Selection>)> {
+fn lone_terminal(scene: &Scene) -> Option<(u64, &Rc<Frame>, Option<Selection>)> {
     if scene.layers.len() != 1
         || scene.layers[0].items.len() != 1
         || scene.layers[0].transform != Transform::IDENTITY
@@ -1061,6 +1061,20 @@ fn union_rect(a: RectPx, b: RectPx) -> RectPx {
 /// terminals' row content (same id/rect/selection/dim/grid/metrics, no images). The
 /// band is the changed rows ∪ the cursor's old/new rows. Anything else ⇒ `Full`.
 fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
+    // A scene with any non-identity layer transform is mid-animation (the camera moved),
+    // which always repaints in full. Decide that FIRST, from a cheap transform scan,
+    // before the deep `prev == new` / per-layer equality below — otherwise every
+    // animation tick would deep-walk the frozen frames' rows/runs only to reach the same
+    // Full verdict via the transform, which `Layer`'s field order compares AFTER `items`.
+    // (The frames flow through each tick as shared `Rc`s, so this is the only place left
+    // that would touch their content per frame.)
+    if new
+        .layers
+        .iter()
+        .any(|l| l.transform != Transform::IDENTITY)
+    {
+        return RawDamage::Full;
+    }
     if prev == new {
         return RawDamage::Identical;
     }
@@ -1157,6 +1171,16 @@ fn scene_damage(prev: &Scene, new: &Scene) -> RawDamage {
         // the equality short-circuit above) — repaint fully to stay correct.
         None => RawDamage::Full,
     }
+}
+
+/// Whether two shared frames are the same content. Pointer identity is the fast path
+/// that makes an animation flat: the frozen content flows through every tick as the SAME
+/// `Rc`, so a composited-but-unchanged session is a one-instruction hit, never a deep
+/// walk of its rows/runs/strings. A distinct `Rc` (a fresh layout — steady typing, a
+/// re-fed tile) falls back to the structural compare, so correctness never depends on
+/// sharing.
+fn frames_eq(a: &Rc<Frame>, b: &Rc<Frame>) -> bool {
+    Rc::ptr_eq(a, b) || **a == **b
 }
 
 /// The TIGHT (un-expanded) inclusive row range `[lo, hi]` that differs between two
@@ -1862,7 +1886,7 @@ impl Renderer {
     fn ensure_surface(
         &mut self,
         session: u64,
-        frame: &Frame,
+        frame: &Rc<Frame>,
         selection: Option<Selection>,
         rect: RectPx,
         font: FontRef,
@@ -1877,7 +1901,10 @@ impl Renderer {
             Full, // no surface, a resize, a selection change, or an un-bandable change
         }
         let plan = match self.surfaces.get(&session) {
-            Some(c) if c.size == size && c.frame == *frame && c.selection == selection => {
+            // `frames_eq` is pointer-identity-first: a composited-but-unchanged session
+            // (every animation tick after the first) hits here in one instruction, never
+            // deep-walking its rows — the flat-cost invariant of the compositor.
+            Some(c) if c.size == size && frames_eq(&c.frame, frame) && c.selection == selection => {
                 Plan::Current
             }
             // Band only when the texture size AND selection are unchanged and the surface
@@ -1923,7 +1950,7 @@ impl Renderer {
     fn update_surface_band(
         &mut self,
         surface: &mut Surface,
-        frame: &Frame,
+        frame: &Rc<Frame>,
         selection: Option<Selection>,
         rows: (usize, usize),
         font: FontRef,
@@ -2037,7 +2064,7 @@ impl Renderer {
     /// size before the main pass, which always runs after every surface sub-pass.
     fn render_surface(
         &mut self,
-        frame: &Frame,
+        frame: &Rc<Frame>,
         selection: Option<Selection>,
         rect: RectPx,
         font: FontRef,
@@ -3809,7 +3836,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f.clone(),
+                    frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
                 }],
@@ -3867,7 +3894,7 @@ mod tests {
                 w: w as f32,
                 h: h as f32,
             },
-            frame: f.clone(),
+            frame: std::rc::Rc::new(f.clone()),
             selection: None,
             dim: false,
         };
@@ -3926,7 +3953,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f.clone(),
+                    frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
                 }],
@@ -4076,7 +4103,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f.clone(),
+                    frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
                 }],
@@ -4114,7 +4141,7 @@ mod tests {
                         w: 50.0, // clip the 180px of content to the left 50px
                         h: 40.0,
                     },
-                    frame: f,
+                    frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
                 }],
@@ -4155,7 +4182,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f.clone(),
+                    frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
                 }],
@@ -4285,7 +4312,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f,
+                    frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
                 }],
@@ -4310,7 +4337,7 @@ mod tests {
                         w: w as f32,
                         h: h as f32,
                     },
-                    frame: f,
+                    frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
                 }],
@@ -4358,7 +4385,7 @@ mod tests {
                     id,
                     session: sess,
                     rect,
-                    frame: f.clone(),
+                    frame: std::rc::Rc::new(f.clone()),
                     selection: None,
                     dim: false,
                 }],
@@ -4408,7 +4435,7 @@ mod tests {
                     id: SceneId::Tile(1),
                     session: sess,
                     rect,
-                    frame: f,
+                    frame: std::rc::Rc::new(f),
                     selection: None,
                     dim: false,
                 }],
@@ -4477,7 +4504,7 @@ mod tests {
                 w: w as f32,
                 h: h as f32,
             },
-            frame: f.clone(),
+            frame: std::rc::Rc::new(f.clone()),
             selection,
             dim: false,
         };

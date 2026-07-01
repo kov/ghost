@@ -2047,4 +2047,47 @@ mod tests {
             "the incoming side sits half a width in from the right, got tx={in_tx}"
         );
     }
+
+    /// Each terminal's (session, shared frame) in `scene`.
+    fn frames_by_session(scene: &Scene) -> HashMap<u64, std::rc::Rc<ghost_render::Frame>> {
+        scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|it| match it {
+                SceneItem::Terminal { session, frame, .. } => Some((*session, frame.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_slide_shares_frozen_frames_across_ticks_instead_of_deep_cloning() {
+        // The payoff of compositing cached textures: during an animation the frozen
+        // content is not re-copied each tick — only the camera moves. Pin it
+        // structurally — the frame each side carries is the SAME `Rc` allocation across
+        // two consecutive ticks, so `Anim::scene` shares it (a refcount bump) rather than
+        // deep-cloning the laid-out rows/runs/strings every frame (the cost that made a
+        // colorized session jank the animation while a plain one didn't).
+        let mut r = root();
+        with_three(&mut r);
+        ctrl_tab(&mut r, false); // start a slide (gamma -> alpha)
+
+        let base = 10_000u64;
+        r.update(UiEvent::Tick { now_ms: base }); // stamps progress 0
+        let a = frames_by_session(&r.view());
+        r.update(UiEvent::Tick {
+            now_ms: base + ANIM_MS / 4,
+        }); // still mid-slide, camera moved
+        let b = frames_by_session(&r.view());
+
+        assert_eq!(a.len(), 2, "both slide sides are on screen");
+        for (session, fa) in &a {
+            let fb = b.get(session).expect("the same sessions on the next tick");
+            assert!(
+                std::rc::Rc::ptr_eq(fa, fb),
+                "session {session:#018x}'s frame must be shared across ticks, not deep-cloned"
+            );
+        }
+    }
 }

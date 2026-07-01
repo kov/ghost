@@ -296,11 +296,11 @@ impl TerminalModel {
 
     /// Render the current state to a single full-window terminal scene.
     pub fn view(&self) -> Scene {
-        let frame = layout_frame_at(
+        let frame = std::rc::Rc::new(layout_frame_at(
             self.screen.vt(),
             self.effective_metrics(),
             self.scroll_offset,
-        );
+        ));
         let rect = RectPx {
             x: 0.0,
             y: 0.0,

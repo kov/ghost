@@ -1223,7 +1223,7 @@ impl FleetModel {
                     id: SceneId::Tile(handle),
                     session: ghost_render::session_key(&tile.id),
                     rect: preview,
-                    frame,
+                    frame: std::rc::Rc::new(frame),
                     selection: if focused {
                         tile.model.selection()
                     } else {

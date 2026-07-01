@@ -9,6 +9,8 @@
 //! that was drawn ([`Scene::hit`]), keeping rendering and input in lockstep and
 //! fully testable without a display.
 
+use std::rc::Rc;
+
 use crate::{CellMetrics, Frame, Run, Selection};
 
 /// Straight-alpha RGBA, matching the renderer's instance color format.
@@ -101,7 +103,11 @@ pub enum SceneItem {
         id: SceneId,
         session: u64,
         rect: RectPx,
-        frame: Frame,
+        /// Shared so cloning a scene (each animation tick, and the damage cache's
+        /// snapshot) is a refcount bump, not a deep copy of the laid-out rows — the
+        /// frozen content of an animation must not be re-copied every frame. Pointer
+        /// identity also serves as a cheap "unchanged since last render" check.
+        frame: Rc<Frame>,
         selection: Option<Selection>,
         dim: bool,
     },
@@ -362,7 +368,7 @@ mod tests {
             id,
             session: 0,
             rect: RectPx { x, y, w, h },
-            frame: Frame {
+            frame: Rc::new(Frame {
                 cols: 0,
                 rows: 0,
                 metrics: CellMetrics {
@@ -372,7 +378,7 @@ mod tests {
                 rows_layout: vec![],
                 cursor: None,
                 images: vec![],
-            },
+            }),
             selection: None,
             dim: false,
         }

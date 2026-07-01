@@ -58,11 +58,21 @@ fn ctrl_tab() -> UiEvent {
 
 /// A block of dense, colourful text — enough lines to fill any plausible window
 /// so each preview rasterises a full screen (the real per-tile cost), not a sliver.
+///
+/// `GHOST_BENCH_HEAVY=1` recolours every other column instead of once per row, so each
+/// row becomes ~110 style runs (each its own `String`) rather than one — the run-density
+/// of colorized `ls` output vs. plain text. It changes NOTHING the compositor renders
+/// (the surface is cached and blitted the same way); it only stresses per-frame content
+/// handling, so it isolates whether animation cost is content-INDEPENDENT as intended.
 fn dense_block() -> Vec<u8> {
+    let heavy = std::env::var_os("GHOST_BENCH_HEAVY").is_some();
     let mut s = String::new();
     for row in 0..200usize {
         s.push_str(&format!("\x1b[38;5;{}m", 16 + (row % 200)));
         for col in 0..220usize {
+            if heavy && col % 2 == 0 {
+                s.push_str(&format!("\x1b[38;5;{}m", 16 + ((row + col) % 200)));
+            }
             s.push(char::from(b'!' + ((row * 7 + col * 3) % 90) as u8));
         }
         s.push_str("\r\n");

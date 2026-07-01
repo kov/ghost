@@ -323,7 +323,7 @@ fn scales_a_large_surface_frame_to_fit_its_tile() {
                 w: 45.0,
                 h: 36.0,
             },
-            frame,
+            frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
         }],
@@ -365,7 +365,7 @@ fn an_unchanged_surface_is_not_re_rasterized() {
             w: 360.0,
             h: 216.0,
         }, // 0.5x: contain_scale < 1
-        frame: frame.clone(),
+        frame: std::rc::Rc::new(frame.clone()),
         selection: None,
         dim: false,
     };
@@ -415,7 +415,7 @@ fn an_animated_dive_camera_does_not_re_rasterize_surfaces_each_frame() {
             w: 180.0,
             h: 108.0,
         }, // 0.25x native
-        frame: frame.clone(),
+        frame: std::rc::Rc::new(frame.clone()),
         selection: None,
         dim: false,
     };
@@ -490,7 +490,7 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
                 w: 180.0,
                 h: 72.0,
             },
-            frame,
+            frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
         }],
@@ -555,7 +555,7 @@ fn an_identical_repaint_reshapes_nothing() {
                 w: 360.0,
                 h: 108.0,
             },
-            frame,
+            frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
         }],
