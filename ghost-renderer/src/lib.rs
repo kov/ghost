@@ -691,23 +691,6 @@ struct Snapshot {
     size: (u32, u32),
 }
 
-/// Our own full-window render target, composited onto the swapchain each present.
-/// A banded (partial) redraw is only valid against a target whose previous contents
-/// survive — and Vulkan leaves an *acquired swapchain image*'s contents UNDEFINED,
-/// so painting a partial frame straight onto it loses everything outside the band on
-/// drivers that don't happen to preserve it. We own this texture and never recycle
-/// it, so `LoadOp::Load` here always sees the last complete frame; each present
-/// renders the scene (full or banded) into it, then blits the WHOLE texture onto the
-/// acquired image, so the displayed frame is always complete regardless of what the
-/// swapchain handed back.
-struct Backbuffer {
-    w: u32,
-    h: u32,
-    texture: wgpu::Texture,
-    /// Samples `texture` (nearest, 1:1) for the composite blit.
-    bind_group: wgpu::BindGroup,
-}
-
 /// Per-row instance offsets for a steady single view, so a damaged (banded)
 /// redraw can draw only the band's rows instead of the whole instance buffer.
 /// llvmpipe processes every *drawn* instance's vertices at submit time regardless
@@ -807,6 +790,24 @@ fn preview_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
         w: rect.w * k,
         h: rect.h * k,
         ..rect
+    }
+}
+
+/// The camera-independent source rect that sizes a session's [`Surface`] texture,
+/// splitting the two cases the one session renderer serves:
+/// - A genuinely SHRUNK terminal (a fleet/dive tile, `preview_scale < 1`) renders at
+///   native resolution (`preview_source_rect`) so the blit that minifies it stays
+///   crisp and the texture is stable while the camera moves.
+/// - A FULL-SIZE terminal (the foreground or a slide side, `preview_scale == 1`)
+///   renders at its on-screen rect, so the texture is window-exact: a 1:1 blit
+///   reproduces the inline render byte-for-byte (background sliver past the last cell
+///   included) and the very same Surface serves the foreground and, unchanged, the
+///   slide's outgoing side — no re-raster across the role change.
+fn surface_src(frame: &Frame, rect: RectPx) -> RectPx {
+    if preview_scale(frame, rect) < 1.0 {
+        preview_source_rect(frame, rect)
+    } else {
+        rect
     }
 }
 
@@ -1005,6 +1006,28 @@ enum RawDamage {
     Identical,
     Full,
     Band(RectPx),
+}
+
+/// The lone full-window terminal a steady single view presents: exactly one layer,
+/// one item, identity transform, a `Terminal`. Its session, frame, and selection are
+/// what the foreground Surface renders. `None` for anything else (chrome, a slide, a
+/// fleet grid), which never reaches the banded present path.
+fn lone_terminal(scene: &Scene) -> Option<(u64, &Frame, Option<Selection>)> {
+    if scene.layers.len() != 1
+        || scene.layers[0].items.len() != 1
+        || scene.layers[0].transform != Transform::IDENTITY
+    {
+        return None;
+    }
+    match &scene.layers[0].items[0] {
+        SceneItem::Terminal {
+            session,
+            frame,
+            selection,
+            ..
+        } => Some((*session, frame, *selection)),
+        _ => None,
+    }
 }
 
 /// A band covering the whole window (a `Full` redraw expressed as a rect).
@@ -1210,16 +1233,14 @@ pub struct Renderer {
     /// Reused target for [`Self::render_to_cached_target`] (headless present
     /// benchmarking) — kept across frames so its contents persist for `LoadOp::Load`.
     bench_target: Option<(u32, u32, wgpu::Texture)>,
-    /// The owned full-window backbuffer (see [`Backbuffer`]); the partial redraw lands
-    /// here and is then blitted whole onto the swapchain.
-    backbuffer: Option<Backbuffer>,
-    /// Whether the backbuffer currently holds the complete last-presented frame. A
-    /// full redraw goes straight to the swapchain (covering every pixel, so it needs
-    /// no backbuffer) and leaves this `false`; the next banded present then repaints
-    /// the backbuffer fully before resuming cheap band updates.
-    backbuffer_valid: bool,
-    /// The fullscreen quad that blits the backbuffer onto the surface, reused.
-    backbuffer_quad: Option<wgpu::Buffer>,
+    /// Whether the foreground session's [`Surface`] currently holds the complete
+    /// last-presented frame. A full redraw goes STRAIGHT to the swapchain (covering
+    /// every pixel — pass-through, the desktop-compositor "unredirect" of a fullscreen
+    /// opaque window) and leaves this `false`; the next banded present then re-renders
+    /// the Surface fully before resuming cheap band updates.
+    foreground_valid: bool,
+    /// The fullscreen quad that blits the foreground Surface onto the swapchain, reused.
+    blit_quad: Option<wgpu::Buffer>,
     /// Per-row instance offsets for the last prepared scene, when it was a steady
     /// single view (one identity-transformed full-window Terminal). `Some` lets a
     /// damaged redraw draw only the band's rows; `None` (chrome, fleet, multi-item)
@@ -1246,9 +1267,10 @@ pub struct Renderer {
     /// the passthrough `fs_blit` (the texture is already premultiplied).
     preview_pipeline: wgpu::RenderPipeline,
     /// The glyph pipeline with blending DISABLED (`blend: None` ⇒ the fragment replaces
-    /// the destination). A banded preview update draws one transparent quad with it to
-    /// erase the band's old pixels to (0,0,0,0) before repainting — the only way to clear
-    /// a sub-region of a transparent-backed texture, since `LoadOp::Clear` is whole-target.
+    /// the destination). A banded update draws one background-coloured quad with it to
+    /// REPLACE the band's old pixels at any alpha before repainting — the only way to
+    /// overwrite a sub-region of a texture (opaque covers, translucent replaces cleanly),
+    /// since `LoadOp::Clear` is whole-target.
     erase_pipeline: wgpu::RenderPipeline,
     /// Per-session rendered textures by [`session_key`] (see [`Surface`]). Keying by
     /// session — not the ephemeral [`SceneId`] role/handle — means a session's texture
@@ -1265,16 +1287,11 @@ pub struct Renderer {
     /// only some rows re-rasterizes just those rows into its persistent texture instead
     /// of a full re-render. A test asserts a one-row change band-updates, not re-renders.
     preview_band_updates: u32,
-    /// Count of times the steady-view backbuffer was adopted as a slide's outgoing
-    /// preview instead of re-rasterizing it. A test asserts a slide after a steady
-    /// view reuses the on-screen pixels rather than rebuilding them.
-    backbuffer_adoptions: u32,
-    /// The session whose complete full-window frame the backbuffer currently holds
-    /// (when [`Self::backbuffer_valid`]). The outgoing side of a slide is exactly that
-    /// session, so matching a terminal's `session` against this is how the outgoing
-    /// side claims the on-screen pixels — without the renderer knowing anything about
-    /// "slides". `None` until a steady single view has been presented.
-    backbuffer_session: Option<u64>,
+    /// The session whose `Surface` is the current foreground (the last steady single view
+    /// presented through the banded path). A foreground switch always passes through a
+    /// full redraw (a slide), so it's only read to defensively force a full re-render if
+    /// a band ever arrives for a different session. `None` until a band has been presented.
+    foreground_session: Option<u64>,
     /// Uploaded image bind groups, keyed by image id; the blob is sent once and
     /// the bind group (which owns its texture) lives until eviction.
     image_bind_groups: HashMap<u32, wgpu::BindGroup>,
@@ -1585,9 +1602,8 @@ impl Renderer {
             shape_misses: 0,
             bg_fill,
             bench_target: None,
-            backbuffer: None,
-            backbuffer_valid: false,
-            backbuffer_quad: None,
+            foreground_valid: false,
+            blit_quad: None,
             single_row_index: None,
             band_instances: 0,
             pack_x: 1,
@@ -1606,8 +1622,7 @@ impl Renderer {
             preview_instances: None,
             preview_renders: 0,
             preview_band_updates: 0,
-            backbuffer_adoptions: 0,
-            backbuffer_session: None,
+            foreground_session: None,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
             image_instances: None,
@@ -1802,24 +1817,15 @@ impl Renderer {
         (w, h)
     }
 
-    /// Pixel size of a tile's preview texture for `rect`, which the caller has
-    /// already sized via [`preview_source_rect`] (a camera-independent rect, not the
-    /// live on-screen one), capped so the frame contain-fit inside never exceeds its
-    /// native resolution (`cols×advance` by `rows×line_height`) — past 1:1 there's no
-    /// more detail, and the cap bounds the texture's cost. The cap is UNIFORM so the
-    /// rect's aspect is preserved: a per-axis cap would squash the preview and render
-    /// the tile at a different aspect than the steady single view — a visible pop.
-    fn preview_size(frame: &Frame, rect: RectPx) -> (u32, u32) {
-        let nw = (frame.cols as f32 * frame.metrics.advance).max(1.0);
-        let nh = (frame.rows as f32 * frame.metrics.line_height).max(1.0);
-        // How much the frame would scale to contain-fit `rect`; if that would magnify
-        // past native (>1), shrink the texture uniformly so the frame lands at 1:1.
-        let contain = (rect.w / nw).min(rect.h / nh);
-        let k = if contain > 1.0 { 1.0 / contain } else { 1.0 };
-        (
-            ((rect.w * k).ceil() as u32).max(1),
-            ((rect.h * k).ceil() as u32).max(1),
-        )
+    /// Pixel size of a session's Surface texture for the source `rect` the caller
+    /// chose via [`surface_src`]: a shrunk tile is upscaled to native resolution
+    /// (`preview_source_rect`) so the minifying blit stays crisp, while a full-size
+    /// terminal keeps its on-screen rect so the texture is window-exact (the sliver
+    /// of background past the last cell included, a 1:1 blit reproducing the inline
+    /// render). Either way the texture is simply the rect, ceiled to whole pixels —
+    /// `surface_src` has already applied the native cap where it belongs.
+    fn preview_size(_frame: &Frame, rect: RectPx) -> (u32, u32) {
+        ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
     }
 
     /// The premultiplied theme background as a render-pass clear colour: `bg·α` in the
@@ -1947,6 +1953,9 @@ impl Renderer {
         let (build_lo, build_hi) = (lo.saturating_sub(1), (hi + 1).min(last));
         let (insts, _) =
             self.build_instances(frame, font, size_px, selection, build_lo..build_hi + 1);
+        // Only the band's rows were built + uploaded (the rest of the Surface is kept via
+        // `LoadOp::Load`) — the steady-typing win a test asserts against a full build.
+        self.band_instances = insts.len() as u32;
 
         // The bg-replace quad (replace-blend, so it overwrites at any alpha) and the band
         // glyphs/selection (alpha-blend over it).
@@ -2020,52 +2029,6 @@ impl Renderer {
         }
         self.gpu.queue.submit([encoder.finish()]);
         surface.frame = frame.clone();
-    }
-
-    /// Adopt the steady-view backbuffer as `session`'s preview texture, if it holds a
-    /// complete `sw`×`sh` full-window frame. The caller only invokes this for the
-    /// session the backbuffer holds (the outgoing side of a slide is exactly the
-    /// session that was last on screen), so the pixels are reused instead of being
-    /// re-rasterized; the subsequent [`ensure_preview`](Self::ensure_preview) then hits
-    /// this entry. No-op (so the caller rasters normally) if there's already a cached
-    /// texture, the backbuffer is invalid, or its size doesn't match.
-    ///
-    /// The recorded `size` is what `ensure_preview` will look up (`preview_size`), so
-    /// later frames hit; the texture itself is the full-window backbuffer, blitted 1:1
-    /// into the full-window rect, so it's pixel-exact (only `size` keys the cache —
-    /// `size` is never assumed to equal the texture's real dimensions). Consumes the
-    /// backbuffer: the animation's `band == None` frames go straight to the swapchain,
-    /// so it was about to go stale regardless.
-    fn adopt_backbuffer_as_preview(
-        &mut self,
-        session: u64,
-        frame: &Frame,
-        src: RectPx,
-        sw: u32,
-        sh: u32,
-    ) {
-        if self.preview_cache.contains_key(&session) || !self.backbuffer_valid {
-            return;
-        }
-        let bb = match self.backbuffer.take() {
-            Some(bb) if bb.w == sw && bb.h == sh => bb,
-            other => {
-                self.backbuffer = other; // size mismatch (or none): raster normally
-                return;
-            }
-        };
-        self.preview_cache.insert(
-            session,
-            Surface {
-                texture: bb.texture,
-                bind_group: bb.bind_group,
-                frame: frame.clone(),
-                selection: None,
-                size: Self::preview_size(frame, src),
-            },
-        );
-        self.backbuffer_valid = false;
-        self.backbuffer_adoptions += 1;
     }
 
     /// Render `frame` (scaled to "contain" within `rect`) to its own texture and
@@ -2253,13 +2216,6 @@ impl Renderer {
         self.preview_band_updates
     }
 
-    /// Count of backbuffer→outgoing-preview adoptions (see
-    /// [`Self::adopt_backbuffer_as_preview`]). A test asserts a slide after a steady
-    /// view reuses the on-screen pixels instead of re-rasterizing the outgoing side.
-    pub fn backbuffer_adoptions(&self) -> u32 {
-        self.backbuffer_adoptions
-    }
-
     /// Shape `text` at `size_px`, caching the result. Shaping (swash GSUB/GPOS)
     /// is the dominant per-frame cost, and a run's text is identical across
     /// redraws, so the cache turns a repaint into a hash lookup + `Rc` clone.
@@ -2368,7 +2324,7 @@ impl Renderer {
     /// for the whole frame), in painter order (backgrounds, selection, glyphs). Each
     /// instance is positioned at its absolute frame-local cell, so a sub-range builds
     /// exactly the geometry it would have in a full build — the incremental banded path
-    /// builds just the band's rows and relies on the backbuffer holding the rest. The
+    /// builds just the band's rows and relies on the Surface holding the rest. The
     /// returned [`RowIndex`] is indexed from `rows.start` (so a whole-frame build indexes
     /// it by absolute row, as the banded-draw fast path expects).
     fn build_instances(
@@ -2820,30 +2776,22 @@ impl Renderer {
                         // momentarily identity (a slide side at p = 0 or p = 1):
                         // otherwise it would render inline-crisp that one frame and
                         // switch to a blit the next — a visible pop — and would raster
-                        // twice. It also lets the outgoing side adopt the backbuffer
-                        // below before it has moved.
+                        // twice. A slide's outgoing side is full-window, so its Surface
+                        // is exactly the foreground's (same session, same window size) —
+                        // a plain cache hit, no re-raster, no special adoption path.
                         let animated = layer.transform != Transform::IDENTITY;
                         if preview_scale(frame, *rect) < 1.0 || animated || multi_terminal {
                             // Preview: blit a cached texture (re-rendered only when its
                             // content, selection, or size changes) instead of re-
                             // rasterizing the glyphs every frame — the SAME session
                             // renderer as the inline path, just into a texture.
-                            // Size the texture to a camera-INDEPENDENT native-resolution
-                            // rect, not the live on-screen rect: an animation moves the
-                            // layer every frame, so on-screen sizing would re-render
-                            // every frame. The blit (below) carries the transform, so
-                            // the terminal still moves/zooms; the texture stays put.
-                            let src = preview_source_rect(frame, *rect);
-                            // When this terminal IS the session the backbuffer holds (the
-                            // outgoing side of a slide is exactly what was last on screen
-                            // full-window), adopt those pixels as its texture instead of
-                            // re-rasterizing them; `ensure_preview` then hits the adopted
-                            // entry. Scoped to a multi-terminal scene so a lone shrinking
-                            // tile (a dive-out) still rasters at native preview size
-                            // rather than adopting a full-window texture to downscale.
-                            if multi_terminal && self.backbuffer_session == Some(*session) {
-                                self.adopt_backbuffer_as_preview(*session, frame, src, sw, sh);
-                            }
+                            // Size the texture from a camera-INDEPENDENT source rect (see
+                            // `surface_src`), not the live on-screen rect: an animation
+                            // moves the layer every frame, so on-screen sizing would
+                            // re-render every frame. The blit (below) carries the
+                            // transform, so the terminal still moves/zooms; the texture
+                            // stays put.
+                            let src = surface_src(frame, *rect);
                             self.ensure_preview(*session, frame, *selection, src, font, size_px);
                             seen.insert(*session);
                             draws.push(Draw::Preview {
@@ -3378,64 +3326,8 @@ impl Renderer {
         self.bench_target = Some((tw, th, tex));
     }
 
-    /// (Re)create the owned [`Backbuffer`] when absent or resized, returning `true`
-    /// if it was just created — its contents are then undefined, so the caller must
-    /// redraw it fully (not banded) this frame. Sampled nearest at 1:1 for the blit.
-    fn ensure_backbuffer(&mut self, w: u32, h: u32) -> bool {
-        if self
-            .backbuffer
-            .as_ref()
-            .is_some_and(|b| b.w == w && b.h == h)
-        {
-            return false;
-        }
-        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("backbuffer"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self
-            .gpu
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("backbuffer bind group"),
-                layout: &self.bind_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-        self.backbuffer = Some(Backbuffer {
-            w,
-            h,
-            texture,
-            bind_group,
-        });
-        true
-    }
-
     /// Point the shared uniform at `w`×`h` and (re)build the fullscreen quad that
-    /// blits the backbuffer onto the surface.
+    /// blits the foreground Surface onto the swapchain.
     fn prepare_blit_quad(&mut self, w: u32, h: u32) {
         let uniforms = Uniforms {
             viewport: [w as f32, h as f32],
@@ -3452,31 +3344,31 @@ impl Renderer {
         Self::upload_instances(
             &self.gpu.device,
             &self.gpu.queue,
-            &mut self.backbuffer_quad,
+            &mut self.blit_quad,
             &mut self.buffer_allocs,
-            "backbuffer blit",
+            "surface blit",
             &quad,
         );
     }
 
-    /// Clear `view` and blit the whole backbuffer over it. The backbuffer is
-    /// premultiplied, so "over" a transparent clear reproduces it exactly (keeping a
-    /// translucent theme see-through); every pixel is written, so the surface holds a
-    /// complete frame regardless of the acquired image's prior contents.
-    fn encode_backbuffer_blit(
+    /// Clear `view` and blit the whole foreground Surface (sampled by `bind_group`) over
+    /// it. The Surface is premultiplied, so "over" a transparent clear reproduces it
+    /// exactly (keeping a translucent theme see-through); every pixel is written, so the
+    /// swapchain holds a complete frame regardless of the acquired image's prior contents.
+    fn encode_surface_blit(
         &self,
         view: &wgpu::TextureView,
-        bb: &Backbuffer,
+        bind_group: &wgpu::BindGroup,
     ) -> wgpu::CommandBuffer {
         let mut encoder = self
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("backbuffer blit"),
+                label: Some("surface blit"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("backbuffer blit"),
+                label: Some("surface blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
@@ -3491,9 +3383,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(buf) = &self.backbuffer_quad {
+            if let Some(buf) = &self.blit_quad {
                 pass.set_pipeline(&self.preview_pipeline);
-                pass.set_bind_group(0, &bb.bind_group, &[]);
+                pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
             }
@@ -3504,14 +3396,19 @@ impl Renderer {
     /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
     ///
     /// A full redraw (`band == None`) covers every pixel, so it goes STRAIGHT to the
-    /// swapchain — it needs nothing of the image's prior contents, which Vulkan leaves
-    /// undefined. A banded redraw, however, relies on the rest of the frame already
-    /// being present; the swapchain can't guarantee that, so it is rendered into a
-    /// backbuffer WE own (where `LoadOp::Load` always sees the last complete frame) and
-    /// the whole backbuffer is then blitted onto the swapchain. This keeps the cheap
-    /// banded raster for typing while keeping bulk output (all full redraws) blit-free,
-    /// and is correct regardless of swapchain content persistence. The caller owns
-    /// acquiring/presenting the surface texture.
+    /// swapchain — pass-through, the desktop-compositor "unredirect" of a fullscreen
+    /// opaque window: no texture, no blit, so bulk output (a screenful of `cat`) stays
+    /// cheap. It leaves the foreground Surface stale.
+    ///
+    /// A banded (steady-typing) redraw can't go straight to the swapchain — a band
+    /// relies on the rest of the frame already being present, which a swapchain image's
+    /// undefined prior contents can't guarantee. So it is rendered into the foreground
+    /// session's own [`Surface`] (which WE own, so `LoadOp::Load` always sees the last
+    /// complete frame) and the whole Surface is blitted onto the swapchain. This is the
+    /// SAME per-session Surface the fleet and slide paths composite — one session
+    /// renderer — so a slide's outgoing side reuses it with no re-raster; here it is
+    /// window-sized, so the blit is 1:1 and reproduces the inline render byte-for-byte.
+    /// The caller owns acquiring/presenting the surface texture.
     pub fn present_scene(
         &mut self,
         view: &wgpu::TextureView,
@@ -3521,141 +3418,46 @@ impl Renderer {
         size_px: f32,
         band: Option<RectPx>,
     ) {
-        let Some(b) = band else {
-            // Full redraw: straight to the swapchain. The backbuffer (if any) is now
-            // stale — the next banded present repaints it fully before banding.
+        if band.is_none() {
             self.render_scene_to_view_damaged(view, scene, font, size_px, None);
-            self.backbuffer_valid = false;
+            self.foreground_valid = false;
+            return;
+        }
+        let Some((session, frame, selection)) = lone_terminal(scene) else {
+            // A band for something that isn't a lone full-window terminal (no split view
+            // produces this today): fall back to a correct full redraw rather than
+            // banding onto a swapchain image whose prior contents are undefined.
+            self.render_scene_to_view_damaged(view, scene, font, size_px, None);
+            self.foreground_valid = false;
             return;
         };
-        let (bw, bh) = (scene.size_px.0.max(1), scene.size_px.1.max(1));
-        // The backbuffer must hold the complete current frame for the band to land on
-        // top of it. If it was just (re)created, or a full redraw left it stale, repaint
-        // it fully this frame; otherwise update just the band.
-        let fresh = self.ensure_backbuffer(bw, bh);
-        let bb_band = if fresh || !self.backbuffer_valid {
-            None
-        } else {
-            Some(b)
+        let win = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: surf.0.max(1) as f32,
+            h: surf.1.max(1) as f32,
         };
-        // Take the backbuffer out so the `&mut self` render call doesn't alias it.
-        let bb = self.backbuffer.take().expect("backbuffer ensured above");
-        let bb_view = bb
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        match bb_band {
-            // Refresh the whole backbuffer (it was just (re)created or left stale).
-            None => self.render_scene_to_view_damaged(&bb_view, scene, font, size_px, None),
-            // Steady band: build + upload + draw ONLY the band's rows into the
-            // backbuffer, which already holds the rest.
-            Some(bp) => self.render_band_incremental(&bb_view, scene, font, size_px, bp),
+        // If the Surface is stale (the last present went straight to the swapchain, not
+        // into it) or holds a different session, drop it so `ensure_preview` re-renders
+        // it in full: a band would otherwise land on rows the swapchain — not the
+        // Surface — last updated.
+        if !self.foreground_valid || self.foreground_session != Some(session) {
+            self.preview_cache.remove(&session);
         }
-        drop(bb_view);
-        // Composite the whole backbuffer onto the surface (resets the uniform, which
-        // the render above set to the scene size, to the surface size for the quad).
+        // Window-sized source (see `surface_src`): the Surface is exactly the swapchain
+        // size, so the blit below is 1:1. `ensure_preview` diffs the new frame against
+        // the Surface's held frame and updates only the changed rows in place.
+        let src = surface_src(frame, win);
+        self.ensure_preview(session, frame, selection, src, font, size_px);
+        self.foreground_valid = true;
+        self.foreground_session = Some(session);
+        // Blit the whole Surface onto the swapchain (resets the uniform, which the render
+        // above set to the texture size, to the surface size for the fullscreen quad).
         self.prepare_blit_quad(surf.0, surf.1);
-        let cb = self.encode_backbuffer_blit(view, &bb);
-        self.gpu.queue.submit([cb]);
-        self.backbuffer = Some(bb);
-        self.backbuffer_valid = true;
-        // Record whose frame the backbuffer now holds, so the next scene's matching
-        // terminal (a slide's outgoing side) can adopt these pixels rather than
-        // re-rasterizing them. The banded path only ever runs for a steady single view,
-        // so there is exactly one terminal to read.
-        self.backbuffer_session = match scene.terminals().next() {
-            Some(SceneItem::Terminal { session, .. }) => Some(*session),
-            _ => None,
-        };
-    }
-
-    /// Redraw just `band` into the backbuffer view, building + uploading ONLY the
-    /// band's rows (±1 for spill) rather than the whole frame — the rest is already in
-    /// the backbuffer. Byte-identical to a full build drawn band-restricted, since the
-    /// band rows carry the same geometry; it just avoids rebuilding/re-uploading ~all
-    /// the other rows. Falls back to a full build + band-restricted draw for any scene
-    /// that isn't a lone identity-transformed terminal (the banded path's invariant, but
-    /// be safe).
-    fn render_band_incremental(
-        &mut self,
-        bb_view: &wgpu::TextureView,
-        scene: &Scene,
-        font: FontRef,
-        size_px: f32,
-        band: RectPx,
-    ) {
-        let eligible = scene.layers.len() == 1
-            && scene.layers[0].items.len() == 1
-            && scene.layers[0].transform == Transform::IDENTITY;
-        let Some(SceneItem::Terminal {
-            frame,
-            rect,
-            selection,
-            dim,
-            ..
-        }) = eligible.then(|| &scene.layers[0].items[0])
-        else {
-            self.render_scene_to_view_damaged(bb_view, scene, font, size_px, Some(band));
-            return;
-        };
-        let n = frame.rows_layout.len();
-        let lh = frame.metrics.line_height;
-        if n == 0 || lh <= 0.0 {
-            self.render_scene_to_view_damaged(bb_view, scene, font, size_px, Some(band));
-            return;
+        if let Some(s) = self.preview_cache.get(&session) {
+            let cb = self.encode_surface_blit(view, &s.bind_group);
+            self.gpu.queue.submit([cb]);
         }
-        // Band pixel span → rows, expanded one row each way for glyphs / sub-pixel
-        // backgrounds spilling across a row boundary (matches `banded_row_ranges`).
-        let last = n - 1;
-        let a = (((band.y - rect.y) / lh).floor().max(0.0) as usize).min(last);
-        let b = ((((band.y + band.h - rect.y) / lh).ceil() as i64 - 1).max(0) as usize).min(last);
-        let (lo, hi) = (a.saturating_sub(1), (b + 1).min(last));
-
-        let (mut insts, _) = self.build_instances(frame, font, size_px, *selection, lo..hi + 1);
-        translate(&mut insts, rect.x, rect.y);
-        if *dim {
-            dim_colors(&mut insts);
-        }
-        self.instance_count = insts.len() as u32;
-        Self::upload_instances(
-            &self.gpu.device,
-            &self.gpu.queue,
-            &mut self.instances,
-            &mut self.buffer_allocs,
-            "band instances",
-            &insts,
-        );
-        self.band_instances = self.instance_count;
-        // The build set no uniform; point it at the backbuffer (scene) size for NDC.
-        let (vw, vh) = scene.size_px;
-        let uniforms = Uniforms {
-            viewport: [vw as f32, vh as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.gpu
-            .queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-        let scissor = clamp_scissor(band, vw, vh);
-        if scissor[2] == 0 || scissor[3] == 0 {
-            return;
-        }
-        // Band background fill (premultiplied, matching `encode_scene`'s clear).
-        let alpha = self.theme.bg_alpha;
-        let fill = solid(
-            band,
-            [
-                f32::from(self.theme.bg[0]) / 255.0 * alpha,
-                f32::from(self.theme.bg[1]) / 255.0 * alpha,
-                f32::from(self.theme.bg[2]) / 255.0 * alpha,
-                alpha,
-            ],
-        );
-        self.gpu
-            .queue
-            .write_buffer(&self.bg_fill, 0, bytemuck::bytes_of(&fill));
-        // One contiguous range: the whole band-rows buffer (drawn under the band scissor).
-        let all = 0..self.instance_count;
-        let cb = self.encode_scene_banded_rows(bb_view, std::slice::from_ref(&all), scissor);
-        self.gpu.queue.submit([cb]);
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a
@@ -4614,8 +4416,8 @@ mod tests {
             )],
         };
         // Two frames differing only in row 3 — and SHORTER there, so a correct update
-        // must ERASE the old longer text (the transparent-clear analog of the
-        // backbuffer's damaged-redraw test).
+        // must ERASE the old longer text (the erase-replace analog of the steady view's
+        // damaged-redraw test).
         let fa = frame(
             cols,
             rows,
@@ -4743,12 +4545,56 @@ mod tests {
     }
 
     #[test]
-    fn a_slide_after_a_steady_view_reuses_the_backbuffer_for_the_outgoing_side() {
-        // The outgoing session is exactly what was just on screen, and the backbuffer
-        // still holds those pixels. A slide that follows a steady single view must
-        // REUSE the backbuffer for the outgoing side (the session the backbuffer holds)
-        // instead of re-rasterizing it; only the incoming side, genuinely new content,
-        // rasters.
+    fn steady_typing_through_a_surface_matches_a_full_render() {
+        // present_scene's banded path renders the foreground into its own Surface and
+        // blits it onto the swapchain; the composited result must be byte-identical to a
+        // full render of the same frame. Guards the steady-typing hot path.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let a = frame(cols, rows, "the steady single view, before a keystroke");
+        let a2 = frame(cols, rows, "the steady single view, AFTER the keystroke");
+        let band = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: w as f32,
+            h: TM.line_height,
+        };
+
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Reference, computed up front so it doesn't perturb the sequence below.
+        let full = r
+            .render_offscreen_scene(&single_scene(a2.clone(), w, h), font, SIZE_PX)
+            .rgba;
+
+        // A full present (frame a) then a banded present (frame a2) — steady typing.
+        r.present_scene(&v, (w, h), &single_scene(a, w, h), font, SIZE_PX, None);
+        r.present_scene(
+            &v,
+            (w, h),
+            &single_scene(a2, w, h),
+            font,
+            SIZE_PX,
+            Some(band),
+        );
+
+        let got = read_back(&r.gpu, &img, w, h);
+        assert_eq!(
+            got, full,
+            "a banded present must reproduce a full render of the frame"
+        );
+    }
+
+    #[test]
+    fn a_slide_after_a_steady_view_reuses_the_foreground_surface_for_the_outgoing_side() {
+        // The foreground session's Surface (window-sized, holding what was just on
+        // screen) IS the slide's outgoing side — same session, same window size. A slide
+        // that follows a steady single view must REUSE that Surface for the outgoing
+        // side (a plain session-keyed cache hit, no adoption hack) instead of
+        // re-rasterizing it; only the incoming side, genuinely new content, rasters.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let (cols, rows) = (40usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);
@@ -4772,8 +4618,9 @@ mod tests {
             .render_offscreen_scene(&single_scene(a2.clone(), w, h), font, SIZE_PX)
             .rgba;
 
-        // Establish a valid backbuffer holding the outgoing frame: a full present,
-        // then a banded one (the steady single-view path).
+        // Establish the foreground Surface holding the outgoing frame: a full present
+        // (straight to the swapchain), then a banded one (the steady single-view path,
+        // which renders the frame into the session's Surface).
         r.present_scene(&v, (w, h), &single_scene(a, w, h), font, SIZE_PX, None);
         r.present_scene(
             &v,
@@ -4783,34 +4630,25 @@ mod tests {
             SIZE_PX,
             Some(band),
         );
-        assert_eq!(
-            r.backbuffer_adoptions(),
-            0,
-            "no adoption during the steady view"
-        );
 
         let before = r.preview_renders();
         // First slide frame: the outgoing fills the window (identity), the incoming
-        // sits fully off the right edge (culled). The outgoing adopts the backbuffer.
+        // sits fully off the right edge (culled). The outgoing is the foreground
+        // session at the same window size, so its Surface is a cache hit — no raster.
         let f0 = slide_scene(a2.clone(), inc.clone(), 0.0, w as f32, w, h);
         r.present_scene(&v, (w, h), &f0, font, SIZE_PX, None);
         assert_eq!(
-            r.backbuffer_adoptions(),
-            1,
-            "the outgoing side adopts the backbuffer"
-        );
-        assert_eq!(
             r.preview_renders(),
             before,
-            "and rasters nothing (the incoming is off-screen)"
+            "the outgoing side reuses the foreground Surface — nothing rasters (the incoming is off-screen)"
         );
 
         // The composited frame must reproduce the outgoing session's last on-screen
-        // frame — the adopted pixels are blitted, not garbage.
+        // frame — the reused pixels are blitted, not garbage.
         let got = read_back(&r.gpu, &img, w, h);
         assert_eq!(
             got, full,
-            "the adopted outgoing side reproduces its last on-screen frame"
+            "the reused outgoing side reproduces its last on-screen frame"
         );
 
         // Mid-slide: the outgoing has moved (cache hit, no raster); the incoming is now
@@ -4822,7 +4660,6 @@ mod tests {
             before + 1,
             "only the incoming side rasters"
         );
-        assert_eq!(r.backbuffer_adoptions(), 1, "no further adoption");
     }
 
     #[test]
@@ -4927,8 +4764,8 @@ mod tests {
             h: TM.line_height,
         };
         // Three frames, each changing one more row than the last (a cumulative edit, as
-        // typing does), so a band carries exactly the changed row and the backbuffer
-        // must accumulate the rest.
+        // typing does), so a band carries exactly the changed row and the foreground
+        // Surface must accumulate the rest.
         let a = frame(cols, rows, "r0\r\nr1\r\nr2\r\nr3\r\nr4");
         let b = frame(cols, rows, "r0\r\nB1\r\nr2\r\nr3\r\nr4"); // row 1 changed
         let c = frame(cols, rows, "r0\r\nB1\r\nC2\r\nr3\r\nr4"); // row 2 changed
@@ -4945,8 +4782,8 @@ mod tests {
             .collect();
 
         // Present A full, then B and C as single-row bands — each onto a freshly
-        // corrupted image, cycling buffers, so a band that only updated the backbuffer
-        // (not the whole surface) would leave garbage behind.
+        // corrupted image, cycling buffers, so a band that only updated the foreground
+        // Surface (not the whole swapchain image) would leave garbage behind.
         let presents = [
             (a, None),
             (b, Some(row_band(1))),
@@ -4979,9 +4816,10 @@ mod tests {
 
     #[test]
     fn steady_band_present_builds_only_its_rows() {
-        // The incremental banded present builds + uploads ONLY the band's rows (the
-        // backbuffer holds the rest), so instance_count after a steady band must be a
-        // small fraction of a full build of the same frame.
+        // A steady band updates the foreground Surface IN PLACE, building + uploading
+        // ONLY the band's rows (the Surface holds the rest via `LoadOp::Load`): so it
+        // must register as a band update, not a full re-render, and the rows it builds
+        // must be a small fraction of a full build of the same frame.
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         let (cols, rows) = (20usize, 24usize);
         let (w, h) = (cols as u32 * 9, rows as u32 * 18);
@@ -5011,7 +4849,9 @@ mod tests {
         let img = offscreen_target(&r.gpu.device, w, h, r.format);
         let v = img.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // A full; B band (fresh backbuffer → full refresh); C band (steady → incremental).
+        // A: full present (straight to swapchain, foreground Surface left stale).
+        // B: band, but the Surface is stale, so it re-renders in full (a preview render).
+        // C: band on a now-valid Surface — a true in-place band update.
         r.present_scene(&v, (w, h), &scene_of(&[]), font, SIZE_PX, None);
         r.present_scene(
             &v,
@@ -5021,6 +4861,7 @@ mod tests {
             SIZE_PX,
             Some(band_of(11)),
         );
+        let renders_before_c = r.preview_renders();
         r.present_scene(
             &v,
             (w, h),
@@ -5029,7 +4870,17 @@ mod tests {
             SIZE_PX,
             Some(band_of(12)),
         );
-        let incremental = r.instance_count();
+        assert_eq!(
+            r.preview_band_updates(),
+            1,
+            "the steady band (C) updates the Surface in place"
+        );
+        assert_eq!(
+            r.preview_renders(),
+            renders_before_c,
+            "and does NOT re-render the whole Surface"
+        );
+        let incremental = r.band_instances();
 
         // A full build of the same frame, for the reference count.
         let _ = r.render_offscreen_scene(&scene_of(&[11, 12]), font, SIZE_PX);
