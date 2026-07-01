@@ -95,6 +95,20 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
         return Some(Shortcut::NewSession);
     }
 
+    // Copy/paste/new-window are also on Alt on Linux (in addition to the Ctrl+Shift
+    // chord below) — a terminal-app convention that keeps Ctrl free for the shell.
+    // Like Alt+T above, these must resolve here rather than be encoded and sent to the
+    // child as Meta+<key>; only C/V/N are taken, so other Alt+key motions (Alt+B/F, …)
+    // still reach the child. macOS keeps Alt = Option/Meta and uses Cmd for these.
+    if !cfg!(target_os = "macos") && mods.alt && !mods.sup && !mods.ctrl {
+        match key {
+            Key::Char(s) if s.eq_ignore_ascii_case("c") => return Some(Shortcut::Copy),
+            Key::Char(s) if s.eq_ignore_ascii_case("v") => return Some(Shortcut::Paste),
+            Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
+            _ => {}
+        }
+    }
+
     let primary = mods.sup || mods.ctrl;
     if !primary {
         return None;
@@ -1809,6 +1823,64 @@ mod tests {
             key(&mut m, Key::Char("w".into()), Mods::CTRL),
             vec![sent("alpha", b"\x17")],
             "bare Ctrl+W is terminal input"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn alt_c_v_n_are_copy_paste_new_window_on_linux() {
+        // On Linux, Alt+C/V/N are frontend shortcuts (copy / paste / new-window) — a
+        // terminal convention that keeps Ctrl free for the shell — resolved here rather
+        // than encoded as Meta+<key> to the child. macOS keeps Alt = Option/Meta (it
+        // uses Cmd for these), so the behaviour and this test are gated off there.
+        let mut m = model();
+        assert_eq!(
+            key(&mut m, Key::Char("v".into()), Mods::ALT),
+            vec![Cmd::ReadClipboard],
+            "Alt+V pastes"
+        );
+        assert_eq!(
+            key(&mut m, Key::Char("n".into()), Mods::ALT),
+            vec![Cmd::NewWindow],
+            "Alt+N opens a new window"
+        );
+
+        // Alt+C copies the current selection.
+        let mut m = model();
+        feed(&mut m, b"hello world");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            40.0,
+            1.0,
+        ));
+        assert_eq!(
+            key(&mut m, Key::Char("c".into()), Mods::ALT),
+            vec![Cmd::WriteClipboard("hello".to_string())],
+            "Alt+C copies the selection"
+        );
+
+        // Only c/v/n are grabbed: another Alt+letter (e.g. Alt+B word motion) still
+        // reaches the child as Meta input, never a frontend shortcut.
+        let mut m = model();
+        let out = key(&mut m, Key::Char("b".into()), Mods::ALT);
+        assert!(
+            !out.iter().any(|c| matches!(
+                c,
+                Cmd::NewWindow | Cmd::ReadClipboard | Cmd::WriteClipboard(_)
+            )),
+            "Alt+B must stay Meta input, not a shortcut: {out:?}"
+        );
+        assert!(
+            !out.is_empty(),
+            "Alt+B should still send Meta bytes to the child"
         );
     }
 
