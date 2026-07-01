@@ -1,8 +1,8 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), the background opacity (`[window]`), the base
-//! font size + family (`[font]`), and how the macOS Option key behaves
-//! (`[input] option_as_meta`).
+//! a persisted font zoom (`[zoom]`), the background opacity and initial grid size
+//! (`[window]`), the base font size + family (`[font]`), and how the macOS Option
+//! key behaves (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
 //! is pure and unit-tested. Scheme ids are inherited from the retired ghost-gtk
@@ -109,6 +109,17 @@ pub const DEFAULT_FONT_PX: f32 = 15.0;
 const MIN_FONT_PX: f32 = 6.0;
 const MAX_FONT_PX: f32 = 120.0;
 
+/// The initial window grid when `[window] columns`/`rows` are unset — the historic
+/// 80x24 the window opened at before it was configurable.
+const DEFAULT_COLUMNS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+/// Sane bounds for the configured initial grid; a value outside these clamps in
+/// (never 0 — a zero-size grid has no cells — and not so large it asks the
+/// compositor for an absurd window).
+const MIN_GRID: u16 = 1;
+const MAX_COLUMNS: u16 = 1000;
+const MAX_ROWS: u16 = 1000;
+
 /// The parsed `ui.toml`. Sections we don't read yet are ignored by serde.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -146,11 +157,19 @@ struct Window {
     /// Background opacity, 0.0..=1.0 (clamped on apply). Only the default
     /// background goes translucent; SGR-coloured cells stay opaque. 1.0 = solid.
     opacity: f32,
+    /// Initial window grid in character cells (clamped on apply). The window opens
+    /// sized to hold this many columns/rows at the base font; it can be resized after.
+    columns: u16,
+    rows: u16,
 }
 
 impl Default for Window {
     fn default() -> Self {
-        Window { opacity: 1.0 }
+        Window {
+            opacity: 1.0,
+            columns: DEFAULT_COLUMNS,
+            rows: DEFAULT_ROWS,
+        }
     }
 }
 
@@ -264,6 +283,16 @@ impl UiConfig {
     pub fn option_as_meta(&self) -> bool {
         self.input.option_as_meta
     }
+
+    /// The initial window grid in cells, clamped to a sane range (never 0). The
+    /// window opens sized to hold this many columns/rows at the base font.
+    pub fn columns(&self) -> u16 {
+        self.window.columns.clamp(MIN_GRID, MAX_COLUMNS)
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.window.rows.clamp(MIN_GRID, MAX_ROWS)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +319,30 @@ mod tests {
     fn unknown_scheme_falls_back_to_the_default() {
         let c = UiConfig::parse("[colors]\nscheme = \"nope\"\n").unwrap();
         assert_eq!(c.theme().bg, Theme::default().bg);
+    }
+
+    #[test]
+    fn window_columns_and_rows_parse_default_and_clamp() {
+        // Defaults are the historic 80x24 window.
+        assert_eq!(
+            (UiConfig::default().columns(), UiConfig::default().rows()),
+            (80, 24)
+        );
+        let empty = UiConfig::parse("").unwrap();
+        assert_eq!((empty.columns(), empty.rows()), (80, 24));
+        // Explicit values are honored (the gtk config's 100x40).
+        let c = UiConfig::parse("[window]\ncolumns = 100\nrows = 40\n").unwrap();
+        assert_eq!((c.columns(), c.rows()), (100, 40));
+        // Zero clamps up to at least one cell (a zero-size grid has none).
+        let z = UiConfig::parse("[window]\ncolumns = 0\nrows = 0\n").unwrap();
+        assert!(z.columns() >= 1 && z.rows() >= 1);
+        // An absurdly large grid clamps down so it can't ask for a monstrous window.
+        let big = UiConfig::parse("[window]\ncolumns = 5000\nrows = 5000\n").unwrap();
+        assert!(big.columns() <= MAX_COLUMNS && big.rows() <= MAX_ROWS);
+        // opacity and the grid coexist in the same [window] table.
+        let both = UiConfig::parse("[window]\nopacity = 0.9\ncolumns = 120\n").unwrap();
+        assert_eq!(both.columns(), 120);
+        assert_eq!(both.theme().bg_alpha, 0.9);
     }
 
     #[test]

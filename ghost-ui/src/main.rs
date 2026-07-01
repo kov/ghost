@@ -44,7 +44,7 @@ use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
 use menu::{MenuIntent, UserEvent};
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
@@ -540,10 +540,17 @@ impl Graphics {
         event_loop: &ActiveEventLoop,
         theme: ghost_renderer::Theme,
         option_as_meta: bool,
+        cols: u16,
+        rows: u16,
     ) -> Self {
-        let size = PhysicalSize::new(
-            u32::from(COLS) * metrics().advance as u32,
-            u32::from(ROWS) * metrics().line_height as u32,
+        // Open sized to `cols`x`rows` cells at the base font. A LOGICAL size (not
+        // physical) so winit scales it by the monitor DPI — the grid then works out to
+        // exactly `cols`x`rows` at any scale (`grid_from_pixels` divides physical px by
+        // cell·scale), which a physical size would only get right at 1x.
+        let m = metrics();
+        let size = LogicalSize::new(
+            f64::from(cols) * f64::from(m.advance),
+            f64::from(rows) * f64::from(m.line_height),
         );
         // Request a transparent window only when the theme is translucent, so an
         // opaque setup never pays the compositor's alpha-blending cost.
@@ -1090,7 +1097,13 @@ impl App {
     /// spawns or takes over a session from there.
     fn open_fleet_window(&mut self, event_loop: &ActiveEventLoop) {
         let cfg = config::UiConfig::load();
-        let gfx = Graphics::new(event_loop, cfg.theme(), cfg.option_as_meta());
+        let gfx = Graphics::new(
+            event_loop,
+            cfg.theme(),
+            cfg.option_as_meta(),
+            cfg.columns(),
+            cfg.rows(),
+        );
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
@@ -1168,7 +1181,13 @@ impl App {
     /// false if the attach fails (the caller exits the app).
     fn open_single_window(&mut self, event_loop: &ActiveEventLoop, name: &str) -> bool {
         let cfg = config::UiConfig::load();
-        let gfx = Graphics::new(event_loop, cfg.theme(), cfg.option_as_meta());
+        let gfx = Graphics::new(
+            event_loop,
+            cfg.theme(),
+            cfg.option_as_meta(),
+            cfg.columns(),
+            cfg.rows(),
+        );
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
