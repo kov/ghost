@@ -105,9 +105,13 @@ macOS (no `signalfd`/`kqueue` split).
 
 ### Storage
 
-- Per-session runtime dir: `$XDG_RUNTIME_DIR/ghost/<name>/` holding `sock` and
-  `pid` (ephemeral — wiped on reboot, which doubles as stale-socket cleanup).
-  Grouping them in one directory makes renaming a single atomic `rename(2)`.
+- Per-session runtime dir: `$XDG_RUNTIME_DIR/ghost/<name>/` (Linux), or a
+  durable per-user dir where there is no `XDG_RUNTIME_DIR` — `~/.local/state/ghost`,
+  or `~/Library/Application Support/ghost` on macOS — holding `sock`, `pid`, and
+  `lock`. macOS's temp dir is avoided on purpose: it is reaped every few days and
+  would strand a still-running session by deleting its files. Dead leftovers are
+  pruned by a liveness check, not by relying on the dir being wiped. Grouping
+  them in one directory makes renaming a single atomic `rename(2)`.
 - Recordings: `$XDG_DATA_HOME/ghost/recordings/<name>.ghostrec` (falls back to
   `~/.local/share/ghost/…`; archival, survives reboot). A framed, per-frame-zstd
   asciicast with periodic checkpoints; `ghost export` turns it into a standard

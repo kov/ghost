@@ -6,6 +6,7 @@ license.workspace = true
 description = "Run a terminal in the background and reattach without losing scrollback, mouse, or keybindings."
 
 [dependencies]
+dirs = "6.0.0"
 libc = "0.2.186"
 nix = { version = "0.31.3", features = ["signal"] }
 postcard = { version = "1.1.3", features = ["alloc"] }

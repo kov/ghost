@@ -1,23 +1,49 @@
 //! Filesystem locations for sessions.
 //!
-//! Each session owns a directory `$XDG_RUNTIME_DIR/ghost/<name>/` holding its
-//! `sock` and `pid` (the base falls back to `/tmp/ghost-<uid>` when the variable
-//! is unset). That tree is ephemeral by design — wiped on reboot — which doubles
-//! as free stale-socket cleanup, since a session never outlives its host's
-//! kernel. Grouping the per-session files in one directory also makes renaming a
-//! session a single atomic `rename(2)` of that directory.
+//! Each session owns a directory `<runtime>/ghost/<name>/` holding its `sock`,
+//! `pid`, and `lock`. The runtime base is `$XDG_RUNTIME_DIR` when set (Linux's
+//! per-user tmpfs, wiped at logout); otherwise it is a durable per-user dir
+//! chosen by [`runtime_dir`] — deliberately **not** the temp dir, which macOS
+//! reaps every few days and would delete a live session's files out from under
+//! its still-running host. Correctness therefore can't lean on the tree being
+//! wiped: stale leftovers (a crashed host, or entries that outlive a reboot) are
+//! pruned by the liveness check in [`crate::session::list`]. Grouping the
+//! per-session files in one directory also makes renaming a session a single
+//! atomic `rename(2)` of that directory.
 
 use std::path::PathBuf;
 
 /// The directory holding the per-session subdirectories.
 pub fn runtime_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = unsafe { libc::getuid() };
-            std::env::temp_dir().join(format!("ghost-{uid}"))
-        });
-    base.join("ghost")
+    resolve_runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        dirs::state_dir(),
+        dirs::data_local_dir(),
+    )
+}
+
+/// Resolve the runtime base, kept pure so it can be unit-tested without poking
+/// process env. An explicit `XDG_RUNTIME_DIR` wins everywhere (the Linux
+/// standard and the test suite's isolation knob). With none set — the normal
+/// case on macOS, where the variable is never present — fall back to a durable
+/// per-user base the OS does **not** periodically reap, never the temp dir:
+/// macOS's `dirhelper` sweeps `$TMPDIR` (`/var/folders/.../T`) every ~3 days,
+/// which would delete a live session's `sock`/`pid`/`lock` out from under the
+/// running host and hide it from discovery. `dirs` maps these to the right home
+/// per platform — state dir (`~/.local/state`) on Linux, or data-local
+/// (`~/Library/Application Support`, `%LOCALAPPDATA%`) where there is no state
+/// dir. Stale entries are pruned by liveness (see [`crate::session::list`]), not
+/// by relying on the directory being wiped.
+fn resolve_runtime_dir(
+    xdg_runtime: Option<PathBuf>,
+    state: Option<PathBuf>,
+    data_local: Option<PathBuf>,
+) -> PathBuf {
+    xdg_runtime
+        .or(state)
+        .or(data_local)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ghost")
 }
 
 /// The directory holding one session's `sock` and `pid`.
@@ -107,4 +133,52 @@ pub fn recording_path(name: &str) -> PathBuf {
     data_dir()
         .join("recordings")
         .join(format!("{name}.ghostrec"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn honors_explicit_xdg_runtime_dir() {
+        // An explicit XDG_RUNTIME_DIR wins on every platform: it is the Linux
+        // standard (a per-user tmpfs wiped at logout) and the test suite's
+        // isolation knob. Resolution must not depend on the durable fallbacks.
+        let got = resolve_runtime_dir(
+            Some(PathBuf::from("/run/user/501")),
+            Some(PathBuf::from("/home/u/.local/state")),
+            Some(PathBuf::from("/home/u/.local/share")),
+        );
+        assert_eq!(got, PathBuf::from("/run/user/501/ghost"));
+    }
+
+    #[test]
+    fn falls_back_to_durable_base_not_reapable_temp() {
+        // Regression: on macOS XDG_RUNTIME_DIR is unset, and the old fallback
+        // used $TMPDIR (`/var/folders/.../T`), which macOS's dirhelper reaps
+        // every ~3 days — silently deleting a live session's sock/pid/lock out
+        // from under the running host, so `ghost ls` (and the GUI) report
+        // nothing. The fallback must be a durable per-user base instead. With no
+        // state dir (macOS), the data-local base (`~/Library/Application
+        // Support`) is used.
+        let app_support = PathBuf::from("/Users/u/Library/Application Support");
+        let got = resolve_runtime_dir(None, None, Some(app_support.clone()));
+        assert_eq!(got, app_support.join("ghost"));
+        assert!(
+            !got.starts_with(std::env::temp_dir()),
+            "runtime dir {got:?} must not live under the reapable temp dir"
+        );
+    }
+
+    #[test]
+    fn prefers_state_over_data_local_without_xdg_runtime() {
+        // Linux without XDG_RUNTIME_DIR set: the state dir (`~/.local/state`) is
+        // the right durable home, preferred over the data-local share dir.
+        let got = resolve_runtime_dir(
+            None,
+            Some(PathBuf::from("/home/u/.local/state")),
+            Some(PathBuf::from("/home/u/.local/share")),
+        );
+        assert_eq!(got, PathBuf::from("/home/u/.local/state/ghost"));
+    }
 }
