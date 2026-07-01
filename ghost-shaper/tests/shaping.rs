@@ -8,7 +8,7 @@
 //! `assets/FiraCode-LICENSE-OFL.txt`), a fixed ligature-bearing font so these
 //! never depend on whatever fonts a machine happens to have installed.
 
-use ghost_shaper::{FontRef, Synthesis, font_from_bytes, glyph_id, rasterize, shape};
+use ghost_shaper::{FontRef, FontSet, Synthesis, font_from_bytes, glyph_id, rasterize, shape};
 
 const FIRA: &[u8] = include_bytes!("assets/FiraCode-Regular.ttf");
 
@@ -155,4 +155,152 @@ fn cell_metrics_scale_with_size() {
     }
     assert!(large.advance > small.advance);
     assert!(large.line_height > small.line_height);
+}
+
+// Each `font_from_bytes` call mints a distinct swash cache key, so building several
+// FontRefs from the same bytes gives us identifiable "faces" to prove which slot
+// `FontSet::face` picks — without needing several real font files.
+fn pick(set: &FontSet, bold: bool, italic: bool) -> (u64, Synthesis) {
+    let (f, synth) = set.face(bold, italic);
+    (f.key.value(), synth)
+}
+
+#[test]
+fn single_face_set_synthesizes_bold_and_italic() {
+    let reg = font_from_bytes(FIRA).unwrap();
+    let rk = reg.key.value();
+    let set = FontSet::single(reg);
+    assert_eq!(pick(&set, false, false), (rk, Synthesis::default()));
+    assert_eq!(
+        pick(&set, true, false),
+        (
+            rk,
+            Synthesis {
+                bold: true,
+                italic: false
+            }
+        )
+    );
+    assert_eq!(
+        pick(&set, false, true),
+        (
+            rk,
+            Synthesis {
+                bold: false,
+                italic: true
+            }
+        )
+    );
+    assert_eq!(
+        pick(&set, true, true),
+        (
+            rk,
+            Synthesis {
+                bold: true,
+                italic: true
+            }
+        )
+    );
+    // `From<FontRef>` is the same single-face set.
+    let from: FontSet = reg.into();
+    assert_eq!(
+        from.face(true, true).1,
+        Synthesis {
+            bold: true,
+            italic: true
+        }
+    );
+}
+
+#[test]
+fn a_family_with_only_bold_uses_it_and_synthesizes_the_oblique() {
+    // The Fira Code case: real Regular + Bold, no italic face.
+    let reg = font_from_bytes(FIRA).unwrap();
+    let bold = font_from_bytes(FIRA).unwrap();
+    let (rk, bk) = (reg.key.value(), bold.key.value());
+    assert_ne!(rk, bk);
+    let set = FontSet {
+        regular: reg,
+        bold: Some(bold),
+        italic: None,
+        bold_italic: None,
+    };
+    assert_eq!(pick(&set, false, false), (rk, Synthesis::default()));
+    assert_eq!(pick(&set, true, false), (bk, Synthesis::default())); // real bold
+    // Italic falls back to Regular + synthetic oblique.
+    assert_eq!(
+        pick(&set, false, true),
+        (
+            rk,
+            Synthesis {
+                bold: false,
+                italic: true
+            }
+        )
+    );
+    // Bold-italic uses the real bold weight with a synthetic oblique on top.
+    assert_eq!(
+        pick(&set, true, true),
+        (
+            bk,
+            Synthesis {
+                bold: false,
+                italic: true
+            }
+        )
+    );
+}
+
+#[test]
+fn a_full_family_uses_the_exact_face_with_no_synthesis() {
+    let reg = font_from_bytes(FIRA).unwrap();
+    let bold = font_from_bytes(FIRA).unwrap();
+    let ital = font_from_bytes(FIRA).unwrap();
+    let bi = font_from_bytes(FIRA).unwrap();
+    let set = FontSet {
+        regular: reg,
+        bold: Some(bold),
+        italic: Some(ital),
+        bold_italic: Some(bi),
+    };
+    assert_eq!(
+        pick(&set, true, false),
+        (bold.key.value(), Synthesis::default())
+    );
+    assert_eq!(
+        pick(&set, false, true),
+        (ital.key.value(), Synthesis::default())
+    );
+    assert_eq!(
+        pick(&set, true, true),
+        (bi.key.value(), Synthesis::default())
+    );
+}
+
+#[test]
+fn only_italic_uses_it_and_synthesizes_the_weight() {
+    // A family with a real italic but no bold: bold-italic uses the italic face and
+    // synthesizes the extra weight.
+    let reg = font_from_bytes(FIRA).unwrap();
+    let ital = font_from_bytes(FIRA).unwrap();
+    let set = FontSet {
+        regular: reg,
+        bold: None,
+        italic: Some(ital),
+        bold_italic: None,
+    };
+    assert_eq!(
+        pick(&set, false, true),
+        (ital.key.value(), Synthesis::default())
+    );
+    assert_eq!(
+        pick(&set, true, true),
+        (
+            ital.key.value(),
+            Synthesis {
+                bold: true,
+                italic: false
+            }
+        )
+    );
 }

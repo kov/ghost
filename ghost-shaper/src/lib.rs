@@ -41,7 +41,77 @@ pub struct GlyphBitmap {
 
 /// Parse a font face (index 0) from its raw bytes.
 pub fn font_from_bytes(data: &[u8]) -> Option<FontRef<'_>> {
-    FontRef::from_index(data, 0)
+    font_from_index(data, 0)
+}
+
+/// Parse the `index`-th face from raw bytes — for a `.ttc` collection (or any file
+/// fontconfig reports with a face index other than 0).
+pub fn font_from_index(data: &[u8], index: usize) -> Option<FontRef<'_>> {
+    FontRef::from_index(data, index)
+}
+
+/// A font family's faces for the four terminal styles. `regular` always exists; the
+/// bold/italic/bold-italic slots are `Some` only when a real face was found, so a
+/// missing style is synthesized from the nearest face we do have. `Copy` — it is
+/// just up to four [`FontRef`]s (each a thin borrow of already-loaded bytes).
+#[derive(Clone, Copy)]
+pub struct FontSet<'a> {
+    pub regular: FontRef<'a>,
+    pub bold: Option<FontRef<'a>>,
+    pub italic: Option<FontRef<'a>>,
+    pub bold_italic: Option<FontRef<'a>>,
+}
+
+impl<'a> FontSet<'a> {
+    /// A single-face set: every style renders from `regular`, synthesizing bold and
+    /// italic as needed — the bundled-font / no-real-faces path.
+    pub fn single(regular: FontRef<'a>) -> Self {
+        FontSet {
+            regular,
+            bold: None,
+            italic: None,
+            bold_italic: None,
+        }
+    }
+
+    /// The face to shape and rasterize a run of style `(bold, italic)` with, plus the
+    /// residual [`Synthesis`] to apply on top — whatever the chosen face does not
+    /// itself provide. Prefers an exact face; then a face covering one axis (real
+    /// bold with a synthetic oblique, or real italic with a synthetic weight); then
+    /// regular with both synthesized. So a family that ships only Regular and Bold
+    /// (e.g. Fira Code) gets a real bold weight and a synthesized oblique for its
+    /// italics, automatically.
+    pub fn face(&self, bold: bool, italic: bool) -> (FontRef<'a>, Synthesis) {
+        let synth = |bold, italic| Synthesis { italic, bold };
+        match (bold, italic) {
+            (false, false) => (self.regular, Synthesis::default()),
+            (true, false) => match self.bold {
+                Some(f) => (f, Synthesis::default()),
+                None => (self.regular, synth(true, false)),
+            },
+            (false, true) => match self.italic {
+                Some(f) => (f, Synthesis::default()),
+                None => (self.regular, synth(false, true)),
+            },
+            (true, true) => {
+                if let Some(f) = self.bold_italic {
+                    (f, Synthesis::default())
+                } else if let Some(f) = self.bold {
+                    (f, synth(false, true)) // real bold weight, synthetic oblique
+                } else if let Some(f) = self.italic {
+                    (f, synth(true, false)) // real italic shapes, synthetic weight
+                } else {
+                    (self.regular, synth(true, true))
+                }
+            }
+        }
+    }
+}
+
+impl<'a> From<FontRef<'a>> for FontSet<'a> {
+    fn from(regular: FontRef<'a>) -> Self {
+        FontSet::single(regular)
+    }
 }
 
 /// The glyph id a single character maps to via the font's cmap, with no shaping
