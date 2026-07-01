@@ -13,7 +13,10 @@
 //! bundle with a log, never fatal.
 
 use ghost_render::CellMetrics;
-use ghost_shaper::{FontRef, FontSet};
+use ghost_shaper::FontSet;
+// `FontRef` only names types in the fontconfig (Linux) resolution path.
+#[cfg(target_os = "linux")]
+use ghost_shaper::FontRef;
 
 /// The bundled default face: Fira Code Regular (SIL OFL-1.1), which carries the
 /// programming ligatures. Same asset the shaper's tests use.
@@ -47,6 +50,9 @@ fn bundled() -> FontSet<'static> {
 }
 
 /// Read a font file and leak its bytes to `'static`, then parse the `idx`-th face.
+/// Only the fontconfig path uses this; off Linux there is no family resolution, so
+/// gate it out to stay `-D dead_code` clean now that macOS is a built target.
+#[cfg(target_os = "linux")]
 fn load(path: &std::path::Path, idx: usize) -> Option<FontRef<'static>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
