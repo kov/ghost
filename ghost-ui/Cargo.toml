@@ -50,10 +50,12 @@ unicode-properties = "0.1"
 # The native macOS menu bar (see src/menu.rs) and CoreText font resolution (see
 # src/font.rs). The objc2 crates are already in the tree via the vendored winit, so
 # they pull in no new compiled crate; pinned to winit's 0.5/0.2 line to share its
-# runtime types (Retained, MainThreadMarker). core-text 20 matches the core-foundation
-# 0.9 / core-graphics 0.23 line wgpu's Metal backend already pulls in, so nothing is
-# duplicated; we only touch its high-level API (std types out), so no direct CF dep.
+# runtime types (Retained, MainThreadMarker). core-text 20 / core-foundation 0.9 match
+# the core-graphics 0.23 line wgpu's Metal backend already pulls in, so nothing is
+# duplicated. core-foundation is a direct dep for the glyph-fallback FFI
+# (CTFontCreateForString wants CFString/CFRange and the TCFType ref conversions).
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
 core-text = "20.1"
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = [

@@ -279,15 +279,18 @@ fn coretext_faces(family: &str) -> Option<ResolvedFaces> {
 /// DB (and reads a file) only once. Faces are read and leaked to `'static`, exactly as
 /// the family faces are.
 ///
-/// Linux resolves through fontconfig (a charset match). macOS/other platforms have no
-/// resolver yet, so `face_for` returns `None` there and the `.notdef` shows as before —
-/// a deliberate v1 scope (see the follow-up note on CoreText fallback + colour emoji).
+/// Linux resolves through fontconfig (a charset match, with emoji-presentation
+/// chars routed to the `emoji` generic family so they land on the color emoji
+/// font); macOS through CoreText (`CTFontCreateForString`, its glyph-substitution
+/// cascade), which hands emoji to Apple Color Emoji — the renderer's color path
+/// rasterizes whatever color form the resolved face carries. Other platforms have
+/// no resolver, so `face_for` returns `None` and the `.notdef` shows as before.
 pub struct SystemFallback {
     /// char → the face that covers it (`None` = looked up, nothing found: don't re-query).
     cache: HashMap<char, Option<FontRef<'static>>>,
     /// (file, face-index) → the leaked face, so two chars from the same fallback file
     /// share one `FontRef` instead of leaking the bytes twice.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     files: HashMap<(PathBuf, usize), Option<FontRef<'static>>>,
     #[cfg(target_os = "linux")]
     fc: Option<fontconfig::Fontconfig>,
@@ -303,7 +306,7 @@ impl SystemFallback {
     pub fn new() -> Self {
         SystemFallback {
             cache: HashMap::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             files: HashMap::new(),
             #[cfg(target_os = "linux")]
             fc: fontconfig::Fontconfig::new(),
@@ -330,7 +333,7 @@ impl SystemFallback {
     }
 
     /// Load the face at `key`, deduplicating repeat loads of the same file.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn load_dedup(&mut self, key: (PathBuf, usize)) -> Option<FontRef<'static>> {
         if let Some(hit) = self.files.get(&key) {
             return *hit;
@@ -375,7 +378,15 @@ impl SystemFallback {
         Some((path, idx))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Resolve a face covering `ch` (uncached) through CoreText, deduplicating the
+    /// loaded file — the macOS analogue of the fontconfig path.
+    #[cfg(target_os = "macos")]
+    fn resolve(&mut self, ch: char) -> Option<FontRef<'static>> {
+        let key = query_coretext_cover(ch)?;
+        self.load_dedup(key)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn resolve(&mut self, _ch: char) -> Option<FontRef<'static>> {
         None
     }
@@ -397,6 +408,53 @@ fn wants_emoji_presentation(ch: char) -> bool {
             | EmojiStatus::EmojiPresentationAndEmojiComponent
             | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
     )
+}
+
+/// The (file, face-index) of a font covering `ch`, via CoreText's glyph-substitution
+/// cascade (`CTFontCreateForString`): given a base font and a string, it returns the
+/// base when it covers the string, else a substitute font that does. We start from a
+/// monospace base (Menlo) and recover the resolved face's index within its file from
+/// its PostScript name, exactly as the family resolver does. The renderer re-checks
+/// coverage before drawing, so a non-covering result degrades to `.notdef`.
+#[cfg(target_os = "macos")]
+fn query_coretext_cover(ch: char) -> Option<(PathBuf, usize)> {
+    use core_foundation::base::{CFRange, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use core_text::font::{self, CTFont, CTFontRef};
+
+    // CoreText is already linked via the core-text crate; declare the one function it
+    // leaves unbound. Returns a +1 CTFontRef, or null when there is no substitute.
+    #[link(name = "CoreText", kind = "framework")]
+    unsafe extern "C" {
+        fn CTFontCreateForString(
+            current: CTFontRef,
+            string: CFStringRef,
+            range: CFRange,
+        ) -> CTFontRef;
+    }
+
+    // Symbols in CoreText's cascade are near-universally in a monospace or system
+    // font; Menlo ships on every macOS and makes a stable base to cascade from.
+    let base = font::new_from_name("Menlo", 14.0).ok()?;
+    let s = CFString::new(&ch.to_string());
+    let range = CFRange {
+        location: 0,
+        length: ch.len_utf16() as isize,
+    };
+    // Safety: `CTFontCreateForString` returns a +1 CTFontRef (or null); wrap it under
+    // the create rule so it is released, and treat null as "no substitute".
+    let substitute = unsafe {
+        let r = CTFontCreateForString(base.as_concrete_TypeRef(), s.as_concrete_TypeRef(), range);
+        if r.is_null() {
+            return None;
+        }
+        CTFont::wrap_under_create_rule(r)
+    };
+
+    let path = substitute.copy_descriptor().font_path()?;
+    let ps = substitute.postscript_name();
+    let idx = ghost_shaper::face_index_by_postscript(&std::fs::read(&path).ok()?, &ps)?;
+    Some((path, idx))
 }
 
 impl ghost_shaper::Fallback for SystemFallback {
@@ -495,6 +553,49 @@ mod tests {
             again.key.value(),
             "a repeat lookup must return the cached face, not re-resolve"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_fallback_finds_a_face_covering_a_symbol_outside_coding_fonts() {
+        use ghost_shaper::Fallback;
+        // ★ (U+2605) is absent from many coding fonts (Fira Code) but present in macOS
+        // system fonts. CoreText's CTFontCreateForString must return a face that
+        // ACTUALLY covers it — recovered to (file, index) and loaded — and the second
+        // lookup must hit the cache (the same face), not re-resolve.
+        let mut fb = SystemFallback::new();
+        let face = fb.face_for('★').expect("a system font should cover ★");
+        assert!(
+            ghost_shaper::covers(face, '★'),
+            "the resolved fallback face must actually have ★"
+        );
+        let again = fb.face_for('★').expect("cached lookup");
+        assert_eq!(
+            face.key.value(),
+            again.key.value(),
+            "a repeat lookup must return the cached face, not re-resolve"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_fallback_covers_common_terminal_symbols() {
+        use ghost_shaper::Fallback;
+        // The classes of glyph a coding font like Fira Code drops and that showed as
+        // tofu on macOS before CoreText fallback: arrows, box-drawing, block elements,
+        // and misc symbols. All are in stock macOS fonts (often Menlo itself), so each
+        // must resolve to a face that actually covers it.
+        let mut fb = SystemFallback::new();
+        for ch in ['→', '←', '↑', '↓', '─', '│', '┌', '█', '▀', '●', '⚠'] {
+            let face = fb
+                .face_for(ch)
+                .unwrap_or_else(|| panic!("no fallback face for U+{:04X}", ch as u32));
+            assert!(
+                ghost_shaper::covers(face, ch),
+                "fallback face for U+{:04X} must actually cover it",
+                ch as u32
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
