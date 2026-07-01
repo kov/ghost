@@ -90,6 +90,29 @@ impl Hasher for FxHasher {
 
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
+/// The glyph list swash produced for one styled run, shared cheaply across redraws.
+type ShapedRun = Rc<Vec<ShapedGlyph>>;
+/// Shaped-run cache: (stable font key, size bits) → (run text → shaped run). Nested
+/// so a hit probes the inner map by borrowed `&str`, allocating nothing.
+type ShapeCache = FastMap<(u64, u32), FastMap<String, ShapedRun>>;
+
+/// A stable identity for `font` across freshly-constructed `FontRef`s of the same
+/// face. swash mints a new `CacheKey` (a global atomic counter) on every `FontRef`
+/// construction, and callers rebuild their `FontRef` from the same embedded bytes
+/// each frame — so `font.key` changes every frame and is useless as a cross-frame
+/// cache key (it would make every run a shape-cache miss and re-shape the whole
+/// screen on every repaint). The font DATA (pointer + length) plus the face offset
+/// are stable for the same bytes, so derive the key from those. A spurious miss
+/// (identical bytes at a new address) is harmless; a wrong hit is impossible — two
+/// distinct live fonts never share an address and length.
+fn stable_font_key(font: FontRef) -> u64 {
+    let mut h = FxHasher::default();
+    h.write_usize(font.data.as_ptr() as usize);
+    h.write_usize(font.data.len());
+    h.write_u32(font.offset);
+    h.finish()
+}
+
 /// An RGBA8 image read back from the GPU, tightly packed (`width * 4` per row).
 pub struct Rendered {
     pub width: u32,
@@ -1043,13 +1066,20 @@ pub struct Renderer {
     format: wgpu::TextureFormat,
     /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
     cache: FastMap<(u16, u32, Synthesis), Option<Slot>>,
-    /// Shaped-run cache keyed by (font key, font size bits, run text). Shaping
-    /// dominates per-frame CPU, and a run's text is identical across redraws
-    /// (navigation, unchanged tiles), so caching it makes a repaint nearly free.
-    shape_cache: FastMap<(u64, u32, String), Rc<Vec<ShapedGlyph>>>,
+    /// Shaped-run cache keyed by (font key, font size bits) → (run text → shaped).
+    /// Shaping dominates per-frame CPU, and a run's text is identical across redraws
+    /// (navigation, unchanged tiles), so caching it makes a repaint nearly free. The
+    /// map is nested so a hit probes the inner map by borrowed `&str` and allocates
+    /// nothing — building an owned key just to look it up cost ~half a heavy raster.
+    shape_cache: ShapeCache,
     /// Count of actual shaping calls (cache misses) — never bumped on a hit. Lets
     /// a test prove a repaint of unchanged text re-shapes nothing.
     shape_misses: u32,
+    /// Count of owned `String` cache keys allocated to populate `shape_cache` — one
+    /// per miss. A hit must NOT allocate (it probes by borrowed `&str`), so a test
+    /// can prove that re-rasterizing already-seen text (every cache-cold re-blit of
+    /// an unchanged heavy session) allocates no probe keys.
+    shape_key_allocs: u32,
     // shelf-packing cursor into the atlas.
     pack_x: u32,
     pack_y: u32,
@@ -1427,6 +1457,7 @@ impl Renderer {
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
             shape_misses: 0,
+            shape_key_allocs: 0,
             bench_target: None,
             foreground_valid: false,
             blit_quad: None,
@@ -2206,26 +2237,37 @@ impl Renderer {
     /// is the dominant per-frame cost, and a run's text is identical across
     /// redraws, so the cache turns a repaint into a hash lookup + `Rc` clone.
     fn shape_cached(&mut self, font: FontRef, text: &str, size_px: f32) -> Rc<Vec<ShapedGlyph>> {
+        let outer = (stable_font_key(font), size_px.to_bits());
+        // Fast path: a hit probes the inner map by borrowed `&str`, allocating nothing.
+        if let Some(inner) = self.shape_cache.get(&outer)
+            && let Some(rc) = inner.get(text)
+        {
+            return Rc::clone(rc);
+        }
+        // Miss: shape once, then allocate the owned key exactly once to store it.
+        self.shape_misses += 1;
+        let shaped = Rc::new(ghost_shaper::shape(font, text, size_px));
+        let inner = self.shape_cache.entry(outer).or_default();
         // Bound long-term growth from scrollback churn; the working set (the
         // currently-visible runs) is tiny next to this, so we clear rarely.
-        if self.shape_cache.len() > 8192 {
-            self.shape_cache.clear();
+        if inner.len() > 8192 {
+            inner.clear();
         }
-        let key = (font.key.value(), size_px.to_bits(), text.to_string());
-        let mut missed = false;
-        let rc = Rc::clone(self.shape_cache.entry(key).or_insert_with(|| {
-            missed = true;
-            Rc::new(ghost_shaper::shape(font, text, size_px))
-        }));
-        if missed {
-            self.shape_misses += 1;
-        }
-        rc
+        self.shape_key_allocs += 1;
+        inner.insert(text.to_string(), Rc::clone(&shaped));
+        shaped
     }
 
     /// Total shaping calls (cache misses) — see [`Self::shape_misses`](Self::shape_misses).
     pub fn shape_misses(&self) -> u32 {
         self.shape_misses
+    }
+
+    /// Total owned cache-key `String`s allocated for `shape_cache` — see
+    /// [`Self::shape_key_allocs`](Self::shape_key_allocs). Equals the miss count; a
+    /// hit allocates nothing.
+    pub fn shape_key_allocs(&self) -> u32 {
+        self.shape_key_allocs
     }
 
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.

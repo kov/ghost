@@ -583,6 +583,129 @@ fn an_identical_repaint_reshapes_nothing() {
 }
 
 #[test]
+fn a_fresh_font_of_the_same_face_reuses_the_shape_cache() {
+    // The app rebuilds its `FontRef` from the same embedded bytes every frame, and
+    // swash mints a fresh `CacheKey` (a global atomic) on every construction. The
+    // shape cache must key on the font's stable *data* identity, not that ephemeral
+    // key — otherwise every frame re-shapes every run (the heavy `ls` re-raster),
+    // silently defeating the cache no matter how effective it looks in a test that
+    // happens to reuse one `FontRef`.
+    let text = "fn main() != ok { let x = 1; } => colorized ls here";
+    let build = || {
+        let mut vt = Vt::new(52, 4);
+        vt.feed_str(text);
+        std::rc::Rc::new(layout_frame(&vt, METRICS))
+    };
+    let scene = |frame: std::rc::Rc<ghost_render::Frame>| {
+        let mut s = Scene::new((52 * 9, 4 * 18));
+        s.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Tile(0),
+                session: 0,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 52.0 * 9.0,
+                    h: 4.0 * 18.0,
+                },
+                frame,
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        ));
+        s
+    };
+    let mut r = Renderer::headless(Theme::default());
+
+    // Frame 1: a freshly-built font shapes the runs.
+    let font1 = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let _ = r.render_offscreen_scene(&scene(build()), font1, 15.0);
+    let after_first = r.shape_misses();
+    assert!(after_first > 0, "the first paint shapes its runs");
+
+    // Frame 2: a DIFFERENT `FontRef` of the SAME face (distinct swash key) over a
+    // fresh frame `Rc` must re-shape nothing — the cache keys on the font's data.
+    let font2 = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    assert_ne!(
+        font1.key.value(),
+        font2.key.value(),
+        "swash mints a fresh key per construction (else the test proves nothing)"
+    );
+    let _ = r.render_offscreen_scene(&scene(build()), font2, 15.0);
+    assert_eq!(
+        r.shape_misses(),
+        after_first,
+        "a fresh FontRef of the same face must reuse the shape cache, re-shaping nothing"
+    );
+}
+
+#[test]
+fn re_rasterizing_seen_text_allocates_no_probe_keys() {
+    // Every dive-out rebuilds a tile's frame as a FRESH `Rc`, so the surface cache
+    // misses (not ptr-equal) and `build_instances` re-runs in full — the heavy
+    // re-raster the animation-warm path pays. Its run texts are already shaped, so
+    // that re-raster must not only re-shape nothing but also allocate no owned probe
+    // keys: the shape-cache lookup probes by borrowed `&str`. Allocating a `String`
+    // per run just to look it up was ~half the heavy raster's CPU.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+
+    // Enough distinct runs that the first raster does real shaping and keys them.
+    let text = "let mut xs = vec![1, 2, 3]; // ls -la /lib64 => many entries here";
+    let build = || {
+        let mut vt = Vt::new(64, 4);
+        vt.feed_str(text);
+        std::rc::Rc::new(layout_frame(&vt, METRICS))
+    };
+    let scene = |frame: std::rc::Rc<ghost_render::Frame>| {
+        let mut s = Scene::new((64 * 9, 4 * 18));
+        s.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Tile(0),
+                session: 0,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 64.0 * 9.0,
+                    h: 4.0 * 18.0,
+                },
+                frame,
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        ));
+        s
+    };
+
+    // First raster: shapes the runs and allocates one cache key per distinct run.
+    let _ = r.render_offscreen_scene(&scene(build()), font, 15.0);
+    let misses = r.shape_misses();
+    let allocs = r.shape_key_allocs();
+    assert!(
+        misses > 0 && allocs > 0,
+        "the first raster shapes its runs and keys them (misses={misses}, allocs={allocs})"
+    );
+
+    // A distinct `Rc` with identical text forces a surface-cache miss (not ptr-equal)
+    // and re-runs `build_instances`, but every run text is already in the shape cache.
+    let _ = r.render_offscreen_scene(&scene(build()), font, 15.0);
+    assert_eq!(
+        r.shape_misses(),
+        misses,
+        "re-rasterizing seen text re-shapes nothing"
+    );
+    assert_eq!(
+        r.shape_key_allocs(),
+        allocs,
+        "a shape-cache hit must allocate no owned probe key"
+    );
+}
+
+#[test]
 fn a_layer_transform_moves_and_scales_its_content() {
     // A red square at layer-space (0,0,20,20) in a layer scaled 2x and shifted by
     // (40,40) must be drawn on screen at (40,40)..(80,80) — the camera the
