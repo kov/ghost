@@ -1116,7 +1116,7 @@ pub struct Renderer {
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
     /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
-    cache: FastMap<(u16, u32, Synthesis), Option<Slot>>,
+    cache: FastMap<(u64, u16, u32, Synthesis), Option<Slot>>,
     /// Shaped-run cache keyed by (font key, font size bits) → (run text → shaped).
     /// Shaping dominates per-frame CPU, and a run's text is identical across redraws
     /// (navigation, unchanged tiles), so caching it makes a repaint nearly free. The
@@ -2428,7 +2428,11 @@ impl Renderer {
         size_px: f32,
         synth: Synthesis,
     ) -> Option<Slot> {
-        let key = (id, size_px.to_bits(), synth);
+        // Key on the FACE too (via its stable data identity): a family with a real
+        // bold/italic face shares glyph indices across its files, and a real face needs
+        // no synthesis, so regular 'X' and bold 'X' would otherwise collide on
+        // (id, size, synth) and alias to one bitmap. Mirrors the shape cache's key.
+        let key = (stable_font_key(font), id, size_px.to_bits(), synth);
         if let Some(slot) = self.cache.get(&key) {
             self.stats.glyph.hit();
             return *slot;
@@ -3729,6 +3733,7 @@ mod tests {
     use ghost_term::Vt;
 
     const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
+    const FIRA_BOLD: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Bold.ttf");
     const SIZE_PX: f32 = 15.0;
     const TM: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -3757,6 +3762,47 @@ mod tests {
 
     fn is_green(p: [u8; 4]) -> bool {
         p[0] < 0x20 && p[1] > 0x60 && p[2] < 0x20
+    }
+
+    #[test]
+    fn distinct_faces_do_not_alias_in_the_glyph_atlas() {
+        // Regression: the glyph atlas must be keyed per FACE, not just by
+        // (glyph_id, size, synthesis). A family with a REAL bold face (e.g. Fira
+        // Code) shares glyph *indices* between its regular and bold files, and a
+        // real bold face is used as-is (no synthesis) — so regular 'X' and bold 'X'
+        // land on the identical (id, size, Synthesis::default()) key. Without the
+        // face in the key they collide: whichever rasterizes first wins and poisons
+        // the other, so regular text renders bold for whichever glyphs the bold face
+        // happened to rasterize first (non-deterministic across runs). Two distinct
+        // faces at the same (id, size, synth) must occupy two distinct atlas slots.
+        let regular = ghost_shaper::font_from_bytes(FIRA).expect("regular");
+        let bold = ghost_shaper::font_from_bytes(FIRA_BOLD).expect("bold");
+        // One glyph index, resolved on the regular face and reused for both — this is
+        // exactly the shared-index case that collides. '8' has ink in both weights.
+        let id = ghost_shaper::glyph_id(regular, '8');
+        let synth = ghost_shaper::Synthesis::default();
+
+        let mut r = Renderer::headless(Theme::default());
+        let bold_slot = r.ensure_glyph(bold, id, SIZE_PX, synth).expect("bold '8'");
+        let reg_slot = r
+            .ensure_glyph(regular, id, SIZE_PX, synth)
+            .expect("regular '8'");
+
+        assert_ne!(
+            (bold_slot.ax, bold_slot.ay),
+            (reg_slot.ax, reg_slot.ay),
+            "regular and bold '8' aliased to one atlas slot — regular text will render bold"
+        );
+        // Two genuine rasterizations, and re-fetching a cached face still hits (per-face
+        // caching is intact, not defeated by the extra key field).
+        assert_eq!(r.cache_stats().glyph.misses, 2, "each face rasterizes once");
+        let hits = r.cache_stats().glyph.hits;
+        let _ = r.ensure_glyph(regular, id, SIZE_PX, synth);
+        assert_eq!(
+            r.cache_stats().glyph.hits,
+            hits + 1,
+            "a repeat fetch of the same face must be a cache hit"
+        );
     }
 
     #[test]
