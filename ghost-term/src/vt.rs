@@ -1,6 +1,6 @@
 use crate::graphics::{Image, Placement};
 use crate::line::Line;
-use crate::parser::{self, DecMode, Parser};
+use crate::parser::{self, DecMode, DynamicColor, Parser};
 use crate::terminal::{ClipboardSelection, Cursor, Terminal};
 
 /// The active mouse-reporting protocol (DEC private modes 1000/1002/1003),
@@ -109,6 +109,21 @@ impl Vt {
     /// Drain the decoded OSC 52 clipboard writes queued while feeding output.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
         self.terminal.take_clipboard_writes()
+    }
+
+    /// The app-set default foreground (OSC 10), if any.
+    pub fn dynamic_foreground(&self) -> Option<[u8; 3]> {
+        self.terminal.dynamic_color(DynamicColor::Foreground)
+    }
+
+    /// The app-set default background (OSC 11), if any.
+    pub fn dynamic_background(&self) -> Option<[u8; 3]> {
+        self.terminal.dynamic_color(DynamicColor::Background)
+    }
+
+    /// The app-set cursor color (OSC 12), if any.
+    pub fn dynamic_cursor_color(&self) -> Option<[u8; 3]> {
+        self.terminal.dynamic_color(DynamicColor::Cursor)
     }
 
     /// Absolute rows (same space as [`lines_scrolled_off`](Self::lines_scrolled_off))
@@ -878,6 +893,71 @@ mod tests {
         assert!(!vt.dump().contains("2026"), "dump leaked mode 2026");
         vt.feed_str("\x1bc");
         assert!(!vt.synchronized_output());
+    }
+
+    #[test]
+    fn osc_dynamic_colors_set_and_reset() {
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.dynamic_foreground(), None);
+        assert_eq!(vt.dynamic_background(), None);
+        assert_eq!(vt.dynamic_cursor_color(), None);
+
+        // rgb:/ # spec forms, BEL- or ST-terminated. rgb: components scale
+        // by digit count (X11); # forms are left-justified, high byte kept.
+        vt.feed_str("\x1b]10;rgb:ff/80/00\x07");
+        assert_eq!(vt.dynamic_foreground(), Some([0xff, 0x80, 0x00]));
+        vt.feed_str("\x1b]11;#102030\x1b\\");
+        assert_eq!(vt.dynamic_background(), Some([0x10, 0x20, 0x30]));
+        vt.feed_str("\x1b]12;rgb:aaaa/bbbb/cccc\x07");
+        assert_eq!(vt.dynamic_cursor_color(), Some([0xaa, 0xbb, 0xcc]));
+        vt.feed_str("\x1b]10;rgb:a/b/c\x07"); // 1-digit: v * 255/15
+        assert_eq!(vt.dynamic_foreground(), Some([0xaa, 0xbb, 0xcc]));
+        vt.feed_str("\x1b]10;#abc\x07"); // left-justified nibbles
+        assert_eq!(vt.dynamic_foreground(), Some([0xa0, 0xb0, 0xc0]));
+
+        // The query form is the host's to answer, not a set; unparseable
+        // specs are ignored.
+        vt.feed_str("\x1b]11;?\x07");
+        vt.feed_str("\x1b]11;bogus\x07");
+        assert_eq!(vt.dynamic_background(), Some([0x10, 0x20, 0x30]));
+
+        // OSC 110/111/112 reset each override to the theme default.
+        vt.feed_str("\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+        assert_eq!(vt.dynamic_foreground(), None);
+        assert_eq!(vt.dynamic_background(), None);
+        assert_eq!(vt.dynamic_cursor_color(), None);
+    }
+
+    #[test]
+    fn dynamic_colors_survive_a_dump_roundtrip() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]10;rgb:d8/db/e0\x07\x1b]11;#101012\x07\x1b]12;#ff0000\x07");
+
+        let mut vt2 = Vt::new(20, 5);
+        vt2.feed_str(&vt.dump());
+        assert_eq!(vt2.dynamic_foreground(), Some([0xd8, 0xdb, 0xe0]));
+        assert_eq!(vt2.dynamic_background(), Some([0x10, 0x10, 0x12]));
+        assert_eq!(vt2.dynamic_cursor_color(), Some([0xff, 0x00, 0x00]));
+
+        // RIS drops the overrides.
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.dynamic_foreground(), None);
+        assert_eq!(vt.dynamic_background(), None);
+        assert_eq!(vt.dynamic_cursor_color(), None);
+    }
+
+    #[test]
+    fn tracks_color_scheme_report_mode_2031() {
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.dec_mode_state(2031), Some(false));
+        vt.feed_str("\x1b[?2031h");
+        assert_eq!(vt.dec_mode_state(2031), Some(true));
+        assert!(
+            vt.dump().contains("\x1b[?2031h"),
+            "the subscription must survive a resync"
+        );
+        vt.feed_str("\x1b[?2031l");
+        assert_eq!(vt.dec_mode_state(2031), Some(false));
     }
 
     #[test]

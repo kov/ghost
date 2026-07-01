@@ -171,6 +171,17 @@ impl Screen {
         self.vt.take_clipboard_writes()
     }
 
+    /// The colors OSC 10/11/12 (and the `?996` color-scheme) queries answer
+    /// with: an app-set dynamic override (OSC 10/11/12 set forms) wins over
+    /// `theme`, the frontend's configured scheme.
+    pub fn effective_colors(&self, theme: crate::query::ThemeColors) -> crate::query::ThemeColors {
+        crate::query::ThemeColors {
+            fg: self.vt.dynamic_foreground().unwrap_or(theme.fg),
+            bg: self.vt.dynamic_background().unwrap_or(theme.bg),
+            cursor: self.vt.dynamic_cursor_color().unwrap_or(theme.cursor),
+        }
+    }
+
     /// Cursor position as 1-based `(col, row)` — the form a cursor-position
     /// report (CPR) carries. `avt` tracks the cursor 0-based.
     pub fn cursor(&self) -> (u16, u16) {

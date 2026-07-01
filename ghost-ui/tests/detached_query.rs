@@ -142,6 +142,39 @@ fn detached_session_answers_background_color_query() {
 }
 
 #[test]
+fn detached_session_answers_color_scheme_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "scheme-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The never-attached child asks dark-or-light (CSI ? 996 n, mode 2031's
+    // query form). Detached, the host answers from ghost's default scheme:
+    // dark, `CSI ? 997 ; 1 n`.
+    let sentinel = xdg.join("scheme-answered");
+    let script = format!(
+        "printf '\\033[?996n'; \
+         if IFS= read -r -s -d 'n' -t 2 reply; then case \"$reply\" in *'[?997;1'*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the color-scheme query"
+    );
+}
+
+#[test]
 fn detached_session_answers_xtversion_query() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

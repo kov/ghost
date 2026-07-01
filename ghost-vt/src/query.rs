@@ -48,6 +48,13 @@ pub enum Query {
     /// `OSC 11 ; ? ST` — the default background color; what vim/fzf/neovim
     /// theme detection rides on. Reply mirrors [`Query::ForegroundColor`].
     BackgroundColor,
+    /// `OSC 12 ; ? ST` — the cursor color. Reply mirrors
+    /// [`Query::ForegroundColor`].
+    CursorColor,
+    /// `CSI ? 996 n` — one-shot color-scheme request (contour's dark/light
+    /// extension, mode 2031's query form). Reply: `CSI ? 997 ; Ps n` with
+    /// Ps 1 = dark, 2 = light.
+    ColorScheme,
 }
 
 /// The default fg/bg an OSC 10/11 color query is answered with. The attached
@@ -59,6 +66,9 @@ pub enum Query {
 pub struct ThemeColors {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
+    /// Cursor color (OSC 12). Ghost paints the cursor with the theme
+    /// foreground, so that is the default.
+    pub cursor: [u8; 3],
 }
 
 impl Default for ThemeColors {
@@ -66,8 +76,19 @@ impl Default for ThemeColors {
         ThemeColors {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
+            cursor: [0xd8, 0xdb, 0xe0],
         }
     }
+}
+
+/// The `CSI ? 997 ; Ps n` color-scheme report for `colors` (Ps 1 = dark,
+/// 2 = light, by the background's relative luminance) — both the `?996`
+/// query's reply and the unsolicited mode-2031 notification.
+pub fn color_scheme_report(colors: &ThemeColors) -> Vec<u8> {
+    let [r, g, b] = colors.bg;
+    let luma = 2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b);
+    let ps = if luma < 128 * 10_000 { 1 } else { 2 };
+    format!("\x1b[?997;{ps}n").into_bytes()
 }
 
 /// Everything [`Query::reply`] can draw on, threaded identically by the
@@ -126,6 +147,10 @@ impl Query {
             Query::BackgroundColor => {
                 format!("\x1b]11;{}\x1b\\", xterm_rgb(ctx.colors.bg)).into_bytes()
             }
+            Query::CursorColor => {
+                format!("\x1b]12;{}\x1b\\", xterm_rgb(ctx.colors.cursor)).into_bytes()
+            }
+            Query::ColorScheme => color_scheme_report(&ctx.colors),
         }
     }
 }
@@ -197,6 +222,7 @@ impl QueryScanner {
         match self.osc.as_slice() {
             b"10;?" => Some(Query::ForegroundColor),
             b"11;?" => Some(Query::BackgroundColor),
+            b"12;?" => Some(Query::CursorColor),
             _ => None,
         }
     }
@@ -293,10 +319,12 @@ impl QueryScanner {
 /// Only the query sequences we answer return `Some`.
 fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
     match final_byte {
-        // DSR — device status report. The `?`-private DEC variants are left alone.
+        // DSR — device status report. Of the `?`-private DEC variants only the
+        // color-scheme request (996) is ours to answer.
         b'n' => match params {
             b"6" => Some(Query::CursorPosition),
             b"5" => Some(Query::DeviceStatus),
+            b"?996" => Some(Query::ColorScheme),
             _ => None,
         },
         // DA — device attributes. `>` marks the secondary request.
@@ -423,9 +451,10 @@ mod tests {
     fn recognizes_osc_color_queries() {
         assert_eq!(scan_all(b"\x1b]10;?\x07"), [Query::ForegroundColor]);
         assert_eq!(scan_all(b"\x1b]11;?\x1b\\"), [Query::BackgroundColor]);
-        // Set forms and unrelated OSCs are not queries.
+        assert_eq!(scan_all(b"\x1b]12;?\x07"), [Query::CursorColor]);
+        // Set/reset forms and unrelated OSCs are not queries.
         assert!(scan_all(b"\x1b]11;#101012\x07").is_empty());
-        assert!(scan_all(b"\x1b]12;?\x07").is_empty()); // cursor color: not yet
+        assert!(scan_all(b"\x1b]112\x07").is_empty());
         assert!(scan_all(b"\x1b]0;title\x07").is_empty());
         // A long payload overflows the small buffer and is never classified,
         // even if its prefix looks like a query.
@@ -479,6 +508,7 @@ mod tests {
             colors: ThemeColors {
                 fg: [0xd8, 0xdb, 0xe0],
                 bg: [0x10, 0x10, 0x12],
+                ..ThemeColors::default()
             },
             ..ctx()
         };
@@ -490,6 +520,37 @@ mod tests {
             Query::BackgroundColor.reply(&themed),
             b"\x1b]11;rgb:1010/1010/1212\x1b\\"
         );
+    }
+
+    #[test]
+    fn cursor_color_reply_uses_the_theme_cursor() {
+        let themed = ReplyCtx {
+            colors: ThemeColors {
+                cursor: [0xff, 0x00, 0x00],
+                ..ThemeColors::default()
+            },
+            ..ctx()
+        };
+        assert_eq!(
+            Query::CursorColor.reply(&themed),
+            b"\x1b]12;rgb:ffff/0000/0000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn color_scheme_query_reports_dark_or_light() {
+        assert_eq!(scan_all(b"\x1b[?996n"), [Query::ColorScheme]);
+        // Ghost's default scheme is dark…
+        assert_eq!(Query::ColorScheme.reply(&ctx()), b"\x1b[?997;1n");
+        // …a white background reports light.
+        let light = ReplyCtx {
+            colors: ThemeColors {
+                bg: [0xff, 0xff, 0xff],
+                ..ThemeColors::default()
+            },
+            ..ctx()
+        };
+        assert_eq!(Query::ColorScheme.reply(&light), b"\x1b[?997;2n");
     }
 
     #[test]

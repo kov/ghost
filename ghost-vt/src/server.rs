@@ -480,9 +480,10 @@ fn host_main(
                             size: screen.dimensions(),
                             kitty_flags: screen.kitty_keyboard_flags(),
                             // Detached, nobody knows the live scheme; answer
-                            // with ghost's default until last-attached colors
-                            // are persisted per session.
-                            colors: crate::query::ThemeColors::default(),
+                            // with ghost's default (under any app-set dynamic
+                            // overrides) until last-attached colors are
+                            // persisted per session.
+                            colors: screen.effective_colors(crate::query::ThemeColors::default()),
                             mode_state: &mode_state,
                         };
                         let mut reply = Vec::new();

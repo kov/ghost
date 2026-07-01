@@ -124,6 +124,9 @@ pub enum Function {
     /// OSC 52 clipboard write: the raw `Pc` selection list and the base64
     /// `Pd` payload, decoded and dispatched by the terminal.
     SetClipboard(String, String),
+    /// OSC 10/11/12 dynamic-color set (spec already parsed to 8-bit RGB) or
+    /// the matching OSC 110/111/112 reset (`None`) back to the theme default.
+    SetDynamicColor(DynamicColor, Option<[u8; 3]>),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
     /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
     SetCursorStyle(u8),
@@ -172,6 +175,7 @@ pub enum DecMode {
     SaveCursorAltScreenBuffer = 1049, // xterm
     BracketedPaste = 2004,            // wrap pastes in ESC[200~ / ESC[201~
     SynchronizedOutput = 2026,        // atomic frames: hold presentation between h..l
+    ColorSchemeReport = 2031,         // unsolicited CSI ?997;Ps n on theme change
 }
 
 impl DecMode {
@@ -188,8 +192,19 @@ impl DecMode {
                 | MouseSgr
                 | BracketedPaste
                 | SynchronizedOutput
+                | ColorSchemeReport
         )
     }
+}
+
+/// The three xterm "dynamic colors" an application can override at runtime:
+/// default text foreground (OSC 10), default background (OSC 11), and the
+/// cursor color (OSC 12).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DynamicColor {
+    Foreground,
+    Background,
+    Cursor,
 }
 
 /// The OSC 133 semantic marks (FinalTerm shell integration): where a prompt
@@ -1064,6 +1079,24 @@ impl Parser {
                 (payload.len() <= MAX_CLIPBOARD_B64)
                     .then(|| Function::SetClipboard(selection.to_string(), payload.to_string()))
             }
+            // OSC 10/11/12 — set a dynamic color. Only the first spec is
+            // taken (xterm's consecutive-code form is rare); the "?" query
+            // form is the host's to answer, and specs we can't parse
+            // (named colors) are dropped whole.
+            "10" | "11" | "12" => {
+                let target = match ps {
+                    "10" => DynamicColor::Foreground,
+                    "11" => DynamicColor::Background,
+                    _ => DynamicColor::Cursor,
+                };
+                let spec = rest.split(';').next().unwrap_or("");
+                let rgb = parse_color_spec(spec)?;
+                Some(Function::SetDynamicColor(target, Some(rgb)))
+            }
+            // OSC 110/111/112 — reset a dynamic color to the theme default.
+            "110" => Some(Function::SetDynamicColor(DynamicColor::Foreground, None)),
+            "111" => Some(Function::SetDynamicColor(DynamicColor::Background, None)),
+            "112" => Some(Function::SetDynamicColor(DynamicColor::Cursor, None)),
             // OSC 133 — FinalTerm shell integration. The letter picks the
             // mark; anything after a `;` is extension parameters (kitty's
             // `k=s` and friends), accepted and dropped — except D's first
@@ -1298,6 +1331,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     SaveCursorAltScreenBuffer => 1049,
                     BracketedPaste => 2004,
                     SynchronizedOutput => 2026,
+                    ColorSchemeReport => 2031,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1326,6 +1360,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     SaveCursorAltScreenBuffer => 1049,
                     BracketedPaste => 2004,
                     SynchronizedOutput => 2026,
+                    ColorSchemeReport => 2031,
                 })
                 .map(|param| param.to_string())
                 .collect::<Vec<_>>();
@@ -1449,6 +1484,21 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push(';');
             seq.push_str(payload);
             seq.push('\u{07}');
+        }
+
+        SetDynamicColor(target, rgb) => {
+            let code = match target {
+                DynamicColor::Foreground => 10,
+                DynamicColor::Background => 11,
+                DynamicColor::Cursor => 12,
+            };
+            match rgb {
+                Some([r, g, b]) => {
+                    seq.push_str(&format!("\u{1b}]{code};rgb:{r:02x}/{g:02x}/{b:02x}\u{7}"));
+                }
+                // Resets are OSC 110/111/112.
+                None => seq.push_str(&format!("\u{1b}]1{code}\u{7}")),
+            }
         }
 
         PromptMark(mark) => {
@@ -1854,8 +1904,47 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         1049 => Some(SaveCursorAltScreenBuffer),
         2004 => Some(BracketedPaste),
         2026 => Some(SynchronizedOutput),
+        2031 => Some(ColorSchemeReport),
         _ => None,
     }
+}
+
+/// Parse an XParseColor-style color spec to 8-bit RGB. `rgb:R/G/B` takes 1–4
+/// hex digits per component, scaled by digit count; `#…` takes 3/6/9/12
+/// digits, left-justified with the high byte kept (X11 semantics). Named
+/// colors are not supported.
+fn parse_color_spec(spec: &str) -> Option<[u8; 3]> {
+    fn scaled(part: &str) -> Option<u8> {
+        if part.is_empty() || part.len() > 4 {
+            return None;
+        }
+        let v = u32::from_str_radix(part, 16).ok()?;
+        let max = (1u32 << (4 * part.len() as u32)) - 1;
+        Some(((v * 255 + max / 2) / max) as u8)
+    }
+
+    if let Some(rest) = spec.strip_prefix("rgb:") {
+        let mut parts = rest.split('/');
+        let r = scaled(parts.next()?)?;
+        let g = scaled(parts.next()?)?;
+        let b = scaled(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some([r, g, b]);
+    }
+
+    let hex = spec.strip_prefix('#')?;
+    let n = hex.len() / 3;
+    if hex.len() != n * 3 || !(1..=4).contains(&n) {
+        return None;
+    }
+    let mut out = [0u8; 3];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let v = u32::from_str_radix(&hex[i * n..(i + 1) * n], 16).ok()?;
+        *byte = ((v << (16 - 4 * n as u32)) >> 8) as u8;
+    }
+    Some(out)
 }
 
 /// Upper bound on an accepted OSC 8 URI. Generous (browsers cap around 2k;

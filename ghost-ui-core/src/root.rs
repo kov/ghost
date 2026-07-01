@@ -340,16 +340,18 @@ impl RootModel {
     }
 
     /// Set the scheme's default fg/bg (OSC 10/11 color-query replies) on every
-    /// model this root holds now or creates later.
-    pub fn set_theme(&mut self, theme: ThemeColors) {
+    /// model this root holds now or creates later. Returns the mode-2031
+    /// dark/light notifications a real change owes subscribed sessions.
+    pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
         self.theme = theme;
-        match &mut self.mode {
+        let mut cmds = match &mut self.mode {
             Mode::Single(m) => m.set_theme(theme),
             Mode::Fleet(f) => f.set_theme(theme),
-        }
+        };
         for m in self.warm.values_mut() {
-            m.set_theme(theme);
+            cmds.extend(m.set_theme(theme));
         }
+        cmds
     }
 
     /// The fleet's per-tile preview-frame cache stats, if a fleet is present (`None`

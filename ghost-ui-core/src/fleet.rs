@@ -310,12 +310,15 @@ impl FleetModel {
     }
 
     /// Set the scheme's default fg/bg (for OSC 10/11 color-query replies) on
-    /// every tile model, current and future.
-    pub fn set_theme(&mut self, theme: ThemeColors) {
+    /// every tile model, current and future. Returns the mode-2031 dark/light
+    /// notifications a real change owes subscribed sessions.
+    pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
         self.theme = theme;
+        let mut cmds = Vec::new();
         for tile in &mut self.tiles {
-            tile.model.set_theme(theme);
+            cmds.extend(tile.model.set_theme(theme));
         }
+        cmds
     }
 
     /// Physical cell metrics: the base metrics scaled by the device scale factor.

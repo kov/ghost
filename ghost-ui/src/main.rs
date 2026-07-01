@@ -689,11 +689,13 @@ impl Graphics {
 }
 
 /// The scheme's default fg/bg handed to the models, so apps that query their
-/// terminal colors (OSC 10/11 — vim, fzf) see the configured theme.
+/// terminal colors (OSC 10/11/12 — vim, fzf) see the configured theme. Ghost
+/// paints the cursor with the theme foreground, so that is its query color.
 fn theme_colors(theme: &ghost_renderer::Theme) -> ghost_ui_core::ThemeColors {
     ghost_ui_core::ThemeColors {
         fg: theme.fg,
         bg: theme.bg,
+        cursor: theme.fg,
     }
 }
 

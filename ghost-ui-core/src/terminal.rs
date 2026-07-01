@@ -250,10 +250,17 @@ impl TerminalModel {
     }
 
     /// Set the scheme's default fg/bg reported to apps that query them
-    /// (OSC 10/11). The theme is fixed at startup today, so this is called
-    /// once per model, right after construction.
-    pub fn set_theme(&mut self, theme: ThemeColors) {
+    /// (OSC 10/11). Called once per model right after construction; on a real
+    /// theme *change*, sessions subscribed to mode 2031 get the unsolicited
+    /// `CSI ? 997 ; Ps n` dark/light notification.
+    pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
+        let changed = theme != self.theme;
         self.theme = theme;
+        if changed && self.screen.vt().dec_mode_state(2031) == Some(true) {
+            let colors = self.screen.effective_colors(self.theme);
+            return self.send(ghost_vt::query::color_scheme_report(&colors));
+        }
+        Vec::new()
     }
 
     /// The [`TermDamage`] to stamp on this session's scene item: `All` on the first
@@ -770,7 +777,7 @@ impl TerminalModel {
                 cursor: screen.cursor(),
                 size: screen.dimensions(),
                 kitty_flags: screen.kitty_keyboard_flags(),
-                colors: self.theme,
+                colors: screen.effective_colors(self.theme),
                 mode_state: &mode_state,
             };
             let replies = query_replies(&mut self.scanner, bytes, &ctx);
@@ -3014,6 +3021,7 @@ mod tests {
         m.set_theme(ThemeColors {
             fg: [0x01, 0x02, 0x03],
             bg: [0x0a, 0x0b, 0x0c],
+            ..ThemeColors::default()
         });
         let cmds = m.update(UiEvent::SessionData {
             name: "alpha".to_string(),
@@ -3027,6 +3035,69 @@ mod tests {
             )),
             "no themed color reply: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn color_replies_prefer_app_set_dynamic_colors() {
+        let mut m = model();
+        // The app overrides the background (OSC 11 set), then queries it and
+        // the cursor color back in the same feed — replies must reflect
+        // post-feed state: the override for bg, the theme default for cursor.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]11;#204060\x07\x1b]11;?\x07\x1b]12;?\x07".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent(
+                "alpha",
+                b"\x1b]11;rgb:2020/4040/6060\x1b\\\x1b]12;rgb:d8d8/dbdb/e0e0\x1b\\"
+            )),
+            "dynamic color not preferred: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn color_scheme_query_answers_from_the_live_theme() {
+        let mut m = model();
+        // Ghost's default theme is dark.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?996n".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[?997;1n")),
+            "no color-scheme reply: {cmds:?}"
+        );
+        // An app-set light background flips the answer.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]11;#ffffff\x07\x1b[?996n".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[?997;2n")),
+            "no light color-scheme reply: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn theme_changes_notify_mode_2031_subscribers() {
+        const LIGHT: ThemeColors = ThemeColors {
+            fg: [0x10, 0x10, 0x12],
+            bg: [0xff, 0xff, 0xff],
+            cursor: [0x10, 0x10, 0x12],
+        };
+        let mut m = model();
+        // Nobody subscribed: a theme change stays silent.
+        assert!(m.set_theme(LIGHT).is_empty());
+        feed(&mut m, b"\x1b[?2031h");
+        // Subscribed: flipping back to the dark default reports dark (1).
+        let cmds = m.set_theme(ThemeColors::default());
+        assert_eq!(cmds, [sent("alpha", b"\x1b[?997;1n")]);
+        // Re-setting the same theme is not a change.
+        assert!(m.set_theme(ThemeColors::default()).is_empty());
     }
 
     #[test]

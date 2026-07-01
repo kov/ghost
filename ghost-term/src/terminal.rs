@@ -10,8 +10,8 @@ use crate::graphics::{GraphicsState, Image, Placement};
 use crate::line::Line;
 use crate::links::Links;
 use crate::parser::{
-    AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, EdScope, ElScope, Function, SgrOp, SgrOps,
-    TbcScope, XtwinopsOp,
+    AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function, SgrOp,
+    SgrOps, TbcScope, XtwinopsOp,
 };
 use crate::pen::{Intensity, Pen};
 use crate::tabs::Tabs;
@@ -94,6 +94,10 @@ pub struct Terminal {
     command_running: bool,
     /// The exit code the last OSC 133;D reported, if any.
     last_exit: Option<i32>,
+    /// OSC 10/11/12 dynamic-color overrides, indexed by [`DynamicColor`]:
+    /// default foreground, default background, cursor color. `None` = the
+    /// frontend's theme default applies.
+    dynamic_colors: [Option<[u8; 3]>; 3],
 }
 
 /// Cap on retained prompt marks; the oldest fall off first (they are also the
@@ -198,6 +202,7 @@ impl Terminal {
             prompt_marks: VecDeque::new(),
             command_running: false,
             last_exit: None,
+            dynamic_colors: [None; 3],
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -625,6 +630,10 @@ impl Terminal {
                 }
             }
 
+            SetDynamicColor(target, rgb) => {
+                self.dynamic_colors[target as usize] = rgb;
+            }
+
             SetClipboard(selection, payload) => {
                 // The "?" query form is deliberately unanswered: replying
                 // would hand any program running in any session the user's
@@ -1000,6 +1009,7 @@ impl Terminal {
         self.prompt_marks.clear();
         self.command_running = false;
         self.last_exit = None;
+        self.dynamic_colors = [None; 3];
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -1103,6 +1113,12 @@ impl Terminal {
     /// The attached frontend applies them; the detached host discards them.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
         mem::take(&mut self.clipboard_writes)
+    }
+
+    /// The OSC 10/11/12 dynamic-color override for `target`, if an app set
+    /// one (`None` = the frontend's theme default applies).
+    pub fn dynamic_color(&self, target: DynamicColor) -> Option<[u8; 3]> {
+        self.dynamic_colors[target as usize]
     }
 
     /// Absolute rows (same space as [`lines_scrolled_off`]) of OSC 133;A
@@ -2155,6 +2171,20 @@ impl Terminal {
         // 16. restore the window title (OSC 0/2).
         if !self.title.is_empty() {
             funs.push(Function::SetTitle(self.title.clone()));
+        }
+
+        // 17. restore dynamic-color overrides (OSC 10/11/12).
+        for (i, target) in [
+            DynamicColor::Foreground,
+            DynamicColor::Background,
+            DynamicColor::Cursor,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(rgb) = self.dynamic_colors[i] {
+                funs.push(Function::SetDynamicColor(target, Some(rgb)));
+            }
         }
 
         funs
