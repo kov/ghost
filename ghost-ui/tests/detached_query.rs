@@ -187,6 +187,18 @@ fn detached_color_replies_use_the_last_attached_theme() {
             cursor: [0xd0, 0xd0, 0xd0],
         })
         .expect("report_theme failed");
+        // Stay connected until the resync repaint arrives. Dropping straight
+        // away races the host: if its first read catches only the Resize, the
+        // resync flush hits our already-closed socket and the host discards
+        // the connection with the Theme frame still unread in its buffer.
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || s
+                .pump()
+                .map(|p| !p.output.is_empty())
+                .unwrap_or(false)),
+            "resync repaint never arrived"
+        );
     }
     std::fs::write(&marker, b"").unwrap();
 
