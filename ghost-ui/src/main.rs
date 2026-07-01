@@ -1218,6 +1218,15 @@ impl ApplicationHandler for App {
                             ) {
                                 eprintln!("{}", summary.report());
                             }
+                            // Stream bench: accumulate this bulk-output frame; exit when
+                            // the run is complete (a no-op outside `GHOST_BENCH=stream`).
+                            if self
+                                .bench
+                                .as_mut()
+                                .is_some_and(|h| h.record_stream_present(build, present))
+                            {
+                                event_loop.exit();
+                            }
                         }
                     }
                 }

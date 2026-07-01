@@ -1,12 +1,15 @@
 //! Frame-pacing bench harness — drives the **real** app through a scripted
 //! animation so the pacing can be measured on the actual render+present path (with
 //! [`framestats`](crate::framestats)), instead of a separate offscreen
-//! reimplementation of the frame loop. Two scripts:
+//! reimplementation of the frame loop. Three scripts:
 //!
 //! - `GHOST_BENCH=dive` — repeated single↔fleet dives (F9 out, tile-select in).
 //! - `GHOST_BENCH=slide` — repeated Ctrl-Tab cycles between the window's attached
 //!   sessions (the `RootModel` slide). The same setup adopts every session into one
 //!   window, so Ctrl-Tab has somewhere to go.
+//! - `GHOST_BENCH=stream` — continuous bulk output to the foreground (a fresh
+//!   screenful per turn), measuring the full-window redraw + present path (the
+//!   `cat bigfile` workload), reported as build/present percentiles over a run.
 //!
 //! It supplies synthetic input only: a fixed [`SessionInfo`] list (so the fleet
 //! populates without a running host — `Cmd::ListSessions` is answered from here)
@@ -34,6 +37,9 @@ enum Bench {
     Dive,
     /// Repeated Ctrl-Tab cycles between the window's attached sessions.
     Slide,
+    /// Continuous bulk output to the foreground (a screenful per turn), measuring the
+    /// full-window redraw + present path — the `cat bigfile` workload.
+    Stream,
 }
 
 /// The F9 key event that toggles single↔fleet (a dive).
@@ -64,16 +70,21 @@ fn ctrl_tab() -> UiEvent {
 /// of colorized `ls` output vs. plain text. It changes NOTHING the compositor renders
 /// (the surface is cached and blitted the same way); it only stresses per-frame content
 /// handling, so it isolates whether animation cost is content-INDEPENDENT as intended.
-fn dense_block() -> Vec<u8> {
+/// `tick` shifts the colour ramp and glyph pattern so consecutive blocks render a
+/// *different* screenful — otherwise the deterministic block leaves the visible
+/// screen byte-identical after each feed and the damage layer (correctly) skips the
+/// present. A moving `tick` mimics `cat bigfile` scrolling genuinely-new content in,
+/// which is the full-window-redraw workload the stream bench exists to measure.
+fn dense_block(tick: usize) -> Vec<u8> {
     let heavy = std::env::var_os("GHOST_BENCH_HEAVY").is_some();
     let mut s = String::new();
     for row in 0..200usize {
-        s.push_str(&format!("\x1b[38;5;{}m", 16 + (row % 200)));
+        s.push_str(&format!("\x1b[38;5;{}m", 16 + ((row + tick) % 200)));
         for col in 0..220usize {
             if heavy && col % 2 == 0 {
-                s.push_str(&format!("\x1b[38;5;{}m", 16 + ((row + col) % 200)));
+                s.push_str(&format!("\x1b[38;5;{}m", 16 + ((row + col + tick) % 200)));
             }
-            s.push(char::from(b'!' + ((row * 7 + col * 3) % 90) as u8));
+            s.push(char::from(b'!' + ((row * 7 + col * 3 + tick) % 90) as u8));
         }
         s.push_str("\r\n");
     }
@@ -108,20 +119,30 @@ pub struct Harness {
     /// Earliest clock (ms, the app's monotonic `now_ms`) at which the next animation
     /// may fire; gates the `GAP_MS` spacing between them.
     next_at_ms: Option<u64>,
+    /// Stream mode: presented-frame samples `(build_ms, present_ms)`, and how many
+    /// leading (cold-cache) frames to discard before measuring.
+    stream_samples: Vec<(f32, f32)>,
+    stream_warmup_left: usize,
+    stream_measure_left: usize,
+    /// Monotonic feed counter for stream mode; shifts each `dense_block` so the
+    /// screen genuinely changes frame-to-frame (see [`dense_block`]).
+    stream_tick: usize,
 }
 
 impl Harness {
-    /// Build from the environment, or `None` unless `GHOST_BENCH` is `dive`/`slide`.
+    /// Build from the environment, or `None` unless `GHOST_BENCH` is
+    /// `dive`/`slide`/`stream`.
     pub fn from_env() -> Option<Self> {
         let mode = match std::env::var("GHOST_BENCH").ok().as_deref() {
             Some("dive") => Bench::Dive,
             Some("slide") => Bench::Slide,
+            Some("stream") => Bench::Stream,
             _ => return None,
         };
         // A slide needs at least two sessions to have somewhere to cycle to.
         let floor = match mode {
             Bench::Slide => 2,
-            Bench::Dive => 1,
+            Bench::Dive | Bench::Stream => 1,
         };
         let n = env_usize("GHOST_BENCH_SESSIONS", 4).clamp(floor, 64);
         let cycles = env_usize("GHOST_BENCH_CYCLES", env_usize("GHOST_BENCH_DIVES", 4)).max(1);
@@ -130,11 +151,22 @@ impl Harness {
         let label = match mode {
             Bench::Dive => "dive",
             Bench::Slide => "slide",
+            Bench::Stream => "stream",
         };
-        eprintln!(
-            "ghost bench: {label}, {n} sessions, {cycles} cycles (warm-up first); \
-             set GHOST_FRAME_STATS=1 for per-animation drop summaries"
-        );
+        // Stream measures presented frames, not cycles; default to a longer run.
+        let stream_measure = env_usize("GHOST_BENCH_FRAMES", 240).max(1);
+        let stream_warmup = env_usize("GHOST_BENCH_WARMUP", 30);
+        if mode == Bench::Stream {
+            eprintln!(
+                "ghost bench: stream, {stream_measure} frames ({stream_warmup} warm-up \
+                 discarded); GHOST_BENCH_HEAVY recolours for run-density"
+            );
+        } else {
+            eprintln!(
+                "ghost bench: {label}, {n} sessions, {cycles} cycles (warm-up first); \
+                 set GHOST_FRAME_STATS=1 for per-animation drop summaries"
+            );
+        }
         Some(Self {
             mode,
             names,
@@ -142,6 +174,10 @@ impl Harness {
             cycles_left: cycles,
             phase: Phase::Single,
             next_at_ms: None,
+            stream_samples: Vec::new(),
+            stream_warmup_left: stream_warmup,
+            stream_measure_left: stream_measure,
+            stream_tick: 0,
         })
     }
 
@@ -174,7 +210,7 @@ impl Harness {
             evs.push(UiEvent::AdoptSession(n.clone()));
             evs.push(UiEvent::SessionData {
                 name: n.clone(),
-                bytes: dense_block(),
+                bytes: dense_block(0),
                 ended: false,
             });
         }
@@ -187,6 +223,17 @@ impl Harness {
     /// window is mid-animation; fires the next animation only once the previous one
     /// has settled and `GAP_MS` has elapsed.
     pub fn step(&mut self, now_ms: u64, animating: bool) -> Vec<Action> {
+        // Stream feeds a fresh screenful every turn (no animation gate, no GAP) so each
+        // present is a full bulk-output redraw; collection + exit are driven by
+        // `record_stream_present` from the present path.
+        if self.mode == Bench::Stream {
+            self.stream_tick += 1;
+            return vec![Action::Dispatch(UiEvent::SessionData {
+                name: self.target.clone(),
+                bytes: dense_block(self.stream_tick),
+                ended: false,
+            })];
+        }
         if animating {
             return Vec::new(); // let the current animation finish
         }
@@ -198,7 +245,67 @@ impl Harness {
         match self.mode {
             Bench::Dive => self.step_dive(),
             Bench::Slide => self.step_slide(),
+            Bench::Stream => unreachable!("stream handled above"),
         }
+    }
+
+    /// Record one presented bulk-output frame (stream mode only). Discards the leading
+    /// warm-up frames, accumulates the rest, and returns `true` — after printing the
+    /// summary — once the run is complete, so the caller exits. A no-op otherwise.
+    pub fn record_stream_present(
+        &mut self,
+        build: std::time::Duration,
+        present: std::time::Duration,
+    ) -> bool {
+        if self.mode != Bench::Stream {
+            return false;
+        }
+        if self.stream_warmup_left > 0 {
+            self.stream_warmup_left -= 1;
+            return false;
+        }
+        if self.stream_measure_left == 0 {
+            return false;
+        }
+        self.stream_samples
+            .push((build.as_secs_f32() * 1000.0, present.as_secs_f32() * 1000.0));
+        self.stream_measure_left -= 1;
+        if self.stream_measure_left == 0 {
+            self.print_stream_summary();
+            return true;
+        }
+        false
+    }
+
+    fn print_stream_summary(&self) {
+        let pct = |mut v: Vec<f32>, p: f32| -> f32 {
+            if v.is_empty() {
+                return 0.0;
+            }
+            v.sort_by(f32::total_cmp);
+            v[((v.len() as f32 * p) as usize).min(v.len() - 1)]
+        };
+        let mean = |v: &[f32]| -> f32 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
+        let builds: Vec<f32> = self.stream_samples.iter().map(|s| s.0).collect();
+        let presents: Vec<f32> = self.stream_samples.iter().map(|s| s.1).collect();
+        eprintln!(
+            "ghost bench stream: {} frames | build avg {:.2} p50 {:.2} p90 {:.2} worst {:.2} ms \
+             | present avg {:.2} p90 {:.2} worst {:.2} ms",
+            self.stream_samples.len(),
+            mean(&builds),
+            pct(builds.clone(), 0.5),
+            pct(builds.clone(), 0.9),
+            builds.iter().copied().fold(0.0, f32::max),
+            mean(&presents),
+            pct(presents.clone(), 0.9),
+            presents.iter().copied().fold(0.0, f32::max),
+        );
     }
 
     /// One dive step: out to the fleet, then in to the target tile, counting a cycle
