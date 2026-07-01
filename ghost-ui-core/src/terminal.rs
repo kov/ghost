@@ -582,7 +582,12 @@ impl TerminalModel {
         let mut cmds = Vec::new();
         if !bytes.is_empty() {
             let before = self.screen.vt().lines_scrolled_off();
-            self.screen.feed(bytes);
+            // `Screen::feed` reports the viewport rows this feed changed; an empty
+            // slice means nothing on screen moved (a mode set, a query that only
+            // produced a reply, an incomplete UTF-8 tail). That is the "backing
+            // buffer modified since last composition" signal — gate the repaint on
+            // it so a no-op feed doesn't drive a present.
+            let viewport_changed = !self.screen.feed(bytes).is_empty();
             // Keep a scrolled-up view pinned to its content: advance the offset by
             // the GROSS lines that scrolled off the top this feed. That count
             // survives scrollback trimming (unlike the net scrollback_len delta,
@@ -616,18 +621,27 @@ impl TerminalModel {
             // At the live bottom, new output replaces the viewport, so a
             // viewport-relative selection no longer maps — drop it (unless a drag
             // is live). While scrolled back, stay-put keeps the same content on
-            // screen, so the selection stays valid and is preserved.
+            // screen, so the selection stays valid and is preserved. Dropping a
+            // visible highlight is itself a repaint even if no row's text changed.
+            let had_selection = self.selection.is_some();
             if self.held.is_none() && self.scroll_offset == 0 {
                 self.selection = None;
                 self.sel_anchor = None;
             }
+            let selection_dropped = had_selection && self.selection.is_none();
             // Reflect an OSC 0/2 window-title change to the shell, once per change.
             if self.screen.title() != self.last_title.as_str() {
                 self.last_title = self.screen.title().to_string();
                 cmds.push(Cmd::SetTitle(self.last_title.clone()));
             }
+            // A new image may be a direct placement the row-damage hint doesn't
+            // cover, so upload count is its own repaint trigger.
+            let images_before = cmds.len();
             self.upload_new_images(&mut cmds);
-            cmds.push(Cmd::Redraw);
+            let images_added = cmds.len() > images_before;
+            if viewport_changed || selection_dropped || images_added {
+                cmds.push(Cmd::Redraw);
+            }
         }
         if ended {
             self.ended = true;
@@ -1875,6 +1889,34 @@ mod tests {
         // cursor after "hi" is col 3, row 1 -> CSI 1;3 R, plus a redraw.
         assert_eq!(cmds, vec![sent("alpha", b"\x1b[1;3R"), Cmd::Redraw]);
         assert!(m.screen().text()[0].starts_with("hi"));
+    }
+
+    #[test]
+    fn content_feed_redraws() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"hello".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::Redraw), "visible output must repaint");
+    }
+
+    #[test]
+    fn no_op_feed_does_not_redraw() {
+        let mut m = model();
+        // A lone incomplete UTF-8 lead byte is held back whole for the next feed:
+        // nothing is decoded, no cell is written, so `Screen::feed` reports zero
+        // dirty rows and there is nothing to repaint.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: vec![0xf0],
+            ended: false,
+        });
+        assert!(
+            !cmds.contains(&Cmd::Redraw),
+            "a feed that changes no viewport row must not repaint: {cmds:?}"
+        );
     }
 
     #[test]
