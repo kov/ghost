@@ -3,6 +3,10 @@
 //! Screen, and renders it offscreen to a PNG. Asserts the session's output
 //! reached our screen and that a non-blank image was produced — exercising the
 //! whole spawn → attach → pump → feed → layout → render path.
+//!
+//! Linux-only: capture mode renders on a software adapter (lavapipe), which macOS
+//! lacks, so gate the whole target out to keep a bare-macOS `cargo test` green.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

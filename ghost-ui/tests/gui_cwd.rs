@@ -5,6 +5,11 @@
 //! A launch from a real working directory must be left alone. Both are checked by
 //! running capture mode (which spawns a real session) with `pwd -P` as the
 //! command and reading the captured screen off stderr.
+//!
+//! Linux-only: capture mode renders on a software adapter (lavapipe), which macOS
+//! lacks, so gate the whole target out — the `home_launch_dir` unit test covers
+//! the redirect logic on every platform.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

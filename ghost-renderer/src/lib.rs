@@ -3726,7 +3726,11 @@ pub fn render_frame<'f>(
     Renderer::headless(theme).render_offscreen(frame, font.into(), size_px)
 }
 
-#[cfg(test)]
+// These render tests draw on the GPU via `Renderer::headless`, which needs a
+// software adapter (lavapipe). macOS has no fallback adapter, so gate the module
+// to Linux to keep a bare-macOS `cargo test` green; it runs in full on Linux CI.
+// (The few pure tests here ride along under the same gate.)
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use ghost_render::{Layer, RectPx, Scene, SceneId, SceneItem, layout_frame, session_key};

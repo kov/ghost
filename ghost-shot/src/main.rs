@@ -1086,6 +1086,9 @@ mod tests {
 
     /// ANSI that paints a distinct 2×2-cell colour block in each corner of a
     /// `cols`×`rows` grid (TL red, TR green, BL blue, BR yellow), on a grey fill.
+    // Only the GPU dive test uses this; gate it with that test to avoid a
+    // dead-code warning on non-Linux where the test is compiled out.
+    #[cfg(target_os = "linux")]
     fn corner_markers(cols: u16, rows: u16) -> String {
         use std::fmt::Write;
         let mut s = String::new();
@@ -1104,6 +1107,7 @@ mod tests {
     }
 
     /// Bounding-box centre of pixels matching `rgb` within `tol`; None if absent.
+    #[cfg(target_os = "linux")]
     fn find(img: &Rendered, rgb: [u8; 3], tol: i16) -> Option<(f32, f32)> {
         let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
         let mut n = 0u64;
@@ -1128,7 +1132,10 @@ mod tests {
 
     // The dive's full-zoom endpoints (dive-out start, dive-in end) must frame the
     // session exactly like the single view — corner markers land in the same place,
-    // none clipped off-screen. GPU test: needs the lavapipe ICD.
+    // none clipped off-screen. GPU test: needs the lavapipe ICD, so it is Linux-CI
+    // only — macOS has no software fallback adapter (the sibling parse/layout tests
+    // here are pure and stay).
+    #[cfg(target_os = "linux")]
     #[test]
     fn dive_full_zoom_aligns_the_session_with_the_single_view() {
         let size = (1400u32, 900u32);

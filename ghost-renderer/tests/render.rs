@@ -2,6 +2,10 @@
 //! `ghost_term::Vt`, lay it out with `ghost-render`, shape + rasterize with
 //! `ghost-shaper`, and draw it on the GPU — asserting on the read-back pixels
 //! and dumping PNGs to eyeball. Runs headless on lavapipe.
+//!
+//! Linux-only: the GPU path needs a software adapter (lavapipe), absent on macOS,
+//! so gate the whole target out to keep a bare-macOS `cargo test` green.
+#![cfg(target_os = "linux")]
 
 use ghost_render::{
     CellMetrics, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, Transform,

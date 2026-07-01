@@ -1,5 +1,10 @@
 //! Headless GPU smoke test: device on a software adapter, offscreen clear, and
 //! pixel readback all work — the foundation for glyph golden tests.
+//!
+//! Linux-only: it needs a software Vulkan adapter (lavapipe), which is only
+//! present on the Linux CI. On macOS there is no fallback adapter, so gate the
+//! whole target out to keep a bare-macOS `cargo test` green.
+#![cfg(target_os = "linux")]
 
 use ghost_renderer::render_solid;
 
