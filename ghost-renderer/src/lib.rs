@@ -3421,20 +3421,22 @@ impl Renderer {
 
     /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
     ///
-    /// A full redraw (`band == None`) covers every pixel, so it goes STRAIGHT to the
-    /// swapchain — pass-through, the desktop-compositor "unredirect" of a fullscreen
-    /// opaque window: no texture, no blit, so bulk output (a screenful of `cat`) stays
-    /// cheap. It leaves the foreground Surface stale.
+    /// A lone opaque full-window terminal — the steady single view, and bulk output —
+    /// is rendered into the session's own [`Surface`] (which WE own, so `LoadOp::Load`
+    /// always sees the last complete frame) and the whole Surface is blitted onto the
+    /// swapchain. `ensure_surface` diffs the new frame against the Surface's held frame
+    /// and re-rasters only the changed rows, so steady typing touches a few rows while
+    /// bulk output re-rasters the screen; either way the blit is 1:1 and the composited
+    /// result is byte-identical to an inline render (pinned by
+    /// `a_full_window_surface_renders_identically_to_the_inline_path`). This is the SAME
+    /// per-session Surface the fleet and slide paths composite — one session renderer —
+    /// so a slide's outgoing side reuses it with no re-raster. Compositing every frame
+    /// this way (rather than a full frame going straight to the swapchain) costs a
+    /// full-window blit that measures free on a real GPU.
     ///
-    /// A banded (steady-typing) redraw can't go straight to the swapchain — a band
-    /// relies on the rest of the frame already being present, which a swapchain image's
-    /// undefined prior contents can't guarantee. So it is rendered into the foreground
-    /// session's own [`Surface`] (which WE own, so `LoadOp::Load` always sees the last
-    /// complete frame) and the whole Surface is blitted onto the swapchain. This is the
-    /// SAME per-session Surface the fleet and slide paths composite — one session
-    /// renderer — so a slide's outgoing side reuses it with no re-raster; here it is
-    /// window-sized, so the blit is 1:1 and reproduces the inline render byte-for-byte.
-    /// The caller owns acquiring/presenting the surface texture.
+    /// Anything else (a multi-terminal / chrome scene) goes through `build_scene`, which
+    /// composites any per-session Surfaces itself. The caller owns acquiring/presenting
+    /// the surface texture.
     pub fn present_scene(
         &mut self,
         view: &wgpu::TextureView,
@@ -3444,16 +3446,10 @@ impl Renderer {
         size_px: f32,
         band: Option<RectPx>,
     ) {
-        if band.is_none() {
-            self.render_scene_to_view_damaged(view, scene, font, size_px, None);
-            self.foreground_valid = false;
-            return;
-        }
         let Some((session, frame, selection)) = lone_terminal(scene) else {
-            // A band for something that isn't a lone full-window terminal (no split view
-            // produces this today): fall back to a correct full redraw rather than
-            // banding onto a swapchain image whose prior contents are undefined.
-            self.render_scene_to_view_damaged(view, scene, font, size_px, None);
+            // A multi-terminal / chrome scene: build_scene composites any per-session
+            // Surfaces itself.
+            self.render_scene_to_view_damaged(view, scene, font, size_px, band);
             self.foreground_valid = false;
             return;
         };
@@ -3463,10 +3459,10 @@ impl Renderer {
             w: surf.0.max(1) as f32,
             h: surf.1.max(1) as f32,
         };
-        // If the Surface is stale (the last present went straight to the swapchain, not
-        // into it) or holds a different session, drop it so `ensure_surface` re-renders
-        // it in full: a band would otherwise land on rows the swapchain — not the
-        // Surface — last updated.
+        // If the Surface is stale (the last present drew a non-lone scene, leaving no
+        // valid foreground Surface) or holds a different session, drop it so
+        // `ensure_surface` re-renders it in full: a partial update would otherwise land
+        // on rows the Surface never received.
         if !self.foreground_valid || self.foreground_session != Some(session) {
             self.surfaces.remove(&session);
         }
@@ -4615,6 +4611,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_present_of_a_lone_terminal_composites_through_its_surface() {
+        // Always-composite: even a Full (bulk-output) present of a lone opaque terminal
+        // renders into the session's Surface and blits it, rather than straight to the
+        // swapchain. So one full present rasters exactly one Surface — established and
+        // reusable by a follow-up present — where the old pass-through path left none.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        let a = frame(cols, rows, "a lone full-window terminal, bulk output");
+        let mut r = Renderer::headless(Theme::default());
+        let img = offscreen_target(&r.gpu.device, w, h, r.format);
+        let v = img.create_view(&wgpu::TextureViewDescriptor::default());
+        r.present_scene(&v, (w, h), &single_scene(a, w, h), font, SIZE_PX, None);
+        assert_eq!(
+            r.surface_renders(),
+            1,
+            "a Full present composites the lone terminal via its Surface, not pass-through"
+        );
+    }
+
+    #[test]
     fn a_slide_after_a_steady_view_reuses_the_foreground_surface_for_the_outgoing_side() {
         // The foreground session's Surface (window-sized, holding what was just on
         // screen) IS the slide's outgoing side — same session, same window size. A slide
@@ -4875,10 +4892,15 @@ mod tests {
         let img = offscreen_target(&r.gpu.device, w, h, r.format);
         let v = img.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // A: full present (straight to swapchain, foreground Surface left stale).
-        // B: band, but the Surface is stale, so it re-renders in full (a surface render).
-        // C: band on a now-valid Surface — a true in-place band update.
+        // A: full present — composites the whole frame into a fresh foreground Surface.
+        // B, C: steady single-row edits — each updates the now-valid Surface IN PLACE (a
+        // band update building only its row), never re-rendering the whole Surface.
         r.present_scene(&v, (w, h), &scene_of(&[]), font, SIZE_PX, None);
+        assert_eq!(
+            r.surface_renders(),
+            1,
+            "A composites the frame into a fresh Surface"
+        );
         r.present_scene(
             &v,
             (w, h),
@@ -4887,7 +4909,6 @@ mod tests {
             SIZE_PX,
             Some(band_of(11)),
         );
-        let renders_before_c = r.surface_renders();
         r.present_scene(
             &v,
             (w, h),
@@ -4898,13 +4919,13 @@ mod tests {
         );
         assert_eq!(
             r.surface_band_updates(),
-            1,
-            "the steady band (C) updates the Surface in place"
+            2,
+            "B and C each update the Surface in place"
         );
         assert_eq!(
             r.surface_renders(),
-            renders_before_c,
-            "and does NOT re-render the whole Surface"
+            1,
+            "and never re-render the whole Surface"
         );
         let incremental = r.band_instances();
 
