@@ -37,6 +37,11 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 # default (no target enabled), so instrumented code stays free in normal runs.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# Resolve a configured `[font] family` to a font file. fontconfig is the Linux font
+# database, so this is Linux-only; other targets fall back to the bundled font.
+[target.'cfg(target_os = "linux")'.dependencies]
+fontconfig = "0.11"
+
 [dev-dependencies]
 # The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.
 tempfile = "3"

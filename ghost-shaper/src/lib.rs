@@ -11,7 +11,7 @@
 //!
 //! [swash]: https://docs.rs/swash
 
-use ghost_render::Run;
+use ghost_render::{CellMetrics, Run};
 use swash::scale::{Render, ScaleContext, Source};
 use swash::shape::ShapeContext;
 use swash::zeno::{Angle, Format, Transform};
@@ -48,6 +48,27 @@ pub fn font_from_bytes(data: &[u8]) -> Option<FontRef<'_>> {
 /// applied — the "naive" id, useful as a baseline against shaped output.
 pub fn glyph_id(font: FontRef, ch: char) -> u16 {
     font.charmap().map(ch)
+}
+
+/// The terminal cell size for `font` at `size_px`: the monospace advance and the
+/// line height, both rounded to whole pixels so the grid stays crisp. The advance is
+/// a representative glyph's shaped advance (every glyph in a monospace face shares
+/// it); the line height is the font's own ascent + descent + line gap. This is what
+/// makes a configurable font/size correct — a different face or size has different
+/// cell dimensions, and glyphs must sit on cells sized from the same font.
+pub fn cell_metrics(font: FontRef, size_px: f32) -> CellMetrics {
+    let advance = shape(font, "M", size_px)
+        .first()
+        .map(|g| g.advance)
+        .filter(|a| *a > 0.0)
+        .unwrap_or(size_px * 0.6)
+        .round();
+    let m = font.metrics(&[]).scale(size_px);
+    let line_height = (m.ascent + m.descent + m.leading).round();
+    CellMetrics {
+        advance,
+        line_height,
+    }
 }
 
 /// Shape `text` at `size_px`, applying the font's OpenType features (including

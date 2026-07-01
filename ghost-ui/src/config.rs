@@ -1,11 +1,12 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), and the background opacity (`[window]`).
+//! a persisted font zoom (`[zoom]`), the background opacity (`[window]`), and the
+//! base font size + family (`[font]`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
 //! is pure and unit-tested. Scheme ids are inherited from the retired ghost-gtk
 //! frontend (kept stable because they're persisted). Unknown sections/fields are
-//! ignored, so a file that also carries (not-yet-read) `[font]` settings still loads.
+//! ignored, so a file that carries settings a newer ghost added still loads here.
 
 use ghost_renderer::Theme;
 use serde::Deserialize;
@@ -99,6 +100,14 @@ fn scheme_by_id(id: &str) -> Option<&'static Scheme> {
     SCHEMES.iter().find(|s| s.id == id)
 }
 
+/// The built-in base glyph size (px) used when `[font] size` is unset. 15px is the
+/// size the renderer's original hardcoded 9x18 Fira Code cell was measured at.
+pub const DEFAULT_FONT_PX: f32 = 15.0;
+
+/// Sane bounds for a configured font size; a value outside these clamps in.
+const MIN_FONT_PX: f32 = 6.0;
+const MAX_FONT_PX: f32 = 120.0;
+
 /// The parsed `ui.toml`. Sections we don't read yet are ignored by serde.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -106,6 +115,7 @@ pub struct UiConfig {
     colors: Colors,
     zoom: Zoom,
     window: Window,
+    font: Font,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,6 +149,25 @@ struct Window {
 impl Default for Window {
     fn default() -> Self {
         Window { opacity: 1.0 }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Font {
+    /// Base glyph size in px, before zoom/DPI (clamped to a sane range on read).
+    size: f32,
+    /// fontconfig family name (e.g. "JetBrains Mono"); absent uses the bundled
+    /// Fira Code. Resolved through fontconfig at launch — see the binary.
+    family: Option<String>,
+}
+
+impl Default for Font {
+    fn default() -> Self {
+        Font {
+            size: DEFAULT_FONT_PX,
+            family: None,
+        }
     }
 }
 
@@ -192,6 +221,21 @@ impl UiConfig {
     /// when unset.
     pub fn zoom(&self) -> f32 {
         self.zoom.scale as f32
+    }
+
+    /// The base glyph size in px, before zoom/DPI. Absent or out-of-range (or
+    /// non-finite) falls back to / clamps into a sane range around the built-in.
+    pub fn font_size(&self) -> f32 {
+        if self.font.size.is_finite() {
+            self.font.size.clamp(MIN_FONT_PX, MAX_FONT_PX)
+        } else {
+            DEFAULT_FONT_PX
+        }
+    }
+
+    /// The configured fontconfig family name, or `None` to use the bundled font.
+    pub fn font_family(&self) -> Option<&str> {
+        self.font.family.as_deref()
     }
 }
 
@@ -271,8 +315,58 @@ mod tests {
     fn unread_sections_do_not_break_loading() {
         // Forward-compat: a file carrying settings we don't consume yet must
         // still parse and apply the parts we do.
-        let c =
-            UiConfig::parse("[font]\nsize = 14.0\n\n[colors]\nscheme = \"tango-dark\"\n").unwrap();
+        let c = UiConfig::parse(
+            "[keybindings]\nquit = \"ctrl+q\"\n\n[colors]\nscheme = \"tango-dark\"\n",
+        )
+        .unwrap();
         assert_eq!(c.theme().bg, [0x2e, 0x34, 0x36]);
+    }
+
+    #[test]
+    fn font_size_parses_defaults_and_clamps() {
+        assert_eq!(UiConfig::default().font_size(), DEFAULT_FONT_PX);
+        assert_eq!(UiConfig::parse("").unwrap().font_size(), DEFAULT_FONT_PX);
+        // A present [font] table without size keeps the default.
+        assert_eq!(
+            UiConfig::parse("[font]\n").unwrap().font_size(),
+            DEFAULT_FONT_PX
+        );
+        // A set value flows through.
+        assert_eq!(
+            UiConfig::parse("[font]\nsize = 14.0\n")
+                .unwrap()
+                .font_size(),
+            14.0
+        );
+        // Out-of-range clamps into the sane band; non-finite falls back to default.
+        assert_eq!(
+            UiConfig::parse("[font]\nsize = 0.0\n").unwrap().font_size(),
+            MIN_FONT_PX
+        );
+        assert_eq!(
+            UiConfig::parse("[font]\nsize = 999.0\n")
+                .unwrap()
+                .font_size(),
+            MAX_FONT_PX
+        );
+        let c = UiConfig::parse("[font]\nsize = nan\n").unwrap();
+        assert_eq!(c.font_size(), DEFAULT_FONT_PX);
+    }
+
+    #[test]
+    fn font_family_parses_and_defaults_to_none() {
+        assert_eq!(UiConfig::default().font_family(), None);
+        assert_eq!(UiConfig::parse("").unwrap().font_family(), None);
+        assert_eq!(UiConfig::parse("[font]\n").unwrap().font_family(), None);
+        let c = UiConfig::parse("[font]\nfamily = \"JetBrains Mono\"\n").unwrap();
+        assert_eq!(c.font_family(), Some("JetBrains Mono"));
+        // Font settings are independent of the rest.
+        let c = UiConfig::parse(
+            "[font]\nsize = 13.0\nfamily = \"Fira Code\"\n\n[zoom]\nscale = 1.25\n",
+        )
+        .unwrap();
+        assert_eq!(c.font_size(), 13.0);
+        assert_eq!(c.font_family(), Some("Fira Code"));
+        assert_eq!(c.zoom(), 1.25);
     }
 }

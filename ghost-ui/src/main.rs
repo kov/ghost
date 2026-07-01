@@ -20,6 +20,7 @@
 
 mod bench;
 mod config;
+mod font;
 mod from_winit;
 mod pacer;
 mod resize;
@@ -47,12 +48,27 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-const FIRA: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/FiraCode-Regular.ttf");
-const METRICS: CellMetrics = CellMetrics {
-    advance: 9.0,
-    line_height: 18.0,
-};
-const SIZE_PX: f32 = 15.0;
+/// The resolved font, base size, and cell metrics for this process, read once from
+/// `ui.toml`. Resolving leaks the font bytes to `'static` (they live the whole run),
+/// so it is memoised here — every window shares this one setup. See [`font::FontSetup`].
+fn font_setup() -> &'static font::FontSetup {
+    static SETUP: std::sync::OnceLock<font::FontSetup> = std::sync::OnceLock::new();
+    SETUP.get_or_init(|| {
+        let cfg = config::UiConfig::load();
+        font::FontSetup::resolve(cfg.font_family(), cfg.font_size())
+    })
+}
+
+/// The configured cell metrics (derived from the font at the base size).
+fn metrics() -> CellMetrics {
+    font_setup().metrics
+}
+
+/// The configured base glyph size in px, before zoom/DPI.
+fn size_px() -> f32 {
+    font_setup().size
+}
+
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
 const POLL: Duration = Duration::from_millis(8);
@@ -77,8 +93,8 @@ fn main() {
 /// Grid cell count for a surface of `w`×`h` physical pixels at `scale` (cells
 /// are the base metrics scaled by the device factor, matching the model).
 fn grid_from_pixels(w: u32, h: u32, scale: f32) -> (u16, u16) {
-    let advance = METRICS.advance * scale;
-    let line_height = METRICS.line_height * scale;
+    let advance = metrics().advance * scale;
+    let line_height = metrics().line_height * scale;
     let cols = (w as f32 / advance).floor().max(1.0) as u16;
     let rows = (h as f32 / line_height).floor().max(1.0) as u16;
     (cols, rows)
@@ -213,7 +229,7 @@ fn capture(path: PathBuf) {
     .expect("spawn session");
 
     let mut session = attach_retry(&name, COLS, ROWS);
-    let mut model = TerminalModel::new(name.clone(), COLS, ROWS, METRICS);
+    let mut model = TerminalModel::new(name.clone(), COLS, ROWS, metrics());
 
     // Optionally feed input first, to exercise the keystroke path (the child is
     // typically `cat`, which echoes it back through the PTY).
@@ -261,10 +277,13 @@ fn capture(path: PathBuf) {
         }
     }
 
-    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let font = ghost_shaper::font_from_bytes(font_setup().bytes).expect("font");
     let scene = model.view();
-    let img = Renderer::headless(config::UiConfig::load().theme())
-        .render_offscreen_scene(&scene, font, SIZE_PX);
+    let img = Renderer::headless(config::UiConfig::load().theme()).render_offscreen_scene(
+        &scene,
+        font,
+        size_px(),
+    );
     write_png(&path, &img);
     eprintln!(
         "captured {}x{} to {}",
@@ -424,8 +443,8 @@ struct Graphics {
 impl Graphics {
     fn new(event_loop: &ActiveEventLoop, theme: ghost_renderer::Theme) -> Self {
         let size = PhysicalSize::new(
-            u32::from(COLS) * METRICS.advance as u32,
-            u32::from(ROWS) * METRICS.line_height as u32,
+            u32::from(COLS) * metrics().advance as u32,
+            u32::from(ROWS) * metrics().line_height as u32,
         );
         // Request a transparent window only when the theme is translucent, so an
         // opaque setup never pays the compositor's alpha-blending cost.
@@ -486,7 +505,7 @@ impl Graphics {
             )),
             renderer,
             scene_cache: SceneCache::default(),
-            font: ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads"),
+            font: ghost_shaper::font_from_bytes(font_setup().bytes).expect("resolved font loads"),
         }
     }
 
@@ -922,7 +941,7 @@ impl App {
                 resize::Step::Defer => {
                     if !w.gfx.renderer.has_snapshot() {
                         let scene = w.root.view();
-                        let font_px = SIZE_PX * w.root.render_scale();
+                        let font_px = size_px() * w.root.render_scale();
                         w.gfx.renderer.capture_snapshot(&scene, w.gfx.font, font_px);
                     }
                     w.gfx.resize(w_px, h_px);
@@ -952,7 +971,7 @@ impl App {
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
-        let (mut root, init) = RootModel::fleet(METRICS, (w, h), scale as f32);
+        let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         apply_anim_ms(&mut root);
         self.windows.insert(
             wid,
@@ -1013,8 +1032,8 @@ impl App {
                 return false;
             }
         };
-        let model = TerminalModel::new(name.to_string(), cols, rows, METRICS);
-        let mut root = RootModel::single(model, METRICS, (w, h));
+        let model = TerminalModel::new(name.to_string(), cols, rows, metrics());
+        let mut root = RootModel::single(model, metrics(), (w, h));
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);
@@ -1042,7 +1061,7 @@ impl App {
         // before the first paint — this drives the NDC mapping, the scissor
         // clamp, and the cell metrics, and its `Cmd::Redraw` requests that paint.
         // (No earlier `request_redraw`: it would race a frame at the default 1x
-        // scale against glyphs the renderer rasterizes at `SIZE_PX * scale`.)
+        // scale against glyphs the renderer rasterizes at `size_px() * scale`.)
         self.dispatch(
             wid,
             UiEvent::Resize {
@@ -1222,7 +1241,7 @@ impl ApplicationHandler for App {
                         win.gfx.renderer.set_deferring(animating);
                         // Rasterize at the model's render scale (device × zoom) so
                         // glyph size matches the grid the scene was laid out for.
-                        let font_px = SIZE_PX * win.root.render_scale();
+                        let font_px = size_px() * win.root.render_scale();
                         // Keep the IME candidate window pinned to the text cursor.
                         if let Some(a) = win.root.ime_cursor_area() {
                             win.gfx.window.set_ime_cursor_area(

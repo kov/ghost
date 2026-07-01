@@ -129,3 +129,30 @@ fn faux_bold_thickens_the_glyph() {
         ink(&roman)
     );
 }
+
+#[test]
+fn cell_metrics_match_the_historic_fira_15px_grid() {
+    // The renderer shipped a hardcoded 9x18 cell for Fira Code at 15px; deriving the
+    // cell from the font must reproduce it exactly, so making the font/size
+    // configurable doesn't shift the default layout.
+    let m = ghost_shaper::cell_metrics(font(), 15.0);
+    assert_eq!(m.advance, 9.0);
+    assert_eq!(m.line_height, 18.0);
+}
+
+#[test]
+fn cell_metrics_scale_with_size() {
+    // Sanity for other sizes: a positive whole-pixel cell that grows with the font.
+    let small = ghost_shaper::cell_metrics(font(), 12.0);
+    let large = ghost_shaper::cell_metrics(font(), 24.0);
+    for m in [small, large] {
+        assert!(m.advance > 0.0 && m.advance.fract() == 0.0);
+        assert!(m.line_height > 0.0 && m.line_height.fract() == 0.0);
+        assert!(
+            m.line_height > m.advance,
+            "a cell is taller than it is wide"
+        );
+    }
+    assert!(large.advance > small.advance);
+    assert!(large.line_height > small.line_height);
+}
