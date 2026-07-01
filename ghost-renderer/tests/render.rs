@@ -1031,3 +1031,31 @@ fn cold_full_screen_build_stays_within_budget() {
          shaping got slower)"
     );
 }
+
+#[test]
+fn no_readback_render_drives_the_full_path() {
+    // The no-readback render is the primitive behind the GPU benchmark and any test
+    // that drives the real render path to assert on something other than pixels. Here
+    // it stands in for that pattern: it runs the whole build → upload → render pass →
+    // submit → GPU-wait path (panicking on any GPU/validation error) and reports the
+    // target size, which must match both frame_size and the readback path's dims —
+    // proving the two share a target and differ only in the pixel copy.
+    let vt = dense_ls_screen(80, 24);
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).unwrap();
+
+    let mut r = Renderer::headless(Theme::default());
+    let (w, h) = r.render_offscreen_no_readback(&frame, font, 15.0);
+    assert_eq!(
+        (w, h),
+        Renderer::frame_size(&frame),
+        "no-readback render targets the frame's pixel size"
+    );
+
+    let img = r.render_offscreen(&frame, font, 15.0);
+    assert_eq!(
+        (w, h),
+        (img.width, img.height),
+        "no-readback and readback render the same target; only the pixel copy differs"
+    );
+}

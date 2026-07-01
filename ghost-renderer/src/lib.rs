@@ -237,6 +237,31 @@ impl Gpu {
                 .expect("request device");
         Gpu { device, queue }
     }
+
+    /// A headless device on the environment's DEFAULT Vulkan adapter — the real GPU
+    /// (venus on the dev VM), NOT the software fallback. For benchmarking the true GPU
+    /// render path: unlike [`Self::request_headless`] it neither pins the lavapipe ICD
+    /// nor forces the fallback adapter, so it takes whatever the loader offers first
+    /// (honouring an inherited `VK_DRIVER_FILES`). Returns the adapter info alongside
+    /// the context so a caller can label the run and decide teardown handling — a wgpu
+    /// device on a real driver may SIGSEGV at libtest teardown (the venus-teardown
+    /// bug), so a `#[test]` using this must force-exit on success.
+    pub fn request_default() -> (Self, wgpu::AdapterInfo) {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(desc);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("no default GPU adapter");
+        let info = adapter.get_info();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("request device");
+        (Gpu { device, queue }, info)
+    }
 }
 
 /// Locate a lavapipe (llvmpipe) Vulkan ICD manifest so [`Gpu::request_headless`]
@@ -1201,6 +1226,15 @@ impl Renderer {
     /// golden tests.
     pub fn headless(theme: Theme) -> Self {
         Self::new(Gpu::headless(), theme, FORMAT)
+    }
+
+    /// A headless renderer on the DEFAULT GPU (the real device, not the software
+    /// fallback) — for the GPU render benchmark. Returns the adapter info so the
+    /// caller can label the run and handle the venus teardown quirk. See
+    /// [`Gpu::request_default`].
+    pub fn headless_default_gpu(theme: Theme) -> (Self, wgpu::AdapterInfo) {
+        let (gpu, info) = Gpu::request_default();
+        (Self::new(gpu, theme, FORMAT), info)
     }
 
     /// Build a renderer on an existing device/queue (e.g. a windowed device).
@@ -2782,19 +2816,57 @@ impl Renderer {
     }
 
     /// Render a frame to an offscreen target and read the pixels back.
-    pub fn render_offscreen(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Rendered {
+    /// Render `frame` to a fresh offscreen target and submit; return the target
+    /// texture and its size. Shared by the pixel path ([`Self::render_offscreen`],
+    /// which reads the texture back) and the no-readback path
+    /// ([`Self::render_offscreen_no_readback`], which waits for the GPU instead).
+    fn render_to_offscreen_target(
+        &mut self,
+        frame: &Frame,
+        font: FontRef,
+        size_px: f32,
+    ) -> (wgpu::Texture, u32, u32) {
         let (w, h) = Self::frame_size(frame);
         self.prepare(frame, font, size_px, w, h);
         let target = offscreen_target(&self.gpu.device, w, h, self.format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let cb = self.encode(&view);
         self.gpu.queue.submit([cb]);
+        (target, w, h)
+    }
+
+    pub fn render_offscreen(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Rendered {
+        let (target, w, h) = self.render_to_offscreen_target(frame, font, size_px);
         let rgba = read_back(&self.gpu, &target, w, h);
         Rendered {
             width: w,
             height: h,
             rgba,
         }
+    }
+
+    /// Render `frame` to an offscreen target and block until the GPU finishes, WITHOUT
+    /// copying the pixels back. It does every bit of real render work — build, glyph
+    /// uploads, render pass, submit, GPU execution — minus the ~w·h·4-byte readback
+    /// that dominates [`Self::render_offscreen`]'s wall-clock at 4K. So a timer around
+    /// this call measures the true GPU frame cost, and a test can drive the whole
+    /// render path to assert on things other than pixels (it panics on a GPU/validation
+    /// error, exercises the surface caches, drives a scene to completion, …). Returns
+    /// the target size. The `poll` is what makes the wait real: `submit` alone returns
+    /// before the GPU has run, so without it a timing captures only CPU-side encode.
+    pub fn render_offscreen_no_readback(
+        &mut self,
+        frame: &Frame,
+        font: FontRef,
+        size_px: f32,
+    ) -> (u32, u32) {
+        let (target, w, h) = self.render_to_offscreen_target(frame, font, size_px);
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        drop(target);
+        (w, h)
     }
 
     /// Build one frame's draw instances (layout → shape → instances) and return the
