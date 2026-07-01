@@ -9,3 +9,9 @@
   second face (distinct glyph outlines, shared glyph indices with the Regular) so
   a test can prove the glyph atlas keys per face and never aliases the two. Not
   shipped in any ghost binary.
+- **`DejaVuSansMono.ttf`** — [DejaVu Sans Mono](https://dejavu-fonts.github.io/),
+  a permissive Bitstream Vera / Arev license (`DejaVu-LICENSE.txt`; the DejaVu
+  changes are public domain). Bundled as a *different-coverage* monospace fixture:
+  it carries glyphs Fira Code lacks (e.g. ★ U+2605, ❤ U+2764), so a font-fallback
+  test can prove an uncovered char is drawn from a fallback face instead of the
+  `.notdef` box. Not shipped in any ghost binary.

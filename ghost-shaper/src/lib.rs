@@ -139,6 +139,25 @@ pub fn glyph_id(font: FontRef, ch: char) -> u16 {
     font.charmap().map(ch)
 }
 
+/// Whether `font` has a real glyph for `ch` — its cmap maps it to something other
+/// than `.notdef` (glyph 0). A terminal uses this to decide when to reach for a
+/// fallback font instead of drawing the empty/tofu `.notdef`.
+pub fn covers(font: FontRef, ch: char) -> bool {
+    font.charmap().map(ch) != 0
+}
+
+/// Finds a fallback face for a character the primary font can't render. The renderer
+/// consults it when shaping a run yields `.notdef`, to locate a font that *does* cover
+/// the char (typically via the platform font database — fontconfig / CoreText). It is
+/// stateful — implementations cache both the per-char lookup and the fonts they load —
+/// hence `&mut self`. A returned face must be `'static` (loaded and leaked like the
+/// family faces), so a glyph rasterized from it outlives any single frame.
+pub trait Fallback {
+    /// A face that covers `ch`, or `None` if none could be found (the caller then
+    /// draws the primary's `.notdef`, degrading gracefully).
+    fn face_for(&mut self, ch: char) -> Option<FontRef<'static>>;
+}
+
 /// The terminal cell size for `font` at `size_px`: the monospace advance and the
 /// line height, both rounded to whole pixels so the grid stays crisp. The advance is
 /// a representative glyph's shaped advance (every glyph in a monospace face shares

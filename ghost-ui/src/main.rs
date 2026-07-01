@@ -366,11 +366,9 @@ fn capture(path: PathBuf) {
     }
 
     let scene = model.view();
-    let img = Renderer::headless(config::UiConfig::load().theme()).render_offscreen_scene(
-        &scene,
-        font_setup().fonts,
-        size_px(),
-    );
+    let mut renderer = Renderer::headless(config::UiConfig::load().theme());
+    renderer.set_fallback(Box::new(font::SystemFallback::new()));
+    let img = renderer.render_offscreen_scene(&scene, font_setup().fonts, size_px());
     write_png(&path, &img);
     eprintln!(
         "captured {}x{} to {}",
@@ -605,7 +603,10 @@ impl Graphics {
             device: device.clone(),
             queue,
         };
-        let renderer = Renderer::new(gpu, theme, format);
+        let mut renderer = Renderer::new(gpu, theme, format);
+        // Draw characters outside the configured family (symbols, box-drawing, arrows)
+        // from a covering system font instead of the tofu box.
+        renderer.set_fallback(Box::new(font::SystemFallback::new()));
 
         Graphics {
             window,

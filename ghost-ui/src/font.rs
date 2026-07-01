@@ -15,10 +15,9 @@
 //! the bundle with a log, never fatal.
 
 use ghost_render::CellMetrics;
-use ghost_shaper::FontSet;
-// `FontRef` and file paths only appear in the family-resolution paths (Linux/macOS).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use ghost_shaper::FontRef;
+use ghost_shaper::{FontRef, FontSet};
+use std::collections::HashMap;
+// File paths only appear in the family-resolution and fallback paths (Linux/macOS).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
@@ -272,6 +271,92 @@ fn coretext_faces(family: &str) -> Option<ResolvedFaces> {
     })
 }
 
+/// Runtime per-character font fallback backed by the platform font database. When the
+/// configured family has no glyph for a character (`.notdef`), the renderer asks this
+/// for a font that *does* cover it — so symbols, box-drawing, arrows, etc. outside the
+/// primary font render instead of the tofu box. Each character's lookup is cached, and
+/// loaded files are deduplicated, so a screen full of the same symbol queries the font
+/// DB (and reads a file) only once. Faces are read and leaked to `'static`, exactly as
+/// the family faces are.
+///
+/// Linux resolves through fontconfig (a charset match). macOS/other platforms have no
+/// resolver yet, so `face_for` returns `None` there and the `.notdef` shows as before —
+/// a deliberate v1 scope (see the follow-up note on CoreText fallback + colour emoji).
+pub struct SystemFallback {
+    /// char → the face that covers it (`None` = looked up, nothing found: don't re-query).
+    cache: HashMap<char, Option<FontRef<'static>>>,
+    /// (file, face-index) → the leaked face, so two chars from the same fallback file
+    /// share one `FontRef` instead of leaking the bytes twice.
+    #[cfg(target_os = "linux")]
+    files: HashMap<(PathBuf, usize), Option<FontRef<'static>>>,
+    #[cfg(target_os = "linux")]
+    fc: Option<fontconfig::Fontconfig>,
+}
+
+impl Default for SystemFallback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemFallback {
+    pub fn new() -> Self {
+        SystemFallback {
+            cache: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            files: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            fc: fontconfig::Fontconfig::new(),
+        }
+    }
+
+    /// Resolve a face covering `ch` (uncached). Linux: a fontconfig charset match,
+    /// deduplicating the loaded file. Elsewhere: none yet.
+    #[cfg(target_os = "linux")]
+    fn resolve(&mut self, ch: char) -> Option<FontRef<'static>> {
+        let key = self.query_fontconfig(ch)?;
+        if let Some(hit) = self.files.get(&key) {
+            return *hit;
+        }
+        let face = load(&key.0, key.1);
+        self.files.insert(key, face);
+        face
+    }
+
+    /// The (file, face-index) fontconfig picks as the best match that covers `ch`.
+    /// fontconfig may still hand back a non-covering font when nothing covers it; the
+    /// renderer re-checks coverage before using the glyph, so a miss degrades to
+    /// `.notdef` rather than a wrong glyph.
+    #[cfg(target_os = "linux")]
+    fn query_fontconfig(&self, ch: char) -> Option<(PathBuf, usize)> {
+        let fc = self.fc.as_ref()?;
+        let mut pat = fontconfig::Pattern::new(fc).ok()?;
+        let mut charset = fontconfig::CharSet::new(fc).ok()?;
+        charset.add_char(ch).ok()?;
+        pat.add_charset(charset).ok()?;
+        let matched = pat.font_match().ok()?;
+        let path = PathBuf::from(matched.filename().ok()?);
+        let idx = matched.face_index().unwrap_or(0).max(0) as usize;
+        Some((path, idx))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn resolve(&mut self, _ch: char) -> Option<FontRef<'static>> {
+        None
+    }
+}
+
+impl ghost_shaper::Fallback for SystemFallback {
+    fn face_for(&mut self, ch: char) -> Option<FontRef<'static>> {
+        if let Some(hit) = self.cache.get(&ch) {
+            return *hit;
+        }
+        let face = self.resolve(ch);
+        self.cache.insert(ch, face);
+        face
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +384,28 @@ mod tests {
         assert!(setup.metrics.advance > 0.0 && setup.metrics.advance.fract() == 0.0);
         assert!(setup.metrics.line_height > 0.0);
         assert_eq!(setup.size, 15.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_fallback_finds_a_face_covering_a_symbol_outside_coding_fonts() {
+        use ghost_shaper::Fallback;
+        // ★ (U+2605) is absent from Fira Code but present in DejaVu/Symbola, near-
+        // universal on a desktop. The resolver must return a face that ACTUALLY covers
+        // it (fontconfig can hand back a non-covering best-effort match, which we reject
+        // downstream), and the second lookup must hit the cache — the same face.
+        let mut fb = SystemFallback::new();
+        let face = fb.face_for('★').expect("a system font should cover ★");
+        assert!(
+            ghost_shaper::covers(face, '★'),
+            "the resolved fallback face must actually have ★"
+        );
+        let again = fb.face_for('★').expect("cached lookup");
+        assert_eq!(
+            face.key.value(),
+            again.key.value(),
+            "a repeat lookup must return the cached face, not re-resolve"
+        );
     }
 
     #[cfg(target_os = "macos")]

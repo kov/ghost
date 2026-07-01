@@ -1123,6 +1123,12 @@ pub struct Renderer {
     /// map is nested so a hit probes the inner map by borrowed `&str` and allocates
     /// nothing — building an owned key just to look it up cost ~half a heavy raster.
     shape_cache: ShapeCache,
+    /// Finds a face for a char the configured family can't render (`.notdef`), so a
+    /// symbol/emoji outside the primary font draws from a covering font instead of the
+    /// tofu box. `None` = no fallback wired (tests, tools) → `.notdef` as before. Owned
+    /// like the caches rather than threaded per-call; consulted only on the sequential
+    /// glyph path (never from parallel pre-shaping), so a non-`Send` box is fine.
+    fallback: Option<Box<dyn ghost_shaper::Fallback>>,
     /// Running hit/miss tallies for the shape, glyph-atlas, and surface caches. The
     /// single source of truth behind [`Self::cache_stats`] and the back-compat
     /// [`Self::shape_misses`]/[`Self::surface_renders`] accessors.
@@ -1513,6 +1519,7 @@ impl Renderer {
             format,
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
+            fallback: None,
             stats: RenderCacheStats::default(),
             parallel_shaping: true,
             bench_target: None,
@@ -2385,6 +2392,14 @@ impl Renderer {
         self.stats
     }
 
+    /// Install a fallback face resolver (see [`ghost_shaper::Fallback`]). The glyph
+    /// path consults it whenever a run shapes to `.notdef`, so characters outside the
+    /// configured family (symbols, box-drawing, …) draw from a covering font instead of
+    /// the tofu box. Without one, an uncovered glyph renders as `.notdef` as before.
+    pub fn set_fallback(&mut self, fallback: Box<dyn ghost_shaper::Fallback>) {
+        self.fallback = Some(fallback);
+    }
+
     /// Enable/disable parallel pre-shaping of a cold frame's runs (on by default).
     /// Output is identical either way; a bench flips it off to measure the win.
     pub fn set_parallel_shaping(&mut self, on: bool) {
@@ -2489,6 +2504,38 @@ impl Renderer {
         self.stats.glyph.insert();
         self.cache.insert(key, resolved);
         resolved
+    }
+
+    /// Resolve which (face, glyph, synthesis) actually renders a shaped glyph `g` (whose
+    /// source char is at byte `g.cluster` of `text`): the primary face as shaped, unless
+    /// it came back `.notdef` (glyph 0) and a wired fallback face covers the char — then
+    /// that fallback face's glyph, with the run's bold/italic applied as synthesis (a
+    /// fallback face carries no styled variants of its own). When no fallback is wired,
+    /// or none covers the char, returns the primary `.notdef` so the tofu box still shows
+    /// rather than the glyph silently vanishing.
+    fn render_glyph<'p>(
+        &mut self,
+        primary: FontRef<'p>,
+        primary_synth: Synthesis,
+        g: &ShapedGlyph,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> (FontRef<'p>, u16, Synthesis) {
+        if g.id != 0 {
+            return (primary, g.id, primary_synth);
+        }
+        if let Some(ch) = text
+            .get(g.cluster as usize..)
+            .and_then(|s| s.chars().next())
+            && let Some(face) = self.fallback.as_mut().and_then(|f| f.face_for(ch))
+        {
+            let id = face.charmap().map(ch);
+            if id != 0 {
+                return (face, id, Synthesis { italic, bold });
+            }
+        }
+        (primary, g.id, primary_synth)
     }
 
     fn slot_uv(slot: &Slot) -> [f32; 4] {
@@ -2606,7 +2653,15 @@ impl Renderer {
                 for g in shaped.iter() {
                     let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
-                    if let Some(slot) = self.ensure_glyph(face, g.id, size_px, synth) {
+                    let (gface, gid, gsynth) = self.render_glyph(
+                        face,
+                        synth,
+                        g,
+                        &run.text,
+                        run.style.bold,
+                        run.style.italic,
+                    );
+                    if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth) {
                         glyphs.push(Instance {
                             rect: [
                                 pen + slot.left as f32,
@@ -3161,7 +3216,9 @@ impl Renderer {
             for g in shaped.iter() {
                 let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
-                if let Some(slot) = self.ensure_glyph(face, g.id, size_px, synth) {
+                let (gface, gid, gsynth) =
+                    self.render_glyph(face, synth, g, &run.text, run.style.bold, run.style.italic);
+                if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth) {
                     out.push(Instance {
                         rect: [
                             pen + slot.left as f32,

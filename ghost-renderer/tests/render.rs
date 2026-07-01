@@ -361,6 +361,56 @@ fn a_translucent_lone_terminal_composites_see_through() {
 }
 
 #[test]
+fn an_uncovered_glyph_falls_back_to_a_face_that_has_it() {
+    // Fira Code has no ★ (U+2605): shaping it yields .notdef, drawn as the tofu box.
+    // With a fallback resolver that points ★ at DejaVu Sans Mono (which covers it), the
+    // renderer must draw DejaVu's real star instead — byte-identical to rendering the
+    // same line with DejaVu as the primary font, and DIFFERENT from Fira's notdef box.
+    const DEJAVU: &[u8] = include_bytes!("../../ghost-shaper/tests/assets/DejaVuSansMono.ttf");
+    let fira = ghost_shaper::font_from_bytes(FIRA).expect("fira");
+    let dejavu = ghost_shaper::font_from_bytes(DEJAVU).expect("dejavu");
+    assert_eq!(
+        ghost_shaper::glyph_id(fira, '★'),
+        0,
+        "precondition: Fira must lack ★"
+    );
+    assert_ne!(
+        ghost_shaper::glyph_id(dejavu, '★'),
+        0,
+        "precondition: DejaVu must cover ★"
+    );
+
+    // A resolver that sends ★ (and only ★) to DejaVu.
+    struct StarToDejaVu;
+    impl ghost_shaper::Fallback for StarToDejaVu {
+        fn face_for(&mut self, ch: char) -> Option<ghost_shaper::FontRef<'static>> {
+            (ch == '★').then(|| ghost_shaper::font_from_bytes(DEJAVU).expect("dejavu"))
+        }
+    }
+
+    let mut vt = Vt::new(3, 1);
+    vt.feed_str("\x1b[?25l★"); // a lone star; hide the cursor so it can't tint the cell
+    let frame = layout_frame(&vt, METRICS);
+
+    // Fira alone: the star is .notdef (the tofu box). DejaVu as primary: the reference.
+    let notdef = Renderer::headless(Theme::default()).render_offscreen(&frame, fira, 15.0);
+    let reference = Renderer::headless(Theme::default()).render_offscreen(&frame, dejavu, 15.0);
+    // Fira primary + the fallback: must reproduce DejaVu's star exactly.
+    let mut r = Renderer::headless(Theme::default());
+    r.set_fallback(Box::new(StarToDejaVu));
+    let fallback = r.render_offscreen(&frame, fira, 15.0);
+
+    assert_eq!(
+        fallback.rgba, reference.rgba,
+        "the fallback must draw DejaVu's ★ exactly, as if DejaVu were the primary font"
+    );
+    assert_ne!(
+        fallback.rgba, notdef.rgba,
+        "the fallback ★ must replace Fira's .notdef box, not sit alongside it"
+    );
+}
+
+#[test]
 fn scales_a_large_surface_frame_to_fit_its_tile() {
     // A real-size session frame drawn into a tile smaller than itself must be
     // scaled to "contain", not clipped. Mark the bottom-right cell blue: at 1:1
