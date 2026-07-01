@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use ghost_render::Scene;
-use ghost_shaper::FontRef;
+use ghost_shaper::FontSet;
 
 use crate::{Damage, Renderer, SceneCache};
 
@@ -118,15 +118,16 @@ impl Target {
     ///
     /// `pre_present` runs just before a surface present (the app's
     /// `window.pre_present_notify()`); it is ignored for an offscreen target.
-    pub fn render_frame(
+    pub fn render_frame<'f>(
         &mut self,
         renderer: &mut Renderer,
         cache: &mut SceneCache,
         scene: &Scene,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         font_px: f32,
         pre_present: impl FnOnce(),
     ) -> Option<(Duration, Duration)> {
+        let font = font.into();
         // Skip an identical scene; otherwise present it. The per-session Surface keeps
         // the redraw cheap (it re-rasters only its changed rows), so the scene-level
         // verdict is just skip-or-present.
