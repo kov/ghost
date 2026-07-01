@@ -131,9 +131,10 @@ mod imp {
 
     use std::cell::RefCell;
 
+    use objc2::ffi::class_addMethod;
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, Sel};
-    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, sel};
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::{ClassType, DeclaredClass, declare_class, msg_send, msg_send_id, mutability, sel};
     use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
     use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, ns_string};
     use winit::event_loop::EventLoopProxy;
@@ -187,6 +188,27 @@ mod imp {
         /// items but not their target, so if this dropped, every custom item's
         /// click would message a freed object.
         static MENU: RefCell<Option<Retained<MenuTarget>>> = const { RefCell::new(None) };
+
+        /// The Dock icon's right-click menu, built once and kept alive for the
+        /// process. AppKit asks for it via `applicationDockMenu:` (see
+        /// [`application_dock_menu`]); we return this same menu each time.
+        static DOCK_MENU: RefCell<Option<Retained<NSMenu>>> = const { RefCell::new(None) };
+    }
+
+    /// The app delegate's `applicationDockMenu:`, injected onto winit's delegate
+    /// class in [`install_dock_menu`]. Returns the Dock menu we built, autoreleased
+    /// as the method's contract requires. `this`/`_app` are unused: the menu's item
+    /// already targets our [`MenuTarget`], so the Dock action needs nothing from the
+    /// delegate.
+    unsafe extern "C" fn application_dock_menu(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _app: *mut AnyObject,
+    ) -> *mut AnyObject {
+        DOCK_MENU.with(|m| match m.borrow().as_ref() {
+            Some(menu) => Retained::autorelease_return(menu.clone()).cast(),
+            None => std::ptr::null_mut(),
+        })
     }
 
     /// Append ghost's File / Edit / View / Window submenus to the menu bar winit
@@ -310,7 +332,57 @@ mod imp {
         ));
         unsafe { app.setWindowsMenu(Some(&window)) };
 
+        install_dock_menu(mtm, &app, &target);
+
         MENU.with(|m| *m.borrow_mut() = Some(target));
+    }
+
+    /// Give the Dock icon's right-click menu a "New Window" item. AppKit sources the
+    /// Dock menu from the app delegate's `applicationDockMenu:`, and winit owns the
+    /// delegate, so we add that one method to its class at runtime (winit does not
+    /// implement it) and hand back a menu we build here. The item routes through the
+    /// same [`MenuTarget`] as File > New Window — the target holds the event-loop
+    /// proxy — so it works even with no window focused or the app in the background.
+    fn install_dock_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarget) {
+        let menu = NSMenu::new(mtm);
+        menu.addItem(&action_item(
+            mtm,
+            target,
+            ns_string!("New Window"),
+            MenuAction::NewWindow,
+            ns_string!(""),
+        ));
+        DOCK_MENU.with(|m| *m.borrow_mut() = Some(menu));
+
+        // winit installs its delegate in applicationDidFinishLaunching (before
+        // `resumed`, where this runs), so it is present; skip the Dock menu if not.
+        let delegate: *mut AnyObject = unsafe { msg_send![app, delegate] };
+        if delegate.is_null() {
+            eprintln!("ghost-ui: no app delegate; Dock menu unavailable");
+            return;
+        }
+        let cls: &AnyClass = unsafe { msg_send![delegate, class] };
+        let imp: Imp = unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut AnyObject,
+                Imp,
+            >(application_dock_menu)
+        };
+        // `AnyClass` wraps `objc_class`, so the pointer casts straight through. Adding
+        // the method returns false only if it already exists (a second install) — the
+        // `MENU`-set guard above makes that unreachable, and it would be harmless.
+        // Encoding: returns an object (`@`), args self (`@`) + _cmd (`:`) + sender (`@`).
+        let cls_ptr = core::ptr::from_ref(cls)
+            .cast::<objc2::ffi::objc_class>()
+            .cast_mut();
+        unsafe {
+            class_addMethod(
+                cls_ptr,
+                sel!(applicationDockMenu:).as_ptr(),
+                Some(imp),
+                c"@@:@".as_ptr(),
+            );
+        }
     }
 
     /// Add a titled submenu to the bar and return it for populating.
@@ -378,6 +450,29 @@ mod imp {
         match unsafe { app.mainMenu() } {
             Some(bar) => dump_menu(&bar, 0),
             None => println!("MENU\t<no menu bar>"),
+        }
+        dump_dock_menu(&app);
+    }
+
+    /// Ask the app delegate for the Dock menu exactly as AppKit would and print it
+    /// under a `DOCK` header — proving the injected `applicationDockMenu:` is live
+    /// and returns our routed item (a native Dock menu can't be right-clicked in the
+    /// sandbox, so we assert on this instead).
+    fn dump_dock_menu(app: &NSApplication) {
+        let delegate: *mut AnyObject = unsafe { msg_send![app, delegate] };
+        if delegate.is_null() {
+            return;
+        }
+        let responds: bool =
+            unsafe { msg_send![delegate, respondsToSelector: sel!(applicationDockMenu:)] };
+        if !responds {
+            return;
+        }
+        let dock: *mut NSMenu =
+            unsafe { msg_send![delegate, applicationDockMenu: std::ptr::null_mut::<AnyObject>()] };
+        if let Some(dock) = unsafe { dock.as_ref() } {
+            println!("DOCK");
+            dump_menu(dock, 1);
         }
     }
 

@@ -75,4 +75,14 @@ fn menu_dump_lists_the_expected_native_menu_bar() {
             "missing top-level {submenu} submenu in:\n{dump}"
         );
     }
+
+    // Dock: the icon's right-click menu carries a New Window that routes to the app
+    // (so it works with no window focused), verified by asking the delegate exactly
+    // as AppKit would. Its key equivalent is empty — a Dock menu has no chords —
+    // which also distinguishes it from File > New Window (Cmd-N).
+    assert!(dump.contains("DOCK"), "no Dock menu section in:\n{dump}");
+    assert!(
+        dump.contains("New Window\tkey=\taction=ghostMenuAction:"),
+        "Dock menu missing a routed New Window in:\n{dump}"
+    );
 }
