@@ -1059,3 +1059,45 @@ fn no_readback_render_drives_the_full_path() {
         "no-readback and readback render the same target; only the pixel copy differs"
     );
 }
+
+#[test]
+fn a_real_bold_face_is_used_instead_of_synthesizing_weight() {
+    // A bold run rendered through a FontSet with a real bold slot must go to that
+    // face, not the emboldened Regular. We can't ship a second face in the test, so
+    // the bold slot here is the SAME outline as regular — which means the real-face
+    // path emboldens NOTHING, while the single-face path synthesizes the weight. The
+    // emboldened render therefore covers strictly more ink, proving the slot is what
+    // decided whether synthesis ran.
+    let mut vt = Vt::new(20, 1);
+    vt.feed_str("\x1b[1mMMMMMMMM"); // a bold run
+    let frame = layout_frame(&vt, METRICS);
+
+    let reg = ghost_shaper::font_from_bytes(FIRA).unwrap();
+    let with_real_bold = ghost_shaper::FontSet {
+        regular: reg,
+        bold: Some(ghost_shaper::font_from_bytes(FIRA).unwrap()),
+        italic: None,
+        bold_italic: None,
+    };
+
+    // Single face → the bold run's weight is synthesized (emboldened).
+    let synth = Renderer::headless(Theme::default()).render_offscreen(&frame, reg, 15.0);
+    // Real bold slot (same outline) → no synthesis, so the strokes stay unthickened.
+    let real = Renderer::headless(Theme::default()).render_offscreen(&frame, with_real_bold, 15.0);
+
+    let ink = |img: &Rendered| {
+        let bg = px(img, 0, 0);
+        (0..img.height * img.width)
+            .filter(|i| {
+                let (x, y) = (i % img.width, i / img.width);
+                px(img, x, y) != bg
+            })
+            .count()
+    };
+    assert!(
+        ink(&synth) > ink(&real),
+        "synthesized bold must add ink over the real (unweighted) face: {} vs {}",
+        ink(&synth),
+        ink(&real)
+    );
+}

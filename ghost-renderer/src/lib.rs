@@ -20,7 +20,7 @@ use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene,
     SceneItem, Selection, Style, TermDamage, Transform,
 };
-use ghost_shaper::{FontRef, ShapedGlyph, Synthesis};
+use ghost_shaper::{FontRef, FontSet, ShapedGlyph, Synthesis};
 use ghost_term::Color;
 use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
@@ -1787,7 +1787,7 @@ impl Renderer {
         selection: Option<Selection>,
         damage: TermDamage,
         rect: RectPx,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
         deferring: bool,
     ) -> Option<(u32, u32)> {
@@ -1942,7 +1942,8 @@ impl Renderer {
     /// Rasterize ONE queued deferred surface (see [`WarmRequest`]), off the animation's
     /// critical path; returns whether more remain (so the shell keeps requesting redraws
     /// until the fleet is warm). A no-op returning `false` when the queue is empty.
-    pub fn warm_next(&mut self, font: FontRef) -> bool {
+    pub fn warm_next<'f>(&mut self, font: impl Into<FontSet<'f>>) -> bool {
+        let font = font.into();
         if self.warm_queue.is_empty() {
             return false;
         }
@@ -2004,7 +2005,7 @@ impl Renderer {
         frame: &Rc<Frame>,
         selection: Option<Selection>,
         rows: (usize, usize),
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
     ) {
         let (lo, hi) = rows;
@@ -2117,7 +2118,7 @@ impl Renderer {
         frame: &Rc<Frame>,
         selection: Option<Selection>,
         rect: RectPx,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
     ) -> Surface {
         let size = Self::surface_size(frame, rect);
@@ -2304,23 +2305,29 @@ impl Renderer {
     fn prewarm_shapes(
         &mut self,
         frame: &Frame,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
         rows: std::ops::Range<usize>,
     ) {
         if !self.parallel_shaping {
             return;
         }
-        let outer = (stable_font_key(font), size_px.to_bits());
-        // Distinct run texts not already cached — probed by borrowed `&str` (no alloc).
-        let cached = self.shape_cache.get(&outer);
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut todo: Vec<&str> = Vec::new();
+        let bits = size_px.to_bits();
+        // Distinct (face, text) pairs not already cached. A run's face depends on its
+        // style, so a bold or italic run keys under a different face than regular; each
+        // face has its own inner cache map keyed by its stable font identity.
+        let mut seen: HashSet<(u64, &str)> = HashSet::new();
+        let mut todo: Vec<(u64, FontRef, &str)> = Vec::new();
         for row in &frame.rows_layout[rows] {
             for run in &row.runs {
-                let uncached = cached.is_none_or(|m| !m.contains_key(run.text.as_str()));
-                if uncached && seen.insert(run.text.as_str()) {
-                    todo.push(run.text.as_str());
+                let (face, _synth) = font.face(run.style.bold, run.style.italic);
+                let fkey = stable_font_key(face);
+                let cached = self
+                    .shape_cache
+                    .get(&(fkey, bits))
+                    .is_some_and(|m| m.contains_key(run.text.as_str()));
+                if !cached && seen.insert((fkey, run.text.as_str())) {
+                    todo.push((fkey, face, run.text.as_str()));
                 }
             }
         }
@@ -2328,16 +2335,16 @@ impl Renderer {
             return; // few enough that the inline path is cheaper than the fan-out
         }
         // Shape off-thread (owned `Vec<ShapedGlyph>` is `Send`; `Rc` is not, so wrap on
-        // the way back in), then store on this thread.
-        let shaped: Vec<(&str, Vec<ShapedGlyph>)> = todo
+        // the way back in), then store per face on this thread.
+        let shaped: Vec<(u64, &str, Vec<ShapedGlyph>)> = todo
             .par_iter()
-            .map(|t| (*t, ghost_shaper::shape(font, t, size_px)))
+            .map(|(fkey, face, t)| (*fkey, *t, ghost_shaper::shape(*face, t, size_px)))
             .collect();
-        let inner = self.shape_cache.entry(outer).or_default();
-        if inner.len() > 8192 {
-            inner.clear();
-        }
-        for (text, glyphs) in shaped {
+        for (fkey, text, glyphs) in shaped {
+            let inner = self.shape_cache.entry((fkey, bits)).or_default();
+            if inner.len() > 8192 {
+                inner.clear();
+            }
             self.stats.shape.miss();
             self.stats.shape.insert();
             inner.insert(text.to_string(), Rc::new(glyphs));
@@ -2502,7 +2509,7 @@ impl Renderer {
     fn build_instances(
         &mut self,
         frame: &Frame,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
         selection: Option<Selection>,
         rows: std::ops::Range<usize>,
@@ -2588,15 +2595,14 @@ impl Renderer {
                 // ligature spans its cells naturally and a wide char occupies two
                 // columns regardless of the font's reported advance.
                 fill_cell_cols(&mut col_of_byte, &run.text);
-                let shaped = self.shape_cached(font, &run.text, size_px);
+                // Pick the real face for this run's style (bold/italic), plus whatever
+                // synthesis the chosen face doesn't itself provide.
+                let (face, synth) = font.face(run.style.bold, run.style.italic);
+                let shaped = self.shape_cached(face, &run.text, size_px);
                 for g in shaped.iter() {
                     let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                     let pen = (run.start_col + cell) as f32 * metrics.advance;
-                    let synth = Synthesis {
-                        italic: run.style.italic,
-                        bold: run.style.bold,
-                    };
-                    if let Some(slot) = self.ensure_glyph(font, g.id, size_px, synth) {
+                    if let Some(slot) = self.ensure_glyph(face, g.id, size_px, synth) {
                         glyphs.push(Instance {
                             rect: [
                                 pen + slot.left as f32,
@@ -2725,7 +2731,7 @@ impl Renderer {
 
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
-    fn prepare(&mut self, frame: &Frame, font: FontRef, size_px: f32, vw: u32, vh: u32) {
+    fn prepare(&mut self, frame: &Frame, font: FontSet, size_px: f32, vw: u32, vh: u32) {
         let instances = self.build_instances(
             frame,
             font,
@@ -2801,15 +2807,16 @@ impl Renderer {
 
     /// Render a frame into a window surface's texture view. The caller owns
     /// acquiring/presenting the surface texture.
-    pub fn render_to_view(
+    pub fn render_to_view<'f>(
         &mut self,
         view: &wgpu::TextureView,
         vw: u32,
         vh: u32,
         frame: &Frame,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         size_px: f32,
     ) {
+        let font = font.into();
         self.prepare(frame, font, size_px, vw, vh);
         let cb = self.encode(view);
         self.gpu.queue.submit([cb]);
@@ -2823,7 +2830,7 @@ impl Renderer {
     fn render_to_offscreen_target(
         &mut self,
         frame: &Frame,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
     ) -> (wgpu::Texture, u32, u32) {
         let (w, h) = Self::frame_size(frame);
@@ -2835,7 +2842,13 @@ impl Renderer {
         (target, w, h)
     }
 
-    pub fn render_offscreen(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> Rendered {
+    pub fn render_offscreen<'f>(
+        &mut self,
+        frame: &Frame,
+        font: impl Into<FontSet<'f>>,
+        size_px: f32,
+    ) -> Rendered {
+        let font = font.into();
         let (target, w, h) = self.render_to_offscreen_target(frame, font, size_px);
         let rgba = read_back(&self.gpu, &target, w, h);
         Rendered {
@@ -2854,12 +2867,13 @@ impl Renderer {
     /// error, exercises the surface caches, drives a scene to completion, …). Returns
     /// the target size. The `poll` is what makes the wait real: `submit` alone returns
     /// before the GPU has run, so without it a timing captures only CPU-side encode.
-    pub fn render_offscreen_no_readback(
+    pub fn render_offscreen_no_readback<'f>(
         &mut self,
         frame: &Frame,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         size_px: f32,
     ) -> (u32, u32) {
+        let font = font.into();
         let (target, w, h) = self.render_to_offscreen_target(frame, font, size_px);
         self.gpu
             .device
@@ -2879,7 +2893,13 @@ impl Renderer {
     /// build can't be optimized away. A test that inspects pixels wants
     /// [`Self::render_offscreen`] instead (which additionally reads ~w·h·4 bytes back
     /// off the GPU — that copy, not the build, dominates its wall-clock at 4K).
-    pub fn build_frame_cpu(&mut self, frame: &Frame, font: FontRef, size_px: f32) -> usize {
+    pub fn build_frame_cpu<'f>(
+        &mut self,
+        frame: &Frame,
+        font: impl Into<FontSet<'f>>,
+        size_px: f32,
+    ) -> usize {
+        let font = font.into();
         self.build_instances(
             frame,
             font,
@@ -2900,7 +2920,7 @@ impl Renderer {
     fn build_scene(
         &mut self,
         scene: &Scene,
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
     ) -> (Vec<Instance>, Vec<Draw>, Vec<ImageDraw>, Vec<RectPx>) {
         let (sw, sh) = scene.size_px;
@@ -3124,7 +3144,7 @@ impl Renderer {
         runs: &[Run],
         metrics: CellMetrics,
         color: [f32; 4],
-        font: FontRef,
+        font: FontSet,
         size_px: f32,
     ) -> Vec<Instance> {
         let baseline = rect.y + metrics.line_height * 0.8;
@@ -3132,15 +3152,12 @@ impl Renderer {
         let mut col_of_byte: Vec<u16> = Vec::new();
         for run in runs {
             fill_cell_cols(&mut col_of_byte, &run.text);
-            let shaped = self.shape_cached(font, &run.text, size_px);
+            let (face, synth) = font.face(run.style.bold, run.style.italic);
+            let shaped = self.shape_cached(face, &run.text, size_px);
             for g in shaped.iter() {
                 let cell = col_of_byte.get(g.cluster as usize).copied().unwrap_or(0) as usize;
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
-                let synth = Synthesis {
-                    italic: run.style.italic,
-                    bold: run.style.bold,
-                };
-                if let Some(slot) = self.ensure_glyph(font, g.id, size_px, synth) {
+                if let Some(slot) = self.ensure_glyph(face, g.id, size_px, synth) {
                     out.push(Instance {
                         rect: [
                             pen + slot.left as f32,
@@ -3184,7 +3201,7 @@ impl Renderer {
     /// Upload a scene's instances and viewport uniform; return the ordered draws.
     /// `build_scene` runs every surface sub-pass first (each repointing the shared
     /// uniform), so the scene-size uniform write here must come last.
-    fn prepare_scene(&mut self, scene: &Scene, font: FontRef, size_px: f32) -> Vec<Draw> {
+    fn prepare_scene(&mut self, scene: &Scene, font: FontSet, size_px: f32) -> Vec<Draw> {
         let (instances, draws, images, blits) = self.build_scene(scene, font, size_px);
         self.image_draws = images;
         self.build_image_instances();
@@ -3287,13 +3304,14 @@ impl Renderer {
     /// attachment. The caller owns acquiring/presenting the surface texture. Used for
     /// a multi-terminal / chrome scene; a lone terminal composites through its Surface
     /// (see [`Self::present_scene`]).
-    pub fn render_scene_to_view(
+    pub fn render_scene_to_view<'f>(
         &mut self,
         view: &wgpu::TextureView,
         scene: &Scene,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         size_px: f32,
     ) {
+        let font = font.into();
         let groups = self.prepare_scene(scene, font, size_px);
         let cb = self.encode_scene(view, &groups);
         self.gpu.queue.submit([cb]);
@@ -3304,7 +3322,13 @@ impl Renderer {
     /// surface present path, for benchmarking the real cost of a redraw. The target
     /// persists across calls so `LoadOp::Load` sees the prior frame, exactly like a
     /// swapchain image.
-    pub fn render_to_cached_target(&mut self, scene: &Scene, font: FontRef, size_px: f32) {
+    pub fn render_to_cached_target<'f>(
+        &mut self,
+        scene: &Scene,
+        font: impl Into<FontSet<'f>>,
+        size_px: f32,
+    ) {
+        let font = font.into();
         let (w, h) = (scene.size_px.0.max(1), scene.size_px.1.max(1));
         // Take the target out so the &mut self render call below doesn't alias it;
         // (re)allocate only when the size changed, then put it back.
@@ -3405,14 +3429,15 @@ impl Renderer {
     /// Anything else (a multi-terminal / chrome scene) goes through `build_scene`, which
     /// composites any per-session Surfaces itself. The caller owns acquiring/presenting
     /// the surface texture.
-    pub fn present_scene(
+    pub fn present_scene<'f>(
         &mut self,
         view: &wgpu::TextureView,
         surf: (u32, u32),
         scene: &Scene,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         size_px: f32,
     ) {
+        let font = font.into();
         let Some((session, frame, selection, damage)) = lone_terminal(scene) else {
             // A multi-terminal / chrome scene: build_scene composites any per-session
             // Surfaces itself.
@@ -3459,12 +3484,13 @@ impl Renderer {
     /// Render a scene to an offscreen target and read the pixels back. For a
     /// single full-window `Terminal` this is byte-identical to
     /// [`Self::render_offscreen`] (pinned by a golden test).
-    pub fn render_offscreen_scene(
+    pub fn render_offscreen_scene<'f>(
         &mut self,
         scene: &Scene,
-        font: FontRef,
+        font: impl Into<FontSet<'f>>,
         size_px: f32,
     ) -> Rendered {
+        let font = font.into();
         let w = scene.size_px.0.max(1);
         let h = scene.size_px.1.max(1);
         let groups = self.prepare_scene(scene, font, size_px);
@@ -3486,7 +3512,13 @@ impl Renderer {
     /// exactly as the surface path would; the texture is kept (premultiplied, in
     /// the surface format) and later sampled with linear filtering so the stretch
     /// is smooth. Replaces any previously held snapshot.
-    pub fn capture_snapshot(&mut self, scene: &Scene, font: FontRef, size_px: f32) {
+    pub fn capture_snapshot<'f>(
+        &mut self,
+        scene: &Scene,
+        font: impl Into<FontSet<'f>>,
+        size_px: f32,
+    ) {
+        let font = font.into();
         let w = scene.size_px.0.max(1);
         let h = scene.size_px.1.max(1);
         let draws = self.prepare_scene(scene, font, size_px);
@@ -3653,8 +3685,13 @@ impl Renderer {
 }
 
 /// Convenience: render a single frame offscreen on a fresh headless renderer.
-pub fn render_frame(frame: &Frame, font: FontRef, size_px: f32, theme: Theme) -> Rendered {
-    Renderer::headless(theme).render_offscreen(frame, font, size_px)
+pub fn render_frame<'f>(
+    frame: &Frame,
+    font: impl Into<FontSet<'f>>,
+    size_px: f32,
+    theme: Theme,
+) -> Rendered {
+    Renderer::headless(theme).render_offscreen(frame, font.into(), size_px)
 }
 
 #[cfg(test)]
