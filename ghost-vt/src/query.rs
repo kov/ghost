@@ -42,45 +42,89 @@ pub enum Query {
     /// DECRPM `CSI ? Ps ; Pm $ y` with Pm 0 = unrecognized, 1 = set, 2 = reset.
     /// Apps probe synchronized output (2026) this way before using it.
     ReportMode(u16),
+    /// `OSC 10 ; ? ST` — the default foreground color. Reply: `OSC 10 ;
+    /// rgb:rrrr/gggg/bbbb ST` (16-bit-per-channel xterm form).
+    ForegroundColor,
+    /// `OSC 11 ; ? ST` — the default background color; what vim/fzf/neovim
+    /// theme detection rides on. Reply mirrors [`Query::ForegroundColor`].
+    BackgroundColor,
+}
+
+/// The default fg/bg an OSC 10/11 color query is answered with. The attached
+/// frontend passes its live scheme; the detached host answers with this
+/// `Default` — ghost's default scheme (`ghost-renderer`'s `Theme::default`,
+/// duplicated here because the layering points the other way) — until
+/// last-attached colors are persisted per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeColors {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        ThemeColors {
+            fg: [0xd8, 0xdb, 0xe0],
+            bg: [0x10, 0x10, 0x12],
+        }
+    }
+}
+
+/// Everything [`Query::reply`] can draw on, threaded identically by the
+/// attached frontend and the detached host.
+pub struct ReplyCtx<'a> {
+    /// 1-based `(col, row)` cursor position (CPR).
+    pub cursor: (u16, u16),
+    /// `(cols, rows)` text-area size.
+    pub size: (u16, u16),
+    /// Current kitty-keyboard progressive-enhancement flags.
+    pub kitty_flags: u8,
+    /// Default fg/bg for the OSC color queries.
+    pub colors: ThemeColors,
+    /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
+    /// reset, `None` unrecognized.
+    pub mode_state: &'a dyn Fn(u16) -> Option<bool>,
+}
+
+/// The 16-bit-per-channel `rgb:rrrr/gggg/bbbb` form xterm reports colors in
+/// (each 8-bit channel doubled into 16 bits).
+fn xterm_rgb([r, g, b]: [u8; 3]) -> String {
+    format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
 }
 
 impl Query {
-    /// The reply bytes to write back to the child's PTY. `cursor` is the 1-based
-    /// `(col, row)` cursor position, `size` is `(cols, rows)`, `kitty_flags` is
-    /// the current kitty-keyboard flags (only the kitty query uses it), and
-    /// `mode_state` reports a DEC private mode's state for DECRQM (`Some(true)`
-    /// set, `Some(false)` reset, `None` unrecognized).
+    /// The reply bytes to write back to the child's PTY.
     ///
     /// The device-attribute strings mirror VTE's non-test replies: DA1 reports a
     /// VT100-level (61) terminal with 132-column mode (1), horizontal scrolling
     /// (21), colour (22) and rectangular editing (28); DA2 reports the same level
     /// with VTE's version encoding as the firmware field.
-    pub fn reply(
-        &self,
-        cursor: (u16, u16),
-        size: (u16, u16),
-        kitty_flags: u8,
-        mode_state: impl Fn(u16) -> Option<bool>,
-    ) -> Vec<u8> {
-        let (col, row) = cursor;
-        let (cols, rows) = size;
+    pub fn reply(&self, ctx: &ReplyCtx) -> Vec<u8> {
+        let (col, row) = ctx.cursor;
+        let (cols, rows) = ctx.size;
         match self {
             Query::CursorPosition => format!("\x1b[{row};{col}R").into_bytes(),
             Query::DeviceStatus => b"\x1b[0n".to_vec(),
             Query::PrimaryDeviceAttributes => b"\x1b[?61;1;21;22;28c".to_vec(),
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
-            Query::KittyKeyboardFlags => format!("\x1b[?{kitty_flags}u").into_bytes(),
+            Query::KittyKeyboardFlags => format!("\x1b[?{}u", ctx.kitty_flags).into_bytes(),
             Query::TerminalVersion => {
                 format!("\x1bP>|ghost {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
             }
             Query::ReportMode(mode) => {
-                let pm = match mode_state(*mode) {
+                let pm = match (ctx.mode_state)(*mode) {
                     Some(true) => 1,
                     Some(false) => 2,
                     None => 0,
                 };
                 format!("\x1b[?{mode};{pm}$y").into_bytes()
+            }
+            Query::ForegroundColor => {
+                format!("\x1b]10;{}\x1b\\", xterm_rgb(ctx.colors.fg)).into_bytes()
+            }
+            Query::BackgroundColor => {
+                format!("\x1b]11;{}\x1b\\", xterm_rgb(ctx.colors.bg)).into_bytes()
             }
         }
     }
@@ -90,6 +134,11 @@ impl Query {
 /// we recognize, so a pathological run of parameters can't grow the buffer.
 const MAX_CSI_PARAMS: usize = 32;
 
+/// Upper bound on a collected OSC payload. The OSC queries we answer ("10;?",
+/// "11;?") are tiny; anything longer is a title/clipboard/other string, marked
+/// overflowed and never classified — so a truncation can't masquerade as one.
+const MAX_OSC_PAYLOAD: usize = 16;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Normal output.
@@ -98,7 +147,8 @@ enum State {
     Esc,
     /// Inside a CSI (`ESC [`), collecting parameter/intermediate bytes.
     Csi,
-    /// Inside an OSC string (`ESC ]`), skipping until its terminator.
+    /// Inside an OSC string (`ESC ]`), collecting a small payload (the color
+    /// queries live here) and skipping the rest until its terminator.
     Osc,
     /// Saw `ESC` inside an OSC string — maybe the start of an ST (`ESC \`).
     OscEsc,
@@ -114,6 +164,12 @@ pub struct QueryScanner {
     state: State,
     /// Parameter and intermediate bytes of the CSI currently being collected.
     params: Vec<u8>,
+    /// Payload of the OSC currently being collected (bounded; see
+    /// [`MAX_OSC_PAYLOAD`]).
+    osc: Vec<u8>,
+    /// The current OSC outgrew [`MAX_OSC_PAYLOAD`] (or carried an embedded
+    /// escape): whatever terminates it, it is not a query.
+    osc_overflow: bool,
 }
 
 impl Default for QueryScanner {
@@ -127,6 +183,21 @@ impl QueryScanner {
         QueryScanner {
             state: State::Ground,
             params: Vec::new(),
+            osc: Vec::new(),
+            osc_overflow: false,
+        }
+    }
+
+    /// Classify the just-terminated OSC, if it stayed small enough to be one
+    /// of the queries we answer.
+    fn osc_query(&self) -> Option<Query> {
+        if self.osc_overflow {
+            return None;
+        }
+        match self.osc.as_slice() {
+            b"10;?" => Some(Query::ForegroundColor),
+            b"11;?" => Some(Query::BackgroundColor),
+            _ => None,
         }
     }
 
@@ -145,7 +216,11 @@ impl QueryScanner {
                         self.params.clear();
                         self.state = State::Csi;
                     }
-                    b']' => self.state = State::Osc,
+                    b']' => {
+                        self.osc.clear();
+                        self.osc_overflow = false;
+                        self.state = State::Osc;
+                    }
                     // DCS, SOS, PM, APC: string controls terminated by ST.
                     b'P' | b'X' | b'^' | b'_' => self.state = State::Str,
                     // ESC ESC: stay primed for the real introducer.
@@ -172,17 +247,29 @@ impl QueryScanner {
                     _ => {}
                 },
                 State::Osc => match b {
-                    0x07 => self.state = State::Ground, // BEL terminates
+                    // BEL terminates: classify what was collected.
+                    0x07 => {
+                        if let Some(q) = self.osc_query() {
+                            out.push(q);
+                        }
+                        self.state = State::Ground;
+                    }
                     0x1b => self.state = State::OscEsc,
-                    _ => {}
+                    _ if self.osc.len() < MAX_OSC_PAYLOAD => self.osc.push(b),
+                    _ => self.osc_overflow = true,
                 },
                 State::OscEsc => {
-                    // `ESC \` is ST; any other byte is still OSC payload.
-                    self.state = if b == b'\\' {
-                        State::Ground
+                    // `ESC \` is ST; any other byte is still OSC payload (and
+                    // an embedded escape disqualifies it as a query).
+                    if b == b'\\' {
+                        if let Some(q) = self.osc_query() {
+                            out.push(q);
+                        }
+                        self.state = State::Ground;
                     } else {
-                        State::Osc
-                    };
+                        self.osc_overflow = true;
+                        self.state = State::Osc;
+                    }
                 }
                 State::Str => match b {
                     0x07 => self.state = State::Ground,
@@ -321,42 +408,93 @@ mod tests {
         None
     }
 
+    /// A baseline reply context; tests override the fields they exercise.
+    fn ctx() -> ReplyCtx<'static> {
+        ReplyCtx {
+            cursor: (1, 1),
+            size: (80, 24),
+            kitty_flags: 0,
+            colors: ThemeColors::default(),
+            mode_state: &no_modes,
+        }
+    }
+
+    #[test]
+    fn recognizes_osc_color_queries() {
+        assert_eq!(scan_all(b"\x1b]10;?\x07"), [Query::ForegroundColor]);
+        assert_eq!(scan_all(b"\x1b]11;?\x1b\\"), [Query::BackgroundColor]);
+        // Set forms and unrelated OSCs are not queries.
+        assert!(scan_all(b"\x1b]11;#101012\x07").is_empty());
+        assert!(scan_all(b"\x1b]12;?\x07").is_empty()); // cursor color: not yet
+        assert!(scan_all(b"\x1b]0;title\x07").is_empty());
+        // A long payload overflows the small buffer and is never classified,
+        // even if its prefix looks like a query.
+        let mut long = b"\x1b]10;?".to_vec();
+        long.extend(std::iter::repeat_n(b'x', 100));
+        long.push(0x07);
+        assert!(scan_all(&long).is_empty());
+        // Split across feeds still recognized.
+        let mut s = QueryScanner::new();
+        assert!(s.scan(b"\x1b]11").is_empty());
+        assert!(s.scan(b";?").is_empty());
+        assert_eq!(s.scan(b"\x07"), [Query::BackgroundColor]);
+    }
+
     #[test]
     fn reply_strings_match_vte() {
         assert_eq!(
-            Query::CursorPosition.reply((5, 3), (80, 24), 0, no_modes),
+            Query::CursorPosition.reply(&ReplyCtx {
+                cursor: (5, 3),
+                ..ctx()
+            }),
             b"\x1b[3;5R" // row;col, 1-based
         );
+        assert_eq!(Query::DeviceStatus.reply(&ctx()), b"\x1b[0n");
         assert_eq!(
-            Query::DeviceStatus.reply((1, 1), (80, 24), 0, no_modes),
-            b"\x1b[0n"
-        );
-        assert_eq!(
-            Query::PrimaryDeviceAttributes.reply((1, 1), (80, 24), 0, no_modes),
+            Query::PrimaryDeviceAttributes.reply(&ctx()),
             b"\x1b[?61;1;21;22;28c"
         );
         assert_eq!(
-            Query::SecondaryDeviceAttributes.reply((1, 1), (80, 24), 0, no_modes),
+            Query::SecondaryDeviceAttributes.reply(&ctx()),
             b"\x1b[>61;8400;1c"
         );
         assert_eq!(
-            Query::TextAreaSize.reply((1, 1), (80, 24), 0, no_modes),
+            Query::TextAreaSize.reply(&ctx()),
             b"\x1b[8;24;80t" // rows;cols
         );
         // The kitty query reports the current flags.
+        assert_eq!(Query::KittyKeyboardFlags.reply(&ctx()), b"\x1b[?0u");
         assert_eq!(
-            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 0, no_modes),
-            b"\x1b[?0u"
-        );
-        assert_eq!(
-            Query::KittyKeyboardFlags.reply((1, 1), (80, 24), 5, no_modes),
+            Query::KittyKeyboardFlags.reply(&ReplyCtx {
+                kitty_flags: 5,
+                ..ctx()
+            }),
             b"\x1b[?5u"
         );
     }
 
     #[test]
+    fn color_replies_use_the_xterm_rgb_form() {
+        let themed = ReplyCtx {
+            colors: ThemeColors {
+                fg: [0xd8, 0xdb, 0xe0],
+                bg: [0x10, 0x10, 0x12],
+            },
+            ..ctx()
+        };
+        assert_eq!(
+            Query::ForegroundColor.reply(&themed),
+            b"\x1b]10;rgb:d8d8/dbdb/e0e0\x1b\\"
+        );
+        assert_eq!(
+            Query::BackgroundColor.reply(&themed),
+            b"\x1b]11;rgb:1010/1010/1212\x1b\\"
+        );
+    }
+
+    #[test]
     fn xtversion_reply_names_ghost() {
-        let reply = Query::TerminalVersion.reply((1, 1), (80, 24), 0, no_modes);
+        let reply = Query::TerminalVersion.reply(&ctx());
         let s = String::from_utf8(reply).unwrap();
         assert!(
             s.starts_with("\x1bP>|ghost ") && s.ends_with("\x1b\\"),
@@ -372,17 +510,12 @@ mod tests {
             2004 => Some(false),
             _ => None,
         };
-        assert_eq!(
-            Query::ReportMode(2026).reply((1, 1), (80, 24), 0, state),
-            b"\x1b[?2026;1$y"
-        );
-        assert_eq!(
-            Query::ReportMode(2004).reply((1, 1), (80, 24), 0, state),
-            b"\x1b[?2004;2$y"
-        );
-        assert_eq!(
-            Query::ReportMode(12345).reply((1, 1), (80, 24), 0, state),
-            b"\x1b[?12345;0$y"
-        );
+        let modal = ReplyCtx {
+            mode_state: &state,
+            ..ctx()
+        };
+        assert_eq!(Query::ReportMode(2026).reply(&modal), b"\x1b[?2026;1$y");
+        assert_eq!(Query::ReportMode(2004).reply(&modal), b"\x1b[?2004;2$y");
+        assert_eq!(Query::ReportMode(12345).reply(&modal), b"\x1b[?12345;0$y");
     }
 }

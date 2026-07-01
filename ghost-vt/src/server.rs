@@ -474,14 +474,20 @@ fn host_main(
                     // attached or not, so split sequences stay tracked.
                     let asked = queries.scan(&ptybuf[..n]);
                     if client.is_none() && !asked.is_empty() {
-                        let cursor = screen.cursor();
-                        let size = screen.dimensions();
-                        let kitty_flags = screen.kitty_keyboard_flags();
+                        let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+                        let ctx = crate::query::ReplyCtx {
+                            cursor: screen.cursor(),
+                            size: screen.dimensions(),
+                            kitty_flags: screen.kitty_keyboard_flags(),
+                            // Detached, nobody knows the live scheme; answer
+                            // with ghost's default until last-attached colors
+                            // are persisted per session.
+                            colors: crate::query::ThemeColors::default(),
+                            mode_state: &mode_state,
+                        };
                         let mut reply = Vec::new();
                         for q in asked {
-                            reply.extend_from_slice(&q.reply(cursor, size, kitty_flags, |m| {
-                                screen.vt().dec_mode_state(m)
-                            }));
+                            reply.extend_from_slice(&q.reply(&ctx));
                         }
                         let mut w: &pty_process::blocking::Pty = &pty;
                         let _ = w.write_all(&reply);

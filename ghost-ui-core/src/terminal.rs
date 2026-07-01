@@ -17,7 +17,7 @@ use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
 use ghost_term::{ClipboardSelection, Line, MouseProtocol};
-use ghost_vt::query::QueryScanner;
+use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
 
 use std::collections::HashSet;
@@ -193,6 +193,10 @@ pub struct TerminalModel {
     /// frame (DEC mode 2026). Released by the mode resetting, or by the tick
     /// scheduled when the hold began (so a stuck app can't freeze the window).
     sync_held: bool,
+    /// The scheme's default fg/bg, for answering OSC 10/11 color queries (vim
+    /// and fzf theme detection). Defaults to ghost's default scheme; the shell
+    /// overrides it when a scheme is configured (see `set_theme`).
+    theme: ThemeColors,
 }
 
 /// How long a synchronized-output hold may last before the scheduled tick
@@ -241,7 +245,15 @@ impl TerminalModel {
             feed_dirty: None,
             presented: None,
             sync_held: false,
+            theme: ThemeColors::default(),
         }
+    }
+
+    /// Set the scheme's default fg/bg reported to apps that query them
+    /// (OSC 10/11). The theme is fixed at startup today, so this is called
+    /// once per model, right after construction.
+    pub fn set_theme(&mut self, theme: ThemeColors) {
+        self.theme = theme;
     }
 
     /// The [`TermDamage`] to stamp on this session's scene item: `All` on the first
@@ -709,13 +721,16 @@ impl TerminalModel {
                 let pushed = self.screen.vt().lines_scrolled_off().saturating_sub(before);
                 self.scroll_offset = (self.scroll_offset + pushed).min(self.max_scroll());
             }
-            let cursor = self.screen.cursor();
-            let size = self.screen.dimensions();
-            let kitty_flags = self.screen.kitty_keyboard_flags();
             let screen = &self.screen;
-            let replies = query_replies(&mut self.scanner, bytes, cursor, size, kitty_flags, |m| {
-                screen.vt().dec_mode_state(m)
-            });
+            let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+            let ctx = ReplyCtx {
+                cursor: screen.cursor(),
+                size: screen.dimensions(),
+                kitty_flags: screen.kitty_keyboard_flags(),
+                colors: self.theme,
+                mode_state: &mode_state,
+            };
+            let replies = query_replies(&mut self.scanner, bytes, &ctx);
             if !replies.is_empty() {
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
@@ -1150,19 +1165,11 @@ fn is_word_char(c: char) -> bool {
 // ---- pure protocol helpers (shared with the shell) ----
 
 /// Scan child output for terminal queries and build the reply bytes from the
-/// 1-based `(col, row)` cursor and `(cols, rows)` size; `mode_state` answers
-/// DECRQM (a DEC private mode's set/reset state). Pure.
-pub fn query_replies(
-    scanner: &mut QueryScanner,
-    output: &[u8],
-    cursor: (u16, u16),
-    size: (u16, u16),
-    kitty_flags: u8,
-    mode_state: impl Fn(u16) -> Option<bool>,
-) -> Vec<u8> {
+/// given context (cursor, size, kitty flags, theme colors, mode state). Pure.
+pub fn query_replies(scanner: &mut QueryScanner, output: &[u8], ctx: &ReplyCtx) -> Vec<u8> {
     let mut out = Vec::new();
     for query in scanner.scan(output) {
-        out.extend_from_slice(&query.reply(cursor, size, kitty_flags, &mode_state));
+        out.extend_from_slice(&query.reply(ctx));
     }
     out
 }
@@ -2872,13 +2879,25 @@ mod tests {
         None
     }
 
+    /// A baseline reply context; tests override the fields they exercise.
+    fn reply_ctx() -> ReplyCtx<'static> {
+        ReplyCtx {
+            cursor: (1, 1),
+            size: (80, 24),
+            kitty_flags: 0,
+            colors: ThemeColors::default(),
+            mode_state: &no_modes,
+        }
+    }
+
     #[test]
     fn query_replies_answers_cursor_position() {
         let mut s = QueryScanner::new();
-        assert_eq!(
-            query_replies(&mut s, b"\x1b[6n", (3, 5), (80, 24), 0, no_modes),
-            b"\x1b[5;3R"
-        );
+        let ctx = ReplyCtx {
+            cursor: (3, 5),
+            ..reply_ctx()
+        };
+        assert_eq!(query_replies(&mut s, b"\x1b[6n", &ctx), b"\x1b[5;3R");
     }
 
     #[test]
@@ -2886,11 +2905,33 @@ mod tests {
         let mut s = QueryScanner::new();
         // `CSI ? u` is answered with the flags passed in (the model supplies the
         // live `kitty_keyboard_flags()`); a bare `CSI u` is not a query.
-        assert_eq!(
-            query_replies(&mut s, b"\x1b[?u", (1, 1), (80, 24), 5, no_modes),
-            b"\x1b[?5u"
+        let ctx = ReplyCtx {
+            kitty_flags: 5,
+            ..reply_ctx()
+        };
+        assert_eq!(query_replies(&mut s, b"\x1b[?u", &ctx), b"\x1b[?5u");
+        assert!(query_replies(&mut s, b"\x1b[u", &ctx).is_empty());
+    }
+
+    #[test]
+    fn osc_color_queries_answer_from_the_set_theme() {
+        let mut m = model();
+        m.set_theme(ThemeColors {
+            fg: [0x01, 0x02, 0x03],
+            bg: [0x0a, 0x0b, 0x0c],
+        });
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]11;?\x1b\\\x1b]10;?\x07".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent(
+                "alpha",
+                b"\x1b]11;rgb:0a0a/0b0b/0c0c\x1b\\\x1b]10;rgb:0101/0202/0303\x1b\\"
+            )),
+            "no themed color reply: {cmds:?}"
         );
-        assert!(query_replies(&mut s, b"\x1b[u", (1, 1), (80, 24), 5, no_modes).is_empty());
     }
 
     #[test]

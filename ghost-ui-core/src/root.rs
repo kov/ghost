@@ -16,6 +16,7 @@ use crate::terminal::{Shortcut, classify_shortcut};
 use crate::{
     CellMetrics, Cmd, FleetModel, Scene, SceneItem, SessionId, TerminalModel, Transform, UiEvent,
 };
+use ghost_vt::query::ThemeColors;
 
 enum Mode {
     Single(Box<TerminalModel>),
@@ -227,6 +228,10 @@ fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
 pub struct RootModel {
     mode: Mode,
     metrics: CellMetrics,
+    /// The scheme's default fg/bg (OSC 10/11 color-query replies), stamped on
+    /// every model this root creates or holds. Set once by the shell after
+    /// construction (the theme is fixed at startup today).
+    theme: ThemeColors,
     size_px: (u32, u32),
     /// Device scale factor, tracked so a fleet toggle preserves HiDPI sizing.
     scale: f32,
@@ -296,6 +301,7 @@ impl RootModel {
         RootModel {
             mode: Mode::Single(Box::new(model)),
             metrics,
+            theme: ThemeColors::default(),
             size_px,
             scale: 1.0,
             mine: HashSet::from([id.clone()]),
@@ -315,6 +321,7 @@ impl RootModel {
         let root = RootModel {
             mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px, HashSet::new()))),
             metrics,
+            theme: ThemeColors::default(),
             size_px,
             scale,
             mine: HashSet::new(),
@@ -330,6 +337,19 @@ impl RootModel {
 
     pub fn is_fleet(&self) -> bool {
         matches!(self.mode, Mode::Fleet(_))
+    }
+
+    /// Set the scheme's default fg/bg (OSC 10/11 color-query replies) on every
+    /// model this root holds now or creates later.
+    pub fn set_theme(&mut self, theme: ThemeColors) {
+        self.theme = theme;
+        match &mut self.mode {
+            Mode::Single(m) => m.set_theme(theme),
+            Mode::Fleet(f) => f.set_theme(theme),
+        }
+        for m in self.warm.values_mut() {
+            m.set_theme(theme);
+        }
     }
 
     /// The fleet's per-tile preview-frame cache stats, if a fleet is present (`None`
@@ -599,10 +619,11 @@ impl RootModel {
                     // target's mirror if we have one (instant, no re-attach), else
                     // build a fresh model.
                     self.warm.insert(old, *m);
-                    let model = self
-                        .warm
-                        .remove(&id)
-                        .unwrap_or_else(|| TerminalModel::new(id.clone(), 1, 1, self.metrics));
+                    let model = self.warm.remove(&id).unwrap_or_else(|| {
+                        let mut m = TerminalModel::new(id.clone(), 1, 1, self.metrics);
+                        m.set_theme(self.theme);
+                        m
+                    });
                     (model, Vec::new())
                 }
             }
@@ -654,10 +675,11 @@ impl RootModel {
         if let Some(next) = next {
             // Promote its warm mirror to the foreground (already attached and kept
             // resized); the dead model is discarded, never stowed as a mirror.
-            let mut model = self
-                .warm
-                .remove(&next)
-                .unwrap_or_else(|| TerminalModel::new(next.clone(), 1, 1, self.metrics));
+            let mut model = self.warm.remove(&next).unwrap_or_else(|| {
+                let mut m = TerminalModel::new(next.clone(), 1, 1, self.metrics);
+                m.set_theme(self.theme);
+                m
+            });
             let mut cmds = resize_model(&mut model, self.size_px, self.scale);
             self.mode = Mode::Single(Box::new(model));
             self.primary = Some(next);
@@ -671,6 +693,7 @@ impl RootModel {
 
         // Nothing left to show: drop to the fleet overview.
         let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
+        fleet.set_theme(self.theme);
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
         fleet.update(UiEvent::Resize {
             w_px: self.size_px.0.max(1),
@@ -810,7 +833,7 @@ impl RootModel {
                 // Hand the foreground and every warm background mirror to the
                 // fleet, so all of this window's previews are live, not cold.
                 let warm: Vec<TerminalModel> = self.warm.drain().map(|(_, m)| m).collect();
-                let (fleet, mut cmds) = FleetModel::adopting(
+                let (mut fleet, mut cmds) = FleetModel::adopting(
                     *m,
                     warm,
                     self.metrics,
@@ -818,6 +841,7 @@ impl RootModel {
                     self.scale,
                     self.mine.clone(),
                 );
+                fleet.set_theme(self.theme);
                 cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
                 // Dive out, but don't animate yet: the grid we just built only knows
                 // this window's sessions. Wait for the ListSessions reply to assemble

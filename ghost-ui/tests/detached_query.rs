@@ -109,6 +109,39 @@ fn detached_session_answers_decrqm_mode_query() {
 }
 
 #[test]
+fn detached_session_answers_background_color_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "osc11-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The never-attached child asks for the default background (OSC 11 ;?),
+    // the query vim/fzf theme detection rides on. Detached, the host answers
+    // with ghost's default scheme; the ST-terminated reply ends in backslash.
+    let sentinel = xdg.join("osc11-answered");
+    let script = format!(
+        "printf '\\033]11;?\\033\\\\'; \
+         if IFS= read -r -s -d '\\' -t 2 reply; then case \"$reply\" in *'rgb:1010/1010/1212'*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the OSC 11 color query"
+    );
+}
+
+#[test]
 fn detached_session_answers_xtversion_query() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

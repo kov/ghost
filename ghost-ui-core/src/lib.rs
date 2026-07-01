@@ -22,6 +22,8 @@ pub mod terminal;
 pub use cmd::Cmd;
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
 pub use fleet::{FleetModel, Locality};
+/// The scheme's default fg/bg the models report to OSC 10/11 color queries.
+pub use ghost_vt::query::ThemeColors;
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{

@@ -688,6 +688,15 @@ impl Graphics {
     }
 }
 
+/// The scheme's default fg/bg handed to the models, so apps that query their
+/// terminal colors (OSC 10/11 — vim, fzf) see the configured theme.
+fn theme_colors(theme: &ghost_renderer::Theme) -> ghost_ui_core::ThemeColors {
+    ghost_ui_core::ThemeColors {
+        fg: theme.fg,
+        bg: theme.bg,
+    }
+}
+
 /// Open a hyperlink in the system handler (`Cmd::OpenUrl` — the model has
 /// already allowlisted the scheme). Spawned detached, with a reaper thread so
 /// the handler process never lingers as a zombie.
@@ -1146,6 +1155,7 @@ impl App {
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
+        root.set_theme(theme_colors(&cfg.theme()));
         apply_anim_ms(&mut root);
         self.windows.insert(
             wid,
@@ -1260,6 +1270,7 @@ impl App {
         };
         let model = TerminalModel::new(name.to_string(), cols, rows, metrics());
         let mut root = RootModel::single(model, metrics(), (w, h));
+        root.set_theme(theme_colors(&cfg.theme()));
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);

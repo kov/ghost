@@ -21,6 +21,7 @@ use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId,
     SceneItem, Style, Transform, layout_frame,
 };
+use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
 use crate::input::{Key, Mods, NamedKey};
@@ -212,6 +213,9 @@ pub struct FleetModel {
     pending: Option<Pending>,
     /// An in-progress inline rename; swallows text/keys into its buffer.
     renaming: Option<Renaming>,
+    /// The scheme's default fg/bg, stamped on every tile model so previews
+    /// answer OSC 10/11 color queries like the single view does.
+    theme: ThemeColors,
     /// Vertical scroll offset in physical pixels (0 = top). The grid lays out at a
     /// readable tile size regardless of session count and scrolls when it overflows
     /// the viewport, rather than shrinking previews to fit.
@@ -301,6 +305,16 @@ impl FleetModel {
             pending: None,
             renaming: None,
             scroll_y: 0.0,
+            theme: ThemeColors::default(),
+        }
+    }
+
+    /// Set the scheme's default fg/bg (for OSC 10/11 color-query replies) on
+    /// every tile model, current and future.
+    pub fn set_theme(&mut self, theme: ThemeColors) {
+        self.theme = theme;
+        for tile in &mut self.tiles {
+            tile.model.set_theme(theme);
         }
     }
 
@@ -555,6 +569,7 @@ impl FleetModel {
         scale: f32,
     ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
         let metrics = self.metrics;
+        let theme = self.theme;
         let mine = self.mine.clone();
         let mut kept = None;
         let mut warm = Vec::new();
@@ -571,7 +586,11 @@ impl FleetModel {
             h_px: size_px.1.max(1),
             scale: scale as f64,
         };
-        let mut model = kept.unwrap_or_else(|| TerminalModel::new(fresh, 1, 1, metrics));
+        let mut model = kept.unwrap_or_else(|| {
+            let mut m = TerminalModel::new(fresh, 1, 1, metrics);
+            m.set_theme(theme);
+            m
+        });
         let mut cmds = model.update(resize.clone());
         for m in &mut warm {
             cmds.append(&mut m.update(resize.clone()));
@@ -686,8 +705,9 @@ impl FleetModel {
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
             } else {
-                let model =
+                let mut model =
                     TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
+                model.set_theme(self.theme);
                 self.push_tile(
                     info.name.clone(),
                     model,
