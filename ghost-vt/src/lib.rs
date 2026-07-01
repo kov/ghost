@@ -23,6 +23,7 @@ pub mod screen;
 pub mod server;
 pub mod session;
 mod signals;
+pub mod terminfo;
 pub mod transport;
 
 /// ghost's terminal-emulator core (`ghost-term`, forked from asciinema's `avt`),
