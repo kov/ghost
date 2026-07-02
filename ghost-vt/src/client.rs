@@ -103,6 +103,92 @@ impl Client {
     }
 }
 
+/// Ready state drained from a [`Subscriber`] by [`pump`](Subscriber::pump).
+#[derive(Debug, Default)]
+pub struct SubscriberPump {
+    /// The one consistent starting state, delivered shortly after connect and
+    /// before any event.
+    pub snapshot: Option<crate::protocol::SessionState>,
+    /// State changes since the snapshot (or the previous pump), in order.
+    pub events: Vec<crate::protocol::SessionEvent>,
+    /// `true` once the subscription has ended — the host exited (socket EOF)
+    /// or the connection failed. No further events will arrive.
+    pub ended: bool,
+}
+
+/// A state-observer connection to a session host: subscribes on connect
+/// ([`ClientMsg::Subscribe`]) and is pushed one snapshot followed by
+/// [`SessionEvent`](crate::protocol::SessionEvent) deltas. An observer is not
+/// a display client — it never resizes the PTY, never steals the display, and
+/// a bell it observes is not "seen". Host death arrives as
+/// [`ended`](SubscriberPump::ended), not an error.
+///
+/// Watch [`as_fd`](Subscriber::as_fd) for readiness (or set a read timeout),
+/// then [`pump`](Subscriber::pump) — the same loop shape as [`Session`].
+pub struct Subscriber {
+    client: Client,
+}
+
+impl Subscriber {
+    /// Subscribe to the named session (resolved via the XDG paths).
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] when the host predates
+    /// subscriptions ([`PROTO_SUBSCRIBE`](crate::protocol::PROTO_SUBSCRIBE));
+    /// callers fall back to polling the session's marker files.
+    pub fn connect(name: &str) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect(name)?)
+    }
+
+    /// Subscribe to a session whose control socket is at `sock`.
+    pub fn connect_path(sock: &Path) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect_path(sock)?)
+    }
+
+    fn from_client(mut client: Client) -> io::Result<Subscriber> {
+        if client.proto() < crate::protocol::PROTO_SUBSCRIBE {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host predates subscriptions; poll its markers instead",
+            ));
+        }
+        client.send(&ClientMsg::Subscribe)?;
+        Ok(Subscriber { client })
+    }
+
+    /// The connection's file descriptor, for a poll/event-loop watch.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.client.as_fd()
+    }
+
+    /// Bound how long a [`pump`](Subscriber::pump) read waits for data; `None`
+    /// restores blocking until readable.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.client.set_read_timeout(timeout)
+    }
+
+    /// Drain whatever state is ready now. Any read failure ends the
+    /// subscription (reported via [`ended`](SubscriberPump::ended)) — for an
+    /// observer, a broken connection and a dead host mean the same thing.
+    pub fn pump(&mut self) -> io::Result<SubscriberPump> {
+        let mut pump = SubscriberPump::default();
+        match self.client.recv_ready() {
+            Ok(Some(msgs)) => {
+                for msg in msgs {
+                    match msg {
+                        ServerMsg::Snapshot(state) => pump.snapshot = Some(state),
+                        ServerMsg::Event(e) => pump.events.push(e),
+                        // Output/exit frames are display-client traffic; a pure
+                        // subscriber connection never receives them.
+                        _ => {}
+                    }
+                }
+            }
+            Ok(None) | Err(_) => pump.ended = true,
+        }
+        Ok(pump)
+    }
+}
+
 /// Ready output drained from a [`Session`] by [`pump`](Session::pump).
 #[derive(Debug, Default)]
 pub struct Pump {

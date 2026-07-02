@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ghost_vt::client::Client;
+use ghost_vt::client::{Client, Subscriber};
 use ghost_vt::protocol::{
     AttachInfo, ClientMsg, PROTO_SUBSCRIBE, ServerMsg, SessionEvent, SessionState,
 };
@@ -120,6 +120,58 @@ fn recv_events_until(
         }
     }
     assert!(pred(seen), "expected event did not arrive; got {seen:?}");
+}
+
+#[test]
+fn the_subscriber_api_delivers_the_snapshot_then_events_then_eof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "subscriber-api-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    let session_dir = spawn_session(xdg, name, "sleep 60");
+    let sock = session_dir.join("sock");
+
+    // The typed observer wrapper: connects, verifies the host serves
+    // subscriptions, and subscribes in one step.
+    let mut sub = Subscriber::connect_path(&sock).expect("subscriber connect");
+    sub.set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+
+    // First pump(s) deliver the snapshot.
+    let mut snapshot = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let p = sub.pump().unwrap();
+            snapshot = snapshot.take().or(p.snapshot);
+            snapshot.is_some()
+        }),
+        "no snapshot delivered"
+    );
+    assert_eq!(snapshot.unwrap().attached, None);
+
+    // A display client attaching arrives as a pushed event.
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    let mut events = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            events.extend(sub.pump().unwrap().events);
+            events.contains(&SessionEvent::Attached(AttachInfo { client: None }))
+        }),
+        "no Attached event; got {events:?}"
+    );
+
+    // Killing the session ends the subscription: pump reports it ended.
+    drop(display);
+    let out = ghost(xdg).args(["kill", name]).output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        wait_until(Duration::from_secs(5), || sub.pump().unwrap().ended),
+        "subscription did not observe the host's death as EOF"
+    );
 }
 
 #[test]
