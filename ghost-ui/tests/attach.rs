@@ -742,6 +742,59 @@ fn cli_rename_does_not_disturb_attached_client() {
 }
 
 #[test]
+fn rename_is_refused_for_a_host_predating_label_renames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "elder-old";
+    let new = "elder-fresh";
+    let _g = KillOnDrop { xdg, name: old };
+
+    let out = ghost(xdg)
+        .args(["new", old, "-d", "--", "sh", "-c", "exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(old)),
+        "session not listed"
+    );
+
+    // Masquerade as a host built before label renames (proto level 1, the Theme
+    // era): such a host would MOVE the session directory on Rename — the exact
+    // file churn that detaches clients and strands stale ids in windows. The
+    // client must refuse rather than trigger it. (Level 0 — no marker at all —
+    // is the same refusal path.)
+    let dir = xdg.join("run/ghost").join(old);
+    std::fs::write(dir.join("proto"), "1").unwrap();
+
+    let out = ghost(xdg).args(["rename", old, new]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "renaming an old host must be refused, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("restart"),
+        "the refusal should tell the user to restart the session: {err}"
+    );
+    // Nothing changed: same name listed, no directory for the new name.
+    assert!(
+        ls(xdg).contains(old),
+        "the session kept its name: {}",
+        ls(xdg)
+    );
+    assert!(
+        !xdg.join("run/ghost").join(new).exists(),
+        "no rename side effects on disk"
+    );
+}
+
+#[test]
 fn rename_moves_no_files_and_keeps_the_attach_marker() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

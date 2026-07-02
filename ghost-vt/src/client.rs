@@ -52,14 +52,9 @@ impl Client {
 
     /// Connect to a session whose control socket is at `sock`.
     pub fn connect_path(sock: &Path) -> io::Result<Self> {
-        let proto = sock
-            .parent()
-            .and_then(|dir| std::fs::read_to_string(dir.join("proto")).ok())
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
         Ok(Client {
             conn: Conn::connect(sock)?,
-            proto,
+            proto: proto_at(sock),
         })
     }
 
@@ -68,6 +63,28 @@ impl Client {
         self.conn.as_fd()
     }
 
+    /// The host's declared protocol feature level (0 for a pre-marker host).
+    pub fn proto(&self) -> u32 {
+        self.proto
+    }
+}
+
+/// The protocol feature level declared by the host whose socket is at `sock`,
+/// read from the session dir's `proto` marker (0 when absent — a host built
+/// before the marker existed).
+fn proto_at(sock: &Path) -> u32 {
+    sock.parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("proto")).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The named session's declared protocol feature level (see [`proto_at`]).
+fn session_proto(name: &str) -> u32 {
+    proto_at(&paths::socket_path(name))
+}
+
+impl Client {
     /// Send a message to the host.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
         self.conn.send(msg)
@@ -333,7 +350,19 @@ pub fn attach(name: &str) -> io::Result<()> {
 /// returning the host's verdict. A label change only — the session's files and
 /// attach state are untouched — and sent over a control connection (no resize),
 /// so any attached client is left undisturbed.
+///
+/// Refused for a host predating label renames (see
+/// [`PROTO_RENAME_LABEL`](crate::protocol::PROTO_RENAME_LABEL)): such a host
+/// would move the session's files, detaching clients — the very churn the
+/// label design removed.
 pub fn rename(old: &str, new: &str) -> io::Result<()> {
+    if session_proto(old) < crate::protocol::PROTO_RENAME_LABEL {
+        return Err(io::Error::other(format!(
+            "session '{old}' is hosted by an older ghost that would move its \
+             files to rename it (detaching clients); restart the session to \
+             rename it safely"
+        )));
+    }
     let mut conn = Conn::connect(&paths::socket_path(old))
         .map_err(|e| io::Error::new(e.kind(), format!("cannot reach session '{old}': {e}")))?;
     conn.send(&ClientMsg::Rename(new.to_string()))?;
@@ -399,6 +428,17 @@ fn prompt_input(
             b'\r' | b'\n' => {
                 let name = prompt.as_ref().unwrap().buf.trim().to_string();
                 if name.is_empty() {
+                    continue;
+                }
+                // A host predating label renames would move the session's files
+                // (detaching us); refuse in the prompt rather than trigger it.
+                if client.proto() < crate::protocol::PROTO_RENAME_LABEL {
+                    render_prompt(
+                        &mut out,
+                        fd,
+                        &name,
+                        Some("host too old; restart the session to rename"),
+                    )?;
                     continue;
                 }
                 client.send(&ClientMsg::Rename(name))?;

@@ -58,12 +58,19 @@ pub enum ServerMsg {
 /// running host understands — hosts are long-lived daemons that keep executing
 /// the binary that spawned them, and one built before a message existed treats
 /// it as a connection error and drops the client. A missing file reads as
-/// level 0. Bump this when appending a message clients send unprompted, and
-/// add a `PROTO_*` gate constant for it.
-pub const PROTO_LEVEL: u32 = 1;
+/// level 0. Bump this when appending a message clients send unprompted — or
+/// when an existing message's *semantics* change in a way clients must gate on
+/// — and add a `PROTO_*` constant for it.
+pub const PROTO_LEVEL: u32 = 2;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
+
+/// Feature level at which [`ClientMsg::Rename`] sets a display-name label.
+/// Hosts below this level MOVE the session directory instead — file churn that
+/// detaches clients and strands the old id in every attached window — so
+/// clients refuse to send them a rename rather than trigger it.
+pub const PROTO_RENAME_LABEL: u32 = 2;
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.

@@ -914,8 +914,12 @@ impl App {
                     name,
                 } => {
                     // A control connection rename — works whether or not this
-                    // window holds the session.
-                    let _ = ghost_vt::client::rename(&target, &name);
+                    // window holds the session. On refusal (e.g. a host too old
+                    // for label renames) the fleet's optimistic label reverts on
+                    // the next reconcile; log the reason it didn't stick.
+                    if let Err(e) = ghost_vt::client::rename(&target, &name) {
+                        eprintln!("ghost: rename failed: {e}");
+                    }
                 }
                 Cmd::Spawn { name, command } => {
                     spawn_session(&name, command);
