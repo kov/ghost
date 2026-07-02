@@ -72,10 +72,12 @@ const OVERLAY_BG: Rgba = [0.04, 0.04, 0.06, 0.82];
 const OVERLAY_FG: Rgba = [0.92, 0.94, 0.97, 1.0];
 /// Confirm-modal text is emphasized 50% over the terminal font size.
 const MODAL_SCALE: f32 = 1.5;
-/// Confirm-modal button chips: the action reads red (it kills or steals a
-/// session), the safe cancel green; the selected chip carries the focus ring.
-const CONFIRM_BUTTON_BG: Rgba = [0.52, 0.15, 0.15, 1.0];
-const CANCEL_BUTTON_BG: Rgba = [0.13, 0.38, 0.20, 1.0];
+/// Confirm-modal button chips: red for a destructive action (kill), green
+/// for a simple confirmation (take over), neutral grey for the safe cancel;
+/// the selected chip carries the focus ring.
+const DESTRUCTIVE_BUTTON_BG: Rgba = [0.52, 0.15, 0.15, 1.0];
+const AFFIRM_BUTTON_BG: Rgba = [0.13, 0.38, 0.20, 1.0];
+const CANCEL_BUTTON_BG: Rgba = [0.24, 0.26, 0.31, 1.0];
 /// How often (ms) the fleet asks the shell to re-enumerate sessions.
 const REFRESH_MS: u64 = 500;
 
@@ -1609,8 +1611,12 @@ impl FleetModel {
                 color: OVERLAY_FG,
                 scale: MODAL_SCALE,
             });
+            let confirm_bg = match p.action {
+                PendingAction::Kill => DESTRUCTIVE_BUTTON_BG,
+                PendingAction::TakeOver => AFFIRM_BUTTON_BG,
+            };
             let buttons = [
-                (l.confirm, confirm_label, CONFIRM_BUTTON_BG, Choice::Confirm),
+                (l.confirm, confirm_label, confirm_bg, Choice::Confirm),
                 (l.cancel, "Cancel", CANCEL_BUTTON_BG, Choice::Cancel),
             ];
             for (rect, label, bg, choice) in buttons {
@@ -2755,8 +2761,9 @@ mod tests {
         );
     }
 
-    /// The confirm chips' rects, read from the view by their colours.
-    fn chip_rects(m: &FleetModel) -> (RectPx, RectPx) {
+    /// The confirm chips' rects, read from the view by their colours; the
+    /// confirm chip's expected colour depends on the pending action.
+    fn chip_rects(m: &FleetModel, confirm_bg: Rgba) -> (RectPx, RectPx) {
         let items = m.view().layers[0].items.clone();
         let find = |color: Rgba| {
             items
@@ -2767,7 +2774,19 @@ mod tests {
                 })
                 .expect("a confirm chip with the expected colour")
         };
-        (find(CONFIRM_BUTTON_BG), find(CANCEL_BUTTON_BG))
+        (find(confirm_bg), find(CANCEL_BUTTON_BG))
+    }
+
+    #[test]
+    fn a_takeover_confirmation_uses_a_green_confirm_button() {
+        let mut m = fleet();
+        let mut a = info("a");
+        a.attached = true; // held by another window -> take-over confirm
+        m.update(UiEvent::SessionList(vec![a]));
+        press(&mut m, "a");
+        // A take-over is a simple confirmation, not destruction: green, with
+        // the grey cancel beside it (chip_rects panics if either is missing).
+        chip_rects(&m, AFFIRM_BUTTON_BG);
     }
 
     #[test]
@@ -2791,7 +2810,7 @@ mod tests {
         assert_eq!(msg.1, MODAL_SCALE, "modal text is emphasized");
         // Red confirm and green cancel chips sit on the line below the
         // question, and the safe cancel is pre-selected (focus ring).
-        let (confirm, cancel) = chip_rects(&m);
+        let (confirm, cancel) = chip_rects(&m, DESTRUCTIVE_BUTTON_BG);
         assert!(
             confirm.y > msg.0.y && cancel.y > msg.0.y,
             "the buttons sit under the question"
@@ -2824,7 +2843,7 @@ mod tests {
         list(&mut m, &["a", "b"]);
         let r = button_rect(&m, "b", Button::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
-        let (confirm, cancel) = chip_rects(&m);
+        let (confirm, cancel) = chip_rects(&m, DESTRUCTIVE_BUTTON_BG);
         // Clicking cancel dismisses without killing.
         let cmds = press_at(&mut m, cancel.x + cancel.w / 2.0, cancel.y + cancel.h / 2.0);
         assert!(
