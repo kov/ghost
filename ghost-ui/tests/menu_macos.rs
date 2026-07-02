@@ -50,10 +50,12 @@ fn menu_dump_lists_the_expected_native_menu_bar() {
         "{dump}"
     );
     // Emoji & Symbols opens the system Character Viewer via AppKit's own
-    // selector — the standard, discoverable entry the Ctrl-Cmd-Space global
-    // shortcut mirrors; insertion then arrives through the IME commit path.
+    // selector, bound to Ctrl-Cmd-Space: the chord is NOT a global hotkey — in
+    // apps where it works it is the key equivalent of their (usually AppKit
+    // auto-added) Edit-menu item, so ours must carry it too. Insertion then
+    // arrives through the IME commit path.
     assert!(
-        dump.contains("Emoji & Symbols\tkey=\taction=orderFrontCharacterPalette:"),
+        dump.contains("Emoji & Symbols\tkey= \taction=orderFrontCharacterPalette:\tmods=ctrl-cmd"),
         "{dump}"
     );
 

@@ -135,7 +135,7 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
     use objc2::{ClassType, DeclaredClass, declare_class, msg_send, msg_send_id, mutability, sel};
-    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
     use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, ns_string};
     use winit::event_loop::EventLoopProxy;
 
@@ -275,16 +275,22 @@ mod imp {
         ));
         edit.addItem(&NSMenuItem::separatorItem(mtm));
         // AppKit's own Character Viewer (the system emoji picker). Nil-targeted:
-        // the responder chain ends at NSApplication, which implements it. No key
-        // equivalent — the system's global Ctrl-Cmd-Space (not a Command chord)
-        // already opens it; this is the discoverable menu entry. The picked
-        // characters arrive through the IME commit path like any composed text.
-        edit.addItem(&native_item(
+        // the responder chain ends at NSApplication, which implements it. Bound
+        // to Ctrl-Cmd-Space: the chord is not a global hotkey — in apps where it
+        // works it is the key equivalent of their (usually AppKit auto-added)
+        // Edit-menu item, so ours must carry it too. The picked characters
+        // arrive through the IME commit path like any composed text.
+        let emoji = native_item(
             mtm,
             ns_string!("Emoji & Symbols"),
             sel!(orderFrontCharacterPalette:),
-            ns_string!(""),
-        ));
+            ns_string!(" "),
+        );
+        emoji.setKeyEquivalentModifierMask(
+            NSEventModifierFlags::NSEventModifierFlagControl
+                | NSEventModifierFlags::NSEventModifierFlagCommand,
+        );
+        edit.addItem(&emoji);
 
         // View: font zoom (Cmd +/-/0) and the fleet overview toggle (F9).
         let view = submenu(mtm, &bar, ns_string!("View"));
@@ -500,7 +506,27 @@ mod imp {
                 .map(|s| s.name().to_string())
                 .unwrap_or_default();
             let indent = "  ".repeat(depth);
-            println!("MENU\t{indent}{title}\tkey={key}\taction={action}");
+            // Non-default modifier masks (AppKit defaults to plain Command) get
+            // a `mods=` suffix, so chords like Ctrl-Cmd-Space are assertable.
+            let mask = unsafe { item.keyEquivalentModifierMask() };
+            let mods = if mask == NSEventModifierFlags::NSEventModifierFlagCommand {
+                String::new()
+            } else {
+                let names = [
+                    (NSEventModifierFlags::NSEventModifierFlagControl, "ctrl"),
+                    (NSEventModifierFlags::NSEventModifierFlagOption, "opt"),
+                    (NSEventModifierFlags::NSEventModifierFlagShift, "shift"),
+                    (NSEventModifierFlags::NSEventModifierFlagCommand, "cmd"),
+                ];
+                let joined = names
+                    .iter()
+                    .filter(|(flag, _)| mask.contains(*flag))
+                    .map(|(_, name)| *name)
+                    .collect::<Vec<_>>()
+                    .join("-");
+                format!("\tmods={joined}")
+            };
+            println!("MENU\t{indent}{title}\tkey={key}\taction={action}{mods}");
             if let Some(sub) = unsafe { item.submenu() } {
                 dump_menu(&sub, depth + 1);
             }
