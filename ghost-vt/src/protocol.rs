@@ -53,6 +53,15 @@ pub enum ClientMsg {
     /// state change until the connection closes. Host death is observed as
     /// EOF on the subscription.
     Subscribe,
+    /// Subscribe *and* receive the session's output, read-only: everything
+    /// [`ClientMsg::Subscribe`] delivers, plus a
+    /// [`SessionEvent::Resized`] carrying the session's real grid, a resync
+    /// of the current screen, and live [`ServerMsg::Output`] thereafter.
+    /// Like a subscriber, an observer never resizes the PTY, never steals
+    /// the display, never spawns a deferred child, and a bell it observes is
+    /// not "seen" — it watches the session exactly as the display client
+    /// shapes it (live fleet previews).
+    Observe,
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -97,6 +106,12 @@ pub enum SessionEvent {
     Activity,
     /// The session's display name changed ([`ClientMsg::Rename`]).
     Renamed(String),
+    /// The session's grid changed (the display client resized the PTY), or —
+    /// as the first event of an observation — its current size. An observer
+    /// re-grids its mirror to `cols`×`rows`; the resync that follows re-seeds
+    /// it. Appended after `PROTO_SUBSCRIBE` shipped: level-3 subscribers skip
+    /// the unknown frame without losing the stream.
+    Resized { cols: u16, rows: u16 },
 }
 
 /// Messages sent from the session host to an attach client.
@@ -142,6 +157,16 @@ pub const PROTO_SUBSCRIBE: u32 = 3;
 
 const _: () = assert!(PROTO_SUBSCRIBE > PROTO_RENAME_LABEL);
 const _: () = assert!(PROTO_LEVEL >= PROTO_SUBSCRIBE);
+
+/// Feature level at which the host serves [`ClientMsg::Observe`] (read-only
+/// output observation) and emits [`SessionEvent::Resized`].
+pub const PROTO_OBSERVE: u32 = 4;
+
+const _: () = assert!(PROTO_OBSERVE > PROTO_SUBSCRIBE);
+// Remove this guard in the change that makes the host serve observation (and
+// bump PROTO_LEVEL there): advertising it earlier would let clients observe a
+// host that silently ignores them.
+const _: () = assert!(PROTO_LEVEL < PROTO_OBSERVE);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
@@ -277,6 +302,62 @@ mod tests {
             r.push(&encode(&msg));
             assert_eq!(r.next_msg::<ServerMsg>().unwrap().unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn roundtrip_observe_surface() {
+        // The observer verb (PROTO_OBSERVE): subscribe-plus-output.
+        let mut r = FrameReader::new();
+        r.push(&encode(&ClientMsg::Observe));
+        assert_eq!(
+            r.next_msg::<ClientMsg>().unwrap().unwrap(),
+            ClientMsg::Observe
+        );
+
+        let resized = ServerMsg::Event(SessionEvent::Resized {
+            cols: 155,
+            rows: 42,
+        });
+        let mut r = FrameReader::new();
+        r.push(&encode(&resized));
+        assert_eq!(r.next_msg::<ServerMsg>().unwrap().unwrap(), resized);
+    }
+
+    #[test]
+    fn a_proto3_subscriber_skips_a_resized_event_without_losing_sync() {
+        // `Resized` was appended to SessionEvent after PROTO_SUBSCRIBE shipped:
+        // a subscriber built at level 3 must skip the unknown frame and keep
+        // decoding the events it knows.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum OldSessionEvent {
+            Bell,
+            TitleChanged(String),
+            Attached(AttachInfo),
+            Detached,
+            Activity,
+            Renamed(String),
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum OldServerMsg {
+            Output(Vec<u8>),
+            Exited(i32),
+            RenameResult { ok: bool, message: String },
+            Snapshot(SessionState),
+            Event(OldSessionEvent),
+        }
+
+        let mut bytes = encode(&ServerMsg::Event(SessionEvent::Resized {
+            cols: 80,
+            rows: 24,
+        }));
+        bytes.extend_from_slice(&encode(&ServerMsg::Event(SessionEvent::Bell)));
+        let mut r = FrameReader::new();
+        r.push(&bytes);
+        assert_eq!(
+            r.next_msg::<OldServerMsg>().unwrap().unwrap(),
+            OldServerMsg::Event(OldSessionEvent::Bell),
+            "the unknown Resized frame is skipped and the Bell decodes"
+        );
     }
 
     #[test]

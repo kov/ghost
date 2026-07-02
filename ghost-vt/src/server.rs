@@ -939,6 +939,11 @@ fn handle_client_messages(
                 }));
                 c.subscribed = true;
             }
+            ClientMsg::Observe => {
+                // Observation surface (PROTO_OBSERVE), not served yet: the
+                // host doesn't advertise the level, so nothing should send
+                // this; tolerate it rather than dropping the client.
+            }
         }
     }
     Ok(Disposition::Keep)

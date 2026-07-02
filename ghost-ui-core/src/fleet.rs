@@ -878,6 +878,9 @@ impl FleetModel {
                 }
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
+            // Handled once the fleet observes foreign sessions (re-grids the
+            // observed tile's mirror); inert until then.
+            SessionPush::Event(SessionEvent::Resized { .. }) => {}
         }
         if dirty { vec![Cmd::Redraw] } else { Vec::new() }
     }
