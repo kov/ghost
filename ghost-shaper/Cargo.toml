@@ -11,7 +11,14 @@ publish = false
 ghost-render = { path = "../ghost-render" }
 # Pure-Rust OpenType shaping (applies ligatures) + deterministic outline raster.
 swash = "0.2"
+# COLRv1 color-glyph rasterization (the format modern Noto Color Emoji ships
+# as, which swash cannot paint): skrifa traverses the paint graph, tiny-skia
+# rasterizes it. swash still covers bitmap strikes (CBDT/sbix) and COLRv0.
+skrifa = "0.43"
+tiny-skia = "0.12"
 
 # The tests bundle Fira Code (tests/assets/FiraCode-Regular.ttf, SIL OFL-1.1 —
 # see the LICENSE file alongside it) as a fixed, ligature-bearing fixture so
-# glyph goldens are reproducible without depending on system fonts.
+# glyph goldens are reproducible without depending on system fonts. The color
+# tests bundle a two-glyph Noto Color Emoji COLRv1 subset the same way (also
+# OFL-1.1; see tests/assets/README.md for how it was generated).

@@ -12,9 +12,12 @@
 //! [swash]: https://docs.rs/swash
 
 use ghost_render::{CellMetrics, Run};
-use swash::scale::{Render, ScaleContext, Source};
+use swash::scale::image::Content;
+use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::shape::ShapeContext;
 use swash::zeno::{Angle, Format, Transform};
+
+mod colr;
 
 pub use swash::FontRef;
 
@@ -37,6 +40,57 @@ pub struct GlyphBitmap {
     pub height: u32,
     /// Row-major coverage, `width * height` bytes.
     pub coverage: Vec<u8>,
+}
+
+/// A straight-alpha RGBA bitmap for one *color* glyph (emoji), positioned like
+/// [`GlyphBitmap`] relative to the pen origin (`left`/`top`, y-up). Straight
+/// (non-premultiplied) alpha — the convention of the renderer's image
+/// textures, whose shader premultiplies at sample time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColorGlyphBitmap {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Row-major straight-alpha RGBA, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+}
+
+/// Rasterize a glyph's *color* form, if the font has one: a COLRv1 paint graph
+/// (skrifa traversal painted with tiny-skia — the format modern Noto Color
+/// Emoji ships as), COLRv0 layers, or an embedded bitmap strike (CBDT/sbix,
+/// both via swash). Returns `None` for a glyph with no color form; the caller
+/// then falls back to [`rasterize`]'s coverage mask.
+///
+/// Layers that paint in the "current text color" (palette index `0xFFFF`) use
+/// opaque black; real emoji essentially never rely on it, and a fixed choice
+/// keeps the raster cacheable per `(font, glyph, size)` alone.
+pub fn rasterize_color(font: FontRef, glyph: u16, size_px: f32) -> Option<ColorGlyphBitmap> {
+    colr::rasterize_colrv1(font, glyph, size_px)
+        .or_else(|| rasterize_color_swash(font, glyph, size_px))
+}
+
+/// The swash half of [`rasterize_color`]: COLRv0 layer stacks and embedded
+/// bitmap strikes. Listed color sources only — a plain outline font falls
+/// through to `None` rather than producing a mask dressed up as color.
+fn rasterize_color_swash(font: FontRef, glyph: u16, size_px: f32) -> Option<ColorGlyphBitmap> {
+    let mut ctx = ScaleContext::new();
+    let mut scaler = ctx.builder(font).size(size_px).hint(false).build();
+    let image = Render::new(&[
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+    ])
+    .render(&mut scaler, glyph)?;
+    if image.content != Content::Color {
+        return None;
+    }
+    Some(ColorGlyphBitmap {
+        left: image.placement.left,
+        top: image.placement.top,
+        width: image.placement.width,
+        height: image.placement.height,
+        rgba: image.data,
+    })
 }
 
 /// Parse a font face (index 0) from its raw bytes.

@@ -8,7 +8,9 @@
 //! `assets/FiraCode-LICENSE-OFL.txt`), a fixed ligature-bearing font so these
 //! never depend on whatever fonts a machine happens to have installed.
 
-use ghost_shaper::{FontRef, FontSet, Synthesis, font_from_bytes, glyph_id, rasterize, shape};
+use ghost_shaper::{
+    FontRef, FontSet, Synthesis, font_from_bytes, glyph_id, rasterize, rasterize_color, shape,
+};
 
 const FIRA: &[u8] = include_bytes!("assets/FiraCode-Regular.ttf");
 
@@ -303,4 +305,99 @@ fn only_italic_uses_it_and_synthesizes_the_weight() {
             }
         )
     );
+}
+
+// ---- Color glyph rasterization (emoji) -------------------------------------
+//
+// Fixture: `assets/NotoColorEmoji-COLRv1-subset.ttf` — Noto Color Emoji
+// (COLRv1 build, SIL OFL-1.1; see `assets/NotoColorEmoji-LICENSE-OFL.txt`)
+// subset to U+1F92A 🤪 and U+2B50 ⭐ so the paint-graph raster is reproducible
+// without depending on system fonts. Its graph exercises layers, glyph clips,
+// solid fills, transforms, and linear + radial gradients.
+
+const NOTO_EMOJI: &[u8] = include_bytes!("assets/NotoColorEmoji-COLRv1-subset.ttf");
+
+fn emoji_font() -> FontRef<'static> {
+    font_from_bytes(NOTO_EMOJI).expect("parse bundled Noto Color Emoji subset")
+}
+
+/// Distinct opaque-ish RGB values in a straight-alpha RGBA bitmap. A colorful
+/// emoji has many; anything monochrome collapses to one (plus antialiased
+/// edges, which the alpha threshold filters out).
+fn distinct_colors(rgba: &[u8]) -> std::collections::HashSet<[u8; 3]> {
+    rgba.chunks_exact(4)
+        .filter(|px| px[3] > 200)
+        .map(|px| [px[0], px[1], px[2]])
+        .collect()
+}
+
+#[test]
+fn colrv1_emoji_rasterizes_in_color() {
+    let font = emoji_font();
+    let gid = glyph_id(font, '\u{1F92A}');
+    assert_ne!(gid, 0, "subset covers the zany face");
+
+    let bmp = rasterize_color(font, gid, 32.0).expect("a COLRv1 glyph rasterizes in color");
+    assert!(bmp.width > 0 && bmp.height > 0);
+    assert!(
+        bmp.width <= 128 && bmp.height <= 128,
+        "a 32px raster stays glyph-sized, got {}x{}",
+        bmp.width,
+        bmp.height
+    );
+    assert_eq!(bmp.rgba.len(), (bmp.width * bmp.height * 4) as usize);
+
+    let colors = distinct_colors(&bmp.rgba);
+    assert!(
+        colors.len() >= 4,
+        "a color emoji carries several distinct hues, got {}",
+        colors.len()
+    );
+    // The zany face is dominated by the yellow head: some strongly yellow
+    // pixel (red and green high, blue well below) must be present.
+    assert!(
+        colors
+            .iter()
+            .any(|c| c[0] > 180 && c[1] > 120 && c[2] < 100),
+        "expected the yellow face among {colors:?}"
+    );
+}
+
+#[test]
+fn both_subset_emoji_rasterize() {
+    let font = emoji_font();
+    for (ch, name) in [('\u{1F92A}', "zany face"), ('\u{2B50}', "star")] {
+        let gid = glyph_id(font, ch);
+        let bmp = rasterize_color(font, gid, 24.0)
+            .unwrap_or_else(|| panic!("{name} rasterizes in color"));
+        let covered = bmp.rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(
+            covered > (bmp.width * bmp.height / 4) as usize,
+            "{name} paints a substantial part of its box"
+        );
+    }
+}
+
+#[test]
+fn color_raster_scales_with_size() {
+    let font = emoji_font();
+    let gid = glyph_id(font, '\u{2B50}');
+    let small = rasterize_color(font, gid, 16.0).expect("16px");
+    let large = rasterize_color(font, gid, 64.0).expect("64px");
+    assert!(
+        large.width >= small.width * 3 && large.height >= small.height * 3,
+        "raster tracks the requested size: {}x{} vs {}x{}",
+        small.width,
+        small.height,
+        large.width,
+        large.height
+    );
+}
+
+#[test]
+fn color_raster_of_a_text_font_is_none() {
+    // Fira Code has no color tables: the color path declines, so the caller
+    // falls through to the normal coverage-mask raster.
+    let font = font();
+    assert!(rasterize_color(font, glyph_id(font, 'A'), 32.0).is_none());
 }

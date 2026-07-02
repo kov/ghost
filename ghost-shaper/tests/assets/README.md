@@ -15,3 +15,12 @@
   it carries glyphs Fira Code lacks (e.g. ★ U+2605, ❤ U+2764), so a font-fallback
   test can prove an uncovered char is drawn from a fallback face instead of the
   `.notdef` box. Not shipped in any ghost binary.
+- **`NotoColorEmoji-COLRv1-subset.ttf`** —
+  [Noto Color Emoji](https://github.com/googlefonts/noto-emoji) (COLRv1 build),
+  © Google, licensed under the **SIL Open Font License 1.1**
+  (`NotoColorEmoji-LICENSE-OFL.txt`), subset to U+1F92A 🤪 and U+2B50 ⭐ with
+  `pyftsubset Noto-COLRv1.ttf --unicodes=U+1F92A,U+2B50 --no-hinting
+  --name-IDs='*'` (fonttools 4.63). A fixed COLRv1 fixture whose paint graphs
+  exercise layers, glyph clips, solid fills, transforms, and linear + radial
+  gradients, so the color-raster tests are reproducible without depending on
+  system fonts. Not shipped in any ghost binary.
