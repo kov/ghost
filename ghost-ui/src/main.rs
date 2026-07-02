@@ -537,18 +537,31 @@ fn interactive() {
 /// Pick a surface alpha mode. Our pipeline emits premultiplied alpha, so for a
 /// translucent window we want `PreMultiplied` (and `Inherit`/`Auto`, which defer
 /// to a premultiplied compositor); `PostMultiplied` would expect straight alpha
-/// and wash the colours, so it is never chosen. A capability list always has at
-/// least one entry, and an opaque window just takes the first (usually Opaque).
+/// and wash the colours, so it is normally declined.
+///
+/// Metal is the exception: its capability list is exactly
+/// `[Opaque, PostMultiplied]`, and choosing `PostMultiplied` does nothing but
+/// `CAMetalLayer.isOpaque = false` (wgpu-hal performs no conversion) — while
+/// Core Animation *always* composites layer content as premultiplied. So on
+/// that backend `PostMultiplied` is a mislabel for the premultiplied semantics
+/// we want, and refusing it is what kept macOS windows opaque.
+///
+/// A capability list always has at least one entry, and an opaque window just
+/// takes the first (usually Opaque).
 fn choose_alpha_mode(
     modes: &[wgpu::CompositeAlphaMode],
     want_transparent: bool,
+    backend: wgpu::Backend,
 ) -> wgpu::CompositeAlphaMode {
-    use wgpu::CompositeAlphaMode::{Auto, Inherit, PreMultiplied};
+    use wgpu::CompositeAlphaMode::{Auto, Inherit, PostMultiplied, PreMultiplied};
     if want_transparent {
         for preferred in [PreMultiplied, Inherit, Auto] {
             if modes.contains(&preferred) {
                 return preferred;
             }
+        }
+        if backend == wgpu::Backend::Metal && modes.contains(&PostMultiplied) {
+            return PostMultiplied;
         }
         eprintln!("ghost-ui: no premultiplied alpha mode; window will stay opaque");
     }
@@ -667,7 +680,11 @@ impl Graphics {
             height: win.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: choose_alpha_mode(&caps.alpha_modes, want_transparent),
+            alpha_mode: choose_alpha_mode(
+                &caps.alpha_modes,
+                want_transparent,
+                adapter.get_info().backend,
+            ),
             view_formats: vec![],
         };
         surface.configure(&device, &config);
@@ -2309,16 +2326,31 @@ mod tests {
 
     #[test]
     fn alpha_mode_prefers_premultiplied_when_transparent() {
+        use wgpu::Backend::{Metal, Vulkan};
         // The compositor offers premultiplied: take it.
         assert_eq!(
-            choose_alpha_mode(&[Opaque, PreMultiplied], true),
+            choose_alpha_mode(&[Opaque, PreMultiplied], true, Vulkan),
             PreMultiplied
         );
         // Only straight (post) alpha is offered — it would wash our premultiplied
         // output, so we decline and stay opaque (the first mode) instead.
-        assert_eq!(choose_alpha_mode(&[Opaque, PostMultiplied], true), Opaque);
+        assert_eq!(
+            choose_alpha_mode(&[Opaque, PostMultiplied], true, Vulkan),
+            Opaque
+        );
+        // Metal is the exception: Core Animation always composites layer content
+        // as premultiplied, and wgpu's Metal "PostMultiplied" merely un-opaques
+        // the layer — so it IS our premultiplied mode there (Metal never offers
+        // PreMultiplied at all: [Opaque, PostMultiplied] is its whole list).
+        assert_eq!(
+            choose_alpha_mode(&[Opaque, PostMultiplied], true, Metal),
+            PostMultiplied
+        );
         // An opaque window ignores transparency entirely.
-        assert_eq!(choose_alpha_mode(&[Opaque, PreMultiplied], false), Opaque);
+        assert_eq!(
+            choose_alpha_mode(&[Opaque, PreMultiplied], false, Metal),
+            Opaque
+        );
     }
 
     #[test]
