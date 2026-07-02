@@ -111,6 +111,12 @@ pub struct SubscriberPump {
     pub snapshot: Option<crate::protocol::SessionState>,
     /// State changes since the snapshot (or the previous pump), in order.
     pub events: Vec<crate::protocol::SessionEvent>,
+    /// Mirrored session output, in arrival order — only for a connection
+    /// opened with [`Subscriber::observe`]; always empty on a plain
+    /// subscription. Feed it to an emulator sized by the latest
+    /// [`SessionEvent::Resized`](crate::protocol::SessionEvent::Resized)
+    /// (which precedes any output).
+    pub output: Vec<u8>,
     /// `true` once the subscription has ended — the host exited (socket EOF)
     /// or the connection failed. No further events will arrive.
     pub ended: bool,
@@ -136,22 +142,39 @@ impl Subscriber {
     /// subscriptions ([`PROTO_SUBSCRIBE`](crate::protocol::PROTO_SUBSCRIBE));
     /// callers fall back to polling the session's marker files.
     pub fn connect(name: &str) -> io::Result<Subscriber> {
-        Self::from_client(Client::connect(name)?)
+        Self::from_client(Client::connect(name)?, ClientMsg::Subscribe)
     }
 
     /// Subscribe to a session whose control socket is at `sock`.
     pub fn connect_path(sock: &Path) -> io::Result<Subscriber> {
-        Self::from_client(Client::connect_path(sock)?)
+        Self::from_client(Client::connect_path(sock)?, ClientMsg::Subscribe)
     }
 
-    fn from_client(mut client: Client) -> io::Result<Subscriber> {
-        if client.proto() < crate::protocol::PROTO_SUBSCRIBE {
+    /// Observe the named session: subscribe *and* mirror its output
+    /// read-only ([`ClientMsg::Observe`] — live previews). Fails with
+    /// [`io::ErrorKind::Unsupported`] when the host predates observation
+    /// ([`PROTO_OBSERVE`](crate::protocol::PROTO_OBSERVE)).
+    pub fn observe(name: &str) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect(name)?, ClientMsg::Observe)
+    }
+
+    /// Observe a session whose control socket is at `sock`.
+    pub fn observe_path(sock: &Path) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect_path(sock)?, ClientMsg::Observe)
+    }
+
+    fn from_client(mut client: Client, verb: ClientMsg) -> io::Result<Subscriber> {
+        let needed = match verb {
+            ClientMsg::Observe => crate::protocol::PROTO_OBSERVE,
+            _ => crate::protocol::PROTO_SUBSCRIBE,
+        };
+        if client.proto() < needed {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "host predates subscriptions; poll its markers instead",
+                "host predates this subscription verb; poll its markers instead",
             ));
         }
-        client.send(&ClientMsg::Subscribe)?;
+        client.send(&verb)?;
         // Never block: a shell pumps a whole pool of subscriptions on its loop
         // cadence, and even a millisecond's read timeout per idle subscription
         // would add up to real latency.
@@ -175,9 +198,10 @@ impl Subscriber {
                     match msg {
                         ServerMsg::Snapshot(state) => pump.snapshot = Some(state),
                         ServerMsg::Event(e) => pump.events.push(e),
-                        // Output/exit frames are display-client traffic; a pure
-                        // subscriber connection never receives them.
-                        _ => {}
+                        // Mirrored output (observe connections only; a plain
+                        // subscription never receives it).
+                        ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
+                        ServerMsg::Exited(_) | ServerMsg::RenameResult { .. } => {}
                     }
                 }
             }

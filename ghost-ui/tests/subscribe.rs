@@ -173,6 +173,40 @@ fn the_subscriber_api_delivers_the_snapshot_then_events_then_eof() {
 }
 
 #[test]
+fn the_observer_api_delivers_grid_then_screen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observer-api-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    let session_dir = spawn_session(xdg, name, "printf 'OBSERVED'; sleep 60");
+    let sock = session_dir.join("sock");
+
+    let mut obs = Subscriber::observe_path(&sock).expect("observer connect");
+    let mut snapshot = None;
+    let mut vt: Option<ghost_vt::screen::Screen> = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let p = obs.pump().unwrap();
+            snapshot = snapshot.take().or(p.snapshot);
+            for e in p.events {
+                if let SessionEvent::Resized { cols, rows } = e {
+                    vt = Some(ghost_vt::screen::Screen::new(cols, rows, 0));
+                }
+            }
+            if let Some(vt) = vt.as_mut() {
+                vt.feed(&p.output);
+            }
+            snapshot.is_some()
+                && vt
+                    .as_ref()
+                    .is_some_and(|v| v.text().join("\n").contains("OBSERVED"))
+        }),
+        "the observer API did not deliver snapshot + grid + screen"
+    );
+}
+
+#[test]
 fn a_subscriber_is_pushed_state_events_as_the_session_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
