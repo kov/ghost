@@ -3405,9 +3405,19 @@ impl Renderer {
                         runs,
                         metrics,
                         color,
+                        scale,
                         ..
                     } => {
-                        let t = self.text_instances(*rect, runs, *metrics, *color, font, size_px);
+                        // The item's scale sizes the glyphs; its (pre-scaled)
+                        // metrics position them, so the two stay in step.
+                        let t = self.text_instances(
+                            *rect,
+                            runs,
+                            *metrics,
+                            *color,
+                            font,
+                            size_px * scale,
+                        );
                         push_glyphs(&mut all, &mut draws, scissor, t);
                     }
                 }

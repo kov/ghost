@@ -67,14 +67,27 @@ const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
 const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
 const BUTTON_BG: Rgba = [0.17, 0.19, 0.24, 1.0];
 const BUTTON_FG: Rgba = [0.80, 0.83, 0.89, 1.0];
-/// Confirm-overlay colours (a scrim and its prompt text).
+/// Confirm-overlay colours (a scrim, its prompt text, and the choice buttons).
 const OVERLAY_BG: Rgba = [0.04, 0.04, 0.06, 0.82];
 const OVERLAY_FG: Rgba = [0.92, 0.94, 0.97, 1.0];
+/// Confirm-modal text is emphasized 50% over the terminal font size.
+const MODAL_SCALE: f32 = 1.5;
+/// Confirm-modal button chips: the action reads red (it kills or steals a
+/// session), the safe cancel green; the selected chip carries the focus ring.
+const CONFIRM_BUTTON_BG: Rgba = [0.52, 0.15, 0.15, 1.0];
+const CANCEL_BUTTON_BG: Rgba = [0.13, 0.38, 0.20, 1.0];
 /// How often (ms) the fleet asks the shell to re-enumerate sessions.
 const REFRESH_MS: u64 = 500;
 
 /// A laid-out tile: stable handle, session id, and pixel rect.
 type Placement = (u64, SessionId, RectPx);
+
+/// The confirm modal's geometry: the message line and the two choice buttons.
+struct ConfirmLayout {
+    message: RectPx,
+    confirm: RectPx,
+    cancel: RectPx,
+}
 /// A section header: its locality and the header band's rect.
 type SectionHeader = (Locality, RectPx);
 
@@ -100,6 +113,25 @@ impl Button {
 struct Pending {
     id: SessionId,
     action: PendingAction,
+    /// Which button holds keyboard focus; starts on Cancel (the safe choice),
+    /// so plain Enter never destroys anything.
+    selected: Choice,
+}
+
+/// The confirm modal's two buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Choice {
+    Confirm,
+    Cancel,
+}
+
+impl Choice {
+    fn other(self) -> Choice {
+        match self {
+            Choice::Confirm => Choice::Cancel,
+            Choice::Cancel => Choice::Confirm,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1124,6 +1156,7 @@ impl FleetModel {
                 self.pending = Some(Pending {
                     id,
                     action: PendingAction::TakeOver,
+                    selected: Choice::Cancel,
                 });
                 vec![Cmd::Redraw]
             }
@@ -1141,6 +1174,7 @@ impl FleetModel {
                 self.pending = Some(Pending {
                     id,
                     action: PendingAction::Kill,
+                    selected: Choice::Cancel,
                 });
                 vec![Cmd::Redraw]
             }
@@ -1162,29 +1196,129 @@ impl FleetModel {
         }
     }
 
-    /// Keyboard for the confirm dialog: Enter runs the pending action, Escape
-    /// cancels it.
+    /// Input for the confirm dialog. The arrows (or Tab) move the selection
+    /// between the two buttons and Enter chooses the selected one; Space and
+    /// Escape remain the direct confirm/cancel chords; a click chooses the
+    /// button under the pointer.
     fn pending_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        let UiEvent::Key { key, kind, .. } = ev else {
-            return Vec::new();
-        };
-        if !kind.is_down() {
-            return Vec::new();
-        }
-        match key {
-            Key::Named(NamedKey::Enter) => {
-                let p = self.pending.take().expect("pending checked by caller");
-                let cmd = match p.action {
-                    PendingAction::TakeOver => Cmd::TakeOver(p.id),
-                    PendingAction::Kill => Cmd::Kill(p.id),
-                };
-                vec![cmd, Cmd::Redraw]
-            }
-            Key::Named(NamedKey::Escape) => {
-                self.pending = None;
-                vec![Cmd::Redraw]
+        match ev {
+            UiEvent::Key { key, kind, .. } if kind.is_down() => match key {
+                Key::Named(NamedKey::Enter) => {
+                    let p = self.pending.as_ref().expect("pending checked by caller");
+                    match p.selected {
+                        Choice::Confirm => self.run_pending(),
+                        Choice::Cancel => {
+                            self.pending = None;
+                            vec![Cmd::Redraw]
+                        }
+                    }
+                }
+                Key::Named(NamedKey::Space) => self.run_pending(),
+                Key::Named(NamedKey::Escape) => {
+                    self.pending = None;
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Tab) => {
+                    let p = self.pending.as_mut().expect("pending checked by caller");
+                    p.selected = p.selected.other();
+                    vec![Cmd::Redraw]
+                }
+                _ => Vec::new(),
+            },
+            UiEvent::Pointer {
+                phase: PointerPhase::Press,
+                pos,
+                ..
+            } => {
+                let p = self.pending.as_ref().expect("pending checked by caller");
+                let (message, confirm_label) = self.confirm_texts(p);
+                let l = self.confirm_layout(&message, confirm_label);
+                let (x, y) = (pos.x as f32, pos.y as f32);
+                if l.confirm.contains(x, y) {
+                    self.run_pending()
+                } else if l.cancel.contains(x, y) {
+                    self.pending = None;
+                    vec![Cmd::Redraw]
+                } else {
+                    Vec::new()
+                }
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Execute the pending action and dismiss the modal.
+    fn run_pending(&mut self) -> Vec<Cmd> {
+        let p = self.pending.take().expect("pending checked by caller");
+        let cmd = match p.action {
+            PendingAction::TakeOver => Cmd::TakeOver(p.id),
+            PendingAction::Kill => Cmd::Kill(p.id),
+        };
+        vec![cmd, Cmd::Redraw]
+    }
+
+    /// The confirm modal's message and confirm-button label, naming the
+    /// session as the user knows it (its display name).
+    fn confirm_texts(&self, p: &Pending) -> (String, &'static str) {
+        let shown = self
+            .tiles
+            .iter()
+            .find(|t| t.id == p.id)
+            .map(|t| t.model.display().to_string())
+            .unwrap_or_else(|| p.id.clone());
+        match p.action {
+            PendingAction::Kill => (format!("Kill {shown}?"), "Kill"),
+            PendingAction::TakeOver => (
+                format!("{shown} is open in another window \u{2014} take it over?"),
+                "Take over",
+            ),
+        }
+    }
+
+    /// Cell metrics of modal text: the terminal cell scaled by [`MODAL_SCALE`].
+    fn modal_metrics(&self) -> CellMetrics {
+        let m = self.effective_metrics();
+        CellMetrics {
+            advance: m.advance * MODAL_SCALE,
+            line_height: m.line_height * MODAL_SCALE,
+        }
+    }
+
+    /// Geometry of the confirm modal, shared by the view and the pointer
+    /// hit-test: the message line with the confirm/cancel buttons centred on
+    /// the line below, the whole block centred in the window.
+    fn confirm_layout(&self, message: &str, confirm_label: &str) -> ConfirmLayout {
+        let m = self.modal_metrics();
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let msg_w = message.chars().count() as f32 * m.advance;
+        let message = RectPx {
+            x: ((w - msg_w) * 0.5).max(0.0),
+            y: ((h - m.line_height * 3.8) * 0.5).max(0.0),
+            w: msg_w.max(1.0),
+            h: m.line_height,
+        };
+        // A chip is its label padded a cell each side; the pair sits a
+        // half-line under the message with a two-cell gap between them.
+        let chip_w = |label: &str| (label.chars().count() as f32 + 2.0) * m.advance;
+        let chip_h = m.line_height * 1.4;
+        let (cw, xw) = (chip_w(confirm_label), chip_w("Cancel"));
+        let gap = m.advance * 2.0;
+        let x0 = ((w - (cw + gap + xw)) * 0.5).max(0.0);
+        let by = message.y + m.line_height * 1.5;
+        ConfirmLayout {
+            message,
+            confirm: RectPx {
+                x: x0,
+                y: by,
+                w: cw,
+                h: chip_h,
+            },
+            cancel: RectPx {
+                x: x0 + cw + gap,
+                y: by,
+                w: xw,
+                h: chip_h,
+            },
         }
     }
 
@@ -1213,6 +1347,15 @@ impl FleetModel {
                 Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
                     if let Some(r) = &mut self.renaming {
                         r.buffer.insert(&s);
+                    }
+                    vec![Cmd::Redraw]
+                }
+                // The space bar is a Named key, not a Char: type it as text.
+                Key::Named(NamedKey::Space)
+                    if !mods.ctrl && !mods.sup && self.preedit.is_empty() =>
+                {
+                    if let Some(r) = &mut self.renaming {
+                        r.buffer.insert(" ");
                     }
                     vec![Cmd::Redraw]
                 }
@@ -1300,6 +1443,7 @@ impl FleetModel {
                 runs: vec![label_run(section_label(loc))],
                 metrics,
                 color: SECTION_LABEL_COLOR,
+                scale: 1.0,
             });
         }
         for (handle, id, mut rect) in placements {
@@ -1344,6 +1488,7 @@ impl FleetModel {
                 runs: vec![label_run(&header_text)],
                 metrics,
                 color: CARD_META_COLOR,
+                scale: 1.0,
             });
 
             // Preview area: a live, scaled terminal, or a placeholder + hint.
@@ -1388,6 +1533,7 @@ impl FleetModel {
                     runs: vec![label_run(hint)],
                     metrics,
                     color: PLACEHOLDER_FG,
+                    scale: 1.0,
                 });
             }
 
@@ -1406,6 +1552,7 @@ impl FleetModel {
                     runs: vec![label_run(button.label())],
                     metrics,
                     color: BUTTON_FG,
+                    scale: 1.0,
                 });
             }
 
@@ -1435,7 +1582,9 @@ impl FleetModel {
             }
         }
 
-        // A pending action scrims the whole grid with a confirm prompt.
+        // A pending action scrims the whole grid with a confirm dialog: the
+        // question in emphasized (1.5x) text, the two choice buttons centred
+        // on the line below, the selected one ringed like a focused tile.
         if let Some(p) = &self.pending {
             let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
             items.push(SceneItem::Rect {
@@ -1449,25 +1598,45 @@ impl FleetModel {
                 color: OVERLAY_BG,
                 radius: 0.0,
             });
-            // Name the session as the user knows it (its display name).
-            let shown = self
-                .tiles
-                .iter()
-                .find(|t| t.id == p.id)
-                .map(|t| t.model.display().to_string())
-                .unwrap_or_else(|| p.id.clone());
+            let mm = self.modal_metrics();
+            let (message, confirm_label) = self.confirm_texts(p);
+            let l = self.confirm_layout(&message, confirm_label);
             items.push(SceneItem::Text {
                 id: SceneId::NavBar,
-                rect: RectPx {
-                    x: 16.0,
-                    y: (h - metrics.line_height) / 2.0,
-                    w: (w - 32.0).max(1.0),
-                    h: metrics.line_height,
-                },
-                runs: vec![label_run(&confirm_prompt(p, &shown))],
-                metrics,
+                rect: l.message,
+                runs: vec![label_run(&message)],
+                metrics: mm,
                 color: OVERLAY_FG,
+                scale: MODAL_SCALE,
             });
+            let buttons = [
+                (l.confirm, confirm_label, CONFIRM_BUTTON_BG, Choice::Confirm),
+                (l.cancel, "Cancel", CANCEL_BUTTON_BG, Choice::Cancel),
+            ];
+            for (rect, label, bg, choice) in buttons {
+                items.push(SceneItem::Rect {
+                    id: SceneId::NavBar,
+                    rect,
+                    color: bg,
+                    radius: 5.0,
+                });
+                if p.selected == choice {
+                    items.push(SceneItem::Border {
+                        id: SceneId::NavBar,
+                        rect,
+                        color: FOCUS_COLOR,
+                        width: FOCUS_BORDER,
+                    });
+                }
+                items.push(SceneItem::Text {
+                    id: SceneId::NavBar,
+                    rect: centered_line(rect, mm, label),
+                    runs: vec![label_run(label)],
+                    metrics: mm,
+                    color: OVERLAY_FG,
+                    scale: MODAL_SCALE,
+                });
+            }
         }
 
         let mut scene = Scene::new(self.size_px);
@@ -1549,22 +1718,6 @@ fn card_meta(
         }
     }
     s
-}
-
-/// The prompt shown in the confirm overlay; `shown` is the session's
-/// human-facing name (display name, or the id when unlabeled).
-fn confirm_prompt(p: &Pending, shown: &str) -> String {
-    match p.action {
-        PendingAction::Kill => {
-            format!("Kill {shown}?  Enter = confirm, Esc = cancel")
-        }
-        PendingAction::TakeOver => {
-            format!(
-                "{} is open in another window — take it over?  Enter / Esc",
-                shown
-            )
-        }
-    }
 }
 
 /// The header label for an attach-state section.
@@ -2256,10 +2409,10 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::Kill(_))),
             "kill is confirmed, not immediate: {cmds:?}"
         );
-        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert!(
             cmds.contains(&Cmd::Kill("b".into())),
-            "Enter confirms the kill: {cmds:?}"
+            "Space confirms the kill: {cmds:?}"
         );
     }
 
@@ -2536,11 +2689,160 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "must confirm before stealing an elsewhere session: {cmds:?}"
         );
-        // Confirming with Enter issues the take-over.
-        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        // Confirming with Space issues the take-over (Enter would pick the
+        // selected button, which starts on the safe Cancel).
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert!(
             cmds.contains(&Cmd::TakeOver("a".into())),
-            "Enter confirms the take-over: {cmds:?}"
+            "Space confirms the take-over: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn enter_chooses_the_selected_confirm_button() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Cancel is pre-selected (the safe default), so plain Enter dismisses.
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Kill(_))),
+            "Enter on the default (cancel) selection must not kill: {cmds:?}"
+        );
+        assert!(!m.modal_open(), "Enter on cancel dismisses the modal");
+        // Reopen; the arrows move the selection onto the confirm button.
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        key(&mut m, Key::Named(NamedKey::ArrowLeft));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Kill("b".into())),
+            "Enter chooses the selected button: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn space_confirms_a_pending_action_directly() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Space is the direct confirm chord (Enter picks the selected button).
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Kill("b".into())),
+            "Space confirms directly: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_accepts_spaces() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // The space bar arrives as a Named key, not a Char — it must still type.
+        key(&mut m, Key::Named(NamedKey::Space));
+        key(&mut m, Key::Char("b".into()));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "a".into(),
+                name: "a b".into()
+            }),
+            "a space types into the rename buffer: {cmds:?}"
+        );
+    }
+
+    /// The confirm chips' rects, read from the view by their colours.
+    fn chip_rects(m: &FleetModel) -> (RectPx, RectPx) {
+        let items = m.view().layers[0].items.clone();
+        let find = |color: Rgba| {
+            items
+                .iter()
+                .find_map(|it| match it {
+                    SceneItem::Rect { rect, color: c, .. } if *c == color => Some(*rect),
+                    _ => None,
+                })
+                .expect("a confirm chip with the expected colour")
+        };
+        (find(CONFIRM_BUTTON_BG), find(CANCEL_BUTTON_BG))
+    }
+
+    #[test]
+    fn the_confirm_modal_emphasizes_text_and_shows_choice_buttons() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let scene = m.view();
+        let items = &scene.layers[0].items;
+        // The question renders 50% over the terminal font, centred.
+        let msg = items
+            .iter()
+            .find_map(|it| match it {
+                SceneItem::Text {
+                    rect, scale, runs, ..
+                } if runs.iter().any(|r| r.text.starts_with("Kill")) => Some((*rect, *scale)),
+                _ => None,
+            })
+            .expect("the confirm question is in the view");
+        assert_eq!(msg.1, MODAL_SCALE, "modal text is emphasized");
+        // Red confirm and green cancel chips sit on the line below the
+        // question, and the safe cancel is pre-selected (focus ring).
+        let (confirm, cancel) = chip_rects(&m);
+        assert!(
+            confirm.y > msg.0.y && cancel.y > msg.0.y,
+            "the buttons sit under the question"
+        );
+        assert!(
+            confirm.x < cancel.x,
+            "confirm left, cancel right: {confirm:?} {cancel:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, SceneItem::Border { rect, .. } if *rect == cancel)),
+            "the selected (cancel) chip carries the focus ring"
+        );
+        // Moving the selection moves the ring.
+        key(&mut m, Key::Named(NamedKey::ArrowLeft));
+        let scene = m.view();
+        assert!(
+            scene.layers[0]
+                .items
+                .iter()
+                .any(|it| matches!(it, SceneItem::Border { rect, .. } if *rect == confirm)),
+            "the arrows move the focus ring to the confirm chip"
+        );
+    }
+
+    #[test]
+    fn the_confirm_buttons_are_clickable() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let (confirm, cancel) = chip_rects(&m);
+        // Clicking cancel dismisses without killing.
+        let cmds = press_at(&mut m, cancel.x + cancel.w / 2.0, cancel.y + cancel.h / 2.0);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Kill(_))),
+            "clicking cancel must not kill: {cmds:?}"
+        );
+        assert!(!m.modal_open(), "clicking cancel dismisses the modal");
+        // Reopen and click the confirm chip: the action runs.
+        let r = button_rect(&m, "b", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let cmds = press_at(
+            &mut m,
+            confirm.x + confirm.w / 2.0,
+            confirm.y + confirm.h / 2.0,
+        );
+        assert!(
+            cmds.contains(&Cmd::Kill("b".into())),
+            "clicking the confirm chip kills: {cmds:?}"
         );
     }
 

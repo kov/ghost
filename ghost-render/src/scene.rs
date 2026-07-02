@@ -119,6 +119,11 @@ pub enum SceneItem {
         runs: Vec<Run>,
         metrics: CellMetrics,
         color: Rgba,
+        /// Font size relative to the base font the scene is presented at
+        /// (1.0 = the terminal's size). `metrics` must be pre-scaled to match,
+        /// since layout positions come from it while glyph rasterization uses
+        /// this factor — emphasized chrome like modal text sets both.
+        scale: f32,
     },
     /// An embedded terminal viewport, drawn from a [`Frame`] offset to `rect`
     /// and clipped to it. `dim` darkens an unfocused tile. `session` is the
