@@ -799,6 +799,22 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     feed(&mut fleet, "edit", EDIT);
     feed(&mut fleet, "build", BUILD);
 
+    // The detached session is observed, and its mirror has the session's OWN
+    // grid — a square-ish 100×50 here — so its card takes that shape instead
+    // of the window's aspect.
+    fleet.update(UiEvent::SessionPush {
+        name: "prod".to_string(),
+        push: ghost_ui_core::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
+            cols: 100,
+            rows: 50,
+        }),
+    });
+    feed(
+        &mut fleet,
+        "prod",
+        "$ uptime\r\n 14:02:11 up 41 days,  3:07,  1 user\r\n$ ",
+    );
+
     let scene = fleet.view();
     (scene, size.0, size.1)
 }

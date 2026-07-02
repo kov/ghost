@@ -1306,9 +1306,15 @@ mod tests {
     fn dive_geometry_zooms_the_target_between_its_tile_and_the_whole_window() {
         use crate::RectPx;
         let (w, h) = (1400.0f32, 900.0f32);
-        // A "cover" framing fills the window (one dimension exact, the other spills).
-        let covers =
-            |r: RectPx| r.x <= 0.5 && r.y <= 0.5 && r.x + r.w >= w - 0.5 && r.y + r.h >= h - 0.5;
+        // A full-zoom framing fills the window up to the sub-cell remainder —
+        // exactly how the live single view draws (a 1400px window holds 155
+        // 9px columns = 1395px, with the leftover as a right gap).
+        let covers = |r: RectPx| {
+            r.x <= 0.5
+                && r.y <= 0.5
+                && r.x + r.w >= w - METRICS.advance
+                && r.y + r.h >= h - METRICS.line_height
+        };
         let area = |r: RectPx| r.w * r.h;
 
         let mut r = root();

@@ -89,6 +89,12 @@ const REFRESH_MS: u64 = 5_000;
 // that pushed state (not this tick) is what the user experiences.
 const _: () = assert!(REFRESH_MS >= 5_000);
 
+/// Bounds on a preview's width:height aspect. A tile follows its own grid's
+/// shape, but one degenerate session (2 columns, or 400) must not produce a
+/// sliver or a row-swallowing slab.
+const MIN_TILE_ASPECT: f32 = 0.5;
+const MAX_TILE_ASPECT: f32 = 4.0;
+
 /// A laid-out tile: stable handle, session id, and pixel rect.
 type Placement = (u64, SessionId, RectPx);
 
@@ -276,6 +282,30 @@ pub struct FleetModel {
     /// mirror. Unobserved when the tile goes, the window takes the session
     /// over, or the fleet closes.
     observing: HashSet<SessionId>,
+}
+
+/// Greedily pack cards of the given widths into rows: `(start, end, row_width)`
+/// per row, half-open index ranges in order. A row takes cards while they fit
+/// in `avail` (each after a `gap`) up to [`MAX_PER_ROW`]; a card wider than
+/// `avail` still gets a row of its own.
+fn pack_rows(widths: &[f32], avail: f32, gap: f32) -> Vec<(usize, usize, f32)> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut row_w = 0.0;
+    for (i, &cw) in widths.iter().enumerate() {
+        let grown = row_w + gap + cw;
+        if i > start && (grown > avail || i - start >= MAX_PER_ROW) {
+            rows.push((start, i, row_w));
+            start = i;
+            row_w = cw;
+        } else {
+            row_w = if i == start { cw } else { grown };
+        }
+    }
+    if start < widths.len() {
+        rows.push((start, widths.len(), row_w));
+    }
+    rows
 }
 
 /// Split a tile rect into its metadata header, preview area, and a row of three
@@ -958,18 +988,25 @@ impl FleetModel {
         }
 
         let (band, gap) = (base_band, GAP);
-        // Preview pixel aspect (width : height) of the terminal grid.
-        let aspect =
-            (PREVIEW_COLS as f32 * metrics.advance) / (PREVIEW_ROWS as f32 * metrics.line_height);
+        let avail_w = (w - 2.0 * gap).max(1.0);
+        // Each preview keeps ITS OWN grid's aspect (width : height): an observed
+        // mirror has the session's real shape, which needn't match this window's;
+        // driven tiles are window-sized and placeholders keep the 80×24 default.
+        // Clamped so one degenerate grid can't blow up its row.
+        let aspect = |t: &Tile| -> f32 {
+            let (cols, rows) = t.model.dims();
+            ((cols.max(1) as f32 * metrics.advance) / (rows.max(1) as f32 * metrics.line_height))
+                .clamp(MIN_TILE_ASPECT, MAX_TILE_ASPECT)
+        };
+        let card_w = |t: &Tile, ch: f32| -> f32 { ((ch - 2.0 * band) * aspect(t)).min(avail_w) };
 
         // A card is an aspect-locked little terminal (the preview) plus two chrome
-        // bands. Its SIZE adapts to the session count: a crowded grid uses the
-        // compact thumbnail size and scrolls, while a few sessions GROW (up to
-        // native 1:1 — past that the preview can't get any sharper) to use the
-        // space. Width follows the terminal aspect ratio rather than stretching to
-        // fill the column (which would distort the preview); a narrow window shrinks
-        // it to fit.
-        let avail_w = (w - 2.0 * gap).max(1.0);
+        // bands. Rows share a HEIGHT — the size that adapts to the session count:
+        // a crowded grid uses the compact thumbnail size and scrolls, while a few
+        // sessions GROW (up to native 1:1 — past that the preview can't get any
+        // sharper) to use the space. Each card's width then follows its own
+        // aspect rather than stretching to a uniform column (which would distort
+        // the preview); a narrow window shrinks it to fit.
         let min_card_h = 2.0 * band + MIN_PREVIEW_LINES * metrics.line_height;
         let native_card_h = 2.0 * band + PREVIEW_ROWS as f32 * metrics.line_height;
         let compact_card_h =
@@ -980,15 +1017,14 @@ impl FleetModel {
         let cap = native_card_h.min((h * MAX_CARD_VIEWPORT_FRAC).max(min_card_h));
         let floor = compact_card_h.clamp(min_card_h, cap);
 
-        // Total content height for a candidate card height, recomputing the column
-        // count (cards are aspect-locked, so a taller card is wider and fewer fit).
-        let seg: Vec<usize> = sections.iter().map(|(_, ts)| ts.len()).collect();
+        // Total content height for a candidate card height, re-packing the rows
+        // (cards are aspect-locked, so a taller card is wider and fewer fit).
         let content_for = |ch: f32| -> f32 {
-            let pw = ((ch - 2.0 * band) * aspect).min(avail_w);
-            let per_row = (((w - gap) / (pw + gap)).floor() as usize).clamp(1, MAX_PER_ROW);
             let mut yy = gap;
-            for &n in &seg {
-                yy += band + n.div_ceil(per_row) as f32 * (ch + gap);
+            for (_, ts) in &sections {
+                let widths: Vec<f32> = ts.iter().map(|t| card_w(t, ch)).collect();
+                let nrows = pack_rows(&widths, avail_w, gap).len();
+                yy += band + nrows as f32 * (ch + gap);
             }
             yy
         };
@@ -1010,50 +1046,44 @@ impl FleetModel {
             lo
         };
 
-        let mut preview_h = card_h - 2.0 * band;
-        let mut card_w = preview_h * aspect;
-        if card_w > avail_w {
-            card_w = avail_w; // width-bound (narrow window): keep aspect, shrink
-            preview_h = card_w / aspect;
-        }
-        let card_h = (preview_h + 2.0 * band).max(min_card_h);
-
-        // Fit as many aspect-locked cards across as the width allows, then centre
-        // the row so the leftover width is shared as margins (the scroll, when the
-        // grid overflows, is vertical only).
-        let per_row = (((w - gap) / (card_w + gap)).floor() as usize).clamp(1, MAX_PER_ROW);
-        let row_w = per_row as f32 * card_w + (per_row as f32 - 1.0) * gap;
-        let left = ((w - row_w) / 2.0).max(gap);
-
+        // Pack each section's cards into rows of the shared height, left-aligned
+        // at the section grid's centred edge so the leftover width is shared as
+        // margins (the scroll, when the grid overflows, is vertical only).
         let mut headers = Vec::new();
         let mut placements = Vec::new();
         let mut y = gap;
         for (loc, ts) in &sections {
-            let nrows = ts.len().div_ceil(per_row);
+            let widths: Vec<f32> = ts.iter().map(|t| card_w(t, card_h)).collect();
+            let rows = pack_rows(&widths, avail_w, gap);
+            let max_row_w = rows.iter().map(|r| r.2).fold(1.0f32, f32::max);
+            let left = ((w - max_row_w) / 2.0).max(gap);
             headers.push((
                 *loc,
                 RectPx {
                     x: left,
                     y,
-                    w: row_w.max(1.0),
+                    w: max_row_w,
                     h: band,
                 },
             ));
             y += band;
-            for (i, t) in ts.iter().enumerate() {
-                let (r, c) = (i / per_row, i % per_row);
-                placements.push((
-                    t.handle,
-                    t.id.clone(),
-                    RectPx {
-                        x: left + c as f32 * (card_w + gap),
-                        y: y + r as f32 * (card_h + gap),
-                        w: card_w,
-                        h: card_h,
-                    },
-                ));
+            for (start, end, _) in rows {
+                let mut x = left;
+                for i in start..end {
+                    placements.push((
+                        ts[i].handle,
+                        ts[i].id.clone(),
+                        RectPx {
+                            x,
+                            y,
+                            w: widths[i],
+                            h: card_h,
+                        },
+                    ));
+                    x += widths[i] + gap;
+                }
+                y += card_h + gap;
             }
-            y += nrows as f32 * (card_h + gap);
         }
         (headers, placements, band, y)
     }
@@ -2020,6 +2050,41 @@ mod tests {
     }
 
     #[test]
+    fn a_tiles_card_follows_its_own_grids_aspect() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        // "b"'s observed mirror reports a square-ish real grid: 60×30 at the
+        // 9×18 test metrics is exactly 1:1, unlike the 80×24 default (5:3).
+        push(
+            &mut m,
+            "b",
+            SessionPush::Event(SessionEvent::Resized { cols: 60, rows: 30 }),
+        );
+        let (_, placements, band, _) = m.sections_layout();
+        let rect = |id: &str| {
+            placements
+                .iter()
+                .find(|(_, i, _)| i == id)
+                .expect("tile placed")
+                .2
+        };
+        let (ra, rb) = (rect("a"), rect("b"));
+        assert_eq!(ra.h, rb.h, "cards share the row height");
+        let aspect = |r: RectPx| r.w / (r.h - 2.0 * band);
+        assert!(
+            (aspect(rb) - 1.0).abs() < 0.05,
+            "the square grid gets a square preview box, got {}",
+            aspect(rb)
+        );
+        assert!(
+            aspect(ra) > 1.5,
+            "the default tile keeps the terminal aspect, got {}",
+            aspect(ra)
+        );
+    }
+
+    #[test]
     fn the_fleet_observes_sessions_it_does_not_drive() {
         let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
@@ -2465,10 +2530,11 @@ mod tests {
             "dive target aspect {} should match the session aspect {session_aspect}",
             aspect(target)
         );
-        // Which is meaningfully different from the fixed-aspect preview box (the bug).
+        // And the preview BOX itself now follows the session's aspect (cards are
+        // shaped by their own grid), so the contain-fit is exact — no letterbox.
         assert!(
-            (aspect(preview) - aspect(target)).abs() > 0.05,
-            "and should differ from the preview box aspect ({} vs {})",
+            (aspect(preview) - aspect(target)).abs() < 0.02,
+            "the preview box matches the target's aspect ({} vs {})",
             aspect(preview),
             aspect(target)
         );
