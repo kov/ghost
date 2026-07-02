@@ -1164,37 +1164,18 @@ impl App {
                     }
                 }
                 Cmd::Recreate(id) => {
-                    // Bring a dead session back under its old name: the durable
-                    // descriptor says what to run and where, and the previous
-                    // life's recording seeds the screen and scrollback (the
-                    // host reads it before the new recording replaces it).
-                    let d = ghost_vt::descriptor::read(&id).unwrap_or_default();
-                    let recording = ghost_vt::paths::recording_path(&id);
-                    let seed_from = recording.exists().then(|| recording.clone());
-                    let spawned = server::spawn(SpawnOpts {
-                        name: id.clone(),
-                        command: d.command,
-                        size: (COLS, ROWS),
-                        cwd: d.cwd,
-                        record: Some(recording),
-                        seed_from,
-                        scrollback: screen::DEFAULT_SCROLLBACK,
-                        max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
-                        start_on_attach: true,
-                    });
-                    match spawned {
-                        Err(e) => eprintln!("ghost: recreating '{id}' failed: {e}"),
-                        Ok(()) => {
-                            // Its tile previews the OLD recording; a fresh death
-                            // after this new life must re-feed.
-                            if let Some(w) = self.windows.get_mut(&wid) {
-                                w.dead_fed.remove(&id);
-                            }
-                            if self.attach_into(wid, &id) {
-                                self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
-                            }
-                        }
+                    // Bring a dead session back and step into it.
+                    if self.respawn_dead(wid, &id) && self.attach_into(wid, &id) {
+                        self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
+                }
+                Cmd::Resurrect(id) => {
+                    // The background half of a group relaunch: the host comes
+                    // back (serving its seeded screen), but nothing attaches —
+                    // the child command starts when the user first opens the
+                    // session, and the runtime-dir watcher's re-list revives
+                    // the tile. A failed spawn just leaves the tile dead.
+                    self.respawn_dead(wid, &id);
                 }
                 Cmd::Rename {
                     session: target,
@@ -1396,6 +1377,41 @@ impl App {
 
     /// Attach window `wid`'s own client to `name` (no-op if it already holds one).
     /// Returns whether the window now has a client for it.
+    /// Respawn a dead session under its old name: the durable descriptor says
+    /// what to run and where, and the previous life's recording seeds the
+    /// screen and scrollback (the host reads it before the new recording
+    /// replaces it). The child command itself is deferred to the first attach.
+    fn respawn_dead(&mut self, wid: WindowId, id: &str) -> bool {
+        let d = ghost_vt::descriptor::read(id).unwrap_or_default();
+        let recording = ghost_vt::paths::recording_path(id);
+        let seed_from = recording.exists().then(|| recording.clone());
+        let spawned = server::spawn(SpawnOpts {
+            name: id.to_string(),
+            command: d.command,
+            size: (COLS, ROWS),
+            cwd: d.cwd,
+            record: Some(recording),
+            seed_from,
+            scrollback: screen::DEFAULT_SCROLLBACK,
+            max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
+            start_on_attach: true,
+        });
+        match spawned {
+            Err(e) => {
+                eprintln!("ghost: recreating '{id}' failed: {e}");
+                false
+            }
+            Ok(()) => {
+                // Its tile previews the OLD recording; a fresh death after
+                // this new life must re-feed.
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.dead_fed.remove(id);
+                }
+                true
+            }
+        }
+    }
+
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
         let Some(w) = self.windows.get_mut(&wid) else {
             return false;

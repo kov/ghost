@@ -50,6 +50,12 @@ pub enum Cmd {
     /// the same name from its durable descriptor (command, cwd), seeds it
     /// from its recording, then attaches and replies `UiEvent::AdoptSession`.
     Recreate(SessionId),
+    /// The background half of a group relaunch: respawn a dead session like
+    /// `Recreate`, but attach nothing — its child command starts only when a
+    /// display client first attaches, and its tile revives when the next
+    /// listing shows the session alive (claimed on success, never
+    /// optimistically). A failed spawn just leaves the tile dead.
+    Resurrect(SessionId),
     /// Rename a session (the shell sends `ClientMsg::Rename`).
     Rename {
         session: SessionId,

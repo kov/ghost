@@ -143,9 +143,14 @@ impl Button {
     }
 }
 
-/// A group-header action button.
+/// A group-header action button. Which of these a header actually shows is
+/// per-group ([`FleetModel::group_chipset`]): a chip renders only when it has
+/// something to act on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GroupButton {
+    /// Respawn every dead member in the background (hosts + seeded screens
+    /// only; each child command starts when its session is first opened).
+    Relaunch,
     /// Attach every member to this window and switch to the first.
     Open,
     /// Detach the members this window drives (they keep running).
@@ -157,15 +162,9 @@ enum GroupButton {
 }
 
 impl GroupButton {
-    const ALL: [GroupButton; 4] = [
-        GroupButton::Open,
-        GroupButton::Detach,
-        GroupButton::Ungroup,
-        GroupButton::Kill,
-    ];
-
     fn label(self) -> &'static str {
         match self {
+            GroupButton::Relaunch => "relaunch",
             GroupButton::Open => "open all",
             GroupButton::Detach => "detach",
             GroupButton::Ungroup => "ungroup",
@@ -174,22 +173,20 @@ impl GroupButton {
     }
 }
 
-/// The group-header action chips, right-aligned on the header band — shared by
-/// the view and pointer hit-testing, like [`card_layout`] for cards.
-fn group_buttons(header: RectPx, m: CellMetrics) -> [(GroupButton, RectPx); 4] {
-    let zero = RectPx {
-        x: 0.0,
-        y: 0.0,
-        w: 0.0,
-        h: 0.0,
-    };
-    let mut out = [(GroupButton::Open, zero); 4];
+/// Lay out a group header's action chips, right-aligned on the header band —
+/// shared by the view and pointer hit-testing, like [`card_layout`] for cards.
+fn group_buttons(
+    header: RectPx,
+    m: CellMetrics,
+    set: &[GroupButton],
+) -> Vec<(GroupButton, RectPx)> {
+    let mut out = Vec::with_capacity(set.len());
     // Laid right-to-left from the band's right edge, half a cell apart.
     let mut x = header.x + header.w;
-    for (i, b) in GroupButton::ALL.iter().enumerate().rev() {
+    for b in set.iter().rev() {
         let w = (b.label().chars().count() as f32 + 2.0) * m.advance;
         x -= w;
-        out[i] = (
+        out.push((
             *b,
             RectPx {
                 x,
@@ -197,9 +194,10 @@ fn group_buttons(header: RectPx, m: CellMetrics) -> [(GroupButton, RectPx); 4] {
                 w,
                 h: header.h,
             },
-        );
+        ));
         x -= m.advance * 0.5;
     }
+    out.reverse();
     out
 }
 
@@ -1685,6 +1683,43 @@ impl FleetModel {
             .collect()
     }
 
+    /// Group `idx`'s members whose tiles are dead — what the relaunch chip
+    /// brings back.
+    fn dead_members(&self, idx: usize) -> Vec<SessionId> {
+        self.groups[idx]
+            .members
+            .iter()
+            .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
+            .cloned()
+            .collect()
+    }
+
+    /// The action chips group `idx`'s header offers, left to right: each only
+    /// when it has something to act on — relaunch needs dead members, open/kill
+    /// need living ones, detach needs a member this window drives. Ungroup
+    /// always applies (the grouping itself exists).
+    fn group_chipset(&self, idx: usize) -> Vec<GroupButton> {
+        let present = self.present_members(idx);
+        let mut set = Vec::new();
+        if !self.dead_members(idx).is_empty() {
+            set.push(GroupButton::Relaunch);
+        }
+        if !present.is_empty() {
+            set.push(GroupButton::Open);
+        }
+        if present
+            .iter()
+            .any(|id| self.locality_of(id) == Some(Locality::ThisWindow))
+        {
+            set.push(GroupButton::Detach);
+        }
+        set.push(GroupButton::Ungroup);
+        if !present.is_empty() {
+            set.push(GroupButton::Kill);
+        }
+        set
+    }
+
     /// Open the whole group into this window (Ctrl-Enter on a member, or the
     /// header's open-all button): attach every member, foreground the first.
     /// Confirmed once if any member is held by another window.
@@ -1714,6 +1749,19 @@ impl FleetModel {
     /// confirm killing every member.
     fn group_button(&mut self, idx: usize, button: GroupButton) -> Vec<Cmd> {
         match button {
+            GroupButton::Relaunch => {
+                // Background respawns only — no confirm (no commands run: the
+                // hosts come back with seeded screens, children start on first
+                // attach) and no adopt (the next listing revives the tiles as
+                // detached, ready to open here or elsewhere).
+                let mut cmds: Vec<Cmd> = self
+                    .dead_members(idx)
+                    .into_iter()
+                    .map(Cmd::Resurrect)
+                    .collect();
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
             GroupButton::Open => self.open_group(idx),
             GroupButton::Detach => {
                 let mut cmds: Vec<Cmd> = self
@@ -2136,9 +2184,10 @@ impl FleetModel {
         // Group-header action chips first (they sit on no tile).
         for (kind, header) in &headers {
             if let Band::Group { idx, .. } = kind
-                && let Some((b, brect)) = group_buttons(*header, self.effective_metrics())
-                    .into_iter()
-                    .find(|(_, r)| r.contains(px, py))
+                && let Some((b, brect)) =
+                    group_buttons(*header, self.effective_metrics(), &self.group_chipset(*idx))
+                        .into_iter()
+                        .find(|(_, r)| r.contains(px, py))
             {
                 self.grab = Some(Grab {
                     target: GrabTarget::Chip {
@@ -2344,7 +2393,7 @@ impl FleetModel {
                         scale: 1.0,
                     });
                     // The group's action chips, right-aligned on the band.
-                    for (b, brect) in group_buttons(rect, metrics) {
+                    for (b, brect) in group_buttons(rect, metrics, &self.group_chipset(idx)) {
                         let chip = inset(brect, 2.0);
                         items.push(SceneItem::Rect {
                             id,
@@ -3123,10 +3172,10 @@ mod tests {
                 _ => None,
             })
             .expect("the group has a header band");
-        group_buttons(header, m.effective_metrics())
+        group_buttons(header, m.effective_metrics(), &m.group_chipset(idx))
             .into_iter()
             .find(|(b, _)| *b == button)
-            .expect("all buttons are laid out")
+            .expect("the chip applies to this group")
             .1
     }
 
@@ -3244,13 +3293,24 @@ mod tests {
     }
 
     #[test]
-    fn the_group_header_draws_its_action_chips() {
-        let mut m = fleet();
+    fn the_group_header_draws_the_chips_that_apply() {
+        // A group with a member this window drives shows the full live set;
+        // nothing is dead, so there is no relaunch chip.
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("c")]));
         make_group(&mut m, "web", &["a", "c"]);
+        assert_eq!(
+            m.group_chipset(0),
+            vec![
+                GroupButton::Open,
+                GroupButton::Detach,
+                GroupButton::Ungroup,
+                GroupButton::Kill
+            ]
+        );
         let scene = m.view();
-        for b in GroupButton::ALL {
+        for b in m.group_chipset(0) {
             assert!(
                 scene.layers[0].items.iter().any(|it| matches!(it,
                     SceneItem::Text { runs, .. } if runs[0].text == b.label())),
@@ -3258,6 +3318,20 @@ mod tests {
                 b.label()
             );
         }
+        assert!(
+            !scene.layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Text { runs, .. } if runs[0].text == "relaunch")),
+            "no relaunch chip while every member lives"
+        );
+        // Nothing driven by this window — the detach chip goes too.
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        assert_eq!(
+            m.group_chipset(0),
+            vec![GroupButton::Open, GroupButton::Ungroup, GroupButton::Kill]
+        );
     }
 
     fn dead_info(name: &str, display: &str, command: &[&str]) -> crate::event::DeadSession {
@@ -3303,6 +3377,49 @@ mod tests {
             scene.layers[0].items.iter().any(|it| matches!(it,
                 SceneItem::Text { runs, .. } if runs[0].text.contains("exited"))),
             "the dead card is labelled exited"
+        );
+    }
+
+    #[test]
+    fn the_groups_relaunch_chip_respawns_dead_members_in_the_background() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "b", "c"]);
+        assert!(
+            !m.group_chipset(0).contains(&GroupButton::Relaunch),
+            "a fully-alive group offers nothing to relaunch"
+        );
+        list(&mut m, &["b"]); // a and c die
+        let r = group_button_rect(&m, 0, GroupButton::Relaunch);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::Resurrect("a".into()),
+                Cmd::Resurrect("c".into()),
+                Cmd::Redraw
+            ],
+            "every dead member respawns, in stored order, with no adopt"
+        );
+        assert!(!m.modal_open(), "relaunching runs no commands — no confirm");
+        assert!(
+            m.tiles.iter().filter(|t| t.id != "b").all(|t| t.dead),
+            "tiles revive on the next listing (claim on success), not optimistically"
+        );
+    }
+
+    #[test]
+    fn an_all_dead_groups_chips_shrink_to_what_still_applies() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        list(&mut m, &["b"]); // the whole group dies
+        assert_eq!(
+            m.group_chipset(0),
+            vec![GroupButton::Relaunch, GroupButton::Ungroup],
+            "open/detach/kill have no living member to act on"
         );
     }
 
