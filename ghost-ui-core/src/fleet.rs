@@ -168,7 +168,7 @@ impl GroupButton {
     fn label(self) -> &'static str {
         match self {
             GroupButton::Relaunch => "relaunch",
-            GroupButton::Open => "open all",
+            GroupButton::Open => "attach all",
             GroupButton::Detach => "detach",
             GroupButton::Ungroup => "ungroup",
             GroupButton::Kill => "kill",
@@ -1698,16 +1698,20 @@ impl FleetModel {
     }
 
     /// The action chips group `idx`'s header offers, left to right: each only
-    /// when it has something to act on — relaunch needs dead members, open/kill
-    /// need living ones, detach needs a member this window drives. Ungroup
-    /// always applies (the grouping itself exists).
+    /// when it has something to act on — relaunch needs dead members,
+    /// attach-all a living member not yet driven here, kill any living one,
+    /// detach a member this window drives. Ungroup always applies (the
+    /// grouping itself exists).
     fn group_chipset(&self, idx: usize) -> Vec<GroupButton> {
         let present = self.present_members(idx);
         let mut set = Vec::new();
         if !self.dead_members(idx).is_empty() {
             set.push(GroupButton::Relaunch);
         }
-        if !present.is_empty() {
+        if present
+            .iter()
+            .any(|id| self.locality_of(id) != Some(Locality::ThisWindow))
+        {
             set.push(GroupButton::Open);
         }
         if present
@@ -3427,6 +3431,34 @@ mod tests {
             scene.layers[0].items.iter().any(|it| matches!(it,
                 SceneItem::Text { runs, .. } if runs[0].text.contains("exited"))),
             "the dead card is labelled exited"
+        );
+    }
+
+    #[test]
+    fn the_attach_all_chip_hides_when_every_member_is_already_attached_here() {
+        let mut m = FleetModel::new(
+            METRICS,
+            SIZE,
+            HashSet::from(["a".to_string(), "c".to_string()]),
+        );
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        make_group(&mut m, "web", &["a", "c"]);
+        assert!(
+            !m.group_chipset(0).contains(&GroupButton::Open),
+            "with every member driven here there is nothing left to attach: {:?}",
+            m.group_chipset(0)
+        );
+        assert_eq!(GroupButton::Open.label(), "attach all");
+        // Releasing a member brings the chip back.
+        let r = button_rect(&m, "a", Button::Detach);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            m.group_chipset(0).contains(&GroupButton::Open),
+            "a detached member makes attach-all applicable again"
         );
     }
 
