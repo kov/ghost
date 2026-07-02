@@ -96,6 +96,13 @@ struct Client {
     /// so the repaint is laid out at the client's real geometry and the client
     /// never sees pre-resync bytes.
     resynced: bool,
+    /// Whether the connection subscribed to state events (`ClientMsg::Subscribe`).
+    /// A subscriber is not a display client: it is answered with a snapshot and
+    /// kept, but never promoted, never resized, never resynced.
+    subscribed: bool,
+    /// The connection's self-reported identity (`ClientMsg::Hello`), surfaced
+    /// through [`AttachInfo`] when this connection holds the display.
+    hello: Option<String>,
 }
 
 impl Client {
@@ -105,6 +112,8 @@ impl Client {
         Ok(Client {
             conn,
             resynced: false,
+            subscribed: false,
+            hello: None,
         })
     }
 
@@ -401,6 +410,11 @@ fn host_main(
     // first and is serviced without disturbing the attached client.
     let mut client: Option<Client> = None;
     let mut pending: Vec<Client> = Vec::new();
+    // State subscribers (`ClientMsg::Subscribe`): long-lived observer
+    // connections that are pushed a snapshot on subscribe (and, later, state
+    // events). Kept apart from `pending` so watchers never crowd out the
+    // half-open connection budget.
+    let mut subscribers: Vec<Client> = Vec::new();
     // Mirrors whether a display client is attached into the `attached` marker
     // file, so discovery can report it. Tracked here to touch the filesystem only
     // on the attach/detach transitions, not every loop turn.
@@ -408,6 +422,8 @@ fn host_main(
     // Bell count last reflected into the marker, so a fresh ring is spotted by a
     // change rather than re-touching the filesystem every loop turn.
     let mut last_bell_count = 0u64;
+    // Mirrors the bell marker's presence so a snapshot never has to stat it.
+    let mut bell_marked = false;
     let mut ptybuf = [0u8; 8192];
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
@@ -440,6 +456,14 @@ fn host_main(
             }
             fds.push(PollFd::from_borrowed_fd(p.conn.as_fd(), flags));
         }
+        let subs_start = fds.len();
+        for s in &subscribers {
+            let mut flags = PollFlags::IN;
+            if s.conn.wants_write() {
+                flags |= PollFlags::OUT;
+            }
+            fds.push(PollFd::from_borrowed_fd(s.conn.as_fd(), flags));
+        }
         match poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
@@ -454,7 +478,20 @@ fn host_main(
         let pending_re: Vec<PollFlags> = (0..pending.len())
             .map(|i| fds[pending_start + i].revents())
             .collect();
+        let subs_re: Vec<PollFlags> = (0..subscribers.len())
+            .map(|i| fds[subs_start + i].revents())
+            .collect();
         drop(fds);
+
+        // Who holds the display right now, as a snapshot answer. Computed once
+        // per turn, before any connection is serviced.
+        let attached_info =
+            client
+                .as_ref()
+                .filter(|c| c.resynced)
+                .map(|c| crate::protocol::AttachInfo {
+                    client: c.hello.clone(),
+                });
 
         // PTY output -> authoritative screen state, and live to the attached
         // client (if any). State is always tracked so the next attach can be
@@ -477,6 +514,7 @@ fn host_main(
                         last_bell_count = bells;
                         if !client.as_ref().is_some_and(|c| c.resynced) {
                             set_bell_marker(current_name, true);
+                            bell_marked = true;
                         }
                     }
                     // Answer the child's terminal queries while detached. When a
@@ -594,6 +632,8 @@ fn host_main(
                             current_name,
                             &mut meta,
                             &mut last_theme,
+                            &attached_info,
+                            bell_marked,
                         )?;
                     }
                     Err(_) => disposition = Disposition::Drop,
@@ -607,6 +647,46 @@ fn host_main(
                     return Ok(0);
                 }
             }
+        }
+
+        // Service the subscribers: a watcher may identify itself, re-subscribe
+        // (harmless — it just gets a fresh snapshot), or disconnect. Serviced
+        // before the pending pool so `subs_re` still matches: promotions grow
+        // `subscribers` below, and the newcomers are polled next turn.
+        if !subscribers.is_empty() {
+            let mut kept = Vec::new();
+            for (i, mut s) in std::mem::take(&mut subscribers).into_iter().enumerate() {
+                let re = subs_re.get(i).copied().unwrap_or_else(PollFlags::empty);
+                if !re.intersects(PollFlags::IN | PollFlags::HUP) {
+                    kept.push(s);
+                    continue;
+                }
+                let disposition = match s.conn.recv::<ClientMsg>() {
+                    Ok(None) => Disposition::Drop,
+                    Ok(Some(msgs)) => handle_client_messages(
+                        &mut s,
+                        msgs,
+                        &pty,
+                        &mut screen,
+                        &mut recorder,
+                        current_name,
+                        &mut meta,
+                        &mut last_theme,
+                        &attached_info,
+                        bell_marked,
+                    )?,
+                    Err(_) => Disposition::Drop,
+                };
+                match disposition {
+                    Disposition::Kill => {
+                        kill_child(&mut child);
+                        return Ok(0);
+                    }
+                    Disposition::Drop => {} // drop s
+                    Disposition::Keep => kept.push(s),
+                }
+            }
+            subscribers = kept;
         }
 
         // Service pending connections through the same handler. A connection
@@ -635,6 +715,8 @@ fn host_main(
                         current_name,
                         &mut meta,
                         &mut last_theme,
+                        &attached_info,
+                        bell_marked,
                     )?,
                     Err(_) => Disposition::Drop,
                 };
@@ -648,6 +730,8 @@ fn host_main(
                         let _ = p.flush();
                         if p.resynced {
                             client = Some(p); // attach handshake done -> display client
+                        } else if p.subscribed {
+                            subscribers.push(p); // state observer, kept for pushes
                         } else {
                             still_pending.push(p); // control / not yet identified
                         }
@@ -670,12 +754,13 @@ fn host_main(
             )?);
         }
 
-        // Push queued output to the client.
+        // Push queued output to the client, and queued state to the watchers.
         if let Some(c) = &mut client
             && c.flush().is_err()
         {
             client = None;
         }
+        subscribers.retain_mut(|s| s.flush().is_ok());
 
         // Reconcile the attach marker with the display client's presence. All the
         // ways `client` can change this turn (handshake takeover, detach, drop,
@@ -687,6 +772,7 @@ fn host_main(
                 // Attaching is "switching to" the session: any unseen-bell
                 // notification is now seen, so clear its marker.
                 set_bell_marker(current_name, false);
+                bell_marked = false;
             }
             attached_marked = now_attached;
         }
@@ -737,6 +823,8 @@ fn handle_client_messages(
     current_name: &str,
     meta: &mut crate::meta::Meta,
     last_theme: &mut crate::query::ThemeColors,
+    attached_info: &Option<crate::protocol::AttachInfo>,
+    bell_marked: bool,
 ) -> io::Result<Disposition> {
     for msg in msgs {
         match msg {
@@ -773,10 +861,19 @@ fn handle_client_messages(
             ClientMsg::Theme(colors) => {
                 *last_theme = colors;
             }
-            ClientMsg::Hello { .. } | ClientMsg::Subscribe => {
-                // Subscription surface (PROTO_SUBSCRIBE), not served yet: the
-                // host doesn't advertise the level, so nothing should send
-                // these; tolerate them rather than dropping the client.
+            ClientMsg::Hello { client } => {
+                c.hello = Some(client);
+            }
+            ClientMsg::Subscribe => {
+                // Answer with one consistent snapshot before any delta, and
+                // mark the connection so the caller keeps it as a watcher.
+                c.queue(&ServerMsg::Snapshot(crate::protocol::SessionState {
+                    attached: attached_info.clone(),
+                    bell: bell_marked,
+                    title: meta.title.clone(),
+                    display_name: meta.display_name.clone(),
+                }));
+                c.subscribed = true;
             }
         }
     }
