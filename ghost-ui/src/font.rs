@@ -311,10 +311,27 @@ impl SystemFallback {
     }
 
     /// Resolve a face covering `ch` (uncached). Linux: a fontconfig charset match,
-    /// deduplicating the loaded file. Elsewhere: none yet.
+    /// deduplicating the loaded file; a char with default *emoji presentation*
+    /// first tries the `emoji` generic family so it gets the color emoji font
+    /// (a plain charset match ranks whatever monochrome font covers the char —
+    /// Symbola, typically — above it). Elsewhere: none yet.
     #[cfg(target_os = "linux")]
     fn resolve(&mut self, ch: char) -> Option<FontRef<'static>> {
+        if wants_emoji_presentation(ch)
+            && let Some(key) = self.query_fontconfig_emoji(ch)
+            && let Some(face) = self.load_dedup(key)
+            && ghost_shaper::covers(face, ch)
+            && ghost_shaper::has_color_glyphs(face)
+        {
+            return Some(face);
+        }
         let key = self.query_fontconfig(ch)?;
+        self.load_dedup(key)
+    }
+
+    /// Load the face at `key`, deduplicating repeat loads of the same file.
+    #[cfg(target_os = "linux")]
+    fn load_dedup(&mut self, key: (PathBuf, usize)) -> Option<FontRef<'static>> {
         if let Some(hit) = self.files.get(&key) {
             return *hit;
         }
@@ -329,8 +346,26 @@ impl SystemFallback {
     /// `.notdef` rather than a wrong glyph.
     #[cfg(target_os = "linux")]
     fn query_fontconfig(&self, ch: char) -> Option<(PathBuf, usize)> {
+        self.query(ch, false)
+    }
+
+    /// Like [`query_fontconfig`](Self::query_fontconfig), but asks for the
+    /// `emoji` generic family, which fontconfig aliases to the installed color
+    /// emoji font. The caller still verifies coverage and color capability —
+    /// a family request is a preference, and fontconfig always returns
+    /// *something*.
+    #[cfg(target_os = "linux")]
+    fn query_fontconfig_emoji(&self, ch: char) -> Option<(PathBuf, usize)> {
+        self.query(ch, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query(&self, ch: char, emoji_family: bool) -> Option<(PathBuf, usize)> {
         let fc = self.fc.as_ref()?;
         let mut pat = fontconfig::Pattern::new(fc).ok()?;
+        if emoji_family {
+            pat.add_string(c"family", c"emoji").ok()?;
+        }
         let mut charset = fontconfig::CharSet::new(fc).ok()?;
         charset.add_char(ch).ok()?;
         pat.add_charset(charset).ok()?;
@@ -344,6 +379,24 @@ impl SystemFallback {
     fn resolve(&mut self, _ch: char) -> Option<FontRef<'static>> {
         None
     }
+}
+
+/// Whether `ch` defaults to *emoji presentation* (Unicode `Emoji_Presentation`):
+/// the chars a terminal should render as color emoji without any variation
+/// selector. Text-presentation emoji (↔, ★-adjacent symbols) stay monochrome,
+/// matching other terminals. VS16/ZWJ sequences are a known non-goal for now —
+/// fallback is per-char, so a sequence renders as its parts.
+#[cfg(target_os = "linux")]
+fn wants_emoji_presentation(ch: char) -> bool {
+    use unicode_properties::UnicodeEmoji;
+    use unicode_properties::emoji::EmojiStatus;
+    matches!(
+        ch.emoji_status(),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
 }
 
 impl ghost_shaper::Fallback for SystemFallback {
@@ -384,6 +437,42 @@ mod tests {
         assert!(setup.metrics.advance > 0.0 && setup.metrics.advance.fract() == 0.0);
         assert!(setup.metrics.line_height > 0.0);
         assert_eq!(setup.size, 15.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn emoji_presentation_chars_prefer_a_color_capable_face() {
+        use ghost_shaper::Fallback;
+        // 🤪 has default emoji presentation: when fontconfig's `emoji` generic
+        // family resolves to a color-capable font (Noto Color Emoji on any
+        // modern desktop), the resolver must hand back THAT face — not
+        // whatever monochrome font a plain charset match ranks first
+        // (Symbola, typically), which would render a gray-tinted emoji.
+        let mut fb = SystemFallback::new();
+        let Some((path, index)) = fb.query_fontconfig_emoji('\u{1F92A}') else {
+            eprintln!("skipping: no emoji generic family on this system");
+            return;
+        };
+        let color_capable = load(&path, index).is_some_and(|f| {
+            ghost_shaper::has_color_glyphs(f) && ghost_shaper::covers(f, '\u{1F92A}')
+        });
+        if !color_capable {
+            eprintln!("skipping: this system's emoji family is not color-capable");
+            return;
+        }
+
+        let face = fb.face_for('\u{1F92A}').expect("emoji face resolves");
+        assert!(ghost_shaper::covers(face, '\u{1F92A}'));
+        assert!(
+            ghost_shaper::has_color_glyphs(face),
+            "an emoji-presentation char must resolve to the color-capable face"
+        );
+
+        // A text-presentation char must NOT be routed to the emoji family:
+        // ★ has no default emoji presentation, so even though the emoji font
+        // may cover related symbols, the plain charset match decides.
+        let star = fb.face_for('★').expect("a system font should cover ★");
+        assert!(ghost_shaper::covers(star, '★'));
     }
 
     #[cfg(target_os = "linux")]

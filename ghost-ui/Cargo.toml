@@ -42,6 +42,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
+# Emoji_Presentation property data: chars that default to emoji presentation
+# route font fallback through fontconfig's `emoji` generic family, so they get
+# the color emoji font instead of whatever monochrome face covers them.
+unicode-properties = "0.1"
 
 # The native macOS menu bar (see src/menu.rs) and CoreText font resolution (see
 # src/font.rs). The objc2 crates are already in the tree via the vendored winit, so
