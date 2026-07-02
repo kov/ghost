@@ -25,6 +25,7 @@ use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
 use crate::input::{Key, Mods, NamedKey};
+use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
 
 const GAP: f32 = 10.0;
@@ -112,7 +113,7 @@ enum PendingAction {
 /// An in-progress inline rename of a tile.
 struct Renaming {
     id: SessionId,
-    buffer: String,
+    buffer: TextInput,
 }
 
 /// Which window owns or sees a session.
@@ -1086,6 +1087,15 @@ impl FleetModel {
             {
                 self.activate(self.focused.clone())
             }
+            // F2 renames the focused tile, the keyboard twin of its rename button.
+            UiEvent::Key { key, kind, .. }
+                if kind.is_down() && matches!(key, Key::Named(NamedKey::F2)) =>
+            {
+                match self.focused.clone() {
+                    Some(id) => self.button(Button::Rename, id),
+                    None => Vec::new(),
+                }
+            }
             UiEvent::Pointer {
                 phase: PointerPhase::Wheel,
                 wheel_dy,
@@ -1131,13 +1141,16 @@ impl FleetModel {
             Button::Rename => {
                 // Edit the human-facing display name, starting from what the card
                 // shows; the id stays the immutable routing key.
-                let buffer = self
+                let seed = self
                     .tiles
                     .iter()
                     .find(|t| t.id == id)
                     .map(|t| t.model.display().to_string())
                     .unwrap_or_else(|| id.clone());
-                self.renaming = Some(Renaming { buffer, id });
+                self.renaming = Some(Renaming {
+                    buffer: TextInput::new(seed),
+                    id,
+                });
                 vec![Cmd::Redraw]
             }
         }
@@ -1169,11 +1182,12 @@ impl FleetModel {
         }
     }
 
-    /// Keyboard for an inline rename: text appends, Backspace deletes, Enter
-    /// commits (a no-op for an empty/unchanged name), Escape cancels.
+    /// Keyboard for an inline rename: text inserts at the caret, the
+    /// [`TextInput`] chords navigate and edit, Enter commits (a no-op for an
+    /// empty/unchanged name), Escape cancels.
     ///
     /// Ordinary typing arrives as `UiEvent::Key`/`Key::Char` (the shell only makes
-    /// `UiEvent::Text` for IME commits and pastes), so printable keys append too —
+    /// `UiEvent::Text` for IME commits and pastes), so printable keys insert too —
     /// otherwise a name could be deleted but never typed. Ctrl/Cmd chords are
     /// shortcuts, not text, and are ignored; while an IME composition is active the
     /// raw keys belong to it, so they are swallowed until the `Text` commit lands.
@@ -1183,7 +1197,7 @@ impl FleetModel {
                 // A commit ends any composition; the committed text is the insertion.
                 self.preedit.clear();
                 if let Some(r) = &mut self.renaming {
-                    r.buffer.push_str(&s);
+                    r.buffer.insert(&s);
                 }
                 vec![Cmd::Redraw]
             }
@@ -1192,37 +1206,32 @@ impl FleetModel {
             } if kind.is_down() => match key {
                 Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
                     if let Some(r) = &mut self.renaming {
-                        r.buffer.push_str(&s);
-                    }
-                    vec![Cmd::Redraw]
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    if let Some(r) = &mut self.renaming {
-                        r.buffer.pop();
+                        r.buffer.insert(&s);
                     }
                     vec![Cmd::Redraw]
                 }
                 Key::Named(NamedKey::Enter) => {
                     let r = self.renaming.take().expect("renaming checked by caller");
+                    let name = r.buffer.into_text();
                     let tile = self.tiles.iter_mut().find(|t| t.id == r.id);
-                    let unchanged = tile.as_ref().is_some_and(|t| t.model.display() == r.buffer);
-                    if r.buffer.is_empty() || unchanged {
+                    let unchanged = tile.as_ref().is_some_and(|t| t.model.display() == name);
+                    if name.is_empty() || unchanged {
                         vec![Cmd::Redraw]
                     } else {
                         // Show the new display name immediately; the host is the
                         // authority and the next reconcile confirms (or reverts,
                         // if it refused the name).
                         if let Some(t) = tile {
-                            t.model.set_display_name(if r.buffer == r.id {
+                            t.model.set_display_name(if name == r.id {
                                 String::new() // renaming back to the id unlabels
                             } else {
-                                r.buffer.clone()
+                                name.clone()
                             });
                         }
                         vec![
                             Cmd::Rename {
                                 session: r.id,
-                                name: r.buffer,
+                                name,
                             },
                             Cmd::Redraw,
                         ]
@@ -1232,7 +1241,18 @@ impl FleetModel {
                     self.renaming = None;
                     vec![Cmd::Redraw]
                 }
-                _ => Vec::new(),
+                // Everything else is offered to the entry's editing chords
+                // (arrows, Home/End, Backspace/Delete and their word/line
+                // variants); unhandled keys fall through untouched.
+                key => {
+                    if let Some(r) = &mut self.renaming
+                        && r.buffer.key(&key, mods)
+                    {
+                        vec![Cmd::Redraw]
+                    } else {
+                        Vec::new()
+                    }
+                }
             },
             _ => Vec::new(),
         }
@@ -1300,7 +1320,11 @@ impl FleetModel {
 
             // Metadata header — or the live buffer of an in-progress rename.
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
-                Some(r) => format!("{}\u{2588}", r.buffer), // trailing caret block
+                Some(r) => {
+                    // Caret block at the cursor, splitting the edited text.
+                    let (before, after) = r.buffer.halves();
+                    format!("{before}\u{2588}{after}")
+                }
                 None => card_meta(
                     tile.model.display(),
                     &tile.command,
@@ -2315,6 +2339,82 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
             "a modifier chord must not type into the rename: {cmds:?}"
+        );
+    }
+
+    fn key_mods(m: &mut FleetModel, k: Key, mods: crate::Mods) -> Vec<Cmd> {
+        m.update(UiEvent::Key {
+            key: k,
+            mods,
+            kind: KeyEventKind::Press,
+            alts: None,
+        })
+    }
+
+    #[test]
+    fn f2_opens_an_inline_rename_of_the_focused_tile() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // Focus the first tile with the keyboard, then rename it with F2 — no
+        // pointer trip to the card's rename button required.
+        key(&mut m, Key::Named(NamedKey::ArrowRight));
+        key(&mut m, Key::Named(NamedKey::F2));
+        key(&mut m, Key::Char("X".into()));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "a".into(),
+                name: "aX".into()
+            }),
+            "F2 opens the focused tile's rename: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn f2_in_an_empty_fleet_is_a_no_op() {
+        // The reconcile defaults focus to the visually-first tile, so the only
+        // focusless fleet is an empty one; F2 must not open a rename there.
+        let mut m = fleet();
+        list(&mut m, &[]);
+        key(&mut m, Key::Named(NamedKey::F2));
+        key(&mut m, Key::Char("X".into()));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
+            "F2 with nothing to rename must not open a rename: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_supports_word_navigation_and_editing() {
+        let mut m = fleet();
+        let mut i = info("sess-1");
+        i.display_name = "build box".into();
+        m.update(UiEvent::SessionList(vec![i]));
+        let r = button_rect(&m, "sess-1", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Alt-Backspace deletes the trailing word: "build box" -> "build ".
+        key_mods(&mut m, Key::Named(NamedKey::Backspace), crate::Mods::ALT);
+        key(&mut m, Key::Char("web".into())); // "build web", cursor at end
+        // Alt-Left steps back over "web"; typing lands at the cursor.
+        key_mods(&mut m, Key::Named(NamedKey::ArrowLeft), crate::Mods::ALT);
+        key(&mut m, Key::Char("cob".into())); // "build cobweb"
+        // The caret block renders at the cursor, not glued to the end.
+        let texts = view_texts(&m);
+        assert!(
+            texts.iter().any(|t| t.contains("build cob\u{2588}web")),
+            "the caret follows the cursor into the text: {texts:?}"
+        );
+        // Home + Delete drops the leading character: "uild cobweb".
+        key(&mut m, Key::Named(NamedKey::Home));
+        key(&mut m, Key::Named(NamedKey::Delete));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "sess-1".into(),
+                name: "uild cobweb".into()
+            }),
+            "word ops edit at the cursor: {cmds:?}"
         );
     }
 

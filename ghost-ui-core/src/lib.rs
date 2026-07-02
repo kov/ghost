@@ -18,6 +18,7 @@ pub mod input;
 pub mod mouse;
 pub mod root;
 pub mod terminal;
+pub mod text_input;
 
 pub use cmd::{Cmd, PointerIcon};
 pub use event::{PointPx, PointerButton, PointerPhase, UiEvent};
