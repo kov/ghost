@@ -381,19 +381,23 @@ impl TerminalModel {
         }
     }
 
-    /// The window title for this session: the app-set title (OSC 0/2) when it
-    /// has one, else the user-chosen display name (`ghost rename`), else the
-    /// session id — so the titlebar always shows something meaningful. Lives on
-    /// the screen state and the label, so it is remembered across
+    /// The window title for this session. A user-chosen display name (`ghost
+    /// rename`) prefixes the app-set title (OSC 0/2): "label — title" — the
+    /// label only earns the titlebar when it differs from the auto-generated
+    /// session id, since the id carries no meaning the app title doesn't.
+    /// With one of the two missing the other stands alone, and with neither
+    /// the id does — so the titlebar always shows something meaningful. Lives
+    /// on the screen state and the label, so it is remembered across
     /// background/foreground switches.
     pub fn title(&self) -> String {
         let title = self.screen.title();
-        if !title.is_empty() {
-            title.to_string()
-        } else if !self.display_name.is_empty() {
-            self.display_name.clone()
-        } else {
-            self.session.clone()
+        let label = (!self.display_name.is_empty() && self.display_name != self.session)
+            .then_some(self.display_name.as_str());
+        match (label, title.is_empty()) {
+            (Some(label), false) => format!("{label} — {title}"),
+            (Some(label), true) => label.to_string(),
+            (None, false) => title.to_string(),
+            (None, true) => self.session.clone(),
         }
     }
 
@@ -3033,7 +3037,7 @@ mod tests {
     }
 
     #[test]
-    fn title_prefers_the_app_title_then_display_name_then_id() {
+    fn title_prefixes_a_custom_display_name_onto_the_app_title() {
         let mut m = model(); // session id "alpha"
         assert_eq!(m.title(), "alpha", "no title, no label: the id");
         m.set_display_name("build box".to_string());
@@ -3043,7 +3047,17 @@ mod tests {
             bytes: b"\x1b]2;vim\x07".to_vec(),
             ended: false,
         });
-        assert_eq!(m.title(), "vim", "the app's OSC title beats the label");
+        assert_eq!(
+            m.title(),
+            "build box — vim",
+            "a user-chosen label prefixes the app's OSC title"
+        );
+        // A label merely equal to the auto-generated id is not a rename the
+        // user cares to see twice: no prefix.
+        m.set_display_name("alpha".to_string());
+        assert_eq!(m.title(), "vim", "a label equal to the id does not prefix");
+        m.set_display_name(String::new());
+        assert_eq!(m.title(), "vim", "no label: the OSC title alone");
     }
 
     #[test]

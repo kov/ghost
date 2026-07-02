@@ -2053,6 +2053,21 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_of_a_titled_foreground_prefixes_the_window_title() {
+        let mut r = root(); // single view of alpha
+        set_title(&mut r, "alpha", "vim");
+        // A rename (possibly from another window) arrives via the reconcile;
+        // the window title gains the label as a prefix, keeping the app title.
+        let mut s = sess("alpha", true, 1);
+        s.display_name = "build box".into();
+        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        assert!(
+            cmds.contains(&Cmd::SetTitle("build box — vim".into())),
+            "a custom label prefixes the foreground's app title: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn diving_back_in_reasserts_the_foreground_title() {
         let mut r = root(); // single view of alpha
         set_title(&mut r, "alpha", "vim");
