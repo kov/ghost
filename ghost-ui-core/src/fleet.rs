@@ -216,6 +216,11 @@ pub struct FleetModel {
     pending: Option<Pending>,
     /// An in-progress inline rename; swallows text/keys into its buffer.
     renaming: Option<Renaming>,
+    /// The in-progress IME composition (empty when not composing). While non-empty,
+    /// a rename swallows raw `Key::Char` presses so the eventual commit (`Text`) is
+    /// the sole insertion — mirrors the terminal's preedit guard, avoiding a
+    /// double-type of composed characters.
+    preedit: String,
     /// The scheme's default fg/bg, stamped on every tile model so previews
     /// answer OSC 10/11 color queries like the single view does.
     theme: ThemeColors,
@@ -307,6 +312,7 @@ impl FleetModel {
             frames: CacheCounters::default(),
             pending: None,
             renaming: None,
+            preedit: String::new(),
             scroll_y: 0.0,
             theme: ThemeColors::default(),
         }
@@ -627,6 +633,17 @@ impl FleetModel {
             }
             // Re-enumerate on the scheduled refresh tick.
             UiEvent::Tick { .. } => vec![Cmd::ListSessions],
+            // Track IME composition so an inline rename can suppress the raw keys
+            // driving it (the commit arrives separately as `Text`).
+            UiEvent::Preedit(s) => {
+                let changed = self.preedit != s;
+                self.preedit = s;
+                if changed {
+                    vec![Cmd::Redraw]
+                } else {
+                    Vec::new()
+                }
+            }
             // Input goes through the modal router (rename / confirm / normal).
             ev @ (UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }) => {
                 self.input(ev)
@@ -1146,15 +1163,31 @@ impl FleetModel {
 
     /// Keyboard for an inline rename: text appends, Backspace deletes, Enter
     /// commits (a no-op for an empty/unchanged name), Escape cancels.
+    ///
+    /// Ordinary typing arrives as `UiEvent::Key`/`Key::Char` (the shell only makes
+    /// `UiEvent::Text` for IME commits and pastes), so printable keys append too —
+    /// otherwise a name could be deleted but never typed. Ctrl/Cmd chords are
+    /// shortcuts, not text, and are ignored; while an IME composition is active the
+    /// raw keys belong to it, so they are swallowed until the `Text` commit lands.
     fn rename_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
         match ev {
             UiEvent::Text(s) => {
+                // A commit ends any composition; the committed text is the insertion.
+                self.preedit.clear();
                 if let Some(r) = &mut self.renaming {
                     r.buffer.push_str(&s);
                 }
                 vec![Cmd::Redraw]
             }
-            UiEvent::Key { key, kind, .. } if kind.is_down() => match key {
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() => match key {
+                Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
+                    if let Some(r) = &mut self.renaming {
+                        r.buffer.push_str(&s);
+                    }
+                    vec![Cmd::Redraw]
+                }
                 Key::Named(NamedKey::Backspace) => {
                     if let Some(r) = &mut self.renaming {
                         r.buffer.pop();
@@ -2204,6 +2237,83 @@ mod tests {
                 name: "aX".into()
             }),
             "Enter commits the rename: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_accepts_characters_typed_through_the_key_channel() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Ordinary typing reaches the core as `UiEvent::Key`/`Key::Char` — the shell
+        // only synthesizes `UiEvent::Text` for IME commits — so the editor must grow
+        // its buffer from key presses, not just Text. Otherwise a name can be deleted
+        // (Backspace is a Named key) but never typed.
+        let cmds = key(&mut m, Key::Char("X".into()));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
+            "typing buffers until Enter: {cmds:?}"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "a".into(),
+                name: "aX".into()
+            }),
+            "a typed character must reach the rename buffer: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_modifier_chord_does_not_type_into_a_rename() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // Ctrl-/Cmd- chords are shortcuts, not text: they must not land in the buffer,
+        // or e.g. Ctrl-C would append a stray "c" to the name.
+        for mods in [crate::Mods::CTRL, crate::Mods::SUPER] {
+            m.update(UiEvent::Key {
+                key: Key::Char("c".into()),
+                mods,
+                kind: KeyEventKind::Press,
+                alts: None,
+            });
+        }
+        // The buffer is still the original name, so Enter commits nothing.
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
+            "a modifier chord must not type into the rename: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn an_ime_composition_does_not_double_type_into_a_rename() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let r = button_rect(&m, "a", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // During IME composition the shell delivers Preedit for the in-progress text,
+        // the raw driving keystroke as Key::Char, AND the final Text commit. Only the
+        // committed result must land — appending the raw key too would garble the name
+        // (e.g. "n" + "你" -> "n你"). Mirrors the terminal's preedit suppression.
+        m.update(UiEvent::Preedit("n".into())); // composition in progress
+        m.update(UiEvent::Key {
+            key: Key::Char("n".into()),
+            mods: crate::Mods::NONE,
+            kind: KeyEventKind::Press,
+            alts: None,
+        }); // raw key while composing — must be swallowed
+        m.update(UiEvent::Text("\u{4f60}".into())); // commit "你"
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "a".into(),
+                name: "a\u{4f60}".into()
+            }),
+            "only committed IME text lands in the rename, not the raw keys: {cmds:?}"
         );
     }
 
