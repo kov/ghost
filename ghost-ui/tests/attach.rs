@@ -613,6 +613,22 @@ fn resync_uses_the_attaching_clients_size() {
         "session not listed"
     );
 
+    // Barrier: the reflow assertion below only tests the resync when the host's
+    // screen already holds the X's — otherwise they arrive as live output after
+    // the narrow attach and wrap naturally (cursor row 1), which is correct but
+    // not what this test is about. `ls` listing the session doesn't imply the
+    // child has printed yet, so attach at the session's own size and wait for
+    // the content: the host feeds its screen before forwarding, so seeing the
+    // X's here means the host screen has them.
+    {
+        let warm = Attached::new(xdg, name, 80, 24);
+        assert!(
+            warm.wait_for_screen(Duration::from_secs(5), screen_contains(&fifty_x)),
+            "session content never appeared; got: {:?}",
+            warm.screen()
+        );
+    } // drop: disconnect so the narrow attach below is the sole client
+
     // Attach at 40 columns — narrower than the session. If the host repaints at
     // the client's size, the 50 X's wrap at column 40 and the cursor settles at
     // column 10 on the second visual row's worth of cells; if it repaints at the
