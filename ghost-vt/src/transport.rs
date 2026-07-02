@@ -71,6 +71,12 @@ impl<T: Transport> Conn<T> {
         !self.outbuf.is_empty()
     }
 
+    /// How many buffered bytes are still waiting to be written — the peer's
+    /// backlog, for callers that bound what they queue to a slow reader.
+    pub fn pending(&self) -> usize {
+        self.outbuf.len()
+    }
+
     /// Write as much buffered output as the transport will accept now, stopping
     /// on would-block and leaving the rest for the next call.
     pub fn flush(&mut self) -> io::Result<()> {

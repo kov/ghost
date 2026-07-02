@@ -340,6 +340,85 @@ fn an_observer_mirrors_the_screen_without_becoming_a_display_client() {
 }
 
 #[test]
+fn a_lagging_observer_is_capped_and_heals_by_resync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observe-lag-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    // On wake the child floods ~4MB through the PTY, then prints a marker.
+    const FLOOD: usize = 4 * 1024 * 1024;
+    let session_dir = spawn_session(
+        xdg,
+        name,
+        &format!(
+            "read line; head -c {FLOOD} /dev/zero | tr '\\0' x; printf 'END-MARKER'; sleep 60"
+        ),
+    );
+    let sock = session_dir.join("sock");
+
+    let mut obs = Client::connect_path(&sock).expect("observer connect");
+    obs.set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    obs.send(&ClientMsg::Observe).unwrap();
+
+    let mut vt: Option<ghost_vt::screen::Screen> = None;
+    let mut grid = (0u16, 0u16);
+    let mut received = 0usize;
+    let mut drain =
+        |obs: &mut Client, vt: &mut Option<ghost_vt::screen::Screen>, received: &mut usize| {
+            for msg in obs.recv_ready().ok().flatten().unwrap_or_default() {
+                match msg {
+                    ServerMsg::Event(SessionEvent::Resized { cols, rows }) => {
+                        grid = (cols, rows);
+                        *vt = Some(ghost_vt::screen::Screen::new(cols, rows, 0));
+                    }
+                    ServerMsg::Output(bytes) => {
+                        *received += bytes.len();
+                        if let Some(vt) = vt.as_mut() {
+                            vt.feed(&bytes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            drain(&mut obs, &mut vt, &mut received);
+            vt.is_some()
+        }),
+        "no Resized grid arrived"
+    );
+
+    // Trigger the flood while the observer is NOT reading, so the host's
+    // outbound queue for it fills past any cap.
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    display.send(&ClientMsg::Input(b"\n".to_vec())).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Now drain: the mirror must converge on the post-flood screen (the host
+    // re-seeds a lagged observer with a resync once it catches up)…
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            drain(&mut obs, &mut vt, &mut received);
+            vt.as_ref()
+                .is_some_and(|v| v.text().join("\n").contains("END-MARKER"))
+        }),
+        "the lagged observer never converged; received {received} bytes"
+    );
+    // …while receiving far less than the flood: the host dropped, not
+    // buffered, what the observer was too slow to take.
+    assert!(
+        received < FLOOD / 2,
+        "observer received {received} bytes — the host buffered the flood instead of capping it"
+    );
+}
+
+#[test]
 fn a_subscriber_gets_a_snapshot_without_becoming_the_display_client() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

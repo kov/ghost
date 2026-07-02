@@ -82,6 +82,12 @@ fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
 /// that connects but never sends its first message.
 const MAX_PENDING: usize = 8;
 
+/// Cap on an observer's outbound backlog. Past this the host stops queueing
+/// live output for it (state events still flow — they are small and bounded)
+/// and re-seeds it with a resync when it drains, so a slow or stalled observer
+/// costs bounded memory instead of buffering a `cat bigfile` per watcher.
+const OBSERVER_MAX_PENDING: usize = 256 * 1024;
+
 /// The hidden argv marker that selects host mode: `ghost __host <fd> <blob>`.
 /// Not a documented subcommand — an internal handoff used by [`spawn`]'s re-exec
 /// and recognized by [`run_host_if_invoked`].
@@ -103,6 +109,11 @@ struct Client {
     /// Whether the subscription also receives output (`ClientMsg::Observe`):
     /// a read-only mirror of the session as the display client shapes it.
     observing: bool,
+    /// An observer whose outbound backlog crossed the cap: live output is
+    /// being dropped for it, and once it drains it is re-seeded with a fresh
+    /// resync — the host holds authoritative state, so a mirror can always be
+    /// rebuilt rather than buffered toward.
+    lagged: bool,
     /// The connection's self-reported identity (`ClientMsg::Hello`), surfaced
     /// through [`AttachInfo`] when this connection holds the display.
     hello: Option<String>,
@@ -117,6 +128,7 @@ impl Client {
             resynced: false,
             subscribed: false,
             observing: false,
+            lagged: false,
             hello: None,
         })
     }
@@ -619,7 +631,17 @@ fn host_main(
                     }
                     // ...and to every read-only observer (their resync was
                     // queued when they observed, so the stream is contiguous).
+                    // A slow observer is capped, not buffered toward: past the
+                    // backlog cap its live output is dropped and it is marked
+                    // lagged; a fresh resync re-seeds it once it drains.
                     for s in subscribers.iter_mut().filter(|s| s.observing) {
+                        if s.lagged {
+                            continue;
+                        }
+                        if s.conn.pending() > OBSERVER_MAX_PENDING {
+                            s.lagged = true;
+                            continue;
+                        }
                         s.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
                     }
                 }
@@ -866,7 +888,22 @@ fn host_main(
             }
             last_state = now_state;
         }
-        subscribers.retain_mut(|s| s.flush().is_ok());
+        subscribers.retain_mut(|s| {
+            if s.flush().is_err() {
+                return false;
+            }
+            // Re-seed a lagged observer the moment its backlog drains — in
+            // this same turn, since a quiet session gives poll no other
+            // reason to wake and run a later check.
+            if s.lagged && !s.conn.wants_write() {
+                s.lagged = false;
+                s.queue_output(screen.resync());
+                if s.flush().is_err() {
+                    return false;
+                }
+            }
+            true
+        });
 
         // Signals.
         if sig_re.contains(PollFlags::IN) {
