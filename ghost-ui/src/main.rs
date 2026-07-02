@@ -1255,6 +1255,13 @@ impl App {
                         w.gfx.renderer.upload_image(id, width, height, &rgba);
                     }
                 }
+                Cmd::RequestAttention => {
+                    if let Some(w) = self.windows.get(&wid) {
+                        w.gfx.window.request_user_attention(Some(
+                            winit::window::UserAttentionType::Informational,
+                        ));
+                    }
+                }
                 Cmd::Redraw => {
                     // Don't paint inline — record the request and let the pacer
                     // release it within the frame budget (coalescing bursts).

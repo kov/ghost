@@ -89,6 +89,10 @@ pub enum Cmd {
     OpenUrl(String),
     /// Set the window's pointer shape (hand over a Ctrl-hovered hyperlink).
     PointerIcon(PointerIcon),
+    /// Ask the OS to flag this window for attention (taskbar highlight /
+    /// dock bounce) — an owned session rang its bell while the window was
+    /// unfocused.
+    RequestAttention,
     /// Repaint the window.
     Redraw,
     /// Set the window title.

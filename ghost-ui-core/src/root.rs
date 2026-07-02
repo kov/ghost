@@ -268,6 +268,10 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
+    /// Whether this window currently has OS focus (from `UiEvent::Focus`).
+    /// Drives the live-bell reaction: a bell in an owned session while the
+    /// window is unfocused asks the OS for attention.
+    focused_win: bool,
     /// The user-defined session groups. The fleet model owns the live editing
     /// copy while open; this carries them across fleet close/reopen (the fleet
     /// is rebuilt each opening) and receives the shell's authoritative
@@ -323,6 +327,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            focused_win: true,
             groups: Vec::new(),
             pad: 0.0,
         }
@@ -345,6 +350,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            focused_win: true,
             groups: Vec::new(),
             pad: 0.0,
         };
@@ -595,10 +601,28 @@ impl RootModel {
             }
             return cmds;
         }
-        match &mut self.mode {
+        // Track OS focus for the live-bell reaction (the event still reaches
+        // the terminal below for mode-1004 focus reporting).
+        if let UiEvent::Focus(f) = &ev {
+            self.focused_win = *f;
+        }
+        // A bell in one of this window's sessions while the window is
+        // unfocused asks the OS for attention — the fleet badge and the
+        // terminal feed handle the visible part; this is the "hey, over
+        // here" a background window owes its user.
+        let bell_attention = matches!(&ev,
+            UiEvent::SessionPush {
+                name,
+                push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
+            } if !self.focused_win && self.mine.contains(name.as_str()));
+        let mut cmds = match &mut self.mode {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
+        };
+        if bell_attention {
+            cmds.push(Cmd::RequestAttention);
         }
+        cmds
     }
 
     /// Start the deferred dive-out pull-back over the now-complete fleet: zoom from
@@ -1065,6 +1089,29 @@ mod tests {
     fn dive_out(r: &mut RootModel, sessions: &[ghost_vt::session::SessionInfo]) {
         key(r, Key::Named(NamedKey::F9), Mods::NONE);
         r.update(UiEvent::SessionList(sessions.to_vec()));
+    }
+
+    #[test]
+    fn a_bell_from_an_owned_session_requests_attention_only_when_unfocused() {
+        let bell = |r: &mut RootModel, name: &str| {
+            r.update(UiEvent::SessionPush {
+                name: name.into(),
+                push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
+            })
+        };
+        let mut r = root(); // owns "alpha", single view
+        // Unfocused + owned session rings: ask the OS for attention.
+        r.update(UiEvent::Focus(false));
+        assert!(
+            bell(&mut r, "alpha").contains(&Cmd::RequestAttention),
+            "an unfocused window flags its own session's bell"
+        );
+        // Focused: the user is looking at it; no attention theatrics.
+        r.update(UiEvent::Focus(true));
+        assert!(!bell(&mut r, "alpha").contains(&Cmd::RequestAttention));
+        // Unfocused, but someone else's session: not this window's news.
+        r.update(UiEvent::Focus(false));
+        assert!(!bell(&mut r, "beta").contains(&Cmd::RequestAttention));
     }
 
     #[test]
