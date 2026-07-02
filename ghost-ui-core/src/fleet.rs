@@ -384,6 +384,9 @@ pub struct FleetModel {
     groups: Vec<Group>,
     /// The group-name prompt (`g` with marks): `Some` while it is open.
     naming_group: Option<TextInput>,
+    /// The in-flight pointer press, if any (see [`Grab`]): a click waiting for
+    /// its release, or a tile drag in progress.
+    grab: Option<Grab>,
 }
 
 /// Greedily pack cards of the given widths into rows: `(start, end, row_width)`
@@ -479,6 +482,38 @@ fn nav(key: &Key, mods: Mods) -> Option<Nav> {
     }
 }
 
+/// How far the pointer may wobble (in physical pixels) between press and
+/// release and still count as a click; past it a tile press becomes a drag.
+const DRAG_SLOP: f32 = 6.0;
+
+/// What a pointer press landed on. The action runs on release (so a press can
+/// still become a drag); only tiles grabbed by their body can drag.
+enum GrabTarget {
+    Tile {
+        id: SessionId,
+        /// The card action button under the press, if any (`None` for the
+        /// header/preview body — including a dead card, whose activation is
+        /// its relaunch).
+        button: Option<Button>,
+    },
+    Chip {
+        group: usize,
+        button: GroupButton,
+    },
+}
+
+/// An armed pointer press: where it landed, where the pointer is now, and
+/// whether it has travelled past [`DRAG_SLOP`] into a drag. Coordinates are
+/// view space (`rect` is the grabbed tile's rect at press time), so the
+/// floating card follows the pointer even if the grid scrolls under it.
+struct Grab {
+    target: GrabTarget,
+    press: (f32, f32),
+    pos: (f32, f32),
+    rect: RectPx,
+    dragging: bool,
+}
+
 impl FleetModel {
     pub fn new(metrics: CellMetrics, size_px: (u32, u32), mine: HashSet<SessionId>) -> Self {
         FleetModel {
@@ -499,6 +534,7 @@ impl FleetModel {
             marked: HashSet::new(),
             groups: Vec::new(),
             naming_group: None,
+            grab: None,
         }
     }
 
@@ -1556,7 +1592,11 @@ impl FleetModel {
             UiEvent::Key { key, kind, .. }
                 if kind.is_down() && matches!(key, Key::Named(NamedKey::Escape)) =>
             {
-                if self.marked.is_empty() {
+                if self.grab.as_ref().is_some_and(|g| g.dragging) {
+                    // Cancel the drag: the card snaps home, nothing changes.
+                    self.grab = None;
+                    vec![Cmd::Redraw]
+                } else if self.marked.is_empty() {
                     Vec::new()
                 } else {
                     self.marked.clear();
@@ -1761,7 +1801,7 @@ impl FleetModel {
                 _ => Vec::new(),
             },
             UiEvent::Pointer {
-                phase: PointerPhase::Press,
+                phase: PointerPhase::Release,
                 pos,
                 ..
             } => {
@@ -2075,20 +2115,42 @@ impl FleetModel {
     }
 
     fn pointer(&mut self, phase: PointerPhase, pos: PointPx, ctrl: bool) -> Vec<Cmd> {
-        if phase != PointerPhase::Press {
-            return Vec::new(); // the overview only reacts to presses
+        let (vx, vy) = (pos.x as f32, pos.y as f32);
+        match phase {
+            PointerPhase::Press => self.pointer_press(vx, vy, ctrl),
+            PointerPhase::Motion => self.pointer_motion(vx, vy),
+            PointerPhase::Release => self.pointer_release(vx, vy),
+            PointerPhase::Wheel => Vec::new(),
         }
+    }
+
+    /// A press arms: it focuses and remembers what it landed on, and the
+    /// action runs on the release — unless the pointer travels past the slop
+    /// first and the press becomes a drag. The exception is Ctrl-click:
+    /// marking is immediate (a selection gesture never drags, and delayed
+    /// mark feedback reads as a miss).
+    fn pointer_press(&mut self, vx: f32, vy: f32, ctrl: bool) -> Vec<Cmd> {
         // Hit-test in content space: the viewport point plus the scroll offset.
-        let (px, py) = (pos.x as f32, pos.y as f32 + self.scroll_y);
+        let (px, py) = (vx, vy + self.scroll_y);
         let (headers, placements, band, _) = self.sections_layout();
         // Group-header action chips first (they sit on no tile).
         for (kind, header) in &headers {
             if let Band::Group { idx, .. } = kind
-                && let Some((b, _)) = group_buttons(*header, self.effective_metrics())
+                && let Some((b, brect)) = group_buttons(*header, self.effective_metrics())
                     .into_iter()
                     .find(|(_, r)| r.contains(px, py))
             {
-                return self.group_button(*idx, b);
+                self.grab = Some(Grab {
+                    target: GrabTarget::Chip {
+                        group: *idx,
+                        button: b,
+                    },
+                    press: (vx, vy),
+                    pos: (vx, vy),
+                    rect: brect,
+                    dragging: false,
+                });
+                return Vec::new();
             }
         }
         let hit = placements.into_iter().find(|(_, _, r)| r.contains(px, py));
@@ -2101,17 +2163,131 @@ impl FleetModel {
             self.toggle_mark(&id);
             return vec![Cmd::Redraw];
         }
-        // A press on a card button runs that action; anywhere else opens the
-        // tile. A dead card has no live-session buttons — its whole footer is
-        // the relaunch chip, and activation IS the relaunch.
-        if self.tiles.iter().any(|t| t.id == id && t.dead) {
-            return self.activate(Some(id));
+        // A dead card has no live-session buttons — its whole footer is the
+        // relaunch chip, and activation IS the relaunch.
+        let dead = self.tiles.iter().any(|t| t.id == id && t.dead);
+        let button = if dead {
+            None
+        } else {
+            let (_, _, buttons) = card_layout(rect, band);
+            buttons
+                .into_iter()
+                .find(|(_, r)| r.contains(px, py))
+                .map(|(b, _)| b)
+        };
+        self.grab = Some(Grab {
+            target: GrabTarget::Tile { id, button },
+            press: (vx, vy),
+            pos: (vx, vy),
+            rect: RectPx {
+                x: rect.x,
+                y: rect.y - self.scroll_y,
+                w: rect.w,
+                h: rect.h,
+            },
+            dragging: false,
+        });
+        vec![Cmd::Redraw] // the focus ring moved
+    }
+
+    fn pointer_motion(&mut self, vx: f32, vy: f32) -> Vec<Cmd> {
+        let Some(g) = &mut self.grab else {
+            return Vec::new();
+        };
+        g.pos = (vx, vy);
+        if !g.dragging {
+            let (dx, dy) = (vx - g.press.0, vy - g.press.1);
+            if dx * dx + dy * dy <= DRAG_SLOP * DRAG_SLOP {
+                return Vec::new(); // still a click in the making
+            }
+            match g.target {
+                // Past the slop a tile press becomes a drag of its card.
+                GrabTarget::Tile { .. } => g.dragging = true,
+                // A group chip doesn't drag; wandering off just abandons it.
+                GrabTarget::Chip { .. } => {
+                    self.grab = None;
+                    return Vec::new();
+                }
+            }
         }
-        let (_, _, buttons) = card_layout(rect, band);
-        match buttons.iter().find(|(_, r)| r.contains(px, py)) {
-            Some((button, _)) => self.button(*button, id),
-            None => self.activate(Some(id)),
+        vec![Cmd::Redraw] // the floating card follows the pointer
+    }
+
+    /// The release completes the gesture: a drag drops the card, a click runs
+    /// what the press armed (a card button, a group chip, or opening the tile).
+    fn pointer_release(&mut self, vx: f32, vy: f32) -> Vec<Cmd> {
+        let Some(g) = self.grab.take() else {
+            return Vec::new();
+        };
+        if g.dragging {
+            return match g.target {
+                GrabTarget::Tile { id, .. } => self.drop_tile(&id, vx, vy + self.scroll_y),
+                GrabTarget::Chip { .. } => vec![Cmd::Redraw],
+            };
         }
+        match g.target {
+            GrabTarget::Chip { group, button } => self.group_button(group, button),
+            GrabTarget::Tile {
+                id,
+                button: Some(b),
+            } => self.button(b, id),
+            GrabTarget::Tile { id, button: None } => self.activate(Some(id)),
+        }
+    }
+
+    /// Drop a dragged tile at `(px, py)` (content space). Inside a group
+    /// block it joins — or moves within — that group, at the slot under the
+    /// pointer; anywhere else it leaves its group. A group emptied either way
+    /// dissolves, and a dead tile dragged out of its group is forgotten on
+    /// the spot (only its membership was keeping it around).
+    fn drop_tile(&mut self, id: &str, px: f32, py: f32) -> Vec<Cmd> {
+        let before = self.groups.clone();
+        let (headers, placements, _, _) = self.sections_layout();
+        let target = headers.iter().find_map(|(kind, _)| match kind {
+            Band::Group { idx, block } if block.contains(px, py) => Some(*idx),
+            _ => None,
+        });
+        match target {
+            Some(mut gi) => {
+                // The slot under the pointer, from the pre-drop layout minus
+                // the dragged card: a member counts as passed when the drop
+                // point is below its row, or on it and past its centre.
+                let members = self.groups[gi].members.clone();
+                let slot = placements
+                    .iter()
+                    .filter(|(_, tid, _)| tid != id && members.iter().any(|m| m == tid))
+                    .filter(|(_, _, r)| py > r.y + r.h || (py >= r.y && px > r.x + r.w * 0.5))
+                    .count();
+                if let Some(fi) = self.group_of(id) {
+                    self.groups[fi].members.retain(|m| m != id);
+                    if fi != gi && self.groups[fi].members.is_empty() {
+                        self.groups.remove(fi);
+                        if fi < gi {
+                            gi -= 1;
+                        }
+                    }
+                }
+                self.groups[gi].members.insert(slot, id.to_string());
+            }
+            None => {
+                if let Some(fi) = self.group_of(id) {
+                    self.groups[fi].members.retain(|m| m != id);
+                    if self.groups[fi].members.is_empty() {
+                        self.groups.remove(fi);
+                    }
+                    if self.tiles.iter().any(|t| t.id == id && t.dead) {
+                        self.tiles.retain(|t| t.id != id);
+                        if self.focused.as_deref() == Some(id) {
+                            self.focused = self.tiles.first().map(|t| t.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if self.groups == before {
+            return vec![Cmd::Redraw];
+        }
+        vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
     }
 
     fn toggle_mark(&mut self, id: &str) {
@@ -2121,9 +2297,12 @@ impl FleetModel {
     }
 
     /// Whether the fleet claims an Escape press ahead of the root's
-    /// Esc-leaves-the-overview shortcut: an open modal, or marks to clear.
+    /// Esc-leaves-the-overview shortcut: an open modal, marks to clear, or a
+    /// drag to cancel.
     pub fn consumes_escape(&self) -> bool {
-        self.modal_open() || !self.marked.is_empty()
+        self.modal_open()
+            || !self.marked.is_empty()
+            || self.grab.as_ref().is_some_and(|g| g.dragging)
     }
 
     // ---- view ----
@@ -2185,14 +2364,43 @@ impl FleetModel {
                 }
             }
         }
+        // A card being dragged floats: it renders at the pointer (keeping the
+        // grab offset) instead of its slot, and last, so it rides above the
+        // grid. Everything else about it — header, preview, buttons — is the
+        // ordinary card, just relocated.
+        let drag = self.grab.as_ref().filter(|g| g.dragging).and_then(|g| {
+            let GrabTarget::Tile { id, .. } = &g.target else {
+                return None;
+            };
+            Some((
+                id.clone(),
+                RectPx {
+                    x: g.rect.x + (g.pos.0 - g.press.0),
+                    y: g.rect.y + (g.pos.1 - g.press.1),
+                    w: g.rect.w,
+                    h: g.rect.h,
+                },
+            ))
+        });
+        let mut float: Vec<SceneItem> = Vec::new();
         for (handle, id, mut rect) in placements {
             rect.y -= sy;
+            let floated = drag.as_ref().filter(|(did, _)| *did == id).map(|(_, r)| *r);
+            if let Some(fr) = floated {
+                rect = fr;
+            }
             // Cull tiles fully outside the viewport: otherwise their previews are
             // re-rendered to textures (costly with many sessions) only to be
             // scissored away. Headers above stay, so the section structure shows.
-            if rect.y + rect.h <= 0.0 || rect.y >= view_h {
+            // (A floating card is under the pointer by construction — never culled.)
+            if floated.is_none() && (rect.y + rect.h <= 0.0 || rect.y >= view_h) {
                 continue;
             }
+            let out = if floated.is_some() {
+                &mut float
+            } else {
+                &mut items
+            };
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
@@ -2200,7 +2408,7 @@ impl FleetModel {
             let (header, preview, buttons) = card_layout(rect, band);
 
             // The whole card on a solid panel, so it reads as one unit.
-            items.push(SceneItem::Rect {
+            out.push(SceneItem::Rect {
                 id: SceneId::Tile(handle),
                 rect,
                 color: CARD_BG,
@@ -2238,7 +2446,7 @@ impl FleetModel {
             // long command, and overflow would bleed into the neighbours.
             let meta_rect = text_line(header, metrics, 6.0);
             let header_text = clip_text(&header_text, (meta_rect.w / metrics.advance) as usize);
-            items.push(SceneItem::Text {
+            out.push(SceneItem::Text {
                 id: SceneId::Label(handle),
                 rect: meta_rect,
                 runs: vec![label_run(&header_text)],
@@ -2258,7 +2466,7 @@ impl FleetModel {
                     .frame
                     .clone()
                     .unwrap_or_else(|| Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
-                items.push(SceneItem::Terminal {
+                out.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
                     session: ghost_render::session_key(&tile.id),
                     rect: preview,
@@ -2276,7 +2484,7 @@ impl FleetModel {
                     damage: ghost_render::TermDamage::All,
                 });
             } else {
-                items.push(SceneItem::Rect {
+                out.push(SceneItem::Rect {
                     id: SceneId::Label(handle),
                     rect: preview,
                     color: PLACEHOLDER_BG,
@@ -2287,7 +2495,7 @@ impl FleetModel {
                 } else {
                     placeholder_hint(tile.locality)
                 };
-                items.push(SceneItem::Text {
+                out.push(SceneItem::Text {
                     id: SceneId::Badge(handle),
                     rect: centered_line(preview, metrics, hint),
                     runs: vec![label_run(hint)],
@@ -2308,13 +2516,13 @@ impl FleetModel {
                     h: buttons[0].1.h,
                 };
                 let chip = inset(footer, 3.0);
-                items.push(SceneItem::Rect {
+                out.push(SceneItem::Rect {
                     id: SceneId::Tile(handle),
                     rect: chip,
                     color: BUTTON_BG,
                     radius: 3.0,
                 });
-                items.push(SceneItem::Text {
+                out.push(SceneItem::Text {
                     id: SceneId::Label(handle),
                     rect: centered_line(chip, metrics, "relaunch"),
                     runs: vec![label_run("relaunch")],
@@ -2325,13 +2533,13 @@ impl FleetModel {
             } else {
                 for (button, brect) in buttons {
                     let chip = inset(brect, 3.0);
-                    items.push(SceneItem::Rect {
+                    out.push(SceneItem::Rect {
                         id: SceneId::Tile(handle),
                         rect: chip,
                         color: BUTTON_BG,
                         radius: 3.0,
                     });
-                    items.push(SceneItem::Text {
+                    out.push(SceneItem::Text {
                         id: SceneId::Label(handle),
                         rect: centered_line(chip, metrics, button.label()),
                         runs: vec![label_run(button.label())],
@@ -2343,7 +2551,7 @@ impl FleetModel {
             }
 
             if focused {
-                items.push(SceneItem::Border {
+                out.push(SceneItem::Border {
                     id: SceneId::Tile(handle),
                     rect,
                     color: FOCUS_COLOR,
@@ -2353,7 +2561,7 @@ impl FleetModel {
             // A multi-select mark rings the card inside any focus ring, so a
             // tile can show both (focused AND marked) without ambiguity.
             if self.marked.contains(&id) {
-                items.push(SceneItem::Border {
+                out.push(SceneItem::Border {
                     id: SceneId::Tile(handle),
                     rect: RectPx {
                         x: rect.x + FOCUS_BORDER + 1.0,
@@ -2370,7 +2578,7 @@ impl FleetModel {
                 // outside (negative x / oversized).
                 let bw = BADGE_PX.min(rect.w);
                 let bh = BADGE_PX.min(rect.h);
-                items.push(SceneItem::Badge {
+                out.push(SceneItem::Badge {
                     id: SceneId::Badge(handle),
                     rect: RectPx {
                         x: (rect.x + rect.w - bw - 2.0).max(rect.x),
@@ -2382,6 +2590,7 @@ impl FleetModel {
                 });
             }
         }
+        items.extend(float);
 
         // A pending action scrims the whole grid with a confirm dialog: the
         // question in emphasized (1.5x) text, the two choice buttons centred
@@ -3219,6 +3428,130 @@ mod tests {
     }
 
     #[test]
+    fn a_click_opens_on_release_and_a_wiggle_within_the_slop_still_clicks() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        let (cx, cy) = centre(&tile_rect(&m, "a"));
+        let cmds = pointer_phase(&mut m, PointerPhase::Press, cx, cy);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "the press alone opens nothing (it may become a drag): {cmds:?}"
+        );
+        assert_eq!(m.focused(), Some("a"), "focus lands on the press");
+        let cmds = pointer_phase(&mut m, PointerPhase::Release, cx, cy);
+        assert!(
+            cmds.contains(&Cmd::TakeOver("a".into())),
+            "the release opens the tile: {cmds:?}"
+        );
+        // A couple of pixels of wobble is still a click, not a drag.
+        let (cx, cy) = centre(&tile_rect(&m, "b"));
+        pointer_phase(&mut m, PointerPhase::Press, cx, cy);
+        pointer_phase(&mut m, PointerPhase::Motion, cx + 2.0, cy + 2.0);
+        let cmds = pointer_phase(&mut m, PointerPhase::Release, cx + 2.0, cy + 2.0);
+        assert!(
+            cmds.contains(&Cmd::TakeOver("b".into())),
+            "slop-sized wobble still clicks: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn dragging_a_tile_into_a_group_block_adds_it_at_the_pointer() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a"]);
+        // Drag the ungrouped "c" onto the RIGHT half of a's card: it joins
+        // the group after "a".
+        let from = centre(&tile_rect(&m, "c"));
+        let a = tile_rect(&m, "a");
+        let cmds = drag(&mut m, from, (a.x + a.w * 0.9, a.y + a.h / 2.0));
+        assert_eq!(m.groups[0].members, vec!["a".to_string(), "c".to_string()]);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))),
+            "membership changes persist: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "a drag is not a click: {cmds:?}"
+        );
+        // Dragging "b" onto the LEFT half of a's card puts it before "a".
+        let from = centre(&tile_rect(&m, "b"));
+        let a = tile_rect(&m, "a");
+        drag(&mut m, from, (a.x + a.w * 0.1, a.y + a.h / 2.0));
+        assert_eq!(
+            m.groups[0].members,
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn dragging_within_a_group_reorders_its_members() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        // Drag "c" onto the left half of "a": [c, a].
+        let from = centre(&tile_rect(&m, "c"));
+        let a = tile_rect(&m, "a");
+        let cmds = drag(&mut m, from, (a.x + a.w * 0.1, a.y + a.h / 2.0));
+        assert_eq!(m.groups[0].members, vec!["c".to_string(), "a".to_string()]);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))));
+    }
+
+    #[test]
+    fn dragging_a_member_out_removes_it_and_an_emptied_group_dissolves() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        // Drop "c" onto empty space well below every block.
+        let from = centre(&tile_rect(&m, "c"));
+        let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
+        assert_eq!(m.groups[0].members, vec!["a".to_string()]);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))));
+        // The last member leaving dissolves the group entirely.
+        let from = centre(&tile_rect(&m, "a"));
+        drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
+        assert!(m.groups.is_empty(), "an empty group has no reason to live");
+    }
+
+    #[test]
+    fn a_drag_floats_the_card_under_the_pointer_and_escape_cancels() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        let r = tile_rect(&m, "a");
+        let (cx, cy) = centre(&r);
+        pointer_phase(&mut m, PointerPhase::Press, cx, cy);
+        pointer_phase(&mut m, PointerPhase::Motion, cx + 200.0, cy + 100.0);
+        let scene = m.view();
+        let floated = scene.layers[0].items.iter().any(|it| match it {
+            SceneItem::Rect { rect, .. } => {
+                // The card body follows the pointer, keeping the grab offset:
+                // its centre sits under the pointer.
+                (rect.x + rect.w / 2.0 - (cx + 200.0)).abs() < 1.0
+                    && (rect.y + rect.h / 2.0 - (cy + 100.0)).abs() < 1.0
+                    && rect.w == r.w
+            }
+            _ => false,
+        });
+        assert!(floated, "the dragged card floats under the pointer");
+        assert!(m.consumes_escape(), "a live drag claims Escape");
+        key(&mut m, Key::Named(NamedKey::Escape));
+        let scene = m.view();
+        let still_floating = scene.layers[0].items.iter().any(|it| {
+            matches!(it,
+            SceneItem::Rect { rect, .. } if (rect.x + rect.w / 2.0 - (cx + 200.0)).abs() < 1.0
+                && rect.w == r.w && (rect.y + rect.h / 2.0 - (cy + 100.0)).abs() < 1.0)
+        });
+        assert!(!still_floating, "Escape cancels the drag");
+        // The release after a cancelled drag does nothing.
+        let cmds = pointer_phase(&mut m, PointerPhase::Release, cx + 200.0, cy + 100.0);
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))));
+    }
+
+    #[test]
     fn the_group_prompt_draws_a_scrim_and_the_typed_name_with_a_caret() {
         let mut m = fleet();
         list(&mut m, &["a"]);
@@ -4013,16 +4346,22 @@ mod tests {
         assert_eq!(m.focused(), Some("a"));
     }
 
-    /// Press at the centre of `id`'s tile (its preview area).
+    /// Click (press + release in place) at the centre of `id`'s tile.
     fn press(m: &mut FleetModel, id: &str) -> Vec<Cmd> {
         let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
         press_at(m, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
     }
 
-    /// Press at point `(x, y)`.
+    /// Click (press + release in place) at `(x, y)`. Returns the release's
+    /// commands — where click actions live now that a press may become a drag.
     fn press_at(m: &mut FleetModel, x: f32, y: f32) -> Vec<Cmd> {
+        pointer_phase(m, PointerPhase::Press, x, y);
+        pointer_phase(m, PointerPhase::Release, x, y)
+    }
+
+    fn pointer_phase(m: &mut FleetModel, phase: PointerPhase, x: f32, y: f32) -> Vec<Cmd> {
         m.update(UiEvent::Pointer {
-            phase: PointerPhase::Press,
+            phase,
             button: Some(crate::PointerButton::Left),
             pos: PointPx {
                 x: x as f64,
@@ -4032,6 +4371,26 @@ mod tests {
             wheel_dy: 0.0,
             clicks: 1,
         })
+    }
+
+    /// Drag from `(fx, fy)` to `(tx, ty)` (press, motion, release), returning
+    /// the release's commands.
+    fn drag(m: &mut FleetModel, (fx, fy): (f32, f32), (tx, ty): (f32, f32)) -> Vec<Cmd> {
+        pointer_phase(m, PointerPhase::Press, fx, fy);
+        pointer_phase(m, PointerPhase::Motion, tx, ty);
+        pointer_phase(m, PointerPhase::Release, tx, ty)
+    }
+
+    fn centre(r: &RectPx) -> (f32, f32) {
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    fn tile_rect(m: &FleetModel, id: &str) -> RectPx {
+        m.layout()
+            .into_iter()
+            .find(|(_, i, _)| i == id)
+            .map(|(_, _, r)| r)
+            .unwrap()
     }
 
     /// The pixel rect of `id`'s `button` (centre is a good press target).
