@@ -565,6 +565,60 @@ fn an_uncovered_glyph_falls_back_to_a_face_that_has_it() {
 }
 
 #[test]
+fn a_color_emoji_renders_in_color_not_tinted() {
+    // Fira Code has no 🤪; the fallback resolves it to the bundled Noto Color
+    // Emoji COLRv1 subset. The glyph must render with the emoji's own palette
+    // (many hues, notably the yellow face) — not as a coverage mask tinted
+    // with the cell's near-gray foreground, which is what a mask-only glyph
+    // path produces.
+    const NOTO: &[u8] =
+        include_bytes!("../../ghost-shaper/tests/assets/NotoColorEmoji-COLRv1-subset.ttf");
+    let fira = ghost_shaper::font_from_bytes(FIRA).expect("fira");
+    assert_eq!(
+        ghost_shaper::glyph_id(fira, '\u{1F92A}'),
+        0,
+        "precondition: Fira must lack the emoji"
+    );
+
+    struct EmojiFallback;
+    impl ghost_shaper::Fallback for EmojiFallback {
+        fn face_for(&mut self, ch: char) -> Option<ghost_shaper::FontRef<'static>> {
+            (ch == '\u{1F92A}').then(|| ghost_shaper::font_from_bytes(NOTO).expect("noto subset"))
+        }
+    }
+
+    let mut vt = Vt::new(4, 1);
+    vt.feed_str("\x1b[?25l🤪");
+    let frame = layout_frame(&vt, METRICS);
+    let mut r = Renderer::headless(Theme::default());
+    r.set_fallback(Box::new(EmojiFallback));
+    let img = r.render_offscreen(&frame, fira, 15.0);
+
+    // Scan the emoji's two-cell box. A tinted mask stays achromatic (fg and bg
+    // are both near-gray), so saturation is the discriminator, not pixel count.
+    let (box_w, box_h) = (2.0 * METRICS.advance, METRICS.line_height);
+    let mut saturated = 0u32;
+    let mut yellow = false;
+    for y in 0..box_h as u32 {
+        for x in 0..box_w as u32 {
+            let [red, g, b, _] = px(&img, x, y);
+            let spread = red.max(g).max(b) - red.min(g).min(b);
+            if spread > 40 {
+                saturated += 1;
+            }
+            if red > 180 && g > 120 && b < 100 {
+                yellow = true;
+            }
+        }
+    }
+    assert!(
+        saturated > 20,
+        "a color emoji must paint saturated pixels, found {saturated}"
+    );
+    assert!(yellow, "the zany face's yellow head must be present");
+}
+
+#[test]
 fn scales_a_large_surface_frame_to_fit_its_tile() {
     // A real-size session frame drawn into a tile smaller than itself must be
     // scaled to "contain", not clipped. Mark the bottom-right cell blue: at 1:1

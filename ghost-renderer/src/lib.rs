@@ -585,6 +585,19 @@ fn fill_cell_cols(buf: &mut Vec<u16>, text: &str) {
     }
 }
 
+/// How many grid columns the glyph whose cluster starts at `byte` spans: the
+/// column distance to the next char's cell, or to the run's end for the last
+/// one. This is the box a color glyph (emoji) is fitted into.
+fn span_cols(text: &str, col_of_byte: &[u16], byte: u32, width_cols: u16) -> u16 {
+    let start = col_of_byte.get(byte as usize).copied().unwrap_or(0);
+    let next = text
+        .get(byte as usize..)
+        .and_then(|s| s.chars().next())
+        .and_then(|c| col_of_byte.get(byte as usize + c.len_utf8()).copied())
+        .unwrap_or(width_cols);
+    next.saturating_sub(start).max(1)
+}
+
 // ---- GPU plumbing -------------------------------------------------------
 
 /// Instanced textured quad: one per cell background and per visible glyph.
@@ -642,12 +655,17 @@ fn vs(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let a = textureSample(atlas, samp, in.uv).r;
+    // The atlas is RGBA: mask glyphs are stored white with coverage in alpha,
+    // so multiplying by the instance color tints them exactly as the old
+    // coverage-only atlas did; color glyphs (emoji) carry their real straight
+    // RGBA and draw with a white instance color, i.e. untinted. Dim/fade still
+    // work on both — they scale the instance color.
+    let texel = textureSample(atlas, samp, in.uv);
     // Premultiplied output: the surface alpha modes our windows use (and Wayland
     // / macOS natively) expect colour already scaled by coverage. At full opacity
     // this is identity, so opaque rendering is unchanged.
-    let cov = in.color.a * a;
-    return vec4<f32>(in.color.rgb * cov, cov);
+    let cov = in.color.a * texel.a;
+    return vec4<f32>(in.color.rgb * texel.rgb * cov, cov);
 }
 
 // Image variant: the bound texture is a full RGBA image, not the coverage atlas,
@@ -681,6 +699,23 @@ struct ImageDraw {
     z: i32,
 }
 
+/// Glyph-cache key: stable face identity, glyph id, size bits, synthesis, and
+/// the rounded cell box a color glyph was fitted to (see
+/// [`Renderer::ensure_glyph`]).
+type GlyphKey = (u64, u16, u32, Synthesis, [u32; 2]);
+
+/// A glyph bitmap in atlas form — straight-alpha RGBA, either a real color
+/// raster (emoji) or a coverage mask expanded to white-with-coverage-alpha —
+/// plus its swash-style pen-relative placement.
+struct AtlasBitmap {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    color: bool,
+}
+
 /// A glyph's slot in the atlas plus its pen-relative placement.
 #[derive(Clone, Copy)]
 struct Slot {
@@ -690,6 +725,9 @@ struct Slot {
     h: u32,
     left: i32,
     top: i32,
+    /// A color glyph (emoji): the atlas holds its real straight-alpha RGBA, so
+    /// it draws with a white instance color (untinted) instead of the cell fg.
+    color: bool,
 }
 
 const ATLAS_DIM: u32 = 2048;
@@ -1124,14 +1162,18 @@ pub struct Renderer {
     scene_bg: Option<[u8; 3]>,
     /// Color-attachment format the pipeline targets (offscreen vs surface).
     format: wgpu::TextureFormat,
-    /// glyph cache keyed by (glyph id, font size bits, synthesis); `None` = no bitmap.
-    cache: FastMap<(u64, u16, u32, Synthesis), Option<Slot>>,
+    /// glyph cache (see [`GlyphKey`]); `None` = no bitmap.
+    cache: FastMap<GlyphKey, Option<Slot>>,
     /// Shaped-run cache keyed by (font key, font size bits) → (run text → shaped).
     /// Shaping dominates per-frame CPU, and a run's text is identical across redraws
     /// (navigation, unchanged tiles), so caching it makes a repaint nearly free. The
     /// map is nested so a hit probes the inner map by borrowed `&str` and allocates
     /// nothing — building an owned key just to look it up cost ~half a heavy raster.
     shape_cache: ShapeCache,
+    /// Per-face "carries color-glyph tables" memo (keyed like the glyph cache's
+    /// face component): text fonts skip the color-raster probe on every glyph
+    /// miss, which would otherwise dominate a cold build.
+    color_capable: FastMap<u64, bool>,
     /// Finds a face for a char the configured family can't render (`.notdef`), so a
     /// symbol/emoji outside the primary font draws from a covering font instead of the
     /// tofu box. `None` = no fallback wired (tests, tools) → `.notdef` as before. Owned
@@ -1266,12 +1308,17 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            // RGBA, not a bare coverage channel: mask glyphs pack as white with
+            // coverage in alpha (tinted by the instance color exactly as an R8
+            // atlas was), which leaves room for color glyphs (emoji) to carry
+            // their real straight-alpha RGBA through the same pipeline.
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        // Reserve the (0,0) texel as fully opaque so background/cursor rects can
-        // sample a coverage of 1.0 and fill solid through the same pipeline.
+        // Reserve the (0,0) texel as fully opaque white so background/cursor
+        // rects can sample a coverage of 1.0 and fill solid through the same
+        // pipeline.
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &atlas,
@@ -1279,10 +1326,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[255u8],
+            &[255u8; 4],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(1),
+                bytes_per_row: Some(4),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
@@ -1530,6 +1577,7 @@ impl Renderer {
             format,
             cache: FastMap::default(),
             shape_cache: FastMap::default(),
+            color_capable: FastMap::default(),
             fallback: None,
             stats: RenderCacheStats::default(),
             parallel_shaping: true,
@@ -2470,24 +2518,40 @@ impl Renderer {
     }
 
     /// Rasterize (if needed) and pack a glyph into the atlas, returning its slot.
+    ///
+    /// `cell_box` is the pixel box the glyph's cells span (columns × advance,
+    /// line height). A glyph with a *color* form (emoji) rasterizes in color
+    /// and is re-rasterized smaller if its bitmap overflows that box — emoji
+    /// clip boxes routinely exceed the em, the atlas sampler is Nearest (no
+    /// pretty downscale at draw time), and a glyph bleeding into its neighbor
+    /// cells is wrong on a grid. Mask glyphs ignore it (their metrics already
+    /// fit the grid the font was chosen for).
     fn ensure_glyph(
         &mut self,
         font: FontRef,
         id: u16,
         size_px: f32,
         synth: Synthesis,
+        cell_box: (f32, f32),
     ) -> Option<Slot> {
         // Key on the FACE too (via its stable data identity): a family with a real
         // bold/italic face shares glyph indices across its files, and a real face needs
         // no synthesis, so regular 'X' and bold 'X' would otherwise collide on
         // (id, size, synth) and alias to one bitmap. Mirrors the shape cache's key.
-        let key = (stable_font_key(font), id, size_px.to_bits(), synth);
+        // The cell box joins the key because a color glyph's raster is fitted to it.
+        let box_key = [cell_box.0 as u32, cell_box.1 as u32];
+        let key = (stable_font_key(font), id, size_px.to_bits(), synth, box_key);
         if let Some(slot) = self.cache.get(&key) {
             self.stats.glyph.hit();
             return *slot;
         }
         self.stats.glyph.miss();
-        let resolved = match ghost_shaper::rasterize(font, id, size_px, synth) {
+        let try_color = *self
+            .color_capable
+            .entry(key.0)
+            .or_insert_with(|| ghost_shaper::has_color_glyphs(font));
+        let raster = Self::rasterize_any(font, id, size_px, synth, cell_box, try_color);
+        let resolved = match raster {
             Some(bmp) if bmp.width > 0 && bmp.height > 0 => {
                 if self.pack_x + bmp.width + 1 > ATLAS_DIM {
                     self.pack_x = 1;
@@ -2504,6 +2568,7 @@ impl Renderer {
                         h: bmp.height,
                         left: bmp.left,
                         top: bmp.top,
+                        color: bmp.color,
                     };
                     self.gpu.queue.write_texture(
                         wgpu::TexelCopyTextureInfo {
@@ -2516,10 +2581,10 @@ impl Renderer {
                             },
                             aspect: wgpu::TextureAspect::All,
                         },
-                        &bmp.coverage,
+                        &bmp.rgba,
                         wgpu::TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: Some(bmp.width),
+                            bytes_per_row: Some(bmp.width * 4),
                             rows_per_image: Some(bmp.height),
                         },
                         wgpu::Extent3d {
@@ -2538,6 +2603,56 @@ impl Renderer {
         self.stats.glyph.insert();
         self.cache.insert(key, resolved);
         resolved
+    }
+
+    /// Rasterize a glyph in atlas (RGBA) form: its color form fitted to
+    /// `cell_box` when it has one (probed only for `color_capable` faces),
+    /// else its coverage mask expanded to white with coverage in alpha.
+    fn rasterize_any(
+        font: FontRef,
+        id: u16,
+        size_px: f32,
+        synth: Synthesis,
+        cell_box: (f32, f32),
+        color_capable: bool,
+    ) -> Option<AtlasBitmap> {
+        let mut size = size_px;
+        if color_capable && let Some(mut bmp) = ghost_shaper::rasterize_color(font, id, size) {
+            // Shrink until the bitmap fits its cells; dimensions scale roughly
+            // linearly with size, so this converges in one step almost always.
+            for _ in 0..2 {
+                if bmp.width == 0 || bmp.height == 0 {
+                    break;
+                }
+                let fit = (cell_box.0 / bmp.width as f32).min(cell_box.1 / bmp.height as f32);
+                if fit >= 1.0 {
+                    break;
+                }
+                size = (size * fit).max(1.0);
+                bmp = ghost_shaper::rasterize_color(font, id, size)?;
+            }
+            return Some(AtlasBitmap {
+                left: bmp.left,
+                top: bmp.top,
+                width: bmp.width,
+                height: bmp.height,
+                rgba: bmp.rgba,
+                color: true,
+            });
+        }
+        let bmp = ghost_shaper::rasterize(font, id, size_px, synth)?;
+        let mut rgba = Vec::with_capacity(bmp.coverage.len() * 4);
+        for &cov in &bmp.coverage {
+            rgba.extend_from_slice(&[255, 255, 255, cov]);
+        }
+        Some(AtlasBitmap {
+            left: bmp.left,
+            top: bmp.top,
+            width: bmp.width,
+            height: bmp.height,
+            rgba,
+            color: false,
+        })
     }
 
     /// Resolve which (face, glyph, synthesis) actually renders a shaped glyph `g` (whose
@@ -2703,7 +2818,9 @@ impl Renderer {
                         run.style.bold,
                         run.style.italic,
                     );
-                    if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth) {
+                    let span = span_cols(&run.text, &col_of_byte, g.cluster, run.width_cols as u16);
+                    let cell_box = (span as f32 * metrics.advance, metrics.line_height);
+                    if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth, cell_box) {
                         glyphs.push(Instance {
                             rect: [
                                 pen + slot.left as f32,
@@ -2712,7 +2829,13 @@ impl Renderer {
                                 slot.h as f32,
                             ],
                             uv: Self::slot_uv(&slot),
-                            color: glyph_color,
+                            // A color glyph carries its own colors: draw it
+                            // untinted (white), keeping only the fade alpha.
+                            color: if slot.color {
+                                [1.0, 1.0, 1.0, glyph_color[3]]
+                            } else {
+                                glyph_color
+                            },
                         });
                     }
                 }
@@ -3287,7 +3410,9 @@ impl Renderer {
                 let pen = rect.x + (run.start_col + cell) as f32 * metrics.advance;
                 let (gface, gid, gsynth) =
                     self.render_glyph(face, synth, g, &run.text, run.style.bold, run.style.italic);
-                if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth) {
+                let span = span_cols(&run.text, &col_of_byte, g.cluster, run.width_cols as u16);
+                let cell_box = (span as f32 * metrics.advance, metrics.line_height);
+                if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth, cell_box) {
                     out.push(Instance {
                         rect: [
                             pen + slot.left as f32,
@@ -3296,7 +3421,12 @@ impl Renderer {
                             slot.h as f32,
                         ],
                         uv: Self::slot_uv(&slot),
-                        color,
+                        // Color glyphs (emoji in chrome text) draw untinted.
+                        color: if slot.color {
+                            [1.0, 1.0, 1.0, color[3]]
+                        } else {
+                            color
+                        },
                     });
                 }
             }
@@ -3918,9 +4048,12 @@ mod tests {
         let synth = ghost_shaper::Synthesis::default();
 
         let mut r = Renderer::headless(Theme::default());
-        let bold_slot = r.ensure_glyph(bold, id, SIZE_PX, synth).expect("bold '8'");
+        let cell_box = (SIZE_PX * 2.0, SIZE_PX * 2.0);
+        let bold_slot = r
+            .ensure_glyph(bold, id, SIZE_PX, synth, cell_box)
+            .expect("bold '8'");
         let reg_slot = r
-            .ensure_glyph(regular, id, SIZE_PX, synth)
+            .ensure_glyph(regular, id, SIZE_PX, synth, cell_box)
             .expect("regular '8'");
 
         assert_ne!(
@@ -3932,7 +4065,7 @@ mod tests {
         // caching is intact, not defeated by the extra key field).
         assert_eq!(r.cache_stats().glyph.misses, 2, "each face rasterizes once");
         let hits = r.cache_stats().glyph.hits;
-        let _ = r.ensure_glyph(regular, id, SIZE_PX, synth);
+        let _ = r.ensure_glyph(regular, id, SIZE_PX, synth, cell_box);
         assert_eq!(
             r.cache_stats().glyph.hits,
             hits + 1,

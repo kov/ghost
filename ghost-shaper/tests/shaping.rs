@@ -395,6 +395,15 @@ fn color_raster_scales_with_size() {
 }
 
 #[test]
+fn color_capability_probe_matches_the_fonts() {
+    // The cheap table scan gates the color-raster probe: it must be positive
+    // for the emoji font and negative for text fonts, or every text glyph
+    // cache miss pays for a doomed color attempt.
+    assert!(ghost_shaper::has_color_glyphs(emoji_font()));
+    assert!(!ghost_shaper::has_color_glyphs(font()));
+}
+
+#[test]
 fn color_raster_of_a_text_font_is_none() {
     // Fira Code has no color tables: the color path declines, so the caller
     // falls through to the normal coverage-mask raster.

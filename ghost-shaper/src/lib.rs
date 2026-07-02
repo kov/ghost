@@ -56,6 +56,25 @@ pub struct ColorGlyphBitmap {
     pub rgba: Vec<u8>,
 }
 
+/// Whether the font carries any color-glyph tables (`COLR`, `CBDT`, `sbix`).
+/// A cheap table-directory scan — callers use it (cached per face) to skip the
+/// [`rasterize_color`] probe entirely for ordinary text fonts, whose every
+/// glyph-cache miss would otherwise pay for a doomed color attempt.
+pub fn has_color_glyphs(font: FontRef) -> bool {
+    let base = font.offset as usize;
+    let Some(count) = font
+        .data
+        .get(base + 4..base + 6)
+        .map(|b| u16::from_be_bytes(b.try_into().unwrap()) as usize)
+    else {
+        return false;
+    };
+    (0..count).any(|i| {
+        let at = base + 12 + i * 16;
+        matches!(font.data.get(at..at + 4), Some(b"COLR" | b"CBDT" | b"sbix"))
+    })
+}
+
 /// Rasterize a glyph's *color* form, if the font has one: a COLRv1 paint graph
 /// (skrifa traversal painted with tiny-skia — the format modern Noto Color
 /// Emoji ships as), COLRv0 layers, or an embedded bitmap strike (CBDT/sbix,
