@@ -425,16 +425,22 @@ declare_class!(
             // text is reported as `KeyboardInput` by `keyDown:`.
             let has_marked = unsafe { self.hasMarkedText() };
             let outside_key_event = !self.ivars().in_key_event.get();
-            if (has_marked || outside_key_event) && self.is_ime_enabled() && !is_control {
-                if has_marked {
-                    self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                    // The enclosing `keyDown:` consumes this to suppress the
-                    // keystroke's own `KeyboardInput` for committed text.
-                    self.ivars().ime_state.set(ImeState::Committed);
-                }
-                // A palette/dictation insert has no enclosing key event, so the
-                // state is left alone: marking it `Committed` would make the NEXT
-                // keystroke read as IME input and swallow it.
+            if has_marked && self.is_ime_enabled() && !is_control {
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                // The enclosing `keyDown:` consumes this to suppress the
+                // keystroke's own `KeyboardInput` for committed text.
+                self.ivars().ime_state.set(ImeState::Committed);
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+            } else if outside_key_event && self.ivars().ime_allowed.get() && !is_control {
+                // The palette path is gated on `ime_allowed` (the app's opt-in),
+                // NOT on `ime_state`: that state machine tracks *compositions* —
+                // it starts `Disabled`, only leaves on `setMarkedText:` (e.g. a
+                // dead-key accent), and any input-source switch knocks it back —
+                // so gating on it made palette input work only in windows that
+                // had already hosted a composition. The state is also left
+                // alone: there is no enclosing key event, and marking it
+                // `Committed` would make the NEXT keystroke read as IME input
+                // and be swallowed.
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
             }
         }
