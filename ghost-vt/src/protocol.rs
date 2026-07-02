@@ -39,6 +39,64 @@ pub enum ClientMsg {
     /// built-in defaults. Clients that know their scheme (the GUI) send it
     /// right after attaching.
     Theme(crate::query::ThemeColors),
+    /// Identify this connection: an opaque self-chosen id (e.g. one GUI
+    /// window). A display client sends it right after attaching — like
+    /// [`ClientMsg::Theme`] — so the host can say *who* holds the display in
+    /// [`AttachInfo`]; frontends compare it with their own id to tell
+    /// "attached to me" from "attached elsewhere". Optional: an anonymous
+    /// display client reports as `AttachInfo { client: None }`.
+    Hello { client: String },
+    /// Subscribe to state events for this session. A subscriber is *not* a
+    /// display client: it never sends [`ClientMsg::Resize`], so it never
+    /// steals the display or resizes the PTY. The host replies with one
+    /// [`ServerMsg::Snapshot`], then pushes a [`ServerMsg::Event`] on every
+    /// state change until the connection closes. Host death is observed as
+    /// EOF on the subscription.
+    Subscribe,
+}
+
+/// Who holds a session's display. Richer than the on-disk `attached` marker
+/// (a bare bool): carries the display client's self-reported identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AttachInfo {
+    /// The display client's identity as reported by [`ClientMsg::Hello`], or
+    /// `None` for a client that never identified itself.
+    pub client: Option<String>,
+}
+
+/// A session's mutable state, sent once as [`ServerMsg::Snapshot`] when a
+/// subscription starts so the subscriber is consistent before any delta.
+/// Mirrors the marker/meta-backed fields of [`SessionInfo`](crate::session::SessionInfo);
+/// immutable facts (pid, command, creation time) stay with discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionState {
+    /// The current display attachment, or `None` when the session is detached.
+    pub attached: Option<AttachInfo>,
+    /// The session rang the bell while unattached and has not been seen since.
+    pub bell: bool,
+    /// The current terminal title (OSC 0/2), empty if none has been set.
+    pub title: String,
+    /// The user-chosen display name, empty if never renamed.
+    pub display_name: String,
+}
+
+/// A state change pushed to subscribers as [`ServerMsg::Event`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionEvent {
+    /// The child rang the terminal bell.
+    Bell,
+    /// The child set the terminal title (OSC 0/2).
+    TitleChanged(String),
+    /// A display client attached, or replaced the previous one.
+    Attached(AttachInfo),
+    /// The display client detached; nothing is driving the session.
+    Detached,
+    /// The child produced output. Coalesced by the host — a burst of output
+    /// is a single event, and a slow subscriber is never flooded; it exists
+    /// to drive activity badges, not to carry content.
+    Activity,
+    /// The session's display name changed ([`ClientMsg::Rename`]).
+    Renamed(String),
 }
 
 /// Messages sent from the session host to an attach client.
@@ -51,6 +109,11 @@ pub enum ServerMsg {
     /// Result of a [`ClientMsg::Rename`]: `ok` true on success, otherwise
     /// `message` explains why it was refused.
     RenameResult { ok: bool, message: String },
+    /// One consistent state snapshot, sent as the reply to
+    /// [`ClientMsg::Subscribe`] before any [`ServerMsg::Event`].
+    Snapshot(SessionState),
+    /// A state change, pushed to subscribers.
+    Event(SessionEvent),
 }
 
 /// The protocol feature level this binary speaks. The host writes it to the
@@ -71,6 +134,19 @@ pub const PROTO_THEME: u32 = 1;
 /// detaches clients and strands the old id in every attached window — so
 /// clients refuse to send them a rename rather than trigger it.
 pub const PROTO_RENAME_LABEL: u32 = 2;
+
+/// Feature level at which the host serves [`ClientMsg::Subscribe`] and
+/// [`ClientMsg::Hello`] and pushes [`ServerMsg::Snapshot`]/[`ServerMsg::Event`].
+/// Clients keep polling the marker files of a session whose host predates it.
+/// [`PROTO_LEVEL`] is bumped to this only when the host actually serves
+/// subscriptions — the types landing first must not advertise the feature.
+pub const PROTO_SUBSCRIBE: u32 = 3;
+
+const _: () = assert!(PROTO_SUBSCRIBE > PROTO_RENAME_LABEL);
+// Remove this guard in the change that makes the host serve subscriptions
+// (and bump PROTO_LEVEL there): until then, advertising the level would let
+// clients subscribe to a host that silently ignores them.
+const _: () = assert!(PROTO_LEVEL < PROTO_SUBSCRIBE);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
@@ -206,6 +282,75 @@ mod tests {
             r.push(&encode(&msg));
             assert_eq!(r.next_msg::<ServerMsg>().unwrap().unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn roundtrip_subscribe_surface() {
+        // The subscription verbs a state observer speaks (PROTO_SUBSCRIBE).
+        for msg in [
+            ClientMsg::Subscribe,
+            ClientMsg::Hello {
+                client: "gui:4242:1".to_string(),
+            },
+        ] {
+            let mut r = FrameReader::new();
+            r.push(&encode(&msg));
+            assert_eq!(r.next_msg::<ClientMsg>().unwrap().unwrap(), msg);
+        }
+
+        let snapshot = ServerMsg::Snapshot(SessionState {
+            attached: Some(AttachInfo {
+                client: Some("gui:4242:1".to_string()),
+            }),
+            bell: true,
+            title: "vim".to_string(),
+            display_name: "build box".to_string(),
+        });
+        let detached_snapshot = ServerMsg::Snapshot(SessionState {
+            attached: None,
+            bell: false,
+            title: String::new(),
+            display_name: String::new(),
+        });
+        let events = [
+            SessionEvent::Bell,
+            SessionEvent::TitleChanged("make -j8".to_string()),
+            SessionEvent::Attached(AttachInfo { client: None }),
+            SessionEvent::Detached,
+            SessionEvent::Activity,
+            SessionEvent::Renamed("otter".to_string()),
+        ]
+        .map(ServerMsg::Event);
+        for msg in [snapshot, detached_snapshot].into_iter().chain(events) {
+            let mut r = FrameReader::new();
+            r.push(&encode(&msg));
+            assert_eq!(r.next_msg::<ServerMsg>().unwrap().unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn old_client_skips_snapshot_and_event_frames() {
+        // A display client built before PROTO_SUBSCRIBE that shares a stream
+        // with pushed state (a dual-written migration host, or a bug) must
+        // skip the frames it predates and keep decoding output.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum OldServerMsg {
+            Output(Vec<u8>),
+            Exited(i32),
+            RenameResult { ok: bool, message: String },
+        }
+
+        let mut bytes = encode(&ServerMsg::Event(SessionEvent::Bell));
+        bytes.extend_from_slice(&encode(&ServerMsg::Snapshot(SessionState::default())));
+        bytes.extend_from_slice(&encode(&ServerMsg::Output(b"still here".to_vec())));
+        let mut r = FrameReader::new();
+        r.push(&bytes);
+        assert_eq!(
+            r.next_msg::<OldServerMsg>().unwrap().unwrap(),
+            OldServerMsg::Output(b"still here".to_vec()),
+            "unknown pushed frames are skipped and output still decodes"
+        );
+        assert!(r.next_msg::<OldServerMsg>().unwrap().is_none());
     }
 
     #[test]

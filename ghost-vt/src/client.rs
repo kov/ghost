@@ -226,6 +226,9 @@ impl Session {
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
                         ServerMsg::Exited(_code) => pump.ended = true,
                         ServerMsg::RenameResult { .. } => {}
+                        // Pushed subscription state; a display client is not a
+                        // subscriber, so nothing to do.
+                        ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
                     }
                 }
             }
@@ -332,6 +335,9 @@ pub fn attach(name: &str) -> io::Result<()> {
                     ServerMsg::RenameResult { ok, message } => {
                         rename_result(ok, &message, &mut prompt, &mut client, stdin)?;
                     }
+                    // Pushed subscription state; a display client is not a
+                    // subscriber, so nothing to do.
+                    ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
                 }
             }
         }

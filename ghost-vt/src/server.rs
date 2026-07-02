@@ -773,6 +773,11 @@ fn handle_client_messages(
             ClientMsg::Theme(colors) => {
                 *last_theme = colors;
             }
+            ClientMsg::Hello { .. } | ClientMsg::Subscribe => {
+                // Subscription surface (PROTO_SUBSCRIBE), not served yet: the
+                // host doesn't advertise the level, so nothing should send
+                // these; tolerate them rather than dropping the client.
+            }
         }
     }
     Ok(Disposition::Keep)
