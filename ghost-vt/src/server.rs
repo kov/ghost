@@ -424,6 +424,11 @@ fn host_main(
     let mut last_bell_count = 0u64;
     // Mirrors the bell marker's presence so a snapshot never has to stat it.
     let mut bell_marked = false;
+    // The state the subscribers were last told about; each loop turn ends by
+    // diffing the current state against it and pushing the deltas as events.
+    // Dual-written with the marker files, which stay authoritative for polling
+    // clients during the migration.
+    let mut last_state = crate::protocol::SessionState::default();
     let mut ptybuf = [0u8; 8192];
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
@@ -493,6 +498,12 @@ fn host_main(
                     client: c.hello.clone(),
                 });
 
+        // Turn-local facts for the end-of-turn event push: a bell is an
+        // occurrence, not a state (the diff below can't see one that rang and
+        // was witnessed within the same turn), and activity is any output.
+        let mut rang = false;
+        let mut activity = false;
+
         // PTY output -> authoritative screen state, and live to the attached
         // client (if any). State is always tracked so the next attach can be
         // repainted even after a period with nobody attached.
@@ -500,6 +511,7 @@ fn host_main(
             match (&pty).read(&mut ptybuf) {
                 Ok(0) => return child_exited(&mut child, &mut client),
                 Ok(n) => {
+                    activity = n > 0;
                     // `feed` reports the rows it changed; an empty set means this
                     // output was non-rendering (a query, a mode toggle, pen
                     // changes) and left the visible screen untouched.
@@ -512,6 +524,7 @@ fn host_main(
                     let bells = screen.bell_count();
                     if bells != last_bell_count {
                         last_bell_count = bells;
+                        rang = true;
                         if !client.as_ref().is_some_and(|c| c.resynced) {
                             set_bell_marker(current_name, true);
                             bell_marked = true;
@@ -754,13 +767,12 @@ fn host_main(
             )?);
         }
 
-        // Push queued output to the client, and queued state to the watchers.
+        // Push queued output to the client.
         if let Some(c) = &mut client
             && c.flush().is_err()
         {
             client = None;
         }
-        subscribers.retain_mut(|s| s.flush().is_ok());
 
         // Reconcile the attach marker with the display client's presence. All the
         // ways `client` can change this turn (handshake takeover, detach, drop,
@@ -776,6 +788,58 @@ fn host_main(
             }
             attached_marked = now_attached;
         }
+
+        // Tell the watchers what changed this turn: diff the session's state
+        // against what they last saw, plus the turn's occurrences (bell rings,
+        // output activity). The state is always tracked — even with no
+        // subscriber — so the first event a late subscriber receives is a
+        // delta on its snapshot, never a replay of older history.
+        {
+            let now_state = crate::protocol::SessionState {
+                attached: client.as_ref().filter(|c| c.resynced).map(|c| {
+                    crate::protocol::AttachInfo {
+                        client: c.hello.clone(),
+                    }
+                }),
+                bell: bell_marked,
+                title: meta.title.clone(),
+                display_name: meta.display_name.clone(),
+            };
+            if !subscribers.is_empty() {
+                use crate::protocol::SessionEvent;
+                let mut events = Vec::new();
+                if rang {
+                    events.push(SessionEvent::Bell);
+                }
+                if now_state.title != last_state.title {
+                    events.push(SessionEvent::TitleChanged(now_state.title.clone()));
+                }
+                if now_state.display_name != last_state.display_name {
+                    events.push(SessionEvent::Renamed(now_state.display_name.clone()));
+                }
+                match (&last_state.attached, &now_state.attached) {
+                    (before, Some(info)) if before.as_ref() != Some(info) => {
+                        events.push(SessionEvent::Attached(info.clone()));
+                    }
+                    (Some(_), None) => events.push(SessionEvent::Detached),
+                    _ => {}
+                }
+                for s in &mut subscribers {
+                    // Activity is best-effort and high-frequency: skip a
+                    // watcher that has not drained its previous push, so a
+                    // slow reader never accumulates an unbounded queue of
+                    // "something happened" frames.
+                    if activity && !s.conn.wants_write() {
+                        s.queue(&ServerMsg::Event(SessionEvent::Activity));
+                    }
+                    for e in &events {
+                        s.queue(&ServerMsg::Event(e.clone()));
+                    }
+                }
+            }
+            last_state = now_state;
+        }
+        subscribers.retain_mut(|s| s.flush().is_ok());
 
         // Signals.
         if sig_re.contains(PollFlags::IN) {

@@ -9,7 +9,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ghost_vt::client::Client;
-use ghost_vt::protocol::{AttachInfo, ClientMsg, PROTO_SUBSCRIBE, ServerMsg, SessionState};
+use ghost_vt::protocol::{
+    AttachInfo, ClientMsg, PROTO_SUBSCRIBE, ServerMsg, SessionEvent, SessionState,
+};
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 
@@ -88,6 +90,105 @@ fn recv_snapshot(client: &mut Client, timeout: Duration) -> Option<SessionState>
         }
     }
     None
+}
+
+/// Pump the connection, appending every pushed event to `seen`, until `pred`
+/// is satisfied (or time runs out — the assertion then shows what arrived).
+fn recv_events_until(
+    client: &mut Client,
+    seen: &mut Vec<SessionEvent>,
+    timeout: Duration,
+    mut pred: impl FnMut(&[SessionEvent]) -> bool,
+) {
+    client
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if pred(seen) {
+            return;
+        }
+        let msgs = match client.recv_ready() {
+            Ok(Some(msgs)) => msgs,
+            Ok(None) => break,  // EOF
+            Err(_) => continue, // read timeout — keep waiting
+        };
+        for msg in msgs {
+            if let ServerMsg::Event(e) = msg {
+                seen.push(e);
+            }
+        }
+    }
+    assert!(pred(seen), "expected event did not arrive; got {seen:?}");
+}
+
+#[test]
+fn a_subscriber_is_pushed_state_events_as_the_session_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "events-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The child waits for a line of input, then rings the bell and sets the
+    // terminal title — observable state changes we trigger on demand.
+    let session_dir = spawn_session(
+        xdg,
+        name,
+        "read line; printf '\\a'; printf '\\033]2;hello\\007'; sleep 60",
+    );
+    let sock = session_dir.join("sock");
+
+    // Subscribe first, so every later change is a delta on the snapshot.
+    let mut sub = Client::connect_path(&sock).expect("subscriber connect");
+    sub.send(&ClientMsg::Subscribe).unwrap();
+    let state = recv_snapshot(&mut sub, Duration::from_secs(5)).expect("snapshot");
+    assert_eq!(state.attached, None);
+    let mut seen = Vec::new();
+
+    // An identified display client attaches -> Attached(window-1).
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Hello {
+            client: "window-1".to_string(),
+        })
+        .unwrap();
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    let attached = SessionEvent::Attached(AttachInfo {
+        client: Some("window-1".to_string()),
+    });
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.contains(&attached)
+    });
+
+    // Waking the child rings the bell and sets the title. The bell rings while
+    // a display client is attached: the live event fires anyway (that is the
+    // point of the push), while the unseen-bell marker stays clear.
+    display.send(&ClientMsg::Input(b"\n".to_vec())).unwrap();
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.contains(&SessionEvent::Bell)
+            && seen.contains(&SessionEvent::TitleChanged("hello".to_string()))
+            && seen.contains(&SessionEvent::Activity)
+    });
+    assert!(
+        !session_dir.join("bell").exists(),
+        "a bell witnessed by an attached client must not be marked unseen"
+    );
+
+    // Renaming the session -> Renamed.
+    display
+        .send(&ClientMsg::Rename("otter".to_string()))
+        .unwrap();
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.contains(&SessionEvent::Renamed("otter".to_string()))
+    });
+
+    // Dropping the display client -> Detached.
+    drop(display);
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.contains(&SessionEvent::Detached)
+    });
 }
 
 #[test]
