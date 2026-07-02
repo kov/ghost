@@ -828,6 +828,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
         name: "db".to_string(),
         display_name: String::new(),
         command: vec!["psql".to_string(), "prod".to_string()],
+        cwd: Some("~/ops".to_string()),
     }]));
     feed(
         &mut fleet,
@@ -1079,6 +1080,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         attached,
         bell: false,
         display_name: String::new(),
+        cwd: None,
     }
 }
 

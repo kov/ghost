@@ -944,6 +944,7 @@ impl App {
                 name: name.clone(),
                 display_name: d.display_name,
                 command: d.command,
+                cwd: d.cwd.as_deref().map(session::display_path),
             });
         }
         self.dispatch(wid, UiEvent::DeadSessions(dead.clone()), event_loop);
@@ -2187,6 +2188,7 @@ mod tests {
             attached,
             bell: false,
             display_name: String::new(),
+            cwd: None,
         }
     }
 

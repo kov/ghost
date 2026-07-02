@@ -329,6 +329,9 @@ struct Tile {
     /// The OSC 9;4 progress shown in the card header at the last feed, so a
     /// pure progress report (which dirties no screen rows) still repaints.
     progress: Option<ghost_term::Progress>,
+    /// The session's working directory (display form, `~`-abbreviated), from
+    /// the listing's descriptor read; `None` when unknown.
+    cwd: Option<String>,
     /// A dead-but-remembered group member: its session is gone, but the tile
     /// stays in its group's block (previewing its recording's last screen)
     /// and activating it recreates the session. Never observed or attached;
@@ -595,6 +598,7 @@ impl FleetModel {
             frame: None,
             frame_dirty: true,
             progress: None,
+            cwd: None,
             dead: false,
         });
     }
@@ -957,6 +961,7 @@ impl FleetModel {
                     || tile.command != info.command
                     || tile.pid != info.pid
                     || tile.created_at != info.created_at
+                    || tile.cwd != info.cwd
                     || tile.model.display_name() != info.display_name
                 {
                     // A creation-time change reorders the grid (it's the sort key),
@@ -970,6 +975,7 @@ impl FleetModel {
                 tile.command = info.command.clone();
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
+                tile.cwd = info.cwd.clone();
                 tile.model.set_display_name(info.display_name.clone());
             } else {
                 let mut model =
@@ -985,6 +991,7 @@ impl FleetModel {
                     info.pid,
                     info.created_at,
                 );
+                self.tiles.last_mut().expect("just pushed").cwd = info.cwd.clone();
                 dirty = true;
             }
         }
@@ -1052,7 +1059,9 @@ impl FleetModel {
                     0,
                     None,
                 );
-                self.tiles.last_mut().expect("just pushed").dead = true;
+                let t = self.tiles.last_mut().expect("just pushed");
+                t.dead = true;
+                t.cwd = d.cwd;
                 dirty = true;
             }
         }
@@ -1269,9 +1278,16 @@ impl FleetModel {
         // Pack each segment's cards into rows of the shared height, left-aligned
         // at the segment grid's centred edge so the leftover width is shared as
         // margins (the scroll, when the grid overflows, is vertical only).
+        // A sparse grid floats to the vertical centre: when the whole content
+        // fits the viewport, the leftover splits into top/bottom margins
+        // instead of hugging the top (max_scroll stays 0, so this never
+        // interacts with scrolling).
         let mut headers = Vec::new();
         let mut placements = Vec::new();
-        let mut y = gap;
+        // (`content_for` counts a gap on both edges; centring the visible
+        // block means placing its top at half the true leftover, plus the
+        // leading gap that the loop below does not re-add.)
+        let mut y = gap.max((h - content_for(card_h)) * 0.5 + gap);
         for (kind, ts) in &segments {
             let widths: Vec<f32> = ts.iter().map(|t| card_w(t, card_h)).collect();
             let rows = pack_rows(&widths, avail_w, gap);
@@ -2202,18 +2218,29 @@ impl FleetModel {
                 // pid or progress report would only pretend it still runs.
                 None if tile.dead => format!(
                     "{} \u{b7} exited",
-                    card_meta(tile.model.display(), &tile.command, 0, None)
+                    card_meta(
+                        tile.model.display(),
+                        &tile.command,
+                        0,
+                        tile.cwd.clone(),
+                        None
+                    )
                 ),
                 None => card_meta(
                     tile.model.display(),
                     &tile.command,
                     tile.pid,
+                    tile.cwd.clone(),
                     tile.model.screen().vt().progress(),
                 ),
             };
+            // Clipped to the card: a narrow (aspect-locked) card cannot show a
+            // long command, and overflow would bleed into the neighbours.
+            let meta_rect = text_line(header, metrics, 6.0);
+            let header_text = clip_text(&header_text, (meta_rect.w / metrics.advance) as usize);
             items.push(SceneItem::Text {
                 id: SceneId::Label(handle),
-                rect: text_line(header, metrics, 6.0),
+                rect: meta_rect,
                 runs: vec![label_run(&header_text)],
                 metrics,
                 color: CARD_META_COLOR,
@@ -2505,19 +2532,25 @@ fn placeholder_hint(loc: Locality) -> &'static str {
     }
 }
 
-/// One-line card metadata: `name · command · pid`. The command is omitted when
-/// the session just runs the user's `$SHELL` (an empty command) — it's always the
-/// shell there, so it's noise; the pid is omitted when unknown.
+/// One-line card metadata: `name · command · cwd · pid`. The command is omitted
+/// when the session just runs the user's `$SHELL` (an empty command) — it's
+/// always the shell there, so it's noise; the cwd and pid are omitted when
+/// unknown.
 fn card_meta(
     id: &str,
     command: &[String],
     pid: i32,
+    cwd: Option<String>,
     progress: Option<ghost_term::Progress>,
 ) -> String {
     let mut s = id.to_string();
     if !command.is_empty() {
         s.push_str(" \u{b7} ");
         s.push_str(&command.join(" "));
+    }
+    if let Some(cwd) = cwd {
+        s.push_str(" \u{b7} ");
+        s.push_str(&cwd);
     }
     if pid > 0 {
         s.push_str(" \u{b7} ");
@@ -2535,6 +2568,16 @@ fn card_meta(
             Paused(pct) => s.push_str(&format!("\u{23f8} {pct}%")),
         }
     }
+    s
+}
+
+/// Fit `text` into `cap` cells, marking a cut with a trailing ellipsis.
+fn clip_text(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(cap.saturating_sub(1)).collect();
+    s.push('\u{2026}');
     s
 }
 
@@ -2591,6 +2634,7 @@ mod tests {
             attached: false,
             bell: false,
             display_name: String::new(),
+            cwd: None,
         }
     }
 
@@ -3012,6 +3056,7 @@ mod tests {
             name: name.to_string(),
             display_name: display.to_string(),
             command: command.iter().map(|s| s.to_string()).collect(),
+            cwd: None,
         }
     }
 
@@ -4550,16 +4595,118 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_grid_floats_to_the_vertical_centre() {
+        let mut m = fleet();
+        widen(&mut m); // 1000x700: one card cannot fill it
+        list(&mut m, &["a"]);
+        let (headers, placements, _, _) = m.sections_layout();
+        let top = headers[0].1.y;
+        let card = placements[0].2;
+        let bottom = WIDE.1 as f32 - (card.y + card.h);
+        assert!(
+            top > GAP + 1.0,
+            "a lone card does not hug the top: header at y={top}"
+        );
+        assert!(
+            (top - bottom).abs() <= GAP + 1.0,
+            "the block is vertically centred: {top} above vs {bottom} below"
+        );
+        // A crowded, scrolling grid still starts at the top.
+        list_many(&mut m, 30);
+        let (headers, _, _, content_h) = m.sections_layout();
+        assert!(content_h > WIDE.1 as f32, "precondition: it overflows");
+        assert!(
+            (headers[0].1.y - GAP).abs() < 1.0,
+            "an overflowing grid starts at the top"
+        );
+    }
+
+    #[test]
+    fn card_metadata_shows_the_working_directory() {
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![SessionInfo {
+            cwd: Some("~/Projects/ghost".into()),
+            ..info("a")
+        }]));
+        let scene = m.view();
+        assert!(
+            scene.layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Text { runs, .. }
+                    if runs[0].text.contains("~/Projects/ghost"))),
+            "the card meta line carries the session's cwd"
+        );
+        // Between the command and the pid, before any progress tail.
+        assert_eq!(
+            card_meta(
+                "a",
+                &["vim".into()],
+                12,
+                Some("~/x".into()),
+                Some(ghost_term::Progress::Normal(3)),
+            ),
+            "a \u{b7} vim \u{b7} ~/x \u{b7} 12 \u{b7} 3%"
+        );
+    }
+
+    #[test]
+    fn card_metadata_is_clipped_to_its_card() {
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![SessionInfo {
+            command: vec![
+                "journalctl".into(),
+                "-f".into(),
+                "--unit".into(),
+                "some-very-long-daemon.service".into(),
+            ],
+            pid: 123456,
+            ..info("skinny")
+        }]));
+        // A tall observed grid narrows the card (aspect-locked), so the long
+        // command cannot possibly fit its meta line.
+        m.update(UiEvent::SessionPush {
+            name: "skinny".into(),
+            push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
+                cols: 20,
+                rows: 80,
+            }),
+        });
+        let scene = m.view();
+        let meta = scene.layers[0]
+            .items
+            .iter()
+            .find_map(|it| match it {
+                SceneItem::Text { runs, rect, .. } if runs[0].text.starts_with("skinny") => {
+                    Some((runs[0].text.clone(), *rect))
+                }
+                _ => None,
+            })
+            .expect("the card has a meta line");
+        let (text, rect) = meta;
+        assert!(
+            text.chars().count() as f32 * METRICS.advance <= rect.w + 0.5,
+            "the meta line fits its card: {text:?} ({} chars) in {}px",
+            text.chars().count(),
+            rect.w
+        );
+        assert!(text.ends_with('\u{2026}'), "the cut is visible: {text:?}");
+    }
+
+    #[test]
     fn card_metadata_omits_the_shell_command() {
         // A shell session (empty command) shows just name · pid — no "$SHELL".
-        assert_eq!(card_meta("build", &[], 4012, None), "build \u{b7} 4012");
+        assert_eq!(
+            card_meta("build", &[], 4012, None, None),
+            "build \u{b7} 4012"
+        );
         // A real command is shown.
         assert_eq!(
-            card_meta("edit", &["nvim".into(), "x.rs".into()], 40, None),
+            card_meta("edit", &["nvim".into(), "x.rs".into()], 40, None, None),
             "edit \u{b7} nvim x.rs \u{b7} 40"
         );
         // Unknown pid is omitted too.
-        assert_eq!(card_meta("s", &[], 0, None), "s");
+        assert_eq!(card_meta("s", &[], 0, None, None), "s");
     }
 
     #[test]
@@ -4567,19 +4714,19 @@ mod tests {
         use ghost_term::Progress;
         // The suffix formats per OSC 9;4 state.
         assert_eq!(
-            card_meta("b", &[], 0, Some(Progress::Normal(42))),
+            card_meta("b", &[], 0, None, Some(Progress::Normal(42))),
             "b \u{b7} 42%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, Some(Progress::Error(90))),
+            card_meta("b", &[], 0, None, Some(Progress::Error(90))),
             "b \u{b7} \u{2717} 90%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, Some(Progress::Indeterminate)),
+            card_meta("b", &[], 0, None, Some(Progress::Indeterminate)),
             "b \u{b7} \u{2026}"
         );
         assert_eq!(
-            card_meta("b", &[], 0, Some(Progress::Paused(10))),
+            card_meta("b", &[], 0, None, Some(Progress::Paused(10))),
             "b \u{b7} \u{23f8} 10%"
         );
 

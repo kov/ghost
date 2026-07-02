@@ -37,6 +37,10 @@ pub struct SessionInfo {
     /// directory, socket, and recording never move). Show [`Self::display`],
     /// key on `name`.
     pub display_name: String,
+    /// The child's working directory for display (home collapsed to `~`),
+    /// read from the durable descriptor — so it refreshes on the host's
+    /// checkpoint/detach cadence, not per keystroke. `None` when unknown.
+    pub cwd: Option<String>,
 }
 
 impl SessionInfo {
@@ -66,7 +70,25 @@ enum HostState {
 
 /// List live sessions, pruning directories whose host is gone.
 pub fn list() -> io::Result<Vec<SessionInfo>> {
-    list_in(&paths::runtime_dir())
+    let mut out = list_in(&paths::runtime_dir())?;
+    // Enrich with the durable descriptor's cwd (display metadata, like the
+    // title): done here, not in `list_in`, so the directory-scan logic stays
+    // testable against a plain tempdir.
+    for s in &mut out {
+        s.cwd = crate::descriptor::read(&s.name)
+            .and_then(|d| d.cwd)
+            .map(|p| display_path(&p));
+    }
+    Ok(out)
+}
+
+/// A path for human display: the user's home collapsed to `~`.
+pub fn display_path(p: &Path) -> String {
+    match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
 }
 
 /// [`list`], but over an explicit runtime directory (so it can be tested against
@@ -100,6 +122,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     attached: path.join("attached").exists(),
                     bell: path.join("bell").exists(),
                     display_name: meta.display_name,
+                    cwd: None, // filled by [`list`] from the descriptor
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -258,6 +281,7 @@ mod tests {
             attached: false,
             bell: false,
             display_name: String::new(),
+            cwd: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();

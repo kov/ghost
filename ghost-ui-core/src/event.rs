@@ -19,6 +19,8 @@ pub struct DeadSession {
     pub display_name: String,
     /// The command it ran (empty means the user's `$SHELL`).
     pub command: Vec<String>,
+    /// Its last known working directory (display form, `~`-abbreviated).
+    pub cwd: Option<String>,
 }
 
 /// What a session subscription pushed: the one starting snapshot, or a delta

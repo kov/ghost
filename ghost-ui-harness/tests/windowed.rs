@@ -47,6 +47,7 @@ fn info(name: &str, attached: bool, created_at: i64) -> SessionInfo {
         attached,
         bell: false,
         display_name: String::new(),
+        cwd: None,
     }
 }
 
