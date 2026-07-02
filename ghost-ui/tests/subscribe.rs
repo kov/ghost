@@ -242,6 +242,104 @@ fn a_subscriber_is_pushed_state_events_as_the_session_changes() {
 }
 
 #[test]
+fn an_observer_mirrors_the_screen_without_becoming_a_display_client() {
+    use ghost_vt::protocol::PROTO_OBSERVE;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observe-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The child waits for input, then prints a marker we expect to see
+    // through the observer's read-only mirror.
+    let session_dir = spawn_session(xdg, name, "read line; printf 'MORE-CONTENT'; sleep 60");
+    let sock = session_dir.join("sock");
+
+    let mut obs = Client::connect_path(&sock).expect("observer connect");
+    assert!(
+        obs.proto() >= PROTO_OBSERVE,
+        "host must advertise the observe level it serves (got {})",
+        obs.proto()
+    );
+    obs.set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    obs.send(&ClientMsg::Observe).unwrap();
+
+    // The observation starts with the session's real grid, then a resync of
+    // the current screen; we mirror it into our own emulator, sized by the
+    // pushed grid — never by anything we sent.
+    let mut vt: Option<ghost_vt::screen::Screen> = None;
+    let mut grid = (0u16, 0u16);
+    let drain =
+        |obs: &mut Client, vt: &mut Option<ghost_vt::screen::Screen>, grid: &mut (u16, u16)| {
+            for msg in obs.recv_ready().ok().flatten().unwrap_or_default() {
+                match msg {
+                    ServerMsg::Event(SessionEvent::Resized { cols, rows }) => {
+                        *grid = (cols, rows);
+                        *vt = Some(ghost_vt::screen::Screen::new(cols, rows, 0));
+                    }
+                    ServerMsg::Output(bytes) => {
+                        if let Some(vt) = vt.as_mut() {
+                            vt.feed(&bytes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            drain(&mut obs, &mut vt, &mut grid);
+            vt.is_some()
+        }),
+        "no Resized grid arrived"
+    );
+    assert!(grid.0 > 0 && grid.1 > 0);
+
+    // Watching must not attach, and an attach must not be needed for the
+    // mirror to work: wake the child via a real display client and see its
+    // output arrive live on the observer.
+    assert!(
+        !session_dir.join("attached").exists(),
+        "observing must not set the attached marker"
+    );
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    display.send(&ClientMsg::Input(b"\n".to_vec())).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            drain(&mut obs, &mut vt, &mut grid);
+            vt.as_ref()
+                .is_some_and(|v| v.text().join("\n").contains("MORE-CONTENT"))
+        }),
+        "live output did not reach the observer's mirror; screen: {:?}",
+        vt.as_ref().map(|v| v.text())
+    );
+
+    // The display client resizing the PTY re-grids the mirror and re-seeds it
+    // (a reflowed screen can't be patched incrementally from outside).
+    display
+        .send(&ClientMsg::Resize {
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            drain(&mut obs, &mut vt, &mut grid);
+            grid == (100, 30)
+                && vt
+                    .as_ref()
+                    .is_some_and(|v| v.text().join("\n").contains("MORE-CONTENT"))
+        }),
+        "the observer did not follow the display resize; grid {grid:?}, screen: {:?}",
+        vt.as_ref().map(|v| v.text())
+    );
+}
+
+#[test]
 fn a_subscriber_gets_a_snapshot_without_becoming_the_display_client() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

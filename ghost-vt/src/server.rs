@@ -100,6 +100,9 @@ struct Client {
     /// A subscriber is not a display client: it is answered with a snapshot and
     /// kept, but never promoted, never resized, never resynced.
     subscribed: bool,
+    /// Whether the subscription also receives output (`ClientMsg::Observe`):
+    /// a read-only mirror of the session as the display client shapes it.
+    observing: bool,
     /// The connection's self-reported identity (`ClientMsg::Hello`), surfaced
     /// through [`AttachInfo`] when this connection holds the display.
     hello: Option<String>,
@@ -113,6 +116,7 @@ impl Client {
             conn,
             resynced: false,
             subscribed: false,
+            observing: false,
             hello: None,
         })
     }
@@ -429,6 +433,10 @@ fn host_main(
     // Dual-written with the marker files, which stay authoritative for polling
     // clients during the migration.
     let mut last_state = crate::protocol::SessionState::default();
+    // The grid the subscribers last saw. A change (the display client resized
+    // the PTY) re-grids every observer's mirror, with a resync to re-seed it —
+    // a reflow cannot be patched from outside.
+    let mut last_grid = screen.dimensions();
     let mut ptybuf = [0u8; 8192];
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
@@ -608,6 +616,11 @@ fn host_main(
                         && c.resynced
                     {
                         c.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
+                    }
+                    // ...and to every read-only observer (their resync was
+                    // queued when they observed, so the stream is contiguous).
+                    for s in subscribers.iter_mut().filter(|s| s.observing) {
+                        s.queue(&ServerMsg::Output(ptybuf[..n].to_vec()));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -805,8 +818,22 @@ fn host_main(
                 title: meta.title.clone(),
                 display_name: meta.display_name.clone(),
             };
+            let grid = screen.dimensions();
+            let regridded = grid != last_grid;
+            last_grid = grid;
             if !subscribers.is_empty() {
                 use crate::protocol::SessionEvent;
+                if regridded {
+                    for s in &mut subscribers {
+                        s.queue(&ServerMsg::Event(SessionEvent::Resized {
+                            cols: grid.0,
+                            rows: grid.1,
+                        }));
+                        if s.observing {
+                            s.queue_output(screen.resync());
+                        }
+                    }
+                }
                 let mut events = Vec::new();
                 if rang {
                     events.push(SessionEvent::Bell);
@@ -940,9 +967,25 @@ fn handle_client_messages(
                 c.subscribed = true;
             }
             ClientMsg::Observe => {
-                // Observation surface (PROTO_OBSERVE), not served yet: the
-                // host doesn't advertise the level, so nothing should send
-                // this; tolerate it rather than dropping the client.
+                // A subscription that also mirrors output: snapshot first,
+                // then the session's real grid, then a resync of the current
+                // screen — the observer sizes its emulator from the grid
+                // before feeding the resync. Live output follows from the
+                // host loop's fan-out.
+                c.queue(&ServerMsg::Snapshot(crate::protocol::SessionState {
+                    attached: attached_info.clone(),
+                    bell: bell_marked,
+                    title: meta.title.clone(),
+                    display_name: meta.display_name.clone(),
+                }));
+                let (cols, rows) = screen.dimensions();
+                c.queue(&ServerMsg::Event(crate::protocol::SessionEvent::Resized {
+                    cols,
+                    rows,
+                }));
+                c.queue_output(screen.resync());
+                c.subscribed = true;
+                c.observing = true;
             }
         }
     }

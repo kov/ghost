@@ -139,7 +139,7 @@ pub enum ServerMsg {
 /// level 0. Bump this when appending a message clients send unprompted — or
 /// when an existing message's *semantics* change in a way clients must gate on
 /// — and add a `PROTO_*` constant for it.
-pub const PROTO_LEVEL: u32 = 3;
+pub const PROTO_LEVEL: u32 = 4;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
@@ -163,10 +163,7 @@ const _: () = assert!(PROTO_LEVEL >= PROTO_SUBSCRIBE);
 pub const PROTO_OBSERVE: u32 = 4;
 
 const _: () = assert!(PROTO_OBSERVE > PROTO_SUBSCRIBE);
-// Remove this guard in the change that makes the host serve observation (and
-// bump PROTO_LEVEL there): advertising it earlier would let clients observe a
-// host that silently ignores them.
-const _: () = assert!(PROTO_LEVEL < PROTO_OBSERVE);
+const _: () = assert!(PROTO_LEVEL >= PROTO_OBSERVE);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
