@@ -413,6 +413,12 @@ impl FleetModel {
         self.focused.as_deref()
     }
 
+    /// Whether a modal (inline rename or confirm dialog) is capturing input —
+    /// keys like Escape belong to it, not to whoever hosts the fleet.
+    pub fn modal_open(&self) -> bool {
+        self.renaming.is_some() || self.pending.is_some()
+    }
+
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }

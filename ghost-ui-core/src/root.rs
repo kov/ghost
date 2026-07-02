@@ -451,7 +451,12 @@ impl RootModel {
         } = &ev
             && kind.is_down()
         {
-            if is_fleet_toggle(key) {
+            // Esc backs out of the fleet like F9 — but only when no fleet
+            // modal (rename/confirm) claims it, and never in the single view,
+            // where Esc is terminal input.
+            let escape_out = matches!(key, Key::Named(NamedKey::Escape))
+                && matches!(&self.mode, Mode::Fleet(f) if !f.modal_open());
+            if is_fleet_toggle(key) || escape_out {
                 return self.toggle();
             }
             if let Some(forward) = cycle_dir(key, *mods) {
@@ -1060,6 +1065,43 @@ mod tests {
                 bytes: b"z".to_vec()
             }]
         );
+    }
+
+    #[test]
+    fn escape_in_the_fleet_dives_back_like_f9() {
+        let mut r = root(); // single view of alpha
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet());
+        let cmds = key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(!r.is_fleet(), "Esc leaves the fleet like F9: {cmds:?}");
+        // Back in the single view, Esc is terminal input again, never a toggle.
+        let cmds = key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(!r.is_fleet(), "Esc in the single view stays put");
+        assert_eq!(
+            cmds,
+            vec![Cmd::SendInput {
+                session: "alpha".into(),
+                bytes: b"\x1b".to_vec()
+            }],
+            "Esc reaches the terminal as input"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_a_fleet_modal_instead_of_leaving() {
+        let mut r = root(); // owns "alpha"
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        r.update(UiEvent::SessionList(vec![sess("alpha", true, 1)]));
+        // F2 opens a rename on the focused tile; Esc must close the modal and
+        // stay in the fleet, only leaving on a second, unclaimed press.
+        key(&mut r, Key::Named(NamedKey::F2), Mods::NONE);
+        key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(
+            r.is_fleet(),
+            "Esc with a rename open only cancels the rename"
+        );
+        key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(!r.is_fleet(), "the next Esc dives back in");
     }
 
     #[test]
