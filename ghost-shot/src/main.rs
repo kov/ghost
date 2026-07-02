@@ -816,12 +816,24 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     );
 
     // A user-defined group renders as its own accent-outlined block ahead of
-    // the attach-state sections, regardless of who drives its members.
+    // the attach-state sections, regardless of who drives its members. The
+    // "db" member is dead-but-remembered: its tile stays in the block,
+    // previewing its recording's last screen, offering a relaunch.
     fleet.set_groups(vec![ghost_ui_core::Group {
         name: "web".to_string(),
         color: 0,
-        members: vec!["edit".to_string(), "prod".to_string()],
+        members: vec!["edit".to_string(), "prod".to_string(), "db".to_string()],
     }]);
+    fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
+        name: "db".to_string(),
+        display_name: String::new(),
+        command: vec!["psql".to_string(), "prod".to_string()],
+    }]));
+    feed(
+        &mut fleet,
+        "db",
+        "prod=# select count(*) from orders;\r\n count \r\n-------\r\n 42917\r\n(1 row)\r\n\r\nprod=# ",
+    );
 
     let scene = fleet.view();
     (scene, size.0, size.1)

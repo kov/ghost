@@ -329,6 +329,11 @@ struct Tile {
     /// The OSC 9;4 progress shown in the card header at the last feed, so a
     /// pure progress report (which dirties no screen rows) still repaints.
     progress: Option<ghost_term::Progress>,
+    /// A dead-but-remembered group member: its session is gone, but the tile
+    /// stays in its group's block (previewing its recording's last screen)
+    /// and activating it recreates the session. Never observed or attached;
+    /// revived by a listing that names it again.
+    dead: bool,
 }
 
 pub struct FleetModel {
@@ -590,6 +595,7 @@ impl FleetModel {
             frame: None,
             frame_dirty: true,
             progress: None,
+            dead: false,
         });
     }
 
@@ -814,6 +820,7 @@ impl FleetModel {
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         let cmds = match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
+            UiEvent::DeadSessions(dead) => self.dead_sessions(dead),
             UiEvent::SessionPush { name, push } => self.session_push(&name, push),
             // Authoritative groups from the shell (startup load, or another
             // window saved): replace ours without echoing a save back.
@@ -900,13 +907,32 @@ impl FleetModel {
         let mut cmds = Vec::new();
         let mut dirty = false;
         let new_ids: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        let grouped: HashSet<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
+            .collect();
 
-        // Drop sessions that disappeared.
+        // Sessions that disappeared: a group member is remembered as a dead
+        // tile (its content stays; the shell refreshes it from the recording);
+        // anything else is dropped — including a dead tile whose group was
+        // dissolved out from under it.
         let mut gone = Vec::new();
+        for t in &mut self.tiles {
+            if !new_ids.contains(t.id.as_str()) && grouped.contains(t.id.as_str()) && !t.dead {
+                t.dead = true;
+                t.locality = Locality::Detached;
+                t.frame_dirty = true; // the card meta now says "exited"
+                gone.push(t.id.clone()); // still release its client + mirror
+                dirty = true;
+            }
+        }
         self.tiles.retain(|t| {
-            let keep = new_ids.contains(t.id.as_str());
+            let keep =
+                new_ids.contains(t.id.as_str()) || (t.dead && grouped.contains(t.id.as_str()));
             if !keep {
                 gone.push(t.id.clone());
+                dirty = true;
             }
             keep
         });
@@ -916,7 +942,6 @@ impl FleetModel {
             }
             self.marked.remove(&id);
             cmds.push(Cmd::Detach(id));
-            dirty = true;
         }
 
         // Add placeholder tiles; refresh bell/locality on existing ones. The
@@ -926,7 +951,8 @@ impl FleetModel {
         for info in &infos {
             let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
-                if tile.bell != info.bell
+                if tile.dead
+                    || tile.bell != info.bell
                     || tile.locality != locality
                     || tile.command != info.command
                     || tile.pid != info.pid
@@ -937,6 +963,8 @@ impl FleetModel {
                     // so it warrants a repaint just like locality/metadata changes.
                     dirty = true;
                 }
+                // A listing naming a dead tile revives it (a recreate landed).
+                tile.dead = false;
                 tile.bell = info.bell;
                 tile.locality = locality;
                 tile.command = info.command.clone();
@@ -963,8 +991,10 @@ impl FleetModel {
 
         // Live mirrors: observe every session this window doesn't drive, and
         // drop the observation of any it now does (its own client feeds it).
+        // A dead tile has no session to observe; its preview comes from the
+        // recording, fed by the shell.
         for tile in &self.tiles {
-            let foreign = tile.locality != Locality::ThisWindow;
+            let foreign = !tile.dead && tile.locality != Locality::ThisWindow;
             if foreign && !self.observing.contains(&tile.id) {
                 self.observing.insert(tile.id.clone());
                 cmds.push(Cmd::Observe(tile.id.clone()));
@@ -990,6 +1020,43 @@ impl FleetModel {
             after_ms: REFRESH_MS,
         });
         cmds
+    }
+
+    /// Seed/refresh dead tiles from the shell's descriptor sweep: a group
+    /// member that died before this fleet ever saw it alive still gets its
+    /// tile (metadata from the durable descriptor; the shell follows up with
+    /// the recording's last screen as ordinary tile output). Only group
+    /// members are remembered — a stray descriptor seeds nothing.
+    fn dead_sessions(&mut self, dead: Vec<crate::event::DeadSession>) -> Vec<Cmd> {
+        let mut dirty = false;
+        for d in dead {
+            if !self.groups.iter().any(|g| g.members.contains(&d.name)) {
+                continue;
+            }
+            if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == d.name) {
+                if tile.dead && tile.model.display_name() != d.display_name {
+                    tile.model.set_display_name(d.display_name);
+                    dirty = true;
+                }
+            } else {
+                let mut model =
+                    TerminalModel::new(d.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
+                model.set_theme(self.theme);
+                model.set_display_name(d.display_name);
+                self.push_tile(
+                    d.name.clone(),
+                    model,
+                    false,
+                    Locality::Detached,
+                    d.command,
+                    0,
+                    None,
+                );
+                self.tiles.last_mut().expect("just pushed").dead = true;
+                dirty = true;
+            }
+        }
+        if dirty { vec![Cmd::Redraw] } else { Vec::new() }
     }
 
     /// Apply a pushed subscription state change to its tile. This is how tile
@@ -1057,9 +1124,11 @@ impl FleetModel {
             // The observed session's real grid (observation start, or the
             // display client resized it). Rebuild the mirror at that size —
             // the resync that follows the event re-seeds its content. Driven
-            // tiles size through their own client, never through this.
+            // tiles size through their own client, never through this. The
+            // shell also uses this for a dead tile's recording playback (the
+            // recording's grid, then its last screen as ordinary output).
             SessionPush::Event(SessionEvent::Resized { cols, rows }) => {
-                if observed && tile.model.dims() != (cols, rows) {
+                if (observed || tile.dead) && tile.model.dims() != (cols, rows) {
                     let mut model = TerminalModel::new(tile.id.clone(), cols, rows, self.metrics);
                     model.set_theme(self.theme);
                     model.set_display_name(tile.model.display_name().to_string());
@@ -1327,7 +1396,9 @@ impl FleetModel {
         if had_output {
             tile.fed = true; // attached and live: stop re-attaching it
             tile.frame_dirty = true; // its screen changed; preview is stale
-            if background {
+            // A dead tile's feed is its recording played back — history,
+            // not activity; no badge for it.
+            if background && !tile.dead {
                 tile.activity = tile.activity.saturating_add(1);
             }
         }
@@ -1519,6 +1590,12 @@ impl FleetModel {
         let Some(id) = id else {
             return Vec::new();
         };
+        // A dead tile has nothing to attach to: opening it brings the
+        // session back (respawned from its descriptor, seeded from its
+        // recording); the adopt follows once the listing shows it alive.
+        if self.tiles.iter().any(|t| t.id == id && t.dead) {
+            return vec![Cmd::Recreate(id), Cmd::Redraw];
+        }
         match self.locality_of(&id) {
             Some(Locality::Elsewhere) => {
                 self.pending = Some(Pending {
@@ -1540,12 +1617,14 @@ impl FleetModel {
             .position(|g| g.members.iter().any(|m| m == id))
     }
 
-    /// Group `idx`'s members that still exist as tiles, in stored order.
+    /// Group `idx`'s members that are alive as tiles, in stored order — what
+    /// the group operations act on (dead members render, but there is nothing
+    /// to attach, kill, or detach in them).
     fn present_members(&self, idx: usize) -> Vec<SessionId> {
         self.groups[idx]
             .members
             .iter()
-            .filter(|id| self.tiles.iter().any(|t| &t.id == *id))
+            .filter(|id| self.tiles.iter().any(|t| &t.id == *id && !t.dead))
             .cloned()
             .collect()
     }
@@ -2006,7 +2085,12 @@ impl FleetModel {
             self.toggle_mark(&id);
             return vec![Cmd::Redraw];
         }
-        // A press on a card button runs that action; anywhere else opens the tile.
+        // A press on a card button runs that action; anywhere else opens the
+        // tile. A dead card has no live-session buttons — its whole footer is
+        // the relaunch chip, and activation IS the relaunch.
+        if self.tiles.iter().any(|t| t.id == id && t.dead) {
+            return self.activate(Some(id));
+        }
         let (_, _, buttons) = card_layout(rect, band);
         match buttons.iter().find(|(_, r)| r.contains(px, py)) {
             Some((button, _)) => self.button(*button, id),
@@ -2114,6 +2198,12 @@ impl FleetModel {
                     let (before, after) = r.buffer.halves();
                     format!("{before}\u{2588}{after}")
                 }
+                // A dead card states its fate where the pid would be; a stale
+                // pid or progress report would only pretend it still runs.
+                None if tile.dead => format!(
+                    "{} \u{b7} exited",
+                    card_meta(tile.model.display(), &tile.command, 0, None)
+                ),
                 None => card_meta(
                     tile.model.display(),
                     &tile.command,
@@ -2165,7 +2255,11 @@ impl FleetModel {
                     color: PLACEHOLDER_BG,
                     radius: 3.0,
                 });
-                let hint = placeholder_hint(tile.locality);
+                let hint = if tile.dead {
+                    "exited \u{b7} \u{21b5} relaunches"
+                } else {
+                    placeholder_hint(tile.locality)
+                };
                 items.push(SceneItem::Text {
                     id: SceneId::Badge(handle),
                     rect: centered_line(preview, metrics, hint),
@@ -2176,9 +2270,17 @@ impl FleetModel {
                 });
             }
 
-            // Action buttons — a centred label on its own inset chip.
-            for (button, brect) in buttons {
-                let chip = inset(brect, 3.0);
+            // Action buttons — a centred label on its own inset chip. A dead
+            // card replaces them with one full-width relaunch chip (kill/
+            // detach/rename have no live session to act on).
+            if tile.dead {
+                let footer = RectPx {
+                    x: buttons[0].1.x,
+                    y: buttons[0].1.y,
+                    w: rect.w,
+                    h: buttons[0].1.h,
+                };
+                let chip = inset(footer, 3.0);
                 items.push(SceneItem::Rect {
                     id: SceneId::Tile(handle),
                     rect: chip,
@@ -2187,12 +2289,30 @@ impl FleetModel {
                 });
                 items.push(SceneItem::Text {
                     id: SceneId::Label(handle),
-                    rect: centered_line(chip, metrics, button.label()),
-                    runs: vec![label_run(button.label())],
+                    rect: centered_line(chip, metrics, "relaunch"),
+                    runs: vec![label_run("relaunch")],
                     metrics,
                     color: BUTTON_FG,
                     scale: 1.0,
                 });
+            } else {
+                for (button, brect) in buttons {
+                    let chip = inset(brect, 3.0);
+                    items.push(SceneItem::Rect {
+                        id: SceneId::Tile(handle),
+                        rect: chip,
+                        color: BUTTON_BG,
+                        radius: 3.0,
+                    });
+                    items.push(SceneItem::Text {
+                        id: SceneId::Label(handle),
+                        rect: centered_line(chip, metrics, button.label()),
+                        runs: vec![label_run(button.label())],
+                        metrics,
+                        color: BUTTON_FG,
+                        scale: 1.0,
+                    });
+                }
             }
 
             if focused {
@@ -2887,6 +3007,172 @@ mod tests {
         }
     }
 
+    fn dead_info(name: &str, display: &str, command: &[&str]) -> crate::event::DeadSession {
+        crate::event::DeadSession {
+            name: name.to_string(),
+            display_name: display.to_string(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_dead_group_member_stays_as_a_dead_tile_an_ungrouped_one_vanishes() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        data(&mut m, "c", b"LAST-WORDS");
+        // b (ungrouped) and c (grouped) both die.
+        let cmds = list(&mut m, &["a"]);
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "b"),
+            "an ungrouped dead session is not remembered"
+        );
+        let c = m
+            .tiles
+            .iter()
+            .find(|t| t.id == "c")
+            .expect("a grouped dead session keeps its tile");
+        assert!(c.dead, "the kept tile is marked dead");
+        assert!(c.fed, "the reconcile itself does not clear its content");
+        assert!(
+            m.layout().iter().any(|(_, id, _)| id == "c"),
+            "the dead member still renders in its group's block"
+        );
+        assert!(
+            !cmds.contains(&Cmd::Observe("c".into())),
+            "a dead session cannot be observed: {cmds:?}"
+        );
+        // The card says so instead of showing a stale pid.
+        let scene = m.view();
+        assert!(
+            scene.layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Text { runs, .. } if runs[0].text.contains("exited"))),
+            "the dead card is labelled exited"
+        );
+    }
+
+    #[test]
+    fn a_dead_tile_relaunches_on_activation() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        list(&mut m, &["a", "b"]); // c dies
+        let cmds = press(&mut m, "c");
+        assert_eq!(
+            cmds,
+            vec![Cmd::Recreate("c".into()), Cmd::Redraw],
+            "opening a dead tile recreates its session"
+        );
+        // The keyboard twin.
+        focus(&mut m, "c");
+        assert_eq!(
+            key(&mut m, Key::Named(NamedKey::Enter)),
+            vec![Cmd::Recreate("c".into()), Cmd::Redraw]
+        );
+        // A dead card has no live-session buttons — a press where "kill"
+        // would be just relaunches like anywhere else on the card — and its
+        // footer offers a single relaunch chip instead.
+        let r = button_rect(&m, "c", Button::Kill);
+        assert_eq!(
+            press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0),
+            vec![Cmd::Recreate("c".into()), Cmd::Redraw]
+        );
+        assert!(!m.modal_open(), "no kill confirm for a dead session");
+        let scene = m.view();
+        let labels: Vec<&str> = scene.layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => Some(runs[0].text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.contains(&"relaunch"),
+            "the dead card offers relaunch"
+        );
+    }
+
+    #[test]
+    fn dead_sessions_seed_tiles_for_members_dead_before_the_fleet_opened() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a"]);
+        m.set_groups(vec![Group {
+            name: "web".into(),
+            color: 0,
+            members: vec!["a".into(), "x".into()],
+        }]);
+        m.update(UiEvent::DeadSessions(vec![dead_info(
+            "x",
+            "worker",
+            &["npm", "run", "dev"],
+        )]));
+        let x = m
+            .tiles
+            .iter()
+            .find(|t| t.id == "x")
+            .expect("the dead member gets a tile");
+        assert!(x.dead);
+        assert_eq!(x.model.display_name(), "worker");
+        assert_eq!(x.command, vec!["npm", "run", "dev"]);
+        assert!(
+            m.layout().iter().any(|(_, id, _)| id == "x"),
+            "it renders in its group's block"
+        );
+        // The recording playback that follows is history, not activity: the
+        // dead card must not light an activity badge over it.
+        data(&mut m, "x", b"prod=# select 1;");
+        let x = m.tiles.iter().find(|t| t.id == "x").unwrap();
+        assert!(x.fed, "the playback feeds the preview");
+        assert_eq!(x.activity, 0, "history is not activity");
+        // A dead session NOT in any group is never seeded.
+        m.update(UiEvent::DeadSessions(vec![dead_info("stray", "", &[])]));
+        assert!(!m.tiles.iter().any(|t| t.id == "stray"));
+    }
+
+    #[test]
+    fn a_revived_session_stops_being_dead_and_is_observed_again() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        list(&mut m, &["a"]); // c dies
+        assert!(m.tiles.iter().find(|t| t.id == "c").unwrap().dead);
+        let cmds = list(&mut m, &["a", "c"]); // c returns
+        let c = m.tiles.iter().find(|t| t.id == "c").unwrap();
+        assert!(!c.dead, "a live listing revives the tile");
+        assert!(
+            cmds.contains(&Cmd::Observe("c".into())),
+            "the revived session is mirrored again: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn group_ops_skip_dead_members() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        list(&mut m, &["a", "b"]); // c dies
+        focus(&mut m, "a");
+        assert_eq!(
+            ctrl_enter(&mut m),
+            vec![Cmd::TakeOver("a".into()), Cmd::Redraw],
+            "open-all attaches only the living"
+        );
+        let r = group_button_rect(&m, 0, GroupButton::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert_eq!(
+            cmds,
+            vec![Cmd::Kill("a".into()), Cmd::Redraw],
+            "kill has nothing to kill in a dead member"
+        );
+    }
+
     #[test]
     fn the_group_prompt_draws_a_scrim_and_the_typed_name_with_a_caret() {
         let mut m = fleet();
@@ -2969,20 +3255,21 @@ mod tests {
     }
 
     #[test]
-    fn a_groups_dead_members_do_not_render_and_its_last_loss_hides_the_block() {
+    fn a_dead_member_keeps_its_groups_block_on_screen() {
         let mut m = fleet();
         widen(&mut m);
         list(&mut m, &["a", "b"]);
         make_group(&mut m, "web", &["a"]);
-        // "a" dies: the group block disappears (nothing to show) but the group
-        // itself survives for its return.
+        // "a" dies: the block stays, showing the dead-but-remembered tile.
         list(&mut m, &["b"]);
-        assert_eq!(order(&m), ["b"]);
-        assert_eq!(m.groups.len(), 1, "an empty group persists, just unshown");
-        // It returns: the block is back.
+        assert_eq!(order(&m), ["a", "b"]);
+        assert!(m.tiles.iter().find(|t| t.id == "a").unwrap().dead);
+        assert_eq!(m.groups.len(), 1, "the group persists");
+        // It returns (a recreate landed): the tile is live in its block again.
         list(&mut m, &["a", "b"]);
+        assert!(!m.tiles.iter().find(|t| t.id == "a").unwrap().dead);
         let (ya, yb) = (tile_y(&m, "a"), tile_y(&m, "b"));
-        assert!(ya < yb, "the group block renders above the sections again");
+        assert!(ya < yb, "the group block renders above the sections");
     }
 
     #[test]

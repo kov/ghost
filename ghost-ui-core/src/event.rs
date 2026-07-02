@@ -9,6 +9,18 @@ use crate::input::{Key, KeyAlternates, KeyEventKind, Mods};
 use ghost_vt::protocol::{SessionEvent, SessionState};
 use ghost_vt::session::SessionInfo;
 
+/// A dead-but-remembered session, read back from its durable descriptor (see
+/// the host's `ghost_vt::descriptor`): the identity and metadata a dead tile
+/// shows, and the key a recreate is issued under.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeadSession {
+    pub name: SessionId,
+    /// The display name it had, empty if never renamed.
+    pub display_name: String,
+    /// The command it ran (empty means the user's `$SHELL`).
+    pub command: Vec<String>,
+}
+
 /// What a session subscription pushed: the one starting snapshot, or a delta
 /// event ([`ghost_vt::client::Subscriber`]). The shell subscribes to every
 /// session whose host serves it and fans the pushes out to each window.
@@ -103,6 +115,10 @@ pub enum UiEvent {
     /// The authoritative session groups: loaded from disk at startup, or
     /// re-broadcast when another window saved a change.
     GroupsLoaded(Vec<crate::group::Group>),
+    /// The dead-but-remembered sessions (group members with a durable
+    /// descriptor but no live host), refreshed alongside every session list.
+    /// The fleet keeps them as dead tiles offering a recreate.
+    DeadSessions(Vec<DeadSession>),
     /// The shell has attached `SessionId` for this window (reply to
     /// `Cmd::SpawnSession` / `Cmd::TakeOver`): switch to its single view and
     /// take ownership. The window adopts the fleet tile's screen if it has one.

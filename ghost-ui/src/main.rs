@@ -27,7 +27,7 @@ mod menu;
 mod pacer;
 mod resize;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -429,15 +429,11 @@ fn capture(path: PathBuf) {
 // ---- interactive mode (window) -----------------------------------------
 
 fn spawn_session(name: &str, command: Vec<String>) {
-    spawn_session_in(name, command, None)
-}
-
-fn spawn_session_in(name: &str, command: Vec<String>, cwd: Option<std::path::PathBuf>) {
     server::spawn(SpawnOpts {
         name: name.to_string(),
         command, // empty => $SHELL
         size: (COLS, ROWS),
-        cwd,
+        cwd: None,
         // Record like the CLI does (`--no-record` is its opt-out): the
         // recording is what lets a dead session's card preview its last
         // screen, and what seeds a recreate with its predecessor's history.
@@ -798,6 +794,10 @@ struct WindowState {
     /// output feeds the tiles as `SessionData`, and only their `Resized` event
     /// is forwarded (the app-wide subscription already delivers the rest).
     observers: HashMap<String, Subscriber>,
+    /// Dead sessions whose recording has been played into their tile already,
+    /// so the periodic sweep doesn't re-feed the same last screen every tick.
+    /// A name is cleared when its session lives again (a fresh death re-feeds).
+    dead_fed: HashSet<String>,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
     /// so we cache it for button/wheel events).
@@ -921,6 +921,78 @@ impl App {
         }
     }
 
+    /// The descriptor sweep that runs with every session listing: tell the
+    /// window which group members are dead-but-remembered (its fleet shows
+    /// them as dead tiles), play each one's recording into its tile once (the
+    /// last screen, via the ordinary Resized-push + output path), and prune
+    /// descriptors nothing references any more — not live, in no group — so
+    /// the data dir doesn't keep one per session ever spawned.
+    fn sync_dead_sessions(
+        &mut self,
+        wid: WindowId,
+        live: &[ghost_vt::session::SessionInfo],
+        event_loop: &ActiveEventLoop,
+    ) {
+        let live_names: HashSet<&str> = live.iter().map(|i| i.name.as_str()).collect();
+        let mut dead: Vec<ghost_ui_core::DeadSession> = Vec::new();
+        for name in self.groups.iter().flat_map(|g| &g.members) {
+            if live_names.contains(name.as_str()) || dead.iter().any(|d| &d.name == name) {
+                continue;
+            }
+            let d = ghost_vt::descriptor::read(name).unwrap_or_default();
+            dead.push(ghost_ui_core::DeadSession {
+                name: name.clone(),
+                display_name: d.display_name,
+                command: d.command,
+            });
+        }
+        self.dispatch(wid, UiEvent::DeadSessions(dead.clone()), event_loop);
+        // A session alive again may die again later: let it re-feed then.
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.dead_fed.retain(|n| !live_names.contains(n.as_str()));
+        }
+        for d in dead {
+            let fresh = self
+                .windows
+                .get_mut(&wid)
+                .is_some_and(|w| w.dead_fed.insert(d.name.clone()));
+            if !fresh {
+                continue;
+            }
+            let Ok(rec) = ghost_vt::record::read(&ghost_vt::paths::recording_path(&d.name)) else {
+                continue; // never recorded: the tile stays a placeholder
+            };
+            let s = screen::Screen::from_recording(&rec, 0);
+            let (cols, rows) = s.dimensions();
+            self.dispatch(
+                wid,
+                UiEvent::SessionPush {
+                    name: d.name.clone(),
+                    push: SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
+                        cols,
+                        rows,
+                    }),
+                },
+                event_loop,
+            );
+            self.dispatch(
+                wid,
+                UiEvent::SessionData {
+                    name: d.name,
+                    bytes: s.resync(),
+                    ended: false,
+                },
+                event_loop,
+            );
+        }
+        let grouped: HashSet<&String> = self.groups.iter().flat_map(|g| &g.members).collect();
+        for name in ghost_vt::descriptor::all_names() {
+            if !live_names.contains(name.as_str()) && !grouped.contains(&name) {
+                ghost_vt::descriptor::remove(&name);
+            }
+        }
+    }
+
     /// Drain every subscription and fan its pushes out to all windows (each
     /// window's fleet keeps its own tiles). A subscription ending usually
     /// means the session died: drop it and hint a re-enumeration.
@@ -1012,10 +1084,14 @@ impl App {
                         Some(h) => h.session_list(),
                         None => session::list().unwrap_or_default(),
                     };
-                    if self.bench.is_none() {
+                    let live = self.bench.is_none();
+                    if live {
                         self.sync_subscriptions(&infos);
                     }
-                    self.dispatch(wid, UiEvent::SessionList(infos), event_loop);
+                    self.dispatch(wid, UiEvent::SessionList(infos.clone()), event_loop);
+                    if live {
+                        self.sync_dead_sessions(wid, &infos, event_loop);
+                    }
                 }
                 Cmd::Attach(id) => {
                     if let Some(w) = self.windows.get_mut(&wid)
@@ -1084,6 +1160,39 @@ impl App {
                     let _ = session::kill_session(&id);
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.sessions.remove(&id);
+                    }
+                }
+                Cmd::Recreate(id) => {
+                    // Bring a dead session back under its old name: the durable
+                    // descriptor says what to run and where, and the previous
+                    // life's recording seeds the screen and scrollback (the
+                    // host reads it before the new recording replaces it).
+                    let d = ghost_vt::descriptor::read(&id).unwrap_or_default();
+                    let recording = ghost_vt::paths::recording_path(&id);
+                    let seed_from = recording.exists().then(|| recording.clone());
+                    let spawned = server::spawn(SpawnOpts {
+                        name: id.clone(),
+                        command: d.command,
+                        size: (COLS, ROWS),
+                        cwd: d.cwd,
+                        record: Some(recording),
+                        seed_from,
+                        scrollback: screen::DEFAULT_SCROLLBACK,
+                        max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
+                        start_on_attach: true,
+                    });
+                    match spawned {
+                        Err(e) => eprintln!("ghost: recreating '{id}' failed: {e}"),
+                        Ok(()) => {
+                            // Its tile previews the OLD recording; a fresh death
+                            // after this new life must re-feed.
+                            if let Some(w) = self.windows.get_mut(&wid) {
+                                w.dead_fed.remove(&id);
+                            }
+                            if self.attach_into(wid, &id) {
+                                self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
+                            }
+                        }
                     }
                 }
                 Cmd::Rename {
@@ -1388,6 +1497,7 @@ impl App {
                 root,
                 sessions: HashMap::new(),
                 observers: HashMap::new(),
+                dead_fed: HashSet::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -1524,6 +1634,7 @@ impl App {
                 root,
                 sessions,
                 observers: HashMap::new(),
+                dead_fed: HashSet::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,

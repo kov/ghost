@@ -454,7 +454,8 @@ impl TerminalModel {
             | UiEvent::AdoptSession(_)
             | UiEvent::SessionPush { .. }
             | UiEvent::SessionsChanged
-            | UiEvent::GroupsLoaded(_) => Vec::new(),
+            | UiEvent::GroupsLoaded(_)
+            | UiEvent::DeadSessions(_) => Vec::new(),
         }
     }
 

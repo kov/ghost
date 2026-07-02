@@ -46,6 +46,10 @@ pub enum Cmd {
     Unobserve(SessionId),
     /// Kill a session and its process (the shell sends `ClientMsg::Kill`).
     Kill(SessionId),
+    /// Bring a dead-but-remembered session back: the shell respawns it under
+    /// the same name from its durable descriptor (command, cwd), seeds it
+    /// from its recording, then attaches and replies `UiEvent::AdoptSession`.
+    Recreate(SessionId),
     /// Rename a session (the shell sends `ClientMsg::Rename`).
     Rename {
         session: SessionId,

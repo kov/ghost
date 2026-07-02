@@ -56,6 +56,24 @@ pub fn remove(name: &str) {
     let _ = std::fs::remove_file(path(name));
 }
 
+/// Every session name with a descriptor on disk (for the shell's sweep: dead
+/// group members to remember, unreferenced leftovers to prune).
+pub fn all_names() -> Vec<String> {
+    let dir = crate::paths::data_dir().join("sessions");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension()? != "json" {
+                return None;
+            }
+            Some(p.file_stem()?.to_str()?.to_owned())
+        })
+        .collect()
+}
+
 /// Refresh just the display name of an existing descriptor (a rename while the
 /// session runs). A session whose child hasn't started yet has no descriptor;
 /// the eventual spawn writes the then-current name.
