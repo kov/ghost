@@ -20,6 +20,13 @@ pub struct Meta {
     pub command: Vec<String>,
     /// The current terminal title (OSC 0/2), empty if none has been set.
     pub title: String,
+    /// The user-chosen display name (`ghost rename`), empty if never renamed.
+    /// Purely a label: the session's *identity* — its directory, socket, and
+    /// recording — is the immutable spawn-time name, so renaming moves no files
+    /// and never disturbs attached clients. `default` keeps metadata written
+    /// before this field existed parseable.
+    #[serde(default)]
+    pub display_name: String,
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -48,9 +55,21 @@ mod tests {
             created_at: 1_700_000_000_000,
             command: vec!["vim".into(), "main.rs".into()],
             title: "vim · main.rs".into(),
+            display_name: "build box".into(),
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));
+    }
+
+    #[test]
+    fn meta_without_a_display_name_still_reads() {
+        // Metadata written before display names existed must keep parsing, with
+        // the display name defaulting to unset (the session shows its id).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta");
+        std::fs::write(&path, br#"{"created_at":1,"command":["sh"],"title":"t"}"#).unwrap();
+        let meta = read(&path).expect("legacy meta parses");
+        assert_eq!(meta.display_name, "");
     }
 
     #[test]

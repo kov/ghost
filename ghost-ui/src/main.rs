@@ -1315,10 +1315,17 @@ impl App {
                 return false;
             }
         };
-        let model = TerminalModel::new(name.to_string(), cols, rows, metrics());
-        // Title the window with the session up front (its name until the app sets an
-        // OSC title), so the initial view follows the foreground like every switch does
-        // — not a static "ghost".
+        let mut model = TerminalModel::new(name.to_string(), cols, rows, metrics());
+        // Seed the display name so a labeled session titles the window with its
+        // label from the first frame (best-effort; a reconcile would fix it too).
+        if let Ok(sessions) = session::list()
+            && let Some(info) = sessions.iter().find(|s| s.name == name)
+        {
+            model.set_display_name(info.display_name.clone());
+        }
+        // Title the window with the session up front (its label or name until the
+        // app sets an OSC title), so the initial view follows the foreground like
+        // every switch does — not a static "ghost".
         gfx.window.set_title(&model.title());
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
@@ -1801,6 +1808,7 @@ mod tests {
             command: Vec::new(),
             attached,
             bell: false,
+            display_name: String::new(),
         }
     }
 

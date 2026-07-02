@@ -1042,6 +1042,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         command: command.iter().map(|s| s.to_string()).collect(),
         attached,
         bell: false,
+        display_name: String::new(),
     }
 }
 

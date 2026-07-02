@@ -60,7 +60,7 @@ ghost new -d [NAME]            # start in the background without attaching
 ghost ls                       # list live sessions (name + pid)
 ghost attach NAME              # attach to a session
 ghost kill NAME                # kill a session and its process
-ghost rename OLD NEW           # rename a running session
+ghost rename OLD NEW           # rename a session (a display label; attach state untouched)
 ghost export NAME [FILE]       # export the recording as an asciicast (v2)
 ```
 
@@ -110,8 +110,10 @@ macOS (no `signalfd`/`kqueue` split).
   or `~/Library/Application Support/ghost` on macOS — holding `sock`, `pid`, and
   `lock`. macOS's temp dir is avoided on purpose: it is reaped every few days and
   would strand a still-running session by deleting its files. Dead leftovers are
-  pruned by a liveness check, not by relying on the dir being wiped. Grouping
-  them in one directory makes renaming a single atomic `rename(2)`.
+  pruned by a liveness check, not by relying on the dir being wiped. `<name>` is
+  the session's *immutable* spawn-time id: `ghost rename` only sets a display
+  label in its metadata, so these files never move and attached clients are
+  never disturbed.
 - Recordings: `$XDG_DATA_HOME/ghost/recordings/<name>.ghostrec` (falls back to
   `~/.local/share/ghost/…`; archival, survives reboot). A framed, per-frame-zstd
   asciicast with periodic checkpoints; `ghost export` turns it into a standard

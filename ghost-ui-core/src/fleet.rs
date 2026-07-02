@@ -718,6 +718,7 @@ impl FleetModel {
                     || tile.command != info.command
                     || tile.pid != info.pid
                     || tile.created_at != info.created_at
+                    || tile.model.display_name() != info.display_name
                 {
                     // A creation-time change reorders the grid (it's the sort key),
                     // so it warrants a repaint just like locality/metadata changes.
@@ -728,10 +729,12 @@ impl FleetModel {
                 tile.command = info.command.clone();
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
+                tile.model.set_display_name(info.display_name.clone());
             } else {
                 let mut model =
                     TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
                 model.set_theme(self.theme);
+                model.set_display_name(info.display_name.clone());
                 self.push_tile(
                     info.name.clone(),
                     model,
@@ -1126,10 +1129,15 @@ impl FleetModel {
                 vec![Cmd::Redraw]
             }
             Button::Rename => {
-                self.renaming = Some(Renaming {
-                    buffer: id.clone(),
-                    id,
-                });
+                // Edit the human-facing display name, starting from what the card
+                // shows; the id stays the immutable routing key.
+                let buffer = self
+                    .tiles
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.model.display().to_string())
+                    .unwrap_or_else(|| id.clone());
+                self.renaming = Some(Renaming { buffer, id });
                 vec![Cmd::Redraw]
             }
         }
@@ -1196,9 +1204,21 @@ impl FleetModel {
                 }
                 Key::Named(NamedKey::Enter) => {
                     let r = self.renaming.take().expect("renaming checked by caller");
-                    if r.buffer.is_empty() || r.buffer == r.id {
+                    let tile = self.tiles.iter_mut().find(|t| t.id == r.id);
+                    let unchanged = tile.as_ref().is_some_and(|t| t.model.display() == r.buffer);
+                    if r.buffer.is_empty() || unchanged {
                         vec![Cmd::Redraw]
                     } else {
+                        // Show the new display name immediately; the host is the
+                        // authority and the next reconcile confirms (or reverts,
+                        // if it refused the name).
+                        if let Some(t) = tile {
+                            t.model.set_display_name(if r.buffer == r.id {
+                                String::new() // renaming back to the id unlabels
+                            } else {
+                                r.buffer.clone()
+                            });
+                        }
                         vec![
                             Cmd::Rename {
                                 session: r.id,
@@ -1282,7 +1302,7 @@ impl FleetModel {
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
                 Some(r) => format!("{}\u{2588}", r.buffer), // trailing caret block
                 None => card_meta(
-                    &tile.id,
+                    tile.model.display(),
                     &tile.command,
                     tile.pid,
                     tile.model.screen().vt().progress(),
@@ -1399,6 +1419,13 @@ impl FleetModel {
                 color: OVERLAY_BG,
                 radius: 0.0,
             });
+            // Name the session as the user knows it (its display name).
+            let shown = self
+                .tiles
+                .iter()
+                .find(|t| t.id == p.id)
+                .map(|t| t.model.display().to_string())
+                .unwrap_or_else(|| p.id.clone());
             items.push(SceneItem::Text {
                 id: SceneId::NavBar,
                 rect: RectPx {
@@ -1407,7 +1434,7 @@ impl FleetModel {
                     w: (w - 32.0).max(1.0),
                     h: metrics.line_height,
                 },
-                runs: vec![label_run(&confirm_prompt(p))],
+                runs: vec![label_run(&confirm_prompt(p, &shown))],
                 metrics,
                 color: OVERLAY_FG,
             });
@@ -1494,16 +1521,17 @@ fn card_meta(
     s
 }
 
-/// The prompt shown in the confirm overlay.
-fn confirm_prompt(p: &Pending) -> String {
+/// The prompt shown in the confirm overlay; `shown` is the session's
+/// human-facing name (display name, or the id when unlabeled).
+fn confirm_prompt(p: &Pending, shown: &str) -> String {
     match p.action {
         PendingAction::Kill => {
-            format!("Kill {}?  Enter = confirm, Esc = cancel", p.id)
+            format!("Kill {shown}?  Enter = confirm, Esc = cancel")
         }
         PendingAction::TakeOver => {
             format!(
                 "{} is open in another window — take it over?  Enter / Esc",
-                p.id
+                shown
             )
         }
     }
@@ -1560,6 +1588,7 @@ mod tests {
             command: vec![],
             attached: false,
             bell: false,
+            display_name: String::new(),
         }
     }
 
@@ -2286,6 +2315,78 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
             "a modifier chord must not type into the rename: {cmds:?}"
+        );
+    }
+
+    /// All card/header text currently in the view.
+    fn view_texts(m: &FleetModel) -> Vec<String> {
+        m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cards_show_the_display_name_not_the_id() {
+        let mut m = fleet();
+        let mut i = info("sess-1");
+        i.display_name = "build box".into();
+        m.update(UiEvent::SessionList(vec![i]));
+        let texts = view_texts(&m);
+        assert!(
+            texts.iter().any(|t| t.contains("build box")),
+            "the card header shows the display name: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("sess-1")),
+            "the immutable id is plumbing, not card text: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn rename_edits_the_display_name_and_commits_against_the_id() {
+        let mut m = fleet();
+        let mut i = info("sess-1");
+        i.display_name = "old label".into();
+        m.update(UiEvent::SessionList(vec![i]));
+        let r = button_rect(&m, "sess-1", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        // The edit starts from the current display name, not the internal id.
+        let texts = view_texts(&m);
+        assert!(
+            texts.iter().any(|t| t.contains("old label\u{2588}")),
+            "the rename buffer seeds with the display name: {texts:?}"
+        );
+        // Committing the unchanged display name is a no-op.
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
+            "an unchanged display name commits nothing: {cmds:?}"
+        );
+        // Editing and committing targets the session by its immutable id.
+        let r = button_rect(&m, "sess-1", Button::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        key(&mut m, Key::Char("2".into()));
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(
+            cmds.contains(&Cmd::Rename {
+                session: "sess-1".into(),
+                name: "old label2".into()
+            }),
+            "the rename addresses the id and carries the new display name: {cmds:?}"
+        );
+        // The card reflects the new display name immediately, without waiting
+        // for the next reconcile.
+        let texts = view_texts(&m);
+        assert!(
+            texts.iter().any(|t| t.contains("old label2")),
+            "the committed display name shows immediately: {texts:?}"
         );
     }
 

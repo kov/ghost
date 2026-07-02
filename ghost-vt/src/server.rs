@@ -259,11 +259,11 @@ fn run_host(
     // SAFETY: the listening socket the parent bound and passed with CLOEXEC cleared.
     let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
     let HostArgs { opts, launch_dir } = host_args;
-    // `current_name` may change under us if the session is renamed, so the host
-    // reports the final name and cleans up its directory by that.
-    let mut current_name = opts.name.clone();
-    let result = host_main(&listener, &opts, launch_dir.as_deref(), &mut current_name);
-    let _ = std::fs::remove_dir_all(paths::session_dir(&current_name));
+    // The name is the session's immutable identity: a rename only changes the
+    // display-name label in `meta`, so files never move and cleanup always
+    // targets the spawn-time directory.
+    let result = host_main(&listener, &opts, launch_dir.as_deref(), &opts.name);
+    let _ = std::fs::remove_dir_all(paths::session_dir(&opts.name));
     result.unwrap_or(1)
 }
 
@@ -326,7 +326,7 @@ fn host_main(
     listener: &UnixListener,
     opts: &SpawnOpts,
     launch_dir: Option<&std::path::Path>,
-    current_name: &mut String,
+    current_name: &str,
 ) -> io::Result<i32> {
     std::fs::write(
         paths::pid_path(current_name),
@@ -371,6 +371,7 @@ fn host_main(
             .unwrap_or(0),
         command: opts.command.clone(),
         title: String::new(),
+        display_name: String::new(),
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
@@ -591,6 +592,7 @@ fn host_main(
                             &mut screen,
                             &mut recorder,
                             current_name,
+                            &mut meta,
                             &mut last_theme,
                         )?;
                     }
@@ -631,6 +633,7 @@ fn host_main(
                         &mut screen,
                         &mut recorder,
                         current_name,
+                        &mut meta,
                         &mut last_theme,
                     )?,
                     Err(_) => Disposition::Drop,
@@ -724,13 +727,15 @@ enum Disposition {
 /// resizes, handle renames and repaints. A Resize sets `c.resynced` (and queues
 /// the repaint), which is how the caller knows the connection is an attach client
 /// rather than a control-only one. Returns how the connection should be treated.
+#[allow(clippy::too_many_arguments)] // the host's whole mutable state, threaded once
 fn handle_client_messages(
     c: &mut Client,
     msgs: Vec<ClientMsg>,
     pty: &pty_process::blocking::Pty,
     screen: &mut Screen,
     recorder: &mut Option<crate::record::FileRecorder>,
-    current_name: &mut String,
+    current_name: &str,
+    meta: &mut crate::meta::Meta,
     last_theme: &mut crate::query::ThemeColors,
 ) -> io::Result<Disposition> {
     for msg in msgs {
@@ -754,8 +759,8 @@ fn handle_client_messages(
             ClientMsg::Detach => return Ok(Disposition::Drop),
             ClientMsg::Kill => return Ok(Disposition::Kill),
             ClientMsg::Rename(new) => {
-                let (ok, message) = match rename_session(current_name, &new, recorder) {
-                    Ok(()) => (true, current_name.clone()),
+                let (ok, message) = match set_display_name(current_name, &new, meta) {
+                    Ok(()) => (true, new.clone()),
                     Err(e) => (false, e),
                 };
                 c.queue(&ServerMsg::RenameResult { ok, message });
@@ -798,44 +803,45 @@ fn set_bell_marker(name: &str, rung: bool) {
     }
 }
 
-/// Rename the running session: move its runtime directory (sock + pid together,
-/// atomically) and its recording, updating `current_name` so cleanup targets the
-/// right directory. Returns a human-readable error if the new name is invalid or
-/// already taken.
-fn rename_session(
-    current_name: &mut String,
+/// Rename the running session by setting its display-name label in `meta`. The
+/// session's *identity* — its directory, socket, pid file, and recording — is the
+/// immutable spawn-time name and never moves, so a rename cannot disturb attached
+/// clients or change attach state. Renaming back to the session's own name clears
+/// the label. Returns a human-readable error if the new name is invalid or would
+/// collide with another session's name or display name (which would make it
+/// ambiguous for `ghost attach`/`kill`/`rename` lookups).
+fn set_display_name(
+    current_name: &str,
     new_name: &str,
-    recorder: &mut Option<crate::record::FileRecorder>,
+    meta: &mut crate::meta::Meta,
 ) -> Result<(), String> {
-    if current_name.as_str() == new_name {
-        return Ok(()); // no-op
-    }
     if !crate::session::valid_name(new_name) {
         return Err(format!(
             "'{new_name}' is not a valid session name (letters, digits, '-', '_', '.')"
         ));
     }
-    // Refuse to clobber a live session. `list` also prunes dead sessions, so a
-    // stale directory for `new_name` is cleared and the rename can proceed.
+    // Refuse a label another session already answers to (by id or display name),
+    // so name-based lookups stay unambiguous.
     match crate::session::list() {
-        Ok(sessions) if sessions.iter().any(|s| s.name == new_name) => {
+        Ok(sessions)
+            if sessions
+                .iter()
+                .filter(|s| s.name != current_name)
+                .any(|s| s.name == new_name || s.display() == new_name) =>
+        {
             return Err(format!("a session named '{new_name}' already exists"));
         }
         Ok(_) => {}
         Err(e) => return Err(format!("could not check existing sessions: {e}")),
     }
-    let new_dir = paths::session_dir(new_name);
-    // Defensive: clear any leftover empty directory so the rename target is free.
-    let _ = std::fs::remove_dir_all(&new_dir);
-    std::fs::rename(paths::session_dir(current_name), &new_dir)
-        .map_err(|e| format!("could not move session directory: {e}"))?;
-    // The directory move is authoritative — the session is now `new_name`.
-    *current_name = new_name.to_string();
-    // Move the recording too. Best effort: the session itself is already renamed,
-    // and discovery never depends on the recording.
-    if let Some(r) = recorder {
-        let _ = r.rename(&paths::recording_path(new_name));
-    }
+    // The spawn-time name means "no label" — store it as unset.
+    meta.display_name = if new_name == current_name {
+        String::new()
+    } else {
+        new_name.to_string()
+    };
+    crate::meta::write(&paths::meta_path(current_name), meta)
+        .map_err(|e| format!("could not store the display name: {e}"))?;
     Ok(())
 }
 

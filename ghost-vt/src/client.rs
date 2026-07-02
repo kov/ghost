@@ -329,9 +329,10 @@ pub fn attach(name: &str) -> io::Result<()> {
 }
 
 /// Rename a session non-interactively (the `ghost rename` command). Connects to
-/// the named session and sends a single rename request, returning the host's
-/// verdict. Sends no resize, so the host treats it as a control connection and
-/// does not disturb any attached client.
+/// the session by its immutable id and asks the host to set its display name,
+/// returning the host's verdict. A label change only — the session's files and
+/// attach state are untouched — and sent over a control connection (no resize),
+/// so any attached client is left undisturbed.
 pub fn rename(old: &str, new: &str) -> io::Result<()> {
     let mut conn = Conn::connect(&paths::socket_path(old))
         .map_err(|e| io::Error::new(e.kind(), format!("cannot reach session '{old}': {e}")))?;

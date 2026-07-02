@@ -64,7 +64,8 @@ enum Command {
         /// Name of the session to kill.
         name: String,
     },
-    /// Rename a running session.
+    /// Rename a running session (sets its display name; the session itself —
+    /// socket, recording, attach state — is untouched).
     Rename {
         /// Current session name.
         old: String,
@@ -106,6 +107,14 @@ fn dispatch(command: Command) {
             command,
         } => {
             let name = name.unwrap_or_else(default_name);
+            // A new id must not shadow a name some session already answers to
+            // (as an id — spawn itself refuses that — or as a display name),
+            // so `attach`/`kill`/`rename` lookups stay unambiguous.
+            if let Ok(sessions) = session::list()
+                && sessions.iter().any(|s| s.display() == name)
+            {
+                fail(&format!("a session named '{name}' already exists"));
+            }
             let record = (!no_record).then(|| ghost_vt::paths::recording_path(&name));
             let opts = SpawnOpts {
                 name: name.clone(),
@@ -135,9 +144,9 @@ fn dispatch(command: Command) {
             Ok(sessions) => {
                 for s in sessions {
                     if s.title.is_empty() {
-                        println!("{}\t(pid {})", s.name, s.pid);
+                        println!("{}\t(pid {})", s.display(), s.pid);
                     } else {
-                        println!("{}\t(pid {})\t{}", s.name, s.pid, s.title);
+                        println!("{}\t(pid {})\t{}", s.display(), s.pid, s.title);
                     }
                 }
             }
@@ -147,24 +156,41 @@ fn dispatch(command: Command) {
             let Some(name) = name else {
                 fail("specify a session to attach to (see `ghost ls`)");
             };
-            if let Err(e) = client::attach(&name) {
+            if let Err(e) = client::attach(&resolve(&name)) {
                 fail(&e.to_string());
             }
         }
-        Command::Kill { name } => match session::kill_session(&name) {
+        Command::Kill { name } => match session::kill_session(&resolve(&name)) {
             Ok(true) => println!("killed session '{name}'"),
             Ok(false) => fail(&format!("no such session '{name}'")),
             Err(e) => fail(&e.to_string()),
         },
-        Command::Rename { old, new } => match client::rename(&old, &new) {
+        Command::Rename { old, new } => match client::rename(&resolve(&old), &new) {
             Ok(()) => println!("renamed '{old}' to '{new}'"),
             Err(e) => fail(&e.to_string()),
         },
         Command::Export { name, output } => {
-            if let Err(e) = export(&name, output.as_deref()) {
+            if let Err(e) = export(&resolve(&name), output.as_deref()) {
                 fail(&e.to_string());
             }
         }
+    }
+}
+
+/// Resolve a user-typed name to a session's immutable id. An exact id match
+/// wins; otherwise a display-name match (unique by construction — the host
+/// refuses colliding renames) maps back to the id it labels. An unknown name
+/// passes through so the callee reports its usual error.
+fn resolve(name: &str) -> String {
+    let Ok(sessions) = session::list() else {
+        return name.to_string();
+    };
+    if sessions.iter().any(|s| s.name == name) {
+        return name.to_string();
+    }
+    match sessions.iter().find(|s| s.display() == name) {
+        Some(s) => s.name.clone(),
+        None => name.to_string(),
     }
 }
 

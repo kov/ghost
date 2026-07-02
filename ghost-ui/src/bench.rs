@@ -195,6 +195,7 @@ impl Harness {
                 command: Vec::new(),
                 attached: false,
                 bell: false,
+                display_name: String::new(),
             })
             .collect()
     }

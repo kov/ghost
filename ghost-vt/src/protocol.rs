@@ -24,8 +24,10 @@ pub enum ClientMsg {
     Detach,
     /// Kill: terminate the session and its child.
     Kill,
-    /// Rename the session to this name. The host renames its socket, pidfile,
-    /// and recording, then replies with [`ServerMsg::RenameResult`].
+    /// Rename the session to this name. The host stores it as the session's
+    /// display name — a label; the socket, pidfile, and recording keep the
+    /// immutable spawn-time name, so attached clients are never disturbed —
+    /// then replies with [`ServerMsg::RenameResult`].
     Rename(String),
     /// Ask the host to repaint the screen (re-send the current state). Used by
     /// the client to heal its display after drawing a transient overlay such as

@@ -726,6 +726,115 @@ fn cli_rename_does_not_disturb_attached_client() {
 }
 
 #[test]
+fn rename_moves_no_files_and_keeps_the_attach_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "steady-old";
+    let new = "steady-fresh";
+    let _g_old = KillOnDrop { xdg, name: old };
+    let _g_new = KillOnDrop { xdg, name: new };
+
+    let term = Attached::new_session(xdg, old, &["sh", "-c", "echo READYtag; exec cat"], 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("READYtag")),
+        "session not attached; got: {:?}",
+        term.screen()
+    );
+
+    // The rename is a display-name change only: the session's identity — and with
+    // it the socket, pid file, and attached marker — must stay exactly where they
+    // are, so nothing about the attachment can be disturbed.
+    let dir = xdg.join("run/ghost").join(old);
+    assert!(
+        dir.join("sock").exists(),
+        "socket missing before the rename"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || dir.join("attached").exists()),
+        "attached marker missing before the rename"
+    );
+
+    let out = ghost(xdg).args(["rename", old, new]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(new)),
+        "rename not reflected in `ls`: {}",
+        ls(xdg)
+    );
+
+    assert!(
+        dir.join("sock").exists(),
+        "rename moved the session's socket"
+    );
+    assert!(
+        dir.join("attached").exists(),
+        "rename dropped the attached marker"
+    );
+    assert!(
+        !xdg.join("run/ghost").join(new).exists(),
+        "rename created a directory for the display name"
+    );
+}
+
+#[test]
+fn rename_keeps_a_detached_session_detached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let old = "calm-old";
+    let new = "calm-fresh";
+    let _g_old = KillOnDrop { xdg, name: old };
+    let _g_new = KillOnDrop { xdg, name: new };
+
+    let out = ghost(xdg)
+        .args(["new", old, "-d", "--", "sh", "-c", "echo HItag; exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(old)),
+        "session not listed"
+    );
+    let dir = xdg.join("run/ghost").join(old);
+    assert!(
+        !dir.join("attached").exists(),
+        "a detached session must carry no attached marker"
+    );
+
+    let out = ghost(xdg).args(["rename", old, new]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(new)),
+        "rename not reflected in `ls`: {}",
+        ls(xdg)
+    );
+
+    // Renaming must not attach: the session stays detached, and is still
+    // reachable (by its display name) afterwards.
+    assert!(
+        !dir.join("attached").exists(),
+        "rename attached a detached session"
+    );
+    let term = Attached::new(xdg, new, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("HItag")),
+        "renamed session not reachable by display name; got: {:?}",
+        term.screen()
+    );
+}
+
+#[test]
 fn rename_prompt_renames_attached_session() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

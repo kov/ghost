@@ -32,6 +32,23 @@ pub struct SessionInfo {
     /// been switched to since, read from the host's `bell` marker file. Lets a
     /// front-end highlight a session with an unseen notification.
     pub bell: bool,
+    /// The user-chosen display name (`ghost rename`), empty if never renamed.
+    /// A label only — `name` remains the session's immutable identity (its
+    /// directory, socket, and recording never move). Show [`Self::display`],
+    /// key on `name`.
+    pub display_name: String,
+}
+
+impl SessionInfo {
+    /// The name a human should see: the display name when one was set, else the
+    /// immutable session name.
+    pub fn display(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
+    }
 }
 
 /// Liveness of a session directory, read from its lock file.
@@ -82,6 +99,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     command: meta.command,
                     attached: path.join("attached").exists(),
                     bell: path.join("bell").exists(),
+                    display_name: meta.display_name,
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -227,6 +245,52 @@ mod tests {
         // Hold the lock fds until the assertions are done.
         drop(live_lock);
         drop(starting_lock);
+    }
+
+    #[test]
+    fn display_prefers_the_display_name_and_falls_back_to_the_id() {
+        let mut s = SessionInfo {
+            name: "sess-1".into(),
+            pid: 1,
+            created_at: None,
+            title: String::new(),
+            command: vec![],
+            attached: false,
+            bell: false,
+            display_name: String::new(),
+        };
+        assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
+        s.display_name = "build box".into();
+        assert_eq!(s.display(), "build box");
+    }
+
+    #[test]
+    fn list_in_reports_the_display_name_from_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("sess-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = std::fs::File::create(dir.join("lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        std::fs::write(dir.join("pid"), std::process::id().to_string()).unwrap();
+        crate::meta::write(
+            &dir.join("meta"),
+            &crate::meta::Meta {
+                created_at: 1,
+                command: vec![],
+                title: String::new(),
+                display_name: "build box".into(),
+            },
+        )
+        .unwrap();
+
+        let sessions = list_in(root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].display_name, "build box",
+            "the display name travels from meta into the listing"
+        );
+        drop(lock);
     }
 
     #[test]

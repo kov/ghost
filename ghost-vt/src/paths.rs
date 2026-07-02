@@ -7,9 +7,10 @@
 //! reaps every few days and would delete a live session's files out from under
 //! its still-running host. Correctness therefore can't lean on the tree being
 //! wiped: stale leftovers (a crashed host, or entries that outlive a reboot) are
-//! pruned by the liveness check in [`crate::session::list`]. Grouping the
-//! per-session files in one directory also makes renaming a session a single
-//! atomic `rename(2)` of that directory.
+//! pruned by the liveness check in [`crate::session::list`]. The directory is
+//! keyed by the session's *immutable* spawn-time name: renaming a session only
+//! sets a display-name label in its metadata, so these paths never move while
+//! a host lives.
 
 use std::path::PathBuf;
 

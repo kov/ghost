@@ -209,6 +209,10 @@ pub struct TerminalModel {
     /// every visible run of it and the pointer shows a hand (see
     /// [`Cmd::PointerIcon`]). Updated on pointer motion.
     hovered_link: Option<u16>,
+    /// The session's user-chosen display name (`ghost rename`), empty if
+    /// unlabeled. A human-facing label only: `session` stays the immutable id
+    /// every effect routes by. Feeds the [`Self::title`] fallback.
+    display_name: String,
     /// The text cursor (0-based, with visibility and shape) as of the previous feed.
     /// Moving the cursor writes no cell, so a bare CUP/CUF — common in full-screen
     /// apps whose differential renderers reposition without rewriting — leaves
@@ -275,6 +279,7 @@ impl TerminalModel {
             sync_held: false,
             theme: ThemeColors::default(),
             hovered_link: None,
+            display_name: String::new(),
             prev_cursor,
         }
     }
@@ -355,16 +360,40 @@ impl TerminalModel {
         &self.session
     }
 
-    /// The window title for this session: the app-set title (OSC 0/2) when it has
-    /// one, else the session name so a shell that never set a title still shows
-    /// something meaningful. Lives on the screen state, so it is remembered across
+    /// Set the session's user-chosen display name (empty = unlabeled). A label
+    /// for humans only — routing stays on the immutable [`Self::session`] id.
+    pub fn set_display_name(&mut self, name: String) {
+        self.display_name = name;
+    }
+
+    /// The session's user-chosen display name, empty if unlabeled.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// The name a human should see for this session: its display name when
+    /// labeled, else its immutable id.
+    pub fn display(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.session
+        } else {
+            &self.display_name
+        }
+    }
+
+    /// The window title for this session: the app-set title (OSC 0/2) when it
+    /// has one, else the user-chosen display name (`ghost rename`), else the
+    /// session id — so the titlebar always shows something meaningful. Lives on
+    /// the screen state and the label, so it is remembered across
     /// background/foreground switches.
     pub fn title(&self) -> String {
         let title = self.screen.title();
-        if title.is_empty() {
-            self.session.clone()
-        } else {
+        if !title.is_empty() {
             title.to_string()
+        } else if !self.display_name.is_empty() {
+            self.display_name.clone()
+        } else {
+            self.session.clone()
         }
     }
 
@@ -3001,6 +3030,20 @@ mod tests {
         // A different title emits again.
         let cmds = feed_cmds(&mut m, b"\x1b]2;other\x07");
         assert!(cmds.contains(&Cmd::SetTitle("other".to_string())));
+    }
+
+    #[test]
+    fn title_prefers_the_app_title_then_display_name_then_id() {
+        let mut m = model(); // session id "alpha"
+        assert_eq!(m.title(), "alpha", "no title, no label: the id");
+        m.set_display_name("build box".to_string());
+        assert_eq!(m.title(), "build box", "the display name beats the id");
+        m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]2;vim\x07".to_vec(),
+            ended: false,
+        });
+        assert_eq!(m.title(), "vim", "the app's OSC title beats the label");
     }
 
     #[test]

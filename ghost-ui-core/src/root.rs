@@ -534,11 +534,31 @@ impl RootModel {
         // The session list completes the fleet (foreign/detached tiles, final order).
         // If a dive-out was waiting on it, launch the pull-back now that the grid is
         // whole — every tile already in its final slot, so nothing reshuffles.
-        if let UiEvent::SessionList(_) = &ev {
-            let mut cmds = match &mut self.mode {
+        if let UiEvent::SessionList(infos) = &ev {
+            // Teach this window's models their display names — a rename (possibly
+            // made in another window) reaches us only through the reconcile. The
+            // fleet handles its own tiles below; the foreground drives the window
+            // title, so a label change there retitles.
+            let mut cmds = Vec::new();
+            for info in infos {
+                if let Some(m) = self.warm.get_mut(&info.name) {
+                    m.set_display_name(info.display_name.clone());
+                }
+            }
+            if let Mode::Single(m) = &mut self.mode
+                && let Some(info) = infos.iter().find(|i| i.name == m.session())
+            {
+                let before = m.title();
+                m.set_display_name(info.display_name.clone());
+                let after = m.title();
+                if after != before {
+                    cmds.push(Cmd::SetTitle(after));
+                }
+            }
+            cmds.extend(match &mut self.mode {
                 Mode::Single(m) => m.update(ev),
                 Mode::Fleet(f) => f.update(ev),
-            };
+            });
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(&p));
             }
@@ -989,6 +1009,7 @@ mod tests {
             command: vec![],
             attached,
             bell: false,
+            display_name: String::new(),
         }
     }
 
@@ -1054,6 +1075,7 @@ mod tests {
                 command: vec![],
                 attached,
                 bell: false,
+                display_name: String::new(),
             }
         }
         let mut r = root(); // owns "alpha"
@@ -1705,6 +1727,7 @@ mod tests {
             command: vec![],
             attached,
             bell: false,
+            display_name: String::new(),
         }
     }
 
@@ -2004,6 +2027,28 @@ mod tests {
         assert!(
             cmds.contains(&Cmd::SetTitle("beta".into())),
             "a titleless foreground shows its session name: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_list_teaches_the_foreground_its_display_name() {
+        let mut r = root(); // single view of alpha, no OSC title
+        // The reconcile carries the display name a rename (possibly from another
+        // window) gave the session; the foreground's window title follows it.
+        let mut s = sess("alpha", true, 1);
+        s.display_name = "build box".into();
+        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        assert!(
+            cmds.contains(&Cmd::SetTitle("build box".into())),
+            "learning a display name retitles the window: {cmds:?}"
+        );
+        // An unchanged list does not re-emit.
+        let mut s = sess("alpha", true, 1);
+        s.display_name = "build box".into();
+        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
+            "an unchanged display name must not retitle: {cmds:?}"
         );
     }
 
