@@ -353,7 +353,9 @@ fn capture(path: PathBuf) {
         name: name.clone(),
         command,
         size: (COLS, ROWS),
+        cwd: None,
         record: None,
+        seed_from: None,
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: None,
         start_on_attach: true,
@@ -427,13 +429,22 @@ fn capture(path: PathBuf) {
 // ---- interactive mode (window) -----------------------------------------
 
 fn spawn_session(name: &str, command: Vec<String>) {
+    spawn_session_in(name, command, None)
+}
+
+fn spawn_session_in(name: &str, command: Vec<String>, cwd: Option<std::path::PathBuf>) {
     server::spawn(SpawnOpts {
         name: name.to_string(),
         command, // empty => $SHELL
         size: (COLS, ROWS),
-        record: None,
+        cwd,
+        // Record like the CLI does (`--no-record` is its opt-out): the
+        // recording is what lets a dead session's card preview its last
+        // screen, and what seeds a recreate with its predecessor's history.
+        record: Some(ghost_vt::paths::recording_path(name)),
+        seed_from: None,
         scrollback: screen::DEFAULT_SCROLLBACK,
-        max_recording_bytes: None,
+        max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
         start_on_attach: true,
     })
     .expect("spawn session");

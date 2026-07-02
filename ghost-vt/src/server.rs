@@ -36,8 +36,18 @@ pub struct SpawnOpts {
     pub command: Vec<String>,
     /// Initial terminal size as `(cols, rows)`.
     pub size: (u16, u16),
+    /// Where to start the child, overriding the spawner's own current
+    /// directory (the default). What lets a recreate put a session's
+    /// successor back in its predecessor's directory.
+    pub cwd: Option<std::path::PathBuf>,
     /// Where to record the session, or `None` to not record.
     pub record: Option<std::path::PathBuf>,
+    /// A predecessor's recording to seed this session's screen from (a
+    /// recreate): the host starts with that recording's final screen and
+    /// scrollback already in place, and the new child's output continues
+    /// below it. Read before `record` is created, so seeding a session from
+    /// its own name's previous recording works.
+    pub seed_from: Option<std::path::PathBuf>,
     /// Bound on retained scrollback lines for resync on attach.
     pub scrollback: usize,
     /// Cap on the recording's on-disk size, or `None` for unbounded.
@@ -353,6 +363,9 @@ fn host_main(
     launch_dir: Option<&std::path::Path>,
     current_name: &str,
 ) -> io::Result<i32> {
+    // An explicit cwd (a recreate) beats where the spawning process happened
+    // to run; everything below sees only the effective launch directory.
+    let launch_dir = opts.cwd.as_deref().or(launch_dir);
     std::fs::write(
         paths::pid_path(current_name),
         std::process::id().to_string(),
@@ -364,28 +377,10 @@ fn host_main(
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
 
-    // The child is started eagerly for a plain detached session, or deferred
-    // until the first attach handshake (see `SpawnOpts::start_on_attach`). While
-    // deferred we hold the slave (`pts`) so the PTY master never sees EOF and the
-    // poll loop just idles until a client attaches.
-    let mut pts = Some(pts);
-    let mut child: Option<std::process::Child> = None;
-    if !opts.start_on_attach {
-        child = Some(spawn_child(
-            &opts.command,
-            launch_dir,
-            pts.take().expect("slave present before first spawn"),
-        )?);
-    }
-
-    let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
-
-    // Authoritative screen state, fed every byte the child writes so a late
-    // attach can be repainted to the current state.
-    let mut screen = Screen::new(cols, rows, opts.scrollback);
-
     // Descriptive metadata for discovery (the GUI sidebar). Created time and
     // command are fixed; the title is refreshed below whenever it changes.
+    // Built before the child can spawn: the spawn also writes the durable
+    // descriptor, which carries these facts.
     let mut meta = crate::meta::Meta {
         // Milliseconds, not seconds: this is the fleet's spatial sort key, so
         // sub-second resolution keeps sessions spawned in the same second in their
@@ -400,6 +395,44 @@ fn host_main(
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
+    // The child is started eagerly for a plain detached session, or deferred
+    // until the first attach handshake (see `SpawnOpts::start_on_attach`). While
+    // deferred we hold the slave (`pts`) so the PTY master never sees EOF and the
+    // poll loop just idles until a client attaches.
+    let mut pts = Some(pts);
+    let mut child: Option<std::process::Child> = None;
+    // The last cwd written to the durable descriptor, so refreshes only touch
+    // the file when the child actually moved.
+    let mut desc_cwd: Option<std::path::PathBuf> = None;
+    if !opts.start_on_attach {
+        child = Some(spawn_child(
+            &opts.command,
+            launch_dir,
+            pts.take().expect("slave present before first spawn"),
+        )?);
+        desc_cwd = child_cwd(&child).or_else(|| launch_dir.map(Into::into));
+        write_descriptor(current_name, &meta, desc_cwd.clone());
+    }
+
+    let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
+
+    // Authoritative screen state, fed every byte the child writes so a late
+    // attach can be repainted to the current state. A seeded spawn (a
+    // recreate) starts from its predecessor's recording instead of blank:
+    // read it NOW, before the recorder below truncates the (typically same)
+    // path, and reflow the restored state to this session's grid.
+    let mut screen = match opts.seed_from.as_ref().and_then(|p| {
+        crate::record::read(p)
+            .map(|rec| Screen::from_recording(&rec, opts.scrollback))
+            .ok()
+    }) {
+        Some(mut seeded) => {
+            seeded.resize(cols, rows);
+            seeded
+        }
+        None => Screen::new(cols, rows, opts.scrollback),
+    };
+
     // Optional durable recording. Best-effort: if it cannot be created, the
     // session still runs (just unrecorded).
     let mut recorder = opts.record.as_ref().and_then(|path| {
@@ -412,6 +445,17 @@ fn host_main(
         )
         .ok()
     });
+    // A seeded session's recording must stand alone: open it with a checkpoint
+    // of the inherited state, so replaying it never needs the predecessor's
+    // file (which this recording typically just replaced on disk).
+    if opts.seed_from.is_some()
+        && let Some(r) = &mut recorder
+    {
+        let (c, rws) = screen.dimensions();
+        let dump = screen.dump_without_images();
+        let imgs = screen.graphics_images();
+        let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
+    }
     let mut bytes_since_checkpoint = 0usize;
     // Whether any viewport row changed since the last checkpoint we wrote. A
     // checkpoint is a whole-state dump, so writing one for a screen that hasn't
@@ -613,6 +657,15 @@ fn host_main(
                                 let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
                                 dirty_since_checkpoint = false;
                             }
+                            // Same cadence: keep the durable descriptor's cwd
+                            // current (a cheap /proc readlink; only an actual
+                            // move rewrites the file).
+                            if let Some(cwd) = child_cwd(&child)
+                                && desc_cwd.as_ref() != Some(&cwd)
+                            {
+                                crate::descriptor::set_cwd(current_name, &cwd);
+                                desc_cwd = Some(cwd);
+                            }
                             // Reset the budget whether or not we wrote: a screen
                             // unchanged since the last checkpoint waits another full
                             // interval before reconsidering, so a flood of non-
@@ -800,6 +853,8 @@ fn host_main(
                 pts.take()
                     .expect("slave present until the deferred child spawns"),
             )?);
+            desc_cwd = child_cwd(&child).or_else(|| launch_dir.map(Into::into));
+            write_descriptor(current_name, &meta, desc_cwd.clone());
         }
 
         // Push queued output to the client.
@@ -820,6 +875,16 @@ fn host_main(
                 // notification is now seen, so clear its marker.
                 set_bell_marker(current_name, false);
                 bell_marked = false;
+            } else {
+                // The user just left: remember where the child was, so a
+                // quiet session (no output, so no checkpoint-cadence refresh)
+                // still records its final directory for a recreate.
+                if let Some(cwd) = child_cwd(&child)
+                    && desc_cwd.as_ref() != Some(&cwd)
+                {
+                    crate::descriptor::set_cwd(current_name, &cwd);
+                    desc_cwd = Some(cwd);
+                }
             }
             attached_marked = now_attached;
         }
@@ -976,7 +1041,12 @@ fn handle_client_messages(
             ClientMsg::Kill => return Ok(Disposition::Kill),
             ClientMsg::Rename(new) => {
                 let (ok, message) = match set_display_name(current_name, &new, meta) {
-                    Ok(()) => (true, new.clone()),
+                    Ok(()) => {
+                        // The durable descriptor mirrors the label (a no-op
+                        // until the child's spawn has written one).
+                        crate::descriptor::set_display_name(current_name, &new);
+                        (true, new.clone())
+                    }
                     Err(e) => (false, e),
                 };
                 c.queue(&ServerMsg::RenameResult { ok, message });
@@ -1139,6 +1209,38 @@ fn spawn_child(
         cmd = cmd.current_dir(dir);
     }
     cmd.spawn(pts).map_err(io::Error::other)
+}
+
+/// The child's current working directory, best-effort: Linux reads it from
+/// `/proc`; elsewhere (or on any error) `None`, and the descriptor keeps the
+/// launch directory.
+fn child_cwd(child: &Option<std::process::Child>) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        child
+            .as_ref()
+            .and_then(|c| std::fs::read_link(format!("/proc/{}/cwd", c.id())).ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        None
+    }
+}
+
+/// Record the durable descriptor once the child actually starts — the fleet's
+/// memory of the session after it dies (see [`crate::descriptor`]). Best-effort,
+/// like `meta`.
+fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path::PathBuf>) {
+    let _ = crate::descriptor::write(
+        name,
+        &crate::descriptor::Descriptor {
+            command: meta.command.clone(),
+            cwd,
+            created_at: meta.created_at,
+            display_name: meta.display_name.clone(),
+        },
+    );
 }
 
 /// Kill and reap the child if one has been spawned; a no-op for a deferred

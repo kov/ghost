@@ -12,6 +12,7 @@
 //! front-end.
 
 pub mod client;
+pub mod descriptor;
 pub mod keys;
 pub mod meta;
 pub mod paths;

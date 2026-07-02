@@ -38,6 +38,14 @@ enum Command {
         /// help. Without it, `-d` starts the child eagerly.
         #[arg(long, hide = true)]
         defer: bool,
+        /// Start the session in this directory instead of the current one.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Seed the session's screen and scrollback from a predecessor's
+        /// recording (recreating a dead session). An implementation detail
+        /// used by front-ends, hidden from help.
+        #[arg(long, hide = true)]
+        seed_from: Option<std::path::PathBuf>,
         /// Do not record this session (recording is on by default).
         #[arg(long)]
         no_record: bool,
@@ -101,6 +109,8 @@ fn dispatch(command: Command) {
             name,
             detached,
             defer,
+            cwd,
+            seed_from,
             no_record,
             scrollback,
             max_recording_size,
@@ -120,7 +130,9 @@ fn dispatch(command: Command) {
                 name: name.clone(),
                 command,
                 size: (80, 24),
+                cwd,
                 record,
+                seed_from,
                 scrollback,
                 max_recording_bytes: Some(max_recording_size),
                 // Attached sessions (the default, and `--defer`) start their
