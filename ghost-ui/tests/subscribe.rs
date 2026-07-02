@@ -133,10 +133,8 @@ fn the_subscriber_api_delivers_the_snapshot_then_events_then_eof() {
     let sock = session_dir.join("sock");
 
     // The typed observer wrapper: connects, verifies the host serves
-    // subscriptions, and subscribes in one step.
+    // subscriptions, and subscribes in one step. Pumps never block.
     let mut sub = Subscriber::connect_path(&sock).expect("subscriber connect");
-    sub.set_read_timeout(Some(Duration::from_millis(25)))
-        .unwrap();
 
     // First pump(s) deliver the snapshot.
     let mut snapshot = None;

@@ -21,9 +21,11 @@ use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId,
     SceneItem, Style, Transform, layout_frame,
 };
+use ghost_vt::protocol::{SessionEvent, SessionState};
 use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
+use crate::event::SessionPush;
 use crate::input::{Key, Mods, NamedKey};
 use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
@@ -78,8 +80,14 @@ const MODAL_SCALE: f32 = 1.5;
 const DESTRUCTIVE_BUTTON_BG: Rgba = [0.52, 0.15, 0.15, 1.0];
 const AFFIRM_BUTTON_BG: Rgba = [0.13, 0.38, 0.20, 1.0];
 const CANCEL_BUTTON_BG: Rgba = [0.24, 0.26, 0.31, 1.0];
-/// How often (ms) the fleet asks the shell to re-enumerate sessions.
-const REFRESH_MS: u64 = 500;
+/// How often (ms) the fleet asks the shell to re-enumerate sessions. A slow
+/// backstop, not the state channel: per-session state arrives pushed
+/// (`UiEvent::SessionPush`) and set changes arrive as `UiEvent::SessionsChanged`
+/// hints; the floor covers hosts that predate subscriptions and missed hints.
+const REFRESH_MS: u64 = 5_000;
+// The floor is a backstop, not the state channel — it must stay slow enough
+// that pushed state (not this tick) is what the user experiences.
+const _: () = assert!(REFRESH_MS >= 5_000);
 
 /// A laid-out tile: stable handle, session id, and pixel rect.
 type Placement = (u64, SessionId, RectPx);
@@ -657,6 +665,7 @@ impl FleetModel {
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         let cmds = match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
+            UiEvent::SessionPush { name, push } => self.session_push(&name, push),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, bytes, ended),
             UiEvent::Resize { w_px, h_px, scale } => {
                 self.size_px = (w_px, h_px);
@@ -806,6 +815,71 @@ impl FleetModel {
             after_ms: REFRESH_MS,
         });
         cmds
+    }
+
+    /// Apply a pushed subscription state change to its tile. This is how tile
+    /// state moves between reconciles: the badge/section updates land the
+    /// moment the host pushes them instead of on the next list. A push for a
+    /// session with no tile yet is dropped — the reconcile seeds tiles, and
+    /// the list it reads carries the same state.
+    fn session_push(&mut self, id: &str, push: SessionPush) -> Vec<Cmd> {
+        let focused = self.focused.as_deref() == Some(id);
+        let mine = &self.mine;
+        let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) else {
+            return Vec::new();
+        };
+        let mut dirty = false;
+        match push {
+            SessionPush::Snapshot(SessionState {
+                attached,
+                bell,
+                title: _, // cards don't show the OSC title (it can't retitle the window)
+                display_name,
+            }) => {
+                let locality = locality_for(mine, id, attached.is_some());
+                dirty |= tile.bell != bell
+                    || tile.locality != locality
+                    || tile.model.display_name() != display_name;
+                tile.bell = bell;
+                tile.locality = locality;
+                tile.model.set_display_name(display_name);
+            }
+            SessionPush::Event(SessionEvent::Bell) => {
+                // Marker parity: only a bell nobody was attached to witness is
+                // an unseen notification — the push just removes the poll
+                // latency. A live reaction for attached sessions layers on
+                // this event separately.
+                if tile.locality == Locality::Detached && !tile.bell {
+                    tile.bell = true;
+                    dirty = true;
+                }
+            }
+            SessionPush::Event(SessionEvent::Attached(_)) => {
+                let locality = locality_for(mine, id, true);
+                // Attaching is "switching to" the session: the bell is seen.
+                dirty |= tile.locality != locality || tile.bell;
+                tile.bell = false;
+                tile.locality = locality;
+            }
+            SessionPush::Event(SessionEvent::Detached) => {
+                let locality = locality_for(mine, id, false);
+                dirty |= tile.locality != locality;
+                tile.locality = locality;
+            }
+            SessionPush::Event(SessionEvent::Renamed(name)) => {
+                dirty |= tile.model.display_name() != name;
+                tile.model.set_display_name(name);
+            }
+            SessionPush::Event(SessionEvent::Activity) => {
+                if !focused {
+                    tile.activity = tile.activity.saturating_add(1);
+                    // Only the badge's appearance changes pixels.
+                    dirty |= tile.activity == 1;
+                }
+            }
+            SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
+        }
+        if dirty { vec![Cmd::Redraw] } else { Vec::new() }
     }
 
     /// Lay out section headers and tile placements in *content* space (unscrolled,
@@ -1760,6 +1834,7 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 mod tests {
     use super::*;
     use crate::input::KeyEventKind;
+    use ghost_vt::protocol::AttachInfo;
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -1883,6 +1958,110 @@ mod tests {
     /// Session ids in laid-out order (section order, then within-section order).
     fn order(m: &FleetModel) -> Vec<String> {
         m.layout().into_iter().map(|(_, id, _)| id).collect()
+    }
+
+    fn push(m: &mut FleetModel, name: &str, p: SessionPush) -> Vec<Cmd> {
+        m.update(UiEvent::SessionPush {
+            name: name.to_string(),
+            push: p,
+        })
+    }
+
+    fn tile<'a>(m: &'a FleetModel, id: &str) -> &'a Tile {
+        m.tiles.iter().find(|t| t.id == id).unwrap()
+    }
+
+    #[test]
+    fn a_pushed_bell_badges_a_detached_tile_immediately() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let cmds = push(&mut m, "a", SessionPush::Event(SessionEvent::Bell));
+        assert!(
+            tile(&m, "a").bell,
+            "the badge lights without a list refresh"
+        );
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn a_bell_witnessed_by_an_attached_client_does_not_badge() {
+        // Marker parity: a bell someone was attached to see is not an unseen
+        // notification. The live *reaction* for the focused window is separate.
+        let mut m = fleet();
+        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        let cmds = push(&mut m, "a", SessionPush::Event(SessionEvent::Bell));
+        assert!(!tile(&m, "a").bell);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn attach_and_detach_events_rebucket_the_tile_without_a_refresh() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        push(&mut m, "a", SessionPush::Event(SessionEvent::Bell));
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Event(SessionEvent::Attached(AttachInfo { client: None })),
+        );
+        assert_eq!(tile(&m, "a").locality, Locality::Elsewhere);
+        assert!(!tile(&m, "a").bell, "attaching witnesses the bell");
+        assert!(cmds.contains(&Cmd::Redraw));
+
+        let cmds = push(&mut m, "a", SessionPush::Event(SessionEvent::Detached));
+        assert_eq!(tile(&m, "a").locality, Locality::Detached);
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn a_pushed_rename_relabels_the_card() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Event(SessionEvent::Renamed("otter".to_string())),
+        );
+        assert_eq!(tile(&m, "a").model.display_name(), "otter");
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn pushed_activity_badges_only_unfocused_tiles() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]); // focus defaults to the first tile ("a")
+        push(&mut m, "a", SessionPush::Event(SessionEvent::Activity));
+        push(&mut m, "b", SessionPush::Event(SessionEvent::Activity));
+        assert_eq!(tile(&m, "a").activity, 0, "the focused tile never badges");
+        assert!(tile(&m, "b").activity > 0);
+    }
+
+    #[test]
+    fn a_snapshot_refreshes_a_tiles_state() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Snapshot(ghost_vt::protocol::SessionState {
+                attached: Some(AttachInfo { client: None }),
+                bell: false,
+                title: String::new(),
+                display_name: "box".to_string(),
+            }),
+        );
+        assert_eq!(tile(&m, "a").locality, Locality::Elsewhere);
+        assert_eq!(tile(&m, "a").model.display_name(), "box");
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn a_push_for_an_unlisted_session_is_ignored() {
+        // The reconcile seeds tiles; a push racing ahead of it is dropped (the
+        // subscription's snapshot re-arrives semantically via the list).
+        let mut m = fleet();
+        let cmds = push(&mut m, "ghost", SessionPush::Event(SessionEvent::Bell));
+        assert!(cmds.is_empty());
     }
 
     #[test]

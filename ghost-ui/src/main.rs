@@ -35,10 +35,10 @@ use std::time::{Duration, Instant};
 use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
-    TerminalModel, UiEvent,
+    SessionPush, TerminalModel, UiEvent,
 };
 use ghost_ui_harness::framestats;
-use ghost_vt::client::Session;
+use ghost_vt::client::{Session, Subscriber};
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
@@ -244,7 +244,38 @@ fn attach(name: &str, cols: u16, rows: u16) -> io::Result<Session> {
     s.set_read_timeout(Some(Duration::from_millis(1)))?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
+    s.hello(&client_identity())?;
     Ok(s)
+}
+
+/// This app instance's identity, reported to hosts via `Hello` so state
+/// subscribers (other windows, other processes) can see who holds a display.
+/// Process-granular for now: windows within this process already tell
+/// themselves apart locally, so finer identity waits for a UI that shows it.
+fn client_identity() -> String {
+    format!("ghost-ui:{}", std::process::id())
+}
+
+/// Watch the session runtime dir and raise `flag` on any change — the
+/// set-change trigger that lets the fleet re-enumerate the moment a session
+/// appears or vanishes instead of waiting for its slow floor tick. `None`
+/// (nothing to watch, or no watch backend) degrades to floor-tick-only.
+fn session_set_watcher(
+    flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    let dir = ghost_vt::paths::runtime_dir();
+    // The dir may not exist before the first session; create it so the watch
+    // can bind now (hosts create it on demand anyway).
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut w = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if res.is_ok() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+    .ok()?;
+    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
+    Some(w)
 }
 
 /// The theme reported to session hosts at attach; fixed at startup, so read
@@ -476,6 +507,7 @@ fn interactive() {
     event_loop.set_control_flow(ControlFlow::Wait);
     #[cfg(target_os = "macos")]
     let proxy = event_loop.create_proxy();
+    let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut app = App {
         windows: HashMap::new(),
         clipboard: None,
@@ -486,6 +518,9 @@ fn interactive() {
         focused: None,
         #[cfg(target_os = "macos")]
         proxy,
+        subs: HashMap::new(),
+        _watcher: session_set_watcher(sessions_changed.clone()),
+        sessions_changed,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -832,9 +867,82 @@ struct App {
     /// main thread. Held only to hand to [`menu::install`].
     #[cfg(target_os = "macos")]
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    /// App-wide state subscriptions, one per session whose host serves them
+    /// (reconciled against every session list). Pushed snapshots/events are
+    /// fanned out to every window; sessions on older hosts simply stay covered
+    /// by the fleet's slow floor tick.
+    subs: HashMap<String, Subscriber>,
+    /// Set by the runtime-dir watcher thread when the session *set* may have
+    /// changed; drained on the loop to hint an immediate re-enumeration.
+    sessions_changed: Arc<std::sync::atomic::AtomicBool>,
+    /// The watch itself; dropping it stops event delivery. `None` when the
+    /// runtime dir cannot be watched — the floor tick still reconciles.
+    _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl App {
+    /// Keep the app-wide subscription pool matched to the session set: drop
+    /// subscriptions for sessions that vanished, open one for each newcomer
+    /// whose host serves them. A host that predates subscriptions (or a
+    /// connect race with a dying session) is simply skipped — its state stays
+    /// covered by the fleet's slow reconcile.
+    fn sync_subscriptions(&mut self, infos: &[ghost_vt::session::SessionInfo]) {
+        let names: std::collections::HashSet<&str> =
+            infos.iter().map(|i| i.name.as_str()).collect();
+        self.subs.retain(|name, _| names.contains(name.as_str()));
+        for info in infos {
+            if !self.subs.contains_key(&info.name)
+                && let Ok(sub) = Subscriber::connect(&info.name)
+            {
+                self.subs.insert(info.name.clone(), sub);
+            }
+        }
+    }
+
+    /// Drain every subscription and fan its pushes out to all windows (each
+    /// window's fleet keeps its own tiles). A subscription ending usually
+    /// means the session died: drop it and hint a re-enumeration.
+    fn pump_subscriptions(&mut self, event_loop: &ActiveEventLoop) {
+        let mut pushes: Vec<(String, SessionPush)> = Vec::new();
+        let mut any_ended = false;
+        self.subs.retain(|name, sub| {
+            let p = sub.pump().unwrap_or_default();
+            if let Some(state) = p.snapshot {
+                pushes.push((name.clone(), SessionPush::Snapshot(state)));
+            }
+            for e in p.events {
+                pushes.push((name.clone(), SessionPush::Event(e)));
+            }
+            any_ended |= p.ended;
+            !p.ended
+        });
+        let changed = any_ended
+            || self
+                .sessions_changed
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if pushes.is_empty() && !changed {
+            return;
+        }
+        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for (name, push) in pushes {
+            for wid in &wids {
+                self.dispatch(
+                    *wid,
+                    UiEvent::SessionPush {
+                        name: name.clone(),
+                        push: push.clone(),
+                    },
+                    event_loop,
+                );
+            }
+        }
+        if changed {
+            for wid in &wids {
+                self.dispatch(*wid, UiEvent::SessionsChanged, event_loop);
+            }
+        }
+    }
+
     /// Feed an event to window `wid`'s model and execute the effects it returns.
     fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &ActiveEventLoop) {
         let cmds = match self.windows.get_mut(&wid) {
@@ -882,6 +990,9 @@ impl App {
                         Some(h) => h.session_list(),
                         None => session::list().unwrap_or_default(),
                     };
+                    if self.bench.is_none() {
+                        self.sync_subscriptions(&infos);
+                    }
                     self.dispatch(wid, UiEvent::SessionList(infos), event_loop);
                 }
                 Cmd::Attach(id) => {
@@ -1465,6 +1576,9 @@ impl ApplicationHandler<UserEvent> for App {
         for (wid, name, bytes, ended) in pumped {
             self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, event_loop);
         }
+        // Pushed session state (subscriptions) and set-change hints (the
+        // runtime-dir watch), fanned out to every window.
+        self.pump_subscriptions(event_loop);
         // Fire any per-window ticks that are now due.
         let now = Instant::now();
         let due: Vec<WindowId> = self

@@ -32,6 +32,9 @@ wgpu = "29"
 pollster = "0.4"
 png = "0.18"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
+# Filesystem watch on the session runtime dir: the set-change trigger that
+# replaces steady session polling (state itself arrives over subscriptions).
+notify = "8.2"
 # Cache-efficiency (and any future) instrumentation is emitted via `tracing`; this
 # installs the subscriber that turns `RUST_LOG` into filtered stderr output. Off by
 # default (no target enabled), so instrumented code stays free in normal runs.

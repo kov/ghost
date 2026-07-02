@@ -6,7 +6,17 @@
 
 use crate::SessionId;
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods};
+use ghost_vt::protocol::{SessionEvent, SessionState};
 use ghost_vt::session::SessionInfo;
+
+/// What a session subscription pushed: the one starting snapshot, or a delta
+/// event ([`ghost_vt::client::Subscriber`]). The shell subscribes to every
+/// session whose host serves it and fans the pushes out to each window.
+#[derive(Clone, Debug)]
+pub enum SessionPush {
+    Snapshot(SessionState),
+    Event(SessionEvent),
+}
 
 /// A pointer position in physical pixels (origin top-left).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,6 +89,17 @@ pub enum UiEvent {
     },
     /// Reply to `Cmd::ListSessions`.
     SessionList(Vec<SessionInfo>),
+    /// A state push from `name`'s subscription. State reaches the fleet the
+    /// moment it changes; the periodic `SessionList` remains only as set
+    /// discovery and a slow backstop.
+    SessionPush {
+        name: SessionId,
+        push: SessionPush,
+    },
+    /// The session *set* may have changed (a session directory appeared or
+    /// vanished, or a subscription ended): re-enumerate now rather than waiting
+    /// for the floor tick.
+    SessionsChanged,
     /// The shell has attached `SessionId` for this window (reply to
     /// `Cmd::SpawnSession` / `Cmd::TakeOver`): switch to its single view and
     /// take ownership. The window adopts the fleet tile's screen if it has one.

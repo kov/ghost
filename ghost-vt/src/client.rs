@@ -152,6 +152,10 @@ impl Subscriber {
             ));
         }
         client.send(&ClientMsg::Subscribe)?;
+        // Never block: a shell pumps a whole pool of subscriptions on its loop
+        // cadence, and even a millisecond's read timeout per idle subscription
+        // would add up to real latency.
+        client.conn.set_nonblocking(true)?;
         Ok(Subscriber { client })
     }
 
@@ -160,15 +164,9 @@ impl Subscriber {
         self.client.as_fd()
     }
 
-    /// Bound how long a [`pump`](Subscriber::pump) read waits for data; `None`
-    /// restores blocking until readable.
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.client.set_read_timeout(timeout)
-    }
-
-    /// Drain whatever state is ready now. Any read failure ends the
-    /// subscription (reported via [`ended`](SubscriberPump::ended)) — for an
-    /// observer, a broken connection and a dead host mean the same thing.
+    /// Drain whatever state is ready now; never blocks. Any read failure ends
+    /// the subscription (reported via [`ended`](SubscriberPump::ended)) — for
+    /// an observer, a broken connection and a dead host mean the same thing.
     pub fn pump(&mut self) -> io::Result<SubscriberPump> {
         let mut pump = SubscriberPump::default();
         match self.client.recv_ready() {
@@ -297,6 +295,20 @@ impl Session {
             return Ok(());
         }
         self.client.send(&ClientMsg::Theme(colors))
+    }
+
+    /// Identify this display client to the host ([`ClientMsg::Hello`]) so
+    /// state subscribers can see *who* holds the display ([`AttachInfo`]
+    /// (crate::protocol::AttachInfo)). Advisory, sent right after attaching
+    /// like [`report_theme`](Session::report_theme); silently skipped on a
+    /// host that predates it.
+    pub fn hello(&mut self, client: &str) -> io::Result<()> {
+        if self.client.proto < crate::protocol::PROTO_SUBSCRIBE {
+            return Ok(());
+        }
+        self.client.send(&ClientMsg::Hello {
+            client: client.to_string(),
+        })
     }
 
     /// Drain whatever output is ready now, flattening protocol messages into

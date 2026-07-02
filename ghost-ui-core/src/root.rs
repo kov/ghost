@@ -476,6 +476,15 @@ impl RootModel {
             let id = id.clone();
             return self.adopt(id);
         }
+        // A set-change hint (a session appeared/vanished, a subscription ended):
+        // re-enumerate now instead of waiting for the fleet's floor tick. Only
+        // the fleet tracks the set; the single view has nothing to refresh.
+        if let UiEvent::SessionsChanged = &ev {
+            return match &self.mode {
+                Mode::Fleet(_) => vec![Cmd::ListSessions],
+                Mode::Single(_) => Vec::new(),
+            };
+        }
         // The foreground session's child exited (the shell was quit). Exiting a
         // shell never quits the app: switch to the next attached session, or drop
         // to the fleet overview when this window has none left.
@@ -1024,6 +1033,39 @@ mod tests {
     fn dive_out(r: &mut RootModel, sessions: &[ghost_vt::session::SessionInfo]) {
         key(r, Key::Named(NamedKey::F9), Mods::NONE);
         r.update(UiEvent::SessionList(sessions.to_vec()));
+    }
+
+    #[test]
+    fn session_pushes_are_inert_in_the_single_view() {
+        let mut r = root();
+        let cmds = r.update(UiEvent::SessionPush {
+            name: "alpha".into(),
+            push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
+        });
+        assert!(cmds.is_empty());
+        assert!(!r.is_fleet());
+    }
+
+    #[test]
+    fn a_pushed_bell_reaches_the_fleet_tile() {
+        let mut r = root();
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
+        let cmds = r.update(UiEvent::SessionPush {
+            name: "beta".into(),
+            push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
+        });
+        assert!(cmds.contains(&Cmd::Redraw), "the tile badge repaints");
+    }
+
+    #[test]
+    fn a_sessions_changed_hint_relists_in_the_fleet_only() {
+        let mut r = root();
+        assert!(
+            r.update(UiEvent::SessionsChanged).is_empty(),
+            "the single view doesn't track the session set"
+        );
+        dive_out(&mut r, &[sess("alpha", true, 1)]);
+        assert_eq!(r.update(UiEvent::SessionsChanged), vec![Cmd::ListSessions]);
     }
 
     #[test]
