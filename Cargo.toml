@@ -29,9 +29,14 @@ license = "MIT OR Apache-2.0"
 inherits = "release"
 debug = true
 
-# Vendored winit 0.30.13 carrying a one-line patch to `is_stateless()` (recognise
-# partially-tiled / snapped windows) so the window restores to its pre-snap size on
-# Wayland/GNOME — see vendor/winit/.../linux/wayland/window/state.rs. To be reported
-# upstream (winit + smithay-client-toolkit), then dropped.
+# Vendored winit 0.30.13 carrying two local patches, each to be reported
+# upstream and then dropped:
+# - `is_stateless()` recognises partially-tiled / snapped windows so the window
+#   restores to its pre-snap size on Wayland/GNOME — see
+#   vendor/winit/.../linux/wayland/window/state.rs (winit + smithay-client-toolkit).
+# - macOS `insertText:` commits text arriving outside a key event (the
+#   Character Viewer / Ctrl-Cmd-Space emoji palette, dictation), which the
+#   marked-text-only gate silently dropped — see
+#   vendor/winit/.../macos/view.rs (upstream winit#3342, milestoned 0.31).
 [patch.crates-io]
 winit = { path = "vendor/winit" }

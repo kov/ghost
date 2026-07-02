@@ -49,6 +49,13 @@ fn menu_dump_lists_the_expected_native_menu_bar() {
         dump.contains("Paste\tkey=v\taction=ghostMenuAction:"),
         "{dump}"
     );
+    // Emoji & Symbols opens the system Character Viewer via AppKit's own
+    // selector — the standard, discoverable entry the Ctrl-Cmd-Space global
+    // shortcut mirrors; insertion then arrives through the IME commit path.
+    assert!(
+        dump.contains("Emoji & Symbols\tkey=\taction=orderFrontCharacterPalette:"),
+        "{dump}"
+    );
 
     // View: font zoom routes to the app.
     assert!(

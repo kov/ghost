@@ -131,6 +131,14 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// True while `keyDown:` is running `interpretKeyEvents` (local ghost patch;
+    /// to be reported upstream). Distinguishes an `insertText:` driven by a
+    /// keystroke (plain typing — reported as `KeyboardInput`, must not also
+    /// commit) from one arriving outside any key event: the Character Viewer
+    /// (emoji palette) and dictation insert directly, with no marked text and no
+    /// key event, and were previously dropped by the marked-text-only gate.
+    in_key_event: Cell<bool>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -407,11 +415,27 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            // Commit only if we have marked text.
-            if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            // Commit if we have marked text (an IME composition concluding), or —
+            // local ghost patch, to be reported upstream — when the insertion
+            // arrives OUTSIDE any key event: the Character Viewer (emoji palette)
+            // and dictation call `insertText:` directly, with no composition and
+            // no keystroke, and the marked-text-only gate silently dropped them.
+            // A keystroke-driven `insertText:` without marked text (plain typing
+            // routed through `interpretKeyEvents`) still must NOT commit: that
+            // text is reported as `KeyboardInput` by `keyDown:`.
+            let has_marked = unsafe { self.hasMarkedText() };
+            let outside_key_event = !self.ivars().in_key_event.get();
+            if (has_marked || outside_key_event) && self.is_ime_enabled() && !is_control {
+                if has_marked {
+                    self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                    // The enclosing `keyDown:` consumes this to suppress the
+                    // keystroke's own `KeyboardInput` for committed text.
+                    self.ivars().ime_state.set(ImeState::Committed);
+                }
+                // A palette/dictation insert has no enclosing key event, so the
+                // state is left alone: marking it `Committed` would make the NEXT
+                // keystroke read as IME input and swallow it.
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
             }
         }
 
@@ -465,7 +489,12 @@ declare_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                // Mark the key event in flight (local ghost patch) so `insertText:`
+                // can tell keystroke-driven insertions (reported as KeyboardInput)
+                // from direct ones (emoji palette, dictation), which must commit.
+                self.ivars().in_key_event.set(true);
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                self.ivars().in_key_event.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -803,6 +832,7 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            in_key_event: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),

@@ -273,6 +273,18 @@ mod imp {
             MenuAction::Paste,
             ns_string!("v"),
         ));
+        edit.addItem(&NSMenuItem::separatorItem(mtm));
+        // AppKit's own Character Viewer (the system emoji picker). Nil-targeted:
+        // the responder chain ends at NSApplication, which implements it. No key
+        // equivalent — the system's global Ctrl-Cmd-Space (not a Command chord)
+        // already opens it; this is the discoverable menu entry. The picked
+        // characters arrive through the IME commit path like any composed text.
+        edit.addItem(&native_item(
+            mtm,
+            ns_string!("Emoji & Symbols"),
+            sel!(orderFrontCharacterPalette:),
+            ns_string!(""),
+        ));
 
         // View: font zoom (Cmd +/-/0) and the fleet overview toggle (F9).
         let view = submenu(mtm, &bar, ns_string!("View"));
