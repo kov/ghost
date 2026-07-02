@@ -191,11 +191,11 @@ impl Gpu {
         // `VK_ICD_FILENAMES` to a hardware driver (e.g. this VM's venus) hides it,
         // making the request fail with NotFound. So pin the loader to ONLY the
         // lavapipe ICD. Pinning (rather than just clearing the inherited pin to scan
-        // every ICD) is deliberate: scanning would also LOAD the venus driver, which
-        // registers a TLS destructor that segfaults at libtest worker-thread teardown
-        // (the venus-teardown bug) even though we render on lavapipe. Only the headless
-        // software path calls this — the windowed app requests its own surface-
-        // compatible adapter elsewhere and never comes through here.
+        // every ICD) keeps golden renders deterministic: loading a hardware driver we
+        // don't render on buys nothing (and mesa < 26.1.3's venus segfaulted libtest
+        // teardown from merely being loaded — its `vn_tls_free` TSD destructor). Only
+        // the headless software path calls this — the windowed app requests its own
+        // surface-compatible adapter elsewhere and never comes through here.
         //
         // Done once under a `Once`: integration-test binaries build this crate without
         // `#[cfg(test)]`, so they DON'T share `shared_test_gpu`'s device — every test
@@ -243,9 +243,7 @@ impl Gpu {
     /// render path: unlike [`Self::request_headless`] it neither pins the lavapipe ICD
     /// nor forces the fallback adapter, so it takes whatever the loader offers first
     /// (honouring an inherited `VK_DRIVER_FILES`). Returns the adapter info alongside
-    /// the context so a caller can label the run and decide teardown handling — a wgpu
-    /// device on a real driver may SIGSEGV at libtest teardown (the venus-teardown
-    /// bug), so a `#[test]` using this must force-exit on success.
+    /// the context so a caller can label the run.
     pub fn request_default() -> (Self, wgpu::AdapterInfo) {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN;
@@ -1297,8 +1295,7 @@ impl Renderer {
 
     /// A headless renderer on the DEFAULT GPU (the real device, not the software
     /// fallback) — for the GPU render benchmark. Returns the adapter info so the
-    /// caller can label the run and handle the venus teardown quirk. See
-    /// [`Gpu::request_default`].
+    /// caller can label the run. See [`Gpu::request_default`].
     pub fn headless_default_gpu(theme: Theme) -> (Self, wgpu::AdapterInfo) {
         let (gpu, info) = Gpu::request_default();
         (Self::new(gpu, theme, FORMAT), info)

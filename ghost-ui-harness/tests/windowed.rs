@@ -127,9 +127,6 @@ impl ApplicationHandler for WindowedDive {
             "windowed adapter: {} / {} ({:?})",
             adapter_info.name, adapter_info.driver, adapter_info.device_type
         );
-        // The software rasterizer (lavapipe = a CPU device) tears down cleanly; a real
-        // driver (venus, on this VM) still SIGSEGVs at teardown — see the exit below.
-        let clean_teardown = adapter_info.device_type == wgpu::DeviceType::Cpu;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("request device");
@@ -211,20 +208,9 @@ impl ApplicationHandler for WindowedDive {
 
         // The dive's goal (real frames presented to the surface) is verified above.
         // Ask winit to exit the loop so `run_app` returns and the test tears down.
+        // (Mesa < 26.1.3 SIGSEGV'd this teardown on venus inside libtest — the
+        // `vn_tls_free` TSD-destructor bug; fixed upstream, workaround removed.)
         event_loop.exit();
-
-        // On a real driver, tearing the venus/Wayland surface + device down *inside
-        // libtest's harness* then SIGSEGVs — and only there: a standalone binary drops
-        // the identical resources cleanly on venus, as does lavapipe (a CPU device,
-        // which reaches the clean return above), so it is neither a device-drop bug nor
-        // a concern for the real app (whose event loop and teardown run on the main
-        // thread). Retested 2026-07-01 on the rebuilt VM: venus still crashes at
-        // teardown, lavapipe still clean. Force-exit on success there rather than crash
-        // on cleanup; a failed assertion panics first, so a real failure still reports
-        // (non-zero) — only a clean success reaches here.
-        if !clean_teardown {
-            std::process::exit(0);
-        }
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}

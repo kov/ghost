@@ -7,8 +7,7 @@
 //! the ~33MB readback that dominates `render_offscreen` at 4K. It also times the
 //! readback path once, so the printout shows exactly how much that copy costs.
 //!
-//! Gated: it needs a real GPU and force-exits to dodge the venus teardown SIGSEGV (see
-//! `venus-teardown-bug`), so a plain `cargo test` skips it. Run it with:
+//! Gated: it needs a real GPU, so a plain `cargo test` skips it. Run it with:
 //!
 //! ```sh
 //! GHOST_GPU_BENCH=1 cargo test -p ghost-renderer --test gpu_bench -- --nocapture
@@ -79,7 +78,7 @@ fn gpu_render_benchmark() {
         let cold_dims = cold_r.render_offscreen_no_readback(&frame, font, 15.0);
         let cold = t.elapsed();
         assert_eq!(cold_dims, (w, h), "cold render targets the frame size");
-        drop(cold_r); // this renderer never renders again; force-exit below dodges its drop
+        drop(cold_r); // this renderer never renders again
 
         let warm_no_readback = median(
             (0..7)
@@ -110,12 +109,5 @@ fn gpu_render_benchmark() {
              | warm +readback {warm_readback:?} (readback adds {:?})",
             warm_readback.saturating_sub(warm_no_readback),
         );
-    }
-
-    // A real driver (venus) SIGSEGVs at libtest teardown; force-exit on success to skip
-    // it. The software fallback (a CPU device) tears down cleanly, so let it report
-    // normally. Assertions above panic first, so a real failure still surfaces.
-    if info.device_type != wgpu::DeviceType::Cpu {
-        std::process::exit(0);
     }
 }
