@@ -1081,6 +1081,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         bell: false,
         display_name: String::new(),
         cwd: None,
+        size: None,
     }
 }
 

@@ -197,6 +197,7 @@ impl Harness {
                 bell: false,
                 display_name: String::new(),
                 cwd: None,
+                size: None,
             })
             .collect()
     }

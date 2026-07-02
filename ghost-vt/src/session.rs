@@ -41,6 +41,11 @@ pub struct SessionInfo {
     /// read from the durable descriptor — so it refreshes on the host's
     /// checkpoint/detach cadence, not per keystroke. `None` when unknown.
     pub cwd: Option<String>,
+    /// The session's terminal grid `(cols, rows)`, refreshed by the host when a
+    /// display client resizes it. Lets a fleet shape a session's tile correctly
+    /// before (or without) observing it. `None` when unrecorded (metadata
+    /// written before the field existed).
+    pub size: Option<(u16, u16)>,
 }
 
 impl SessionInfo {
@@ -123,6 +128,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     bell: path.join("bell").exists(),
                     display_name: meta.display_name,
                     cwd: None, // filled by [`list`] from the descriptor
+                    size: Some(meta.size).filter(|&s| s != (0, 0)),
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -282,6 +288,7 @@ mod tests {
             bell: false,
             display_name: String::new(),
             cwd: None,
+            size: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
@@ -304,6 +311,7 @@ mod tests {
                 command: vec![],
                 title: String::new(),
                 display_name: "build box".into(),
+                size: (120, 60),
             },
         )
         .unwrap();
@@ -314,6 +322,34 @@ mod tests {
             sessions[0].display_name, "build box",
             "the display name travels from meta into the listing"
         );
+        assert_eq!(
+            sessions[0].size,
+            Some((120, 60)),
+            "the grid size travels from meta into the listing"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn list_in_reports_an_unrecorded_size_as_unknown() {
+        // Metadata written before the size field existed reads as (0, 0); the
+        // listing must surface that as "unknown", not a degenerate zero grid.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("sess-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = std::fs::File::create(dir.join("lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        std::fs::write(dir.join("pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(
+            dir.join("meta"),
+            br#"{"created_at":1,"command":[],"title":""}"#,
+        )
+        .unwrap();
+
+        let sessions = list_in(root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].size, None);
         drop(lock);
     }
 

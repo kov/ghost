@@ -27,6 +27,13 @@ pub struct Meta {
     /// before this field existed parseable.
     #[serde(default)]
     pub display_name: String,
+    /// The session's terminal grid `(cols, rows)`, refreshed whenever a display
+    /// client resizes it. Discovery hands it to the fleet so a never-observed
+    /// session's tile is born with its real aspect — the grid must not reshuffle
+    /// when the observer's first snapshot lands. `(0, 0)` (the pre-field
+    /// default) means unrecorded.
+    #[serde(default)]
+    pub size: (u16, u16),
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -56,6 +63,7 @@ mod tests {
             command: vec!["vim".into(), "main.rs".into()],
             title: "vim · main.rs".into(),
             display_name: "build box".into(),
+            size: (120, 60),
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));
@@ -70,6 +78,7 @@ mod tests {
         std::fs::write(&path, br#"{"created_at":1,"command":["sh"],"title":"t"}"#).unwrap();
         let meta = read(&path).expect("legacy meta parses");
         assert_eq!(meta.display_name, "");
+        assert_eq!(meta.size, (0, 0), "pre-size metadata reads as unknown");
     }
 
     #[test]

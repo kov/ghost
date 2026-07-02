@@ -124,3 +124,46 @@ fn created_at_is_recorded_in_milliseconds() {
         meta.created_at
     );
 }
+
+#[test]
+fn a_client_resize_refreshes_the_recorded_grid_size() {
+    // The fleet shapes a never-observed session's tile from the listed grid
+    // size, so the host must keep it current: recorded at spawn, refreshed when
+    // a display client resizes the session.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "sized";
+    let _guard = KillOnDrop { xdg, name };
+
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dir = xdg.join("run").join("ghost").join(name);
+    let size = || ghost_vt::meta::read(&dir.join("meta")).map(|m| m.size);
+    assert!(
+        wait_until(Duration::from_secs(5), || size().is_some()),
+        "session meta never appeared"
+    );
+    assert_eq!(
+        size(),
+        Some((80, 24)),
+        "the spawn records the session's initial grid"
+    );
+
+    // A display client attaches and resizes the session to its real window.
+    let mut session =
+        ghost_vt::client::Session::attach_deferred_path(&dir.join("sock"), name).unwrap();
+    session.resize(100, 40).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || size() == Some((100, 40))),
+        "the recorded grid never followed the client resize; got {:?}",
+        size()
+    );
+}

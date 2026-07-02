@@ -1095,6 +1095,7 @@ mod tests {
             bell: false,
             display_name: String::new(),
             cwd: None,
+            size: None,
         }
     }
 
@@ -1374,6 +1375,7 @@ mod tests {
                 bell: false,
                 display_name: String::new(),
                 cwd: None,
+                size: None,
             }
         }
         let mut r = root(); // owns "alpha"
@@ -2033,6 +2035,7 @@ mod tests {
             bell: false,
             display_name: String::new(),
             cwd: None,
+            size: None,
         }
     }
 

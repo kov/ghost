@@ -400,6 +400,7 @@ fn host_main(
         command: opts.command.clone(),
         title: String::new(),
         display_name: String::new(),
+        size: opts.size,
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
@@ -914,6 +915,13 @@ fn host_main(
             let grid = screen.dimensions();
             let regridded = grid != last_grid;
             last_grid = grid;
+            if regridded {
+                // Keep the discoverable grid size current (coalesced: only an
+                // actual change rewrites the file), so a fleet that has never
+                // observed this session still shapes its tile correctly.
+                meta.size = grid;
+                let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
+            }
             if !subscribers.is_empty() {
                 use crate::protocol::SessionEvent;
                 if regridded {

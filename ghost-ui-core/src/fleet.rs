@@ -1015,8 +1015,12 @@ impl FleetModel {
                 tile.cwd = info.cwd.clone();
                 tile.model.set_display_name(info.display_name.clone());
             } else {
-                let mut model =
-                    TerminalModel::new(info.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
+                // Born at the session's listed grid, so the tile has its real
+                // aspect before the observer's first snapshot lands — a dive-out
+                // freezes the layout at listing time, and the grid must not
+                // reshuffle under the animation when the mirrors catch up.
+                let (cols, rows) = info.size.unwrap_or((PREVIEW_COLS, PREVIEW_ROWS));
+                let mut model = TerminalModel::new(info.name.clone(), cols, rows, self.metrics);
                 model.set_theme(self.theme);
                 model.set_display_name(info.display_name.clone());
                 self.push_tile(
@@ -2935,6 +2939,7 @@ mod tests {
             bell: false,
             display_name: String::new(),
             cwd: None,
+            size: None,
         }
     }
 
@@ -3965,6 +3970,44 @@ mod tests {
             aspect(ra) > 1.5,
             "the default tile keeps the terminal aspect, got {}",
             aspect(ra)
+        );
+    }
+
+    #[test]
+    fn a_listed_size_shapes_the_tile_before_its_preview_lands() {
+        // A dive-out freezes the fleet's layout the moment the listing
+        // completes; the observers' first grid events land milliseconds later,
+        // mid-animation. The listing carries each session's real grid, so a
+        // tile is born with its true aspect and the observation changes
+        // content, never geometry — otherwise the settled fleet wouldn't match
+        // the frozen dive world (the end-of-dive layout jump).
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![SessionInfo {
+            size: Some((120, 60)),
+            ..info("a")
+        }]));
+        assert_eq!(
+            tile(&m, "a").model.dims(),
+            (120, 60),
+            "the placeholder is born at the listed grid, not the 80×24 guess"
+        );
+        let born = tile_rect(&m, "a");
+        // The observation's grid event confirms what the listing already said:
+        // nothing moves, nothing repaints.
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Event(SessionEvent::Resized {
+                cols: 120,
+                rows: 60,
+            }),
+        );
+        assert_eq!(cmds, Vec::new(), "a confirming grid event is a no-op");
+        assert_eq!(
+            tile_rect(&m, "a"),
+            born,
+            "the grid must not reshuffle when the preview lands"
         );
     }
 
