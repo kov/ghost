@@ -72,6 +72,9 @@ const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
 const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
 const BUTTON_BG: Rgba = [0.17, 0.19, 0.24, 1.0];
 const BUTTON_FG: Rgba = [0.80, 0.83, 0.89, 1.0];
+/// Label of an insensitive action chip (e.g. detach on a session this window
+/// does not drive) — visibly dimmed, and inert to clicks.
+const BUTTON_DISABLED_FG: Rgba = [0.42, 0.46, 0.54, 0.7];
 /// Confirm-overlay colours (a scrim, its prompt text, and the choice buttons).
 const OVERLAY_BG: Rgba = [0.04, 0.04, 0.06, 0.82];
 const OVERLAY_FG: Rgba = [0.92, 0.94, 0.97, 1.0];
@@ -1764,12 +1767,13 @@ impl FleetModel {
             }
             GroupButton::Open => self.open_group(idx),
             GroupButton::Detach => {
-                let mut cmds: Vec<Cmd> = self
+                let ours: Vec<SessionId> = self
                     .present_members(idx)
                     .into_iter()
                     .filter(|id| self.locality_of(id) == Some(Locality::ThisWindow))
-                    .map(Cmd::Detach)
                     .collect();
+                let mut cmds: Vec<Cmd> =
+                    ours.iter().flat_map(|id| self.detach_session(id)).collect();
                 cmds.push(Cmd::Redraw);
                 cmds
             }
@@ -1788,11 +1792,37 @@ impl FleetModel {
         }
     }
 
+    /// Release `id` from this window: drop ownership, flip its tile to
+    /// Detached, and observe it so the preview stays a live mirror — the
+    /// inverse of the claim in [`Self::open_group_cmds`]. Returns the shell
+    /// commands (the client drop and the observation).
+    fn detach_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+        let mut cmds = vec![Cmd::Detach(id.clone())];
+        self.mine.remove(id);
+        if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+            t.locality = Locality::Detached;
+        }
+        if self.observing.insert(id.clone()) {
+            cmds.push(Cmd::Observe(id.clone()));
+        }
+        cmds
+    }
+
     /// Run a card button's action: detach immediately, confirm a kill, or open an
     /// inline rename.
     fn button(&mut self, button: Button, id: SessionId) -> Vec<Cmd> {
         match button {
-            Button::Detach => vec![Cmd::Detach(id), Cmd::Redraw],
+            Button::Detach => {
+                // Only a session this window drives can be released; the chip
+                // is drawn insensitive otherwise and the click is inert (it
+                // does NOT fall through to opening the tile).
+                if self.locality_of(&id) != Some(Locality::ThisWindow) {
+                    return Vec::new();
+                }
+                let mut cmds = self.detach_session(&id);
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
             Button::Kill => {
                 self.pending = Some(Pending {
                     target: PendingTarget::Session(id),
@@ -2582,6 +2612,10 @@ impl FleetModel {
             } else {
                 for (button, brect) in buttons {
                     let chip = inset(brect, 3.0);
+                    // Detach applies only to a session this window drives;
+                    // elsewhere the chip is insensitive (dimmed, click inert).
+                    let insensitive =
+                        button == Button::Detach && tile.locality != Locality::ThisWindow;
                     out.push(SceneItem::Rect {
                         id: SceneId::Tile(handle),
                         rect: chip,
@@ -2593,7 +2627,11 @@ impl FleetModel {
                         rect: centered_line(chip, metrics, button.label()),
                         runs: vec![label_run(button.label())],
                         metrics,
-                        color: BUTTON_FG,
+                        color: if insensitive {
+                            BUTTON_DISABLED_FG
+                        } else {
+                            BUTTON_FG
+                        },
                         scale: 1.0,
                     });
                 }
@@ -3289,7 +3327,19 @@ mod tests {
         make_group(&mut m, "web", &["a", "c"]);
         let r = group_button_rect(&m, 0, GroupButton::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
-        assert_eq!(cmds, vec![Cmd::Detach("a".into()), Cmd::Redraw]);
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::Detach("a".into()),
+                Cmd::Observe("a".into()),
+                Cmd::Redraw
+            ]
+        );
+        assert_eq!(
+            m.locality_of("a"),
+            Some(Locality::Detached),
+            "the released member's tile leaves This window at once"
+        );
     }
 
     #[test]
@@ -3421,6 +3471,57 @@ mod tests {
             vec![GroupButton::Relaunch, GroupButton::Ungroup],
             "open/detach/kill have no living member to act on"
         );
+    }
+
+    #[test]
+    fn the_detach_button_releases_the_session_and_keeps_a_live_preview() {
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
+        let r = button_rect(&m, "a", Button::Detach);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            cmds.contains(&Cmd::Detach("a".into())),
+            "the button detaches: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&Cmd::Observe("a".into())),
+            "the released session is observed so its preview stays live: {cmds:?}"
+        );
+        assert_eq!(
+            m.locality_of("a"),
+            Some(Locality::Detached),
+            "the tile moves out of This window immediately"
+        );
+        // The next listing (host confirms the client is gone) keeps it there.
+        m.update(UiEvent::SessionList(vec![info("a"), info("b")]));
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+    }
+
+    #[test]
+    fn the_detach_button_is_insensitive_on_sessions_this_window_does_not_drive() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a"]); // detached: nothing to release
+        let r = button_rect(&m, "a", Button::Detach);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            !cmds.contains(&Cmd::Detach("a".into())),
+            "nothing to detach: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "the dead click does not fall through to opening the tile: {cmds:?}"
+        );
+        // And the chip reads as insensitive.
+        let scene = m.view();
+        let dimmed = scene.layers[0].items.iter().any(|it| {
+            matches!(it,
+            SceneItem::Text { runs, color, .. }
+                if runs[0].text == "detach" && *color == BUTTON_DISABLED_FG)
+        });
+        assert!(dimmed, "the detach label is drawn dimmed");
     }
 
     #[test]
@@ -4532,8 +4633,8 @@ mod tests {
 
     #[test]
     fn clicking_the_detach_button_detaches_instead_of_opening() {
-        let mut m = fleet();
-        list(&mut m, &["a", "b"]);
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
+        m.update(UiEvent::SessionList(vec![info("a"), sinfo("b", true)]));
         let r = button_rect(&m, "b", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(

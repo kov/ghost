@@ -596,6 +596,7 @@ impl RootModel {
                 Mode::Single(m) => m.update(ev),
                 Mode::Fleet(f) => f.update(ev),
             });
+            self.release_detached(&cmds);
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(&p));
             }
@@ -619,10 +620,24 @@ impl RootModel {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         };
+        self.release_detached(&cmds);
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
         cmds
+    }
+
+    /// A delegated command detaching a session means this window stopped
+    /// driving it (the fleet's detach buttons, or a driven group member kept
+    /// only as a dead tile): drop the ownership and any warm mirror, so the
+    /// bell reaction, Ctrl-Tab, and the next fleet all see it as not ours.
+    fn release_detached(&mut self, cmds: &[Cmd]) {
+        for c in cmds {
+            if let Cmd::Detach(id) = c {
+                self.mine.remove(id);
+                self.warm.remove(id);
+            }
+        }
     }
 
     /// Start the deferred dive-out pull-back over the now-complete fleet: zoom from
@@ -1197,6 +1212,27 @@ mod tests {
         // Re-broadcast while open (another window saved): applies live.
         r.update(UiEvent::GroupsLoaded(Vec::new()));
         assert!(!shows_group(&r, "infra"), "a live broadcast replaces them");
+    }
+
+    #[test]
+    fn a_delegated_detach_releases_the_windows_ownership() {
+        let mut r = root();
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
+        settle(&mut r);
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            name: "web".into(),
+            color: 0,
+            members: vec!["alpha".into()],
+        }]));
+        assert!(r.mine.contains("alpha"));
+        // The driven, grouped member dies: the fleet keeps a dead tile and
+        // emits a Detach for the window's client — which must also release
+        // the root's ownership, or the next fleet would claim the corpse.
+        r.update(UiEvent::SessionList(vec![sess("beta", false, 2)]));
+        assert!(
+            !r.mine.contains("alpha"),
+            "a session this window no longer drives is not ours"
+        );
     }
 
     #[test]
