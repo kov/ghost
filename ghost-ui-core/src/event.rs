@@ -100,6 +100,9 @@ pub enum UiEvent {
     /// vanished, or a subscription ended): re-enumerate now rather than waiting
     /// for the floor tick.
     SessionsChanged,
+    /// The authoritative session groups: loaded from disk at startup, or
+    /// re-broadcast when another window saved a change.
+    GroupsLoaded(Vec<crate::group::Group>),
     /// The shell has attached `SessionId` for this window (reply to
     /// `Cmd::SpawnSession` / `Cmd::TakeOver`): switch to its single view and
     /// take ownership. The window adopts the fleet tile's screen if it has one.

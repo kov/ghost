@@ -268,6 +268,11 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
+    /// The user-defined session groups. The fleet model owns the live editing
+    /// copy while open; this carries them across fleet close/reopen (the fleet
+    /// is rebuilt each opening) and receives the shell's authoritative
+    /// [`UiEvent::GroupsLoaded`] (startup load, cross-window broadcasts).
+    groups: Vec<crate::Group>,
     /// Inner padding (logical px per side) for the foreground terminal — a small,
     /// DPI-scaled border filled with the terminal background so content doesn't crowd
     /// the window edges. Applied to the foreground/warm models and folded into
@@ -318,6 +323,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            groups: Vec::new(),
             pad: 0.0,
         }
     }
@@ -339,6 +345,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            groups: Vec::new(),
             pad: 0.0,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
@@ -451,11 +458,12 @@ impl RootModel {
         } = &ev
             && kind.is_down()
         {
-            // Esc backs out of the fleet like F9 — but only when no fleet
-            // modal (rename/confirm) claims it, and never in the single view,
+            // Esc backs out of the fleet like F9 — but only when nothing in
+            // the fleet claims it first (an open rename/confirm modal, or
+            // multi-select marks to clear), and never in the single view,
             // where Esc is terminal input.
             let escape_out = matches!(key, Key::Named(NamedKey::Escape))
-                && matches!(&self.mode, Mode::Fleet(f) if !f.modal_open());
+                && matches!(&self.mode, Mode::Fleet(f) if !f.consumes_escape());
             if is_fleet_toggle(key) || escape_out {
                 return self.toggle();
             }
@@ -475,6 +483,15 @@ impl RootModel {
         if let UiEvent::AdoptSession(id) = &ev {
             let id = id.clone();
             return self.adopt(id);
+        }
+        // Authoritative groups from the shell (startup load, or another window
+        // saved a change): remember them, and apply live to an open fleet.
+        if let UiEvent::GroupsLoaded(groups) = ev {
+            self.groups = groups.clone();
+            return match &mut self.mode {
+                Mode::Fleet(f) => f.update(UiEvent::GroupsLoaded(groups)),
+                Mode::Single(_) => Vec::new(),
+            };
         }
         // A set-change hint (a session appeared/vanished, a subscription ended):
         // re-enumerate now instead of waiting for the fleet's floor tick. Only
@@ -667,6 +684,9 @@ impl RootModel {
         let mut anim = None;
         let (mut model, mut cmds) = match current {
             Mode::Fleet(f) => {
+                // Carry the fleet's (possibly edited) groups out of the closing
+                // overview; the next opening is seeded with them.
+                self.groups = f.groups().to_vec();
                 // Opening a tile dives into where it sat in the grid: snapshot the
                 // fleet world so the whole grid stays visible during the descent (a
                 // freshly spawned session with no tile yet just opens, no dive).
@@ -772,6 +792,7 @@ impl RootModel {
         // Nothing left to show: drop to the fleet overview.
         let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
         fleet.set_theme(self.theme);
+        fleet.set_groups(self.groups.clone());
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
         fleet.update(UiEvent::Resize {
             w_px: self.size_px.0.max(1),
@@ -920,6 +941,7 @@ impl RootModel {
                     self.mine.clone(),
                 );
                 fleet.set_theme(self.theme);
+                fleet.set_groups(self.groups.clone());
                 cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
                 // Dive out, but don't animate yet: the grid we just built only knows
                 // this window's sessions. Wait for the ListSessions reply to assemble
@@ -931,6 +953,9 @@ impl RootModel {
                 (Mode::Fleet(Box::new(fleet)), cmds, None)
             }
             Mode::Fleet(f) => {
+                // Carry the fleet's (possibly edited) groups out of the closing
+                // overview; the next opening is seeded with them.
+                self.groups = f.groups().to_vec();
                 // Dive in: snapshot the fleet world so the whole grid stays visible
                 // while we descend into the tile we land on, then take over with the
                 // live single view once the dive lands.
@@ -1066,6 +1091,58 @@ mod tests {
         );
         dive_out(&mut r, &[sess("alpha", true, 1)]);
         assert_eq!(r.update(UiEvent::SessionsChanged), vec![Cmd::ListSessions]);
+    }
+
+    /// Whether the fleet scene shows a `name` group header.
+    fn shows_group(r: &RootModel, name: &str) -> bool {
+        r.view().layers.iter().any(|l| {
+            l.items.iter().any(|it| match it {
+                SceneItem::Text { runs, .. } => runs.iter().any(|run| run.text == name),
+                _ => false,
+            })
+        })
+    }
+
+    #[test]
+    fn groups_survive_leaving_and_reopening_the_fleet() {
+        let mut r = root();
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
+        settle(&mut r);
+        // Group the focused tile: mark, prompt, name it, commit.
+        key(&mut r, Key::Named(NamedKey::Space), Mods::NONE);
+        key(&mut r, Key::Char("g".into()), Mods::NONE);
+        for c in "web".chars() {
+            key(&mut r, Key::Char(c.to_string()), Mods::NONE);
+        }
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        assert!(shows_group(&r, "web"), "the new group renders");
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single
+        settle(&mut r);
+        assert!(!r.is_fleet());
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
+        settle(&mut r);
+        assert!(
+            shows_group(&r, "web"),
+            "groups persist across fleet close/reopen"
+        );
+    }
+
+    #[test]
+    fn loaded_groups_reach_an_open_fleet_and_later_openings() {
+        let mut r = root();
+        let g = vec![crate::Group {
+            name: "infra".into(),
+            color: 0,
+            members: vec!["beta".into()],
+        }];
+        // Loaded before the fleet ever opens: seeds the next opening.
+        r.update(UiEvent::GroupsLoaded(g.clone()));
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
+        settle(&mut r);
+        assert!(shows_group(&r, "infra"), "startup groups seed the fleet");
+        // Re-broadcast while open (another window saved): applies live.
+        r.update(UiEvent::GroupsLoaded(Vec::new()));
+        assert!(!shows_group(&r, "infra"), "a live broadcast replaces them");
     }
 
     #[test]

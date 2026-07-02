@@ -26,6 +26,7 @@ use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
 use crate::event::SessionPush;
+use crate::group::Group;
 use crate::input::{Key, Mods, NamedKey};
 use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
@@ -33,6 +34,8 @@ use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
 const GAP: f32 = 10.0;
 const FOCUS_BORDER: f32 = 2.0;
 const FOCUS_COLOR: Rgba = [0.30, 0.60, 0.95, 1.0];
+/// Multi-select mark ring (Space / Ctrl-click): amber, distinct from focus.
+const MARK_COLOR: Rgba = [0.95, 0.75, 0.25, 1.0];
 const BADGE_PX: f32 = 10.0;
 /// Colour of section header labels.
 const SECTION_LABEL_COLOR: Rgba = [0.65, 0.70, 0.78, 1.0];
@@ -105,7 +108,22 @@ struct ConfirmLayout {
     cancel: RectPx,
 }
 /// A section header: its locality and the header band's rect.
-type SectionHeader = (Locality, RectPx);
+/// A header band in the laid-out grid: an attach-state section, or a group
+/// block (which also carries the whole block's rect for its accent outline).
+#[derive(Clone, Copy)]
+enum Band {
+    Section(Locality),
+    Group { idx: usize, block: RectPx },
+}
+
+type SectionHeader = (Band, RectPx);
+
+/// Padding of a group block's outline around its header + member rows.
+const BLOCK_PAD: f32 = 6.0;
+
+/// [`SceneId::Section`] ranks 0–2 are the locality sections; group headers are
+/// keyed from this base up.
+const GROUP_SECTION_RANK_BASE: u8 = 3;
 
 /// A per-card action button.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -282,6 +300,15 @@ pub struct FleetModel {
     /// mirror. Unobserved when the tile goes, the window takes the session
     /// over, or the fleet closes.
     observing: HashSet<SessionId>,
+    /// Multi-selected tiles (Space / Ctrl-click), the input to group creation.
+    /// Cleared by Escape — which marks claim ahead of the fleet toggle.
+    marked: HashSet<SessionId>,
+    /// User-defined groups, in creation order. Handed in and out by the root
+    /// across fleet open/close; every mutation is persisted via
+    /// `Cmd::SaveGroups`.
+    groups: Vec<Group>,
+    /// The group-name prompt (`g` with marks): `Some` while it is open.
+    naming_group: Option<TextInput>,
 }
 
 /// Greedily pack cards of the given widths into rows: `(start, end, row_width)`
@@ -394,6 +421,9 @@ impl FleetModel {
             scroll_y: 0.0,
             theme: ThemeColors::default(),
             observing: HashSet::new(),
+            marked: HashSet::new(),
+            groups: Vec::new(),
+            naming_group: None,
         }
     }
 
@@ -407,6 +437,17 @@ impl FleetModel {
             cmds.extend(tile.model.set_theme(theme));
         }
         cmds
+    }
+
+    /// The user-defined groups, for [`RootModel`](crate::RootModel) to carry
+    /// across fleet close/reopen (the fleet model is rebuilt each opening).
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    /// Seed the groups on a freshly built fleet (carry-over or startup load).
+    pub fn set_groups(&mut self, groups: Vec<Group>) {
+        self.groups = groups;
     }
 
     /// Physical cell metrics: the base metrics scaled by the device scale factor.
@@ -491,10 +532,11 @@ impl FleetModel {
         self.focused.as_deref()
     }
 
-    /// Whether a modal (inline rename or confirm dialog) is capturing input —
-    /// keys like Escape belong to it, not to whoever hosts the fleet.
+    /// Whether a modal (inline rename, confirm dialog, or the group-name
+    /// prompt) is capturing input — keys like Escape belong to it, not to
+    /// whoever hosts the fleet.
     pub fn modal_open(&self) -> bool {
-        self.renaming.is_some() || self.pending.is_some()
+        self.renaming.is_some() || self.pending.is_some() || self.naming_group.is_some()
     }
 
     pub fn tile_count(&self) -> usize {
@@ -706,6 +748,16 @@ impl FleetModel {
         let cmds = match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
             UiEvent::SessionPush { name, push } => self.session_push(&name, push),
+            // Authoritative groups from the shell (startup load, or another
+            // window saved): replace ours without echoing a save back.
+            UiEvent::GroupsLoaded(groups) => {
+                if self.groups == groups {
+                    Vec::new()
+                } else {
+                    self.groups = groups;
+                    vec![Cmd::Redraw]
+                }
+            }
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, bytes, ended),
             UiEvent::Resize { w_px, h_px, scale } => {
                 self.size_px = (w_px, h_px);
@@ -795,6 +847,7 @@ impl FleetModel {
             if self.observing.remove(&id) {
                 cmds.push(Cmd::Unobserve(id.clone()));
             }
+            self.marked.remove(&id);
             cmds.push(Cmd::Detach(id));
             dirty = true;
         }
@@ -965,25 +1018,56 @@ impl FleetModel {
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
         let metrics = self.effective_metrics();
         let base_band = metrics.line_height + 6.0;
-        // Tiles grouped by locality, preserving insertion order within each;
-        // empty sections are dropped so they get no header.
-        let sections: Vec<(Locality, Vec<&Tile>)> = [
+        // Group blocks come first, in creation order, each holding its present
+        // members in their stored order — regardless of attach state (a group
+        // renders together; the sections govern only the ungrouped remainder).
+        // Dead members simply don't render; an all-dead group shows no block.
+        let grouped: HashSet<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
+            .collect();
+        let mut segments: Vec<(Band, Vec<&Tile>)> = Vec::new();
+        for (idx, g) in self.groups.iter().enumerate() {
+            let ts: Vec<&Tile> = g
+                .members
+                .iter()
+                .filter_map(|id| self.tiles.iter().find(|t| &t.id == id))
+                .collect();
+            if !ts.is_empty() {
+                segments.push((
+                    Band::Group {
+                        idx,
+                        block: RectPx {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                        }, // filled in during placement
+                    },
+                    ts,
+                ));
+            }
+        }
+        // Then the attach-state sections of ungrouped tiles, preserving the
+        // stable spatial order (see [`tile_order_key`]); empty sections are
+        // dropped so they get no header.
+        for loc in [
             Locality::ThisWindow,
             Locality::Elsewhere,
             Locality::Detached,
-        ]
-        .into_iter()
-        .map(|loc| {
-            let mut ts: Vec<&Tile> = self.tiles.iter().filter(|t| t.locality == loc).collect();
-            // Stable spatial order within the section: a session keeps its slot
-            // for life regardless of enumeration order (see [`tile_order_key`]).
-            // `sort_by` (not `sort_by_key`) since the key borrows the tile's name.
+        ] {
+            let mut ts: Vec<&Tile> = self
+                .tiles
+                .iter()
+                .filter(|t| t.locality == loc && !grouped.contains(t.id.as_str()))
+                .collect();
             ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
-            (loc, ts)
-        })
-        .filter(|(_, ts): &(_, Vec<&Tile>)| !ts.is_empty())
-        .collect();
-        if sections.is_empty() {
+            if !ts.is_empty() {
+                segments.push((Band::Section(loc), ts));
+            }
+        }
+        if segments.is_empty() {
             return (Vec::new(), Vec::new(), base_band, 0.0);
         }
 
@@ -1021,7 +1105,7 @@ impl FleetModel {
         // (cards are aspect-locked, so a taller card is wider and fewer fit).
         let content_for = |ch: f32| -> f32 {
             let mut yy = gap;
-            for (_, ts) in &sections {
+            for (_, ts) in &segments {
                 let widths: Vec<f32> = ts.iter().map(|t| card_w(t, ch)).collect();
                 let nrows = pack_rows(&widths, avail_w, gap).len();
                 yy += band + nrows as f32 * (ch + gap);
@@ -1046,30 +1130,27 @@ impl FleetModel {
             lo
         };
 
-        // Pack each section's cards into rows of the shared height, left-aligned
-        // at the section grid's centred edge so the leftover width is shared as
+        // Pack each segment's cards into rows of the shared height, left-aligned
+        // at the segment grid's centred edge so the leftover width is shared as
         // margins (the scroll, when the grid overflows, is vertical only).
         let mut headers = Vec::new();
         let mut placements = Vec::new();
         let mut y = gap;
-        for (loc, ts) in &sections {
+        for (kind, ts) in &segments {
             let widths: Vec<f32> = ts.iter().map(|t| card_w(t, card_h)).collect();
             let rows = pack_rows(&widths, avail_w, gap);
             let max_row_w = rows.iter().map(|r| r.2).fold(1.0f32, f32::max);
             let left = ((w - max_row_w) / 2.0).max(gap);
-            headers.push((
-                *loc,
-                RectPx {
-                    x: left,
-                    y,
-                    w: max_row_w,
-                    h: band,
-                },
-            ));
+            let header = RectPx {
+                x: left,
+                y,
+                w: max_row_w,
+                h: band,
+            };
             y += band;
-            for (start, end, _) in rows {
+            for (start, end, _) in &rows {
                 let mut x = left;
-                for i in start..end {
+                for i in *start..*end {
                     placements.push((
                         ts[i].handle,
                         ts[i].id.clone(),
@@ -1084,6 +1165,21 @@ impl FleetModel {
                 }
                 y += card_h + gap;
             }
+            // A group's block outline hugs its header + rows (the trailing gap
+            // stays outside).
+            let kind = match *kind {
+                Band::Group { idx, .. } => Band::Group {
+                    idx,
+                    block: RectPx {
+                        x: (left - BLOCK_PAD).max(2.0),
+                        y: header.y - BLOCK_PAD,
+                        w: max_row_w + 2.0 * BLOCK_PAD,
+                        h: (y - gap - header.y) + 2.0 * BLOCK_PAD,
+                    },
+                },
+                sec => sec,
+            };
+            headers.push((kind, header));
         }
         (headers, placements, band, y)
     }
@@ -1262,6 +1358,9 @@ impl FleetModel {
         if self.pending.is_some() {
             return self.pending_input(ev);
         }
+        if self.naming_group.is_some() {
+            return self.group_name_input(ev);
+        }
         match ev {
             UiEvent::Key {
                 key, mods, kind, ..
@@ -1279,6 +1378,31 @@ impl FleetModel {
             {
                 self.activate(self.focused.clone())
             }
+            // Space marks/unmarks the focused tile (multi-select for grouping).
+            UiEvent::Key { key, kind, .. }
+                if kind.is_down() && matches!(key, Key::Named(NamedKey::Space)) =>
+            {
+                match self.focused.clone() {
+                    Some(id) => {
+                        self.toggle_mark(&id);
+                        vec![Cmd::Redraw]
+                    }
+                    None => Vec::new(),
+                }
+            }
+            // Escape clears the marks (it reaches here only when they claimed
+            // it — see [`Self::consumes_escape`]; the root otherwise turns
+            // Esc into the fleet toggle before delegating).
+            UiEvent::Key { key, kind, .. }
+                if kind.is_down() && matches!(key, Key::Named(NamedKey::Escape)) =>
+            {
+                if self.marked.is_empty() {
+                    Vec::new()
+                } else {
+                    self.marked.clear();
+                    vec![Cmd::Redraw]
+                }
+            }
             // F2 renames the focused tile, the keyboard twin of its rename button.
             UiEvent::Key { key, kind, .. }
                 if kind.is_down() && matches!(key, Key::Named(NamedKey::F2)) =>
@@ -1288,12 +1412,29 @@ impl FleetModel {
                     None => Vec::new(),
                 }
             }
+            // `g` groups the marked tiles: opens the name prompt.
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down()
+                && !mods.ctrl
+                && !mods.sup
+                && matches!(&key, Key::Char(s) if s == "g") =>
+            {
+                if self.marked.is_empty() {
+                    Vec::new()
+                } else {
+                    self.naming_group = Some(TextInput::new(String::new()));
+                    vec![Cmd::Redraw]
+                }
+            }
             UiEvent::Pointer {
                 phase: PointerPhase::Wheel,
                 wheel_dy,
                 ..
             } => self.wheel(wheel_dy),
-            UiEvent::Pointer { phase, pos, .. } => self.pointer(phase, pos),
+            UiEvent::Pointer {
+                phase, pos, mods, ..
+            } => self.pointer(phase, pos, mods.ctrl),
             // Otherwise view-only: text and ordinary keys are dropped.
             _ => Vec::new(),
         }
@@ -1561,7 +1702,88 @@ impl FleetModel {
         }
     }
 
-    fn pointer(&mut self, phase: PointerPhase, pos: PointPx) -> Vec<Cmd> {
+    /// Input for the group-name prompt — the same editing surface as the
+    /// inline rename (typed chars, IME commits, word/line chords), committed
+    /// with Enter (an empty name cancels) and cancelled with Escape, which
+    /// keeps the marks so the selection isn't lost to a typo.
+    fn group_name_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        match ev {
+            UiEvent::Text(s) => {
+                self.preedit.clear();
+                if let Some(b) = &mut self.naming_group {
+                    b.insert(&s);
+                }
+                vec![Cmd::Redraw]
+            }
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() => match key {
+                Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
+                    if let Some(b) = &mut self.naming_group {
+                        b.insert(&s);
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Space)
+                    if !mods.ctrl && !mods.sup && self.preedit.is_empty() =>
+                {
+                    if let Some(b) = &mut self.naming_group {
+                        b.insert(" ");
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let name = self
+                        .naming_group
+                        .take()
+                        .expect("prompt checked by caller")
+                        .into_text();
+                    if name.is_empty() {
+                        return vec![Cmd::Redraw];
+                    }
+                    self.create_group(name)
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.naming_group = None;
+                    vec![Cmd::Redraw]
+                }
+                key => {
+                    if let Some(b) = &mut self.naming_group
+                        && b.key(&key, mods)
+                    {
+                        vec![Cmd::Redraw]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Turn the current marks into a new group: members in display order, the
+    /// next palette color, persisted immediately.
+    fn create_group(&mut self, name: String) -> Vec<Cmd> {
+        let members: Vec<SessionId> = self
+            .layout()
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .filter(|id| self.marked.contains(id))
+            .collect();
+        self.marked.clear();
+        if members.is_empty() {
+            return vec![Cmd::Redraw];
+        }
+        let color = (self.groups.len() % crate::group::GROUP_PALETTE.len()) as u8;
+        self.groups.push(Group {
+            name,
+            color,
+            members,
+        });
+        vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
+    }
+
+    fn pointer(&mut self, phase: PointerPhase, pos: PointPx, ctrl: bool) -> Vec<Cmd> {
         if phase != PointerPhase::Press {
             return Vec::new(); // the overview only reacts to presses
         }
@@ -1573,12 +1795,29 @@ impl FleetModel {
             return Vec::new();
         };
         self.set_focus(id.clone());
+        // Ctrl-click multi-selects (marks) rather than opening.
+        if ctrl {
+            self.toggle_mark(&id);
+            return vec![Cmd::Redraw];
+        }
         // A press on a card button runs that action; anywhere else opens the tile.
         let (_, _, buttons) = card_layout(rect, band);
         match buttons.iter().find(|(_, r)| r.contains(px, py)) {
             Some((button, _)) => self.button(*button, id),
             None => self.activate(Some(id)),
         }
+    }
+
+    fn toggle_mark(&mut self, id: &str) {
+        if !self.marked.remove(id) {
+            self.marked.insert(id.to_string());
+        }
+    }
+
+    /// Whether the fleet claims an Escape press ahead of the root's
+    /// Esc-leaves-the-overview shortcut: an open modal, or marks to clear.
+    pub fn consumes_escape(&self) -> bool {
+        self.modal_open() || !self.marked.is_empty()
     }
 
     // ---- view ----
@@ -1589,16 +1828,38 @@ impl FleetModel {
         let view_h = self.size_px.1 as f32;
         let sy = self.scroll_y;
         let mut items = Vec::new();
-        for (loc, mut rect) in headers {
+        for (kind, mut rect) in headers {
             rect.y -= sy;
-            items.push(SceneItem::Text {
-                id: SceneId::Section(loc.rank()),
-                rect: text_line(rect, metrics, GAP * 0.5),
-                runs: vec![label_run(section_label(loc))],
-                metrics,
-                color: SECTION_LABEL_COLOR,
-                scale: 1.0,
-            });
+            match kind {
+                Band::Section(loc) => items.push(SceneItem::Text {
+                    id: SceneId::Section(loc.rank()),
+                    rect: text_line(rect, metrics, GAP * 0.5),
+                    runs: vec![label_run(section_label(loc))],
+                    metrics,
+                    color: SECTION_LABEL_COLOR,
+                    scale: 1.0,
+                }),
+                Band::Group { idx, mut block } => {
+                    block.y -= sy;
+                    let group = &self.groups[idx];
+                    // Group ranks live above the three locality ranks.
+                    let id = SceneId::Section(GROUP_SECTION_RANK_BASE + idx as u8);
+                    items.push(SceneItem::Border {
+                        id,
+                        rect: block,
+                        color: group.rgba(),
+                        width: 1.0,
+                    });
+                    items.push(SceneItem::Text {
+                        id,
+                        rect: text_line(rect, metrics, GAP * 0.5),
+                        runs: vec![label_run(&group.name)],
+                        metrics,
+                        color: group.rgba(),
+                        scale: 1.0,
+                    });
+                }
+            }
         }
         for (handle, id, mut rect) in placements {
             rect.y -= sy;
@@ -1718,6 +1979,21 @@ impl FleetModel {
                     width: FOCUS_BORDER,
                 });
             }
+            // A multi-select mark rings the card inside any focus ring, so a
+            // tile can show both (focused AND marked) without ambiguity.
+            if self.marked.contains(&id) {
+                items.push(SceneItem::Border {
+                    id: SceneId::Tile(handle),
+                    rect: RectPx {
+                        x: rect.x + FOCUS_BORDER + 1.0,
+                        y: rect.y + FOCUS_BORDER + 1.0,
+                        w: (rect.w - 2.0 * (FOCUS_BORDER + 1.0)).max(1.0),
+                        h: (rect.h - 2.0 * (FOCUS_BORDER + 1.0)).max(1.0),
+                    },
+                    color: MARK_COLOR,
+                    width: FOCUS_BORDER,
+                });
+            }
             if let Some(kind) = badge_kind(tile, focused) {
                 // Clamp the badge into the tile so a tiny preview can't float it
                 // outside (negative x / oversized).
@@ -1790,6 +2066,46 @@ impl FleetModel {
                     id: SceneId::NavBar,
                     rect: centered_line(rect, mm, label),
                     runs: vec![label_run(label)],
+                    metrics: mm,
+                    color: OVERLAY_FG,
+                    scale: MODAL_SCALE,
+                });
+            }
+        }
+
+        // The group-name prompt scrims the grid like the confirm dialog: an
+        // emphasized label with the live edit buffer (caret block at the
+        // cursor) centred beneath it. Enter commits, Escape cancels.
+        if let Some(b) = &self.naming_group {
+            let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+            items.push(SceneItem::Rect {
+                id: SceneId::Sidebar,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w,
+                    h,
+                },
+                color: OVERLAY_BG,
+                radius: 0.0,
+            });
+            let mm = self.modal_metrics();
+            let (before, after) = b.halves();
+            let lines = [
+                ("Group name:".to_string(), h * 0.5 - 1.5 * mm.line_height),
+                (format!("{before}\u{2588}{after}"), h * 0.5),
+            ];
+            for (text, y) in lines {
+                let tw = text.chars().count() as f32 * mm.advance;
+                items.push(SceneItem::Text {
+                    id: SceneId::NavBar,
+                    rect: RectPx {
+                        x: ((w - tw) * 0.5).max(GAP),
+                        y,
+                        w: tw.max(1.0),
+                        h: mm.line_height,
+                    },
+                    runs: vec![label_run(&text)],
                     metrics: mm,
                     color: OVERLAY_FG,
                     scale: MODAL_SCALE,
@@ -2047,6 +2363,265 @@ mod tests {
 
     fn tile<'a>(m: &'a FleetModel, id: &str) -> &'a Tile {
         m.tiles.iter().find(|t| t.id == id).unwrap()
+    }
+
+    fn press_ctrl(m: &mut FleetModel, pos: PointPx) -> Vec<Cmd> {
+        m.update(UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(crate::PointerButton::Left),
+            pos,
+            mods: Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+            wheel_dy: 0.0,
+            clicks: 1,
+        })
+    }
+
+    fn centre_of(m: &FleetModel, id: &str) -> PointPx {
+        let r = m
+            .layout()
+            .into_iter()
+            .find(|(_, i, _)| i == id)
+            .expect("tile placed")
+            .2;
+        PointPx {
+            x: (r.x + r.w / 2.0) as f64,
+            y: (r.y + r.h / 2.0) as f64,
+        }
+    }
+
+    #[test]
+    fn space_toggles_a_mark_on_the_focused_tile() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            m.marked.contains("a"),
+            "focus defaults to a; Space marks it"
+        );
+        key(&mut m, Key::Named(NamedKey::Space));
+        assert!(m.marked.is_empty(), "Space again unmarks");
+    }
+
+    #[test]
+    fn ctrl_click_marks_without_activating() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        let pos = centre_of(&m, "b");
+        let cmds = press_ctrl(&mut m, pos);
+        assert!(m.marked.contains("b"));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "a marking click must not open the tile"
+        );
+        press_ctrl(&mut m, pos);
+        assert!(m.marked.is_empty(), "ctrl-click again unmarks");
+    }
+
+    #[test]
+    fn escape_clears_marks_before_leaving_the_fleet() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        assert!(m.consumes_escape(), "marks claim Esc ahead of the toggle");
+        key(&mut m, Key::Named(NamedKey::Escape));
+        assert!(m.marked.is_empty());
+        assert!(!m.consumes_escape());
+    }
+
+    fn type_str(m: &mut FleetModel, s: &str) {
+        for ch in s.chars() {
+            key(m, Key::Char(ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn g_with_marks_creates_a_named_group() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        key(&mut m, Key::Named(NamedKey::Space)); // mark "a" (default focus)
+        let pos = centre_of(&m, "c");
+        press_ctrl(&mut m, pos); // mark "c"
+        key(&mut m, Key::Char("g".into()));
+        assert!(m.modal_open(), "the group-name prompt is a modal");
+        type_str(&mut m, "web");
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert_eq!(m.groups.len(), 1);
+        assert_eq!(m.groups[0].name, "web");
+        assert_eq!(
+            m.groups[0].members,
+            vec!["a".to_string(), "c".to_string()],
+            "members in display order"
+        );
+        assert!(m.marked.is_empty(), "grouping consumes the marks");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SaveGroups(g) if g.len() == 1)),
+            "the new group is persisted; got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn g_without_marks_or_name_is_inert() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        key(&mut m, Key::Char("g".into()));
+        assert!(!m.modal_open(), "no marks, no prompt");
+        // With a mark but an empty name, Enter cancels rather than creating.
+        key(&mut m, Key::Named(NamedKey::Space));
+        key(&mut m, Key::Char("g".into()));
+        key(&mut m, Key::Named(NamedKey::Enter));
+        assert!(m.groups.is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_the_group_prompt_keeping_marks() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        key(&mut m, Key::Char("g".into()));
+        key(&mut m, Key::Named(NamedKey::Escape));
+        assert!(!m.modal_open());
+        assert!(m.groups.is_empty());
+        assert!(
+            m.marked.contains("a"),
+            "cancelling the prompt keeps the selection"
+        );
+    }
+
+    #[test]
+    fn the_group_prompt_draws_a_scrim_and_the_typed_name_with_a_caret() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        key(&mut m, Key::Char("g".into()));
+        type_str(&mut m, "we");
+        let scene = m.view();
+        let items = &scene.layers[0].items;
+        let (w, h) = (m.size_px.0 as f32, m.size_px.1 as f32);
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, SceneItem::Rect { rect, color, .. }
+                if *color == OVERLAY_BG && rect.w == w && rect.h == h)),
+            "the prompt scrims the whole grid"
+        );
+        let texts: Vec<(&str, f32)> = items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, scale, .. } => Some((runs[0].text.as_str(), *scale)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|(t, s)| t.contains("Group name") && *s == MODAL_SCALE),
+            "an emphasized prompt labels the modal; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("we\u{2588}")),
+            "the typed buffer renders with the caret; got {texts:?}"
+        );
+    }
+
+    /// Mark `ids` and group them under `name`.
+    fn make_group(m: &mut FleetModel, name: &str, ids: &[&str]) {
+        for id in ids {
+            let pos = centre_of(m, id);
+            press_ctrl(m, pos);
+        }
+        key(m, Key::Char("g".into()));
+        type_str(m, name);
+        key(m, Key::Named(NamedKey::Enter));
+    }
+
+    #[test]
+    fn grouped_tiles_render_in_their_groups_block_not_their_section() {
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true), // would be Elsewhere
+            info("b"),        // detached
+            info("c"),        // detached, ungrouped
+        ]));
+        make_group(&mut m, "web", &["a", "b"]);
+
+        // The group block comes first, holding both members side by side even
+        // though their attach states differ; "c" stays in its section below.
+        let order = order(&m);
+        assert_eq!(order, ["a", "b", "c"]);
+        let (ya, yb, yc) = (tile_y(&m, "a"), tile_y(&m, "b"), tile_y(&m, "c"));
+        assert_eq!(ya, yb, "group members share the block's row");
+        assert!(yc > ya, "the ungrouped remainder renders below the group");
+
+        // The view carries the group's name and its color-accented block.
+        let scene = m.view();
+        let has_label = scene.layers[0].items.iter().any(|it| {
+            matches!(it, SceneItem::Text { runs, .. }
+                if runs.iter().any(|r| r.text.contains("web")))
+        });
+        assert!(has_label, "the group block is labelled with its name");
+        let accent = m.groups[0].rgba();
+        let has_block_border = scene.layers[0]
+            .items
+            .iter()
+            .any(|it| matches!(it, SceneItem::Border { color, .. } if *color == accent));
+        assert!(has_block_border, "the block is outlined in the group color");
+    }
+
+    #[test]
+    fn a_groups_dead_members_do_not_render_and_its_last_loss_hides_the_block() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        make_group(&mut m, "web", &["a"]);
+        // "a" dies: the group block disappears (nothing to show) but the group
+        // itself survives for its return.
+        list(&mut m, &["b"]);
+        assert_eq!(order(&m), ["b"]);
+        assert_eq!(m.groups.len(), 1, "an empty group persists, just unshown");
+        // It returns: the block is back.
+        list(&mut m, &["a", "b"]);
+        let (ya, yb) = (tile_y(&m, "a"), tile_y(&m, "b"));
+        assert!(ya < yb, "the group block renders above the sections again");
+    }
+
+    #[test]
+    fn group_colors_cycle_the_palette() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        key(&mut m, Key::Char("g".into()));
+        type_str(&mut m, "one");
+        key(&mut m, Key::Named(NamedKey::Enter));
+        let pos = centre_of(&m, "b");
+        press_ctrl(&mut m, pos);
+        key(&mut m, Key::Char("g".into()));
+        type_str(&mut m, "two");
+        key(&mut m, Key::Named(NamedKey::Enter));
+        assert_eq!(m.groups.len(), 2);
+        assert_ne!(
+            m.groups[0].color, m.groups[1].color,
+            "consecutive groups take distinct palette colors"
+        );
+    }
+
+    #[test]
+    fn marked_tiles_show_a_mark_ring() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        key(&mut m, Key::Named(NamedKey::Space));
+        let ring = m.view().layers[0]
+            .items
+            .iter()
+            .any(|it| matches!(it, SceneItem::Border { color, .. } if *color == MARK_COLOR));
+        assert!(ring, "a marked card carries the mark-colored ring");
     }
 
     #[test]

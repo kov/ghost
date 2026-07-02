@@ -14,6 +14,7 @@ pub mod cmd;
 pub mod encode;
 pub mod event;
 pub mod fleet;
+pub mod group;
 pub mod input;
 pub mod mouse;
 pub mod root;
@@ -25,6 +26,7 @@ pub use event::{PointPx, PointerButton, PointerPhase, SessionPush, UiEvent};
 pub use fleet::{FleetModel, Locality};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
 pub use ghost_vt::query::ThemeColors;
+pub use group::Group;
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{

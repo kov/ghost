@@ -1066,6 +1066,7 @@ dependencies = [
  "ghost-render",
  "ghost-term",
  "ghost-vt",
+ "serde",
  "tracing",
 ]
 

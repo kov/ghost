@@ -815,6 +815,14 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
         "$ uptime\r\n 14:02:11 up 41 days,  3:07,  1 user\r\n$ ",
     );
 
+    // A user-defined group renders as its own accent-outlined block ahead of
+    // the attach-state sections, regardless of who drives its members.
+    fleet.set_groups(vec![ghost_ui_core::Group {
+        name: "web".to_string(),
+        color: 0,
+        members: vec!["edit".to_string(), "prod".to_string()],
+    }]);
+
     let scene = fleet.view();
     (scene, size.0, size.1)
 }

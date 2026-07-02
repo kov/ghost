@@ -22,6 +22,7 @@ mod bench;
 mod config;
 mod font;
 mod from_winit;
+mod groups;
 mod menu;
 mod pacer;
 mod resize;
@@ -519,6 +520,7 @@ fn interactive() {
         #[cfg(target_os = "macos")]
         proxy,
         subs: HashMap::new(),
+        groups: groups::load(),
         _watcher: session_set_watcher(sessions_changed.clone()),
         sessions_changed,
     };
@@ -877,6 +879,10 @@ struct App {
     /// fanned out to every window; sessions on older hosts simply stay covered
     /// by the fleet's slow floor tick.
     subs: HashMap<String, Subscriber>,
+    /// The authoritative user-defined session groups: loaded from the data dir
+    /// at startup, updated (and persisted) on every `Cmd::SaveGroups`, and
+    /// broadcast to windows as `UiEvent::GroupsLoaded` so they stay in step.
+    groups: Vec<ghost_ui_core::Group>,
     /// Set by the runtime-dir watcher thread when the session *set* may have
     /// changed; drained on the loop to hint an immediate re-enumeration.
     sessions_changed: Arc<std::sync::atomic::AtomicBool>,
@@ -1038,6 +1044,21 @@ impl App {
                 Cmd::Unobserve(id) => {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.observers.remove(&id);
+                    }
+                }
+                Cmd::SaveGroups(new_groups) => {
+                    // Persist, then rebroadcast to the *other* windows so every
+                    // open fleet agrees (the sender already holds this state).
+                    groups::save(&new_groups);
+                    self.groups = new_groups.clone();
+                    let others: Vec<WindowId> = self
+                        .windows
+                        .keys()
+                        .copied()
+                        .filter(|&other| other != wid)
+                        .collect();
+                    for other in others {
+                        self.dispatch(other, UiEvent::GroupsLoaded(new_groups.clone()), event_loop);
                     }
                 }
                 Cmd::Detach(id) => {
@@ -1384,6 +1405,9 @@ impl App {
         );
         self.exec(wid, init, event_loop);
         self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
+        // Seed the persisted groups so the overview shows them from the start.
+        let groups = self.groups.clone();
+        self.dispatch(wid, UiEvent::GroupsLoaded(groups), event_loop);
     }
 
     /// Open a new window that behaves exactly like a fresh launch (File > New Window
@@ -1522,6 +1546,9 @@ impl App {
         // Apply the persisted zoom now that the viewport is known, so it re-grids
         // against the real surface size (the model clamps to its bounds).
         self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
+        // Seed the persisted groups for when this window opens its fleet.
+        let groups = self.groups.clone();
+        self.dispatch(wid, UiEvent::GroupsLoaded(groups), event_loop);
         true
     }
 }

@@ -89,6 +89,9 @@ pub enum Cmd {
     Redraw,
     /// Set the window title.
     SetTitle(String),
+    /// Persist the user-defined session groups (the shell writes them to the
+    /// data dir). Sent on every mutation with the full new state.
+    SaveGroups(Vec<crate::group::Group>),
     /// Ask for a future `UiEvent::Tick` after the given delay.
     ScheduleTick {
         after_ms: u64,
