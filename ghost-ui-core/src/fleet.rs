@@ -143,13 +143,80 @@ impl Button {
     }
 }
 
+/// A group-header action button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupButton {
+    /// Attach every member to this window and switch to the first.
+    Open,
+    /// Detach the members this window drives (they keep running).
+    Detach,
+    /// Dissolve the grouping; the sessions themselves are untouched.
+    Ungroup,
+    /// Kill every member and its process (confirmed first).
+    Kill,
+}
+
+impl GroupButton {
+    const ALL: [GroupButton; 4] = [
+        GroupButton::Open,
+        GroupButton::Detach,
+        GroupButton::Ungroup,
+        GroupButton::Kill,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupButton::Open => "open all",
+            GroupButton::Detach => "detach",
+            GroupButton::Ungroup => "ungroup",
+            GroupButton::Kill => "kill",
+        }
+    }
+}
+
+/// The group-header action chips, right-aligned on the header band — shared by
+/// the view and pointer hit-testing, like [`card_layout`] for cards.
+fn group_buttons(header: RectPx, m: CellMetrics) -> [(GroupButton, RectPx); 4] {
+    let zero = RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
+    let mut out = [(GroupButton::Open, zero); 4];
+    // Laid right-to-left from the band's right edge, half a cell apart.
+    let mut x = header.x + header.w;
+    for (i, b) in GroupButton::ALL.iter().enumerate().rev() {
+        let w = (b.label().chars().count() as f32 + 2.0) * m.advance;
+        x -= w;
+        out[i] = (
+            *b,
+            RectPx {
+                x,
+                y: header.y,
+                w,
+                h: header.h,
+            },
+        );
+        x -= m.advance * 0.5;
+    }
+    out
+}
+
 /// An action awaiting a yes/no confirmation (a modal overlay).
 struct Pending {
-    id: SessionId,
+    target: PendingTarget,
     action: PendingAction,
     /// Which button holds keyboard focus; starts on Cancel (the safe choice),
     /// so plain Enter never destroys anything.
     selected: Choice,
+}
+
+/// What a pending confirmation acts on: one session, or a whole group (by
+/// index into the fleet's groups).
+enum PendingTarget {
+    Session(SessionId),
+    Group(usize),
 }
 
 /// The confirm modal's two buttons.
@@ -1373,10 +1440,16 @@ impl FleetModel {
                 self.scroll_to_focused();
                 vec![Cmd::Redraw]
             }
-            UiEvent::Key { key, kind, .. }
-                if kind.is_down() && matches!(key, Key::Named(NamedKey::Enter)) =>
-            {
-                self.activate(self.focused.clone())
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && matches!(key, Key::Named(NamedKey::Enter)) => {
+                // Ctrl-Enter opens the focused tile's whole group; plain Enter
+                // (or an ungrouped tile) opens just the tile.
+                let group = self.focused.as_deref().and_then(|id| self.group_of(id));
+                match group.filter(|_| mods.ctrl) {
+                    Some(idx) => self.open_group(idx),
+                    None => self.activate(self.focused.clone()),
+                }
             }
             // Space marks/unmarks the focused tile (multi-select for grouping).
             UiEvent::Key { key, kind, .. }
@@ -1449,7 +1522,7 @@ impl FleetModel {
         match self.locality_of(&id) {
             Some(Locality::Elsewhere) => {
                 self.pending = Some(Pending {
-                    id,
+                    target: PendingTarget::Session(id),
                     action: PendingAction::TakeOver,
                     selected: Choice::Cancel,
                 });
@@ -1460,6 +1533,78 @@ impl FleetModel {
         }
     }
 
+    /// The group `id` belongs to, if any.
+    fn group_of(&self, id: &str) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|g| g.members.iter().any(|m| m == id))
+    }
+
+    /// Group `idx`'s members that still exist as tiles, in stored order.
+    fn present_members(&self, idx: usize) -> Vec<SessionId> {
+        self.groups[idx]
+            .members
+            .iter()
+            .filter(|id| self.tiles.iter().any(|t| &t.id == *id))
+            .cloned()
+            .collect()
+    }
+
+    /// Open the whole group into this window (Ctrl-Enter on a member, or the
+    /// header's open-all button): attach every member, foreground the first.
+    /// Confirmed once if any member is held by another window.
+    fn open_group(&mut self, idx: usize) -> Vec<Cmd> {
+        let members = self.present_members(idx);
+        if members.is_empty() {
+            return Vec::new();
+        }
+        if members
+            .iter()
+            .any(|id| self.locality_of(id) == Some(Locality::Elsewhere))
+        {
+            self.pending = Some(Pending {
+                target: PendingTarget::Group(idx),
+                action: PendingAction::TakeOver,
+                selected: Choice::Cancel,
+            });
+            return vec![Cmd::Redraw];
+        }
+        let mut cmds = self.open_group_cmds(idx);
+        cmds.push(Cmd::Redraw);
+        cmds
+    }
+
+    /// Run a group-header button's action: open all immediately (confirming a
+    /// take-over), detach our members immediately, dissolve the grouping, or
+    /// confirm killing every member.
+    fn group_button(&mut self, idx: usize, button: GroupButton) -> Vec<Cmd> {
+        match button {
+            GroupButton::Open => self.open_group(idx),
+            GroupButton::Detach => {
+                let mut cmds: Vec<Cmd> = self
+                    .present_members(idx)
+                    .into_iter()
+                    .filter(|id| self.locality_of(id) == Some(Locality::ThisWindow))
+                    .map(Cmd::Detach)
+                    .collect();
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
+            GroupButton::Ungroup => {
+                self.groups.remove(idx);
+                vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
+            }
+            GroupButton::Kill => {
+                self.pending = Some(Pending {
+                    target: PendingTarget::Group(idx),
+                    action: PendingAction::Kill,
+                    selected: Choice::Cancel,
+                });
+                vec![Cmd::Redraw]
+            }
+        }
+    }
+
     /// Run a card button's action: detach immediately, confirm a kill, or open an
     /// inline rename.
     fn button(&mut self, button: Button, id: SessionId) -> Vec<Cmd> {
@@ -1467,7 +1612,7 @@ impl FleetModel {
             Button::Detach => vec![Cmd::Detach(id), Cmd::Redraw],
             Button::Kill => {
                 self.pending = Some(Pending {
-                    id,
+                    target: PendingTarget::Session(id),
                     action: PendingAction::Kill,
                     selected: Choice::Cancel,
                 });
@@ -1545,22 +1690,73 @@ impl FleetModel {
     /// Execute the pending action and dismiss the modal.
     fn run_pending(&mut self) -> Vec<Cmd> {
         let p = self.pending.take().expect("pending checked by caller");
-        let cmd = match p.action {
-            PendingAction::TakeOver => Cmd::TakeOver(p.id),
-            PendingAction::Kill => Cmd::Kill(p.id),
+        let mut cmds = match (&p.target, p.action) {
+            (PendingTarget::Session(id), PendingAction::TakeOver) => {
+                vec![Cmd::TakeOver(id.clone())]
+            }
+            (PendingTarget::Session(id), PendingAction::Kill) => vec![Cmd::Kill(id.clone())],
+            (PendingTarget::Group(idx), PendingAction::TakeOver) => self.open_group_cmds(*idx),
+            (PendingTarget::Group(idx), PendingAction::Kill) => self
+                .present_members(*idx)
+                .into_iter()
+                .map(Cmd::Kill)
+                .collect(),
         };
-        vec![cmd, Cmd::Redraw]
+        cmds.push(Cmd::Redraw);
+        cmds
+    }
+
+    /// Commands opening group `idx`: take over the FIRST member (the adopt
+    /// path, so the window lands in its single view) and plainly attach the
+    /// rest as this window's background sessions. The rest are claimed as
+    /// driven NOW — tiles flip to ThisWindow and their observations close
+    /// (the window's own clients feed them from here) — so leaving the fleet
+    /// carries them out as warm mirrors, live content and all.
+    fn open_group_cmds(&mut self, idx: usize) -> Vec<Cmd> {
+        let members = self.present_members(idx);
+        let mut cmds = Vec::new();
+        for id in members.iter().skip(1) {
+            if self.observing.remove(id) {
+                cmds.push(Cmd::Unobserve(id.clone()));
+            }
+            self.mine.insert(id.clone());
+            if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+                t.locality = Locality::ThisWindow;
+            }
+            cmds.push(Cmd::Attach(id.clone()));
+        }
+        cmds.extend(members.first().map(|id| Cmd::TakeOver(id.clone())));
+        cmds
     }
 
     /// The confirm modal's message and confirm-button label, naming the
-    /// session as the user knows it (its display name).
+    /// session as the user knows it (its display name) — or the group.
     fn confirm_texts(&self, p: &Pending) -> (String, &'static str) {
+        let id = match &p.target {
+            PendingTarget::Session(id) => id,
+            PendingTarget::Group(idx) => {
+                let g = &self.groups[*idx];
+                let n = self.present_members(*idx).len();
+                return match p.action {
+                    PendingAction::Kill => {
+                        (format!("Kill the {} group ({n} sessions)?", g.name), "Kill")
+                    }
+                    PendingAction::TakeOver => (
+                        format!(
+                            "{} has sessions open in another window \u{2014} take them over?",
+                            g.name
+                        ),
+                        "Take over",
+                    ),
+                };
+            }
+        };
         let shown = self
             .tiles
             .iter()
-            .find(|t| t.id == p.id)
+            .find(|t| &t.id == id)
             .map(|t| t.model.display().to_string())
-            .unwrap_or_else(|| p.id.clone());
+            .unwrap_or_else(|| id.clone());
         match p.action {
             PendingAction::Kill => (format!("Kill {shown}?"), "Kill"),
             PendingAction::TakeOver => (
@@ -1789,7 +1985,17 @@ impl FleetModel {
         }
         // Hit-test in content space: the viewport point plus the scroll offset.
         let (px, py) = (pos.x as f32, pos.y as f32 + self.scroll_y);
-        let (_, placements, band, _) = self.sections_layout();
+        let (headers, placements, band, _) = self.sections_layout();
+        // Group-header action chips first (they sit on no tile).
+        for (kind, header) in &headers {
+            if let Band::Group { idx, .. } = kind
+                && let Some((b, _)) = group_buttons(*header, self.effective_metrics())
+                    .into_iter()
+                    .find(|(_, r)| r.contains(px, py))
+            {
+                return self.group_button(*idx, b);
+            }
+        }
         let hit = placements.into_iter().find(|(_, _, r)| r.contains(px, py));
         let Some((_, id, rect)) = hit else {
             return Vec::new();
@@ -1858,6 +2064,24 @@ impl FleetModel {
                         color: group.rgba(),
                         scale: 1.0,
                     });
+                    // The group's action chips, right-aligned on the band.
+                    for (b, brect) in group_buttons(rect, metrics) {
+                        let chip = inset(brect, 2.0);
+                        items.push(SceneItem::Rect {
+                            id,
+                            rect: chip,
+                            color: BUTTON_BG,
+                            radius: 3.0,
+                        });
+                        items.push(SceneItem::Text {
+                            id,
+                            rect: centered_line(chip, metrics, b.label()),
+                            runs: vec![label_run(b.label())],
+                            metrics,
+                            color: BUTTON_FG,
+                            scale: 1.0,
+                        });
+                    }
                 }
             }
         }
@@ -2491,6 +2715,176 @@ mod tests {
             m.marked.contains("a"),
             "cancelling the prompt keeps the selection"
         );
+    }
+
+    /// Press Enter with Ctrl held.
+    fn ctrl_enter(m: &mut FleetModel) -> Vec<Cmd> {
+        m.update(UiEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: crate::Mods {
+                ctrl: true,
+                ..crate::Mods::NONE
+            },
+            kind: KeyEventKind::Press,
+            alts: None,
+        })
+    }
+
+    /// Focus `id` without leaving a mark (Ctrl-click toggles it on and off).
+    fn focus(m: &mut FleetModel, id: &str) {
+        for _ in 0..2 {
+            let pos = centre_of(m, id);
+            press_ctrl(m, pos);
+        }
+        assert_eq!(m.focused.as_deref(), Some(id));
+        assert!(!m.marked.contains(id));
+    }
+
+    /// The rect of `button` on group `idx`'s header band.
+    fn group_button_rect(m: &FleetModel, idx: usize, button: GroupButton) -> RectPx {
+        let (headers, _, _, _) = m.sections_layout();
+        let header = headers
+            .iter()
+            .find_map(|(b, r)| match b {
+                Band::Group { idx: i, .. } if *i == idx => Some(*r),
+                _ => None,
+            })
+            .expect("the group has a header band");
+        group_buttons(header, m.effective_metrics())
+            .into_iter()
+            .find(|(b, _)| *b == button)
+            .expect("all buttons are laid out")
+            .1
+    }
+
+    #[test]
+    fn ctrl_enter_opens_the_whole_group_with_the_first_member_foreground() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        focus(&mut m, "c");
+        let cmds = ctrl_enter(&mut m);
+        // The first member is adopted (single view); the rest attach as this
+        // window's background sessions — claimed as driven right away (their
+        // mirrors close, their tiles flip). The ungrouped "b" is untouched.
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::Unobserve("c".into()),
+                Cmd::Attach("c".into()),
+                Cmd::TakeOver("a".into()),
+                Cmd::Redraw
+            ]
+        );
+        assert_eq!(m.locality_of("c"), Some(Locality::ThisWindow));
+    }
+
+    #[test]
+    fn ctrl_enter_on_an_ungrouped_tile_activates_it_alone() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        focus(&mut m, "b");
+        assert_eq!(
+            ctrl_enter(&mut m),
+            vec![Cmd::TakeOver("b".into()), Cmd::Redraw]
+        );
+    }
+
+    #[test]
+    fn opening_a_group_held_elsewhere_confirms_once_then_opens_all() {
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true), // held by another window
+            info("b"),
+            info("c"),
+        ]));
+        make_group(&mut m, "web", &["a", "c"]);
+        focus(&mut m, "c");
+        let cmds = ctrl_enter(&mut m);
+        assert!(m.modal_open(), "a member held elsewhere needs a confirm");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "nothing is taken over before the user confirms: {cmds:?}"
+        );
+        // Space is the direct confirm chord.
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::Unobserve("c".into()),
+                Cmd::Attach("c".into()),
+                Cmd::TakeOver("a".into()),
+                Cmd::Redraw
+            ]
+        );
+    }
+
+    #[test]
+    fn the_groups_kill_button_confirms_then_kills_every_member() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        let r = group_button_rect(&m, 0, GroupButton::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(m.modal_open(), "killing a group is confirmed first");
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert_eq!(
+            cmds,
+            vec![Cmd::Kill("a".into()), Cmd::Kill("c".into()), Cmd::Redraw]
+        );
+    }
+
+    #[test]
+    fn the_groups_ungroup_button_dissolves_only_the_grouping() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        let r = group_button_rect(&m, 0, GroupButton::Ungroup);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(m.groups.is_empty(), "the grouping is gone");
+        assert_eq!(m.tiles.len(), 3, "the sessions themselves are untouched");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SaveGroups(g) if g.is_empty())),
+            "the dissolution is persisted: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_groups_detach_button_detaches_only_members_this_window_drives() {
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true), // driven by this window
+            sinfo("c", true), // held elsewhere — not ours to detach
+        ]));
+        make_group(&mut m, "web", &["a", "c"]);
+        let r = group_button_rect(&m, 0, GroupButton::Detach);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert_eq!(cmds, vec![Cmd::Detach("a".into()), Cmd::Redraw]);
+    }
+
+    #[test]
+    fn the_group_header_draws_its_action_chips() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["a", "b", "c"]);
+        make_group(&mut m, "web", &["a", "c"]);
+        let scene = m.view();
+        for b in GroupButton::ALL {
+            assert!(
+                scene.layers[0].items.iter().any(|it| matches!(it,
+                    SceneItem::Text { runs, .. } if runs[0].text == b.label())),
+                "the {} chip is drawn",
+                b.label()
+            );
+        }
     }
 
     #[test]

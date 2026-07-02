@@ -696,7 +696,10 @@ impl RootModel {
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
                 // The window's other driven sessions stay warm in the background.
+                // Own them too: a group-open claims sessions fleet-side, and this
+                // is where the window learns about them (no-op for ones we knew).
                 for m in warm {
+                    self.mine.insert(m.session().to_string());
                     self.warm.insert(m.session().to_string(), m);
                 }
                 (kept, cmds)
@@ -968,8 +971,11 @@ impl RootModel {
                 let (model, warm, mut cmds) =
                     f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
-                // window's driven sessions stay warm in the background.
+                // window's driven sessions stay warm in the background. Own them
+                // too: a group-open claims sessions fleet-side, and this is where
+                // the window learns about them (no-op for ones we knew).
                 for m in warm {
+                    self.mine.insert(m.session().to_string());
                     self.warm.insert(m.session().to_string(), m);
                 }
                 cmds.push(Cmd::Redraw);
@@ -1143,6 +1149,52 @@ mod tests {
         // Re-broadcast while open (another window saved): applies live.
         r.update(UiEvent::GroupsLoaded(Vec::new()));
         assert!(!shows_group(&r, "infra"), "a live broadcast replaces them");
+    }
+
+    #[test]
+    fn opening_a_group_lands_on_its_first_member_with_the_rest_attached() {
+        let mut r = root();
+        dive_out(
+            &mut r,
+            &[
+                sess("alpha", true, 1),
+                sess("beta", false, 2),
+                sess("gamma", false, 3),
+            ],
+        );
+        settle(&mut r);
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            name: "web".into(),
+            color: 0,
+            members: vec!["alpha".into(), "gamma".into()],
+        }]));
+        // Ctrl-Enter on the focused member opens the whole group; the shell
+        // answers each take-over with an adopt, in command order.
+        let cmds = r.update(UiEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+            kind: KeyEventKind::Press,
+            alts: None,
+        });
+        assert!(
+            cmds.contains(&Cmd::TakeOver("alpha".into()))
+                && cmds.contains(&Cmd::Attach("gamma".into())),
+            "the first member is adopted, the rest attach in the background: {cmds:?}"
+        );
+        r.update(UiEvent::AdoptSession("alpha".into()));
+        assert!(!r.is_fleet(), "opening the group lands in the single view");
+        assert_eq!(
+            r.primary.as_deref(),
+            Some("alpha"),
+            "the group's FIRST member is the foreground"
+        );
+        assert!(
+            r.mine.contains("gamma"),
+            "the other member is attached to this window (Ctrl-Tab reaches it)"
+        );
     }
 
     #[test]
