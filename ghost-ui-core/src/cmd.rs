@@ -36,6 +36,14 @@ pub enum Cmd {
     /// Open / close a session socket (e.g. for a fleet tile preview).
     Attach(SessionId),
     Detach(SessionId),
+    /// Open a read-only observation of a session — a live fleet preview. The
+    /// shell replies with `UiEvent::SessionPush`es (grid, state) and mirrored
+    /// output as `UiEvent::SessionData`; it never resizes or steals the
+    /// session.
+    Observe(SessionId),
+    /// Close a session's observation (its tile is gone, driven by this
+    /// window now, or the fleet closed).
+    Unobserve(SessionId),
     /// Kill a session and its process (the shell sends `ClientMsg::Kill`).
     Kill(SessionId),
     /// Rename a session (the shell sends `ClientMsg::Rename`).

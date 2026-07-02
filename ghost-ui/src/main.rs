@@ -780,6 +780,11 @@ struct WindowState {
     /// previews). Dropping the window drops these, which detaches every session
     /// it held — the "close = detach" default, with no shared-pool bookkeeping.
     sessions: HashMap<String, Session>,
+    /// Read-only mirrors of the sessions this window's fleet shows but does
+    /// not drive (`Cmd::Observe`). Live only while the overview is open; their
+    /// output feeds the tiles as `SessionData`, and only their `Resized` event
+    /// is forwarded (the app-wide subscription already delivers the rest).
+    observers: HashMap<String, Subscriber>,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
     /// so we cache it for button/wheel events).
@@ -1004,6 +1009,35 @@ impl App {
                         if let Ok(s) = attach(&id, cols, rows) {
                             w.sessions.insert(id, s);
                         }
+                    }
+                }
+                Cmd::Observe(id) => {
+                    if self.bench.is_none()
+                        && let Some(w) = self.windows.get_mut(&wid)
+                        && !w.observers.contains_key(&id)
+                    {
+                        match Subscriber::observe(&id) {
+                            Ok(sub) => {
+                                w.observers.insert(id, sub);
+                            }
+                            // An old host or a dying session: report the
+                            // mirror dead so the fleet reverts the tile to a
+                            // placeholder and retries on a later reconcile.
+                            Err(_) => self.dispatch(
+                                wid,
+                                UiEvent::SessionData {
+                                    name: id,
+                                    bytes: Vec::new(),
+                                    ended: true,
+                                },
+                                event_loop,
+                            ),
+                        }
+                    }
+                }
+                Cmd::Unobserve(id) => {
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.observers.remove(&id);
                     }
                 }
                 Cmd::Detach(id) => {
@@ -1321,6 +1355,7 @@ impl App {
                 gfx,
                 root,
                 sessions: HashMap::new(),
+                observers: HashMap::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -1453,6 +1488,7 @@ impl App {
                 gfx,
                 root,
                 sessions,
+                observers: HashMap::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -1575,6 +1611,49 @@ impl ApplicationHandler<UserEvent> for App {
         }
         for (wid, name, bytes, ended) in pumped {
             self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, event_loop);
+        }
+        // Pump each window's read-only observers: mirrored output feeds its
+        // fleet tiles as `SessionData`, and only the `Resized` event is
+        // forwarded (the app-wide subscription already delivers the rest).
+        // Within one pump the event/output interleaving is lost; dispatching
+        // Resized first is safe because the host follows every re-grid with a
+        // resync, which heals any pre-resize bytes fed to the new mirror.
+        let mut observed: Vec<(WindowId, UiEvent)> = Vec::new();
+        for (wid, w) in self.windows.iter_mut() {
+            let mut dead = Vec::new();
+            for (name, sub) in w.observers.iter_mut() {
+                let p = sub.pump().unwrap_or_default();
+                for e in p.events {
+                    if matches!(e, ghost_vt::protocol::SessionEvent::Resized { .. }) {
+                        observed.push((
+                            *wid,
+                            UiEvent::SessionPush {
+                                name: name.clone(),
+                                push: SessionPush::Event(e),
+                            },
+                        ));
+                    }
+                }
+                if !p.output.is_empty() || p.ended {
+                    observed.push((
+                        *wid,
+                        UiEvent::SessionData {
+                            name: name.clone(),
+                            bytes: p.output,
+                            ended: p.ended,
+                        },
+                    ));
+                }
+                if p.ended {
+                    dead.push(name.clone());
+                }
+            }
+            for name in dead {
+                w.observers.remove(&name);
+            }
+        }
+        for (wid, ev) in observed {
+            self.dispatch(wid, ev, event_loop);
         }
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.

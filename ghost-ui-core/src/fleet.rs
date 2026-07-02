@@ -271,6 +271,11 @@ pub struct FleetModel {
     /// readable tile size regardless of session count and scrolls when it overflows
     /// the viewport, rather than shrinking previews to fit.
     scroll_y: f32,
+    /// Sessions this fleet asked the shell to observe (`Cmd::Observe`) — every
+    /// tile the window doesn't drive, so its preview is a live read-only
+    /// mirror. Unobserved when the tile goes, the window takes the session
+    /// over, or the fleet closes.
+    observing: HashSet<SessionId>,
 }
 
 /// Split a tile rect into its metadata header, preview area, and a row of three
@@ -358,6 +363,7 @@ impl FleetModel {
             preedit: String::new(),
             scroll_y: 0.0,
             theme: ThemeColors::default(),
+            observing: HashSet::new(),
         }
     }
 
@@ -633,6 +639,10 @@ impl FleetModel {
         let metrics = self.metrics;
         let theme = self.theme;
         let mine = self.mine.clone();
+        // Leaving the overview closes every live mirror; the single view's
+        // sessions are fed by their own clients, and a re-opened fleet
+        // re-observes from a fresh snapshot.
+        let mut cmds: Vec<Cmd> = self.observing.iter().cloned().map(Cmd::Unobserve).collect();
         let mut kept = None;
         let mut warm = Vec::new();
         for tile in self.tiles {
@@ -653,7 +663,7 @@ impl FleetModel {
             m.set_theme(theme);
             m
         });
-        let mut cmds = model.update(resize.clone());
+        cmds.append(&mut model.update(resize.clone()));
         for m in &mut warm {
             cmds.append(&mut m.update(resize.clone()));
         }
@@ -752,6 +762,9 @@ impl FleetModel {
             keep
         });
         for id in gone {
+            if self.observing.remove(&id) {
+                cmds.push(Cmd::Unobserve(id.clone()));
+            }
             cmds.push(Cmd::Detach(id));
             dirty = true;
         }
@@ -798,6 +811,18 @@ impl FleetModel {
             }
         }
 
+        // Live mirrors: observe every session this window doesn't drive, and
+        // drop the observation of any it now does (its own client feeds it).
+        for tile in &self.tiles {
+            let foreign = tile.locality != Locality::ThisWindow;
+            if foreign && !self.observing.contains(&tile.id) {
+                self.observing.insert(tile.id.clone());
+                cmds.push(Cmd::Observe(tile.id.clone()));
+            } else if !foreign && self.observing.remove(&tile.id) {
+                cmds.push(Cmd::Unobserve(tile.id.clone()));
+            }
+        }
+
         // Keep focus valid; default to the visually-first tile.
         if self
             .focused
@@ -824,6 +849,7 @@ impl FleetModel {
     /// the list it reads carries the same state.
     fn session_push(&mut self, id: &str, push: SessionPush) -> Vec<Cmd> {
         let focused = self.focused.as_deref() == Some(id);
+        let observed = self.observing.contains(id);
         let mine = &self.mine;
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) else {
             return Vec::new();
@@ -878,9 +904,21 @@ impl FleetModel {
                 }
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
-            // Handled once the fleet observes foreign sessions (re-grids the
-            // observed tile's mirror); inert until then.
-            SessionPush::Event(SessionEvent::Resized { .. }) => {}
+            // The observed session's real grid (observation start, or the
+            // display client resized it). Rebuild the mirror at that size —
+            // the resync that follows the event re-seeds its content. Driven
+            // tiles size through their own client, never through this.
+            SessionPush::Event(SessionEvent::Resized { cols, rows }) => {
+                if observed && tile.model.dims() != (cols, rows) {
+                    let mut model = TerminalModel::new(tile.id.clone(), cols, rows, self.metrics);
+                    model.set_theme(self.theme);
+                    model.set_display_name(tile.model.display_name().to_string());
+                    tile.model = model;
+                    tile.fed = false; // placeholder until the resync lands
+                    tile.frame_dirty = true;
+                    dirty = true;
+                }
+            }
         }
         if dirty { vec![Cmd::Redraw] } else { Vec::new() }
     }
@@ -1077,9 +1115,16 @@ impl FleetModel {
 
     fn session_data(&mut self, name: &str, bytes: Vec<u8>, ended: bool) -> Vec<Cmd> {
         let background = self.focused.as_deref() != Some(name);
+        // A dead mirror reverts its tile to a placeholder; the next reconcile
+        // re-observes if the session still exists.
+        let observation_ended = ended && self.observing.remove(name);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
             return Vec::new();
         };
+        if observation_ended {
+            tile.fed = false;
+            tile.frame_dirty = true;
+        }
         let had_output = !bytes.is_empty();
         let cmds = tile.model.update(UiEvent::SessionData {
             name: name.to_string(),
@@ -1972,6 +2017,77 @@ mod tests {
 
     fn tile<'a>(m: &'a FleetModel, id: &str) -> &'a Tile {
         m.tiles.iter().find(|t| t.id == id).unwrap()
+    }
+
+    #[test]
+    fn the_fleet_observes_sessions_it_does_not_drive() {
+        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        assert!(
+            cmds.contains(&Cmd::Observe("b".to_string())),
+            "the foreign tile gets a live mirror; got {cmds:?}"
+        );
+        assert!(
+            !cmds.contains(&Cmd::Observe("a".to_string())),
+            "a driven session is already live — observing it would double-feed"
+        );
+        // A second reconcile doesn't re-observe.
+        let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Observe(_))));
+    }
+
+    #[test]
+    fn a_vanished_session_is_unobserved() {
+        let mut m = fleet();
+        list(&mut m, &["b"]);
+        let cmds = list(&mut m, &[]);
+        assert!(cmds.contains(&Cmd::Unobserve("b".to_string())));
+        // Re-listing it re-observes.
+        let cmds = list(&mut m, &["b"]);
+        assert!(cmds.contains(&Cmd::Observe("b".to_string())));
+    }
+
+    #[test]
+    fn leaving_the_fleet_drops_every_observation() {
+        let mut m = fleet();
+        widen(&mut m);
+        list(&mut m, &["b", "c"]);
+        let (_, _, cmds) = m.into_single_keeping(None, WIDE, 1.0);
+        assert!(cmds.contains(&Cmd::Unobserve("b".to_string())));
+        assert!(cmds.contains(&Cmd::Unobserve("c".to_string())));
+    }
+
+    #[test]
+    fn a_resized_push_regrids_an_observed_tile() {
+        let mut m = fleet();
+        list(&mut m, &["b"]);
+        let cmds = push(
+            &mut m,
+            "b",
+            SessionPush::Event(SessionEvent::Resized {
+                cols: 100,
+                rows: 30,
+            }),
+        );
+        assert_eq!(tile(&m, "b").model.dims(), (100, 30));
+        assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn an_ended_observation_reverts_the_tile_to_a_placeholder() {
+        let mut m = fleet();
+        list(&mut m, &["b"]);
+        data(&mut m, "b", b"live");
+        assert!(tile(&m, "b").fed);
+        m.update(UiEvent::SessionData {
+            name: "b".to_string(),
+            bytes: vec![],
+            ended: true,
+        });
+        assert!(!tile(&m, "b").fed, "a dead mirror is a placeholder again");
+        // The next reconcile re-observes it (the session may still exist).
+        let cmds = list(&mut m, &["b"]);
+        assert!(cmds.contains(&Cmd::Observe("b".to_string())));
     }
 
     #[test]
