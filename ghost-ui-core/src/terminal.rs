@@ -32,6 +32,12 @@ use crate::{
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
 const SCROLL_LINES: i64 = 3;
 
+/// Cadence of selection-autoscroll steps while a drag hovers past a grid edge.
+const AUTOSCROLL_MS: u64 = 30;
+/// Fastest selection autoscroll, in lines per step (reached a few line-heights
+/// past the edge; one line per step right at it).
+const AUTOSCROLL_MAX: i64 = 5;
+
 /// User zoom (font-scale) bounds and step, inherited from the retired ghost-gtk frontend.
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
@@ -167,11 +173,21 @@ pub struct TerminalModel {
     held: Option<mouse::Button>,
     /// Whether the in-progress gesture is forwarded to the child (latched at press).
     gesture_report: bool,
-    /// Selection anchor while dragging, 0-based `(row, col)`.
-    sel_anchor: Option<(usize, usize)>,
+    /// The drag anchor's extent (a single cell, or the whole word/line under
+    /// the press), latched at press. Rows are ABSOLUTE line indices (the
+    /// monotonic lines-ever space, see [`Self::abs_top`]) so the anchor stays
+    /// pinned to its content while the viewport scrolls mid-drag.
+    sel_anchor: Option<Selection>,
     /// Granularity of the active drag (cell / word / line), latched at press.
     sel_mode: SelectMode,
+    /// The selection, in ABSOLUTE line indices like `sel_anchor`; the public
+    /// [`Self::selection`] getter projects it into the current viewport.
     selection: Option<Selection>,
+    /// Armed selection autoscroll: lines per step (positive = into history),
+    /// 0 = off. Set from the pointer's overshoot past the grid edge while
+    /// dragging; each `Tick` steps and re-arms until the drag ends or the
+    /// viewport hits its limit.
+    autoscroll: i64,
     /// Lines scrolled up into history; 0 = pinned to the live bottom.
     scroll_offset: usize,
     /// In-progress IME composition string; non-empty means composing, during
@@ -268,6 +284,7 @@ impl TerminalModel {
             sel_anchor: None,
             sel_mode: SelectMode::Char,
             selection: None,
+            autoscroll: 0,
             scroll_offset: 0,
             preedit: String::new(),
             last_title: String::new(),
@@ -406,8 +423,47 @@ impl TerminalModel {
         (self.cols, self.rows)
     }
 
+    /// The selection projected into the current viewport for painting, clamped
+    /// at the window edges. The model keeps the full range in absolute line
+    /// space (it survives scrolling and can span beyond the window); `None`
+    /// when there is no selection or it lies entirely off-screen.
     pub fn selection(&self) -> Option<Selection> {
-        self.selection
+        let s = self.selection?;
+        let top = self.abs_top();
+        let rows = self.rows as usize;
+        if s.end.0 < top || s.start.0 >= top + rows {
+            return None;
+        }
+        let start = if s.start.0 < top {
+            (0, 0)
+        } else {
+            (s.start.0 - top, s.start.1)
+        };
+        let end = if s.end.0 >= top + rows {
+            (rows - 1, (self.cols as usize).saturating_sub(1))
+        } else {
+            (s.end.0 - top, s.end.1)
+        };
+        Some(Selection { start, end })
+    }
+
+    /// The first viewport row's absolute line index — the monotonic
+    /// lines-ever-scrolled-off space selections are anchored in.
+    fn abs_top(&self) -> usize {
+        self.screen.vt().lines_scrolled_off() - self.scroll_offset
+    }
+
+    /// Lift a viewport cell into absolute line space.
+    fn abs_cell(&self, (row, col): (usize, usize)) -> (usize, usize) {
+        (self.abs_top() + row, col)
+    }
+
+    /// Lift a viewport-relative selection into absolute line space.
+    fn abs_sel(&self, sel: Selection) -> Selection {
+        Selection {
+            start: (sel.start.0 + self.abs_top(), sel.start.1),
+            end: (sel.end.0 + self.abs_top(), sel.end.1),
+        }
     }
 
     /// Whether the child exited / the session closed.
@@ -439,14 +495,16 @@ impl TerminalModel {
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
-            // The clock only matters as the synchronized-output release
-            // backstop: present what accumulated if a hold is still open.
+            // The clock releases a synchronized-output hold and steps an armed
+            // selection autoscroll.
             UiEvent::Tick { .. } => {
-                if std::mem::take(&mut self.sync_held) {
+                let mut cmds = if std::mem::take(&mut self.sync_held) {
                     vec![Cmd::Redraw]
                 } else {
                     Vec::new()
-                }
+                };
+                cmds.extend(self.autoscroll_tick());
+                cmds
             }
             // A lone terminal ignores enumeration, subscription, and group
             // state, and never sees `AdoptSession` — `RootModel` handles those.
@@ -538,7 +596,7 @@ impl TerminalModel {
             session: ghost_render::session_key(self.session()),
             rect,
             frame,
-            selection: self.selection,
+            selection: self.selection(),
             dim: false,
             damage: self.damage(),
         }];
@@ -736,12 +794,7 @@ impl TerminalModel {
             };
         }
         if let Some(scroll) = self.scroll_key(key, mods) {
-            // Don't move the viewport out from under an in-progress drag: the
-            // selection is window-relative, so scrolling would retarget it.
-            if self.held.is_some() {
-                return Vec::new();
-            }
-            return match scroll {
+            let cmds = match scroll {
                 Scroll::By(d) => self.scroll_by(d),
                 Scroll::Top => {
                     let top = self.max_scroll();
@@ -753,14 +806,16 @@ impl TerminalModel {
                 }
                 Scroll::Bottom => self.snap_to_bottom(),
             };
+            // A drag in progress follows the viewport: the selection is
+            // anchored in absolute line space, so re-extend it to whatever
+            // content now sits under the pointer.
+            self.re_extend();
+            return cmds;
         }
         if let Some(back) = self.prompt_jump_key(key, mods) {
-            // Same drag guard as scroll_key: a moving viewport would retarget
-            // an in-progress window-relative selection.
-            if self.held.is_some() {
-                return Vec::new();
-            }
-            return self.jump_to_prompt(back);
+            let cmds = self.jump_to_prompt(back);
+            self.re_extend();
+            return cmds;
         }
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
@@ -840,7 +895,7 @@ impl TerminalModel {
     fn copy(&self) -> Vec<Cmd> {
         match self.selection {
             Some(sel) => {
-                let text = selection_text(&self.screen, sel, self.scroll_offset);
+                let text = selection_text(&self.screen, sel);
                 if text.is_empty() {
                     Vec::new()
                 } else {
@@ -1205,42 +1260,90 @@ impl TerminalModel {
         )
     }
 
-    /// Extend a drag selection from `anchor` to `active` (both 0-based viewport
-    /// `(row, col)`) at the latched granularity: by cell, or growing to cover the
-    /// whole words / lines that contain both endpoints. On a blank cell (no word
-    /// or line) the endpoint degrades to that single cell.
-    fn extend_selection(
-        &self,
-        anchor: (usize, usize),
-        active: (usize, usize),
-    ) -> Option<Selection> {
-        match self.sel_mode {
-            SelectMode::Char => Some(Selection::new(anchor, active)),
-            SelectMode::Word => {
-                let a = self
-                    .word_at(anchor.0, anchor.1)
-                    .unwrap_or_else(|| Selection::new(anchor, anchor));
-                let b = self
-                    .word_at(active.0, active.1)
-                    .unwrap_or_else(|| Selection::new(active, active));
-                Some(Selection {
-                    start: a.start.min(b.start),
-                    end: a.end.max(b.end),
-                })
-            }
-            SelectMode::Line => {
-                let a = self
-                    .line_at(anchor.0)
-                    .unwrap_or_else(|| Selection::new(anchor, anchor));
-                let b = self
-                    .line_at(active.0)
-                    .unwrap_or_else(|| Selection::new(active, active));
-                Some(Selection {
-                    start: a.start.min(b.start),
-                    end: a.end.max(b.end),
-                })
-            }
+    /// Extend the drag selection from the latched `anchor` extent (absolute
+    /// line space) to the viewport cell under the pointer, at the latched
+    /// granularity: by cell, or growing to cover the whole word / line that
+    /// contains the active cell (degrading to the cell itself when blank).
+    /// The result is absolute, so it survives the viewport scrolling mid-drag.
+    fn extend_selection(&self, anchor: Selection, active: (usize, usize)) -> Selection {
+        let ext = match self.sel_mode {
+            SelectMode::Char => None,
+            SelectMode::Word => self.word_at(active.0, active.1),
+            SelectMode::Line => self.line_at(active.0),
         }
+        .map(|s| self.abs_sel(s));
+        let cell = self.abs_cell(active);
+        let b = ext.unwrap_or_else(|| Selection::new(cell, cell));
+        Selection {
+            start: anchor.start.min(b.start),
+            end: anchor.end.max(b.end),
+        }
+    }
+
+    /// After the viewport moved mid-drag, re-extend the selection to the cell
+    /// still under the pointer — which now covers different content.
+    fn re_extend(&mut self) {
+        if self.held == Some(mouse::Button::Left)
+            && !self.gesture_report
+            && let Some(anchor) = self.sel_anchor
+        {
+            self.selection = Some(self.extend_selection(anchor, self.pointer_cell0()));
+        }
+    }
+
+    /// Track selection autoscroll from the pointer's vertical overshoot past
+    /// the grid: hovering above the top edge scrolls into history, below the
+    /// bottom back toward live, faster the further past the edge. Arms the
+    /// tick loop on the off-to-on transition; [`Self::autoscroll_tick`] keeps
+    /// it alive while armed.
+    fn update_autoscroll(&mut self, pos: PointPx) -> Vec<Cmd> {
+        let m = self.effective_metrics();
+        let pad = f64::from(self.pad_px());
+        let lh = f64::from(m.line_height);
+        let bottom = pad + lh * f64::from(self.rows);
+        let overshoot = if pos.y < pad {
+            pad - pos.y
+        } else if pos.y > bottom {
+            bottom - pos.y
+        } else {
+            0.0
+        };
+        let speed = if overshoot == 0.0 {
+            0
+        } else {
+            (1 + (overshoot.abs() / lh) as i64).min(AUTOSCROLL_MAX) * overshoot.signum() as i64
+        };
+        let was = std::mem::replace(&mut self.autoscroll, speed);
+        if was == 0 && speed != 0 {
+            vec![Cmd::ScheduleTick {
+                after_ms: AUTOSCROLL_MS,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// One armed autoscroll step: scroll the viewport, re-extend the selection
+    /// to the pointer (whose cell clamps to the hovered edge row), and keep
+    /// the tick loop alive. Disarms when the drag has ended or the viewport
+    /// hit its limit; a later edge-hover motion re-arms it.
+    fn autoscroll_tick(&mut self) -> Vec<Cmd> {
+        if self.autoscroll == 0 {
+            return Vec::new();
+        }
+        let dragging = self.held == Some(mouse::Button::Left) && self.sel_anchor.is_some();
+        let target = (self.scroll_offset as i64 + self.autoscroll).max(0) as usize;
+        if !dragging || !self.set_scroll(target) {
+            self.autoscroll = 0;
+            return Vec::new();
+        }
+        self.re_extend();
+        vec![
+            Cmd::Redraw,
+            Cmd::ScheduleTick {
+                after_ms: AUTOSCROLL_MS,
+            },
+        ]
     }
 
     /// The word under viewport cell `(row, col)` — a maximal run of word cells —
@@ -1308,6 +1411,15 @@ impl TerminalModel {
         match phase {
             PointerPhase::Motion => {
                 let mut cmds = self.update_hover(pos, mods);
+                // Edge-hover autoscroll is tracked BEFORE the same-cell
+                // early-return: past the edge the clamped cell stops changing,
+                // but the overshoot (and so the scroll speed) still does.
+                if self.held == Some(mouse::Button::Left)
+                    && !self.gesture_report
+                    && self.sel_anchor.is_some()
+                {
+                    cmds.extend(self.update_autoscroll(pos));
+                }
                 let cell = self.point_to_cell(pos);
                 if self.cursor_cell == Some(cell) {
                     return cmds;
@@ -1319,7 +1431,7 @@ impl TerminalModel {
                     } else if b == mouse::Button::Left
                         && let Some(anchor) = self.sel_anchor
                     {
-                        self.selection = self.extend_selection(anchor, self.pointer_cell0());
+                        self.selection = Some(self.extend_selection(anchor, self.pointer_cell0()));
                         vec![Cmd::Redraw]
                     } else {
                         Vec::new()
@@ -1359,24 +1471,32 @@ impl TerminalModel {
                 } else if b == mouse::Button::Left {
                     if clicks >= 2 && self.cursor_cell.is_some() {
                         // Double-click selects the word, triple-click the line, and
-                        // latches that granularity so a drag extends by it.
+                        // latches that granularity so a drag extends by it. The
+                        // anchor extent is lifted to absolute line space so it
+                        // stays pinned to its content if the drag scrolls.
                         let (row, col) = self.pointer_cell0();
-                        self.sel_anchor = Some((row, col));
                         self.sel_mode = if clicks == 2 {
                             SelectMode::Word
                         } else {
                             SelectMode::Line
                         };
-                        self.selection = if clicks == 2 {
+                        let ext = if clicks == 2 {
                             self.word_at(row, col)
                         } else {
                             self.line_at(row)
-                        };
+                        }
+                        .map(|sel| self.abs_sel(sel));
+                        let cell = self.abs_cell((row, col));
+                        self.sel_anchor = Some(ext.unwrap_or_else(|| Selection::new(cell, cell)));
+                        self.selection = ext;
                     } else {
                         // Begin a by-cell drag selection (anchor once the pointer
                         // is known).
                         self.sel_mode = SelectMode::Char;
-                        self.sel_anchor = self.cursor_cell.map(|_| self.pointer_cell0());
+                        self.sel_anchor = self.cursor_cell.map(|_| {
+                            let cell = self.abs_cell(self.pointer_cell0());
+                            Selection::new(cell, cell)
+                        });
                         self.selection = None;
                     }
                     vec![Cmd::Redraw]
@@ -1397,10 +1517,11 @@ impl TerminalModel {
                     _ => Vec::new(),
                 };
                 self.held = None;
+                self.autoscroll = 0;
                 // A finalized local selection becomes the primary selection, so a
                 // middle-click elsewhere pastes it (X11/Wayland convention).
                 if let Some(sel) = self.selection {
-                    let text = selection_text(&self.screen, sel, self.scroll_offset);
+                    let text = selection_text(&self.screen, sel);
                     if !text.is_empty() {
                         cmds.push(Cmd::WritePrimary(text));
                     }
@@ -1420,18 +1541,19 @@ impl TerminalModel {
                     };
                     let cell = self.cursor_cell.unwrap_or((1, 1));
                     self.mouse_report(mouse::Kind::Press, Some(b), self.held.is_some(), cell, mods)
-                } else if self.held.is_some() {
-                    // A drag is in progress: don't scroll the viewport out from
-                    // under the (window-relative) selection.
-                    Vec::new()
                 } else {
-                    // Otherwise scroll local scrollback (up = into history).
+                    // Scroll local scrollback (up = into history). Mid-drag
+                    // this is fine — the selection lives in absolute line
+                    // space — it just re-extends to the content now under the
+                    // pointer.
                     let delta = if wheel_dy > 0.0 {
                         SCROLL_LINES
                     } else {
                         -SCROLL_LINES
                     };
-                    self.scroll_by(delta)
+                    let cmds = self.scroll_by(delta);
+                    self.re_extend();
+                    cmds
                 }
             }
         }
@@ -1477,20 +1599,31 @@ pub fn bracket_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
 }
 
 /// Extract the text covered by `sel` from `screen`'s viewport scrolled
-/// `scroll_offset` lines into history (0 = live), one line per row joined by
-/// newlines. Selection rows are relative to the *visible* window, so copying
-/// while scrolled back yields the history the user sees, not the live viewport.
-/// Wide-cell tail placeholders are dropped; the terminating row keeps its
-/// trailing spaces (selected content) while earlier rows are trimmed.
-pub fn selection_text(screen: &Screen, sel: Selection, scroll_offset: usize) -> String {
+/// one line per row joined by newlines. Selection rows are ABSOLUTE line
+/// indices (the monotonic lines-ever space drags are anchored in), so the text
+/// spans retained scrollback and viewport alike — including ranges wider than
+/// one window — regardless of where the view sits now. Rows already evicted
+/// from the bounded scrollback are skipped. Wide-cell tail placeholders are
+/// dropped; the terminating row keeps its trailing spaces (selected content)
+/// while earlier rows are trimmed.
+pub fn selection_text(screen: &Screen, sel: Selection) -> String {
     let (cols, _rows) = screen.dimensions();
     let cols = cols as usize;
-    let window: Vec<&Line> = screen.vt().view_at(scroll_offset).collect();
+    let vt = screen.vt();
+    // The oldest retained line's absolute index; anything older is gone.
+    let first_abs = vt.lines_scrolled_off() - vt.scrollback_len();
+    let start_row = sel.start.0.max(first_abs);
+    if sel.end.0 < start_row {
+        return String::new();
+    }
+    let window: Vec<&Line> = vt
+        .lines()
+        .skip(start_row - first_abs)
+        .take(sel.end.0 - start_row + 1)
+        .collect();
     let mut lines: Vec<String> = Vec::new();
-    for row in sel.start.0..=sel.end.0 {
-        let Some(line) = window.get(row) else {
-            break;
-        };
+    for (i, line) in window.iter().enumerate() {
+        let row = start_row + i;
         let text = match sel.row_span(row, cols) {
             Some((c0, c1)) => {
                 let len = line.len();
@@ -3382,46 +3515,41 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_is_suppressed_during_an_active_drag() {
+    fn scrolling_mid_drag_retargets_the_selection_not_the_content() {
         let mut m = model();
         feed_lines(&mut m, 100);
         m.update(wheel(1.0)); // top row "L73"
-        // Begin a left-drag selecting "L73".
-        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
-        m.update(ptr(
-            PointerPhase::Press,
-            Some(PointerButton::Left),
-            1.0,
-            1.0,
-        ));
+        // Begin a left-drag anchored on "L73" (anchor at col 2, active at col 0).
+        begin_drag(&mut m, 20.0, 1.0);
         m.update(ptr(
             PointerPhase::Motion,
             Some(PointerButton::Left),
-            18.0,
+            1.0,
             1.0,
         ));
-        // A wheel mid-drag must not move the viewport out from under the selection.
+        // A wheel mid-drag scrolls the viewport; the selection stays pinned to
+        // its content (absolute line space) and extends to whatever now sits
+        // under the pointer.
         assert!(
-            !m.update(wheel(1.0)).contains(&Cmd::Redraw),
-            "wheel is ignored while a drag is held"
+            m.update(wheel(1.0)).contains(&Cmd::Redraw),
+            "wheel scrolls mid-drag"
         );
-        // Shift+PageUp mid-drag is likewise ignored.
-        m.update(UiEvent::Key {
-            key: Key::Named(NamedKey::PageUp),
-            mods: Mods::SHIFT,
-            kind: KeyEventKind::Press,
-            alts: None,
-        });
+        assert_eq!(top_row_text(&m), "L70");
+        // Shift+PageUp/PageDown mid-drag likewise scroll (and cancel out).
+        let cmds = key(&mut m, Key::Named(NamedKey::PageUp), Mods::SHIFT);
+        assert!(cmds.contains(&Cmd::Redraw), "Shift+PageUp scrolls mid-drag");
+        key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+        assert_eq!(top_row_text(&m), "L70");
         m.update(ptr(
             PointerPhase::Release,
             Some(PointerButton::Left),
-            18.0,
+            1.0,
             1.0,
         ));
         assert_eq!(
             key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
-            vec![Cmd::WriteClipboard("L73".to_string())],
-            "copy reads exactly the dragged line, not a scrolled-away one"
+            vec![Cmd::WriteClipboard("L70\nL71\nL72\nL73".to_string())],
+            "the copy runs from the anchored content to the pointer's row"
         );
     }
 
@@ -3682,12 +3810,183 @@ mod tests {
         assert_eq!(bracket_paste(b"hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
     }
 
+    /// Press at `(x, y)` after a motion there, beginning a by-cell drag.
+    fn begin_drag(m: &mut TerminalModel, x: f64, y: f64) {
+        m.update(ptr(PointerPhase::Motion, None, x, y));
+        m.update(ptr(PointerPhase::Press, Some(PointerButton::Left), x, y));
+    }
+
+    fn tick(m: &mut TerminalModel) -> Vec<Cmd> {
+        m.update(UiEvent::Tick { now_ms: 0 })
+    }
+
+    #[test]
+    fn dragging_above_the_top_edge_autoscrolls_the_selection_into_history() {
+        let mut m = model();
+        feed_lines(&mut m, 30); // L0..L29: 6 lines in scrollback, top row shows L6
+        assert_eq!(top_row_text(&m), "L6");
+        begin_drag(&mut m, 10.0, 1.0); // anchor on the top row, col 1
+        // Hovering just above the grid arms the autoscroll.
+        let cmds = m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            1.0,
+            -1.0,
+        ));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "hovering the top edge schedules autoscroll ticks: {cmds:?}"
+        );
+        // Each tick scrolls one line deeper and extends the selection to the
+        // revealed row; the tick keeps itself alive.
+        let cmds = tick(&mut m);
+        assert_eq!(top_row_text(&m), "L5");
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "autoscroll reschedules while armed: {cmds:?}"
+        );
+        for _ in 0..5 {
+            tick(&mut m);
+        }
+        // Pinned at the top of scrollback: the autoscroll stops rescheduling.
+        assert_eq!(top_row_text(&m), "L0");
+        let cmds = tick(&mut m);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "pinned at the scrollback top the autoscroll disarms: {cmds:?}"
+        );
+        // The selection covers everything from L0 up to the anchor row.
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            1.0,
+            -1.0,
+        ));
+        let text = cmds.iter().find_map(|c| match c {
+            Cmd::WritePrimary(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            text.as_deref(),
+            Some("L0\nL1\nL2\nL3\nL4\nL5\nL6"),
+            "the drag selected history that was never in the original viewport"
+        );
+    }
+
+    #[test]
+    fn dragging_below_the_bottom_edge_autoscrolls_back_toward_live() {
+        let mut m = model();
+        feed_lines(&mut m, 30);
+        // Scroll all the way into history, anchor on L0, then hover below the grid.
+        for _ in 0..2 {
+            m.update(wheel(3.0));
+        }
+        assert_eq!(top_row_text(&m), "L0");
+        begin_drag(&mut m, 1.0, 1.0);
+        let cmds = m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            20.0,
+            24.0 * 18.0 + 1.0,
+        ));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "hovering the bottom edge schedules autoscroll ticks: {cmds:?}"
+        );
+        tick(&mut m);
+        assert_eq!(top_row_text(&m), "L1", "the tick scrolled back toward live");
+        // The anchor row (L0) is now above the window: the painted selection
+        // clamps to the window top while the real range is preserved.
+        let sel = m.selection().expect("the drag still shows a selection");
+        assert_eq!(
+            sel.start,
+            (0, 0),
+            "the painted selection clamps to the window"
+        );
+        // Drain the remaining distance and copy: everything from L0 down.
+        for _ in 0..8 {
+            tick(&mut m);
+        }
+        assert_eq!(top_row_text(&m), "L6");
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            20.0,
+            24.0 * 18.0 + 1.0,
+        ));
+        let text = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::WritePrimary(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the finished drag publishes the primary selection");
+        assert!(
+            text.starts_with("L0\nL1\n") && text.contains("L28"),
+            "the copy spans from the anchor in history down past the old window: {text:?}"
+        );
+    }
+
+    #[test]
+    fn autoscroll_stops_on_release() {
+        let mut m = model();
+        feed_lines(&mut m, 30);
+        begin_drag(&mut m, 20.0, 1.0);
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            20.0,
+            -1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            20.0,
+            -1.0,
+        ));
+        let before = top_row_text(&m);
+        let cmds = tick(&mut m);
+        assert_eq!(top_row_text(&m), before, "no scrolling after release");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "released autoscroll does not reschedule: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_scrolling_mid_drag_extends_the_selection() {
+        let mut m = model();
+        feed_lines(&mut m, 30);
+        begin_drag(&mut m, 20.0, 1.0); // anchor on L6 (top row), col 2
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        // Wheel up during the drag: the viewport scrolls and the selection
+        // follows the pointer over the revealed content instead of being stuck.
+        let cmds = m.update(wheel(3.0));
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "the wheel scrolls mid-drag: {cmds:?}"
+        );
+        assert_eq!(top_row_text(&m), "L3");
+        let sel = m.selection().expect("the selection survived the scroll");
+        assert_eq!(
+            (sel.start.0, sel.end.0),
+            (0, 3),
+            "the selection runs from the pointer (L3, window row 0) to the anchor (L6)"
+        );
+    }
+
     #[test]
     fn selection_text_extracts_and_trims() {
         let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
         screen.feed(b"hello world");
         assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 4)), 0),
+            selection_text(&screen, Selection::new((0, 0), (0, 4))),
             "hello"
         );
 
@@ -3695,7 +3994,7 @@ mod tests {
         screen.feed(b"a  b");
         // Trailing spaces on the terminating row are kept (WYSIWYG copy).
         assert_eq!(
-            selection_text(&screen, Selection::new((0, 0), (0, 2)), 0),
+            selection_text(&screen, Selection::new((0, 0), (0, 2))),
             "a  "
         );
     }
