@@ -1,9 +1,11 @@
 # Session coordination: replacing the 500 ms poll with per-session push
 
-**Status:** Decided (design) · **Date:** 2026-06-23 · **Scope:** how the
-frontend/CLI learn about session existence and state, plus the live-bell and
-observer-attach features that ride the same seam · **Work status:** NOT STARTED
-— research/design only.
+**Status:** Decided (design) · **Date:** 2026-06-23, updated 2026-07-02 ·
+**Scope:** how the frontend/CLI learn about session existence and state, plus
+the live-bell and observer-attach features that ride the same seam ·
+**Work status:** NOT STARTED — research/design only. This is the first phase of
+the fleet-redesign completion plan; observer-attach (below) is the second, and
+is what makes every fleet tile a live preview.
 
 ## Problem
 
@@ -68,8 +70,15 @@ death is observed as socket EOF.
 ### Protocol surface
 Today (`ghost-vt/src/protocol.rs`): postcard-serialized, length-prefixed frames
 (`FrameReader`).
-- `ClientMsg`: `Input`, `Resize`, `Detach`, `Kill`, `Rename(String)`, `Repaint`.
+- `ClientMsg`: `Input`, `Resize`, `Detach`, `Kill`, `Rename(String)`, `Repaint`,
+  `Theme(ThemeColors)`.
 - `ServerMsg`: `Output(Vec<u8>)`, `Exited(i32)`, `RenameResult { ok, message }`.
+
+Old-host compatibility already has a mechanism: the host writes its
+`PROTO_LEVEL` to the session's `proto` marker at startup, and clients gate
+newer verbs on it (see `PROTO_RENAME_LABEL`). `Subscribe` gets its own
+`PROTO_SUBSCRIBE` level the same way — a client simply keeps polling a session
+whose host predates it.
 
 Add:
 - `ClientMsg::Subscribe` — "push me state events for this session; I am **not** a
@@ -117,7 +126,13 @@ timer), with a slow reconcile floor as a backstop.
   sessions owned by another window without stealing them. A subscriber that also
   receives output but never sends `Resize` is a read-only OUTPUT observer — a
   small extension on the same seam (the host already treats "sends `Resize`" as
-  the thing that makes a client the display client).
+  the thing that makes a client the display client). On the frontend, observed
+  output feeds a fleet-owned `TerminalModel` that flows into the existing
+  per-session `Surface` compositor unchanged — this is the surface plan's
+  "Brick 4" (eager background liveness), and it is why migration step 7
+  (coalescing/flow control) is load-bearing: bulk output in an observed session
+  must not flood every subscribed window; the fleet's lazy update-on-composite
+  policy is the consumer-side half of that answer.
 - **Multi-window fidelity.** `AttachInfo` with window identity gives the fleet
   accurate ThisWindow / Elsewhere / Detached grouping across windows.
 
