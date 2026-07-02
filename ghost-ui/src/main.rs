@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
+use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
     TerminalModel, UiEvent,
@@ -686,10 +686,9 @@ impl Graphics {
     /// `font_px` the glyph size the scene was laid out for (the model keeps both in
     /// sync via `UiEvent::Resize` and its render scale). Delegates the damage→draw→
     /// present glue to [`Target::render_frame`] — the same code the headless harness
-    /// runs — and returns its `Some((build, present))` split (or `None` when nothing
-    /// was drawn). [`FrameStats`](framestats::FrameStats) consumes the split.
-    fn render(&mut self, scene: &Scene, font_px: f32) -> Option<(Duration, Duration)> {
-        let split = self.target.render_frame(
+    /// runs — and returns its [`FrameOutcome`], which decides the pacer bookkeeping.
+    fn render(&mut self, scene: &Scene, font_px: f32) -> FrameOutcome {
+        let outcome = self.target.render_frame(
             &mut self.renderer,
             &mut self.scene_cache,
             scene,
@@ -699,7 +698,7 @@ impl Graphics {
         );
         // Per-frame cache-efficiency line under `RUST_LOG=ghost::cache=trace`; free otherwise.
         self.renderer.emit_cache_trace();
-        split
+        outcome
     }
 }
 
@@ -1521,9 +1520,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // pass until one lands, rather than trusting the pacer's single request —
                 // else the window sits blank (title bar only) until an unrelated event.
                 w.gfx.window.request_redraw();
-            } else if w.pacer.poll(now_ms) == pacer::Pace::PaintNow {
+            } else if w.pacer.release(now_ms) {
                 w.gfx.window.request_redraw();
-                w.pacer.painted(now_ms);
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
@@ -1563,6 +1561,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
             }
             WindowEvent::RedrawRequested => {
+                let now_ms = self.now_ms();
                 if let Some(win) = self.windows.get_mut(&id) {
                     // First paint of a window created mid-run: recreate the swapchain
                     // before drawing. The initial configure in `Graphics::new` can run
@@ -1582,6 +1581,9 @@ impl ApplicationHandler<UserEvent> for App {
                         // surface rather than render a scene whose size no longer
                         // matches it (the model resize is deferred until settle).
                         win.gfx.blit_snapshot();
+                        // Keep the blits paced during the drag; the commit at settle
+                        // dispatches the real resize, whose Redraw re-arms the pacer.
+                        win.pacer.painted(now_ms);
                     } else {
                         let t_model = Instant::now();
                         let scene = win.root.view();
@@ -1602,37 +1604,52 @@ impl ApplicationHandler<UserEvent> for App {
                                 PhysicalSize::new(a.w, a.h),
                             );
                         }
-                        if let Some((build, present)) = win.gfx.render(&scene, font_px) {
-                            // A frame landed: stop the first-present retry loop below.
-                            win.presented_ok = true;
-                            // The foreground was just composited: reset its per-session
-                            // damage baseline so the next `view` measures change from here
-                            // (a skipped/no-op frame returns `None` and leaves the pending
-                            // damage to fold into the next real present). See
-                            // `RootModel::mark_presented`.
-                            win.root.mark_presented();
-                            // Model-side cache line (fleet preview frames) under
-                            // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
-                            win.root.emit_cache_trace();
-                            // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
-                            // this frame and print a summary when a dive ends.
-                            if let Some(summary) = win.stats.record(
-                                win.root.is_animating(),
-                                model,
-                                build,
-                                present,
-                                Instant::now(),
-                            ) {
-                                eprintln!("{}", summary.report());
+                        match win.gfx.render(&scene, font_px) {
+                            FrameOutcome::Presented { build, present } => {
+                                // A frame landed: the pending repaint is satisfied, and
+                                // the first-present retry loop below can stop.
+                                win.pacer.painted(now_ms);
+                                win.presented_ok = true;
+                                // The foreground was just composited: reset its per-session
+                                // damage baseline so the next `view` measures change from
+                                // here (a Lost frame leaves the pending damage to fold into
+                                // the next real present). See `RootModel::mark_presented`.
+                                win.root.mark_presented();
+                                // Model-side cache line (fleet preview frames) under
+                                // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
+                                win.root.emit_cache_trace();
+                                // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
+                                // this frame and print a summary when a dive ends.
+                                if let Some(summary) = win.stats.record(
+                                    win.root.is_animating(),
+                                    model,
+                                    build,
+                                    present,
+                                    Instant::now(),
+                                ) {
+                                    eprintln!("{}", summary.report());
+                                }
+                                // Stream bench: accumulate this bulk-output frame; exit when
+                                // the run is complete (a no-op outside `GHOST_BENCH=stream`).
+                                if self
+                                    .bench
+                                    .as_mut()
+                                    .is_some_and(|h| h.record_stream_present(build, present))
+                                {
+                                    event_loop.exit();
+                                }
                             }
-                            // Stream bench: accumulate this bulk-output frame; exit when
-                            // the run is complete (a no-op outside `GHOST_BENCH=stream`).
-                            if self
-                                .bench
-                                .as_mut()
-                                .is_some_and(|h| h.record_stream_present(build, present))
-                            {
-                                event_loop.exit();
+                            FrameOutcome::Clean => {
+                                // Nothing to draw: what's on screen already matches the
+                                // scene, so the pending repaint is satisfied.
+                                win.pacer.painted(now_ms);
+                            }
+                            FrameOutcome::Lost => {
+                                // The surface wasn't acquirable, so nothing was presented.
+                                // Re-arm the repaint so `about_to_wait` retries until a
+                                // frame lands — this is what recovers a window whose
+                                // redraws the platform dropped while it was occluded.
+                                win.pacer.request();
                             }
                         }
                         // Warm ONE deferred surface off the just-finished frame's slack, so
@@ -1698,11 +1715,26 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dispatch(id, UiEvent::Preedit(String::new()), event_loop);
             }
             WindowEvent::Ime(Ime::Enabled) => {}
+            WindowEvent::Occluded(occluded) => {
+                // While a window is occluded (another Space/virtual desktop, the lock
+                // screen) the platform may drop our redraw requests, and macOS App Nap
+                // can throttle the poll loop on top. Becoming visible again therefore
+                // re-arms a repaint: if content really did change while hidden it
+                // paints, and an unchanged scene is a cheap `Clean` skip.
+                if !occluded && let Some(w) = self.windows.get_mut(&id) {
+                    w.pacer.request();
+                }
+            }
             WindowEvent::Focused(focused) => {
                 // Remember the last-focused window as the target for menu actions;
                 // keep the previous one on blur (a stale id is filtered at use).
                 if focused {
                     self.focused = Some(id);
+                    // Belt and braces for platforms/WMs that don't report occlusion
+                    // (see `Occluded` above): regaining focus re-arms a repaint too.
+                    if let Some(w) = self.windows.get_mut(&id) {
+                        w.pacer.request();
+                    }
                 }
                 self.dispatch(id, UiEvent::Focus(focused), event_loop);
             }

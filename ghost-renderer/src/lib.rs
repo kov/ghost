@@ -14,7 +14,7 @@ use std::rc::Rc;
 use rayon::prelude::*;
 
 pub mod target;
-pub use target::{SurfaceTarget, Target};
+pub use target::{FrameOutcome, SurfaceTarget, Target};
 
 use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene,
@@ -5593,6 +5593,32 @@ mod tests {
         let mut c2 = SceneCache::default();
         assert_eq!(c2.damage(&with_chrome("x\r\ny"), 15.0), Damage::Full);
         assert_eq!(c2.damage(&with_chrome("x\r\nY"), 15.0), Damage::Full);
+    }
+
+    #[test]
+    fn render_frame_reports_presented_then_clean_for_an_identical_scene() {
+        // The shell's repaint bookkeeping keys off the outcome: `Presented` and
+        // `Clean` satisfy the pending repaint, `Lost` keeps it pending for retry.
+        // An unchanged scene must come back `Clean` (or a redraw whose scene didn't
+        // change would re-request forever), and any change must present again.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut r = Renderer::headless(Theme::default());
+        let mut cache = SceneCache::default();
+        let mut t = Target::Offscreen;
+        let scene = single_scene(frame(20, 5, "hi"), 180, 90);
+        assert!(matches!(
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            FrameOutcome::Presented { .. }
+        ));
+        assert!(matches!(
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            FrameOutcome::Clean
+        ));
+        let changed = single_scene(frame(20, 5, "ho"), 180, 90);
+        assert!(matches!(
+            t.render_frame(&mut r, &mut cache, &changed, font, SIZE_PX, || {}),
+            FrameOutcome::Presented { .. }
+        ));
     }
 
     #[test]

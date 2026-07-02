@@ -102,6 +102,23 @@ impl SurfaceTarget {
     }
 }
 
+/// What [`Target::render_frame`] did with a scene. The caller's repaint
+/// bookkeeping hangs off this: `Presented` and `Clean` mean what's on screen now
+/// matches the scene (the pending repaint is satisfied); `Lost` means nothing was
+/// drawn and the repaint must stay pending and be retried.
+#[derive(Clone, Copy, Debug)]
+pub enum FrameOutcome {
+    /// A frame was drawn and presented. `build` is the scene build + submit,
+    /// `present` the (vsync-blocking, surface-only) present.
+    Presented { build: Duration, present: Duration },
+    /// The scene is identical to the last presented frame — nothing to draw, and
+    /// the displayed frame is already correct.
+    Clean,
+    /// The surface couldn't be acquired (lost/outdated/not ready): nothing was
+    /// presented, and the scene cache was invalidated so the retry fully redraws.
+    Lost,
+}
+
 impl Target {
     /// Whether banded partial redraws are allowed for this target.
     pub fn opaque(&self) -> bool {
@@ -111,10 +128,9 @@ impl Target {
         }
     }
 
-    /// Damage-gate, draw `scene` into the target, and present. Returns
-    /// `Some((build, present))` durations when a frame was presented — `build` is the
-    /// scene build + submit, `present` the (vsync-blocking, surface-only) present — or
-    /// `None` when nothing was drawn (an identical scene, or a lost surface).
+    /// Damage-gate, draw `scene` into the target, and present. See
+    /// [`FrameOutcome`] for the three possible results; an offscreen target never
+    /// returns `Lost`.
     ///
     /// `pre_present` runs just before a surface present (the app's
     /// `window.pre_present_notify()`); it is ignored for an offscreen target.
@@ -126,27 +142,30 @@ impl Target {
         font: impl Into<FontSet<'f>>,
         font_px: f32,
         pre_present: impl FnOnce(),
-    ) -> Option<(Duration, Duration)> {
+    ) -> FrameOutcome {
         let font = font.into();
         // Skip an identical scene; otherwise present it. The per-session Surface keeps
         // the redraw cheap (it re-rasters only its changed rows), so the scene-level
         // verdict is just skip-or-present.
         match cache.damage(scene, font_px) {
-            Damage::None => return None,
+            Damage::None => return FrameOutcome::Clean,
             Damage::Full => {}
         }
         match self {
             Target::Offscreen => {
                 let t = Instant::now();
                 renderer.render_to_cached_target(scene, font, font_px);
-                Some((t.elapsed(), Duration::ZERO))
+                FrameOutcome::Presented {
+                    build: t.elapsed(),
+                    present: Duration::ZERO,
+                }
             }
             Target::Surface(s) => {
                 let Some((frame_tex, view)) = s.acquire() else {
                     // Accepted the scene above but couldn't present it; forget it so
                     // the next request fully redraws onto the reconfigured surface.
                     cache.invalidate();
-                    return None;
+                    return FrameOutcome::Lost;
                 };
                 let size = (s.config.width, s.config.height);
                 let t_build = Instant::now();
@@ -155,7 +174,10 @@ impl Target {
                 let t_present = Instant::now();
                 pre_present();
                 frame_tex.present();
-                Some((build, t_present.elapsed()))
+                FrameOutcome::Presented {
+                    build,
+                    present: t_present.elapsed(),
+                }
             }
         }
     }

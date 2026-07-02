@@ -20,7 +20,7 @@ pub mod framestats;
 use std::time::Duration;
 
 use ghost_render::{CellMetrics, Scene};
-use ghost_renderer::{Rendered, Renderer, SceneCache, Theme};
+use ghost_renderer::{FrameOutcome, Rendered, Renderer, SceneCache, Theme};
 use ghost_shaper::FontRef;
 use ghost_ui_core::{Cmd, RootModel, SessionId, TerminalModel, UiEvent};
 use ghost_vt::session::SessionInfo;
@@ -239,8 +239,13 @@ impl Harness {
         // (`&Box<dyn Fn()>` is itself `FnOnce`, so it passes straight through).
         let renderer = self.renderer.as_mut().expect("just inserted");
         let pre = &self.pre_present;
-        self.target
+        match self
+            .target
             .render_frame(renderer, &mut self.cache, &scene, font, px, pre)
+        {
+            FrameOutcome::Presented { build, present } => Some((build, present)),
+            FrameOutcome::Clean | FrameOutcome::Lost => None,
+        }
     }
 
     /// Count of session surfaces the renderer has (re)rasterised — a benchmark/test

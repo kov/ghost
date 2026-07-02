@@ -73,10 +73,24 @@ impl FramePacer {
         }
     }
 
-    /// Record that a paint just happened at `now_ms`, clearing the pending flag.
+    /// Record that a frame actually landed at `now_ms` (presented, or verified
+    /// identical to what's on screen), clearing the pending flag. Never call this
+    /// at request time: the platform may drop a requested redraw (occluded window,
+    /// another Space, the lock screen), and a repaint marked painted then would be
+    /// lost — the window stays stale until some input forces a fresh request.
     pub fn painted(&mut self, now_ms: u64) {
         self.last_paint_ms = Some(now_ms);
         self.pending = false;
+    }
+
+    /// One decision per event-loop pass: should the shell call
+    /// `window.request_redraw()` now? Does NOT mark anything painted — that
+    /// happens only when the resulting `RedrawRequested` is actually handled
+    /// (see [`painted`](Self::painted)) — so an unconfirmed release keeps
+    /// releasing every pass until a frame lands. `request_redraw` coalesces,
+    /// so the retries are free while the platform is dropping them.
+    pub fn release(&mut self, now_ms: u64) -> bool {
+        self.poll(now_ms) == Pace::PaintNow
     }
 }
 
@@ -142,6 +156,23 @@ mod tests {
         assert_eq!(p.poll(16), Pace::PaintNow);
         p.painted(16);
         assert_eq!(p.poll(17), Pace::Idle);
+    }
+
+    #[test]
+    fn a_dropped_redraw_request_is_retried_until_a_frame_lands() {
+        // The platform is free to drop a requested redraw on the floor — macOS
+        // delivers no RedrawRequested for a window on another Space or behind
+        // the lock screen. A released repaint must therefore stay pending until
+        // `painted` confirms a frame actually landed; otherwise the window
+        // shows stale content until some input forces a fresh request.
+        let mut p = FramePacer::new(16);
+        p.request();
+        assert!(p.release(0), "a pending repaint releases");
+        // No painted(): the RedrawRequested never arrived. Keep asking.
+        assert!(p.release(16), "an unconfirmed repaint must release again");
+        // Only a frame that actually landed clears the pending repaint.
+        p.painted(16);
+        assert!(!p.release(32), "a painted frame is no longer pending");
     }
 
     #[test]
