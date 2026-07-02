@@ -366,6 +366,14 @@ fn host_main(
     // An explicit cwd (a recreate) beats where the spawning process happened
     // to run; everything below sees only the effective launch directory.
     let launch_dir = opts.cwd.as_deref().or(launch_dir);
+    // Funnel signals FIRST — before the pid file exists. The pid file is what
+    // `ghost kill` SIGTERMs, so from the moment it is written we must die
+    // gracefully: a kill racing the rest of this setup used to hit the default
+    // disposition and drop the host on the spot, before the recorder below was
+    // ever created — leaving no recording. With the handler installed the
+    // signal just queues on the self-pipe until the poll loop drains it, after
+    // the recorder exists (its drop flushes the file even on that first turn).
+    let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
     std::fs::write(
         paths::pid_path(current_name),
         std::process::id().to_string(),
@@ -413,8 +421,6 @@ fn host_main(
         desc_cwd = child_cwd(&child).or_else(|| launch_dir.map(Into::into));
         write_descriptor(current_name, &meta, desc_cwd.clone());
     }
-
-    let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
 
     // Authoritative screen state, fed every byte the child writes so a late
     // attach can be repainted to the current state. A seeded spawn (a

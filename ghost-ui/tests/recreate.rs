@@ -86,6 +86,26 @@ fn a_seeded_session_starts_with_its_predecessors_screen() {
         wait_until(Duration::from_secs(5), || ls(xdg).contains("phoenix")),
         "session not listed"
     );
+    // Wait until the first life's output actually reached the host — `ls`
+    // only proves the session exists, not that the child has run, and a kill
+    // can only flush what the host has already pumped into the recorder.
+    let mut first =
+        Session::attach_path(&sock(xdg, "phoenix"), "phoenix", 80, 24).expect("attach first life");
+    first
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    let mut fscreen = Screen::new(80, 24, 100);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            if let Ok(p) = first.pump() {
+                fscreen.feed(&p.output);
+            }
+            fscreen.text().join("\n").contains("FIRST-LIFE-CONTENT")
+        }),
+        "the first life's output never arrived; saw:\n{}",
+        fscreen.text().join("\n")
+    );
+    drop(first); // detach; the session lives on
 
     // Death. Killing flushes and closes the recording.
     let out = ghost(xdg).args(["kill", "phoenix"]).output().unwrap();
