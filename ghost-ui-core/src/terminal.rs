@@ -355,6 +355,19 @@ impl TerminalModel {
         &self.session
     }
 
+    /// The window title for this session: the app-set title (OSC 0/2) when it has
+    /// one, else the session name so a shell that never set a title still shows
+    /// something meaningful. Lives on the screen state, so it is remembered across
+    /// background/foreground switches.
+    pub fn title(&self) -> String {
+        let title = self.screen.title();
+        if title.is_empty() {
+            self.session.clone()
+        } else {
+            title.to_string()
+        }
+    }
+
     /// The terminal's grid size in cells (cols, rows).
     pub fn dims(&self) -> (u16, u16) {
         (self.cols, self.rows)
@@ -934,9 +947,11 @@ impl TerminalModel {
             }
             let selection_dropped = had_selection && self.selection.is_none();
             // Reflect an OSC 0/2 window-title change to the shell, once per change.
+            // Emit the fallback (session name when the app cleared its title) so an
+            // empty OSC 2 never blanks the titlebar — consistent with switch paths.
             if self.screen.title() != self.last_title.as_str() {
                 self.last_title = self.screen.title().to_string();
-                cmds.push(Cmd::SetTitle(self.last_title.clone()));
+                cmds.push(Cmd::SetTitle(self.title()));
             }
             // A new image may be a direct placement the row-damage hint doesn't
             // cover, so upload count is its own repaint trigger.
@@ -2986,6 +3001,27 @@ mod tests {
         // A different title emits again.
         let cmds = feed_cmds(&mut m, b"\x1b]2;other\x07");
         assert!(cmds.contains(&Cmd::SetTitle("other".to_string())));
+    }
+
+    #[test]
+    fn clearing_the_title_falls_back_to_the_session_name() {
+        let mut m = model(); // session "alpha"
+        let feed_cmds = |m: &mut TerminalModel, b: &[u8]| {
+            m.update(UiEvent::SessionData {
+                name: "alpha".to_string(),
+                bytes: b.to_vec(),
+                ended: false,
+            })
+        };
+        feed_cmds(&mut m, b"\x1b]2;my-prog\x07");
+        // Clearing the title (OSC 2 with an empty payload — some TUIs send this on
+        // exit) must not blank the titlebar: fall back to the session name, matching
+        // what a foreground switch would show for a titleless session.
+        let cmds = feed_cmds(&mut m, b"\x1b]2;\x07");
+        assert!(
+            cmds.contains(&Cmd::SetTitle("alpha".to_string())),
+            "a cleared title falls back to the session name, not empty: {cmds:?}"
+        );
     }
 
     #[test]

@@ -578,7 +578,14 @@ impl RootModel {
         };
         let (name, ended) = (name.clone(), *ended);
         let cmds = match self.warm.get_mut(&name) {
-            Some(m) => m.update(ev),
+            // A background mirror still tracks its own title internally (so a later
+            // Ctrl-Tab restores it), but must not drive the window title — only the
+            // foreground session does. Same guard the fleet overview applies to tiles.
+            Some(m) => m
+                .update(ev)
+                .into_iter()
+                .filter(|c| !matches!(c, Cmd::SetTitle(_)))
+                .collect(),
             None => Vec::new(), // not a session this window mirrors
         };
         if ended {
@@ -660,9 +667,13 @@ impl RootModel {
         };
         // Size the (possibly restored or fresh) foreground to the window.
         cmds.extend(resize_model(&mut model, self.size_px, self.scale, self.pad));
+        // The window title follows the foreground: reassert this session's remembered
+        // title on the switch, since it changed no title of its own to trigger one.
+        let title = model.title();
         self.mode = Mode::Single(Box::new(model));
         self.mine.insert(id.clone());
         self.primary = Some(id);
+        cmds.push(Cmd::SetTitle(title));
         cmds.push(Cmd::Redraw);
         if let Some(anim) = anim {
             self.anim = Some(anim);
@@ -711,8 +722,11 @@ impl RootModel {
                 m
             });
             let mut cmds = resize_model(&mut model, self.size_px, self.scale, self.pad);
+            // The window title follows the new foreground, not the exited session.
+            let title = model.title();
             self.mode = Mode::Single(Box::new(model));
             self.primary = Some(next);
+            cmds.push(Cmd::SetTitle(title));
             // Slide the next session in (forward, like a Ctrl-Tab) over the dead
             // session's frozen stand-in.
             let incoming = self.live_scene();
@@ -903,6 +917,9 @@ impl RootModel {
                 let id = model.session().to_string();
                 self.mine.insert(id.clone());
                 self.primary = Some(id);
+                // Follow the foreground: diving in reasserts this session's remembered
+                // title, since the fleet filtered any title changes while overviewing.
+                cmds.push(Cmd::SetTitle(model.title()));
                 (Mode::Single(Box::new(model)), cmds, anim)
             }
         };
@@ -1929,6 +1946,85 @@ mod tests {
                 session: "beta".into(),
                 bytes: b"z".to_vec()
             }]
+        );
+    }
+
+    /// Feed a session an OSC 2 window-title change.
+    fn set_title(r: &mut RootModel, name: &str, title: &str) -> Vec<Cmd> {
+        r.update(UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: format!("\x1b]2;{title}\x07").into_bytes(),
+            ended: false,
+        })
+    }
+
+    #[test]
+    fn the_foreground_session_retitles_the_window() {
+        let mut r = root(); // foreground alpha
+        let cmds = set_title(&mut r, "alpha", "editing README");
+        assert!(
+            cmds.contains(&Cmd::SetTitle("editing README".into())),
+            "the foreground session drives the window title: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_background_session_does_not_retitle_the_window() {
+        let mut r = root(); // foreground alpha
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        // alpha is now a warm background mirror; its OSC title change must stay put.
+        let cmds = set_title(&mut r, "alpha", "background noise");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
+            "a background session must not retitle the window: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn switching_the_foreground_restores_that_sessions_title() {
+        let mut r = root(); // foreground alpha
+        set_title(&mut r, "alpha", "alpha-title");
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        set_title(&mut r, "beta", "beta-title");
+        // Switching back to alpha must reassert alpha's remembered title, not leave
+        // the window showing beta's.
+        let cmds = r.update(UiEvent::AdoptSession("alpha".into()));
+        assert!(
+            cmds.contains(&Cmd::SetTitle("alpha-title".into())),
+            "switching the foreground restores that session's title: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn adopting_a_titleless_session_shows_its_name() {
+        let mut r = root(); // foreground alpha
+        // beta has set no OSC title yet: the window falls back to its session name
+        // rather than lingering on alpha's title or going blank.
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(
+            cmds.contains(&Cmd::SetTitle("beta".into())),
+            "a titleless foreground shows its session name: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn diving_back_in_reasserts_the_foreground_title() {
+        let mut r = root(); // single view of alpha
+        set_title(&mut r, "alpha", "vim");
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // dive out to the fleet
+        // While overviewing, alpha changes its title. The fleet filters it, so the
+        // window keeps showing "vim" even though alpha's title is now "alpha:~".
+        let cmds = set_title(&mut r, "alpha", "alpha:~");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
+            "the fleet must not retitle the window for a tile: {cmds:?}"
+        );
+        // Diving back in (F9) must reassert alpha's current title, not leave the
+        // titlebar stale on "vim".
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(
+            cmds.contains(&Cmd::SetTitle("alpha:~".into())),
+            "diving back into a session reasserts its title: {cmds:?}"
         );
     }
 

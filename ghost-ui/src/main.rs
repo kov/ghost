@@ -1316,6 +1316,10 @@ impl App {
             }
         };
         let model = TerminalModel::new(name.to_string(), cols, rows, metrics());
+        // Title the window with the session up front (its name until the app sets an
+        // OSC title), so the initial view follows the foreground like every switch does
+        // — not a static "ghost".
+        gfx.window.set_title(&model.title());
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
