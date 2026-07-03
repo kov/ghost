@@ -26,7 +26,7 @@ use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
 use crate::event::SessionPush;
-use crate::group::Group;
+use crate::group::{Group, GroupId};
 use crate::input::{Key, Mods, NamedKey};
 use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
@@ -113,10 +113,13 @@ struct ConfirmLayout {
 /// A section header: its locality and the header band's rect.
 /// A header band in the laid-out grid: an attach-state section, or a group
 /// block (which also carries the whole block's rect for its accent outline).
-#[derive(Clone, Copy)]
+/// Groups are keyed by their durable id, never a registry index — the
+/// registry is replaced wholesale by cross-window broadcasts, so an index
+/// could silently retarget.
+#[derive(Clone)]
 enum Band {
     Section(Locality),
-    Group { idx: usize, block: RectPx },
+    Group { id: GroupId, block: RectPx },
 }
 
 type SectionHeader = (Band, RectPx);
@@ -158,8 +161,6 @@ enum GroupButton {
     Open,
     /// Detach the members this window drives (they keep running).
     Detach,
-    /// Dissolve the grouping; the sessions themselves are untouched.
-    Ungroup,
     /// Kill every member and its process (confirmed first).
     Kill,
 }
@@ -170,7 +171,6 @@ impl GroupButton {
             GroupButton::Relaunch => "relaunch",
             GroupButton::Open => "attach all",
             GroupButton::Detach => "detach",
-            GroupButton::Ungroup => "ungroup",
             GroupButton::Kill => "kill",
         }
     }
@@ -214,10 +214,10 @@ struct Pending {
 }
 
 /// What a pending confirmation acts on: one session, or a whole group (by
-/// index into the fleet's groups).
+/// durable id, resilient to the registry being replaced under the modal).
 enum PendingTarget {
     Session(SessionId),
-    Group(usize),
+    Group(GroupId),
 }
 
 /// The confirm modal's two buttons.
@@ -376,15 +376,18 @@ pub struct FleetModel {
     /// mirror. Unobserved when the tile goes, the window takes the session
     /// over, or the fleet closes.
     observing: HashSet<SessionId>,
-    /// Multi-selected tiles (Space / Ctrl-click), the input to group creation.
+    /// Multi-selected tiles (Space / Ctrl-click), the input to bulk actions.
     /// Cleared by Escape — which marks claim ahead of the fleet toggle.
     marked: HashSet<SessionId>,
-    /// User-defined groups, in creation order. Handed in and out by the root
-    /// across fleet open/close; every mutation is persisted via
-    /// `Cmd::SaveGroups`.
+    /// The group registry, in creation order. Handed in and out by the root
+    /// across fleet open/close; membership edits to this window's own group
+    /// are persisted via `Cmd::SaveGroups` (see [`Self::sync_my_group`]).
     groups: Vec<Group>,
-    /// The group-name prompt (`g` with marks): `Some` while it is open.
-    naming_group: Option<TextInput>,
+    /// This window's group identity (id, name, color), minted by the shell at
+    /// window creation. Its registry entry — created on first membership —
+    /// tracks the sessions this window drives plus the dead ones it
+    /// remembers.
+    my_group: Group,
     /// The in-flight pointer press, if any (see [`Grab`]): a click waiting for
     /// its release, or a tile drag in progress.
     grab: Option<Grab>,
@@ -498,7 +501,7 @@ enum GrabTarget {
         button: Option<Button>,
     },
     Chip {
-        group: usize,
+        group: GroupId,
         button: GroupButton,
     },
 }
@@ -534,7 +537,7 @@ impl FleetModel {
             observing: HashSet::new(),
             marked: HashSet::new(),
             groups: Vec::new(),
-            naming_group: None,
+            my_group: Group::auto(String::new(), 0),
             grab: None,
         }
     }
@@ -551,15 +554,22 @@ impl FleetModel {
         cmds
     }
 
-    /// The user-defined groups, for [`RootModel`](crate::RootModel) to carry
+    /// The group registry, for [`RootModel`](crate::RootModel) to carry
     /// across fleet close/reopen (the fleet model is rebuilt each opening).
     pub fn groups(&self) -> &[Group] {
         &self.groups
     }
 
-    /// Seed the groups on a freshly built fleet (carry-over or startup load).
+    /// Seed the registry on a freshly built fleet (carry-over or startup load).
     pub fn set_groups(&mut self, groups: Vec<Group>) {
         self.groups = groups;
+    }
+
+    /// Adopt this window's group identity (minted by the shell at window
+    /// creation, carried by the root). Members are ignored: the registry
+    /// entry, synced from the tiles, is the membership authority.
+    pub fn set_my_group(&mut self, group: Group) {
+        self.my_group = group;
     }
 
     /// Physical cell metrics: the base metrics scaled by the device scale factor.
@@ -650,7 +660,7 @@ impl FleetModel {
     /// prompt) is capturing input — keys like Escape belong to it, not to
     /// whoever hosts the fleet.
     pub fn modal_open(&self) -> bool {
-        self.renaming.is_some() || self.pending.is_some() || self.naming_group.is_some()
+        self.renaming.is_some() || self.pending.is_some()
     }
 
     pub fn tile_count(&self) -> usize {
@@ -859,7 +869,7 @@ impl FleetModel {
     // ---- update ----
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        let cmds = match ev {
+        let mut cmds = match ev {
             UiEvent::SessionList(infos) => self.reconcile(infos),
             UiEvent::DeadSessions(dead) => self.dead_sessions(dead),
             UiEvent::SessionPush { name, push } => self.session_push(&name, push),
@@ -907,6 +917,9 @@ impl FleetModel {
             }
             _ => Vec::new(),
         };
+        // Whatever the event did to the tiles, keep my group's registry entry
+        // (and its persisted form) matched to them.
+        cmds.extend(self.sync_my_group());
         // Rebuild any preview whose content or size this event changed, so `view`
         // can stay a pure read of cached frames.
         self.refresh_dirty_frames();
@@ -1204,51 +1217,51 @@ impl FleetModel {
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
         let metrics = self.effective_metrics();
         let base_band = metrics.line_height + 6.0;
-        // Group blocks come first, in creation order, each holding its present
-        // members in their stored order — regardless of attach state (a group
-        // renders together; the sections govern only the ungrouped remainder).
-        // Dead members simply don't render; an all-dead group shows no block.
-        let grouped: HashSet<&str> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
-            .collect();
+        // This window's group leads, emphasized: the sessions it drives plus
+        // the dead ones it remembers, in the stable spatial order (see
+        // [`tile_order_key`]). Other groups' members render by locality for
+        // now — their own blocks come with per-window identity.
+        let my_members: HashSet<&str> = self
+            .group(&self.my_group.id)
+            .map(|g| g.members.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
         let mut segments: Vec<(Band, Vec<&Tile>)> = Vec::new();
-        for (idx, g) in self.groups.iter().enumerate() {
-            let ts: Vec<&Tile> = g
-                .members
-                .iter()
-                .filter_map(|id| self.tiles.iter().find(|t| &t.id == id))
-                .collect();
-            if !ts.is_empty() {
-                segments.push((
-                    Band::Group {
-                        idx,
-                        block: RectPx {
-                            x: 0.0,
-                            y: 0.0,
-                            w: 0.0,
-                            h: 0.0,
-                        }, // filled in during placement
-                    },
-                    ts,
-                ));
-            }
+        let mut mine_tiles: Vec<&Tile> = self
+            .tiles
+            .iter()
+            .filter(|t| {
+                if t.dead {
+                    my_members.contains(t.id.as_str())
+                } else {
+                    t.locality == Locality::ThisWindow
+                }
+            })
+            .collect();
+        mine_tiles.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
+        let in_my_block: HashSet<&str> = mine_tiles.iter().map(|t| t.id.as_str()).collect();
+        if !mine_tiles.is_empty() {
+            segments.push((
+                Band::Group {
+                    id: self.my_group.id.clone(),
+                    block: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                    }, // filled in during placement
+                },
+                mine_tiles,
+            ));
         }
-        // Then the attach-state sections of ungrouped tiles, preserving the
-        // stable spatial order (see [`tile_order_key`]); empty sections are
-        // dropped so they get no header. Detached comes before Elsewhere:
-        // after this window's own sessions, the unheld pool is what the user
-        // is most likely to reach for.
-        for loc in [
-            Locality::ThisWindow,
-            Locality::Detached,
-            Locality::Elsewhere,
-        ] {
+        // Then the attach-state sections of the rest. Detached comes before
+        // Elsewhere: after this window's own sessions, the unheld pool is
+        // what the user is most likely to reach for. Dead tiles of other
+        // groups don't render (their blocks come later).
+        for loc in [Locality::Detached, Locality::Elsewhere] {
             let mut ts: Vec<&Tile> = self
                 .tiles
                 .iter()
-                .filter(|t| t.locality == loc && !grouped.contains(t.id.as_str()))
+                .filter(|t| !t.dead && t.locality == loc && !in_my_block.contains(t.id.as_str()))
                 .collect();
             ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
             if !ts.is_empty() {
@@ -1362,9 +1375,9 @@ impl FleetModel {
             }
             // A group's block outline hugs its header + rows (the trailing gap
             // stays outside).
-            let kind = match *kind {
-                Band::Group { idx, .. } => Band::Group {
-                    idx,
+            let kind = match kind {
+                Band::Group { id, .. } => Band::Group {
+                    id: id.clone(),
                     block: RectPx {
                         x: (left - BLOCK_PAD).max(2.0),
                         y: header.y - BLOCK_PAD,
@@ -1372,7 +1385,7 @@ impl FleetModel {
                         h: (y - gap - header.y) + 2.0 * BLOCK_PAD,
                     },
                 },
-                sec => sec,
+                sec => sec.clone(),
             };
             headers.push((kind, header));
         }
@@ -1555,9 +1568,6 @@ impl FleetModel {
         if self.pending.is_some() {
             return self.pending_input(ev);
         }
-        if self.naming_group.is_some() {
-            return self.group_name_input(ev);
-        }
         match ev {
             UiEvent::Key {
                 key, mods, kind, ..
@@ -1577,11 +1587,11 @@ impl FleetModel {
                 // (or an ungrouped tile) opens just the tile.
                 let group = self.focused.as_deref().and_then(|id| self.group_of(id));
                 match group.filter(|_| mods.ctrl) {
-                    Some(idx) => self.open_group(idx),
+                    Some(gid) => self.open_group(&gid),
                     None => self.activate(self.focused.clone()),
                 }
             }
-            // Space marks/unmarks the focused tile (multi-select for grouping).
+            // Space marks/unmarks the focused tile (multi-select for bulk ops).
             UiEvent::Key { key, kind, .. }
                 if kind.is_down() && matches!(key, Key::Named(NamedKey::Space)) =>
             {
@@ -1617,21 +1627,6 @@ impl FleetModel {
                 match self.focused.clone() {
                     Some(id) => self.button(Button::Rename, id),
                     None => Vec::new(),
-                }
-            }
-            // `g` groups the marked tiles: opens the name prompt.
-            UiEvent::Key {
-                key, mods, kind, ..
-            } if kind.is_down()
-                && !mods.ctrl
-                && !mods.sup
-                && matches!(&key, Key::Char(s) if s == "g") =>
-            {
-                if self.marked.is_empty() {
-                    Vec::new()
-                } else {
-                    self.naming_group = Some(TextInput::new(String::new()));
-                    vec![Cmd::Redraw]
                 }
             }
             UiEvent::Pointer {
@@ -1673,45 +1668,57 @@ impl FleetModel {
         }
     }
 
+    /// The registry group `gid`, if it (still) exists.
+    fn group(&self, gid: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == gid)
+    }
+
     /// The group `id` belongs to, if any.
-    fn group_of(&self, id: &str) -> Option<usize> {
+    fn group_of(&self, id: &str) -> Option<GroupId> {
         self.groups
             .iter()
-            .position(|g| g.members.iter().any(|m| m == id))
+            .find(|g| g.members.iter().any(|m| m == id))
+            .map(|g| g.id.clone())
     }
 
-    /// Group `idx`'s members that are alive as tiles, in stored order — what
+    /// Group `gid`'s members that are alive as tiles, in stored order — what
     /// the group operations act on (dead members render, but there is nothing
     /// to attach, kill, or detach in them).
-    fn present_members(&self, idx: usize) -> Vec<SessionId> {
-        self.groups[idx]
-            .members
-            .iter()
-            .filter(|id| self.tiles.iter().any(|t| &t.id == *id && !t.dead))
-            .cloned()
-            .collect()
+    fn present_members(&self, gid: &str) -> Vec<SessionId> {
+        self.group(gid)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && !t.dead))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Group `idx`'s members whose tiles are dead — what the relaunch chip
+    /// Group `gid`'s members whose tiles are dead — what the relaunch chip
     /// brings back.
-    fn dead_members(&self, idx: usize) -> Vec<SessionId> {
-        self.groups[idx]
-            .members
-            .iter()
-            .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
-            .cloned()
-            .collect()
+    fn dead_members(&self, gid: &str) -> Vec<SessionId> {
+        self.group(gid)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// The action chips group `idx`'s header offers, left to right: each only
-    /// when it has something to act on — relaunch needs dead members,
-    /// attach-all a living member not yet driven here, kill any living one,
-    /// detach a member this window drives. Ungroup always applies (the
-    /// grouping itself exists).
-    fn group_chipset(&self, idx: usize) -> Vec<GroupButton> {
-        let present = self.present_members(idx);
+    /// The action chips group `gid`'s header offers, left to right: each only
+    /// when it has something to act on — relaunch needs dead members (and a
+    /// group that isn't this window's: my dead tiles relaunch by activation,
+    /// which re-attaches them here), attach-all a living member not yet
+    /// driven here, detach a member this window drives, kill any living one.
+    fn group_chipset(&self, gid: &str) -> Vec<GroupButton> {
+        let present = self.present_members(gid);
         let mut set = Vec::new();
-        if !self.dead_members(idx).is_empty() {
+        if gid != self.my_group.id && !self.dead_members(gid).is_empty() {
             set.push(GroupButton::Relaunch);
         }
         if present
@@ -1726,7 +1733,6 @@ impl FleetModel {
         {
             set.push(GroupButton::Detach);
         }
-        set.push(GroupButton::Ungroup);
         if !present.is_empty() {
             set.push(GroupButton::Kill);
         }
@@ -1736,8 +1742,8 @@ impl FleetModel {
     /// Open the whole group into this window (Ctrl-Enter on a member, or the
     /// header's open-all button): attach every member, foreground the first.
     /// Confirmed once if any member is held by another window.
-    fn open_group(&mut self, idx: usize) -> Vec<Cmd> {
-        let members = self.present_members(idx);
+    fn open_group(&mut self, gid: &str) -> Vec<Cmd> {
+        let members = self.present_members(gid);
         if members.is_empty() {
             return Vec::new();
         }
@@ -1746,21 +1752,21 @@ impl FleetModel {
             .any(|id| self.locality_of(id) == Some(Locality::Elsewhere))
         {
             self.pending = Some(Pending {
-                target: PendingTarget::Group(idx),
+                target: PendingTarget::Group(gid.to_string()),
                 action: PendingAction::TakeOver,
                 selected: Choice::Cancel,
             });
             return vec![Cmd::Redraw];
         }
-        let mut cmds = self.open_group_cmds(idx);
+        let mut cmds = self.open_group_cmds(gid);
         cmds.push(Cmd::Redraw);
         cmds
     }
 
     /// Run a group-header button's action: open all immediately (confirming a
-    /// take-over), detach our members immediately, dissolve the grouping, or
-    /// confirm killing every member.
-    fn group_button(&mut self, idx: usize, button: GroupButton) -> Vec<Cmd> {
+    /// take-over), detach our members immediately, or confirm killing every
+    /// member.
+    fn group_button(&mut self, gid: &str, button: GroupButton) -> Vec<Cmd> {
         match button {
             GroupButton::Relaunch => {
                 // Background respawns only — no confirm (no commands run: the
@@ -1768,17 +1774,17 @@ impl FleetModel {
                 // attach) and no adopt (the next listing revives the tiles as
                 // detached, ready to open here or elsewhere).
                 let mut cmds: Vec<Cmd> = self
-                    .dead_members(idx)
+                    .dead_members(gid)
                     .into_iter()
                     .map(Cmd::Resurrect)
                     .collect();
                 cmds.push(Cmd::Redraw);
                 cmds
             }
-            GroupButton::Open => self.open_group(idx),
+            GroupButton::Open => self.open_group(gid),
             GroupButton::Detach => {
                 let ours: Vec<SessionId> = self
-                    .present_members(idx)
+                    .present_members(gid)
                     .into_iter()
                     .filter(|id| self.locality_of(id) == Some(Locality::ThisWindow))
                     .collect();
@@ -1787,13 +1793,9 @@ impl FleetModel {
                 cmds.push(Cmd::Redraw);
                 cmds
             }
-            GroupButton::Ungroup => {
-                self.groups.remove(idx);
-                vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
-            }
             GroupButton::Kill => {
                 self.pending = Some(Pending {
-                    target: PendingTarget::Group(idx),
+                    target: PendingTarget::Group(gid.to_string()),
                     action: PendingAction::Kill,
                     selected: Choice::Cancel,
                 });
@@ -1918,9 +1920,11 @@ impl FleetModel {
                 vec![Cmd::TakeOver(id.clone())]
             }
             (PendingTarget::Session(id), PendingAction::Kill) => vec![Cmd::Kill(id.clone())],
-            (PendingTarget::Group(idx), PendingAction::TakeOver) => self.open_group_cmds(*idx),
-            (PendingTarget::Group(idx), PendingAction::Kill) => self
-                .present_members(*idx)
+            (PendingTarget::Group(gid), PendingAction::TakeOver) => {
+                self.open_group_cmds(&gid.clone())
+            }
+            (PendingTarget::Group(gid), PendingAction::Kill) => self
+                .present_members(gid)
                 .into_iter()
                 .map(Cmd::Kill)
                 .collect(),
@@ -1935,8 +1939,8 @@ impl FleetModel {
     /// driven NOW — tiles flip to ThisWindow and their observations close
     /// (the window's own clients feed them from here) — so leaving the fleet
     /// carries them out as warm mirrors, live content and all.
-    fn open_group_cmds(&mut self, idx: usize) -> Vec<Cmd> {
-        let members = self.present_members(idx);
+    fn open_group_cmds(&mut self, gid: &str) -> Vec<Cmd> {
+        let members = self.present_members(gid);
         let mut cmds = Vec::new();
         for id in members.iter().skip(1) {
             if self.observing.remove(id) {
@@ -1957,17 +1961,16 @@ impl FleetModel {
     fn confirm_texts(&self, p: &Pending) -> (String, &'static str) {
         let id = match &p.target {
             PendingTarget::Session(id) => id,
-            PendingTarget::Group(idx) => {
-                let g = &self.groups[*idx];
-                let n = self.present_members(*idx).len();
+            PendingTarget::Group(gid) => {
+                let name = self.group(gid).map(|g| g.name.as_str()).unwrap_or(gid);
+                let n = self.present_members(gid).len();
                 return match p.action {
                     PendingAction::Kill => {
-                        (format!("Kill the {} group ({n} sessions)?", g.name), "Kill")
+                        (format!("Kill the {name} group ({n} sessions)?"), "Kill")
                     }
                     PendingAction::TakeOver => (
                         format!(
-                            "{} has sessions open in another window \u{2014} take them over?",
-                            g.name
+                            "{name} has sessions open in another window \u{2014} take them over?"
                         ),
                         "Take over",
                     ),
@@ -2121,86 +2124,51 @@ impl FleetModel {
         }
     }
 
-    /// Input for the group-name prompt — the same editing surface as the
-    /// inline rename (typed chars, IME commits, word/line chords), committed
-    /// with Enter (an empty name cancels) and cancelled with Escape, which
-    /// keeps the marks so the selection isn't lost to a typo.
-    fn group_name_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        match ev {
-            UiEvent::Text(s) => {
-                self.preedit.clear();
-                if let Some(b) = &mut self.naming_group {
-                    b.insert(&s);
-                }
-                vec![Cmd::Redraw]
-            }
-            UiEvent::Key {
-                key, mods, kind, ..
-            } if kind.is_down() => match key {
-                Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
-                    if let Some(b) = &mut self.naming_group {
-                        b.insert(&s);
-                    }
-                    vec![Cmd::Redraw]
-                }
-                Key::Named(NamedKey::Space)
-                    if !mods.ctrl && !mods.sup && self.preedit.is_empty() =>
-                {
-                    if let Some(b) = &mut self.naming_group {
-                        b.insert(" ");
-                    }
-                    vec![Cmd::Redraw]
-                }
-                Key::Named(NamedKey::Enter) => {
-                    let name = self
-                        .naming_group
-                        .take()
-                        .expect("prompt checked by caller")
-                        .into_text();
-                    if name.is_empty() {
-                        return vec![Cmd::Redraw];
-                    }
-                    self.create_group(name)
-                }
-                Key::Named(NamedKey::Escape) => {
-                    self.naming_group = None;
-                    vec![Cmd::Redraw]
-                }
-                key => {
-                    if let Some(b) = &mut self.naming_group
-                        && b.key(&key, mods)
-                    {
-                        vec![Cmd::Redraw]
-                    } else {
-                        Vec::new()
-                    }
-                }
-            },
-            _ => Vec::new(),
-        }
-    }
-
-    /// Turn the current marks into a new group: members in display order, the
-    /// next palette color, persisted immediately.
-    fn create_group(&mut self, name: String) -> Vec<Cmd> {
-        let members: Vec<SessionId> = self
-            .layout()
-            .into_iter()
-            .map(|(_, id, _)| id)
-            .filter(|id| self.marked.contains(id))
+    /// Reconcile this window's registry entry with reality: its members are
+    /// the sessions this window drives plus the dead ones it remembers, in
+    /// tile order. Death keeps membership (that's what a dead tile in the
+    /// block is); detach, steal, and a revival that didn't come back here all
+    /// drop it. Returns the save when the entry actually changed — the single
+    /// place my group's membership is persisted from.
+    fn sync_my_group(&mut self) -> Vec<Cmd> {
+        let current: Vec<SessionId> = self
+            .group(&self.my_group.id)
+            .map(|g| g.members.clone())
+            .unwrap_or_default();
+        // Only an existing tile is evidence for dropping a member: one not
+        // seeded yet (a fresh fleet before the dead-session sweep lands)
+        // stays remembered. A dead tile stays; a live one stays only while
+        // this window drives it.
+        let mut desired: Vec<SessionId> = current
+            .iter()
+            .filter(|id| {
+                self.tiles
+                    .iter()
+                    .find(|t| &&t.id == id)
+                    .is_none_or(|t| t.dead || t.locality == Locality::ThisWindow)
+            })
+            .cloned()
             .collect();
-        self.marked.clear();
-        if members.is_empty() {
-            return vec![Cmd::Redraw];
+        for t in &self.tiles {
+            if !t.dead && t.locality == Locality::ThisWindow && !desired.contains(&t.id) {
+                desired.push(t.id.clone());
+            }
         }
-        let color = (self.groups.len() % crate::group::GROUP_PALETTE.len()) as u8;
-        self.groups.push(Group {
-            id: String::new(),
-            name,
-            color,
-            members,
-        });
-        vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
+        if desired == current {
+            return Vec::new();
+        }
+        if desired.is_empty() {
+            // Nothing driven or remembered: the entry goes; the identity
+            // stays with the window for its next claim.
+            self.groups.retain(|g| g.id != self.my_group.id);
+        } else if let Some(g) = self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
+            g.members = desired;
+        } else {
+            let mut g = self.my_group.clone();
+            g.members = desired;
+            self.groups.push(g);
+        }
+        vec![Cmd::SaveGroups(self.groups.clone())]
     }
 
     fn pointer(&mut self, phase: PointerPhase, pos: PointPx, ctrl: bool) -> Vec<Cmd> {
@@ -2224,15 +2192,15 @@ impl FleetModel {
         let (headers, placements, band, _) = self.sections_layout();
         // Group-header action chips first (they sit on no tile).
         for (kind, header) in &headers {
-            if let Band::Group { idx, .. } = kind
+            if let Band::Group { id: gid, .. } = kind
                 && let Some((b, brect)) =
-                    group_buttons(*header, self.effective_metrics(), &self.group_chipset(*idx))
+                    group_buttons(*header, self.effective_metrics(), &self.group_chipset(gid))
                         .into_iter()
                         .find(|(_, r)| r.contains(px, py))
             {
                 self.grab = Some(Grab {
                     target: GrabTarget::Chip {
-                        group: *idx,
+                        group: gid.clone(),
                         button: b,
                     },
                     press: (vx, vy),
@@ -2316,7 +2284,7 @@ impl FleetModel {
             };
         }
         match g.target {
-            GrabTarget::Chip { group, button } => self.group_button(group, button),
+            GrabTarget::Chip { group, button } => self.group_button(&group, button),
             GrabTarget::Tile {
                 id,
                 button: Some(b),
@@ -2325,59 +2293,11 @@ impl FleetModel {
         }
     }
 
-    /// Drop a dragged tile at `(px, py)` (content space). Inside a group
-    /// block it joins — or moves within — that group, at the slot under the
-    /// pointer; anywhere else it leaves its group. A group emptied either way
-    /// dissolves, and a dead tile dragged out of its group is forgotten on
-    /// the spot (only its membership was keeping it around).
-    fn drop_tile(&mut self, id: &str, px: f32, py: f32) -> Vec<Cmd> {
-        let before = self.groups.clone();
-        let (headers, placements, _, _) = self.sections_layout();
-        let target = headers.iter().find_map(|(kind, _)| match kind {
-            Band::Group { idx, block } if block.contains(px, py) => Some(*idx),
-            _ => None,
-        });
-        match target {
-            Some(mut gi) => {
-                // The slot under the pointer, from the pre-drop layout minus
-                // the dragged card: a member counts as passed when the drop
-                // point is below its row, or on it and past its centre.
-                let members = self.groups[gi].members.clone();
-                let slot = placements
-                    .iter()
-                    .filter(|(_, tid, _)| tid != id && members.iter().any(|m| m == tid))
-                    .filter(|(_, _, r)| py > r.y + r.h || (py >= r.y && px > r.x + r.w * 0.5))
-                    .count();
-                if let Some(fi) = self.group_of(id) {
-                    self.groups[fi].members.retain(|m| m != id);
-                    if fi != gi && self.groups[fi].members.is_empty() {
-                        self.groups.remove(fi);
-                        if fi < gi {
-                            gi -= 1;
-                        }
-                    }
-                }
-                self.groups[gi].members.insert(slot, id.to_string());
-            }
-            None => {
-                if let Some(fi) = self.group_of(id) {
-                    self.groups[fi].members.retain(|m| m != id);
-                    if self.groups[fi].members.is_empty() {
-                        self.groups.remove(fi);
-                    }
-                    if self.tiles.iter().any(|t| t.id == id && t.dead) {
-                        self.tiles.retain(|t| t.id != id);
-                        if self.focused.as_deref() == Some(id) {
-                            self.focused = self.tiles.first().map(|t| t.id.clone());
-                        }
-                    }
-                }
-            }
-        }
-        if self.groups == before {
-            return vec![Cmd::Redraw];
-        }
-        vec![Cmd::SaveGroups(self.groups.clone()), Cmd::Redraw]
+    /// Drop a dragged tile. With groups automatic, dropping edits no
+    /// membership yet — the card snaps home. The attach/detach drop gestures
+    /// land with the marks-and-DnD rework.
+    fn drop_tile(&mut self, _id: &str, _px: f32, _py: f32) -> Vec<Cmd> {
+        vec![Cmd::Redraw]
     }
 
     fn toggle_mark(&mut self, id: &str) {
@@ -2414,16 +2334,25 @@ impl FleetModel {
                     color: SECTION_LABEL_COLOR,
                     scale: 1.0,
                 }),
-                Band::Group { idx, mut block } => {
+                Band::Group { id: gid, mut block } => {
                     block.y -= sy;
-                    let group = &self.groups[idx];
-                    // Group ranks live above the three locality ranks.
-                    let id = SceneId::Section(GROUP_SECTION_RANK_BASE + idx as u8);
+                    // The registry entry may lag a beat behind the tiles (it
+                    // syncs on update); my own block always has its identity.
+                    let group = self.group(&gid).unwrap_or(&self.my_group);
+                    // Group ranks live above the three locality ranks; this
+                    // window's block is emphasized with a heavier outline.
+                    let rank = self
+                        .groups
+                        .iter()
+                        .position(|g| g.id == gid)
+                        .unwrap_or_default() as u8;
+                    let id = SceneId::Section(GROUP_SECTION_RANK_BASE + rank);
+                    let width = if gid == self.my_group.id { 2.0 } else { 1.0 };
                     items.push(SceneItem::Border {
                         id,
                         rect: block,
                         color: group.rgba(),
-                        width: 1.0,
+                        width,
                     });
                     items.push(SceneItem::Text {
                         id,
@@ -2434,7 +2363,7 @@ impl FleetModel {
                         scale: 1.0,
                     });
                     // The group's action chips, right-aligned on the band.
-                    for (b, brect) in group_buttons(rect, metrics, &self.group_chipset(idx)) {
+                    for (b, brect) in group_buttons(rect, metrics, &self.group_chipset(&gid)) {
                         let chip = inset(brect, 2.0);
                         items.push(SceneItem::Rect {
                             id,
@@ -2751,46 +2680,6 @@ impl FleetModel {
             }
         }
 
-        // The group-name prompt scrims the grid like the confirm dialog: an
-        // emphasized label with the live edit buffer (caret block at the
-        // cursor) centred beneath it. Enter commits, Escape cancels.
-        if let Some(b) = &self.naming_group {
-            let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
-            items.push(SceneItem::Rect {
-                id: SceneId::Sidebar,
-                rect: RectPx {
-                    x: 0.0,
-                    y: 0.0,
-                    w,
-                    h,
-                },
-                color: OVERLAY_BG,
-                radius: 0.0,
-            });
-            let mm = self.modal_metrics();
-            let (before, after) = b.halves();
-            let lines = [
-                ("Group name:".to_string(), h * 0.5 - 1.5 * mm.line_height),
-                (format!("{before}\u{2588}{after}"), h * 0.5),
-            ];
-            for (text, y) in lines {
-                let tw = text.chars().count() as f32 * mm.advance;
-                items.push(SceneItem::Text {
-                    id: SceneId::NavBar,
-                    rect: RectPx {
-                        x: ((w - tw) * 0.5).max(GAP),
-                        y,
-                        w: tw.max(1.0),
-                        h: mm.line_height,
-                    },
-                    runs: vec![label_run(&text)],
-                    metrics: mm,
-                    color: OVERLAY_FG,
-                    scale: MODAL_SCALE,
-                });
-            }
-        }
-
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer::new(0, items));
         scene
@@ -3009,19 +2898,23 @@ mod tests {
         }
     }
 
-    /// `(label, top-y)` for each section header in the rendered scene (the
-    /// Section-id Text items, not placeholder name labels).
+    /// `(label, top-y)` for each section header in the rendered scene: the
+    /// FIRST Section-id Text per id — the band's label (a group's chips share
+    /// their band's id and come after it).
     fn headers(m: &FleetModel) -> Vec<(String, f32)> {
+        let mut seen = HashSet::new();
         m.view().layers[0]
             .items
             .iter()
             .filter_map(|it| match it {
                 SceneItem::Text {
-                    id: SceneId::Section(_),
+                    id: SceneId::Section(rank),
                     runs,
                     rect,
                     ..
-                } => Some((runs.iter().map(|r| r.text.as_str()).collect(), rect.y)),
+                } if seen.insert(*rank) => {
+                    Some((runs.iter().map(|r| r.text.as_str()).collect(), rect.y))
+                }
                 _ => None,
             })
             .collect()
@@ -3128,65 +3021,97 @@ mod tests {
         assert!(!m.consumes_escape());
     }
 
-    fn type_str(m: &mut FleetModel, s: &str) {
-        for ch in s.chars() {
-            key(m, Key::Char(ch.to_string()));
-        }
+    /// This window's fleet: `mine` pre-owned, with a minted group identity —
+    /// what the root hands a real fleet.
+    fn my_fleet(mine: &[&str]) -> FleetModel {
+        let mut m = FleetModel::new(METRICS, SIZE, mine.iter().map(|s| s.to_string()).collect());
+        m.set_my_group(Group::auto("w1".into(), 0));
+        m
+    }
+
+    /// Seed a foreign group into the registry, as a shell broadcast would.
+    fn seed_group(m: &mut FleetModel, gid: &str, name: &str, members: &[&str]) {
+        let mut groups: Vec<Group> = m.groups().to_vec();
+        groups.retain(|g| g.id != gid);
+        groups.push(Group {
+            id: gid.to_string(),
+            name: name.to_string(),
+            color: 1,
+            members: members.iter().map(|s| s.to_string()).collect(),
+        });
+        m.update(UiEvent::GroupsLoaded(groups));
+    }
+
+    /// My group's persisted members according to the LAST save in `cmds`
+    /// (`None` when nothing was saved).
+    fn saved_members(cmds: &[Cmd], gid: &str) -> Option<Vec<String>> {
+        cmds.iter().rev().find_map(|c| match c {
+            Cmd::SaveGroups(gs) => Some(
+                gs.iter()
+                    .find(|g| g.id == gid)
+                    .map(|g| g.members.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        })
     }
 
     #[test]
-    fn g_with_marks_creates_a_named_group() {
-        let mut m = fleet();
+    fn this_windows_sessions_render_as_its_emphasized_group_block() {
+        let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        key(&mut m, Key::Named(NamedKey::Space)); // mark "a" (default focus)
-        let pos = centre_of(&m, "c");
-        press_ctrl(&mut m, pos); // mark "c"
-        key(&mut m, Key::Char("g".into()));
-        assert!(m.modal_open(), "the group-name prompt is a modal");
-        type_str(&mut m, "web");
-        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
-        assert_eq!(m.groups.len(), 1);
-        assert_eq!(m.groups[0].name, "web");
+        let cmds = m.update(UiEvent::SessionList(vec![
+            sinfo("a", true), // driven by this window
+            info("b"),        // detached
+            sinfo("c", true), // held elsewhere
+        ]));
+        // The driven session renders in this window's block — named after
+        // its color — with the sections below it.
+        let hs = headers(&m);
+        let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["blue", "Detached", "Attached elsewhere"]);
+        assert!(tile_y(&m, "a") < tile_y(&m, "b"));
+        assert!(tile_y(&m, "b") < tile_y(&m, "c"));
+        // Membership is persisted without being asked.
         assert_eq!(
-            m.groups[0].members,
-            vec!["a".to_string(), "c".to_string()],
-            "members in display order"
+            saved_members(&cmds, "w1"),
+            Some(vec!["a".to_string()]),
+            "the automatic group saves its membership: {cmds:?}"
         );
-        assert!(m.marked.is_empty(), "grouping consumes the marks");
+        // The block is outlined in the group color, heavier than the 1px
+        // norm — this window's group is the emphasized one.
+        let accent = crate::group::GROUP_PALETTE[0];
         assert!(
-            cmds.iter()
-                .any(|c| matches!(c, Cmd::SaveGroups(g) if g.len() == 1)),
-            "the new group is persisted; got {cmds:?}"
+            m.view().layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Border { color, width, .. } if *color == accent && *width == 2.0)),
+            "my block carries an emphasized accent outline"
         );
     }
 
     #[test]
-    fn g_without_marks_or_name_is_inert() {
-        let mut m = fleet();
-        list(&mut m, &["a"]);
-        key(&mut m, Key::Char("g".into()));
-        assert!(!m.modal_open(), "no marks, no prompt");
-        // With a mark but an empty name, Enter cancels rather than creating.
-        key(&mut m, Key::Named(NamedKey::Space));
-        key(&mut m, Key::Char("g".into()));
-        key(&mut m, Key::Named(NamedKey::Enter));
-        assert!(m.groups.is_empty());
-    }
-
-    #[test]
-    fn escape_cancels_the_group_prompt_keeping_marks() {
-        let mut m = fleet();
-        list(&mut m, &["a"]);
-        key(&mut m, Key::Named(NamedKey::Space));
-        key(&mut m, Key::Char("g".into()));
-        key(&mut m, Key::Named(NamedKey::Escape));
-        assert!(!m.modal_open());
-        assert!(m.groups.is_empty());
+    fn a_windows_group_entry_lives_and_dies_with_its_membership() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        // Nothing driven: no entry, no block, no save.
+        let cmds = list(&mut m, &["a", "b"]);
+        assert!(saved_members(&cmds, "w1").is_none(), "{cmds:?}");
+        assert!(m.groups().iter().all(|g| g.id != "w1"));
         assert!(
-            m.marked.contains("a"),
-            "cancelling the prompt keeps the selection"
+            headers(&m).iter().all(|(l, _)| l != "blue"),
+            "an empty group shows no block"
         );
+        // Claiming a session creates the entry; releasing it dissolves it.
+        m.mine.insert("a".to_string());
+        let cmds = list(&mut m, &["a", "b"]);
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["a".to_string()]));
+        let r = button_rect(&m, "a", Button::Detach);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(Vec::new()),
+            "the emptied entry is dropped from the registry: {cmds:?}"
+        );
+        assert!(m.groups().iter().all(|g| g.id != "w1"));
     }
 
     /// Press Enter with Ctrl held.
@@ -3212,17 +3137,17 @@ mod tests {
         assert!(!m.marked.contains(id));
     }
 
-    /// The rect of `button` on group `idx`'s header band.
-    fn group_button_rect(m: &FleetModel, idx: usize, button: GroupButton) -> RectPx {
+    /// The rect of `button` on group `gid`'s header band.
+    fn group_button_rect(m: &FleetModel, gid: &str, button: GroupButton) -> RectPx {
         let (headers, _, _, _) = m.sections_layout();
         let header = headers
             .iter()
             .find_map(|(b, r)| match b {
-                Band::Group { idx: i, .. } if *i == idx => Some(*r),
+                Band::Group { id, .. } if id == gid => Some(*r),
                 _ => None,
             })
             .expect("the group has a header band");
-        group_buttons(header, m.effective_metrics(), &m.group_chipset(idx))
+        group_buttons(header, m.effective_metrics(), &m.group_chipset(gid))
             .into_iter()
             .find(|(b, _)| *b == button)
             .expect("the chip applies to this group")
@@ -3231,25 +3156,33 @@ mod tests {
 
     #[test]
     fn ctrl_enter_opens_the_whole_group_with_the_first_member_foreground() {
-        let mut m = fleet();
+        let mut m = my_fleet(&[]);
         widen(&mut m);
         list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
         // The first member is adopted (single view); the rest attach as this
         // window's background sessions — claimed as driven right away (their
-        // mirrors close, their tiles flip). The ungrouped "b" is untouched.
+        // mirrors close, their tiles flip). The non-member "b" is untouched.
         assert_eq!(
             cmds,
             vec![
                 Cmd::Unobserve("c".into()),
                 Cmd::Attach("c".into()),
                 Cmd::TakeOver("a".into()),
-                Cmd::Redraw
+                Cmd::Redraw,
+                Cmd::SaveGroups(m.groups().to_vec()),
             ]
         );
         assert_eq!(m.locality_of("c"), Some(Locality::ThisWindow));
+        assert!(
+            m.groups()
+                .iter()
+                .any(|g| g.id == "w1" && g.members == vec!["c".to_string()]),
+            "the claimed member joins this window's group: {:?}",
+            m.groups()
+        );
     }
 
     #[test]
@@ -3257,7 +3190,7 @@ mod tests {
         let mut m = fleet();
         widen(&mut m);
         list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "b");
         assert_eq!(
             ctrl_enter(&mut m),
@@ -3274,7 +3207,7 @@ mod tests {
             info("b"),
             info("c"),
         ]));
-        make_group(&mut m, "web", &["a", "c"]);
+        seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
         assert!(m.modal_open(), "a member held elsewhere needs a confirm");
@@ -3282,27 +3215,31 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "nothing is taken over before the user confirms: {cmds:?}"
         );
-        // Space is the direct confirm chord. Members follow layout order, so
-        // the detached "c" leads the group and is the taken-over foreground.
+        // Space is the direct confirm chord. Members open in stored order,
+        // so "a" — held elsewhere — is the taken-over foreground.
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
             cmds,
             vec![
-                Cmd::Unobserve("a".into()),
-                Cmd::Attach("a".into()),
-                Cmd::TakeOver("c".into()),
-                Cmd::Redraw
+                Cmd::Unobserve("c".into()),
+                Cmd::Attach("c".into()),
+                Cmd::TakeOver("a".into()),
+                Cmd::Redraw,
+                Cmd::SaveGroups(m.groups().to_vec()),
             ]
         );
     }
 
     #[test]
-    fn the_groups_kill_button_confirms_then_kills_every_member() {
-        let mut m = fleet();
+    fn my_blocks_kill_button_confirms_then_kills_every_member() {
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        let r = group_button_rect(&m, 0, GroupButton::Kill);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
+        ]));
+        let r = group_button_rect(&m, "w1", GroupButton::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(m.modal_open(), "killing a group is confirmed first");
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
@@ -3313,67 +3250,52 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_ungroup_button_dissolves_only_the_grouping() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        let r = group_button_rect(&m, 0, GroupButton::Ungroup);
-        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
-        assert!(m.groups.is_empty(), "the grouping is gone");
-        assert_eq!(m.tiles.len(), 3, "the sessions themselves are untouched");
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, Cmd::SaveGroups(g) if g.is_empty())),
-            "the dissolution is persisted: {cmds:?}"
-        );
-    }
-
-    #[test]
-    fn the_groups_detach_button_detaches_only_members_this_window_drives() {
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+    fn my_blocks_detach_button_releases_everything_this_window_drives() {
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![
-            sinfo("a", true), // driven by this window
-            sinfo("c", true), // held elsewhere — not ours to detach
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
         ]));
-        make_group(&mut m, "web", &["a", "c"]);
-        let r = group_button_rect(&m, 0, GroupButton::Detach);
+        let r = group_button_rect(&m, "w1", GroupButton::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert_eq!(
             cmds,
             vec![
                 Cmd::Detach("a".into()),
                 Cmd::Observe("a".into()),
-                Cmd::Redraw
+                Cmd::Detach("c".into()),
+                Cmd::Observe("c".into()),
+                Cmd::Redraw,
+                Cmd::SaveGroups(m.groups().to_vec()),
             ]
         );
-        assert_eq!(
-            m.locality_of("a"),
-            Some(Locality::Detached),
-            "the released member's tile leaves This window at once"
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert!(
+            m.groups().iter().all(|g| g.id != "w1"),
+            "detaching everything dissolves the entry: {:?}",
+            m.groups()
         );
     }
 
     #[test]
-    fn the_group_header_draws_the_chips_that_apply() {
-        // A group with a member this window drives shows the full live set;
-        // nothing is dead, so there is no relaunch chip.
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+    fn my_block_offers_the_chips_that_apply() {
+        // Everything in my block is driven here: detach and kill apply;
+        // attach-all has nothing to add and relaunch is per-card.
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("c")]));
-        make_group(&mut m, "web", &["a", "c"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
         assert_eq!(
-            m.group_chipset(0),
-            vec![
-                GroupButton::Open,
-                GroupButton::Detach,
-                GroupButton::Ungroup,
-                GroupButton::Kill
-            ]
+            m.group_chipset("w1"),
+            vec![GroupButton::Detach, GroupButton::Kill]
         );
         let scene = m.view();
-        for b in m.group_chipset(0) {
+        for b in m.group_chipset("w1") {
             assert!(
                 scene.layers[0].items.iter().any(|it| matches!(it,
                     SceneItem::Text { runs, .. } if runs[0].text == b.label())),
@@ -3383,17 +3305,8 @@ mod tests {
         }
         assert!(
             !scene.layers[0].items.iter().any(|it| matches!(it,
-                SceneItem::Text { runs, .. } if runs[0].text == "relaunch")),
-            "no relaunch chip while every member lives"
-        );
-        // Nothing driven by this window — the detach chip goes too.
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        assert_eq!(
-            m.group_chipset(0),
-            vec![GroupButton::Open, GroupButton::Ungroup, GroupButton::Kill]
+                SceneItem::Text { runs, .. } if runs[0].text == "attach all")),
+            "nothing to attach: everything already lives here"
         );
     }
 
@@ -3407,32 +3320,40 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_group_member_stays_as_a_dead_tile_an_ungrouped_one_vanishes() {
-        let mut m = fleet();
+    fn a_dead_member_stays_as_a_dead_tile_in_my_block_a_stray_one_vanishes() {
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
+        ]));
         data(&mut m, "c", b"LAST-WORDS");
-        // b (ungrouped) and c (grouped) both die.
+        // b (nobody's member) and c (driven here) both die.
         let cmds = list(&mut m, &["a"]);
         assert!(
             !m.tiles.iter().any(|t| t.id == "b"),
-            "an ungrouped dead session is not remembered"
+            "a dead session in no group is not remembered"
         );
         let c = m
             .tiles
             .iter()
             .find(|t| t.id == "c")
-            .expect("a grouped dead session keeps its tile");
+            .expect("a dead member keeps its tile");
         assert!(c.dead, "the kept tile is marked dead");
         assert!(c.fed, "the reconcile itself does not clear its content");
         assert!(
             m.layout().iter().any(|(_, id, _)| id == "c"),
-            "the dead member still renders in its group's block"
+            "the dead member still renders in my block"
         );
         assert!(
             !cmds.contains(&Cmd::Observe("c".into())),
             "a dead session cannot be observed: {cmds:?}"
+        );
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            None,
+            "death alone changes no membership: {cmds:?}"
         );
         // The card says so instead of showing a stale pid.
         let scene = m.view();
@@ -3444,73 +3365,23 @@ mod tests {
     }
 
     #[test]
-    fn the_attach_all_chip_hides_when_every_member_is_already_attached_here() {
-        let mut m = FleetModel::new(
-            METRICS,
-            SIZE,
-            HashSet::from(["a".to_string(), "c".to_string()]),
-        );
+    fn an_all_dead_block_keeps_no_chips() {
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![
             sinfo("a", true),
+            info("b"),
             sinfo("c", true),
         ]));
-        make_group(&mut m, "web", &["a", "c"]);
-        assert!(
-            !m.group_chipset(0).contains(&GroupButton::Open),
-            "with every member driven here there is nothing left to attach: {:?}",
-            m.group_chipset(0)
-        );
-        assert_eq!(GroupButton::Open.label(), "attach all");
-        // Releasing a member brings the chip back.
-        let r = button_rect(&m, "a", Button::Detach);
-        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
-        assert!(
-            m.group_chipset(0).contains(&GroupButton::Open),
-            "a detached member makes attach-all applicable again"
-        );
-    }
-
-    #[test]
-    fn the_groups_relaunch_chip_respawns_dead_members_in_the_background() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "b", "c"]);
-        assert!(
-            !m.group_chipset(0).contains(&GroupButton::Relaunch),
-            "a fully-alive group offers nothing to relaunch"
-        );
-        list(&mut m, &["b"]); // a and c die
-        let r = group_button_rect(&m, 0, GroupButton::Relaunch);
-        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        list(&mut m, &["b"]); // everything driven here dies
         assert_eq!(
-            cmds,
-            vec![
-                Cmd::Resurrect("a".into()),
-                Cmd::Resurrect("c".into()),
-                Cmd::Redraw
-            ],
-            "every dead member respawns, in stored order, with no adopt"
+            m.group_chipset("w1"),
+            Vec::new(),
+            "detach/kill have no living member; my dead tiles relaunch by activation"
         );
-        assert!(!m.modal_open(), "relaunching runs no commands — no confirm");
         assert!(
-            m.tiles.iter().filter(|t| t.id != "b").all(|t| t.dead),
-            "tiles revive on the next listing (claim on success), not optimistically"
-        );
-    }
-
-    #[test]
-    fn an_all_dead_groups_chips_shrink_to_what_still_applies() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        list(&mut m, &["b"]); // the whole group dies
-        assert_eq!(
-            m.group_chipset(0),
-            vec![GroupButton::Relaunch, GroupButton::Ungroup],
-            "open/detach/kill have no living member to act on"
+            m.layout().iter().any(|(_, id, _)| id == "a"),
+            "the dead members still render in my block"
         );
     }
 
@@ -3567,10 +3438,13 @@ mod tests {
 
     #[test]
     fn a_dead_tile_relaunches_on_activation() {
-        let mut m = fleet();
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
+        ]));
         list(&mut m, &["a", "b"]); // c dies
         let cmds = press(&mut m, "c");
         assert_eq!(
@@ -3610,15 +3484,16 @@ mod tests {
 
     #[test]
     fn dead_sessions_seed_tiles_for_members_dead_before_the_fleet_opened() {
-        let mut m = fleet();
+        let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        list(&mut m, &["a"]);
+        // The carried-over registry remembers "x" as ours from a past run.
         m.set_groups(vec![Group {
-            id: "g-web".into(),
-            name: "web".into(),
+            id: "w1".into(),
+            name: "blue".into(),
             color: 0,
             members: vec!["a".into(), "x".into()],
         }]);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
         m.update(UiEvent::DeadSessions(vec![dead_info(
             "x",
             "worker",
@@ -3634,7 +3509,7 @@ mod tests {
         assert_eq!(x.command, vec!["npm", "run", "dev"]);
         assert!(
             m.layout().iter().any(|(_, id, _)| id == "x"),
-            "it renders in its group's block"
+            "it renders in my block"
         );
         // The recording playback that follows is history, not activity: the
         // dead card must not light an activity badge over it.
@@ -3652,7 +3527,7 @@ mod tests {
         let mut m = fleet();
         widen(&mut m);
         list(&mut m, &["a", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        seed_group(&mut m, "g-web", "web", &["a", "c"]);
         list(&mut m, &["a"]); // c dies
         assert!(m.tiles.iter().find(|t| t.id == "c").unwrap().dead);
         let cmds = list(&mut m, &["a", "c"]); // c returns
@@ -3666,10 +3541,13 @@ mod tests {
 
     #[test]
     fn group_ops_skip_dead_members() {
-        let mut m = fleet();
+        let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
+        ]));
         list(&mut m, &["a", "b"]); // c dies
         focus(&mut m, "a");
         assert_eq!(
@@ -3677,7 +3555,7 @@ mod tests {
             vec![Cmd::TakeOver("a".into()), Cmd::Redraw],
             "open-all attaches only the living"
         );
-        let r = group_button_rect(&m, 0, GroupButton::Kill);
+        let r = group_button_rect(&m, "w1", GroupButton::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
@@ -3716,64 +3594,25 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_tile_into_a_group_block_adds_it_at_the_pointer() {
-        let mut m = fleet();
+    fn dropping_a_dragged_tile_edits_no_membership() {
+        // Membership is automatic now; dragging still floats the card (and
+        // will grow attach/detach gestures), but a drop edits nothing.
+        let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a"]);
-        // Drag the ungrouped "c" onto the RIGHT half of a's card: it joins
-        // the group after "a".
-        let from = centre(&tile_rect(&m, "c"));
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        let before = m.groups().to_vec();
+        let from = centre(&tile_rect(&m, "b"));
         let a = tile_rect(&m, "a");
-        let cmds = drag(&mut m, from, (a.x + a.w * 0.9, a.y + a.h / 2.0));
-        assert_eq!(m.groups[0].members, vec!["a".to_string(), "c".to_string()]);
+        let cmds = drag(&mut m, from, (a.x + a.w * 0.5, a.y + a.h / 2.0));
+        assert_eq!(m.groups(), &before[..], "a drop changes no group");
         assert!(
-            cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))),
-            "membership changes persist: {cmds:?}"
+            !cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))),
+            "nothing to persist: {cmds:?}"
         );
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "a drag is not a click: {cmds:?}"
         );
-        // Dragging "b" onto the LEFT half of a's card puts it before "a".
-        let from = centre(&tile_rect(&m, "b"));
-        let a = tile_rect(&m, "a");
-        drag(&mut m, from, (a.x + a.w * 0.1, a.y + a.h / 2.0));
-        assert_eq!(
-            m.groups[0].members,
-            vec!["b".to_string(), "a".to_string(), "c".to_string()]
-        );
-    }
-
-    #[test]
-    fn dragging_within_a_group_reorders_its_members() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        // Drag "c" onto the left half of "a": [c, a].
-        let from = centre(&tile_rect(&m, "c"));
-        let a = tile_rect(&m, "a");
-        let cmds = drag(&mut m, from, (a.x + a.w * 0.1, a.y + a.h / 2.0));
-        assert_eq!(m.groups[0].members, vec!["c".to_string(), "a".to_string()]);
-        assert!(cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))));
-    }
-
-    #[test]
-    fn dragging_a_member_out_removes_it_and_an_emptied_group_dissolves() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
-        make_group(&mut m, "web", &["a", "c"]);
-        // Drop "c" onto empty space well below every block.
-        let from = centre(&tile_rect(&m, "c"));
-        let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
-        assert_eq!(m.groups[0].members, vec!["a".to_string()]);
-        assert!(cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))));
-        // The last member leaving dissolves the group entirely.
-        let from = centre(&tile_rect(&m, "a"));
-        drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
-        assert!(m.groups.is_empty(), "an empty group has no reason to live");
     }
 
     #[test]
@@ -3812,124 +3651,23 @@ mod tests {
     }
 
     #[test]
-    fn the_group_prompt_draws_a_scrim_and_the_typed_name_with_a_caret() {
-        let mut m = fleet();
-        list(&mut m, &["a"]);
-        key(&mut m, Key::Named(NamedKey::Space));
-        key(&mut m, Key::Char("g".into()));
-        type_str(&mut m, "we");
-        let scene = m.view();
-        let items = &scene.layers[0].items;
-        let (w, h) = (m.size_px.0 as f32, m.size_px.1 as f32);
-        assert!(
-            items
-                .iter()
-                .any(|it| matches!(it, SceneItem::Rect { rect, color, .. }
-                if *color == OVERLAY_BG && rect.w == w && rect.h == h)),
-            "the prompt scrims the whole grid"
-        );
-        let texts: Vec<(&str, f32)> = items
-            .iter()
-            .filter_map(|it| match it {
-                SceneItem::Text { runs, scale, .. } => Some((runs[0].text.as_str(), *scale)),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts
-                .iter()
-                .any(|(t, s)| t.contains("Group name") && *s == MODAL_SCALE),
-            "an emphasized prompt labels the modal; got {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|(t, _)| t.contains("we\u{2588}")),
-            "the typed buffer renders with the caret; got {texts:?}"
-        );
-    }
-
-    /// Mark `ids` and group them under `name`.
-    fn make_group(m: &mut FleetModel, name: &str, ids: &[&str]) {
-        for id in ids {
-            let pos = centre_of(m, id);
-            press_ctrl(m, pos);
-        }
-        key(m, Key::Char("g".into()));
-        type_str(m, name);
-        key(m, Key::Named(NamedKey::Enter));
-    }
-
-    #[test]
-    fn grouped_tiles_render_in_their_groups_block_not_their_section() {
-        let mut m = fleet();
+    fn a_dead_member_keeps_my_block_on_screen() {
+        let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
-            sinfo("a", true), // would be Elsewhere
-            info("b"),        // detached
-            info("c"),        // detached, ungrouped
-        ]));
-        make_group(&mut m, "web", &["a", "b"]);
-
-        // The group block comes first, holding both members side by side even
-        // though their attach states differ; "c" stays in its section below.
-        // Members follow layout order, so the detached "b" leads.
-        let order = order(&m);
-        assert_eq!(order, ["b", "a", "c"]);
-        let (ya, yb, yc) = (tile_y(&m, "a"), tile_y(&m, "b"), tile_y(&m, "c"));
-        assert_eq!(ya, yb, "group members share the block's row");
-        assert!(yc > ya, "the ungrouped remainder renders below the group");
-
-        // The view carries the group's name and its color-accented block.
-        let scene = m.view();
-        let has_label = scene.layers[0].items.iter().any(|it| {
-            matches!(it, SceneItem::Text { runs, .. }
-                if runs.iter().any(|r| r.text.contains("web")))
-        });
-        assert!(has_label, "the group block is labelled with its name");
-        let accent = m.groups[0].rgba();
-        let has_block_border = scene.layers[0]
-            .items
-            .iter()
-            .any(|it| matches!(it, SceneItem::Border { color, .. } if *color == accent));
-        assert!(has_block_border, "the block is outlined in the group color");
-    }
-
-    #[test]
-    fn a_dead_member_keeps_its_groups_block_on_screen() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b"]);
-        make_group(&mut m, "web", &["a"]);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
         // "a" dies: the block stays, showing the dead-but-remembered tile.
         list(&mut m, &["b"]);
         assert_eq!(order(&m), ["a", "b"]);
         assert!(m.tiles.iter().find(|t| t.id == "a").unwrap().dead);
-        assert_eq!(m.groups.len(), 1, "the group persists");
+        assert!(
+            m.groups().iter().any(|g| g.id == "w1"),
+            "the entry persists through the death"
+        );
         // It returns (a recreate landed): the tile is live in its block again.
         list(&mut m, &["a", "b"]);
         assert!(!m.tiles.iter().find(|t| t.id == "a").unwrap().dead);
         let (ya, yb) = (tile_y(&m, "a"), tile_y(&m, "b"));
-        assert!(ya < yb, "the group block renders above the sections");
-    }
-
-    #[test]
-    fn group_colors_cycle_the_palette() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["a", "b"]);
-        key(&mut m, Key::Named(NamedKey::Space));
-        key(&mut m, Key::Char("g".into()));
-        type_str(&mut m, "one");
-        key(&mut m, Key::Named(NamedKey::Enter));
-        let pos = centre_of(&m, "b");
-        press_ctrl(&mut m, pos);
-        key(&mut m, Key::Char("g".into()));
-        type_str(&mut m, "two");
-        key(&mut m, Key::Named(NamedKey::Enter));
-        assert_eq!(m.groups.len(), 2);
-        assert_ne!(
-            m.groups[0].color, m.groups[1].color,
-            "consecutive groups take distinct palette colors"
-        );
+        assert!(ya < yb, "my block renders above the sections");
     }
 
     #[test]
@@ -4262,11 +4000,12 @@ mod tests {
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
         assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
-        // Three headers, stacked top to bottom: this window first, then the
-        // detached pool (the likeliest tiles to grab), then other windows'.
+        // Three headers, stacked top to bottom: this window's group first,
+        // then the detached pool (the likeliest tiles to grab), then other
+        // windows'.
         let hs = headers(&m);
         let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["Attached", "Detached", "Attached elsewhere"]);
+        assert_eq!(labels, vec!["blue", "Detached", "Attached elsewhere"]);
         assert!(
             hs[0].1 < hs[1].1 && hs[1].1 < hs[2].1,
             "sections stack downward: {hs:?}"

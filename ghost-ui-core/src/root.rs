@@ -272,11 +272,17 @@ pub struct RootModel {
     /// Drives the live-bell reaction: a bell in an owned session while the
     /// window is unfocused asks the OS for attention.
     focused_win: bool,
-    /// The user-defined session groups. The fleet model owns the live editing
-    /// copy while open; this carries them across fleet close/reopen (the fleet
-    /// is rebuilt each opening) and receives the shell's authoritative
+    /// The group registry. The fleet model owns the live editing copy while
+    /// open; this carries it across fleet close/reopen (the fleet is rebuilt
+    /// each opening) and receives the shell's authoritative
     /// [`UiEvent::GroupsLoaded`] (startup load, cross-window broadcasts).
     groups: Vec<crate::Group>,
+    /// This window's group identity (id, name, color), minted by the shell at
+    /// window creation. Its registry entry tracks the sessions the window
+    /// drives plus the dead ones it remembers; the fleet syncs it from its
+    /// tiles while open, and [`Self::claim_member`] keeps it fed from the
+    /// single view's adopts.
+    my_group: crate::Group,
     /// Inner padding (logical px per side) for the foreground terminal — a small,
     /// DPI-scaled border filled with the terminal background so content doesn't crowd
     /// the window edges. Applied to the foreground/warm models and folded into
@@ -329,6 +335,7 @@ impl RootModel {
             anim_ms: ANIM_MS,
             focused_win: true,
             groups: Vec::new(),
+            my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
         }
     }
@@ -352,6 +359,7 @@ impl RootModel {
             anim_ms: ANIM_MS,
             focused_win: true,
             groups: Vec::new(),
+            my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
@@ -374,6 +382,41 @@ impl RootModel {
             cmds.extend(m.set_theme(theme));
         }
         cmds
+    }
+
+    /// Adopt this window's group identity (minted by the shell at window
+    /// creation), handing it to an already-open fleet too. Sessions the
+    /// window already drives join the group on the spot — the returned save
+    /// persists them.
+    pub fn set_my_group(&mut self, group: crate::Group) -> Vec<Cmd> {
+        self.my_group = group.clone();
+        if let Mode::Fleet(f) = &mut self.mode {
+            f.set_my_group(group);
+        }
+        let mine: Vec<SessionId> = self.mine.iter().cloned().collect();
+        let mut save = Vec::new();
+        for id in mine {
+            let cmds = self.claim_member(&id);
+            if !cmds.is_empty() {
+                save = cmds; // each claim re-saves the whole registry; keep the last
+            }
+        }
+        save
+    }
+
+    /// Ensure `id` is a member of this window's group — the single-view twin
+    /// of the fleet's tile sync — persisting the registry when it changes.
+    fn claim_member(&mut self, id: &str) -> Vec<Cmd> {
+        match self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
+            Some(g) if g.members.iter().any(|m| m == id) => return Vec::new(),
+            Some(g) => g.members.push(id.to_string()),
+            None => {
+                let mut g = self.my_group.clone();
+                g.members = vec![id.to_string()];
+                self.groups.push(g);
+            }
+        }
+        vec![Cmd::SaveGroups(self.groups.clone())]
     }
 
     /// The fleet's per-tile preview-frame cache stats, if a fleet is present (`None`
@@ -596,7 +639,7 @@ impl RootModel {
                 Mode::Single(m) => m.update(ev),
                 Mode::Fleet(f) => f.update(ev),
             });
-            self.release_detached(&cmds);
+            self.release_detached(&mut cmds);
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(&p));
             }
@@ -620,7 +663,7 @@ impl RootModel {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         };
-        self.release_detached(&cmds);
+        self.release_detached(&mut cmds);
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
@@ -631,12 +674,36 @@ impl RootModel {
     /// driving it (the fleet's detach buttons, or a driven group member kept
     /// only as a dead tile): drop the ownership and any warm mirror, so the
     /// bell reaction, Ctrl-Tab, and the next fleet all see it as not ours.
-    fn release_detached(&mut self, cmds: &[Cmd]) {
-        for c in cmds {
-            if let Cmd::Detach(id) = c {
-                self.mine.remove(id);
-                self.warm.remove(id);
-            }
+    /// In the single view the released session also leaves this window's
+    /// group (an open fleet syncs the registry itself), appending the save.
+    fn release_detached(&mut self, cmds: &mut Vec<Cmd>) {
+        let ids: Vec<SessionId> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Detach(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            self.mine.remove(id);
+            self.warm.remove(id);
+        }
+        if !matches!(self.mode, Mode::Single(_)) {
+            return;
+        }
+        let mut changed = false;
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
+            let before = g.members.len();
+            g.members.retain(|m| !ids.contains(m));
+            changed = g.members.len() != before;
+        }
+        if changed {
+            self.groups
+                .retain(|g| g.id != self.my_group.id || !g.members.is_empty());
+            cmds.push(Cmd::SaveGroups(self.groups.clone()));
         }
     }
 
@@ -768,6 +835,7 @@ impl RootModel {
         let title = model.title();
         self.mode = Mode::Single(Box::new(model));
         self.mine.insert(id.clone());
+        cmds.extend(self.claim_member(&id));
         self.primary = Some(id);
         cmds.push(Cmd::SetTitle(title));
         cmds.push(Cmd::Redraw);
@@ -835,6 +903,7 @@ impl RootModel {
         let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
         fleet.set_theme(self.theme);
         fleet.set_groups(self.groups.clone());
+        fleet.set_my_group(self.my_group.clone());
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
         fleet.update(UiEvent::Resize {
             w_px: self.size_px.0.max(1),
@@ -984,6 +1053,7 @@ impl RootModel {
                 );
                 fleet.set_theme(self.theme);
                 fleet.set_groups(self.groups.clone());
+                fleet.set_my_group(self.my_group.clone());
                 cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
                 // Dive out, but don't animate yet: the grid we just built only knows
                 // this window's sessions. Wait for the ListSessions reply to assemble
@@ -1174,46 +1244,76 @@ mod tests {
     }
 
     #[test]
-    fn groups_survive_leaving_and_reopening_the_fleet() {
-        let mut r = root();
+    fn my_group_renders_automatically_and_survives_fleet_toggles() {
+        let mut r = root(); // owns "alpha", single view
+        r.set_my_group(crate::Group::auto("w1".into(), 2));
         dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
         settle(&mut r);
-        // Group the focused tile: mark, prompt, name it, commit.
-        key(&mut r, Key::Named(NamedKey::Space), Mods::NONE);
-        key(&mut r, Key::Char("g".into()), Mods::NONE);
-        for c in "web".chars() {
-            key(&mut r, Key::Char(c.to_string()), Mods::NONE);
-        }
-        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
-        assert!(shows_group(&r, "web"), "the new group renders");
+        // The owned session renders in this window's block — no ceremony.
+        assert!(shows_group(&r, "orange"), "my block renders, color-named");
+        assert!(
+            r.groups
+                .iter()
+                .any(|g| g.id == "w1" && g.members == vec!["alpha".to_string()])
+                || matches!(&r.mode, Mode::Fleet(f) if f
+                    .groups()
+                    .iter()
+                    .any(|g| g.id == "w1" && g.members == vec!["alpha".to_string()])),
+            "membership synced into the registry"
+        );
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> single
         settle(&mut r);
         assert!(!r.is_fleet());
+        assert!(
+            r.groups
+                .iter()
+                .any(|g| g.id == "w1" && g.members == vec!["alpha".to_string()]),
+            "closing the fleet carries the entry out: {:?}",
+            r.groups
+        );
         dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
         settle(&mut r);
         assert!(
-            shows_group(&r, "web"),
-            "groups persist across fleet close/reopen"
+            shows_group(&r, "orange"),
+            "my block persists across fleet close/reopen"
+        );
+    }
+
+    #[test]
+    fn a_single_view_adopt_joins_this_windows_group() {
+        let mut r = root(); // owns "alpha", single view
+        r.set_my_group(crate::Group::auto("w1".into(), 0));
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(gs)
+                if gs.iter().any(|g| g.id == "w1" && g.members.contains(&"beta".to_string())))),
+            "adopting a session persists its membership: {cmds:?}"
         );
     }
 
     #[test]
     fn loaded_groups_reach_an_open_fleet_and_later_openings() {
         let mut r = root();
-        let g = vec![crate::Group {
+        let infra = crate::Group {
             id: "g-infra".into(),
             name: "infra".into(),
             color: 0,
             members: vec!["beta".into()],
-        }];
-        // Loaded before the fleet ever opens: seeds the next opening.
-        r.update(UiEvent::GroupsLoaded(g.clone()));
+        };
+        // Loaded before the fleet ever opens: seeds the next opening. (A
+        // foreign group draws no block of its own yet, so assert on the
+        // registry the fleet carries.)
+        r.update(UiEvent::GroupsLoaded(vec![infra.clone()]));
         dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
         settle(&mut r);
-        assert!(shows_group(&r, "infra"), "startup groups seed the fleet");
+        let fleet_has = |r: &RootModel, gid: &str| match &r.mode {
+            Mode::Fleet(f) => f.groups().iter().any(|g| g.id == gid),
+            Mode::Single(_) => false,
+        };
+        assert!(fleet_has(&r, "g-infra"), "startup groups seed the fleet");
         // Re-broadcast while open (another window saved): applies live.
         r.update(UiEvent::GroupsLoaded(Vec::new()));
-        assert!(!shows_group(&r, "infra"), "a live broadcast replaces them");
+        assert!(!fleet_has(&r, "g-infra"), "a live broadcast replaces them");
     }
 
     #[test]

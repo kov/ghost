@@ -1,4 +1,4 @@
-//! Persistence of user-defined session groups: a small TOML file in the data
+//! Persistence of the session-group registry: a small TOML file in the data
 //! dir (`$XDG_DATA_HOME/ghost/groups.toml`), loaded once at startup and
 //! rewritten whole on every `Cmd::SaveGroups`.
 
@@ -18,14 +18,22 @@ fn file_in(dir: &Path) -> PathBuf {
 }
 
 /// Load the persisted groups from `dir`; a missing or malformed file is just
-/// "no groups" (the next save rewrites it).
+/// "no groups" (the next save rewrites it). Records predating durable ids
+/// (the manual-groups era) get distinct ids backfilled — no window claims
+/// them, so they behave as closed groups.
 fn load_from(dir: &Path) -> Vec<Group> {
     let Ok(text) = std::fs::read_to_string(file_in(dir)) else {
         return Vec::new();
     };
-    toml::from_str::<GroupsFile>(&text)
+    let mut groups = toml::from_str::<GroupsFile>(&text)
         .map(|f| f.group)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for (i, g) in groups.iter_mut().enumerate() {
+        if g.id.is_empty() {
+            g.id = format!("legacy-{i}");
+        }
+    }
+    groups
 }
 
 fn save_in(dir: &Path, groups: &[Group]) -> std::io::Result<()> {
@@ -84,19 +92,21 @@ mod tests {
     }
 
     #[test]
-    fn a_file_predating_group_ids_still_loads() {
+    fn a_file_predating_group_ids_loads_with_backfilled_ids() {
         // Files written before groups carried ids (the manual-groups era)
-        // load with an empty id: no window ever claims them, so they behave
-        // as closed groups.
+        // get distinct ids backfilled: no window ever claims them, so they
+        // behave as closed groups, but id-keyed lookups must not collide.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             file_in(dir.path()),
-            "[[group]]\nname = \"web\"\ncolor = 1\nmembers = [\"alpha\"]\n",
+            "[[group]]\nname = \"web\"\ncolor = 1\nmembers = [\"alpha\"]\n\n\
+             [[group]]\nname = \"infra\"\ncolor = 2\nmembers = [\"beta\"]\n",
         )
         .unwrap();
         let loaded = load_from(dir.path());
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "");
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|g| !g.id.is_empty()));
+        assert_ne!(loaded[0].id, loaded[1].id);
         assert_eq!(loaded[0].name, "web");
         assert_eq!(loaded[0].members, vec!["alpha".to_string()]);
     }

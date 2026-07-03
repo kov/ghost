@@ -114,7 +114,7 @@ pub enum UiEvent {
     /// vanished, or a subscription ended): re-enumerate now rather than waiting
     /// for the floor tick.
     SessionsChanged,
-    /// The authoritative session groups: loaded from disk at startup, or
+    /// The authoritative group registry: loaded from disk at startup, or
     /// re-broadcast when another window saved a change.
     GroupsLoaded(Vec<crate::group::Group>),
     /// The dead-but-remembered sessions (group members with a durable

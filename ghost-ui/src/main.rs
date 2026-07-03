@@ -516,18 +516,22 @@ fn interactive() {
     #[cfg(target_os = "macos")]
     let proxy = event_loop.create_proxy();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let groups = groups::load();
+    let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
         windows: HashMap::new(),
         clipboard: None,
         start: Instant::now(),
         initial_name,
         next_session_seq: 0,
+        next_group_seq: 0,
+        next_group_color,
         bench: harness,
         focused: None,
         #[cfg(target_os = "macos")]
         proxy,
         subs: HashMap::new(),
-        groups: groups::load(),
+        groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
         sessions_changed,
     };
@@ -890,6 +894,11 @@ struct App {
     initial_name: Option<String>,
     /// Per-process counter making spawned session names unique.
     next_session_seq: u64,
+    /// Per-process counter making minted window-group ids unique, and the
+    /// palette color the next window's group takes (seeded past the loaded
+    /// registry so fresh windows keep cycling where it left off).
+    next_group_seq: u64,
+    next_group_color: u8,
     /// Frame-pacing bench harness (`GHOST_BENCH=dive`/`slide`): scripts animations
     /// against the real render path and synthesises the session list. `None` in
     /// normal use.
@@ -1392,6 +1401,17 @@ impl App {
         format!("ghost-ui-{}-{}", std::process::id(), seq)
     }
 
+    /// Mint a new window's group identity: a process-unique durable id and
+    /// the next palette color (whose name it carries until renamed).
+    fn mint_group(&mut self) -> ghost_ui_core::Group {
+        let seq = self.next_group_seq;
+        self.next_group_seq += 1;
+        let color = self.next_group_color;
+        self.next_group_color =
+            (self.next_group_color + 1) % ghost_ui_core::group::GROUP_PALETTE.len() as u8;
+        ghost_ui_core::Group::auto(format!("win-{}-{}", std::process::id(), seq), color)
+    }
+
     /// Attach window `wid`'s own client to `name` (no-op if it already holds one).
     /// Returns whether the window now has a client for it.
     /// Respawn a dead session under its old name: the durable descriptor says
@@ -1530,6 +1550,9 @@ impl App {
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
+        let group = self.mint_group();
+        let claims = root.set_my_group(group); // fresh fleet: owns nothing yet
+        debug_assert!(claims.is_empty());
         apply_anim_ms(&mut root);
         self.windows.insert(
             wid,
@@ -1665,6 +1688,11 @@ impl App {
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
+        // Seed the persisted registry BEFORE the group claim, so the claim's
+        // save extends it rather than clobbering it with just this window.
+        root.update(UiEvent::GroupsLoaded(self.groups.clone()));
+        let group = self.mint_group();
+        let claims = root.set_my_group(group);
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
         sessions.insert(name.to_string(), session);
@@ -1709,9 +1737,9 @@ impl App {
         // Apply the persisted zoom now that the viewport is known, so it re-grids
         // against the real surface size (the model clamps to its bounds).
         self.dispatch(wid, UiEvent::SetZoom(cfg.zoom()), event_loop);
-        // Seed the persisted groups for when this window opens its fleet.
-        let groups = self.groups.clone();
-        self.dispatch(wid, UiEvent::GroupsLoaded(groups), event_loop);
+        // Persist (and broadcast) the initial session joining this window's
+        // group — the registry itself was seeded before the claim.
+        self.exec(wid, claims, event_loop);
         true
     }
 }

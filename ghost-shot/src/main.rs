@@ -777,9 +777,10 @@ fn calib_tui() {
     let _ = out.flush();
 }
 
-/// A representative fleet overview: two sessions this window drives (live),
-/// one held by another window, and one detached — covering all three sections,
-/// cards, buttons, the focus border, and scaled live previews.
+/// A representative fleet overview: two sessions this window drives (live, in
+/// the window's emphasized group block), one held by another window, and one
+/// detached — covering the block, both sections, cards, buttons, the focus
+/// border, and scaled live previews.
 fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     let size = (1400u32, 900u32);
     let mine: HashSet<String> = ["edit", "build"].into_iter().map(String::from).collect();
@@ -787,6 +788,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     // The focused/primary tile carries real content via `adopting`.
     let primary = TerminalModel::new("edit".to_string(), 80, 24, METRICS);
     let (mut fleet, _) = FleetModel::adopting(primary, Vec::new(), METRICS, size, 1.0, mine);
+    fleet.set_my_group(ghost_ui_core::Group::auto("win-shot-0".to_string(), 0));
 
     fleet.update(UiEvent::SessionList(vec![
         info("edit", true, &["nvim", "src/fleet.rs"], 4011),
@@ -815,15 +817,14 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
         "$ uptime\r\n 14:02:11 up 41 days,  3:07,  1 user\r\n$ ",
     );
 
-    // A user-defined group renders as its own accent-outlined block ahead of
-    // the attach-state sections, regardless of who drives its members. The
-    // "db" member is dead-but-remembered: its tile stays in the block,
-    // previewing its recording's last screen, offering a relaunch.
+    // The window's own group block also remembers "db", dead: its tile stays
+    // in the block, previewing its recording's last screen, offering a
+    // relaunch on activation.
     fleet.set_groups(vec![ghost_ui_core::Group {
-        id: "g-web".to_string(),
-        name: "web".to_string(),
+        id: "win-shot-0".to_string(),
+        name: "blue".to_string(),
         color: 0,
-        members: vec!["edit".to_string(), "prod".to_string(), "db".to_string()],
+        members: vec!["edit".to_string(), "build".to_string(), "db".to_string()],
     }]);
     fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
         name: "db".to_string(),
