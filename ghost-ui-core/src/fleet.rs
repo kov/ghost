@@ -401,6 +401,11 @@ pub struct FleetModel {
     /// Multi-selected tiles (Space / Ctrl-click), the input to bulk actions.
     /// Cleared by Escape — which marks claim ahead of the fleet toggle.
     marked: HashSet<SessionId>,
+    /// Sessions killed from this fleet whose hosts may not have died yet: a
+    /// racing listing that still names one must not re-seed its tile. An
+    /// entry drains once a listing confirms the session gone (freeing the
+    /// name for a later, unrelated session).
+    killed: HashSet<SessionId>,
     /// The group registry, in creation order. Handed in and out by the root
     /// across fleet open/close; local edits (my membership sync, claims
     /// stripping other entries, dissolutions) are persisted via
@@ -564,6 +569,7 @@ impl FleetModel {
             theme: ThemeColors::default(),
             observing: HashSet::new(),
             marked: HashSet::new(),
+            killed: HashSet::new(),
             groups: Vec::new(),
             saved_groups: Vec::new(),
             my_group: Group::auto(String::new(), 0),
@@ -1001,6 +1007,10 @@ impl FleetModel {
         let mut cmds = Vec::new();
         let mut dirty = false;
         let new_ids: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        // A listing that still names a session killed here is a race with its
+        // dying host: keep suppressing it. One that no longer names it
+        // confirms the death and frees the name.
+        self.killed.retain(|k| new_ids.contains(k.as_str()));
         let grouped: HashSet<&str> = self
             .groups
             .iter()
@@ -1043,6 +1053,9 @@ impl FleetModel {
         // already drives (fed by the shell) get a live preview; the rest stay
         // placeholders until the snapshot follow-up.
         for info in &infos {
+            if self.killed.contains(&info.name) {
+                continue;
+            }
             let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
                 if tile.dead
@@ -1136,6 +1149,32 @@ impl FleetModel {
     /// members are remembered — a stray descriptor seeds nothing.
     fn dead_sessions(&mut self, dead: Vec<crate::event::DeadSession>) -> Vec<Cmd> {
         let mut dirty = false;
+        // The sweep is also the authority on what is still resurrectable: a
+        // remembered member that is neither a live tile nor named by the
+        // sweep was discarded (killed or cleanly exited, possibly from
+        // another process) — its membership and any stale dead tile go,
+        // instead of lingering as an unresurrectable ghost. The sweep always
+        // follows the listing that seeded the live tiles, so absence here is
+        // evidence, not a not-yet-seeded gap.
+        let named: HashSet<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+        let live: HashSet<&str> = self
+            .tiles
+            .iter()
+            .filter(|t| !t.dead)
+            .map(|t| t.id.as_str())
+            .collect();
+        for g in &mut self.groups {
+            let before = g.members.len();
+            g.members
+                .retain(|m| live.contains(m.as_str()) || named.contains(m.as_str()));
+            dirty |= g.members.len() != before;
+        }
+        self.groups
+            .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
+        let before = self.tiles.len();
+        self.tiles
+            .retain(|t| !t.dead || named.contains(t.id.as_str()));
+        dirty |= self.tiles.len() != before;
         for d in dead {
             if !self.groups.iter().any(|g| g.members.contains(&d.name)) {
                 continue;
@@ -2067,6 +2106,41 @@ impl FleetModel {
         cmds
     }
 
+    /// Kill `ids`: the shell ends each session and discards its durable
+    /// traces; the model forgets it in the same stroke.
+    fn kill_sessions(&mut self, ids: &[SessionId]) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for id in ids {
+            cmds.extend(self.forget_session(id));
+            cmds.push(Cmd::Kill(id.clone()));
+        }
+        cmds
+    }
+
+    /// Forget `id` entirely — the model half of a kill, which throws the
+    /// session away: its tile goes now (no dead tile), its membership leaves
+    /// every group (the registry sync persists and broadcasts the
+    /// forgetting), and the name is suppressed against racing listings until
+    /// one confirms the session gone.
+    fn forget_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        if self.observing.remove(id) {
+            cmds.push(Cmd::Unobserve(id.clone()));
+        }
+        self.mine.remove(id);
+        self.marked.remove(id);
+        self.killed.insert(id.clone());
+        self.tiles.retain(|t| &t.id != id);
+        for g in &mut self.groups {
+            g.members.retain(|m| m != id);
+        }
+        // An entry this emptied dissolves — my own included (killing
+        // everything a window drives drops its entry, like detaching
+        // everything does; the identity stays for the next claim).
+        self.groups.retain(|g| !g.members.is_empty());
+        cmds
+    }
+
     /// Attach `ids` to this window in the background (no foreground switch),
     /// with one confirm if any is held by another window. Dead tiles and
     /// sessions already driven here are skipped; the marks feeding the set
@@ -2226,23 +2300,28 @@ impl FleetModel {
             (PendingTarget::Session(id), PendingAction::TakeOver) => {
                 vec![Cmd::TakeOver(id.clone())]
             }
-            (PendingTarget::Session(id), PendingAction::Kill) => vec![Cmd::Kill(id.clone())],
+            (PendingTarget::Session(id), PendingAction::Kill) => {
+                self.kill_sessions(std::slice::from_ref(id))
+            }
             (PendingTarget::Group(gid), PendingAction::TakeOver) => {
                 self.open_group_cmds(&gid.clone())
             }
-            (PendingTarget::Group(gid), PendingAction::Kill) => self
-                .present_members(gid)
-                .into_iter()
-                .map(Cmd::Kill)
-                .collect(),
+            (PendingTarget::Group(gid), PendingAction::Kill) => {
+                // Killing a group throws the whole thing away: its dead
+                // members too (their kill discards the remembered traces).
+                let mut members = self.present_members(gid);
+                members.extend(self.dead_members(gid));
+                self.kill_sessions(&members)
+            }
             (PendingTarget::Sessions(ids), PendingAction::TakeOver) => {
                 let ids = ids.clone();
                 self.marked.clear();
                 ids.iter().flat_map(|id| self.claim_session(id)).collect()
             }
             (PendingTarget::Sessions(ids), PendingAction::Kill) => {
+                let ids = ids.clone();
                 self.marked.clear();
-                ids.iter().cloned().map(Cmd::Kill).collect()
+                self.kill_sessions(&ids)
             }
         };
         cmds.push(Cmd::Redraw);
@@ -2326,7 +2405,8 @@ impl FleetModel {
             }
             PendingTarget::Group(gid) => {
                 let name = self.group(gid).map(|g| g.name.as_str()).unwrap_or(gid);
-                let n = self.present_members(gid).len();
+                // A kill throws away the dead members too, so count them.
+                let n = self.present_members(gid).len() + self.dead_members(gid).len();
                 return match p.action {
                     PendingAction::Kill => {
                         (format!("Kill the {name} group ({n} sessions)?"), "Kill")
@@ -3793,7 +3873,13 @@ mod tests {
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
             cmds,
-            vec![Cmd::Kill("a".into()), Cmd::Kill("c".into()), Cmd::Redraw]
+            vec![
+                Cmd::Kill("a".into()),
+                Cmd::Kill("c".into()),
+                Cmd::Redraw,
+                Cmd::SaveGroups(Vec::new()),
+            ],
+            "the kills forget the members; the emptied entry dissolves"
         );
     }
 
@@ -4088,7 +4174,7 @@ mod tests {
     }
 
     #[test]
-    fn group_ops_skip_dead_members() {
+    fn open_all_skips_dead_members_but_kill_throws_them_away() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![
@@ -4108,8 +4194,17 @@ mod tests {
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
             cmds,
-            vec![Cmd::Kill("a".into()), Cmd::Redraw],
-            "kill has nothing to kill in a dead member"
+            vec![
+                Cmd::Kill("a".into()),
+                Cmd::Kill("c".into()),
+                Cmd::Redraw,
+                Cmd::SaveGroups(Vec::new()),
+            ],
+            "killing the group discards its dead remnant too"
+        );
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "c"),
+            "the dead tile goes with the group kill"
         );
     }
 
@@ -4375,6 +4470,87 @@ mod tests {
             "{cmds:?}"
         );
         assert!(m.marked.is_empty());
+    }
+
+    #[test]
+    fn a_kill_forgets_the_session_entirely() {
+        // Kill is the throw-away verb: the session leaves its group (the
+        // save broadcasts the forgetting) and its tile goes now — no dead
+        // tile, nothing to resurrect.
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        let r = button_rect(&m, "a", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(m.modal_open(), "killing is confirmed first");
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(cmds.contains(&Cmd::Kill("a".into())), "{cmds:?}");
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(vec!["c".to_string()]),
+            "the membership goes with the kill: {cmds:?}"
+        );
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "a"),
+            "the tile goes with the kill, not to a dead tile"
+        );
+        // The host takes a moment to die: a racing listing still naming the
+        // session must not resurrect its tile or its membership.
+        let cmds = m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "a"),
+            "a dying session is not re-seeded"
+        );
+        assert!(
+            saved_members(&cmds, "w1").is_none(),
+            "no registry churn from the race: {cmds:?}"
+        );
+        // Once a listing confirms it gone, the name is free again: a later
+        // same-named session is a new tile like any other.
+        list(&mut m, &["c"]);
+        list(&mut m, &["a", "c"]);
+        assert!(
+            m.tiles.iter().any(|t| t.id == "a"),
+            "a reborn same-name session lists normally"
+        );
+    }
+
+    #[test]
+    fn the_dead_sweep_forgets_members_it_no_longer_names() {
+        // The shell's sweep names every remembered-dead member that still
+        // has a descriptor. One it stops naming was discarded — killed or
+        // cleanly exited, possibly from another process — so its membership
+        // and dead tile go instead of lingering as an unresurrectable ghost.
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g-web", "web", &["x"]);
+        list(&mut m, &[]);
+        m.update(UiEvent::DeadSessions(vec![dead_info("x", "", &[])]));
+        assert!(
+            m.tiles.iter().any(|t| t.id == "x" && t.dead),
+            "precondition: the member is remembered dead"
+        );
+        let cmds = m.update(UiEvent::DeadSessions(Vec::new()));
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "x"),
+            "the discarded member's dead tile goes"
+        );
+        assert!(
+            m.groups().iter().all(|g| g.id != "g-web"),
+            "the emptied group dissolves: {:?}",
+            m.groups()
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SaveGroups(gs) if gs.iter().all(|g| g.id != "g-web"))),
+            "the forgetting persists: {cmds:?}"
+        );
     }
 
     #[test]

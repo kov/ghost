@@ -979,7 +979,13 @@ impl App {
             if live_names.contains(name.as_str()) || dead.iter().any(|d| &d.name == name) {
                 continue;
             }
-            let d = ghost_vt::descriptor::read(name).unwrap_or_default();
+            // The descriptor is the resurrection ticket: a member without one
+            // was discarded (killed, or its child exited — possibly from
+            // another process, whose registry save we never saw). Not naming
+            // it here is what tells the fleet to drop its membership.
+            let Some(d) = ghost_vt::descriptor::read(name) else {
+                continue;
+            };
             dead.push(ghost_ui_core::DeadSession {
                 name: name.clone(),
                 display_name: d.display_name,
@@ -1030,6 +1036,21 @@ impl App {
         for name in ghost_vt::descriptor::all_names() {
             if !live_names.contains(name.as_str()) && !grouped.contains(&name) {
                 ghost_vt::descriptor::remove(&name);
+            }
+        }
+        // Recordings follow the same referencing rule: one whose session is
+        // neither live nor remembered by a group seeds and previews nothing —
+        // remove it rather than keep one per session ever spawned.
+        if let Ok(entries) = std::fs::read_dir(ghost_vt::paths::data_dir().join("recordings")) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = match (p.extension(), p.file_stem().and_then(|s| s.to_str())) {
+                    (Some(ext), Some(stem)) if ext == "ghostrec" => stem.to_string(),
+                    _ => continue,
+                };
+                if !live_names.contains(name.as_str()) && !grouped.contains(&name) {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     }
