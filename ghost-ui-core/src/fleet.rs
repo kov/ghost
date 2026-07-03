@@ -220,11 +220,13 @@ struct Pending {
     selected: Choice,
 }
 
-/// What a pending confirmation acts on: one session, or a whole group (by
-/// durable id, resilient to the registry being replaced under the modal).
+/// What a pending confirmation acts on: one session, a whole group (by
+/// durable id, resilient to the registry being replaced under the modal), or
+/// an ad-hoc set (a marked bulk op or a marked-set drop).
 enum PendingTarget {
     Session(SessionId),
     Group(GroupId),
+    Sessions(Vec<SessionId>),
 }
 
 /// The confirm modal's two buttons.
@@ -1740,6 +1742,59 @@ impl FleetModel {
                     None => Vec::new(),
                 }
             }
+            // Bulk verbs on the marks: `a` attaches them here (one confirm
+            // if any is held elsewhere), `d` detaches the ones this window
+            // drives, Delete kills them (confirmed). Inert without marks.
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down()
+                && !mods.ctrl
+                && !mods.sup
+                && !self.marked.is_empty()
+                && matches!(&key, Key::Char(s) if s == "a") =>
+            {
+                let set = self.marked_in_order();
+                self.attach_here(set)
+            }
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down()
+                && !mods.ctrl
+                && !mods.sup
+                && !self.marked.is_empty()
+                && matches!(&key, Key::Char(s) if s == "d") =>
+            {
+                let ours: Vec<SessionId> = self
+                    .marked_in_order()
+                    .into_iter()
+                    .filter(|id| self.locality_of(id) == Some(Locality::ThisWindow))
+                    .collect();
+                let mut cmds: Vec<Cmd> =
+                    ours.iter().flat_map(|id| self.detach_session(id)).collect();
+                self.marked.clear();
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
+            UiEvent::Key { key, kind, .. }
+                if kind.is_down()
+                    && !self.marked.is_empty()
+                    && matches!(key, Key::Named(NamedKey::Delete)) =>
+            {
+                let targets: Vec<SessionId> = self
+                    .marked_in_order()
+                    .into_iter()
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == id && !t.dead))
+                    .collect();
+                if targets.is_empty() {
+                    return Vec::new();
+                }
+                self.pending = Some(Pending {
+                    target: PendingTarget::Sessions(targets),
+                    action: PendingAction::Kill,
+                    selected: Choice::Cancel,
+                });
+                vec![Cmd::Redraw]
+            }
             UiEvent::Pointer {
                 phase: PointerPhase::Wheel,
                 wheel_dy,
@@ -1964,6 +2019,74 @@ impl FleetModel {
         }
     }
 
+    /// Claim `id` as driven by this window: close its observation, flip its
+    /// tile, attach in the background, and take its membership away from any
+    /// other group (ownership moved here; the registry save follows from the
+    /// sync). The inverse of [`Self::detach_session`].
+    fn claim_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        if self.observing.remove(id) {
+            cmds.push(Cmd::Unobserve(id.clone()));
+        }
+        self.mine.insert(id.clone());
+        if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+            t.locality = Locality::ThisWindow;
+        }
+        for g in &mut self.groups {
+            if g.id != self.my_group.id {
+                g.members.retain(|m| m != id);
+            }
+        }
+        self.groups
+            .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
+        cmds.push(Cmd::Attach(id.clone()));
+        cmds
+    }
+
+    /// Attach `ids` to this window in the background (no foreground switch),
+    /// with one confirm if any is held by another window. Dead tiles and
+    /// sessions already driven here are skipped; the marks feeding the set
+    /// are consumed when the claims actually run.
+    fn attach_here(&mut self, ids: Vec<SessionId>) -> Vec<Cmd> {
+        let targets: Vec<SessionId> = ids
+            .into_iter()
+            .filter(|id| {
+                self.tiles.iter().any(|t| &t.id == id && !t.dead)
+                    && self.locality_of(id) != Some(Locality::ThisWindow)
+            })
+            .collect();
+        if targets.is_empty() {
+            return vec![Cmd::Redraw];
+        }
+        if targets
+            .iter()
+            .any(|id| self.locality_of(id) == Some(Locality::Elsewhere))
+        {
+            self.pending = Some(Pending {
+                target: PendingTarget::Sessions(targets),
+                action: PendingAction::TakeOver,
+                selected: Choice::Cancel,
+            });
+            return vec![Cmd::Redraw];
+        }
+        let mut cmds: Vec<Cmd> = targets
+            .iter()
+            .flat_map(|id| self.claim_session(id))
+            .collect();
+        self.marked.clear();
+        cmds.push(Cmd::Redraw);
+        cmds
+    }
+
+    /// The marked session ids in layout order (stable, deterministic).
+    fn marked_in_order(&self) -> Vec<SessionId> {
+        self.layout()
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .filter(|id| self.marked.contains(id))
+            .collect()
+    }
+
     /// Release `id` from this window: drop ownership, flip its tile to
     /// Detached, and observe it so the preview stays a live mirror — the
     /// inverse of the claim in [`Self::open_group_cmds`]. Returns the shell
@@ -2088,6 +2211,15 @@ impl FleetModel {
                 .into_iter()
                 .map(Cmd::Kill)
                 .collect(),
+            (PendingTarget::Sessions(ids), PendingAction::TakeOver) => {
+                let ids = ids.clone();
+                self.marked.clear();
+                ids.iter().flat_map(|id| self.claim_session(id)).collect()
+            }
+            (PendingTarget::Sessions(ids), PendingAction::Kill) => {
+                self.marked.clear();
+                ids.iter().cloned().map(Cmd::Kill).collect()
+            }
         };
         cmds.push(Cmd::Redraw);
         cmds
@@ -2119,14 +2251,7 @@ impl FleetModel {
             };
         }
         for id in members.iter().skip(1) {
-            if self.observing.remove(id) {
-                cmds.push(Cmd::Unobserve(id.clone()));
-            }
-            self.mine.insert(id.clone());
-            if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
-                t.locality = Locality::ThisWindow;
-            }
-            cmds.push(Cmd::Attach(id.clone()));
+            cmds.extend(self.claim_session(id));
         }
         // The opened members leave every other group — their ownership
         // moved here (a no-op under adoption, where gid IS my group now).
@@ -2147,6 +2272,38 @@ impl FleetModel {
     fn confirm_texts(&self, p: &Pending) -> (String, &'static str) {
         let id = match &p.target {
             PendingTarget::Session(id) => id,
+            PendingTarget::Sessions(ids) => {
+                return match p.action {
+                    PendingAction::Kill => {
+                        let n = ids.len();
+                        if n == 1 {
+                            ("Kill 1 session?".to_string(), "Kill")
+                        } else {
+                            (format!("Kill {n} sessions?"), "Kill")
+                        }
+                    }
+                    PendingAction::TakeOver => {
+                        let n = ids
+                            .iter()
+                            .filter(|id| self.locality_of(id) == Some(Locality::Elsewhere))
+                            .count();
+                        if n == 1 {
+                            (
+                                "1 session is open in another window \u{2014} take it over?"
+                                    .to_string(),
+                                "Take over",
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "{n} sessions are open in another window \u{2014} take them over?"
+                                ),
+                                "Take over",
+                            )
+                        }
+                    }
+                };
+            }
             PendingTarget::Group(gid) => {
                 let name = self.group(gid).map(|g| g.name.as_str()).unwrap_or(gid);
                 let n = self.present_members(gid).len();
@@ -2489,11 +2646,59 @@ impl FleetModel {
         }
     }
 
-    /// Drop a dragged tile. With groups automatic, dropping edits no
-    /// membership yet — the card snaps home. The attach/detach drop gestures
-    /// land with the marks-and-DnD rework.
-    fn drop_tile(&mut self, _id: &str, _px: f32, _py: f32) -> Vec<Cmd> {
-        vec![Cmd::Redraw]
+    /// Drop a dragged tile at `(px, py)` (content space). Inside this
+    /// window's block it — and, when marked, the whole marked set — attaches
+    /// here in the background (one confirm if any is held elsewhere).
+    /// Dropped anywhere else, a member of my block is released: a driven
+    /// session detaches, a dead one is forgotten. Foreign and closed blocks
+    /// are not drop targets — the card just snaps home.
+    fn drop_tile(&mut self, id: &str, px: f32, py: f32) -> Vec<Cmd> {
+        let set: Vec<SessionId> = if self.marked.contains(id) {
+            self.marked_in_order()
+        } else {
+            vec![id.to_string()]
+        };
+        let (headers, _, _, _) = self.sections_layout();
+        let over_mine = headers.iter().any(|(b, _)| {
+            matches!(b, Band::Group { id: gid, block }
+                if *gid == self.my_group.id && block.contains(px, py))
+        });
+        let over_foreign = headers.iter().any(|(b, _)| {
+            matches!(b, Band::Group { id: gid, block }
+                if *gid != self.my_group.id && block.contains(px, py))
+        });
+        if over_mine {
+            return self.attach_here(set);
+        }
+        if over_foreign {
+            return vec![Cmd::Redraw]; // snap home: not a drop target
+        }
+        // Outside every block: release the set's members of my block.
+        let mut cmds = Vec::new();
+        for sid in &set {
+            let dead = self.tiles.iter().any(|t| &t.id == sid && t.dead);
+            if dead {
+                // Forgetting is the drag-out of a dead tile: membership was
+                // all that kept it (the registry save follows the sync).
+                for g in &mut self.groups {
+                    g.members.retain(|m| m != sid);
+                }
+                self.groups.retain(|g| !g.members.is_empty());
+                self.tiles.retain(|t| &t.id != sid);
+            } else if self.locality_of(sid) == Some(Locality::ThisWindow) {
+                cmds.extend(self.detach_session(sid));
+            }
+        }
+        if self
+            .focused
+            .as_ref()
+            .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
+        {
+            self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
+        }
+        self.marked.clear();
+        cmds.push(Cmd::Redraw);
+        cmds
     }
 
     fn toggle_mark(&mut self, id: &str) {
@@ -3801,26 +4006,240 @@ mod tests {
         );
     }
 
+    /// My block's outline rect (content space) — the drop target for the
+    /// attach gesture.
+    fn my_block_rect(m: &FleetModel) -> RectPx {
+        let (headers, _, _, _) = m.sections_layout();
+        headers
+            .iter()
+            .find_map(|(b, _)| match b {
+                Band::Group { id, block } if *id == m.my_group.id => Some(*block),
+                _ => None,
+            })
+            .expect("my block renders")
+    }
+
     #[test]
-    fn dropping_a_dragged_tile_edits_no_membership() {
-        // Membership is automatic now; dragging still floats the card (and
-        // will grow attach/detach gestures), but a drop edits nothing.
+    fn dropping_a_detached_tile_into_my_block_attaches_it_here() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
-        let before = m.groups().to_vec();
-        let from = centre(&tile_rect(&m, "b"));
-        let a = tile_rect(&m, "a");
-        let cmds = drag(&mut m, from, (a.x + a.w * 0.5, a.y + a.h / 2.0));
-        assert_eq!(m.groups(), &before[..], "a drop changes no group");
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        let from = centre(&tile_rect(&m, "d"));
+        let to = centre(&my_block_rect(&m));
+        let cmds = drag(&mut m, from, to);
         assert!(
-            !cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(_))),
-            "nothing to persist: {cmds:?}"
+            cmds.contains(&Cmd::Attach("d".into())),
+            "the drop attaches in the background: {cmds:?}"
         );
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
-            "a drag is not a click: {cmds:?}"
+            "a drag is not a click — no foreground switch: {cmds:?}"
         );
+        assert_eq!(m.locality_of("d"), Some(Locality::ThisWindow));
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(vec!["a".to_string(), "d".to_string()]),
+            "the claim persists: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_an_elsewhere_tile_into_my_block_confirms_the_steal() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("x", true),
+        ]));
+        let from = centre(&tile_rect(&m, "x"));
+        let to = centre(&my_block_rect(&m));
+        let cmds = drag(&mut m, from, to);
+        assert!(m.modal_open(), "stealing a held session needs a confirm");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
+            "{cmds:?}"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::Space)); // confirm
+        assert!(cmds.contains(&Cmd::Attach("x".into())), "{cmds:?}");
+        assert_eq!(m.locality_of("x"), Some(Locality::ThisWindow));
+    }
+
+    #[test]
+    fn dragging_a_member_out_of_my_block_detaches_it() {
+        let mut m = my_fleet(&["a", "b"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("b", true),
+            info("d"),
+        ]));
+        let from = centre(&tile_rect(&m, "a"));
+        // Drop well below everything — outside my block.
+        let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
+        assert!(cmds.contains(&Cmd::Detach("a".into())), "{cmds:?}");
+        assert!(
+            cmds.contains(&Cmd::Observe("a".into())),
+            "the released session keeps a live preview: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn dragging_a_dead_member_out_of_my_block_forgets_it() {
+        let mut m = my_fleet(&["a", "b"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("b", true),
+        ]));
+        list(&mut m, &["b"]); // a dies, remembered in my block
+        assert!(m.tiles.iter().any(|t| t.id == "a" && t.dead));
+        let from = centre(&tile_rect(&m, "a"));
+        let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "a"),
+            "membership was all that kept the dead tile"
+        );
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn foreign_blocks_are_not_drop_targets() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("x", true),
+            info("d"),
+        ]));
+        let before = m.groups().to_vec();
+        // Drop the detached tile onto the foreign block: nothing happens.
+        let from = centre(&tile_rect(&m, "d"));
+        let (headers, _, _, _) = m.sections_layout();
+        let foreign = headers
+            .iter()
+            .find_map(|(b, _)| match b {
+                Band::Group { id, block } if id == "g2" => Some(*block),
+                _ => None,
+            })
+            .expect("the foreign block renders");
+        let cmds = drag(&mut m, from, centre(&foreign));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
+            "{cmds:?}"
+        );
+        assert_eq!(m.groups(), &before[..], "no membership changed");
+        assert_eq!(m.locality_of("d"), Some(Locality::Detached));
+    }
+
+    #[test]
+    fn dragging_a_marked_tile_drags_the_whole_marked_set() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("d1"),
+            info("d2"),
+        ]));
+        for id in ["d1", "d2"] {
+            let pos = centre_of(&m, id);
+            press_ctrl(&mut m, pos); // mark both
+        }
+        let from = centre(&tile_rect(&m, "d1"));
+        let to = centre(&my_block_rect(&m));
+        let cmds = drag(&mut m, from, to);
+        assert!(
+            cmds.contains(&Cmd::Attach("d1".into())) && cmds.contains(&Cmd::Attach("d2".into())),
+            "the whole marked set attaches: {cmds:?}"
+        );
+        assert!(m.marked.is_empty(), "the gesture consumes the marks");
+    }
+
+    #[test]
+    fn a_attaches_the_marked_here_confirming_steals() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("d"),
+            sinfo("x", true),
+        ]));
+        for id in ["d", "x"] {
+            let pos = centre_of(&m, id);
+            press_ctrl(&mut m, pos);
+        }
+        let cmds = key(&mut m, Key::Char("a".into()));
+        assert!(m.modal_open(), "a held member needs the one confirm");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
+            "{cmds:?}"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Attach("d".into())) && cmds.contains(&Cmd::Attach("x".into())),
+            "{cmds:?}"
+        );
+        assert!(m.marked.is_empty());
+        // Without any steal it runs immediately.
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        let pos = centre_of(&m, "d");
+        press_ctrl(&mut m, pos);
+        let cmds = key(&mut m, Key::Char("a".into()));
+        assert!(cmds.contains(&Cmd::Attach("d".into())), "{cmds:?}");
+        assert!(!m.modal_open());
+    }
+
+    #[test]
+    fn d_detaches_the_marked_sessions_this_window_drives() {
+        let mut m = my_fleet(&["a", "b"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("b", true),
+            info("d"),
+        ]));
+        for id in ["a", "d"] {
+            let pos = centre_of(&m, id);
+            press_ctrl(&mut m, pos);
+        }
+        let cmds = key(&mut m, Key::Char("d".into()));
+        assert!(cmds.contains(&Cmd::Detach("a".into())), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Detach(id) if id == "d")),
+            "already-detached marks are skipped: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert!(m.marked.is_empty());
+    }
+
+    #[test]
+    fn delete_kills_the_marked_after_one_confirm() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("d1"),
+            info("d2"),
+        ]));
+        for id in ["d1", "d2"] {
+            let pos = centre_of(&m, id);
+            press_ctrl(&mut m, pos);
+        }
+        let cmds = key(&mut m, Key::Named(NamedKey::Delete));
+        assert!(m.modal_open(), "bulk kill is confirmed");
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Kill(_))), "{cmds:?}");
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Kill("d1".into())) && cmds.contains(&Cmd::Kill("d2".into())),
+            "{cmds:?}"
+        );
+        assert!(m.marked.is_empty());
     }
 
     #[test]
