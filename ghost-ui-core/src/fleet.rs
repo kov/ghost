@@ -1946,6 +1946,25 @@ impl FleetModel {
                 cmds.push(Cmd::Redraw);
                 cmds
             }
+            // `u` ungroups (the drag-out's keyboard twin); Ctrl-u dissolves
+            // the focused tile's whole group, dead members included.
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && !mods.sup && matches!(&key, Key::Char(s) if s == "u") => {
+                let targets = if mods.ctrl {
+                    self.focused_group_all_members()
+                } else {
+                    self.key_targets()
+                };
+                let mut cmds: Vec<Cmd> = targets
+                    .iter()
+                    .flat_map(|id| self.ungroup_session(id))
+                    .collect();
+                self.marked.clear();
+                self.refocus();
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
             UiEvent::Key {
                 key, mods, kind, ..
             } if kind.is_down() && matches!(key, Key::Named(NamedKey::Delete)) => {
@@ -2179,20 +2198,20 @@ impl FleetModel {
                 cmds
             }
             GroupButton::Dissolve => {
-                // Forget the closed group: the living drop to the pool, the
-                // dead are forgotten (membership was all that kept them).
-                // The registry save follows from the sync.
-                let dead = self.dead_members(gid);
-                self.groups.retain(|g| g.id != gid);
-                self.tiles.retain(|t| !(t.dead && dead.contains(&t.id)));
-                if self
-                    .focused
-                    .as_ref()
-                    .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
-                {
-                    self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
-                }
-                vec![Cmd::Redraw]
+                // Forget the group: every member ungroups — the living drop
+                // to the pool, the dead are forgotten (membership was all
+                // that kept them). The registry save follows from the sync.
+                let members: Vec<SessionId> = self
+                    .group(gid)
+                    .map(|g| g.members.clone())
+                    .unwrap_or_default();
+                let mut cmds: Vec<Cmd> = members
+                    .iter()
+                    .flat_map(|id| self.ungroup_session(id))
+                    .collect();
+                self.refocus();
+                cmds.push(Cmd::Redraw);
+                cmds
             }
             GroupButton::Rename => {
                 // Edit my group's name inline on the block header, seeded
@@ -2309,6 +2328,39 @@ impl FleetModel {
         cmds
     }
 
+    /// Ungroup `id` — the verb behind a drag out of its block, the `u` key,
+    /// and (over a whole group) dissolve. Membership goes everywhere; a
+    /// session this window drives also detaches, since a driven session
+    /// always belongs to my group and so cannot stay attached groupless;
+    /// a dead one is forgotten — membership was all that kept it. The
+    /// registry save follows from the sync.
+    fn ungroup_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+        let dead = self.tiles.iter().any(|t| &t.id == id && t.dead);
+        for g in &mut self.groups {
+            g.members.retain(|m| m != id);
+        }
+        self.groups.retain(|g| !g.members.is_empty());
+        if dead {
+            self.tiles.retain(|t| &t.id != id);
+            Vec::new()
+        } else if self.locality_of(id) == Some(Locality::ThisWindow) {
+            self.detach_session(id)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Restore a valid focus after tiles were removed or moved.
+    fn refocus(&mut self) {
+        if self
+            .focused
+            .as_ref()
+            .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
+        {
+            self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
+        }
+    }
+
     /// What the action verbs (`a`/`d`/Delete) act on: the marked set when
     /// marks exist, otherwise the focused tile.
     fn key_targets(&self) -> Vec<SessionId> {
@@ -2325,6 +2377,19 @@ impl FleetModel {
     fn focused_group_targets(&self) -> Vec<SessionId> {
         match self.focused.as_deref().and_then(|id| self.group_of(id)) {
             Some(gid) => self.present_members(&gid),
+            None => self.focused.clone().into_iter().collect(),
+        }
+    }
+
+    /// Like [`Self::focused_group_targets`] but including the group's dead
+    /// members — for the verbs that act on remembered corpses too
+    /// (ungroup forgets them, kill discards them).
+    fn focused_group_all_members(&self) -> Vec<SessionId> {
+        match self.focused.as_deref().and_then(|id| self.group_of(id)) {
+            Some(gid) => self
+                .group(&gid)
+                .map(|g| g.members.clone())
+                .unwrap_or_default(),
             None => self.focused.clone().into_iter().collect(),
         }
     }
@@ -3006,31 +3071,14 @@ impl FleetModel {
         if over_foreign {
             return vec![Cmd::Redraw]; // snap home: not a drop target
         }
-        // Outside every block: the ungroup gesture. Membership goes (the
-        // detach buttons keep it; dragging out is the explicit removal), a
-        // driven session also detaches, and a dead one is forgotten —
-        // membership was all that kept it (the registry save follows the
-        // sync).
-        let mut cmds = Vec::new();
-        for sid in &set {
-            let dead = self.tiles.iter().any(|t| &t.id == sid && t.dead);
-            for g in &mut self.groups {
-                g.members.retain(|m| m != sid);
-            }
-            self.groups.retain(|g| !g.members.is_empty());
-            if dead {
-                self.tiles.retain(|t| &t.id != sid);
-            } else if self.locality_of(sid) == Some(Locality::ThisWindow) {
-                cmds.extend(self.detach_session(sid));
-            }
-        }
-        if self
-            .focused
-            .as_ref()
-            .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
-        {
-            self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
-        }
+        // Outside every block: the ungroup gesture (see
+        // [`Self::ungroup_session`] — the detach buttons keep membership;
+        // dragging out is the explicit removal).
+        let mut cmds: Vec<Cmd> = set
+            .iter()
+            .flat_map(|sid| self.ungroup_session(sid))
+            .collect();
+        self.refocus();
         self.marked.clear();
         cmds.push(Cmd::Redraw);
         cmds
@@ -5018,6 +5066,88 @@ mod tests {
             cmds.contains(&Cmd::Kill("a".into())) && cmds.contains(&Cmd::Kill("c".into())),
             "the whole group dies: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn u_ungroups_the_focused_session() {
+        // `u` is the keyboard twin of dragging a tile out of its block: the
+        // membership goes, and a driven session also detaches (a driven
+        // session always belongs to my group, so it cannot stay attached
+        // and groupless). It lands in the pool.
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        focus(&mut m, "a");
+        let cmds = key(&mut m, Key::Char("u".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Detach("a".into())),
+            "the driven session releases: {cmds:?}"
+        );
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(vec!["c".to_string()]),
+            "the membership goes: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        let block = my_block_rect(&m);
+        let r = tile_rect(&m, "a");
+        assert!(
+            !block.contains(r.x + r.w / 2.0, r.y + r.h / 2.0),
+            "the ungrouped session drops to the pool"
+        );
+    }
+
+    #[test]
+    fn u_forgets_a_focused_dead_member() {
+        let mut m = my_fleet(&["a", "z"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("z", true),
+        ]));
+        list(&mut m, &["a"]); // z dies, remembered
+        focus(&mut m, "z");
+        let cmds = key(&mut m, Key::Char("u".to_string()));
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "z"),
+            "membership was all that kept the corpse"
+        );
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn ctrl_u_dissolves_the_focused_tiles_group() {
+        // The group chord: every member ungroups — driven ones detach to
+        // the pool, dead ones are forgotten — and the entry dissolves. The
+        // sessions themselves keep running; nothing needs a confirm.
+        let mut m = my_fleet(&["a", "c", "z"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+            sinfo("z", true),
+        ]));
+        list(&mut m, &["a", "c"]); // z dies, remembered by my group
+        focus(&mut m, "a");
+        let cmds = key_ctrl(&mut m, Key::Char("u".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Detach("a".into())) && cmds.contains(&Cmd::Detach("c".into())),
+            "the driven members release: {cmds:?}"
+        );
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "z"),
+            "the dead one is forgotten"
+        );
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(Vec::new()),
+            "the entry dissolves: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
     }
 
     #[test]
