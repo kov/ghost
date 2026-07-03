@@ -1237,11 +1237,13 @@ impl FleetModel {
         }
         // Then the attach-state sections of ungrouped tiles, preserving the
         // stable spatial order (see [`tile_order_key`]); empty sections are
-        // dropped so they get no header.
+        // dropped so they get no header. Detached comes before Elsewhere:
+        // after this window's own sessions, the unheld pool is what the user
+        // is most likely to reach for.
         for loc in [
             Locality::ThisWindow,
-            Locality::Elsewhere,
             Locality::Detached,
+            Locality::Elsewhere,
         ] {
             let mut ts: Vec<&Tile> = self
                 .tiles
@@ -3279,14 +3281,15 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "nothing is taken over before the user confirms: {cmds:?}"
         );
-        // Space is the direct confirm chord.
+        // Space is the direct confirm chord. Members follow layout order, so
+        // the detached "c" leads the group and is the taken-over foreground.
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
             cmds,
             vec![
-                Cmd::Unobserve("c".into()),
-                Cmd::Attach("c".into()),
-                Cmd::TakeOver("a".into()),
+                Cmd::Unobserve("a".into()),
+                Cmd::Attach("a".into()),
+                Cmd::TakeOver("c".into()),
                 Cmd::Redraw
             ]
         );
@@ -3866,8 +3869,9 @@ mod tests {
 
         // The group block comes first, holding both members side by side even
         // though their attach states differ; "c" stays in its section below.
+        // Members follow layout order, so the detached "b" leads.
         let order = order(&m);
-        assert_eq!(order, ["a", "b", "c"]);
+        assert_eq!(order, ["b", "a", "c"]);
         let (ya, yb, yc) = (tile_y(&m, "a"), tile_y(&m, "b"), tile_y(&m, "c"));
         assert_eq!(ya, yb, "group members share the block's row");
         assert!(yc > ya, "the ungrouped remainder renders below the group");
@@ -4256,17 +4260,18 @@ mod tests {
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
         assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
-        // Three headers, in attach-state order, stacked top to bottom.
+        // Three headers, stacked top to bottom: this window first, then the
+        // detached pool (the likeliest tiles to grab), then other windows'.
         let hs = headers(&m);
         let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["Attached", "Attached elsewhere", "Detached"]);
+        assert_eq!(labels, vec!["Attached", "Detached", "Attached elsewhere"]);
         assert!(
             hs[0].1 < hs[1].1 && hs[1].1 < hs[2].1,
             "sections stack downward: {hs:?}"
         );
         // Each tile sits in its section's vertical band.
-        assert!(tile_y(&m, "a") < tile_y(&m, "b"));
-        assert!(tile_y(&m, "b") < tile_y(&m, "c"));
+        assert!(tile_y(&m, "a") < tile_y(&m, "c"));
+        assert!(tile_y(&m, "c") < tile_y(&m, "b"));
     }
 
     #[test]
