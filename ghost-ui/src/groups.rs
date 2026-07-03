@@ -28,6 +28,9 @@ fn load_from(dir: &Path) -> Vec<Group> {
     let mut groups = toml::from_str::<GroupsFile>(&text)
         .map(|f| f.group)
         .unwrap_or_default();
+    // A memberless group remembers nothing — prune it rather than render an
+    // empty closed block forever.
+    groups.retain(|g| !g.members.is_empty());
     for (i, g) in groups.iter_mut().enumerate() {
         if g.id.is_empty() {
             g.id = format!("legacy-{i}");
@@ -89,6 +92,20 @@ mod tests {
         assert_eq!(load_from(dir.path()), Vec::new());
         std::fs::write(file_in(dir.path()), "not toml [").unwrap();
         assert_eq!(load_from(dir.path()), Vec::new());
+    }
+
+    #[test]
+    fn memberless_groups_are_pruned_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            file_in(dir.path()),
+            "[[group]]\nid = \"w9\"\nname = \"blue\"\ncolor = 0\nmembers = []\n\n\
+             [[group]]\nid = \"w2\"\nname = \"green\"\ncolor = 1\nmembers = [\"alpha\"]\n",
+        )
+        .unwrap();
+        let loaded = load_from(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "w2");
     }
 
     #[test]

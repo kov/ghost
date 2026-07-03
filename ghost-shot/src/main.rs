@@ -782,7 +782,7 @@ fn calib_tui() {
 /// detached — covering the block, both sections, cards, buttons, the focus
 /// border, and scaled live previews.
 fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
-    let size = (1400u32, 900u32);
+    let size = (1400u32, 1200u32);
     let mine: HashSet<String> = ["edit", "build"].into_iter().map(String::from).collect();
 
     // The focused/primary tile carries real content via `adopting`.
@@ -795,6 +795,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
         info("build", true, &[], 4012),
         info("logs", true, &["journalctl", "-f"], 4099), // attached elsewhere
         info("prod", false, &["ssh", "prod-web-1"], 3777), // detached
+        info("batch", false, &["make", "-j8"], 3120),    // a closed group's member
     ]));
 
     // Live previews for the sessions this window drives.
@@ -820,7 +821,9 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     // The window's own group block also remembers "db", dead: its tile stays
     // in the block, previewing its recording's last screen, offering a
     // relaunch on activation. "logs" belongs to another window's group, so
-    // it renders in that group's block below the detached pool.
+    // it renders in that group's block below the detached pool. "batch" is
+    // the member of a CLOSED group — a windowless, remembered set that
+    // renders last, dimmed, reopenable wholesale.
     fleet.set_groups(vec![
         ghost_ui_core::Group {
             id: "win-shot-0".to_string(),
@@ -833,6 +836,12 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
             name: "green".to_string(),
             color: 1,
             members: vec!["logs".to_string()],
+        },
+        ghost_ui_core::Group {
+            id: "win-shot-2".to_string(),
+            name: "purple".to_string(),
+            color: 3,
+            members: vec!["batch".to_string()],
         },
     ]);
     fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {

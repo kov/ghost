@@ -127,6 +127,9 @@ type SectionHeader = (Band, RectPx);
 /// Padding of a group block's outline around its header + member rows.
 const BLOCK_PAD: f32 = 6.0;
 
+/// Alpha factor dimming a closed (windowless) group's accent.
+const CLOSED_GROUP_ALPHA: f32 = 0.55;
+
 /// [`SceneId::Section`] ranks 0–2 are the locality sections; group headers are
 /// keyed from this base up.
 const GROUP_SECTION_RANK_BASE: u8 = 3;
@@ -161,6 +164,9 @@ enum GroupButton {
     Open,
     /// Detach the members this window drives (they keep running).
     Detach,
+    /// Forget a closed group: living members drop to the detached pool,
+    /// dead ones are forgotten (membership was all that kept them).
+    Dissolve,
     /// Kill every member and its process (confirmed first).
     Kill,
 }
@@ -171,6 +177,7 @@ impl GroupButton {
             GroupButton::Relaunch => "relaunch",
             GroupButton::Open => "attach all",
             GroupButton::Detach => "detach",
+            GroupButton::Dissolve => "dissolve",
             GroupButton::Kill => "kill",
         }
     }
@@ -386,9 +393,14 @@ pub struct FleetModel {
     /// Cleared by Escape — which marks claim ahead of the fleet toggle.
     marked: HashSet<SessionId>,
     /// The group registry, in creation order. Handed in and out by the root
-    /// across fleet open/close; membership edits to this window's own group
-    /// are persisted via `Cmd::SaveGroups` (see [`Self::sync_my_group`]).
+    /// across fleet open/close; local edits (my membership sync, claims
+    /// stripping other entries, dissolutions) are persisted via
+    /// `Cmd::SaveGroups` (see [`Self::sync_registry`]).
     groups: Vec<Group>,
+    /// The registry as last loaded or saved — the baseline
+    /// [`Self::sync_registry`] diffs against to decide whether a save is
+    /// owed.
+    saved_groups: Vec<Group>,
     /// This window's group identity (id, name, color), minted by the shell at
     /// window creation. Its registry entry — created on first membership —
     /// tracks the sessions this window drives plus the dead ones it
@@ -543,6 +555,7 @@ impl FleetModel {
             observing: HashSet::new(),
             marked: HashSet::new(),
             groups: Vec::new(),
+            saved_groups: Vec::new(),
             my_group: Group::auto(String::new(), 0),
             grab: None,
         }
@@ -568,7 +581,14 @@ impl FleetModel {
 
     /// Seed the registry on a freshly built fleet (carry-over or startup load).
     pub fn set_groups(&mut self, groups: Vec<Group>) {
-        self.groups = groups;
+        self.groups = groups.clone();
+        self.saved_groups = groups;
+    }
+
+    /// This window's group identity — the root mirrors it after every
+    /// delegated update, since opening a closed group can rebind it.
+    pub fn my_group(&self) -> &Group {
+        &self.my_group
     }
 
     /// Adopt this window's group identity (minted by the shell at window
@@ -881,12 +901,15 @@ impl FleetModel {
             UiEvent::DeadSessions(dead) => self.dead_sessions(dead),
             UiEvent::SessionPush { name, push } => self.session_push(&name, push),
             // Authoritative groups from the shell (startup load, or another
-            // window saved): replace ours without echoing a save back.
+            // window saved): replace ours without echoing a save back (the
+            // sync below re-adds my entry — and re-saves — only if the
+            // broadcast dropped members I still hold).
             UiEvent::GroupsLoaded(groups) => {
                 if self.groups == groups {
                     Vec::new()
                 } else {
-                    self.groups = groups;
+                    self.groups = groups.clone();
+                    self.saved_groups = groups;
                     vec![Cmd::Redraw]
                 }
             }
@@ -924,9 +947,9 @@ impl FleetModel {
             }
             _ => Vec::new(),
         };
-        // Whatever the event did to the tiles, keep my group's registry entry
-        // (and its persisted form) matched to them.
-        cmds.extend(self.sync_my_group());
+        // Whatever the event did to the tiles or the registry, keep my
+        // group's entry matched to them and persist any drift.
+        cmds.extend(self.sync_registry());
         // Rebuild any preview whose content or size this event changed, so `view`
         // can stay a pure read of cached frames.
         self.refresh_dirty_frames();
@@ -1275,79 +1298,87 @@ impl FleetModel {
                 mine_tiles,
             ));
         }
-        // Then the detached pool: after this window's own sessions, the
-        // unheld sessions are what the user is most likely to reach for.
-        // Dead tiles of other groups don't render (their blocks come later).
+        // Other windows' groups, one block each in registry order. An OPEN
+        // group (someone holds a member) renders right after the detached
+        // pool; a CLOSED one (windowless — a remembered, reopenable set)
+        // renders last, dimmed. A block holds the group's live elsewhere
+        // tiles (holder identity first, membership as fallback — see
+        // [`Self::holder_target`]), its dead members, and — when closed —
+        // its detached members, keeping them out of the pool.
+        let zero = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        }; // block rects are filled in during placement
+        let mut placed: HashSet<&str> = in_my_block.clone();
+        let mut open_blocks: Vec<(Band, Vec<&Tile>)> = Vec::new();
+        let mut closed_blocks: Vec<(Band, Vec<&Tile>)> = Vec::new();
+        for g in &self.groups {
+            if g.id == self.my_group.id {
+                continue;
+            }
+            let closed = self.group_is_closed(&g.id);
+            let mut ts: Vec<&Tile> = self
+                .tiles
+                .iter()
+                .filter(|t| {
+                    if placed.contains(t.id.as_str()) {
+                        return false;
+                    }
+                    if self.holder_target(t).as_deref() == Some(g.id.as_str()) {
+                        return true;
+                    }
+                    g.members.contains(&t.id)
+                        && (t.dead || (closed && t.locality == Locality::Detached))
+                })
+                .collect();
+            ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
+            if ts.is_empty() {
+                continue;
+            }
+            for t in &ts {
+                placed.insert(t.id.as_str());
+            }
+            let band = Band::Group {
+                id: g.id.clone(),
+                block: zero,
+            };
+            if closed {
+                closed_blocks.push((band, ts));
+            } else {
+                open_blocks.push((band, ts));
+            }
+        }
+        // The detached pool: after this window's own sessions, the unheld
+        // sessions are what the user is most likely to reach for. (A closed
+        // group's members stay in its block instead.)
         let mut detached: Vec<&Tile> = self
             .tiles
             .iter()
             .filter(|t| {
-                !t.dead && t.locality == Locality::Detached && !in_my_block.contains(t.id.as_str())
+                !t.dead && t.locality == Locality::Detached && !placed.contains(t.id.as_str())
             })
             .collect();
         detached.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
         if !detached.is_empty() {
             segments.push((Band::Section(Locality::Detached), detached));
         }
-        // Other windows' groups, one block each in registry order. A live
-        // Elsewhere tile belongs to the block its holder identity names (the
-        // host pushes it with the attach); registry membership covers tiles
-        // whose snapshot hasn't landed yet. What names no known group falls
-        // through to the generic elsewhere section.
-        let foreign_of = |t: &'_ Tile| -> Option<GroupId> {
-            if t.dead || t.locality != Locality::Elsewhere {
-                return None;
-            }
-            t.holder
-                .clone()
-                .or_else(|| {
-                    self.groups
-                        .iter()
-                        .find(|g| g.members.contains(&t.id))
-                        .map(|g| g.id.clone())
-                })
-                .filter(|gid| *gid != self.my_group.id && self.groups.iter().any(|g| g.id == *gid))
-        };
-        for g in &self.groups {
-            if g.id == self.my_group.id {
-                continue;
-            }
-            let mut ts: Vec<&Tile> = self
-                .tiles
-                .iter()
-                .filter(|t| foreign_of(t).as_deref() == Some(g.id.as_str()))
-                .collect();
-            ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
-            if !ts.is_empty() {
-                segments.push((
-                    Band::Group {
-                        id: g.id.clone(),
-                        block: RectPx {
-                            x: 0.0,
-                            y: 0.0,
-                            w: 0.0,
-                            h: 0.0,
-                        }, // filled in during placement
-                    },
-                    ts,
-                ));
-            }
-        }
-        // The generic remainder: held elsewhere by nobody we can name.
+        segments.extend(open_blocks);
+        // The generic remainder: held elsewhere by nobody we can name
+        // (plain attach clients, or windows whose registry we lack).
         let mut elsewhere: Vec<&Tile> = self
             .tiles
             .iter()
             .filter(|t| {
-                !t.dead
-                    && t.locality == Locality::Elsewhere
-                    && !in_my_block.contains(t.id.as_str())
-                    && foreign_of(t).is_none()
+                !t.dead && t.locality == Locality::Elsewhere && !placed.contains(t.id.as_str())
             })
             .collect();
         elsewhere.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
         if !elsewhere.is_empty() {
             segments.push((Band::Section(Locality::Elsewhere), elsewhere));
         }
+        segments.extend(closed_blocks);
         if segments.is_empty() {
             return (Vec::new(), Vec::new(), base_band, 0.0);
         }
@@ -1753,6 +1784,36 @@ impl FleetModel {
         self.groups.iter().find(|g| g.id == gid)
     }
 
+    /// The foreign group a live Elsewhere tile belongs under: its holder
+    /// identity (pushed with the attach) wins; registry membership covers
+    /// tiles whose snapshot hasn't landed. `None` when it names no known
+    /// group, or names mine.
+    fn holder_target(&self, t: &Tile) -> Option<GroupId> {
+        if t.dead || t.locality != Locality::Elsewhere {
+            return None;
+        }
+        t.holder
+            .clone()
+            .or_else(|| {
+                self.groups
+                    .iter()
+                    .find(|g| g.members.contains(&t.id))
+                    .map(|g| g.id.clone())
+            })
+            .filter(|gid| *gid != self.my_group.id && self.groups.iter().any(|g| g.id == *gid))
+    }
+
+    /// Whether group `gid` is closed: no window we can see holds any of it.
+    /// A closed group is a remembered set — reopenable wholesale, its
+    /// members kept out of the detached pool.
+    fn group_is_closed(&self, gid: &str) -> bool {
+        gid != self.my_group.id
+            && !self
+                .tiles
+                .iter()
+                .any(|t| self.holder_target(t).as_deref() == Some(gid))
+    }
+
     /// The group `id` belongs to, if any.
     fn group_of(&self, id: &str) -> Option<GroupId> {
         self.groups
@@ -1813,6 +1874,9 @@ impl FleetModel {
         {
             set.push(GroupButton::Detach);
         }
+        if self.group(gid).is_some() && self.group_is_closed(gid) {
+            set.push(GroupButton::Dissolve);
+        }
         if !present.is_empty() {
             set.push(GroupButton::Kill);
         }
@@ -1872,6 +1936,22 @@ impl FleetModel {
                     ours.iter().flat_map(|id| self.detach_session(id)).collect();
                 cmds.push(Cmd::Redraw);
                 cmds
+            }
+            GroupButton::Dissolve => {
+                // Forget the closed group: the living drop to the pool, the
+                // dead are forgotten (membership was all that kept them).
+                // The registry save follows from the sync.
+                let dead = self.dead_members(gid);
+                self.groups.retain(|g| g.id != gid);
+                self.tiles.retain(|t| !(t.dead && dead.contains(&t.id)));
+                if self
+                    .focused
+                    .as_ref()
+                    .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
+                {
+                    self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
+                }
+                vec![Cmd::Redraw]
             }
             GroupButton::Kill => {
                 self.pending = Some(Pending {
@@ -2022,6 +2102,22 @@ impl FleetModel {
     fn open_group_cmds(&mut self, gid: &str) -> Vec<Cmd> {
         let members = self.present_members(gid);
         let mut cmds = Vec::new();
+        // Opening a whole CLOSED group from a window driving nothing ADOPTS
+        // it: the window becomes that group (id, color, name), so the set
+        // survives close/reopen as itself. A window with its own sessions
+        // instead merges the members into its group, and the claims strip
+        // them from the source, which dissolves once emptied.
+        if gid != self.my_group.id
+            && self.mine.is_empty()
+            && self.group(&self.my_group.id).is_none()
+            && self.group_is_closed(gid)
+            && let Some(g) = self.group(gid)
+        {
+            self.my_group = Group {
+                members: Vec::new(),
+                ..g.clone()
+            };
+        }
         for id in members.iter().skip(1) {
             if self.observing.remove(id) {
                 cmds.push(Cmd::Unobserve(id.clone()));
@@ -2032,6 +2128,16 @@ impl FleetModel {
             }
             cmds.push(Cmd::Attach(id.clone()));
         }
+        // The opened members leave every other group — their ownership
+        // moved here (a no-op under adoption, where gid IS my group now).
+        let my_id = self.my_group.id.clone();
+        for g in &mut self.groups {
+            if g.id != my_id {
+                g.members.retain(|m| !members.contains(m));
+            }
+        }
+        self.groups
+            .retain(|g| g.id == my_id || !g.members.is_empty());
         cmds.extend(members.first().map(|id| Cmd::TakeOver(id.clone())));
         cmds
     }
@@ -2208,9 +2314,8 @@ impl FleetModel {
     /// the sessions this window drives plus the dead ones it remembers, in
     /// tile order. Death keeps membership (that's what a dead tile in the
     /// block is); detach, steal, and a revival that didn't come back here all
-    /// drop it. Returns the save when the entry actually changed — the single
-    /// place my group's membership is persisted from.
-    fn sync_my_group(&mut self) -> Vec<Cmd> {
+    /// drop it.
+    fn sync_my_entry(&mut self) {
         let current: Vec<SessionId> = self
             .group(&self.my_group.id)
             .map(|g| g.members.clone())
@@ -2235,7 +2340,7 @@ impl FleetModel {
             }
         }
         if desired == current {
-            return Vec::new();
+            return;
         }
         if desired.is_empty() {
             // Nothing driven or remembered: the entry goes; the identity
@@ -2248,6 +2353,17 @@ impl FleetModel {
             g.members = desired;
             self.groups.push(g);
         }
+    }
+
+    /// Bring my entry up to date, then persist the registry if anything
+    /// local moved it off the last loaded/saved state — the single place
+    /// `Cmd::SaveGroups` is emitted from.
+    fn sync_registry(&mut self) -> Vec<Cmd> {
+        self.sync_my_entry();
+        if self.groups == self.saved_groups {
+            return Vec::new();
+        }
+        self.saved_groups = self.groups.clone();
         vec![Cmd::SaveGroups(self.groups.clone())]
     }
 
@@ -2420,7 +2536,8 @@ impl FleetModel {
                     // syncs on update); my own block always has its identity.
                     let group = self.group(&gid).unwrap_or(&self.my_group);
                     // Group ranks live above the three locality ranks; this
-                    // window's block is emphasized with a heavier outline.
+                    // window's block is emphasized with a heavier outline,
+                    // and a closed (windowless) one reads dimmed.
                     let rank = self
                         .groups
                         .iter()
@@ -2428,10 +2545,14 @@ impl FleetModel {
                         .unwrap_or_default() as u8;
                     let id = SceneId::Section(GROUP_SECTION_RANK_BASE + rank);
                     let width = if gid == self.my_group.id { 2.0 } else { 1.0 };
+                    let mut accent = group.rgba();
+                    if self.group_is_closed(&gid) {
+                        accent[3] *= CLOSED_GROUP_ALPHA;
+                    }
                     items.push(SceneItem::Border {
                         id,
                         rect: block,
-                        color: group.rgba(),
+                        color: accent,
                         width,
                     });
                     items.push(SceneItem::Text {
@@ -2439,7 +2560,7 @@ impl FleetModel {
                         rect: text_line(rect, metrics, GAP * 0.5),
                         runs: vec![label_run(&group.name)],
                         metrics,
-                        color: group.rgba(),
+                        color: accent,
                         scale: 1.0,
                     });
                     // The group's action chips, right-aligned on the band.
@@ -3236,9 +3357,16 @@ mod tests {
 
     #[test]
     fn ctrl_enter_opens_the_whole_group_with_the_first_member_foreground() {
-        let mut m = my_fleet(&[]);
+        // The window drives "m0" already, so the opened group merges rather
+        // than being adopted (that path has its own test).
+        let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        list(&mut m, &["a", "b", "c"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("m0", true),
+            info("a"),
+            info("b"),
+            info("c"),
+        ]));
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
@@ -3259,7 +3387,7 @@ mod tests {
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "w1" && g.members == vec!["c".to_string()]),
+                .any(|g| g.id == "w1" && g.members.contains(&"c".to_string())),
             "the claimed member joins this window's group: {:?}",
             m.groups()
         );
@@ -4013,6 +4141,147 @@ mod tests {
     }
 
     #[test]
+    fn a_windowless_groups_members_render_in_its_closed_block() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "y"]);
+        // Nobody holds x or y: their group is closed. It renders last,
+        // keeping its members out of the detached pool.
+        m.update(UiEvent::SessionList(vec![info("x"), info("y"), info("d")]));
+        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+        assert_eq!(tile_y(&m, "x"), tile_y(&m, "y"));
+        assert!(tile_y(&m, "d") < tile_y(&m, "x"));
+        // The closed block reads dimmed: its accent at reduced alpha.
+        let accent = crate::group::GROUP_PALETTE[1];
+        assert!(
+            m.view().layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Border { color, .. }
+                    if color[..3] == accent[..3] && color[3] < 1.0)),
+            "a closed block is outlined dimmed"
+        );
+        // Chips: reopen, dissolve, kill — nothing dead to relaunch, nothing
+        // driven here to detach.
+        assert_eq!(
+            m.group_chipset("g2"),
+            vec![GroupButton::Open, GroupButton::Dissolve, GroupButton::Kill]
+        );
+    }
+
+    #[test]
+    fn a_dead_member_renders_in_its_groups_block_not_only_mine() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "z"]);
+        m.update(UiEvent::SessionList(vec![info("x")]));
+        // "z" died before this fleet ever saw it: the sweep seeds its tile,
+        // and it renders inside its (closed) group's block.
+        m.update(UiEvent::DeadSessions(vec![dead_info("z", "worker", &[])]));
+        assert_eq!(header_labels(&m), vec!["green"]);
+        assert!(
+            m.layout().iter().any(|(_, id, _)| id == "z"),
+            "the dead member renders in its group's block"
+        );
+        // With a dead member the closed block offers relaunch too.
+        assert_eq!(
+            m.group_chipset("g2"),
+            vec![
+                GroupButton::Relaunch,
+                GroupButton::Open,
+                GroupButton::Dissolve,
+                GroupButton::Kill
+            ]
+        );
+    }
+
+    #[test]
+    fn opening_a_closed_group_with_an_empty_window_adopts_its_identity() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "y"]);
+        m.update(UiEvent::SessionList(vec![info("x"), info("y")]));
+        focus(&mut m, "x");
+        let cmds = ctrl_enter(&mut m);
+        // The empty window BECOMES the group: same id, color, name.
+        assert_eq!(m.my_group.id, "g2");
+        assert_eq!(m.my_group.name, "green");
+        assert!(
+            cmds.contains(&Cmd::TakeOver("x".into())) && cmds.contains(&Cmd::Attach("y".into())),
+            "the whole group opens here: {cmds:?}"
+        );
+        // The claimed member is ThisWindow under the adopted identity.
+        assert_eq!(m.locality_of("y"), Some(Locality::ThisWindow));
+        assert!(
+            m.groups()
+                .iter()
+                .any(|g| g.id == "g2" && g.members.contains(&"y".to_string())),
+            "membership stays under the adopted entry: {:?}",
+            m.groups()
+        );
+    }
+
+    #[test]
+    fn opening_a_closed_group_into_a_nonempty_window_merges_and_dissolves_it() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "y"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("x"),
+            info("y"),
+        ]));
+        focus(&mut m, "x");
+        let cmds = ctrl_enter(&mut m);
+        assert_eq!(m.my_group.id, "w1", "a window with sessions keeps itself");
+        assert!(
+            cmds.contains(&Cmd::TakeOver("x".into())) && cmds.contains(&Cmd::Attach("y".into())),
+            "the whole group opens here: {cmds:?}"
+        );
+        // The claimed member moves INTO this window's group; the source
+        // group dissolves once its members are taken.
+        assert!(
+            m.groups()
+                .iter()
+                .any(|g| g.id == "w1" && g.members.contains(&"y".to_string())),
+            "claimed members join my group: {:?}",
+            m.groups()
+        );
+        assert!(
+            m.groups().iter().all(|g| g.id != "g2"),
+            "the emptied source group dissolves: {:?}",
+            m.groups()
+        );
+    }
+
+    #[test]
+    fn dissolving_a_closed_group_releases_the_living_and_forgets_the_dead() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "z"]);
+        m.update(UiEvent::SessionList(vec![info("x")]));
+        m.update(UiEvent::DeadSessions(vec![dead_info("z", "", &[])]));
+        let r = group_button_rect(&m, "g2", GroupButton::Dissolve);
+        let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            m.groups().iter().all(|g| g.id != "g2"),
+            "the grouping is gone"
+        );
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "z"),
+            "the dead member is forgotten (its membership was all that kept it)"
+        );
+        assert_eq!(
+            header_labels(&m),
+            vec!["Detached"],
+            "the living member drops into the pool"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SaveGroups(g) if g.is_empty())),
+            "the dissolution is persisted: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn elsewhere_members_bucket_under_their_groups_block() {
         let mut m = my_fleet(&[]);
         widen(&mut m);
@@ -4077,9 +4346,10 @@ mod tests {
             })),
         );
         assert_eq!(header_labels(&m), vec!["Detached", "orange"]);
-        // And a detach drops it into the pool with the rest.
+        // And a detach closes its group: still a member of g2, the tile
+        // lands in that group's (now closed) block, not the pool.
         push(&mut m, "x", SessionPush::Event(SessionEvent::Detached));
-        assert_eq!(header_labels(&m), vec!["Detached"]);
+        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
     }
 
     #[test]

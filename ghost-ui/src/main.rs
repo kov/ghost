@@ -807,9 +807,6 @@ fn open_url(url: &str) {
 struct WindowState {
     gfx: Graphics,
     root: RootModel,
-    /// The identity this window's attaches report via `Hello`, embedding its
-    /// group id so other windows' fleets bucket its sessions under its block.
-    identity: String,
     /// This window's own session clients (the single-view session plus any fleet
     /// previews). Dropping the window drops these, which detaches every session
     /// it held — the "close = detach" default, with no shared-pool bookkeeping.
@@ -1130,7 +1127,7 @@ impl App {
                     {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&id, cols, rows, &w.identity) {
+                        if let Ok(s) = attach(&id, cols, rows, &w.root.client_identity()) {
                             w.sessions.insert(id, s);
                         }
                     }
@@ -1225,7 +1222,7 @@ impl App {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&name, cols, rows, &w.identity) {
+                        if let Ok(s) = attach(&name, cols, rows, &w.root.client_identity()) {
                             w.sessions.insert(name, s);
                         }
                     }
@@ -1466,7 +1463,7 @@ impl App {
         // pin its cursor to that smaller bottom row — the next output then lands
         // mid-screen (see `RootModel::grid`).
         let (cols, rows) = w.root.grid();
-        match attach(name, cols, rows, &w.identity) {
+        match attach(name, cols, rows, &w.root.client_identity()) {
             Ok(s) => {
                 w.sessions.insert(name.to_string(), s);
                 true
@@ -1555,7 +1552,6 @@ impl App {
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
         let group = self.mint_group();
-        let identity = ghost_ui_core::group::window_identity(&group.id);
         let claims = root.set_my_group(group); // fresh fleet: owns nothing yet
         debug_assert!(claims.is_empty());
         apply_anim_ms(&mut root);
@@ -1564,7 +1560,6 @@ impl App {
             WindowState {
                 gfx,
                 root,
-                identity,
                 sessions: HashMap::new(),
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),
@@ -1710,7 +1705,6 @@ impl App {
             WindowState {
                 gfx,
                 root,
-                identity,
                 sessions,
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),

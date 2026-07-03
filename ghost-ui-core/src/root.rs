@@ -406,9 +406,26 @@ impl RootModel {
 
     /// Ensure `id` is a member of this window's group — the single-view twin
     /// of the fleet's tile sync — persisting the registry when it changes.
+    /// Ownership moved here, so the session also leaves every other group;
+    /// an emptied one dissolves.
     fn claim_member(&mut self, id: &str) -> Vec<Cmd> {
+        let mut changed = false;
+        for g in &mut self.groups {
+            if g.id != self.my_group.id && g.members.iter().any(|m| m == id) {
+                g.members.retain(|m| m != id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.groups
+                .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
+        }
         match self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
-            Some(g) if g.members.iter().any(|m| m == id) => return Vec::new(),
+            Some(g) if g.members.iter().any(|m| m == id) => {
+                if !changed {
+                    return Vec::new();
+                }
+            }
             Some(g) => g.members.push(id.to_string()),
             None => {
                 let mut g = self.my_group.clone();
@@ -417,6 +434,13 @@ impl RootModel {
             }
         }
         vec![Cmd::SaveGroups(self.groups.clone())]
+    }
+
+    /// The identity this window's attaches report (embedding its group id) —
+    /// read fresh by the shell at every attach, since opening a closed group
+    /// can rebind the group.
+    pub fn client_identity(&self) -> String {
+        crate::group::window_identity(&self.my_group.id)
     }
 
     /// The fleet's per-tile preview-frame cache stats, if a fleet is present (`None`
@@ -639,6 +663,7 @@ impl RootModel {
                 Mode::Single(m) => m.update(ev),
                 Mode::Fleet(f) => f.update(ev),
             });
+            self.mirror_fleet_identity();
             self.release_detached(&mut cmds);
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(&p));
@@ -663,11 +688,23 @@ impl RootModel {
             Mode::Single(m) => m.update(ev),
             Mode::Fleet(f) => f.update(ev),
         };
+        self.mirror_fleet_identity();
         self.release_detached(&mut cmds);
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
         cmds
+    }
+
+    /// Mirror the fleet's group identity: opening a closed group from an
+    /// empty window ADOPTS it (the window becomes that group), and the shell
+    /// reads the identity off this root for the attaches it is about to run.
+    fn mirror_fleet_identity(&mut self) {
+        if let Mode::Fleet(f) = &self.mode
+            && self.my_group.id != f.my_group().id
+        {
+            self.my_group = f.my_group().clone();
+        }
     }
 
     /// A delegated command detaching a session means this window stopped
@@ -790,9 +827,11 @@ impl RootModel {
         let mut anim = None;
         let (mut model, mut cmds) = match current {
             Mode::Fleet(f) => {
-                // Carry the fleet's (possibly edited) groups out of the closing
+                // Carry the fleet's (possibly edited) groups — and identity,
+                // in case it adopted a closed group — out of the closing
                 // overview; the next opening is seeded with them.
                 self.groups = f.groups().to_vec();
+                self.my_group = f.my_group().clone();
                 // Opening a tile dives into where it sat in the grid: snapshot the
                 // fleet world so the whole grid stays visible during the descent (a
                 // freshly spawned session with no tile yet just opens, no dive).
@@ -1065,9 +1104,11 @@ impl RootModel {
                 (Mode::Fleet(Box::new(fleet)), cmds, None)
             }
             Mode::Fleet(f) => {
-                // Carry the fleet's (possibly edited) groups out of the closing
+                // Carry the fleet's (possibly edited) groups — and identity,
+                // in case it adopted a closed group — out of the closing
                 // overview; the next opening is seeded with them.
                 self.groups = f.groups().to_vec();
+                self.my_group = f.my_group().clone();
                 // Dive in: snapshot the fleet world so the whole grid stays visible
                 // while we descend into the tile we land on, then take over with the
                 // live single view once the dive lands.
@@ -1276,6 +1317,44 @@ mod tests {
         assert!(
             shows_group(&r, "orange"),
             "my block persists across fleet close/reopen"
+        );
+    }
+
+    #[test]
+    fn adopting_a_closed_group_rebinds_the_window_identity() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.set_my_group(crate::Group::auto("w1".into(), 0));
+        assert_eq!(r.client_identity(), "ghost-ui:w1");
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g2".into(),
+            name: "green".into(),
+            color: 1,
+            members: vec!["x".into(), "y".into()],
+        }]));
+        r.update(UiEvent::SessionList(vec![
+            sess("x", false, 1),
+            sess("y", false, 2),
+        ]));
+        // Ctrl-Enter on the focused member (the empty window drives
+        // nothing): the window BECOMES the group, and the identity the
+        // shell reads for the very next attach already says so.
+        let cmds = r.update(UiEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+            kind: KeyEventKind::Press,
+            alts: None,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "the group opens: {cmds:?}"
+        );
+        assert_eq!(
+            r.client_identity(),
+            "ghost-ui:g2",
+            "the adopted identity is what the attaches will report"
         );
     }
 
