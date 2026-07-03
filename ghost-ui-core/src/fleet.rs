@@ -2048,7 +2048,7 @@ impl FleetModel {
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
         }
-        self.mine.insert(id.clone());
+        let newly = self.mine.insert(id.clone());
         if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
             t.locality = Locality::ThisWindow;
         }
@@ -2059,7 +2059,11 @@ impl FleetModel {
         }
         self.groups
             .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
-        cmds.push(Cmd::Attach(id.clone()));
+        // A session already driven here needs no client work — the claim is
+        // idempotent so a group open can claim every member uniformly.
+        if newly {
+            cmds.push(Cmd::Attach(id.clone()));
+        }
         cmds
     }
 
@@ -2270,19 +2274,15 @@ impl FleetModel {
                 ..g.clone()
             };
         }
-        for id in members.iter().skip(1) {
+        // Every member is claimed NOW — the take-over target included, even
+        // though its foreground switch (the adopt) completes later. Each
+        // claim moves the member's registry ownership here, so the save this
+        // update emits is already complete; deferring the first member's
+        // claim to the adopt round-trip would persist (and broadcast) a
+        // registry with it orphaned.
+        for id in &members {
             cmds.extend(self.claim_session(id));
         }
-        // The opened members leave every other group — their ownership
-        // moved here (a no-op under adoption, where gid IS my group now).
-        let my_id = self.my_group.id.clone();
-        for g in &mut self.groups {
-            if g.id != my_id {
-                g.members.retain(|m| !members.contains(m));
-            }
-        }
-        self.groups
-            .retain(|g| g.id == my_id || !g.members.is_empty());
         cmds.extend(members.first().map(|id| Cmd::TakeOver(id.clone())));
         cmds
     }
@@ -3666,11 +3666,15 @@ mod tests {
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
         // The first member is adopted (single view); the rest attach as this
-        // window's background sessions — claimed as driven right away (their
-        // mirrors close, their tiles flip). The non-member "b" is untouched.
+        // window's background sessions. Every member is claimed as driven
+        // right away (their mirrors close, their tiles flip) — the take-over
+        // target included, so the registry save is complete. The non-member
+        // "b" is untouched.
         assert_eq!(
             cmds,
             vec![
+                Cmd::Unobserve("a".into()),
+                Cmd::Attach("a".into()),
                 Cmd::Unobserve("c".into()),
                 Cmd::Attach("c".into()),
                 Cmd::TakeOver("a".into()),
@@ -3685,6 +3689,45 @@ mod tests {
                 .any(|g| g.id == "w1" && g.members.contains(&"c".to_string())),
             "the claimed member joins this window's group: {:?}",
             m.groups()
+        );
+    }
+
+    #[test]
+    fn opening_a_group_registers_the_taken_over_member_too() {
+        // The first member opens via take-over (the adopt round-trip), but
+        // its registry ownership must move NOW with the rest: the save this
+        // update emits is what lands on disk and on other windows' fleets,
+        // and an orphaned member would render there as a stray "attached
+        // elsewhere" tile instead of inside this window's block.
+        let mut m = my_fleet(&["m0"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("m0", true),
+            info("a"),
+            info("c"),
+        ]));
+        seed_group(&mut m, "g-web", "web", &["a", "c"]);
+        focus(&mut m, "c");
+        let cmds = ctrl_enter(&mut m);
+        let mine = saved_members(&cmds, "w1").expect("the merge saves the registry");
+        assert!(
+            mine.contains(&"a".to_string()),
+            "the take-over target's membership moves with the open: {mine:?}"
+        );
+        assert!(mine.contains(&"c".to_string()), "{mine:?}");
+        let last_save = cmds
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Cmd::SaveGroups(gs) => Some(gs.clone()),
+                _ => None,
+            })
+            .expect("saved");
+        assert!(
+            last_save
+                .iter()
+                .all(|g| g.id == "w1" || !g.members.contains(&"a".to_string())),
+            "the member belongs to no other group after the move: {last_save:?}"
         );
     }
 
@@ -3724,6 +3767,8 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
+                Cmd::Unobserve("a".into()),
+                Cmd::Attach("a".into()),
                 Cmd::Unobserve("c".into()),
                 Cmd::Attach("c".into()),
                 Cmd::TakeOver("a".into()),
