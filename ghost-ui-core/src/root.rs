@@ -701,7 +701,7 @@ impl RootModel {
     /// reads the identity off this root for the attaches it is about to run.
     fn mirror_fleet_identity(&mut self) {
         if let Mode::Fleet(f) = &self.mode
-            && self.my_group.id != f.my_group().id
+            && self.my_group != *f.my_group()
         {
             self.my_group = f.my_group().clone();
         }

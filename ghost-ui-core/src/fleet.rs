@@ -167,6 +167,8 @@ enum GroupButton {
     /// Forget a closed group: living members drop to the detached pool,
     /// dead ones are forgotten (membership was all that kept them).
     Dissolve,
+    /// Rename this window's group (default: its color's name).
+    Rename,
     /// Kill every member and its process (confirmed first).
     Kill,
 }
@@ -178,6 +180,7 @@ impl GroupButton {
             GroupButton::Open => "attach all",
             GroupButton::Detach => "detach",
             GroupButton::Dissolve => "dissolve",
+            GroupButton::Rename => "rename",
             GroupButton::Kill => "kill",
         }
     }
@@ -374,6 +377,10 @@ pub struct FleetModel {
     pending: Option<Pending>,
     /// An in-progress inline rename; swallows text/keys into its buffer.
     renaming: Option<Renaming>,
+    /// An in-progress rename of this window's group name (`Some` while the
+    /// block header is being edited); commits into [`Self::my_group`] and
+    /// its registry entry.
+    renaming_group: Option<TextInput>,
     /// The in-progress IME composition (empty when not composing). While non-empty,
     /// a rename swallows raw `Key::Char` presses so the eventual commit (`Text`) is
     /// the sole insertion — mirrors the terminal's preedit guard, avoiding a
@@ -551,6 +558,7 @@ impl FleetModel {
             frames: CacheCounters::default(),
             pending: None,
             renaming: None,
+            renaming_group: None,
             preedit: String::new(),
             scroll_y: 0.0,
             theme: ThemeColors::default(),
@@ -689,7 +697,7 @@ impl FleetModel {
     /// prompt) is capturing input — keys like Escape belong to it, not to
     /// whoever hosts the fleet.
     pub fn modal_open(&self) -> bool {
-        self.renaming.is_some() || self.pending.is_some()
+        self.renaming.is_some() || self.pending.is_some() || self.renaming_group.is_some()
     }
 
     pub fn tile_count(&self) -> usize {
@@ -1681,6 +1689,9 @@ impl FleetModel {
         if self.pending.is_some() {
             return self.pending_input(ev);
         }
+        if self.renaming_group.is_some() {
+            return self.group_rename_input(ev);
+        }
         match ev {
             UiEvent::Key {
                 key, mods, kind, ..
@@ -1932,6 +1943,9 @@ impl FleetModel {
         if self.group(gid).is_some() && self.group_is_closed(gid) {
             set.push(GroupButton::Dissolve);
         }
+        if gid == self.my_group.id {
+            set.push(GroupButton::Rename);
+        }
         if !present.is_empty() {
             set.push(GroupButton::Kill);
         }
@@ -2006,6 +2020,12 @@ impl FleetModel {
                 {
                     self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
                 }
+                vec![Cmd::Redraw]
+            }
+            GroupButton::Rename => {
+                // Edit my group's name inline on the block header, seeded
+                // with the current one.
+                self.renaming_group = Some(TextInput::new(self.my_group.name.clone()));
                 vec![Cmd::Redraw]
             }
             GroupButton::Kill => {
@@ -2467,6 +2487,67 @@ impl FleetModel {
         }
     }
 
+    /// Keyboard for the group rename — the same editing surface as the
+    /// inline session rename. Enter commits (an empty name cancels), Escape
+    /// cancels; the registry save follows from the sync.
+    fn group_rename_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        match ev {
+            UiEvent::Text(s) => {
+                self.preedit.clear();
+                if let Some(b) = &mut self.renaming_group {
+                    b.insert(&s);
+                }
+                vec![Cmd::Redraw]
+            }
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() => match key {
+                Key::Char(s) if !mods.ctrl && !mods.sup && self.preedit.is_empty() => {
+                    if let Some(b) = &mut self.renaming_group {
+                        b.insert(&s);
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Space)
+                    if !mods.ctrl && !mods.sup && self.preedit.is_empty() =>
+                {
+                    if let Some(b) = &mut self.renaming_group {
+                        b.insert(" ");
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let name = self
+                        .renaming_group
+                        .take()
+                        .expect("rename checked by caller")
+                        .into_text();
+                    if !name.is_empty() && name != self.my_group.name {
+                        self.my_group.name = name.clone();
+                        if let Some(g) = self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
+                            g.name = name;
+                        }
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.renaming_group = None;
+                    vec![Cmd::Redraw]
+                }
+                key => {
+                    if let Some(b) = &mut self.renaming_group
+                        && b.key(&key, mods)
+                    {
+                        vec![Cmd::Redraw]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            },
+            _ => Vec::new(),
+        }
+    }
+
     /// Reconcile this window's registry entry with reality: its members are
     /// the sessions this window drives plus the dead ones it remembers, in
     /// tile order. Death keeps membership (that's what a dead tile in the
@@ -2760,10 +2841,19 @@ impl FleetModel {
                         color: accent,
                         width,
                     });
+                    // A group rename in flight renders the live buffer with
+                    // a caret block in place of my block's name.
+                    let name = match (&self.renaming_group, gid == self.my_group.id) {
+                        (Some(b), true) => {
+                            let (before, after) = b.halves();
+                            format!("{before}\u{2588}{after}")
+                        }
+                        _ => group.name.clone(),
+                    };
                     items.push(SceneItem::Text {
                         id,
                         rect: text_line(rect, metrics, GAP * 0.5),
-                        runs: vec![label_run(&group.name)],
+                        runs: vec![label_run(&name)],
                         metrics,
                         color: accent,
                         scale: 1.0,
@@ -3705,7 +3795,7 @@ mod tests {
         ]));
         assert_eq!(
             m.group_chipset("w1"),
-            vec![GroupButton::Detach, GroupButton::Kill]
+            vec![GroupButton::Detach, GroupButton::Rename, GroupButton::Kill]
         );
         let scene = m.view();
         for b in m.group_chipset("w1") {
@@ -3789,7 +3879,7 @@ mod tests {
         list(&mut m, &["b"]); // everything driven here dies
         assert_eq!(
             m.group_chipset("w1"),
-            Vec::new(),
+            vec![GroupButton::Rename],
             "detach/kill have no living member; my dead tiles relaunch by activation"
         );
         assert!(
@@ -4769,6 +4859,63 @@ mod tests {
         // lands in that group's (now closed) block, not the pool.
         push(&mut m, "x", SessionPush::Event(SessionEvent::Detached));
         assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+    }
+
+    #[test]
+    fn the_rename_chip_edits_my_groups_name() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        assert_eq!(
+            m.group_chipset("w1"),
+            vec![GroupButton::Detach, GroupButton::Rename, GroupButton::Kill]
+        );
+        let r = group_button_rect(&m, "w1", GroupButton::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(m.modal_open(), "the rename swallows input while open");
+        // The buffer seeds with the current name; type over it wholesale.
+        for _ in 0.."blue".len() {
+            key(&mut m, Key::Named(NamedKey::Backspace));
+        }
+        for c in "work".chars() {
+            key(&mut m, Key::Char(c.to_string()));
+        }
+        let cmds = key(&mut m, Key::Named(NamedKey::Enter));
+        assert_eq!(m.my_group.name, "work");
+        assert!(
+            m.groups().iter().any(|g| g.id == "w1" && g.name == "work"),
+            "the entry renames too: {:?}",
+            m.groups()
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(gs)
+                if gs.iter().any(|g| g.id == "w1" && g.name == "work"))),
+            "the rename persists: {cmds:?}"
+        );
+        assert_eq!(header_labels(&m)[0], "work", "the block header follows");
+    }
+
+    #[test]
+    fn escape_cancels_the_group_rename() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        let r = group_button_rect(&m, "w1", GroupButton::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        for c in "junk".chars() {
+            key(&mut m, Key::Char(c.to_string()));
+        }
+        key(&mut m, Key::Named(NamedKey::Escape));
+        assert!(!m.modal_open());
+        assert_eq!(m.my_group.name, "blue", "cancelling keeps the name");
+        // An emptied buffer also cancels rather than blanking the name.
+        let r = group_button_rect(&m, "w1", GroupButton::Rename);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        for _ in 0.."blue".len() {
+            key(&mut m, Key::Named(NamedKey::Backspace));
+        }
+        key(&mut m, Key::Named(NamedKey::Enter));
+        assert_eq!(m.my_group.name, "blue");
     }
 
     #[test]
