@@ -504,12 +504,14 @@ fn the_snapshot_reports_the_identified_display_client() {
     let session_dir = spawn_session(xdg, name, "sleep 60");
     let sock = session_dir.join("sock");
 
-    // A display client that identifies itself, then completes the attach
+    // A display client that identifies itself the way a real window does —
+    // its identity embeds its window-group id — then completes the attach
     // handshake (the first Resize).
+    let identity = ghost_ui_core::group::window_identity("win-1234-0");
     let mut display = Client::connect_path(&sock).expect("display connect");
     display
         .send(&ClientMsg::Hello {
-            client: "window-1".to_string(),
+            client: identity.clone(),
         })
         .unwrap();
     display
@@ -529,9 +531,20 @@ fn the_snapshot_reports_the_identified_display_client() {
     assert_eq!(
         state.attached,
         Some(AttachInfo {
-            client: Some("window-1".to_string()),
+            client: Some(identity.clone()),
         }),
         "the snapshot names the identified display client"
+    );
+    // The relayed identity parses back to the holder's group id — what the
+    // fleet buckets elsewhere-tiles by.
+    assert_eq!(
+        state
+            .attached
+            .and_then(|a| a.client)
+            .as_deref()
+            .and_then(ghost_ui_core::group::holder_group),
+        Some("win-1234-0".to_string()),
+        "the round-tripped identity names the holding window's group"
     );
     assert!(!state.bell);
 

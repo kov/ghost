@@ -239,20 +239,21 @@ fn write_png(path: &Path, img: &Rendered) {
 /// Attach (deferred) to a named session and complete the handshake at
 /// `cols`×`rows` — the first resize promotes us to the display client and
 /// spawns the deferred child. The configured theme rides along so the host
-/// answers color queries with it after we detach (last-attached colors).
-fn attach(name: &str, cols: u16, rows: u16) -> io::Result<Session> {
+/// answers color queries with it after we detach (last-attached colors), and
+/// `identity` (the attaching window's, embedding its group id) via `Hello`
+/// so other windows' fleets can bucket the session under its block.
+fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Session> {
     let mut s = Session::attach_deferred(name)?;
     s.set_read_timeout(Some(Duration::from_millis(1)))?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
-    s.hello(&client_identity())?;
+    s.hello(identity)?;
     Ok(s)
 }
 
-/// This app instance's identity, reported to hosts via `Hello` so state
-/// subscribers (other windows, other processes) can see who holds a display.
-/// Process-granular for now: windows within this process already tell
-/// themselves apart locally, so finer identity waits for a UI that shows it.
+/// The identity reported by attaches with no window behind them (the
+/// headless bench harness); real windows report their group-derived identity
+/// ([`ghost_ui_core::group::window_identity`]) instead.
 fn client_identity() -> String {
     format!("ghost-ui:{}", std::process::id())
 }
@@ -289,7 +290,7 @@ fn session_theme() -> ghost_ui_core::ThemeColors {
 fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {
     let start = Instant::now();
     loop {
-        match attach(name, cols, rows) {
+        match attach(name, cols, rows, &client_identity()) {
             Ok(s) => return s,
             Err(e) => {
                 if start.elapsed() > Duration::from_secs(5) {
@@ -806,6 +807,9 @@ fn open_url(url: &str) {
 struct WindowState {
     gfx: Graphics,
     root: RootModel,
+    /// The identity this window's attaches report via `Hello`, embedding its
+    /// group id so other windows' fleets bucket its sessions under its block.
+    identity: String,
     /// This window's own session clients (the single-view session plus any fleet
     /// previews). Dropping the window drops these, which detaches every session
     /// it held — the "close = detach" default, with no shared-pool bookkeeping.
@@ -1126,7 +1130,7 @@ impl App {
                     {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&id, cols, rows) {
+                        if let Ok(s) = attach(&id, cols, rows, &w.identity) {
                             w.sessions.insert(id, s);
                         }
                     }
@@ -1221,7 +1225,7 @@ impl App {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&name, cols, rows) {
+                        if let Ok(s) = attach(&name, cols, rows, &w.identity) {
                             w.sessions.insert(name, s);
                         }
                     }
@@ -1462,7 +1466,7 @@ impl App {
         // pin its cursor to that smaller bottom row — the next output then lands
         // mid-screen (see `RootModel::grid`).
         let (cols, rows) = w.root.grid();
-        match attach(name, cols, rows) {
+        match attach(name, cols, rows, &w.identity) {
             Ok(s) => {
                 w.sessions.insert(name.to_string(), s);
                 true
@@ -1551,6 +1555,7 @@ impl App {
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
         let group = self.mint_group();
+        let identity = ghost_ui_core::group::window_identity(&group.id);
         let claims = root.set_my_group(group); // fresh fleet: owns nothing yet
         debug_assert!(claims.is_empty());
         apply_anim_ms(&mut root);
@@ -1559,6 +1564,7 @@ impl App {
             WindowState {
                 gfx,
                 root,
+                identity,
                 sessions: HashMap::new(),
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),
@@ -1666,7 +1672,11 @@ impl App {
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
         let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
-        let session = match attach(name, cols, rows) {
+        // Mint the window's group up front: the very first attach already
+        // reports the group-embedding identity.
+        let group = self.mint_group();
+        let identity = ghost_ui_core::group::window_identity(&group.id);
+        let session = match attach(name, cols, rows, &identity) {
             Ok(session) => session,
             Err(e) => {
                 eprintln!("could not attach to session '{name}': {e}");
@@ -1691,7 +1701,6 @@ impl App {
         // Seed the persisted registry BEFORE the group claim, so the claim's
         // save extends it rather than clobbering it with just this window.
         root.update(UiEvent::GroupsLoaded(self.groups.clone()));
-        let group = self.mint_group();
         let claims = root.set_my_group(group);
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
@@ -1701,6 +1710,7 @@ impl App {
             WindowState {
                 gfx,
                 root,
+                identity,
                 sessions,
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),

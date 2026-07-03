@@ -44,6 +44,21 @@ pub struct Group {
     pub members: Vec<SessionId>,
 }
 
+/// The window-group id embedded in a display client's self-reported identity
+/// (`ghost-ui:<group-id>`, sent in the attach hello), if it carries one.
+/// Identities from other kinds of clients — or from ghost-ui builds
+/// predating window groups, whose suffix is a bare pid — simply name no
+/// known group and bucket as generic "attached elsewhere".
+pub fn holder_group(client: &str) -> Option<GroupId> {
+    client.strip_prefix("ghost-ui:").map(str::to_string)
+}
+
+/// A window's identity string for the attach hello, embedding its group id
+/// so other windows' fleets can bucket the session under its block.
+pub fn window_identity(group_id: &str) -> String {
+    format!("ghost-ui:{group_id}")
+}
+
 impl Group {
     /// A window's newborn group: no members yet, named after its color.
     pub fn auto(id: GroupId, color: u8) -> Self {
@@ -64,6 +79,14 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_identity_round_trips_its_group_id() {
+        let id = window_identity("win-4321-2");
+        assert_eq!(holder_group(&id), Some("win-4321-2".to_string()));
+        // Foreign identities name no group.
+        assert_eq!(holder_group("weird-client"), None);
+    }
 
     #[test]
     fn an_automatic_group_is_named_after_its_color() {

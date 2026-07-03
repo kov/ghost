@@ -819,13 +819,22 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
 
     // The window's own group block also remembers "db", dead: its tile stays
     // in the block, previewing its recording's last screen, offering a
-    // relaunch on activation.
-    fleet.set_groups(vec![ghost_ui_core::Group {
-        id: "win-shot-0".to_string(),
-        name: "blue".to_string(),
-        color: 0,
-        members: vec!["edit".to_string(), "build".to_string(), "db".to_string()],
-    }]);
+    // relaunch on activation. "logs" belongs to another window's group, so
+    // it renders in that group's block below the detached pool.
+    fleet.set_groups(vec![
+        ghost_ui_core::Group {
+            id: "win-shot-0".to_string(),
+            name: "blue".to_string(),
+            color: 0,
+            members: vec!["edit".to_string(), "build".to_string(), "db".to_string()],
+        },
+        ghost_ui_core::Group {
+            id: "win-shot-1".to_string(),
+            name: "green".to_string(),
+            color: 1,
+            members: vec!["logs".to_string()],
+        },
+    ]);
     fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
         name: "db".to_string(),
         display_name: String::new(),

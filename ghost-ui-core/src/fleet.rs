@@ -338,6 +338,12 @@ struct Tile {
     /// and activating it recreates the session. Never observed or attached;
     /// revived by a listing that names it again.
     dead: bool,
+    /// The group of the window holding this session, parsed from the display
+    /// client's pushed identity ([`crate::group::holder_group`]). Live truth
+    /// for bucketing an Elsewhere tile under its window's block; `None`
+    /// until a snapshot lands, for an identity-less client, or when nobody
+    /// is attached.
+    holder: Option<GroupId>,
 }
 
 pub struct FleetModel {
@@ -647,6 +653,7 @@ impl FleetModel {
             progress: None,
             cwd: None,
             dead: false,
+            holder: None,
         });
     }
 
@@ -1022,6 +1029,12 @@ impl FleetModel {
                 tile.dead = false;
                 tile.bell = info.bell;
                 tile.locality = locality;
+                // The marker is a bare bool: it can't say who holds the
+                // session, but it can say nobody does.
+                if !info.attached && tile.holder.is_some() {
+                    tile.holder = None;
+                    dirty = true;
+                }
                 tile.command = info.command.clone();
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
@@ -1143,11 +1156,17 @@ impl FleetModel {
                 display_name,
             }) => {
                 let locality = locality_for(mine, id, attached.is_some());
+                let holder = attached
+                    .as_ref()
+                    .and_then(|a| a.client.as_deref())
+                    .and_then(crate::group::holder_group);
                 dirty |= tile.bell != bell
                     || tile.locality != locality
+                    || tile.holder != holder
                     || tile.model.display_name() != display_name;
                 tile.bell = bell;
                 tile.locality = locality;
+                tile.holder = holder;
                 tile.model.set_display_name(display_name);
             }
             SessionPush::Event(SessionEvent::Bell) => {
@@ -1160,17 +1179,20 @@ impl FleetModel {
                     dirty = true;
                 }
             }
-            SessionPush::Event(SessionEvent::Attached(_)) => {
+            SessionPush::Event(SessionEvent::Attached(info)) => {
                 let locality = locality_for(mine, id, true);
+                let holder = info.client.as_deref().and_then(crate::group::holder_group);
                 // Attaching is "switching to" the session: the bell is seen.
-                dirty |= tile.locality != locality || tile.bell;
+                dirty |= tile.locality != locality || tile.holder != holder || tile.bell;
                 tile.bell = false;
                 tile.locality = locality;
+                tile.holder = holder;
             }
             SessionPush::Event(SessionEvent::Detached) => {
                 let locality = locality_for(mine, id, false);
-                dirty |= tile.locality != locality;
+                dirty |= tile.locality != locality || tile.holder.is_some();
                 tile.locality = locality;
+                tile.holder = None;
             }
             SessionPush::Event(SessionEvent::Renamed(name)) => {
                 dirty |= tile.model.display_name() != name;
@@ -1253,20 +1275,78 @@ impl FleetModel {
                 mine_tiles,
             ));
         }
-        // Then the attach-state sections of the rest. Detached comes before
-        // Elsewhere: after this window's own sessions, the unheld pool is
-        // what the user is most likely to reach for. Dead tiles of other
-        // groups don't render (their blocks come later).
-        for loc in [Locality::Detached, Locality::Elsewhere] {
+        // Then the detached pool: after this window's own sessions, the
+        // unheld sessions are what the user is most likely to reach for.
+        // Dead tiles of other groups don't render (their blocks come later).
+        let mut detached: Vec<&Tile> = self
+            .tiles
+            .iter()
+            .filter(|t| {
+                !t.dead && t.locality == Locality::Detached && !in_my_block.contains(t.id.as_str())
+            })
+            .collect();
+        detached.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
+        if !detached.is_empty() {
+            segments.push((Band::Section(Locality::Detached), detached));
+        }
+        // Other windows' groups, one block each in registry order. A live
+        // Elsewhere tile belongs to the block its holder identity names (the
+        // host pushes it with the attach); registry membership covers tiles
+        // whose snapshot hasn't landed yet. What names no known group falls
+        // through to the generic elsewhere section.
+        let foreign_of = |t: &'_ Tile| -> Option<GroupId> {
+            if t.dead || t.locality != Locality::Elsewhere {
+                return None;
+            }
+            t.holder
+                .clone()
+                .or_else(|| {
+                    self.groups
+                        .iter()
+                        .find(|g| g.members.contains(&t.id))
+                        .map(|g| g.id.clone())
+                })
+                .filter(|gid| *gid != self.my_group.id && self.groups.iter().any(|g| g.id == *gid))
+        };
+        for g in &self.groups {
+            if g.id == self.my_group.id {
+                continue;
+            }
             let mut ts: Vec<&Tile> = self
                 .tiles
                 .iter()
-                .filter(|t| !t.dead && t.locality == loc && !in_my_block.contains(t.id.as_str()))
+                .filter(|t| foreign_of(t).as_deref() == Some(g.id.as_str()))
                 .collect();
             ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
             if !ts.is_empty() {
-                segments.push((Band::Section(loc), ts));
+                segments.push((
+                    Band::Group {
+                        id: g.id.clone(),
+                        block: RectPx {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                        }, // filled in during placement
+                    },
+                    ts,
+                ));
             }
+        }
+        // The generic remainder: held elsewhere by nobody we can name.
+        let mut elsewhere: Vec<&Tile> = self
+            .tiles
+            .iter()
+            .filter(|t| {
+                !t.dead
+                    && t.locality == Locality::Elsewhere
+                    && !in_my_block.contains(t.id.as_str())
+                    && foreign_of(t).is_none()
+            })
+            .collect();
+        elsewhere.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
+        if !elsewhere.is_empty() {
+            segments.push((Band::Section(Locality::Elsewhere), elsewhere));
         }
         if segments.is_empty() {
             return (Vec::new(), Vec::new(), base_band, 0.0);
@@ -3908,6 +3988,98 @@ mod tests {
         assert_eq!(tile(&m, "a").locality, Locality::Elsewhere);
         assert_eq!(tile(&m, "a").model.display_name(), "box");
         assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    /// The header labels in rendered order.
+    fn header_labels(m: &FleetModel) -> Vec<String> {
+        headers(m).into_iter().map(|(l, _)| l).collect()
+    }
+
+    /// A snapshot push naming the session's holder (`client` = the attaching
+    /// window's self-reported identity).
+    fn snap_attached(m: &mut FleetModel, name: &str, client: Option<&str>) -> Vec<Cmd> {
+        push(
+            m,
+            name,
+            SessionPush::Snapshot(ghost_vt::protocol::SessionState {
+                attached: Some(AttachInfo {
+                    client: client.map(str::to_string),
+                }),
+                bell: false,
+                title: String::new(),
+                display_name: String::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn elsewhere_members_bucket_under_their_groups_block() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x", "y"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("x", true),
+            sinfo("y", true),
+            info("d"),
+        ]));
+        // Registry membership alone buckets the foreign pair under their
+        // window's block — after the detached pool, per the fleet order.
+        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+        assert_eq!(
+            tile_y(&m, "x"),
+            tile_y(&m, "y"),
+            "the members share their block"
+        );
+        assert!(tile_y(&m, "d") < tile_y(&m, "x"));
+        // A foreign block offers take-over and kill, never detach.
+        assert_eq!(
+            m.group_chipset("g2"),
+            vec![GroupButton::Open, GroupButton::Kill]
+        );
+    }
+
+    #[test]
+    fn a_pushed_holder_identity_buckets_a_memberless_session() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x"]);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("x", true),
+            sinfo("z", true),
+        ]));
+        // No identity, no membership: "z" sits in the generic section.
+        assert_eq!(header_labels(&m), vec!["green", "Attached elsewhere"]);
+        // Its snapshot names the holder: it joins the block and the generic
+        // section empties away.
+        snap_attached(&mut m, "z", Some("ghost-ui:g2"));
+        assert_eq!(header_labels(&m), vec!["green"]);
+        assert_eq!(tile_y(&m, "x"), tile_y(&m, "z"));
+        // An identity naming no known group falls back to the generic
+        // section (e.g. a client from a process whose registry we lack).
+        snap_attached(&mut m, "z", Some("ghost-ui:mystery"));
+        assert_eq!(header_labels(&m), vec!["green", "Attached elsewhere"]);
+    }
+
+    #[test]
+    fn attach_pushes_move_a_tile_between_group_blocks() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        seed_group(&mut m, "g2", "green", &["x"]);
+        seed_group(&mut m, "g3", "orange", &[]);
+        m.update(UiEvent::SessionList(vec![sinfo("x", true), info("d")]));
+        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+        // Another window steals it: the live identity outranks membership.
+        push(
+            &mut m,
+            "x",
+            SessionPush::Event(SessionEvent::Attached(AttachInfo {
+                client: Some("ghost-ui:g3".to_string()),
+            })),
+        );
+        assert_eq!(header_labels(&m), vec!["Detached", "orange"]);
+        // And a detach drops it into the pool with the rest.
+        push(&mut m, "x", SessionPush::Event(SessionEvent::Detached));
+        assert_eq!(header_labels(&m), vec!["Detached"]);
     }
 
     #[test]
