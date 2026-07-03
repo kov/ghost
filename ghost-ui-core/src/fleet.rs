@@ -119,13 +119,32 @@ struct ConfirmLayout {
 #[derive(Clone)]
 enum Band {
     Section(Locality),
-    Group { id: GroupId, block: RectPx },
+    Group {
+        id: GroupId,
+        block: RectPx,
+    },
+    /// The reveal toggle standing in for the hidden attached-elsewhere
+    /// content (other windows' open groups and the generic elsewhere pool):
+    /// a de-emphasized band naming how many sessions it hides, clickable to
+    /// show or re-hide them.
+    Elsewhere {
+        count: usize,
+    },
 }
 
 type SectionHeader = (Band, RectPx);
 
 /// Padding of a group block's outline around its header + member rows.
 const BLOCK_PAD: f32 = 6.0;
+
+/// Extra vertical space between sections, on top of the in-grid [`GAP`] —
+/// the working set reads as clearly separated bands, not one dense grid.
+const SECTION_EXTRA_GAP: f32 = 18.0;
+
+/// Card-height factor for the de-emphasized tiers (other windows' groups,
+/// the generic elsewhere pool, closed groups): visibly smaller than the
+/// working set — this window's block and the detached pool — at full size.
+const DEEMPHASIZED_TILE_SCALE: f32 = 0.8;
 
 /// Alpha factor dimming a closed (windowless) group's accent.
 const CLOSED_GROUP_ALPHA: f32 = 0.55;
@@ -185,6 +204,32 @@ impl GroupButton {
         }
     }
 }
+
+/// The reveal toggle's label, naming how many sessions it hides.
+fn elsewhere_label(count: usize) -> String {
+    format!("{count} attached elsewhere")
+}
+
+/// The reveal toggle's chip label for the current state.
+fn toggle_chip_label(shown: bool) -> &'static str {
+    if shown { "hide" } else { "show" }
+}
+
+/// The reveal toggle's chip rect, right-aligned on its band — shared by the
+/// view and (via the whole band being clickable) visual affordance only.
+fn toggle_chip_rect(header: RectPx, m: CellMetrics, label: &str) -> RectPx {
+    let w = (label.chars().count() as f32 + 2.0) * m.advance;
+    RectPx {
+        x: header.x + header.w - w,
+        y: header.y,
+        w,
+        h: header.h,
+    }
+}
+
+/// [`SceneId::Section`] rank of the reveal toggle band — far above the
+/// locality (0–2) and group (3+) ranks so it never collides.
+const ELSEWHERE_TOGGLE_RANK: u8 = u8::MAX;
 
 /// Lay out a group header's action chips, right-aligned on the header band —
 /// shared by the view and pointer hit-testing, like [`card_layout`] for cards.
@@ -406,6 +451,10 @@ pub struct FleetModel {
     /// entry drains once a listing confirms the session gone (freeing the
     /// name for a later, unrelated session).
     killed: HashSet<SessionId>,
+    /// Whether the attached-elsewhere content (other windows' open groups
+    /// and the generic elsewhere pool) is revealed. Hidden by default —
+    /// that's someone else's work — behind the [`Band::Elsewhere`] toggle.
+    show_elsewhere: bool,
     /// The group registry, in creation order. Handed in and out by the root
     /// across fleet open/close; local edits (my membership sync, claims
     /// stripping other entries, dissolutions) are persisted via
@@ -536,6 +585,8 @@ enum GrabTarget {
         group: GroupId,
         button: GroupButton,
     },
+    /// The attached-elsewhere reveal toggle band.
+    ElsewhereToggle,
 }
 
 /// An armed pointer press: where it landed, where the pointer is now, and
@@ -570,6 +621,7 @@ impl FleetModel {
             observing: HashSet::new(),
             marked: HashSet::new(),
             killed: HashSet::new(),
+            show_elsewhere: false,
             groups: Vec::new(),
             saved_groups: Vec::new(),
             my_group: Group::auto(String::new(), 0),
@@ -612,6 +664,13 @@ impl FleetModel {
     /// entry, synced from the tiles, is the membership authority.
     pub fn set_my_group(&mut self, group: Group) {
         self.my_group = group;
+    }
+
+    /// Reveal or fold the attached-elsewhere content — the [`Band::Elsewhere`]
+    /// toggle's action, exposed for tooling (ghost-shot renders both states).
+    pub fn set_show_elsewhere(&mut self, show: bool) {
+        self.show_elsewhere = show;
+        self.clamp_scroll();
     }
 
     /// Physical cell metrics: the base metrics scaled by the device scale factor.
@@ -1319,7 +1378,7 @@ impl FleetModel {
             .group(&self.my_group.id)
             .map(|g| g.members.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
-        let mut segments: Vec<(Band, Vec<&Tile>)> = Vec::new();
+        let mut segments: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
         let mut mine_tiles: Vec<&Tile> = self
             .tiles
             .iter()
@@ -1327,7 +1386,10 @@ impl FleetModel {
                 if t.dead {
                     my_members.contains(t.id.as_str())
                 } else {
+                    // Detached members stay in the block: a group survives
+                    // letting go of a session (detach is not ungrouping).
                     t.locality == Locality::ThisWindow
+                        || (t.locality == Locality::Detached && my_members.contains(t.id.as_str()))
                 }
             })
             .collect();
@@ -1345,6 +1407,7 @@ impl FleetModel {
                     }, // filled in during placement
                 },
                 mine_tiles,
+                1.0,
             ));
         }
         // Other windows' groups, one block each in registry order. An OPEN
@@ -1352,8 +1415,9 @@ impl FleetModel {
         // pool; a CLOSED one (windowless — a remembered, reopenable set)
         // renders last, dimmed. A block holds the group's live elsewhere
         // tiles (holder identity first, membership as fallback — see
-        // [`Self::holder_target`]), its dead members, and — when closed —
-        // its detached members, keeping them out of the pool.
+        // [`Self::holder_target`]), its dead members, and its detached
+        // members (detach keeps membership, so a partially attached group
+        // holds on to its cold sessions), keeping them out of the pool.
         let zero = RectPx {
             x: 0.0,
             y: 0.0,
@@ -1361,8 +1425,8 @@ impl FleetModel {
             h: 0.0,
         }; // block rects are filled in during placement
         let mut placed: HashSet<&str> = in_my_block.clone();
-        let mut open_blocks: Vec<(Band, Vec<&Tile>)> = Vec::new();
-        let mut closed_blocks: Vec<(Band, Vec<&Tile>)> = Vec::new();
+        let mut open_blocks: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
+        let mut closed_blocks: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
         for g in &self.groups {
             if g.id == self.my_group.id {
                 continue;
@@ -1378,8 +1442,7 @@ impl FleetModel {
                     if self.holder_target(t).as_deref() == Some(g.id.as_str()) {
                         return true;
                     }
-                    g.members.contains(&t.id)
-                        && (t.dead || (closed && t.locality == Locality::Detached))
+                    g.members.contains(&t.id) && (t.dead || t.locality == Locality::Detached)
                 })
                 .collect();
             ts.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
@@ -1394,9 +1457,9 @@ impl FleetModel {
                 block: zero,
             };
             if closed {
-                closed_blocks.push((band, ts));
+                closed_blocks.push((band, ts, DEEMPHASIZED_TILE_SCALE));
             } else {
-                open_blocks.push((band, ts));
+                open_blocks.push((band, ts, DEEMPHASIZED_TILE_SCALE));
             }
         }
         // The detached pool: after this window's own sessions, the unheld
@@ -1411,9 +1474,8 @@ impl FleetModel {
             .collect();
         detached.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
         if !detached.is_empty() {
-            segments.push((Band::Section(Locality::Detached), detached));
+            segments.push((Band::Section(Locality::Detached), detached, 1.0));
         }
-        segments.extend(open_blocks);
         // The generic remainder: held elsewhere by nobody we can name
         // (plain attach clients, or windows whose registry we lack).
         let mut elsewhere: Vec<&Tile> = self
@@ -1424,8 +1486,30 @@ impl FleetModel {
             })
             .collect();
         elsewhere.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
-        if !elsewhere.is_empty() {
-            segments.push((Band::Section(Locality::Elsewhere), elsewhere));
+        // Attached-elsewhere content — other windows' open groups and the
+        // generic pool — is someone else's work: de-emphasized to the point
+        // of hiding, behind a toggle band naming how much it hides. Detached
+        // members of a partially attached group hide with their group.
+        let hidden_count =
+            open_blocks.iter().map(|(_, ts, _)| ts.len()).sum::<usize>() + elsewhere.len();
+        if hidden_count > 0 {
+            segments.push((
+                Band::Elsewhere {
+                    count: hidden_count,
+                },
+                Vec::new(),
+                1.0,
+            ));
+        }
+        if self.show_elsewhere {
+            segments.extend(open_blocks);
+            if !elsewhere.is_empty() {
+                segments.push((
+                    Band::Section(Locality::Elsewhere),
+                    elsewhere,
+                    DEEMPHASIZED_TILE_SCALE,
+                ));
+            }
         }
         segments.extend(closed_blocks);
         if segments.is_empty() {
@@ -1466,10 +1550,14 @@ impl FleetModel {
         // (cards are aspect-locked, so a taller card is wider and fewer fit).
         let content_for = |ch: f32| -> f32 {
             let mut yy = gap;
-            for (_, ts) in &segments {
-                let widths: Vec<f32> = ts.iter().map(|t| card_w(t, ch)).collect();
+            for (i, (_, ts, sc)) in segments.iter().enumerate() {
+                if i > 0 {
+                    yy += SECTION_EXTRA_GAP; // breathing room BETWEEN sections
+                }
+                let sch = ch * sc;
+                let widths: Vec<f32> = ts.iter().map(|t| card_w(t, sch)).collect();
                 let nrows = pack_rows(&widths, avail_w, gap).len();
-                yy += band + nrows as f32 * (ch + gap);
+                yy += band + nrows as f32 * (sch + gap);
             }
             yy
         };
@@ -1504,10 +1592,42 @@ impl FleetModel {
         // block means placing its top at half the true leftover, plus the
         // leading gap that the loop below does not re-add.)
         let mut y = gap.max((h - content_for(card_h)) * 0.5 + gap);
-        for (kind, ts) in &segments {
-            let widths: Vec<f32> = ts.iter().map(|t| card_w(t, card_h)).collect();
+        for (i, (kind, ts, sc)) in segments.iter().enumerate() {
+            if i > 0 {
+                y += SECTION_EXTRA_GAP; // breathing room BETWEEN sections
+            }
+            let sch = card_h * sc;
+            let widths: Vec<f32> = ts.iter().map(|t| card_w(t, sch)).collect();
             let rows = pack_rows(&widths, avail_w, gap);
-            let max_row_w = rows.iter().map(|r| r.2).fold(1.0f32, f32::max);
+            let max_row_w = match kind {
+                Band::Elsewhere { count } => {
+                    // The toggle band has no tiles: size it to its label +
+                    // chip so the click target hugs the content.
+                    let label = elsewhere_label(*count).chars().count() as f32;
+                    let chip = toggle_chip_label(self.show_elsewhere).chars().count() as f32 + 2.0;
+                    ((label + 1.0 + chip) * metrics.advance).min(avail_w)
+                }
+                Band::Group { id, .. } => {
+                    // A narrow block (one small card) must still fit its name
+                    // and right-aligned chips side by side on the header.
+                    let rows_w = rows.iter().map(|r| r.2).fold(1.0f32, f32::max);
+                    let name = self
+                        .group(id)
+                        .map(|g| g.name.as_str())
+                        .unwrap_or(self.my_group.name.as_str())
+                        .chars()
+                        .count() as f32;
+                    let chips: f32 = self
+                        .group_chipset(id)
+                        .iter()
+                        .map(|b| (b.label().chars().count() as f32 + 2.5) * metrics.advance)
+                        .sum();
+                    rows_w
+                        .max((name + 1.0) * metrics.advance + chips)
+                        .min(avail_w)
+                }
+                Band::Section(_) => rows.iter().map(|r| r.2).fold(1.0f32, f32::max),
+            };
             let left = ((w - max_row_w) / 2.0).max(gap);
             let header = RectPx {
                 x: left,
@@ -1526,12 +1646,12 @@ impl FleetModel {
                             x,
                             y,
                             w: widths[i],
-                            h: card_h,
+                            h: sch,
                         },
                     ));
                     x += widths[i] + gap;
                 }
-                y += card_h + gap;
+                y += sch + gap;
             }
             // A group's block outline hugs its header + rows (the trailing gap
             // stays outside).
@@ -2629,10 +2749,11 @@ impl FleetModel {
     }
 
     /// Reconcile this window's registry entry with reality: its members are
-    /// the sessions this window drives plus the dead ones it remembers, in
-    /// tile order. Death keeps membership (that's what a dead tile in the
-    /// block is); detach, steal, and a revival that didn't come back here all
-    /// drop it.
+    /// the sessions this window drives plus the detached and dead ones it
+    /// remembers, in tile order. Death and detach both keep membership (a
+    /// group survives letting go — its members just go cold in the block);
+    /// only a steal or a revival that didn't come back here drops it, and
+    /// the throw-away verbs (kill, drag-out) remove it explicitly.
     fn sync_my_entry(&mut self) {
         let current: Vec<SessionId> = self
             .group(&self.my_group.id)
@@ -2640,15 +2761,15 @@ impl FleetModel {
             .unwrap_or_default();
         // Only an existing tile is evidence for dropping a member: one not
         // seeded yet (a fresh fleet before the dead-session sweep lands)
-        // stays remembered. A dead tile stays; a live one stays only while
-        // this window drives it.
+        // stays remembered. Dead and detached tiles stay; a live one held by
+        // another window has moved out.
         let mut desired: Vec<SessionId> = current
             .iter()
             .filter(|id| {
                 self.tiles
                     .iter()
                     .find(|t| &&t.id == id)
-                    .is_none_or(|t| t.dead || t.locality == Locality::ThisWindow)
+                    .is_none_or(|t| t.dead || t.locality != Locality::Elsewhere)
             })
             .cloned()
             .collect();
@@ -2724,6 +2845,17 @@ impl FleetModel {
                 });
                 return Vec::new();
             }
+            // The reveal toggle: its whole band is the click target.
+            if matches!(kind, Band::Elsewhere { .. }) && header.contains(px, py) {
+                self.grab = Some(Grab {
+                    target: GrabTarget::ElsewhereToggle,
+                    press: (vx, vy),
+                    pos: (vx, vy),
+                    rect: *header,
+                    dragging: false,
+                });
+                return Vec::new();
+            }
         }
         let hit = placements.into_iter().find(|(_, _, r)| r.contains(px, py));
         let Some((_, id, rect)) = hit else {
@@ -2775,8 +2907,9 @@ impl FleetModel {
             match g.target {
                 // Past the slop a tile press becomes a drag of its card.
                 GrabTarget::Tile { .. } => g.dragging = true,
-                // A group chip doesn't drag; wandering off just abandons it.
-                GrabTarget::Chip { .. } => {
+                // A group chip or the reveal toggle doesn't drag; wandering
+                // off just abandons it.
+                GrabTarget::Chip { .. } | GrabTarget::ElsewhereToggle => {
                     self.grab = None;
                     return Vec::new();
                 }
@@ -2794,11 +2927,17 @@ impl FleetModel {
         if g.dragging {
             return match g.target {
                 GrabTarget::Tile { id, .. } => self.drop_tile(&id, vx, vy + self.scroll_y),
-                GrabTarget::Chip { .. } => vec![Cmd::Redraw],
+                GrabTarget::Chip { .. } | GrabTarget::ElsewhereToggle => vec![Cmd::Redraw],
             };
         }
         match g.target {
             GrabTarget::Chip { group, button } => self.group_button(&group, button),
+            GrabTarget::ElsewhereToggle => {
+                self.show_elsewhere = !self.show_elsewhere;
+                // Hiding can shrink the content past the current offset.
+                self.clamp_scroll();
+                vec![Cmd::Redraw]
+            }
             GrabTarget::Tile {
                 id,
                 button: Some(b),
@@ -2834,17 +2973,19 @@ impl FleetModel {
         if over_foreign {
             return vec![Cmd::Redraw]; // snap home: not a drop target
         }
-        // Outside every block: release the set's members of my block.
+        // Outside every block: the ungroup gesture. Membership goes (the
+        // detach buttons keep it; dragging out is the explicit removal), a
+        // driven session also detaches, and a dead one is forgotten —
+        // membership was all that kept it (the registry save follows the
+        // sync).
         let mut cmds = Vec::new();
         for sid in &set {
             let dead = self.tiles.iter().any(|t| &t.id == sid && t.dead);
+            for g in &mut self.groups {
+                g.members.retain(|m| m != sid);
+            }
+            self.groups.retain(|g| !g.members.is_empty());
             if dead {
-                // Forgetting is the drag-out of a dead tile: membership was
-                // all that kept it (the registry save follows the sync).
-                for g in &mut self.groups {
-                    g.members.retain(|m| m != sid);
-                }
-                self.groups.retain(|g| !g.members.is_empty());
                 self.tiles.retain(|t| &t.id != sid);
             } else if self.locality_of(sid) == Some(Locality::ThisWindow) {
                 cmds.extend(self.detach_session(sid));
@@ -2896,6 +3037,35 @@ impl FleetModel {
                     color: SECTION_LABEL_COLOR,
                     scale: 1.0,
                 }),
+                Band::Elsewhere { count } => {
+                    // The stand-in for the hidden elsewhere content: a
+                    // de-emphasized count plus a show/hide chip.
+                    let id = SceneId::Section(ELSEWHERE_TOGGLE_RANK);
+                    items.push(SceneItem::Text {
+                        id,
+                        rect: text_line(rect, metrics, GAP * 0.5),
+                        runs: vec![label_run(&elsewhere_label(count))],
+                        metrics,
+                        color: SECTION_LABEL_COLOR,
+                        scale: 1.0,
+                    });
+                    let label = toggle_chip_label(self.show_elsewhere);
+                    let chip = inset(toggle_chip_rect(rect, metrics, label), 2.0);
+                    items.push(SceneItem::Rect {
+                        id,
+                        rect: chip,
+                        color: BUTTON_BG,
+                        radius: 3.0,
+                    });
+                    items.push(SceneItem::Text {
+                        id,
+                        rect: centered_line(chip, metrics, label),
+                        runs: vec![label_run(label)],
+                        metrics,
+                        color: BUTTON_FG,
+                        scale: 1.0,
+                    });
+                }
                 Band::Group { id: gid, mut block } => {
                     block.y -= sy;
                     // The registry entry may lag a beat behind the tiles (it
@@ -3642,11 +3812,13 @@ mod tests {
             sinfo("c", true), // held elsewhere
         ]));
         // The driven session renders in this window's block — named after
-        // its color — with the sections below it.
+        // its color — the pool below it, and the elsewhere content folded
+        // into its toggle band.
         let hs = headers(&m);
         let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["blue", "Detached", "Attached elsewhere"]);
+        assert_eq!(labels, vec!["blue", "Detached", "1 attached elsewhere"]);
         assert!(tile_y(&m, "a") < tile_y(&m, "b"));
+        reveal(&mut m);
         assert!(tile_y(&m, "b") < tile_y(&m, "c"));
         // Membership is persisted without being asked.
         assert_eq!(
@@ -3676,16 +3848,30 @@ mod tests {
             headers(&m).iter().all(|(l, _)| l != "blue"),
             "an empty group shows no block"
         );
-        // Claiming a session creates the entry; releasing it dissolves it.
+        // Claiming a session creates the entry; detaching keeps it (the
+        // member just goes cold in the block); the throw-away kill is what
+        // finally removes membership and dissolves the emptied entry.
         m.mine.insert("a".to_string());
         let cmds = list(&mut m, &["a", "b"]);
         assert_eq!(saved_members(&cmds, "w1"), Some(vec!["a".to_string()]));
         let r = button_rect(&m, "a", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert!(
+            saved_members(&cmds, "w1").is_none(),
+            "detach keeps membership: {cmds:?}"
+        );
+        assert!(
+            m.groups()
+                .iter()
+                .any(|g| g.id == "w1" && g.members.contains(&"a".to_string()))
+        );
+        let r = button_rect(&m, "a", Button::Kill);
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
         assert_eq!(
             saved_members(&cmds, "w1"),
             Some(Vec::new()),
-            "the emptied entry is dropped from the registry: {cmds:?}"
+            "the killed member's entry dissolves: {cmds:?}"
         );
         assert!(m.groups().iter().all(|g| g.id != "w1"));
     }
@@ -3834,6 +4020,7 @@ mod tests {
             info("c"),
         ]));
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
+        reveal(&mut m);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
         assert!(m.modal_open(), "a member held elsewhere needs a confirm");
@@ -3884,7 +4071,7 @@ mod tests {
     }
 
     #[test]
-    fn my_blocks_detach_button_releases_everything_this_window_drives() {
+    fn my_blocks_detach_button_releases_the_hold_but_keeps_the_group() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![
@@ -3902,15 +4089,229 @@ mod tests {
                 Cmd::Detach("c".into()),
                 Cmd::Observe("c".into()),
                 Cmd::Redraw,
-                Cmd::SaveGroups(m.groups().to_vec()),
-            ]
+            ],
+            "detaching is not ungrouping — no registry churn"
         );
         assert_eq!(m.locality_of("a"), Some(Locality::Detached));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
         assert!(
-            m.groups().iter().all(|g| g.id != "w1"),
-            "detaching everything dissolves the entry: {:?}",
             m.groups()
+                .iter()
+                .any(|g| g.id == "w1" && g.members == vec!["a".to_string(), "c".to_string()]),
+            "the group stays, named and whole: {:?}",
+            m.groups()
+        );
+        // The detached members still render inside my block, not the pool.
+        let block = my_block_rect(&m);
+        for id in ["a", "c"] {
+            let r = tile_rect(&m, id);
+            assert!(
+                block.contains(r.x + r.w / 2.0, r.y + r.h / 2.0),
+                "{id} stays in my block"
+            );
+        }
+    }
+
+    /// Reveal the hidden attached-elsewhere content — for tests whose
+    /// subject lives behind the toggle.
+    fn reveal(m: &mut FleetModel) {
+        m.show_elsewhere = true;
+    }
+
+    /// The reveal toggle's band rect, if one renders.
+    fn toggle_rect(m: &FleetModel) -> Option<RectPx> {
+        let (headers, _, _, _) = m.sections_layout();
+        headers.iter().find_map(|(b, r)| match b {
+            Band::Elsewhere { .. } => Some(*r),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn attached_elsewhere_hides_behind_a_reveal_toggle() {
+        // Other windows' groups — partially attached ones included — and the
+        // generic elsewhere pool are someone else's work: hidden by default,
+        // behind a toggle band that names how much it hides.
+        let mut m = my_fleet(&["m0"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("m0", true),
+            sinfo("a", true), // held by another window, web's member
+            info("b"),        // detached, but web's member: hides with web
+            sinfo("x", true), // held elsewhere, identity-less (generic)
+            info("d"),        // ungrouped detached: always visible
+        ]));
+        seed_group(&mut m, "g-web", "web", &["a", "b"]);
+        snap_attached(&mut m, "a", Some(&crate::group::window_identity("g-web")));
+        let labels: Vec<String> = headers(&m).iter().map(|(l, _)| l.clone()).collect();
+        assert!(
+            labels
+                .iter()
+                .all(|l| l != "web" && l != "Attached elsewhere"),
+            "hidden by default: {labels:?}"
+        );
+        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        assert!(laid.contains(&"d".to_string()), "the pool stays: {laid:?}");
+        for hidden in ["a", "b", "x"] {
+            assert!(
+                !laid.contains(&hidden.to_string()),
+                "{hidden} is not laid out while hidden: {laid:?}"
+            );
+        }
+        // The toggle band stands in, naming the count; clicking reveals.
+        let r = toggle_rect(&m).expect("a reveal toggle renders");
+        assert!(
+            matches!(toggle_band(&m), Some(Band::Elsewhere { count: 3 })),
+            "the toggle counts the hidden sessions"
+        );
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let labels: Vec<String> = headers(&m).iter().map(|(l, _)| l.clone()).collect();
+        assert!(
+            labels.iter().any(|l| l == "web") && labels.iter().any(|l| l == "Attached elsewhere"),
+            "revealed: {labels:?}"
+        );
+        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        for shown in ["a", "b", "x", "d"] {
+            assert!(
+                laid.contains(&shown.to_string()),
+                "{shown} revealed: {laid:?}"
+            );
+        }
+        // Clicking again re-hides.
+        let r = toggle_rect(&m).expect("the toggle stays while revealed");
+        press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        assert!(!laid.contains(&"a".to_string()), "re-hidden: {laid:?}");
+    }
+
+    /// The reveal toggle's band, if one renders.
+    fn toggle_band(m: &FleetModel) -> Option<Band> {
+        let (headers, _, _, _) = m.sections_layout();
+        headers.iter().find_map(|(b, _)| match b {
+            Band::Elsewhere { .. } => Some(b.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn local_tiles_render_larger_with_more_section_breathing_room() {
+        // The working set — this window's block and the detached pool — is
+        // the emphasized tier: full-size tiles. Everything de-emphasized
+        // (other windows' groups, the generic elsewhere pool, closed
+        // groups) renders smaller, and sections sit further apart than the
+        // tiles within one.
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("d"),
+            sinfo("x", true), // held elsewhere (generic)
+        ]));
+        reveal(&mut m);
+        let ra = tile_rect(&m, "a");
+        let rd = tile_rect(&m, "d");
+        let rx = tile_rect(&m, "x");
+        assert_eq!(ra.h, rd.h, "the local tiers share a size");
+        assert!(
+            rx.h <= ra.h * DEEMPHASIZED_TILE_SCALE + 0.5,
+            "elsewhere tiles are visibly smaller: {} vs {}",
+            rx.h,
+            ra.h
+        );
+        // The gap from one section's tiles to the next section's header is
+        // wider than the in-grid gap.
+        let hs = headers(&m);
+        let detached_y = hs
+            .iter()
+            .find(|(l, _)| l == "Detached")
+            .expect("pool header")
+            .1;
+        assert!(
+            detached_y - (ra.y + ra.h) >= GAP + SECTION_EXTRA_GAP - 0.5,
+            "sections breathe: header at {detached_y}, tile bottom {}",
+            ra.y + ra.h
+        );
+    }
+
+    #[test]
+    fn a_narrow_blocks_header_still_fits_its_name_and_chips() {
+        // A one-tile block at the de-emphasized size can be narrower than
+        // its name plus its chipset: the header must widen to fit, not let
+        // the right-aligned chips run the name over.
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("batch")]));
+        seed_group(&mut m, "g-p", "purple", &["batch"]); // closed: [attach all, dissolve, kill]
+        // A portrait mirror makes the card — and so the block — narrow.
+        m.update(UiEvent::SessionPush {
+            name: "batch".to_string(),
+            push: SessionPush::Event(SessionEvent::Resized { cols: 20, rows: 50 }),
+        });
+        let (headers, _, _, _) = m.sections_layout();
+        let header = headers
+            .iter()
+            .find_map(|(b, r)| match b {
+                Band::Group { id, .. } if id == "g-p" => Some(*r),
+                _ => None,
+            })
+            .expect("the closed block renders");
+        let metrics = m.effective_metrics();
+        let first_chip = group_buttons(header, metrics, &m.group_chipset("g-p"))
+            .first()
+            .expect("chips render")
+            .1;
+        let name_end = header.x + ("purple".chars().count() as f32 + 1.0) * metrics.advance;
+        assert!(
+            first_chip.x >= name_end,
+            "chips start past the name: chip at {}, name ends at {name_end}",
+            first_chip.x
+        );
+    }
+
+    #[test]
+    fn nothing_elsewhere_means_no_toggle() {
+        let mut m = my_fleet(&["a"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        assert!(
+            toggle_rect(&m).is_none(),
+            "no hidden content, no toggle band"
+        );
+    }
+
+    #[test]
+    fn a_detached_member_of_an_open_foreign_group_stays_in_its_block() {
+        // Detaching a member does not ungroup it, seen from any window: the
+        // member renders inside its (held-elsewhere) group's block — a
+        // partially attached group — not in the detached pool.
+        let mut m = my_fleet(&["m0"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("m0", true),
+            sinfo("a", true), // held by the other window
+            info("b"),        // detached, but still web's member
+            info("c"),        // detached and ungrouped: the pool
+        ]));
+        seed_group(&mut m, "g-web", "web", &["a", "b"]);
+        snap_attached(&mut m, "a", Some(&crate::group::window_identity("g-web")));
+        m.show_elsewhere = true; // the block hides by default; look at it
+        let (headers, _, _, _) = m.sections_layout();
+        let block = headers
+            .iter()
+            .find_map(|(band, _)| match band {
+                Band::Group { id, block } if id == "g-web" => Some(*block),
+                _ => None,
+            })
+            .expect("the open foreign group renders a block");
+        let r = tile_rect(&m, "b");
+        assert!(
+            block.contains(r.x + r.w / 2.0, r.y + r.h / 2.0),
+            "the detached member sits in its group's block"
+        );
+        let rc = tile_rect(&m, "c");
+        assert!(
+            !block.contains(rc.x + rc.w / 2.0, rc.y + rc.h / 2.0),
+            "the ungrouped one stays in the pool"
         );
     }
 
@@ -4281,6 +4682,7 @@ mod tests {
             sinfo("a", true),
             sinfo("x", true),
         ]));
+        reveal(&mut m);
         let from = centre(&tile_rect(&m, "x"));
         let to = centre(&my_block_rect(&m));
         let cmds = drag(&mut m, from, to);
@@ -4345,6 +4747,7 @@ mod tests {
             info("d"),
         ]));
         let before = m.groups().to_vec();
+        reveal(&mut m);
         // Drop the detached tile onto the foreign block: nothing happens.
         let from = centre(&tile_rect(&m, "d"));
         let (headers, _, _, _) = m.sections_layout();
@@ -4396,6 +4799,7 @@ mod tests {
             info("d"),
             sinfo("x", true),
         ]));
+        reveal(&mut m);
         for id in ["d", "x"] {
             let pos = centre_of(&m, id);
             press_ctrl(&mut m, pos);
@@ -5021,9 +5425,14 @@ mod tests {
             sinfo("y", true),
             info("d"),
         ]));
+        reveal(&mut m);
         // Registry membership alone buckets the foreign pair under their
-        // window's block — after the detached pool, per the fleet order.
-        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+        // window's block — after the detached pool (and the reveal toggle),
+        // per the fleet order.
+        assert_eq!(
+            header_labels(&m),
+            vec!["Detached", "2 attached elsewhere", "green"]
+        );
         assert_eq!(
             tile_y(&m, "x"),
             tile_y(&m, "y"),
@@ -5046,17 +5455,24 @@ mod tests {
             sinfo("x", true),
             sinfo("z", true),
         ]));
+        reveal(&mut m);
         // No identity, no membership: "z" sits in the generic section.
-        assert_eq!(header_labels(&m), vec!["green", "Attached elsewhere"]);
+        assert_eq!(
+            header_labels(&m),
+            vec!["2 attached elsewhere", "green", "Attached elsewhere"]
+        );
         // Its snapshot names the holder: it joins the block and the generic
         // section empties away.
         snap_attached(&mut m, "z", Some("ghost-ui:g2"));
-        assert_eq!(header_labels(&m), vec!["green"]);
+        assert_eq!(header_labels(&m), vec!["2 attached elsewhere", "green"]);
         assert_eq!(tile_y(&m, "x"), tile_y(&m, "z"));
         // An identity naming no known group falls back to the generic
         // section (e.g. a client from a process whose registry we lack).
         snap_attached(&mut m, "z", Some("ghost-ui:mystery"));
-        assert_eq!(header_labels(&m), vec!["green", "Attached elsewhere"]);
+        assert_eq!(
+            header_labels(&m),
+            vec!["2 attached elsewhere", "green", "Attached elsewhere"]
+        );
     }
 
     #[test]
@@ -5066,7 +5482,11 @@ mod tests {
         seed_group(&mut m, "g2", "green", &["x"]);
         seed_group(&mut m, "g3", "orange", &[]);
         m.update(UiEvent::SessionList(vec![sinfo("x", true), info("d")]));
-        assert_eq!(header_labels(&m), vec!["Detached", "green"]);
+        reveal(&mut m);
+        assert_eq!(
+            header_labels(&m),
+            vec!["Detached", "1 attached elsewhere", "green"]
+        );
         // Another window steals it: the live identity outranks membership.
         push(
             &mut m,
@@ -5075,9 +5495,13 @@ mod tests {
                 client: Some("ghost-ui:g3".to_string()),
             })),
         );
-        assert_eq!(header_labels(&m), vec!["Detached", "orange"]);
+        assert_eq!(
+            header_labels(&m),
+            vec!["Detached", "1 attached elsewhere", "orange"]
+        );
         // And a detach closes its group: still a member of g2, the tile
-        // lands in that group's (now closed) block, not the pool.
+        // lands in that group's (now closed) block, not the pool — and with
+        // nothing held elsewhere any more, the toggle goes.
         push(&mut m, "x", SessionPush::Event(SessionEvent::Detached));
         assert_eq!(header_labels(&m), vec!["Detached", "green"]);
     }
@@ -5229,12 +5653,21 @@ mod tests {
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
         assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        m.show_elsewhere = true;
         // Three headers, stacked top to bottom: this window's group first,
-        // then the detached pool (the likeliest tiles to grab), then other
-        // windows'.
+        // then the detached pool (the likeliest tiles to grab), then —
+        // revealed — other windows'.
         let hs = headers(&m);
         let labels: Vec<&str> = hs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["blue", "Detached", "Attached elsewhere"]);
+        assert_eq!(
+            labels,
+            vec![
+                "blue",
+                "Detached",
+                "1 attached elsewhere",
+                "Attached elsewhere"
+            ]
+        );
         assert!(
             hs[0].1 < hs[1].1 && hs[1].1 < hs[2].1,
             "sections stack downward: {hs:?}"
@@ -5981,6 +6414,7 @@ mod tests {
         let mut a = info("a");
         a.attached = true; // attached by another window
         m.update(UiEvent::SessionList(vec![a]));
+        reveal(&mut m);
         assert_eq!(m.locality_of("a"), Some(Locality::Elsewhere));
         let cmds = press(&mut m, "a");
         assert!(
@@ -6075,6 +6509,7 @@ mod tests {
         let mut a = info("a");
         a.attached = true; // held by another window -> take-over confirm
         m.update(UiEvent::SessionList(vec![a]));
+        reveal(&mut m);
         press(&mut m, "a");
         // A take-over is a simple confirmation, not destruction: green, with
         // the grey cancel beside it (chip_rects panics if either is missing).

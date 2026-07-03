@@ -175,11 +175,12 @@ fn main() {
 
     let out = args.next().unwrap_or_else(|| "ghost-shot.png".to_string());
     let (scene, w, h) = match which.as_str() {
-        "fleet" => fleet_scene(),
+        "fleet" => fleet_scene(false),
+        "fleet-revealed" => fleet_scene(true),
         "single" => single_scene(),
         other => {
             eprintln!(
-                "unknown scene '{other}' (expected: fleet | single | zoom | bench | calib | calib-tui)"
+                "unknown scene '{other}' (expected: fleet | fleet-revealed | single | zoom | bench | calib | calib-tui)"
             );
             std::process::exit(2);
         }
@@ -781,7 +782,7 @@ fn calib_tui() {
 /// the window's emphasized group block), one held by another window, and one
 /// detached — covering the block, both sections, cards, buttons, the focus
 /// border, and scaled live previews.
-fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
+fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     let size = (1400u32, 1200u32);
     let mine: HashSet<String> = ["edit", "build"].into_iter().map(String::from).collect();
 
@@ -855,6 +856,10 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
         "db",
         "prod=# select count(*) from orders;\r\n count \r\n-------\r\n 42917\r\n(1 row)\r\n\r\nprod=# ",
     );
+
+    // The attached-elsewhere content hides behind its toggle by default;
+    // `fleet-revealed` renders the expanded state.
+    fleet.set_show_elsewhere(revealed);
 
     let scene = fleet.view();
     (scene, size.0, size.1)

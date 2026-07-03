@@ -664,7 +664,7 @@ impl RootModel {
                 Mode::Fleet(f) => f.update(ev),
             });
             self.mirror_fleet_identity();
-            self.release_detached(&mut cmds);
+            self.release_detached(&cmds);
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(&p));
             }
@@ -689,7 +689,7 @@ impl RootModel {
             Mode::Fleet(f) => f.update(ev),
         };
         self.mirror_fleet_identity();
-        self.release_detached(&mut cmds);
+        self.release_detached(&cmds);
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
@@ -713,34 +713,15 @@ impl RootModel {
     /// bell reaction, Ctrl-Tab, and the next fleet all see it as not ours.
     /// In the single view the released session also leaves this window's
     /// group (an open fleet syncs the registry itself), appending the save.
-    fn release_detached(&mut self, cmds: &mut Vec<Cmd>) {
-        let ids: Vec<SessionId> = cmds
-            .iter()
-            .filter_map(|c| match c {
-                Cmd::Detach(id) => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        if ids.is_empty() {
-            return;
-        }
-        for id in &ids {
-            self.mine.remove(id);
-            self.warm.remove(id);
-        }
-        if !matches!(self.mode, Mode::Single(_)) {
-            return;
-        }
-        let mut changed = false;
-        if let Some(g) = self.groups.iter_mut().find(|g| g.id == self.my_group.id) {
-            let before = g.members.len();
-            g.members.retain(|m| !ids.contains(m));
-            changed = g.members.len() != before;
-        }
-        if changed {
-            self.groups
-                .retain(|g| g.id != self.my_group.id || !g.members.is_empty());
-            cmds.push(Cmd::SaveGroups(self.groups.clone()));
+    fn release_detached(&mut self, cmds: &[Cmd]) {
+        // Ownership only: the window stops driving the session, but its
+        // group membership stays — detaching is not ungrouping, so the
+        // member just goes cold in its block.
+        for c in cmds {
+            if let Cmd::Detach(id) = c {
+                self.mine.remove(id);
+                self.warm.remove(id);
+            }
         }
     }
 
