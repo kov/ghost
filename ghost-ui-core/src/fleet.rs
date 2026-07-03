@@ -1912,30 +1912,31 @@ impl FleetModel {
                     None => Vec::new(),
                 }
             }
-            // Bulk verbs on the marks: `a` attaches them here (one confirm
-            // if any is held elsewhere), `d` detaches the ones this window
-            // drives, Delete kills them (confirmed). Inert without marks.
+            // The action verbs: `a` attaches here (one confirm if any is
+            // held elsewhere), `d` detaches the ones this window drives,
+            // Delete kills (confirmed). They act on the marked set when
+            // marks exist, otherwise the focused tile; with Ctrl held, on
+            // the focused tile's whole group — the same widening Ctrl-Enter
+            // gives Enter.
             UiEvent::Key {
                 key, mods, kind, ..
-            } if kind.is_down()
-                && !mods.ctrl
-                && !mods.sup
-                && !self.marked.is_empty()
-                && matches!(&key, Key::Char(s) if s == "a") =>
-            {
-                let set = self.marked_in_order();
-                self.attach_here(set)
+            } if kind.is_down() && !mods.sup && matches!(&key, Key::Char(s) if s == "a") => {
+                let targets = if mods.ctrl {
+                    self.focused_group_targets()
+                } else {
+                    self.key_targets()
+                };
+                self.attach_here(targets)
             }
             UiEvent::Key {
                 key, mods, kind, ..
-            } if kind.is_down()
-                && !mods.ctrl
-                && !mods.sup
-                && !self.marked.is_empty()
-                && matches!(&key, Key::Char(s) if s == "d") =>
-            {
-                let ours: Vec<SessionId> = self
-                    .marked_in_order()
+            } if kind.is_down() && !mods.sup && matches!(&key, Key::Char(s) if s == "d") => {
+                let targets = if mods.ctrl {
+                    self.focused_group_targets()
+                } else {
+                    self.key_targets()
+                };
+                let ours: Vec<SessionId> = targets
                     .into_iter()
                     .filter(|id| self.locality_of(id) == Some(Locality::ThisWindow))
                     .collect();
@@ -1945,15 +1946,27 @@ impl FleetModel {
                 cmds.push(Cmd::Redraw);
                 cmds
             }
-            UiEvent::Key { key, kind, .. }
-                if kind.is_down()
-                    && !self.marked.is_empty()
-                    && matches!(key, Key::Named(NamedKey::Delete)) =>
-            {
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && matches!(key, Key::Named(NamedKey::Delete)) => {
+                // Ctrl-Delete kills the focused tile's whole group (dead
+                // remnants included, like the header chip).
+                if mods.ctrl
+                    && let Some(gid) = self.focused.as_deref().and_then(|id| self.group_of(id))
+                {
+                    self.pending = Some(Pending {
+                        target: PendingTarget::Group(gid),
+                        action: PendingAction::Kill,
+                        selected: Choice::Cancel,
+                    });
+                    return vec![Cmd::Redraw];
+                }
+                // Kill works on corpses too (a dead tile is thrown away),
+                // so the only filter is that the tile exists.
                 let targets: Vec<SessionId> = self
-                    .marked_in_order()
+                    .key_targets()
                     .into_iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == id && !t.dead))
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == id))
                     .collect();
                 if targets.is_empty() {
                     return Vec::new();
@@ -2294,6 +2307,26 @@ impl FleetModel {
         self.marked.clear();
         cmds.push(Cmd::Redraw);
         cmds
+    }
+
+    /// What the action verbs (`a`/`d`/Delete) act on: the marked set when
+    /// marks exist, otherwise the focused tile.
+    fn key_targets(&self) -> Vec<SessionId> {
+        if self.marked.is_empty() {
+            self.focused.clone().into_iter().collect()
+        } else {
+            self.marked_in_order()
+        }
+    }
+
+    /// The Ctrl-variant's target: every present member of the focused
+    /// tile's group — or just the focused tile when it belongs to none,
+    /// mirroring how Ctrl-Enter degrades to Enter.
+    fn focused_group_targets(&self) -> Vec<SessionId> {
+        match self.focused.as_deref().and_then(|id| self.group_of(id)) {
+            Some(gid) => self.present_members(&gid),
+            None => self.focused.clone().into_iter().collect(),
+        }
     }
 
     /// The marked session ids in layout order (stable, deterministic).
@@ -4852,6 +4885,141 @@ mod tests {
         assert!(m.marked.is_empty());
     }
 
+    /// Press `key` with Ctrl held.
+    fn key_ctrl(m: &mut FleetModel, key: Key) -> Vec<Cmd> {
+        m.update(UiEvent::Key {
+            key,
+            mods: crate::Mods {
+                ctrl: true,
+                ..crate::Mods::NONE
+            },
+            kind: KeyEventKind::Press,
+            alts: None,
+        })
+    }
+
+    #[test]
+    fn the_action_verbs_fall_back_to_the_focused_tile() {
+        // With nothing marked, `a` attaches the focused tile, `d` detaches
+        // it, and Delete kills it (confirmed) — the verbs always have a
+        // target, marks just widen it.
+        let mut m = my_fleet(&["m0"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![sinfo("m0", true), info("d")]));
+        focus(&mut m, "d");
+        let cmds = key(&mut m, Key::Char("a".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Attach("d".into())),
+            "a attaches the focused tile: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("d"), Some(Locality::ThisWindow));
+        let cmds = key(&mut m, Key::Char("d".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Detach("d".into())),
+            "d releases the focused tile: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("d"), Some(Locality::Detached));
+        focus(&mut m, "m0");
+        let cmds = key(&mut m, Key::Named(NamedKey::Delete));
+        assert!(m.modal_open(), "a kill is confirmed: {cmds:?}");
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Kill("m0".into())),
+            "Delete kills the focused tile: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn delete_forgets_a_focused_dead_tile() {
+        // Kill works on corpses too — the keyboard way to throw a dead,
+        // remembered member away.
+        let mut m = my_fleet(&["a", "z"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("z", true),
+        ]));
+        list(&mut m, &["a"]); // z dies, remembered by my group
+        assert!(m.tiles.iter().any(|t| t.id == "z" && t.dead));
+        focus(&mut m, "z");
+        key(&mut m, Key::Named(NamedKey::Delete));
+        assert!(m.modal_open());
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(cmds.contains(&Cmd::Kill("z".into())), "{cmds:?}");
+        assert!(!m.tiles.iter().any(|t| t.id == "z"), "the corpse is gone");
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(vec!["a".to_string()]),
+            "the membership goes with it: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_attaches_the_focused_tiles_group_in_the_background() {
+        // The group twin of `a`: every present member attaches here, with
+        // no foreground switch (Ctrl-Enter is the opening chord).
+        let mut m = my_fleet(&["m0"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("m0", true),
+            info("x"),
+            info("y"),
+        ]));
+        seed_group(&mut m, "g-web", "web", &["x", "y"]); // closed: both detached
+        focus(&mut m, "x");
+        let cmds = key_ctrl(&mut m, Key::Char("a".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Attach("x".into())) && cmds.contains(&Cmd::Attach("y".into())),
+            "the whole group attaches: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
+            "background only — no foreground switch: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_detaches_the_focused_tiles_group() {
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            info("b"),
+            sinfo("c", true),
+        ]));
+        focus(&mut m, "a");
+        let cmds = key_ctrl(&mut m, Key::Char("d".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Detach("a".into())) && cmds.contains(&Cmd::Detach("c".into())),
+            "every driven member releases: {cmds:?}"
+        );
+        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert!(
+            m.groups().iter().any(|g| g.id == "w1"),
+            "detaching keeps the group: {:?}",
+            m.groups()
+        );
+    }
+
+    #[test]
+    fn ctrl_delete_confirms_killing_the_focused_tiles_group() {
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        focus(&mut m, "a");
+        let cmds = key_ctrl(&mut m, Key::Named(NamedKey::Delete));
+        assert!(m.modal_open(), "a group kill is confirmed: {cmds:?}");
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Kill("a".into())) && cmds.contains(&Cmd::Kill("c".into())),
+            "the whole group dies: {cmds:?}"
+        );
+    }
+
     #[test]
     fn delete_kills_the_marked_after_one_confirm() {
         let mut m = my_fleet(&["a"]);
@@ -6024,8 +6192,9 @@ mod tests {
             vec![],
             "typed text is not forwarded to a preview"
         );
+        // ("x", not "a"/"d": those are the fleet's action verbs now.)
         assert_eq!(
-            key(&mut m, Key::Char("a".into())),
+            key(&mut m, Key::Char("x".into())),
             vec![],
             "ordinary keys are not forwarded to a preview"
         );
