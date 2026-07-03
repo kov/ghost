@@ -184,11 +184,18 @@ pub fn valid_name(name: &str) -> bool {
 
 /// Kill the named session's host (and thereby its child). Returns `false` if no
 /// live session by that name exists.
+///
+/// A kill is the explicit throw-away verb: it also discards the session's
+/// durable traces, so nothing offers to resurrect it. The host cannot do this
+/// itself — the SIGTERM it receives here is indistinguishable from a logout's,
+/// which must leave the session resurrectable — so the killer cleans up.
 pub fn kill_session(name: &str) -> io::Result<bool> {
     let pid = match read_pid(name) {
         Some(pid) if pid_alive(pid) => pid,
         _ => {
+            // Killing an already-dead session is how it gets forgotten.
             prune(name);
+            discard(name);
             return Ok(false);
         }
     };
@@ -201,7 +208,17 @@ pub fn kill_session(name: &str) -> io::Result<bool> {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     prune(name);
+    discard(name);
     Ok(true)
+}
+
+/// Discard `name`'s durable traces — the descriptor and the recording at its
+/// default path — making the session unresurrectable and unremembered. Used
+/// by every explicit end (kill, the child's own exit); an unclean death
+/// (logout, reboot, crash) never reaches this.
+pub fn discard(name: &str) {
+    crate::descriptor::remove(name);
+    let _ = std::fs::remove_file(crate::paths::recording_path(name));
 }
 
 fn read_pid(name: &str) -> Option<i32> {

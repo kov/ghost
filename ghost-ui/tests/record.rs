@@ -1,5 +1,10 @@
 //! End-to-end tests for session recording: the host writes a durable,
 //! framed-zstd recording of session output that can be decoded back.
+//!
+//! The recorded children end themselves with a SIGTERM (`kill $$`) rather
+//! than exiting cleanly: a clean exit is an explicit end and discards the
+//! recording with the session, while a signaled death — the stand-in for a
+//! crash or logout here — flushes and keeps it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,12 +59,20 @@ fn session_output_is_recorded() {
     let data = tempfile::tempdir().unwrap();
     let name = "rec-basic";
 
-    // A short-lived session that prints a marker and exits, so the host flushes
-    // and closes the recording on its own.
+    // A short-lived session that prints a marker and dies (uncleanly, so the
+    // recording survives), making the host flush and close it on its own.
     let out = Command::new(GHOST)
         .env("XDG_RUNTIME_DIR", run.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["new", name, "-d", "--", "sh", "-c", "echo RECORDED-MARKER"])
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo RECORDED-MARKER; kill -TERM $$",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -138,7 +151,7 @@ fn long_session_writes_checkpoints() {
             "--",
             "sh",
             "-c",
-            "seq 1 1000000; echo DONE-CHK",
+            "seq 1 1000000; echo DONE-CHK; kill -TERM $$",
         ])
         .output()
         .unwrap();
@@ -188,7 +201,7 @@ fn a_non_rendering_flood_writes_no_checkpoints() {
             "--",
             "sh",
             "-c",
-            "awk 'BEGIN{for(i=0;i<150000;i++)printf \"\\033[m\"}'; echo done-idle-chk",
+            "awk 'BEGIN{for(i=0;i<150000;i++)printf \"\\033[m\"}'; echo done-idle-chk; kill -TERM $$",
         ])
         .output()
         .unwrap();
@@ -239,7 +252,7 @@ fn recording_size_is_bounded() {
             "--",
             "sh",
             "-c",
-            "head -c 2000000 /dev/urandom; printf '\\033c'; echo BOUNDED-DONE",
+            "head -c 2000000 /dev/urandom; printf '\\033c'; echo BOUNDED-DONE; kill -TERM $$",
         ])
         .output()
         .unwrap();
@@ -285,7 +298,7 @@ fn export_produces_valid_asciicast() {
             "--",
             "sh",
             "-c",
-            "printf 'HELLO-CAST\\n'",
+            "printf 'HELLO-CAST\\n'; kill -TERM $$",
         ])
         .output()
         .unwrap();

@@ -1,8 +1,12 @@
 //! Durable session descriptors: the host writes what recreating a dead session
 //! needs (command, cwd, created time, display name) into the DATA dir — unlike
 //! the runtime `meta`, which is pruned with the session directory, this file
-//! survives the session's death. That is what lets the fleet remember a dead
-//! group member and offer to bring it back.
+//! survives an *unclean* death (logout, reboot, a crash). That is what lets
+//! the fleet remember a dead group member and offer to bring it back.
+//!
+//! An *explicit* end is different: `ghost kill` and the child exiting of its
+//! own accord (the user typed `exit`) throw the session away — descriptor and
+//! recording both — so nothing offers to resurrect a session its user ended.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,8 +61,48 @@ fn read_descriptor(xdg: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(descriptor_path(xdg, name)).ok()
 }
 
+fn recording_path(xdg: &Path, name: &str) -> PathBuf {
+    xdg.join("data")
+        .join("ghost")
+        .join("recordings")
+        .join(format!("{name}.ghostrec"))
+}
+
+/// The session host's pid, from its runtime pidfile.
+fn host_pid(xdg: &Path, name: &str) -> Option<String> {
+    let p = xdg.join("run").join("ghost").join(name).join("pid");
+    Some(std::fs::read_to_string(p).ok()?.trim().to_string())
+}
+
+/// Spawn a detached session running `command` and wait until it is listed
+/// with its descriptor written (the child is up).
+fn spawn_and_settle(xdg: &Path, name: &str, command: &[&str]) {
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--"])
+        .args(command)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || read_descriptor(xdg, name)
+            .is_some()),
+        "no descriptor was written"
+    );
+}
+
 #[test]
-fn a_sessions_descriptor_survives_its_death() {
+fn a_terminated_host_keeps_the_sessions_durable_traces() {
+    // Termination from outside — logout and reboot deliver exactly this
+    // SIGTERM — is an unclean death: the user never said goodbye, so the
+    // descriptor and recording survive to resurrect the session.
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
     // A distinctive launch directory: the descriptor must record where the
@@ -103,17 +147,85 @@ fn a_sessions_descriptor_survives_its_death() {
         "creation time recorded: {desc}"
     );
 
-    // Kill the session: the runtime directory (and its `meta`) is pruned, but
-    // the descriptor is the durable memory — it must survive.
-    let out = ghost(xdg).args(["kill", "durable"]).output().unwrap();
-    assert!(out.status.success());
+    let pid = host_pid(xdg, "durable").expect("host pidfile");
+    let out = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "signalling the host failed");
     assert!(
         wait_until(Duration::from_secs(5), || !ls(xdg).contains("durable")),
-        "session still listed after kill"
+        "session still listed after its host was terminated"
     );
     assert!(
         read_descriptor(xdg, "durable").is_some(),
-        "the descriptor must outlive the session"
+        "the descriptor must outlive an unclean death"
+    );
+    assert!(
+        recording_path(xdg, "durable").exists(),
+        "the recording must outlive an unclean death"
+    );
+}
+
+#[test]
+fn a_kill_discards_the_sessions_durable_traces() {
+    // `ghost kill` is the explicit throw-away verb: the session is not
+    // resurrectable afterwards, so its descriptor and recording go with it.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    spawn_and_settle(xdg, "doomed", &["sh", "-c", "sleep 30"]);
+    assert!(
+        recording_path(xdg, "doomed").exists(),
+        "precondition: the session records"
+    );
+
+    let out = ghost(xdg).args(["kill", "doomed"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        wait_until(Duration::from_secs(5), || !ls(xdg).contains("doomed")),
+        "session still listed after kill"
+    );
+    assert!(
+        read_descriptor(xdg, "doomed").is_none(),
+        "a killed session leaves no descriptor"
+    );
+    assert!(
+        !recording_path(xdg, "doomed").exists(),
+        "a killed session leaves no recording"
+    );
+}
+
+#[test]
+fn a_clean_child_exit_discards_the_sessions_durable_traces() {
+    // The child exiting of its own accord (the user typed `exit`) ends the
+    // session just as explicitly as a kill: nothing to resurrect, so the
+    // host removes the descriptor and recording on its way out.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let flag = xdg.join("goodbye");
+    let script = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        flag.to_str().unwrap()
+    );
+    spawn_and_settle(xdg, "gone", &["sh", "-c", &script]);
+    let _guard = KillOnDrop { xdg, name: "gone" };
+    assert!(
+        recording_path(xdg, "gone").exists(),
+        "precondition: the session records"
+    );
+
+    std::fs::write(&flag, b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || !ls(xdg).contains("gone")),
+        "session still listed after its child exited"
+    );
+    assert!(
+        read_descriptor(xdg, "gone").is_none(),
+        "a cleanly-exited session leaves no descriptor"
+    );
+    assert!(
+        !recording_path(xdg, "gone").exists(),
+        "a cleanly-exited session leaves no recording"
     );
 }
 

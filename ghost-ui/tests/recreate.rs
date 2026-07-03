@@ -59,6 +59,19 @@ fn sock(xdg: &Path, name: &str) -> PathBuf {
     xdg.join("run").join("ghost").join(name).join("sock")
 }
 
+/// End the session the way a logout does — SIGTERM to its host. An unclean
+/// death is what leaves the durable traces (descriptor, recording) in place
+/// for a recreate; an explicit `ghost kill` would discard them.
+fn terminate_host(xdg: &Path, name: &str) {
+    let pidfile = xdg.join("run").join("ghost").join(name).join("pid");
+    let pid = std::fs::read_to_string(pidfile).expect("host pidfile");
+    let out = Command::new("kill")
+        .args(["-TERM", pid.trim()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "signalling the host failed");
+}
+
 #[test]
 fn a_seeded_session_starts_with_its_predecessors_screen() {
     let tmp = tempfile::tempdir().unwrap();
@@ -107,12 +120,13 @@ fn a_seeded_session_starts_with_its_predecessors_screen() {
     );
     drop(first); // detach; the session lives on
 
-    // Death. Killing flushes and closes the recording.
-    let out = ghost(xdg).args(["kill", "phoenix"]).output().unwrap();
-    assert!(out.status.success());
+    // Death — an unclean one (a logout's SIGTERM). The host flushes and
+    // closes the recording on its way out and, not being an explicit kill,
+    // leaves it in place to seed the recreate.
+    terminate_host(xdg, "phoenix");
     assert!(
         wait_until(Duration::from_secs(5), || !ls(xdg).contains("phoenix")),
-        "session still listed after kill"
+        "session still listed after its host was terminated"
     );
     let rec_path = recording_path(xdg, "phoenix");
     let rec = ghost_vt::record::read(&rec_path).expect("the recording survives the death");
@@ -174,8 +188,12 @@ fn a_seeded_session_starts_with_its_predecessors_screen() {
 
     // The new recording is self-contained: replaying it alone (no reference to
     // the seed file) reconstructs a screen that still shows the first life.
-    let out = ghost(xdg).args(["kill", "phoenix"]).output().unwrap();
-    assert!(out.status.success());
+    // Another unclean death, so the recording is flushed but kept.
+    terminate_host(xdg, "phoenix");
+    assert!(
+        wait_until(Duration::from_secs(5), || !ls(xdg).contains("phoenix")),
+        "session still listed after its host was terminated"
+    );
     let rec2 = ghost_vt::record::read(&rec_path).expect("second-life recording");
     let replay = Screen::from_recording(&rec2, 100);
     assert!(

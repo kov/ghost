@@ -580,7 +580,14 @@ fn host_main(
         // repainted even after a period with nobody attached.
         if pty_re.intersects(PollFlags::IN | PollFlags::HUP) {
             match (&pty).read(&mut ptybuf) {
-                Ok(0) => return child_exited(&mut child, &mut client),
+                Ok(0) => {
+                    return child_exited(
+                        &mut child,
+                        &mut client,
+                        current_name,
+                        opts.record.as_deref(),
+                    );
+                }
                 Ok(n) => {
                     activity = n > 0;
                     // `feed` reports the rows it changed; an empty set means this
@@ -708,7 +715,14 @@ fn host_main(
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 // EIO on the master means the child closed the slave (exited).
-                Err(_) => return child_exited(&mut child, &mut client),
+                Err(_) => {
+                    return child_exited(
+                        &mut child,
+                        &mut client,
+                        current_name,
+                        opts.record.as_deref(),
+                    );
+                }
             }
         }
 
@@ -752,6 +766,7 @@ fn host_main(
                 Disposition::Drop => client = None,
                 Disposition::Kill => {
                     kill_child(&mut child);
+                    discard_traces(current_name, opts.record.as_deref());
                     return Ok(0);
                 }
             }
@@ -1186,14 +1201,34 @@ fn set_display_name(
 fn child_exited(
     child: &mut Option<std::process::Child>,
     client: &mut Option<Client>,
+    name: &str,
+    record: Option<&std::path::Path>,
 ) -> io::Result<i32> {
-    let code = child
-        .as_mut()
-        .and_then(|c| c.wait().ok())
-        .and_then(|s| s.code())
-        .unwrap_or(0);
+    let status = child.as_mut().and_then(|c| c.wait().ok());
+    let code = status.as_ref().and_then(|s| s.code()).unwrap_or(0);
+    // A child that exited of its own accord (WIFEXITED: the user typed
+    // `exit`, or the command ran to completion) ended the session as
+    // explicitly as a kill — its durable traces go with it. A signaled child
+    // (a crash, a logout's SIGHUP) died uncleanly and stays resurrectable;
+    // so does one already reaped by `kill_child`, whose cached wait status
+    // is likewise signal-coded.
+    if status.is_some_and(|s| s.code().is_some()) {
+        discard_traces(name, record);
+    }
     notify_exit(client, code);
     Ok(code)
+}
+
+/// An explicitly-ended session leaves nothing behind: drop the durable
+/// descriptor and the recording this host was writing. The SIGTERM exit path
+/// must never come here — external termination (a logout delivers exactly
+/// that signal) keeps the session resurrectable, and `ghost kill` cleans up
+/// on the killer's side instead.
+fn discard_traces(name: &str, record: Option<&std::path::Path>) {
+    crate::descriptor::remove(name);
+    if let Some(p) = record {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// Build and spawn the session's child on the given PTY slave, honoring the
