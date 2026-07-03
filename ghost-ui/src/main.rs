@@ -458,13 +458,23 @@ enum StartupChoice {
 }
 
 /// Decide how to start: honour an explicit `$GHOST_SESSION` request; otherwise
-/// open the fleet whenever any session is detached (so launching reconnects
-/// instead of accumulating new sessions), and only spawn a fresh session when
-/// there is nothing detached to return to.
-fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) -> StartupChoice {
+/// open the fleet whenever there is something to return to — a detached live
+/// session, or a group remembering a session that is no longer running (its
+/// closed block relaunches it) — and only spawn a fresh session when there is
+/// nothing to reconnect. Launching must not pile new sessions on top of
+/// forgotten ones.
+fn startup_choice(
+    requested: Option<String>,
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> StartupChoice {
+    let remembered_dead = groups
+        .iter()
+        .flat_map(|g| &g.members)
+        .any(|m| !sessions.iter().any(|s| &s.name == m));
     match requested {
         Some(name) => StartupChoice::Attach(name),
-        None if sessions.iter().any(|s| !s.attached) => StartupChoice::Fleet,
+        None if sessions.iter().any(|s| !s.attached) || remembered_dead => StartupChoice::Fleet,
         None => StartupChoice::Spawn,
     }
 }
@@ -472,8 +482,11 @@ fn startup_choice(requested: Option<String>, sessions: &[session::SessionInfo]) 
 /// The startup decision for a window opened at runtime via File > New Window / Cmd-N.
 /// A new window "acts like the first one", but carries no `$GHOST_SESSION` request
 /// (that is a launch-only override), so it always takes the plain-launch decision.
-fn new_window_choice(sessions: &[session::SessionInfo]) -> StartupChoice {
-    startup_choice(None, sessions)
+fn new_window_choice(
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> StartupChoice {
+    startup_choice(None, sessions, groups)
 }
 
 fn interactive() {
@@ -491,12 +504,13 @@ fn interactive() {
     // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
     // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
+    let groups = groups::load();
     let initial_name = if harness.is_some() {
         None // open the fleet; the harness populates and dives it
     } else {
         let requested = std::env::var("GHOST_SESSION").ok();
         let sessions = session::list().unwrap_or_default();
-        match startup_choice(requested, &sessions) {
+        match startup_choice(requested, &sessions, &groups) {
             StartupChoice::Attach(name) => Some(name),
             StartupChoice::Fleet => None,
             StartupChoice::Spawn => {
@@ -517,7 +531,6 @@ fn interactive() {
     #[cfg(target_os = "macos")]
     let proxy = event_loop.create_proxy();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let groups = groups::load();
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
         windows: HashMap::new(),
@@ -1597,12 +1610,13 @@ impl App {
     }
 
     /// Open a new window that behaves exactly like a fresh launch (File > New Window
-    /// / Cmd-N): reconnect through the fleet when any session is detached, otherwise
-    /// spawn a fresh session and show it as a single view. Runs in this same process,
-    /// so the new window shares the clipboard, clock, and menu with the others.
+    /// / Cmd-N): reconnect through the fleet when any session is detached or a group
+    /// remembers a dead one, otherwise spawn a fresh session and show it as a single
+    /// view. Runs in this same process, so the new window shares the clipboard,
+    /// clock, and menu with the others.
     fn open_launch_window(&mut self, event_loop: &ActiveEventLoop) {
         let sessions = session::list().unwrap_or_default();
-        match new_window_choice(&sessions) {
+        match new_window_choice(&sessions, &self.groups) {
             StartupChoice::Fleet => self.open_fleet_window(event_loop),
             StartupChoice::Spawn => {
                 let name = self.unique_session_name();
@@ -2265,6 +2279,15 @@ mod tests {
         }
     }
 
+    fn group(id: &str, members: &[&str]) -> ghost_ui_core::Group {
+        ghost_ui_core::Group {
+            id: id.to_string(),
+            name: "blue".to_string(),
+            color: 0,
+            members: members.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn gui_launch_falls_back_to_home_only_without_a_real_cwd() {
         use std::path::{Path, PathBuf};
@@ -2315,7 +2338,7 @@ mod tests {
         // `$GHOST_SESSION` wins regardless of what else is around.
         let sessions = [info("a", false)];
         assert!(matches!(
-            startup_choice(Some("x".into()), &sessions),
+            startup_choice(Some("x".into()), &sessions, &[]),
             StartupChoice::Attach(n) if n == "x"
         ));
     }
@@ -2324,18 +2347,41 @@ mod tests {
     fn startup_opens_the_fleet_when_any_session_is_detached() {
         let sessions = [info("a", true), info("b", false)];
         assert!(matches!(
-            startup_choice(None, &sessions),
+            startup_choice(None, &sessions, &[]),
             StartupChoice::Fleet
+        ));
+    }
+
+    #[test]
+    fn startup_opens_the_fleet_when_a_group_remembers_a_dead_session() {
+        // No live sessions, but the registry remembers a group whose member
+        // is gone: launch into the fleet, where the group renders as a
+        // reopenable block — not a fresh session piled on top of it.
+        let remembered = [group("g1", &["gone"])];
+        assert!(matches!(
+            startup_choice(None, &[], &remembered),
+            StartupChoice::Fleet
+        ));
+        // A group whose members are all live and attached remembers nothing
+        // reconnectable — a plain launch still spawns.
+        let sessions = [info("a", true)];
+        let live = [group("g1", &["a"])];
+        assert!(matches!(
+            startup_choice(None, &sessions, &live),
+            StartupChoice::Spawn
         ));
     }
 
     #[test]
     fn startup_spawns_when_nothing_is_detached() {
         // No sessions at all, or only sessions attached elsewhere → fresh session.
-        assert!(matches!(startup_choice(None, &[]), StartupChoice::Spawn));
+        assert!(matches!(
+            startup_choice(None, &[], &[]),
+            StartupChoice::Spawn
+        ));
         let attached_elsewhere = [info("a", true)];
         assert!(matches!(
-            startup_choice(None, &attached_elsewhere),
+            startup_choice(None, &attached_elsewhere, &[]),
             StartupChoice::Spawn
         ));
     }
@@ -2344,16 +2390,21 @@ mod tests {
     fn new_window_mirrors_a_plain_launch() {
         // File > New Window / Cmd-N opens a window that "acts like the first one":
         // it carries no `$GHOST_SESSION` request, so it always takes the plain-launch
-        // decision — the fleet when anything is detached (reconnect), a fresh session
-        // otherwise — and never attaches to one specific session.
+        // decision — the fleet when anything is detached (reconnect) or remembered
+        // (a closed group), a fresh session otherwise — and never attaches to one
+        // specific session.
         assert!(matches!(
-            new_window_choice(&[info("a", false)]),
+            new_window_choice(&[info("a", false)], &[]),
             StartupChoice::Fleet
         ));
-        assert!(matches!(new_window_choice(&[]), StartupChoice::Spawn));
+        assert!(matches!(new_window_choice(&[], &[]), StartupChoice::Spawn));
         assert!(matches!(
-            new_window_choice(&[info("a", true)]),
+            new_window_choice(&[info("a", true)], &[]),
             StartupChoice::Spawn
+        ));
+        assert!(matches!(
+            new_window_choice(&[], &[group("g1", &["gone"])]),
+            StartupChoice::Fleet
         ));
     }
 
