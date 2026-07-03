@@ -59,11 +59,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = vec![
             Group {
+                id: "w1".into(),
                 name: "web".into(),
                 color: 0,
                 members: vec!["alpha".into(), "beta".into()],
             },
             Group {
+                id: "w2".into(),
                 name: "infra".into(),
                 color: 3,
                 members: vec!["gamma".into()],
@@ -79,5 +81,23 @@ mod tests {
         assert_eq!(load_from(dir.path()), Vec::new());
         std::fs::write(file_in(dir.path()), "not toml [").unwrap();
         assert_eq!(load_from(dir.path()), Vec::new());
+    }
+
+    #[test]
+    fn a_file_predating_group_ids_still_loads() {
+        // Files written before groups carried ids (the manual-groups era)
+        // load with an empty id: no window ever claims them, so they behave
+        // as closed groups.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            file_in(dir.path()),
+            "[[group]]\nname = \"web\"\ncolor = 1\nmembers = [\"alpha\"]\n",
+        )
+        .unwrap();
+        let loaded = load_from(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "");
+        assert_eq!(loaded[0].name, "web");
+        assert_eq!(loaded[0].members, vec!["alpha".to_string()]);
     }
 }

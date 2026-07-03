@@ -820,6 +820,7 @@ fn fleet_scene() -> (ghost_render::Scene, u32, u32) {
     // "db" member is dead-but-remembered: its tile stays in the block,
     // previewing its recording's last screen, offering a relaunch.
     fleet.set_groups(vec![ghost_ui_core::Group {
+        id: "g-web".to_string(),
         name: "web".to_string(),
         color: 0,
         members: vec!["edit".to_string(), "prod".to_string(), "db".to_string()],

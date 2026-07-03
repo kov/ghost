@@ -1,10 +1,16 @@
-//! User-defined session groups: named, color-coded collections treated as a
-//! unit in the fleet. A group is fleet-side state (persisted by the shell in
-//! the data dir), orthogonal to the attach-state sections: grouped sessions
-//! render together in their group's block regardless of who drives them.
+//! Session groups: color-coded collections treated as a unit in the fleet.
+//! A group is born automatically for each window and means "the sessions
+//! attached to this window"; it is persisted by the shell in the data dir so
+//! it survives the window closing. Membership is maintained by the models as
+//! sessions attach and detach, not curated by hand.
 
 use crate::SessionId;
 use serde::{Deserialize, Serialize};
+
+/// A group's durable identity, minted by the shell when its window is
+/// created. Empty on records predating ids (the manual-groups era), which no
+/// window ever claims.
+pub type GroupId = String;
 
 /// Accent colors assigned to groups round-robin at creation, referenced by
 /// index so a future restyle recolors existing groups.
@@ -17,19 +23,56 @@ pub const GROUP_PALETTE: [[f32; 4]; 6] = [
     [0.45, 0.80, 0.80, 1.0], // teal
 ];
 
-/// A named, color-coded collection of sessions.
+/// The palette colors' names, matching [`GROUP_PALETTE`] index for index: an
+/// automatic group is born carrying its color's name until the user renames
+/// it.
+pub const GROUP_COLOR_NAMES: [&str; 6] = ["blue", "green", "orange", "purple", "rose", "teal"];
+
+/// A color-coded collection of sessions: one window's attached set, live or
+/// remembered (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
+    /// Durable identity binding the group to the window carrying it (see
+    /// [`GroupId`]).
+    #[serde(default)]
+    pub id: GroupId,
     pub name: String,
     /// Index into [`GROUP_PALETTE`] (wrapped at use).
     pub color: u8,
-    /// Member session ids (immutable spawn-time names), in display order.
+    /// Member session ids (immutable spawn-time names). The set is what
+    /// matters; display order is the fleet's stable spatial order.
     pub members: Vec<SessionId>,
 }
 
 impl Group {
+    /// A window's newborn group: no members yet, named after its color.
+    pub fn auto(id: GroupId, color: u8) -> Self {
+        Group {
+            id,
+            name: GROUP_COLOR_NAMES[color as usize % GROUP_COLOR_NAMES.len()].to_string(),
+            color,
+            members: Vec::new(),
+        }
+    }
+
     /// The group's accent color.
     pub fn rgba(&self) -> [f32; 4] {
         GROUP_PALETTE[self.color as usize % GROUP_PALETTE.len()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_automatic_group_is_named_after_its_color() {
+        let g = Group::auto("win-1".into(), 2);
+        assert_eq!(g.id, "win-1");
+        assert_eq!(g.name, "orange");
+        assert_eq!(g.rgba(), GROUP_PALETTE[2]);
+        assert!(g.members.is_empty());
+        // The color index wraps like rgba() does.
+        assert_eq!(Group::auto("win-2".into(), 7).name, "green");
     }
 }

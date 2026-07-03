@@ -2195,6 +2195,7 @@ impl FleetModel {
         }
         let color = (self.groups.len() % crate::group::GROUP_PALETTE.len()) as u8;
         self.groups.push(Group {
+            id: String::new(),
             name,
             color,
             members,
@@ -3613,6 +3614,7 @@ mod tests {
         widen(&mut m);
         list(&mut m, &["a"]);
         m.set_groups(vec![Group {
+            id: "g-web".into(),
             name: "web".into(),
             color: 0,
             members: vec!["a".into(), "x".into()],

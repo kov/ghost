@@ -1201,6 +1201,7 @@ mod tests {
     fn loaded_groups_reach_an_open_fleet_and_later_openings() {
         let mut r = root();
         let g = vec![crate::Group {
+            id: "g-infra".into(),
             name: "infra".into(),
             color: 0,
             members: vec!["beta".into()],
@@ -1221,6 +1222,7 @@ mod tests {
         dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", false, 2)]);
         settle(&mut r);
         r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g-web".into(),
             name: "web".into(),
             color: 0,
             members: vec!["alpha".into()],
@@ -1249,6 +1251,7 @@ mod tests {
         );
         settle(&mut r);
         r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g-web".into(),
             name: "web".into(),
             color: 0,
             members: vec!["alpha".into(), "gamma".into()],
