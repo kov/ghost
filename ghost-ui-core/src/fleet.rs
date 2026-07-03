@@ -1946,6 +1946,29 @@ impl FleetModel {
                 cmds.push(Cmd::Redraw);
                 cmds
             }
+            // `r` relaunches dead tiles in the background (the relaunch
+            // chip's verb — Enter on a dead tile is the recreate-and-open
+            // path); Ctrl-r relaunches the focused tile's group's dead.
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() && !mods.sup && matches!(&key, Key::Char(s) if s == "r") => {
+                let targets = if mods.ctrl {
+                    self.focused_group_all_members()
+                } else {
+                    self.key_targets()
+                };
+                let mut cmds: Vec<Cmd> = targets
+                    .into_iter()
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == id && t.dead))
+                    .map(Cmd::Resurrect)
+                    .collect();
+                if cmds.is_empty() {
+                    return Vec::new(); // nothing dead under the verb
+                }
+                self.marked.clear();
+                cmds.push(Cmd::Redraw);
+                cmds
+            }
             // `u` ungroups (the drag-out's keyboard twin); Ctrl-u dissolves
             // the focused tile's whole group, dead members included.
             UiEvent::Key {
@@ -5148,6 +5171,66 @@ mod tests {
         );
         assert_eq!(m.locality_of("a"), Some(Locality::Detached));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+    }
+
+    #[test]
+    fn r_relaunches_the_focused_dead_tile_in_the_background() {
+        // `r` is the relaunch chip's keyboard verb: the host comes back with
+        // its seeded screen, nothing attaches or opens (Enter on the dead
+        // tile is the recreate-and-open path). Live tiles have nothing to
+        // relaunch — the verb is inert on them.
+        let mut m = my_fleet(&["a", "z"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("z", true),
+        ]));
+        list(&mut m, &["a"]); // z dies, remembered by my group
+        focus(&mut m, "z");
+        let cmds = key(&mut m, Key::Char("r".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Resurrect("z".into())),
+            "the corpse relaunches: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::TakeOver(_) | Cmd::Attach(_))),
+            "background only: {cmds:?}"
+        );
+        focus(&mut m, "a");
+        assert_eq!(
+            key(&mut m, Key::Char("r".to_string())),
+            Vec::new(),
+            "a live tile has nothing to relaunch"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_relaunches_the_focused_tiles_dead_members() {
+        // The group chord: every dead member of the focused tile's group
+        // comes back — focused on a LIVE member, like the header chip.
+        let mut m = my_fleet(&["a", "z", "w"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("z", true),
+            sinfo("w", true),
+        ]));
+        list(&mut m, &["a"]); // z and w die, remembered
+        focus(&mut m, "a");
+        let cmds = key_ctrl(&mut m, Key::Char("r".to_string()));
+        assert!(
+            cmds.contains(&Cmd::Resurrect("z".into()))
+                && cmds.contains(&Cmd::Resurrect("w".into())),
+            "the group's corpses relaunch: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Resurrect(id) if id == "a")),
+            "the living member is not resurrected: {cmds:?}"
+        );
     }
 
     #[test]
