@@ -64,10 +64,50 @@ pub fn probe_line() -> String {
     format!("{PROBE_MARKER} proto={}", crate::protocol::PROTO_LEVEL)
 }
 
+/// The environment variable carrying the ssh password to the askpass helper.
+const ASKPASS_SECRET_ENV: &str = "GHOST_ASKPASS_SECRET";
+
+/// The reply `ghost __askpass` prints: the secret from [`ASKPASS_SECRET_ENV`],
+/// or `None` (the helper then exits non-zero and ssh's auth fails) — so a stale
+/// or absent secret never hangs. The prompt ssh passes is ignored: host-key
+/// confirmations are avoided with `accept-new`, and any other prompt (2FA) we
+/// can't answer, so failing is correct.
+pub fn askpass_reply() -> Option<String> {
+    std::env::var(ASKPASS_SECRET_ENV).ok()
+}
+
+/// Ensure the askpass wrapper script exists (idempotent) and return its path. ssh
+/// runs `$SSH_ASKPASS "<prompt>"` directly, so it must be a standalone executable
+/// — a tiny shell script that re-enters this binary as `ghost __askpass`, which
+/// echoes the secret from the environment.
+fn ensure_askpass_helper() -> io::Result<PathBuf> {
+    let dir = crate::paths::runtime_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("askpass.sh");
+    let exe = std::env::current_exe()?;
+    let script = format!(
+        "#!/bin/sh\nexec {} __askpass \"$@\"\n",
+        crate::connection::sh_quote(&exe.to_string_lossy())
+    );
+    std::fs::write(&path, script)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+/// A password source for ssh when there is no controlling terminal (the GUI):
+/// ssh runs the [`askpass`](Askpass::helper) helper, which echoes the
+/// [`secret`](Askpass::secret) it finds in the environment.
+struct Askpass {
+    helper: PathBuf,
+    secret: String,
+}
+
 /// One multiplexed ssh connection to a host, for the transport initiator.
 pub struct RemoteSsh {
     spec: ConnectionSpec,
     control_path: PathBuf,
+    askpass: Option<Askpass>,
 }
 
 impl RemoteSsh {
@@ -77,10 +117,33 @@ impl RemoteSsh {
         let dir = crate::paths::runtime_dir();
         std::fs::create_dir_all(&dir)?;
         let control_path = dir.join(format!("ssh-{}.ctl", sanitize(&spec.target())));
-        Ok(RemoteSsh { spec, control_path })
+        Ok(RemoteSsh {
+            spec,
+            control_path,
+            askpass: None,
+        })
     }
 
-    /// ssh options that share one authenticated connection across invocations.
+    /// Supply `secret` to ssh for password auth without a terminal — for the
+    /// GUI, which has no tty for ssh to prompt on. ssh calls a ghost helper
+    /// ([`ensure_askpass_helper`]) that echoes the secret from the environment.
+    /// The CLI omits this: it has a controlling terminal, so ssh prompts there.
+    ///
+    /// The secret rides to ssh (and its children) as an environment variable —
+    /// ephemeral, never written to disk, but readable via `/proc` by the same
+    /// user (the tradeoff `sshpass` also makes).
+    pub fn with_askpass(mut self, secret: String) -> io::Result<Self> {
+        self.askpass = Some(Askpass {
+            helper: ensure_askpass_helper()?,
+            secret,
+        });
+        Ok(self)
+    }
+
+    /// ssh options shared by every invocation: one authenticated, multiplexed
+    /// connection (`ControlMaster`), and `accept-new` host keys so an unknown
+    /// host doesn't block on a prompt the askpass helper can't answer (a *changed*
+    /// key still errors).
     fn control_opts(&self) -> Vec<String> {
         vec![
             "-o".into(),
@@ -89,6 +152,8 @@ impl RemoteSsh {
             format!("ControlPath={}", self.control_path.display()),
             "-o".into(),
             "ControlPersist=60".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
         ]
     }
 
@@ -97,11 +162,22 @@ impl RemoteSsh {
         self.spec.ssh_command(&self.control_opts(), remote)
     }
 
-    /// An [`std::process::Command`] running `remote` on the host.
+    /// An [`std::process::Command`] running `remote` on the host, carrying the
+    /// askpass environment when a secret was supplied.
     fn command(&self, remote: &[&str]) -> Command {
         let argv = self.argv(remote);
         let mut c = Command::new(&argv[0]);
         c.args(&argv[1..]);
+        if let Some(a) = &self.askpass {
+            c.env("SSH_ASKPASS", &a.helper);
+            c.env("SSH_ASKPASS_REQUIRE", "force");
+            c.env(ASKPASS_SECRET_ENV, &a.secret);
+            // Some ssh builds still consult DISPLAY even with REQUIRE=force; set a
+            // placeholder only if the session has none, never clobbering a real one.
+            if std::env::var_os("DISPLAY").is_none() {
+                c.env("DISPLAY", ":0");
+            }
+        }
         c
     }
 
@@ -243,6 +319,7 @@ mod tests {
         RemoteSsh {
             spec: ConnectionSpec::parse_target(target).unwrap(),
             control_path: PathBuf::from("/run/ghost/ssh-box.ctl"),
+            askpass: None,
         }
     }
 
@@ -259,6 +336,8 @@ mod tests {
                 "ControlPath=/run/ghost/ssh-box.ctl",
                 "-o",
                 "ControlPersist=60",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
                 "kov@box",
                 // Remote words are single-quoted (ssh reparses them remotely).
                 "'ghost'",

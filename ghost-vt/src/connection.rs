@@ -21,7 +21,7 @@ use std::path::PathBuf;
 /// Single-quote a word for a POSIX shell, so ssh's remote login shell reparses
 /// it as one literal argument. Embedded single quotes are closed, escaped, and
 /// reopened (`'\''`).
-fn sh_quote(word: &str) -> String {
+pub(crate) fn sh_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
