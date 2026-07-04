@@ -260,9 +260,10 @@ mod tests {
                 "-o",
                 "ControlPersist=60",
                 "kov@box",
-                "ghost",
-                "__pipe",
-                "work",
+                // Remote words are single-quoted (ssh reparses them remotely).
+                "'ghost'",
+                "'__pipe'",
+                "'work'",
             ]
         );
     }

@@ -21,10 +21,11 @@ use ghost_vt::screen::Screen;
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 
 /// A fake `ssh`: consume ssh options (with `-p/-i/-J/-o` taking a value) and the
-/// destination, then `exec` whatever remote command follows — locally. That
-/// remote command is `<ghost> __pipe <name>`, so it relays to the local session
-/// socket exactly as a remote ghost would to its own. With no remote command
-/// (the ssh *child* form, `ssh <target>`), it drops into a shell like real ssh.
+/// destination, then run whatever remote command follows — locally. Like real
+/// ssh, it does NOT preserve argv boundaries: it space-joins the remote words and
+/// hands them to a shell (`sh -c "$*"`), so the command must be quoted to survive
+/// (this is what catches remote-quoting bugs). With no remote command (the ssh
+/// *child* form, `ssh <target>`), it drops into a shell like real ssh.
 fn shim_ssh() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let ssh = dir.path().join("ssh");
@@ -39,7 +40,7 @@ fn shim_ssh() -> tempfile::TempDir {
          \x20 esac\n\
          done\n\
          [ $# -eq 0 ] && exec sh\n\
-         exec \"$@\"\n",
+         exec sh -c \"$*\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();

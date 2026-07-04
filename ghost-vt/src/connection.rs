@@ -18,6 +18,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+/// Single-quote a word for a POSIX shell, so ssh's remote login shell reparses
+/// it as one literal argument. Embedded single quotes are closed, escaped, and
+/// reopened (`'\''`).
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Which launcher realizes a connection. Distinct from `crate::transport`'s
 /// `Transport` (how the client reaches a *host process*) — this is which binary
 /// the local child runs. Defaults to [`ConnectionKind::Ssh`] so every spec
@@ -112,11 +119,19 @@ impl ConnectionSpec {
     /// are inserted before the destination (e.g. `ControlMaster` flags the
     /// initiator adds). The reach is always ssh here; a spec's [`ConnectionKind`]
     /// selects the local *child* launcher ([`argv`](Self::argv)), not this.
+    ///
+    /// Each `remote` word is single-quoted: ssh does **not** preserve argv
+    /// boundaries — it space-joins everything after the destination and the
+    /// remote login shell re-parses the result — so an unquoted word with a
+    /// space or `$`/`"` would be re-split or expanded on the remote. Quoting
+    /// makes the remote shell reconstruct exactly the argv we intended (a value
+    /// meant to expand there, like `$HOME`, must sit inside an inner `sh -c`
+    /// script, not rely on the outer word).
     pub fn ssh_command(&self, extra_opts: &[String], remote: &[&str]) -> Vec<String> {
         let mut v = vec!["ssh".to_string()];
         v.extend(extra_opts.iter().cloned());
         v.extend(self.ssh_opts_and_target());
-        v.extend(remote.iter().map(|s| s.to_string()));
+        v.extend(remote.iter().map(|s| sh_quote(s)));
         v
     }
 
@@ -243,17 +258,28 @@ mod tests {
             port: Some(2222),
             ..Default::default()
         };
+        // The remote words are single-quoted so ssh's remote shell reparses them
+        // as-is (ssh space-joins everything after the destination).
         assert_eq!(
             spec.transport_argv("ghost", "work"),
-            vec!["ssh", "-p", "2222", "kov@box", "ghost", "__pipe", "work"]
+            vec![
+                "ssh", "-p", "2222", "kov@box", "'ghost'", "'__pipe'", "'work'"
+            ]
         );
-        // An explicit remote binary path (a staged ghost) is honoured verbatim.
         assert_eq!(
             ConnectionSpec::parse_target("box")
                 .unwrap()
                 .transport_argv("/opt/ghost/bin/ghost", "s1"),
-            vec!["ssh", "box", "/opt/ghost/bin/ghost", "__pipe", "s1"]
+            vec!["ssh", "box", "'/opt/ghost/bin/ghost'", "'__pipe'", "'s1'"]
         );
+    }
+
+    #[test]
+    fn sh_quote_wraps_and_escapes_for_the_remote_shell() {
+        assert_eq!(sh_quote("ghost"), "'ghost'");
+        assert_eq!(sh_quote("printf %s \"$HOME\""), "'printf %s \"$HOME\"'");
+        // An embedded single quote is closed, escaped, and reopened.
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
