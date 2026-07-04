@@ -1182,9 +1182,9 @@ fn set_display_name(
     new_name: &str,
     meta: &mut crate::meta::Meta,
 ) -> Result<(), String> {
-    if !crate::session::valid_name(new_name) {
+    if !crate::session::valid_display_name(new_name) {
         return Err(format!(
-            "'{new_name}' is not a valid session name (letters, digits, '-', '_', '.')"
+            "'{new_name}' is not a valid display name (1–64 characters, no control characters)"
         ));
     }
     // Refuse a label another session already answers to (by id or display name),

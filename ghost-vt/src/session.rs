@@ -189,6 +189,17 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Whether `name` is usable as a session's *display name* — a human label shown
+/// in the UI and stored in `meta`, never a path component. Far looser than
+/// [`valid_name`]: spaces, punctuation, and non-ASCII (accents, emoji) are all
+/// fine, since the display name never becomes a directory or socket. Only the
+/// empty string, over-long labels, and control characters are rejected — the
+/// last because they could corrupt the terminal, the `meta` file, or the
+/// `\u{1f}` separator the fleet uses to namespace remote-session ids.
+pub fn valid_display_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control)
+}
+
 /// Kill the named session's host (and thereby its child). Returns `false` if no
 /// live session by that name exists.
 ///
@@ -509,6 +520,24 @@ mod tests {
             &"x".repeat(65), // too long
         ] {
             assert!(!valid_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_display_name_allows_spaces_and_unicode_but_not_control_or_empty() {
+        // A display name is a label, not a path component: it may hold spaces,
+        // punctuation, and non-ASCII.
+        for ok in ["test space", "My Session!", "café ☕", "a", &"x".repeat(64)] {
+            assert!(valid_display_name(ok), "{ok:?} should be a valid label");
+        }
+        for bad in [
+            "",              // empty
+            "tab\there",     // control char
+            "new\nline",     // newline
+            "unit\u{1f}sep", // the remote-id separator (a control char)
+            &"x".repeat(65), // too long
+        ] {
+            assert!(!valid_display_name(bad), "{bad:?} should be rejected");
         }
     }
 }

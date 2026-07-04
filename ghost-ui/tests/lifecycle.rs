@@ -80,6 +80,42 @@ fn session_lifecycle_new_ls_kill() {
 }
 
 #[test]
+fn rename_allows_spaces_in_the_display_name() {
+    // The display name is a label, not a path component (the session keeps its
+    // immutable id), so spaces and other human-friendly characters are fine.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "rename-test";
+    let _guard = Cleanup { xdg, name };
+
+    ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session `{name}` was not listed"
+    );
+
+    let out = ghost(xdg)
+        .args(["rename", name, "prod deploy 🚀"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` to a spaced label failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg)
+            .contains("prod deploy 🚀")),
+        "renamed label not shown by `ghost ls`: {}",
+        ls(xdg)
+    );
+}
+
+#[test]
 fn ls_json_emits_a_parseable_listing() {
     // `ghost ls --json` feeds the remote-fleet initiator, so its output must
     // parse straight back into the SessionInfo the local lister produces.
