@@ -225,6 +225,24 @@ impl RemoteSsh {
         Ok(())
     }
 
+    /// Enumerate the remote host's sessions by running `<remote_ghost> ls --json`
+    /// over the shared connection and parsing the listing — the remote half of the
+    /// fleet. Reuses the open ControlMaster (no auth), so a fleet can poll it
+    /// cheaply. Errors on a non-zero exit or unparseable output.
+    pub fn list_sessions(
+        &self,
+        remote_ghost: &str,
+    ) -> io::Result<Vec<crate::session::SessionInfo>> {
+        let out = self.command(&[remote_ghost, "ls", "--json"]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost ls` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        serde_json::from_slice(&out.stdout).map_err(io::Error::other)
+    }
+
     /// Ensure a detached remote host named `name` exists. A fresh session is
     /// created; a failure here (the name already hosts a live session) is
     /// tolerated — the caller then attaches to whatever is there.
@@ -287,6 +305,29 @@ mod tests {
                 "'ghost'",
                 "'__pipe'",
                 "'work'",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_sessions_runs_ghost_ls_json_over_the_shared_connection() {
+        let r = remote("kov@box");
+        assert_eq!(
+            r.argv(&["ghost", "ls", "--json"]),
+            vec![
+                "ssh",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/ghost/ssh-box.ctl",
+                "-o",
+                "ControlPersist=60",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "kov@box",
+                "'ghost'",
+                "'ls'",
+                "'--json'",
             ]
         );
     }

@@ -78,3 +78,38 @@ fn session_lifecycle_new_ls_kill() {
         "session `{name}` still listed after `ghost kill`"
     );
 }
+
+#[test]
+fn ls_json_emits_a_parseable_listing() {
+    // `ghost ls --json` feeds the remote-fleet initiator, so its output must
+    // parse straight back into the SessionInfo the local lister produces.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "json-test";
+    let _guard = Cleanup { xdg, name };
+
+    // An empty listing is a valid empty JSON array (no session yet).
+    let out = ghost(xdg).args(["ls", "--json"]).output().unwrap();
+    let empty: Vec<ghost_vt::session::SessionInfo> =
+        serde_json::from_slice(&out.stdout).expect("empty --json parses");
+    assert!(empty.is_empty(), "no sessions yet: {empty:?}");
+
+    ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session `{name}` was not listed"
+    );
+
+    let out = ghost(xdg).args(["ls", "--json"]).output().unwrap();
+    let infos: Vec<ghost_vt::session::SessionInfo> =
+        serde_json::from_slice(&out.stdout).expect("--json parses");
+    let s = infos
+        .iter()
+        .find(|s| s.name == name)
+        .expect("the session is in the JSON listing");
+    assert_eq!(s.command, vec!["sleep".to_string(), "600".to_string()]);
+    assert!(s.connection.is_none(), "a local session has no connection");
+}

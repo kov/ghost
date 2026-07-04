@@ -8,3 +8,5 @@ description = "The ghost CLI subcommands (new/ls/attach/kill/rename/export) over
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 ghost-vt = { path = "../ghost-vt" }
+# `ghost ls --json` emits the session listing for the remote-fleet initiator.
+serde_json = "1.0.150"

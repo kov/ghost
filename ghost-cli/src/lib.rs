@@ -98,7 +98,13 @@ enum Command {
         extra: Vec<String>,
     },
     /// List running sessions.
-    Ls,
+    Ls {
+        /// Emit the listing as a JSON array of session objects (one line),
+        /// instead of the human-readable table. Used by the remote-fleet
+        /// initiator to enumerate a host's sessions over the ssh transport.
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach to a session.
     Attach {
         /// Name of the session to attach to.
@@ -274,7 +280,11 @@ fn dispatch(command: Command) {
                 None => ssh_child_fallback(spec, name, detached, seed_from),
             }
         }
-        Command::Ls => match session::list() {
+        Command::Ls { json } => match session::list() {
+            Ok(sessions) if json => match serde_json::to_string(&sessions) {
+                Ok(s) => println!("{s}"),
+                Err(e) => fail(&e.to_string()),
+            },
             Ok(sessions) => {
                 for s in sessions {
                     if s.title.is_empty() {
@@ -503,7 +513,7 @@ mod tests {
         // `global = true` means the flag is accepted anywhere; it just has no
         // effect with a subcommand present (nothing to restore).
         let cli = Cli::try_parse_from(["ghost", "ls", "--fresh"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Ls)));
+        assert!(matches!(cli.command, Some(Command::Ls { json: false })));
         assert!(cli.fresh);
     }
 }

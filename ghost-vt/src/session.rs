@@ -14,7 +14,9 @@ use std::io;
 use std::path::Path;
 
 /// A live session, with the descriptive metadata a GUI uses to identify it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serializable so `ghost ls --json` can emit a listing that the remote-fleet
+/// initiator parses back over the ssh transport.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub name: String,
     pub pid: i32,
@@ -316,6 +318,28 @@ mod tests {
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
         assert_eq!(s.display(), "build box");
+    }
+
+    #[test]
+    fn session_info_round_trips_through_json() {
+        // `ghost ls --json` serializes a listing; the remote-fleet initiator parses
+        // it back, so every field must survive the round trip verbatim.
+        let s = SessionInfo {
+            name: "sess-1".into(),
+            pid: 4321,
+            created_at: Some(1_700_000_000),
+            title: "vim".into(),
+            command: vec!["vim".into(), "src/main.rs".into()],
+            attached: true,
+            bell: false,
+            display_name: "editor".into(),
+            cwd: Some("~/proj".into()),
+            size: Some((120, 40)),
+            connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SessionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]
