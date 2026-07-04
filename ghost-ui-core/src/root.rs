@@ -2478,6 +2478,16 @@ mod tests {
             key(&mut r, Key::Char("s".into()), Mods::CTRL).as_slice(),
             [Cmd::SendInput { .. }]
         ));
+        // On Linux, Alt+S also opens an ssh window (mirroring Alt+N/Alt+T); on
+        // macOS Alt stays Option/Meta, so it is encoded to the child instead.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut r = root();
+            assert_eq!(
+                key(&mut r, Key::Char("s".into()), Mods::ALT),
+                vec![Cmd::NewSshWindow]
+            );
+        }
         // New session is Cmd+T on macOS, Alt+T elsewhere.
         let new_session = if cfg!(target_os = "macos") {
             Mods::SUPER

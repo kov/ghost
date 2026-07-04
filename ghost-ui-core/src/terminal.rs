@@ -80,8 +80,8 @@ pub enum Shortcut {
     Quit,
     /// Open a new window (Cmd+N / Ctrl+Shift+N).
     NewWindow,
-    /// Open a new window connected to a host over SSH (Cmd+S / Ctrl+Shift+S).
-    /// Not bare Ctrl+S — that stays terminal flow control (XOFF).
+    /// Open a new window connected to a host over SSH (Cmd+S / Ctrl+Shift+S /
+    /// Alt+S). Not bare Ctrl+S — that stays terminal flow control (XOFF).
     NewSshWindow,
     /// Close this window (Cmd+W / Ctrl+Shift+W).
     CloseWindow,
@@ -106,16 +106,17 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
         return Some(Shortcut::NewSession);
     }
 
-    // Copy/paste/new-window are also on Alt on Linux (in addition to the Ctrl+Shift
-    // chord below) — a terminal-app convention that keeps Ctrl free for the shell.
-    // Like Alt+T above, these must resolve here rather than be encoded and sent to the
-    // child as Meta+<key>; only C/V/N are taken, so other Alt+key motions (Alt+B/F, …)
-    // still reach the child. macOS keeps Alt = Option/Meta and uses Cmd for these.
+    // Copy/paste/new-window/new-ssh-window are also on Alt on Linux (in addition to
+    // the Ctrl+Shift chord below) — a terminal-app convention that keeps Ctrl free for
+    // the shell. Like Alt+T above, these must resolve here rather than be encoded and
+    // sent to the child as Meta+<key>; only C/V/N/S are taken, so other Alt+key motions
+    // (Alt+B/F, …) still reach the child. macOS keeps Alt = Option/Meta and uses Cmd.
     if !cfg!(target_os = "macos") && mods.alt && !mods.sup && !mods.ctrl {
         match key {
             Key::Char(s) if s.eq_ignore_ascii_case("c") => return Some(Shortcut::Copy),
             Key::Char(s) if s.eq_ignore_ascii_case("v") => return Some(Shortcut::Paste),
             Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
+            Key::Char(s) if s.eq_ignore_ascii_case("s") => return Some(Shortcut::NewSshWindow),
             _ => {}
         }
     }
