@@ -25,13 +25,21 @@ use ghost_ui_core::input::{Key, Mods, NamedKey};
 /// A user event delivered to the winit event loop from outside the normal input
 /// stream. Today the only source is a native menu selection.
 ///
+/// A cross-thread message posted to the event loop via its `EventLoopProxy`.
+///
 /// The `Menu` variant is only ever constructed by the macOS-only [`imp`] target;
-/// off macOS the type still names the event loop's user-event parameter but nothing
-/// posts it, so allow it to go unconstructed there without tripping `-D warnings`.
+/// off macOS nothing posts it, so it's allowed to go unconstructed there without
+/// tripping `-D warnings`. `RemoteSessions` is posted by the remote-fleet poller
+/// thread with a host's latest session listing.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum UserEvent {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Menu(MenuAction),
+    /// A remote host's latest session listing (namespaced ids), for the fleet.
+    RemoteSessions {
+        target: String,
+        infos: Vec<ghost_vt::session::SessionInfo>,
+    },
 }
 
 /// A custom menu item that maps back onto a ghost command. The native window

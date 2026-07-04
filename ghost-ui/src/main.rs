@@ -273,6 +273,83 @@ fn attach_over_ssh(
     Ok(s)
 }
 
+/// A remote host reached over the ssh transport, retained so the fleet can poll
+/// it. `remote` is shared with the poller thread; `remote_ghost` is the negotiated
+/// remote binary path both the poll and any attach reuse.
+#[derive(Clone)]
+struct RemoteHost {
+    remote: Arc<ghost_vt::remote::RemoteSsh>,
+    remote_ghost: String,
+}
+
+/// The unit separator between a target and a real session id inside a fleet id —
+/// a byte that never appears in either, so the composite is unambiguous and never
+/// collides with a local id or another host's.
+const REMOTE_ID_SEP: char = '\u{1f}';
+
+/// How often the poller re-lists each connected remote host.
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Rewrite a remote host's listing for the local fleet: give each session a
+/// fleet-unique id (`<target>␟<real id>`) so it never collides, keep its real id
+/// (or display name) visible as the display name, and tag it with the host's
+/// connection so it renders as a remote tile badged with the host.
+fn namespace_remote_infos(
+    target: &str,
+    infos: Vec<ghost_vt::session::SessionInfo>,
+) -> Vec<ghost_vt::session::SessionInfo> {
+    let spec = ConnectionSpec::parse_target(target);
+    infos
+        .into_iter()
+        .map(|mut i| {
+            let display = if i.display_name.is_empty() {
+                i.name.clone()
+            } else {
+                i.display_name.clone()
+            };
+            i.name = format!("{target}{REMOTE_ID_SEP}{}", i.name);
+            i.display_name = display;
+            i.connection = spec.clone();
+            i
+        })
+        .collect()
+}
+
+/// Spawn the remote-fleet poller: one background thread that periodically lists
+/// every connected host's sessions over its (already-authenticated) ssh
+/// ControlMaster and posts each result to the event loop as
+/// [`UserEvent::RemoteSessions`] (fleet-namespaced). Runs for the app's life,
+/// idling cheaply while no host is connected; listing happens off the event loop
+/// so a slow or blocked ssh never stalls the UI. Ends when the event loop is gone.
+fn spawn_remote_poller(
+    remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            // Snapshot under the lock, then list without holding it (ssh blocks).
+            let hosts: Vec<(String, RemoteHost)> = match remotes.lock() {
+                Ok(g) => g.iter().map(|(t, h)| (t.clone(), h.clone())).collect(),
+                Err(_) => return, // a poisoned lock means the app is tearing down
+            };
+            for (target, host) in hosts {
+                // On error (host unreachable, momentary blip) keep the last known
+                // listing rather than clearing the tiles.
+                if let Ok(infos) = host.remote.list_sessions(&host.remote_ghost) {
+                    let infos = namespace_remote_infos(&target, infos);
+                    if proxy
+                        .send_event(UserEvent::RemoteSessions { target, infos })
+                        .is_err()
+                    {
+                        return; // the event loop closed
+                    }
+                }
+            }
+            std::thread::sleep(REMOTE_POLL_INTERVAL);
+        }
+    });
+}
+
 /// Put a fd (a connect warm-up's PTY) into non-blocking mode so the event loop
 /// can drain it without stalling.
 fn set_nonblocking(fd: impl std::os::fd::AsFd) -> io::Result<()> {
@@ -731,8 +808,8 @@ fn interactive(fresh: bool) {
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    #[cfg(target_os = "macos")]
     let proxy = event_loop.create_proxy();
+    let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
@@ -745,8 +822,10 @@ fn interactive(fresh: bool) {
         next_group_color,
         bench: harness,
         focused: None,
-        #[cfg(target_os = "macos")]
         proxy,
+        remotes,
+        remote_infos: HashMap::new(),
+        remote_index: HashMap::new(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -756,6 +835,9 @@ fn interactive(fresh: bool) {
         last_workspace: workspace,
         workspace_dirty: false,
     };
+    // The remote-fleet poller: lists each connected host's sessions off the event
+    // loop and posts them back as `UserEvent::RemoteSessions`.
+    spawn_remote_poller(app.remotes.clone(), app.proxy.clone());
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -1162,10 +1244,21 @@ struct App {
     /// "the current window" (New Session, Copy, Paste, Zoom, Toggle Fleet). Kept
     /// across focus loss; a stale id is filtered out at use (see `focused_window`).
     focused: Option<WindowId>,
-    /// Proxy for posting native-menu selections into the event loop from AppKit's
-    /// main thread. Held only to hand to [`menu::install`].
-    #[cfg(target_os = "macos")]
+    /// Proxy for posting messages into the event loop from another thread: native
+    /// menu selections (AppKit's main thread, macOS) and the remote-fleet poller's
+    /// listings ([`UserEvent::RemoteSessions`]).
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    /// Remote hosts reached over the ssh transport, keyed by target — retained
+    /// after a successful connect and shared with the poller thread that lists
+    /// their sessions. A host stays until its last window/session is gone.
+    remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>>,
+    /// The latest remote listing per host (fleet-namespaced ids), delivered by the
+    /// poller and merged into every `Cmd::ListSessions` reply.
+    remote_infos: HashMap<String, Vec<ghost_vt::session::SessionInfo>>,
+    /// Maps a namespaced remote fleet id back to `(target, real id)`, so a
+    /// take-over/observe of a remote tile reaches the right host and session.
+    /// Rebuilt whenever `remote_infos` changes.
+    remote_index: HashMap<String, (String, String)>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -1399,9 +1492,17 @@ impl App {
                     };
                     let live = self.bench.is_none();
                     if live {
+                        // Subscriptions and the dead-session sweep are local-only:
+                        // remote sessions have no local socket/descriptor/recording.
                         self.sync_subscriptions(&infos);
                     }
-                    self.dispatch(wid, UiEvent::SessionList(infos.clone()), event_loop);
+                    // Merge the connected hosts' latest listings (poller-fed) so
+                    // the fleet shows local and remote sessions together.
+                    let mut combined = infos.clone();
+                    for r in self.remote_infos.values() {
+                        combined.extend(r.iter().cloned());
+                    }
+                    self.dispatch(wid, UiEvent::SessionList(combined), event_loop);
                     if live {
                         self.sync_dead_sessions(wid, &infos, event_loop);
                     }
@@ -1416,6 +1517,11 @@ impl App {
                             w.sessions.insert(id, s);
                         }
                     }
+                }
+                Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
+                    // A remote tile: metadata-only in v1 (live remote previews
+                    // need a Subscriber over ssh — a follow-up). The tile stays a
+                    // placeholder; the poller keeps its metadata fresh.
                 }
                 Cmd::Observe(id) => {
                     if self.bench.is_none()
@@ -1474,6 +1580,15 @@ impl App {
                 Cmd::Detach(id) => {
                     // Drop this window's client for the session (it keeps running
                     // under its host); other windows' clients are unaffected.
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.sessions.remove(&id);
+                    }
+                }
+                Cmd::Kill(id) if self.remote_index.contains_key(&id) => {
+                    // Killing a remote session from the fleet isn't wired up yet
+                    // (it needs `ghost kill` over the transport); just drop any
+                    // client we hold so the tile detaches locally.
+                    eprintln!("ghost: killing a remote session from the fleet isn't supported yet");
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.sessions.remove(&id);
                     }
@@ -1556,15 +1671,21 @@ impl App {
                     }
                 }
                 Cmd::TakeOver(id) => {
-                    // Switch the window to `id`'s single view. Attach if we don't
-                    // already hold it — stealing the display from another window for
-                    // a confirmed take-over of a session attached elsewhere.
-                    let held = self
-                        .windows
-                        .get(&wid)
-                        .is_some_and(|w| w.sessions.contains_key(&id));
-                    if held || self.attach_into(wid, &id) {
-                        self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
+                    // A remote tile attaches over its host's transport; a local one
+                    // over its unix socket.
+                    if let Some((target, real)) = self.remote_index.get(&id).cloned() {
+                        self.take_over_remote(wid, &id, &target, &real, event_loop);
+                    } else {
+                        // Switch the window to `id`'s single view. Attach if we don't
+                        // already hold it — stealing the display from another window
+                        // for a confirmed take-over of a session attached elsewhere.
+                        let held = self
+                            .windows
+                            .get(&wid)
+                            .is_some_and(|w| w.sessions.contains_key(&id));
+                        if held || self.attach_into(wid, &id) {
+                            self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
+                        }
                     }
                 }
                 Cmd::UploadImage {
@@ -1939,6 +2060,8 @@ impl App {
         let name = setup.name.clone();
         match remote.negotiate() {
             Some(remote_ghost) => {
+                // Retain the host so the fleet polls its other sessions too.
+                self.register_remote(&setup.spec, &remote_ghost);
                 if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
                     return self.connect_fail(wid, format!("could not start the remote host: {e}"));
                 }
@@ -1974,6 +2097,74 @@ impl App {
             w.connect = None;
             w.root.connect_failed(msg);
             w.gfx.window.request_redraw();
+        }
+    }
+
+    /// Retain a connected host so the fleet polls its sessions. Builds a fresh
+    /// `RemoteSsh` from the spec — its control-socket path is deterministic, so it
+    /// shares the ControlMaster the connect already opened (no re-auth).
+    fn register_remote(&mut self, spec: &ConnectionSpec, remote_ghost: &str) {
+        let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) else {
+            return;
+        };
+        if let Ok(mut m) = self.remotes.lock() {
+            m.insert(
+                spec.target(),
+                RemoteHost {
+                    remote: Arc::new(remote),
+                    remote_ghost: remote_ghost.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Rebuild the namespaced-id → `(target, real id)` index from the current
+    /// remote listings, so a take-over of a remote tile reaches the right session.
+    fn rebuild_remote_index(&mut self) {
+        self.remote_index.clear();
+        for (target, infos) in &self.remote_infos {
+            let prefix = format!("{target}{REMOTE_ID_SEP}");
+            for i in infos {
+                if let Some(real) = i.name.strip_prefix(&prefix) {
+                    self.remote_index
+                        .insert(i.name.clone(), (target.clone(), real.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Take over a remote session (a fleet tile on a connected host) into window
+    /// `wid`: attach it over the host's transport — reusing the open master — and
+    /// switch the window to its single view. `id` is the fleet-namespaced id;
+    /// `real` is the session's id on the host.
+    fn take_over_remote(
+        &mut self,
+        wid: WindowId,
+        id: &str,
+        target: &str,
+        real: &str,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let held = self
+            .windows
+            .get(&wid)
+            .is_some_and(|w| w.sessions.contains_key(id));
+        if held {
+            self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
+            return;
+        }
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned());
+        let Some(host) = host else {
+            eprintln!("ghost: no live connection to {target} to open its session");
+            return;
+        };
+        let cmd = host.remote.pipe_command(&host.remote_ghost, real);
+        if self.attach_ssh_into(wid, id, cmd) {
+            self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
         }
     }
 
@@ -2400,7 +2591,18 @@ impl ApplicationHandler<UserEvent> for App {
     /// turned back into the effect a keystroke would have produced, so the pure
     /// core stays the single source of truth (see [`menu::menu_intent`]).
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Menu(action) = event;
+        let action = match event {
+            UserEvent::Menu(action) => action,
+            // The poller thread delivered a remote host's latest listing: stash it
+            // and hint a re-enumeration so the fleet merges it in.
+            UserEvent::RemoteSessions { target, infos } => {
+                self.remote_infos.insert(target, infos);
+                self.rebuild_remote_index();
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
             MenuIntent::NewWindow => self.open_launch_window(event_loop),
@@ -2912,9 +3114,9 @@ impl ApplicationHandler<UserEvent> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupChoice, auth_error_message, choose_alpha_mode, choose_surface_format,
-        home_launch_dir, new_window_choice, password_prompt, respawn_opts, restore_plan,
-        should_restore, startup_choice,
+        REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode, choose_surface_format,
+        home_launch_dir, namespace_remote_infos, new_window_choice, password_prompt, respawn_opts,
+        restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::session::SessionInfo;
@@ -2969,6 +3171,39 @@ mod tests {
         );
         // Nothing at all: a generic note, never an empty string.
         assert_eq!(auth_error_message(""), "ssh connection failed");
+    }
+
+    #[test]
+    fn namespacing_a_remote_listing_makes_ids_unique_and_tags_the_host() {
+        let base = SessionInfo {
+            name: "work".into(),
+            pid: 7,
+            created_at: None,
+            title: String::new(),
+            command: vec!["vim".into()],
+            attached: false,
+            bell: false,
+            display_name: String::new(),
+            cwd: None,
+            size: None,
+            connection: None, // the remote host reports it as local-to-itself
+        };
+        let renamed = SessionInfo {
+            name: "raw-id".into(),
+            display_name: "editor".into(),
+            ..base.clone()
+        };
+        let out = namespace_remote_infos("kov@box", vec![base, renamed]);
+
+        // The id is prefixed with the target (so it can't collide with a local
+        // session or another host), and the connection is set to this host.
+        assert_eq!(out[0].name, format!("kov@box{REMOTE_ID_SEP}work"));
+        assert_eq!(out[0].connection.as_ref().unwrap().target(), "kov@box");
+        // A session with no display name shows its real id; a renamed one keeps
+        // its label — never the namespaced id.
+        assert_eq!(out[0].display_name, "work");
+        assert_eq!(out[1].name, format!("kov@box{REMOTE_ID_SEP}raw-id"));
+        assert_eq!(out[1].display_name, "editor");
     }
 
     fn group(id: &str, members: &[&str]) -> ghost_ui_core::Group {
