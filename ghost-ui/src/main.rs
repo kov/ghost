@@ -3778,6 +3778,104 @@ mod tests {
         });
     }
 
+    /// The built `ghost` binary sitting next to this test binary
+    /// (`target/<profile>/ghost`, sibling of `deps/ghost-<hash>`), or `None` if it
+    /// isn't there — `cargo test` builds it, so it normally is.
+    fn ghost_binary() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let bin = exe.parent()?.parent()?.join("ghost");
+        bin.exists().then_some(bin)
+    }
+
+    /// A fake `ssh` in a fresh dir: strips ssh options + the destination, then runs
+    /// the remaining (quoted) remote words locally through a shell — space-joining
+    /// like real ssh. Prepended to `PATH`, it makes `RemoteSsh`'s `ssh …` invocations
+    /// run against a real local host with no network. Mirrors `tests/ssh_transport.rs`.
+    fn write_ssh_shim() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in\n\
+             \x20   -p|-i|-J|-o) shift 2 ;;\n\
+             \x20   -*) shift ;;\n\
+             \x20   *) shift; break ;;\n\
+             \x20 esac\n\
+             done\n\
+             [ $# -eq 0 ] && exec sh\n\
+             exec sh -c \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn spawn_remote_session_opens_a_real_session_on_the_host_over_the_shim() {
+        // The full inheritance-over-remote flow, end to end and offscreen: the real
+        // shell creates a session ON a host over the (shimmed) transport and drives
+        // it as this-window under the composite id — a real `ghost new -d` + attach
+        // through `ghost __pipe`, no GPU and no network.
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            // Register the host with the real ghost binary as its remote ghost, and a
+            // fleet window that is an ssh group for it.
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .root
+                .set_group_connection(Some(spec.clone()));
+
+            let name = "hr-attach-1";
+            app.spawn_remote_session(wid, "kov@box", name, &fe);
+
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let held = app.windows[&wid].sessions.contains_key(&composite);
+
+            // Tear the real host down before asserting, so a failure never leaks it.
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(
+                held,
+                "the window drives the new remote session over the transport"
+            );
+            assert_eq!(
+                app.remote_index.get(&composite),
+                Some(&("kov@box".to_string(), name.to_string())),
+                "the driven session is indexed back to its host"
+            );
+        });
+    }
+
     #[test]
     fn a_new_session_routes_onto_a_connected_remote_host_only() {
         let spec = ConnectionSpec::parse_target("kov@box").expect("valid target");
