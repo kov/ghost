@@ -48,6 +48,11 @@ fn ghost(xdg: &Path, shim: &Path) -> Command {
     c.env("PATH", format!("{}:{path}", shim.display()));
     // Per-workspace invocation counter file, so the shim can number its runs.
     c.env("SSH_SHIM_COUNT", xdg.join("shim-count"));
+    // Force the local ssh-*child* realization these tests are about: point the
+    // transport at a remote ghost that isn't there, so `ghost ssh` negotiates
+    // once (the shim rejects the `__probe`, uncounted) and falls back — no
+    // staging, no extra shim invocations to skew the run counter.
+    c.env("GHOST_REMOTE_GHOST", "/nonexistent/ghost");
     c
 }
 

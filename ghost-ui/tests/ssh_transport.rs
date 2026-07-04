@@ -228,14 +228,67 @@ fn ghost_ssh_uses_the_transport_when_the_remote_has_ghost() {
 }
 
 #[test]
-fn ghost_ssh_falls_back_to_the_ssh_child_when_the_remote_lacks_ghost() {
+fn ghost_ssh_stages_the_binary_when_the_remote_lacks_ghost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let shim = shim_ssh();
+
+    // No ghost on PATH (restricted to system dirs), none staged, no override —
+    // so `ghost ssh` copies our own binary to the (sandboxed) remote home and
+    // then uses the transport. arch matches: it's the same machine.
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` (staging) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+
+    // The binary landed, version-stamped, under the remote home's cache…
+    let bin_dir = home.path().join(".cache/ghost/bin");
+    let staged = std::fs::read_dir(&bin_dir)
+        .ok()
+        .and_then(|d| {
+            d.filter_map(Result::ok)
+                .find(|e| e.file_name().to_string_lossy().starts_with("ghost-"))
+        })
+        .expect("a ghost binary was staged under the remote cache");
+    assert!(staged.path().is_file());
+
+    // …and a real remote host is running — a plain host (no recorded
+    // connection), the tell that the transport was used, not the ssh child.
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("ssh-example")),
+        "the remote host was never created"
+    );
+    assert!(
+        descriptor(xdg, "ssh-example").connection.is_none(),
+        "a transport session is a plain host, not an ssh child"
+    );
+}
+
+#[test]
+fn ghost_ssh_falls_back_to_the_ssh_child_when_no_transport_is_possible() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
     let shim = shim_ssh();
 
-    // The probe runs a binary that isn't there, so negotiation fails and
-    // `ghost ssh` falls back to the local ssh child — which records the
-    // connection spec (the ssh child's tell).
+    // An explicit remote-ghost override that doesn't answer the probe: negotiation
+    // gives up (the override skips staging), so `ghost ssh` falls back to the
+    // local ssh child — which records the connection spec (the ssh child's tell).
     let out = ghost_ssh(
         xdg,
         shim.path(),
