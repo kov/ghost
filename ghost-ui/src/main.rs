@@ -299,6 +299,10 @@ fn remote_fleet_id(target: &str, real: &str) -> String {
 /// How often the poller re-lists each connected remote host.
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Consecutive poll failures before a remote host's tiles are cleared (a grace
+/// period so a momentary network blip doesn't flicker the fleet).
+const REMOTE_POLL_MAX_FAILURES: u32 = 3;
+
 /// Rewrite a remote host's listing for the local fleet: give each session a
 /// fleet-unique id (`<target>␟<real id>`) so it never collides, keep its real id
 /// (or display name) visible as the display name, and tag it with the host's
@@ -335,23 +339,37 @@ fn spawn_remote_poller(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 ) {
     std::thread::spawn(move || {
+        // Consecutive poll failures per host, so a host that goes unreachable has
+        // its stale tiles cleared (after a grace period) rather than lingering.
+        let mut failures: HashMap<String, u32> = HashMap::new();
         loop {
             // Snapshot under the lock, then list without holding it (ssh blocks).
             let hosts: Vec<(String, RemoteHost)> = match remotes.lock() {
                 Ok(g) => g.iter().map(|(t, h)| (t.clone(), h.clone())).collect(),
                 Err(_) => return, // a poisoned lock means the app is tearing down
             };
+            // Forget failure counts for hosts no longer registered.
+            failures.retain(|t, _| hosts.iter().any(|(ht, _)| ht == t));
             for (target, host) in hosts {
-                // On error (host unreachable, momentary blip) keep the last known
-                // listing rather than clearing the tiles.
-                if let Ok(infos) = host.remote.list_sessions(&host.remote_ghost) {
-                    let infos = namespace_remote_infos(&target, infos);
-                    if proxy
+                let event = match host.remote.list_sessions(&host.remote_ghost) {
+                    Ok(infos) => {
+                        failures.insert(target.clone(), 0);
+                        Some(namespace_remote_infos(&target, infos))
+                    }
+                    // A momentary blip keeps the last listing; only after a grace
+                    // period of failures do we clear the tiles (empty listing).
+                    Err(_) => {
+                        let n = failures.entry(target.clone()).or_insert(0);
+                        *n += 1;
+                        (*n >= REMOTE_POLL_MAX_FAILURES).then(Vec::new)
+                    }
+                };
+                if let Some(infos) = event
+                    && proxy
                         .send_event(UserEvent::RemoteSessions { target, infos })
                         .is_err()
-                    {
-                        return; // the event loop closed
-                    }
+                {
+                    return; // the event loop closed
                 }
             }
             std::thread::sleep(REMOTE_POLL_INTERVAL);
@@ -1571,9 +1589,35 @@ impl App {
                     }
                 }
                 Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
-                    // A remote tile: metadata-only in v1 (live remote previews
-                    // need a Subscriber over ssh — a follow-up). The tile stays a
-                    // placeholder; the poller keeps its metadata fresh.
+                    // Live remote preview: observe the session over its host's
+                    // transport, feeding the tile exactly like a local observer.
+                    if self.bench.is_none()
+                        && self
+                            .windows
+                            .get(&wid)
+                            .is_some_and(|w| !w.observers.contains_key(&id))
+                        && let Some((target, real)) = self.remote_index.get(&id).cloned()
+                    {
+                        match self.observe_remote(&target, &real) {
+                            Some(sub) => {
+                                if let Some(w) = self.windows.get_mut(&wid) {
+                                    w.observers.insert(id, sub);
+                                }
+                            }
+                            // No live connection (host gone) or a failed channel:
+                            // report the mirror dead so the tile reverts to a
+                            // placeholder and a later reconcile retries.
+                            None => self.dispatch(
+                                wid,
+                                UiEvent::SessionData {
+                                    name: id,
+                                    bytes: Vec::new(),
+                                    ended: true,
+                                },
+                                event_loop,
+                            ),
+                        }
+                    }
                 }
                 Cmd::Observe(id) => {
                     if self.bench.is_none()
@@ -1637,10 +1681,11 @@ impl App {
                     }
                 }
                 Cmd::Kill(id) if self.remote_index.contains_key(&id) => {
-                    // Killing a remote session from the fleet isn't wired up yet
-                    // (it needs `ghost kill` over the transport); just drop any
-                    // client we hold so the tile detaches locally.
-                    eprintln!("ghost: killing a remote session from the fleet isn't supported yet");
+                    // Kill the remote session over its host's transport (off-loop),
+                    // then drop any client we hold; the poller drops the tile.
+                    if let Some((target, real)) = self.remote_index.get(&id).cloned() {
+                        self.spawn_remote_kill(&target, &real);
+                    }
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.sessions.remove(&id);
                     }
@@ -1666,15 +1711,15 @@ impl App {
                     // the tile. A failed spawn just leaves the tile dead.
                     self.respawn_dead(wid, &id);
                 }
-                Cmd::Rename {
-                    session: target,
-                    name,
-                } => {
-                    // A control connection rename — works whether or not this
-                    // window holds the session. On refusal (e.g. a host too old
-                    // for label renames) the fleet's optimistic label reverts on
-                    // the next reconcile; log the reason it didn't stick.
-                    if let Err(e) = ghost_vt::client::rename(&target, &name) {
+                Cmd::Rename { session, name } => {
+                    // A remote session renames over its host's transport (off-loop);
+                    // a local one over its control connection. Either works whether
+                    // or not this window holds it. On refusal (e.g. a host too old
+                    // for label renames) the fleet's optimistic label reverts on the
+                    // next reconcile; log the reason it didn't stick.
+                    if let Some((target, real)) = self.remote_index.get(&session).cloned() {
+                        self.spawn_remote_rename(&target, &real, &name);
+                    } else if let Err(e) = ghost_vt::client::rename(&session, &name) {
                         eprintln!("ghost: rename failed: {e}");
                     }
                 }
@@ -2241,6 +2286,58 @@ impl App {
         }
     }
 
+    /// Open a read-only observation of remote session `real` on `target` over its
+    /// host's transport (a live fleet preview). `None` if the host isn't connected
+    /// or the observe channel couldn't open.
+    fn observe_remote(&self, target: &str, real: &str) -> Option<Subscriber> {
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned())?;
+        let cmd = host.remote.pipe_command(&host.remote_ghost, real);
+        Subscriber::observe_ssh(cmd).ok()
+    }
+
+    /// Kill remote session `real` on `target` over its host's transport, off the
+    /// event loop (one ssh command over the open master). The poller reflects the
+    /// removal within a poll.
+    fn spawn_remote_kill(&self, target: &str, real: &str) {
+        let Some(host) = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned())
+        else {
+            return;
+        };
+        let real = real.to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = host.remote.kill_session(&host.remote_ghost, &real) {
+                eprintln!("ghost: remote kill failed: {e}");
+            }
+        });
+    }
+
+    /// Rename remote session `real` on `target` to `new` over its host's transport,
+    /// off the event loop. The poller reflects the new label within a poll.
+    fn spawn_remote_rename(&self, target: &str, real: &str, new: &str) {
+        let Some(host) = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned())
+        else {
+            return;
+        };
+        let (real, new) = (real.to_string(), new.to_string());
+        std::thread::spawn(move || {
+            if let Err(e) = host.remote.rename_session(&host.remote_ghost, &real, &new) {
+                eprintln!("ghost: remote rename failed: {e}");
+            }
+        });
+    }
+
     /// Handle one interactive resize step for window `wid`. An isolated resize
     /// (maximize / snap / un-maximize / a drag's first grab) is applied immediately
     /// and crisply; a rapid drag stream captures the crisp scene once, then
@@ -2421,6 +2518,40 @@ impl App {
         self.windows.remove(&wid);
         // A closed window drops out of the restorable set.
         self.workspace_dirty = true;
+        // It may have been the last window referencing a remote host; stop polling
+        // (and drop the tiles for) any host nothing points at now.
+        self.prune_remotes();
+    }
+
+    /// The set of remote targets still referenced by a live window — either the
+    /// window is an ssh group for it, or it drives a session on it.
+    fn in_use_targets(&self) -> HashSet<String> {
+        let mut targets = HashSet::new();
+        for w in self.windows.values() {
+            if let Some(spec) = w.root.group_connection() {
+                targets.insert(spec.target());
+            }
+            // A driven remote session's id is `<target>␟<real>`; read the target
+            // straight off it (not via the index, which a poll failure can clear).
+            for name in w.sessions.keys() {
+                if let Some((target, _)) = name.split_once(REMOTE_ID_SEP) {
+                    targets.insert(target.to_string());
+                }
+            }
+        }
+        targets
+    }
+
+    /// Drop remote hosts (and their cached listings) that no live window
+    /// references any more, so the poller stops listing them and their fleet tiles
+    /// disappear.
+    fn prune_remotes(&mut self) {
+        let in_use = self.in_use_targets();
+        if let Ok(mut m) = self.remotes.lock() {
+            m.retain(|t, _| in_use.contains(t));
+        }
+        self.remote_infos.retain(|t, _| in_use.contains(t));
+        self.rebuild_remote_index();
     }
 
     /// The single quit path: record the open windows, then leave the event loop.

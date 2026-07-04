@@ -175,6 +175,15 @@ impl Subscriber {
         Self::from_client(Client::connect_path(sock)?, ClientMsg::Observe)
     }
 
+    /// Observe a *remote* session over the SSH transport: `cmd` is the
+    /// `ssh … -- ghost __pipe <name>` tunnel to the remote host's control socket.
+    /// Same read-only mirror as [`observe`](Subscriber::observe), for live remote
+    /// fleet previews; the remote ghost is version-matched, so it speaks our own
+    /// protocol level and supports observation.
+    pub fn observe_ssh(cmd: std::process::Command) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect_ssh(cmd)?, ClientMsg::Observe)
+    }
+
     fn from_client(mut client: Client, verb: ClientMsg) -> io::Result<Subscriber> {
         let needed = match verb {
             ClientMsg::Observe => crate::protocol::PROTO_OBSERVE,

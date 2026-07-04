@@ -13,9 +13,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ghost_vt::client::Session;
+use ghost_vt::client::{Session, Subscriber};
 use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::descriptor::Descriptor;
+use ghost_vt::protocol::SessionEvent;
 use ghost_vt::screen::Screen;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
@@ -164,6 +165,63 @@ fn attaching_over_the_ssh_transport_shows_the_remote_hosts_screen() {
         }),
         "input never round-tripped over the ssh transport; saw:\n{}",
         screen.text().join("\n")
+    );
+}
+
+#[test]
+fn observing_over_the_ssh_transport_mirrors_the_remote_screen() {
+    // R2 live remote previews: a read-only observe over the transport delivers the
+    // remote session's snapshot + grid + current screen, same as a local observe.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let shim = shim_ssh();
+    let ssh = shim.path().join("ssh");
+
+    ghost(xdg)
+        .args([
+            "new",
+            "-d",
+            "watched",
+            "--",
+            "sh",
+            "-c",
+            "printf OBSERVED-REMOTE; sleep 60",
+        ])
+        .output()
+        .unwrap();
+    let _guard = KillOnDrop {
+        xdg,
+        name: "watched",
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("watched")),
+        "the host session never listed"
+    );
+
+    let spec = ConnectionSpec::parse_target("dev@example").unwrap();
+    let cmd = transport_cmd(xdg, &ssh, &spec, "watched");
+    let mut obs = Subscriber::observe_ssh(cmd).expect("observe over ssh");
+
+    let mut snapshot = None;
+    let mut screen: Option<Screen> = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let p = obs.pump().unwrap();
+            snapshot = snapshot.take().or(p.snapshot);
+            for e in p.events {
+                if let SessionEvent::Resized { cols, rows } = e {
+                    screen = Some(Screen::new(cols, rows, 0));
+                }
+            }
+            if let Some(s) = screen.as_mut() {
+                s.feed(&p.output);
+            }
+            snapshot.is_some()
+                && screen
+                    .as_ref()
+                    .is_some_and(|s| s.text().join("\n").contains("OBSERVED-REMOTE"))
+        }),
+        "the remote screen never arrived over the observe tunnel"
     );
 }
 

@@ -308,6 +308,32 @@ impl RemoteSsh {
         serde_json::from_slice(&out.stdout).map_err(io::Error::other)
     }
 
+    /// Kill a remote session by id over the shared connection (`<remote_ghost>
+    /// kill <name>`). For the fleet's kill action on a remote tile.
+    pub fn kill_session(&self, remote_ghost: &str, name: &str) -> io::Result<()> {
+        let out = self.command(&[remote_ghost, "kill", name]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost kill` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rename a remote session over the shared connection (`<remote_ghost> rename
+    /// <old> <new>`). For the fleet's rename action on a remote tile.
+    pub fn rename_session(&self, remote_ghost: &str, old: &str, new: &str) -> io::Result<()> {
+        let out = self.command(&[remote_ghost, "rename", old, new]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost rename` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Ensure a detached remote host named `name` exists. A fresh session is
     /// created; a failure here (the name already hosts a live session) is
     /// tolerated — the caller then attaches to whatever is there.
@@ -394,6 +420,21 @@ mod tests {
                 "'ls'",
                 "'--json'",
             ]
+        );
+    }
+
+    #[test]
+    fn admin_commands_quote_the_remote_words() {
+        // Kill/rename go over the shared connection with each remote word single-
+        // quoted, like every other invocation (ssh reparses them remotely).
+        let r = remote("kov@box");
+        assert_eq!(
+            &r.argv(&["ghost", "kill", "work"])[9..],
+            &["kov@box", "'ghost'", "'kill'", "'work'"]
+        );
+        assert_eq!(
+            &r.argv(&["ghost", "rename", "old", "new"])[9..],
+            &["kov@box", "'ghost'", "'rename'", "'old'", "'new'"]
         );
     }
 
