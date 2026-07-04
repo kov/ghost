@@ -329,6 +329,7 @@ mod tests {
                 title: String::new(),
                 display_name: "build box".into(),
                 size: (120, 60),
+                connection: None,
             },
         )
         .unwrap();

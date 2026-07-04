@@ -363,6 +363,7 @@ fn capture(path: PathBuf) {
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: None,
         start_on_attach: true,
+        connection: None,
     })
     .expect("spawn session");
 
@@ -446,6 +447,7 @@ fn spawn_session(name: &str, command: Vec<String>) {
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
         start_on_attach: true,
+        connection: None,
     })
     .expect("spawn session");
 }
@@ -587,6 +589,9 @@ fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathB
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
         start_on_attach: true,
+        // Phase 1: a relaunch stays local. Phase 3 copies `d.connection` here so
+        // a dead ssh session reconnects instead of dropping to a local shell.
+        connection: None,
     }
 }
 

@@ -24,6 +24,12 @@ pub struct Descriptor {
     /// The user-chosen display name when last written, empty if never renamed.
     #[serde(default)]
     pub display_name: String,
+    /// This session's remote connection, if it is an ssh/mosh session — the
+    /// authoritative record used to *reconnect* it on relaunch (see
+    /// [`crate::connection`]). `None` for an ordinary local session; defaulted
+    /// so descriptors written before connections existed still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<crate::connection::ConnectionSpec>,
 }
 
 /// Where `name`'s descriptor lives.
@@ -110,6 +116,7 @@ mod tests {
             cwd: Some(tmp.path().to_path_buf()),
             created_at: 1_700_000_000_000,
             display_name: "build-box".into(),
+            connection: None,
         };
         let json = serde_json::to_vec(&d).unwrap();
         let back: Descriptor = serde_json::from_slice(&json).unwrap();
@@ -121,5 +128,23 @@ mod tests {
         let legacy = br#"{"command":["sh"],"cwd":null,"created_at":1}"#;
         let d: Descriptor = serde_json::from_slice(legacy).expect("legacy parses");
         assert_eq!(d.display_name, "");
+        assert_eq!(d.connection, None, "a legacy descriptor has no connection");
+    }
+
+    #[test]
+    fn a_connection_carrying_descriptor_round_trips() {
+        // An ssh session's descriptor keeps an empty command (the spec drives
+        // the child) and the spec itself, so relaunch can reconnect.
+        let d = Descriptor {
+            command: Vec::new(),
+            cwd: None,
+            created_at: 1,
+            display_name: String::new(),
+            connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
+        };
+        let json = serde_json::to_vec(&d).unwrap();
+        let back: Descriptor = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.connection.unwrap().target(), "kov@box");
     }
 }

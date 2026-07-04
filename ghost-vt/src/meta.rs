@@ -34,6 +34,12 @@ pub struct Meta {
     /// default) means unrecorded.
     #[serde(default)]
     pub size: (u16, u16),
+    /// This session's remote connection, if it is an ssh/mosh session (see
+    /// [`crate::connection`]). Carried here so the spawn copies it into the
+    /// durable descriptor and discovery (`session::list`) can surface it; `None`
+    /// for a local session, defaulted so pre-connection metadata still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<crate::connection::ConnectionSpec>,
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -64,6 +70,7 @@ mod tests {
             title: "vim · main.rs".into(),
             display_name: "build box".into(),
             size: (120, 60),
+            connection: None,
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));

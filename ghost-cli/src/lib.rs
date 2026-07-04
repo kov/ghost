@@ -153,6 +153,7 @@ fn dispatch(command: Command) {
                 // Attached sessions (the default, and `--defer`) start their
                 // child on the attach handshake; a plain `-d` starts it now.
                 start_on_attach: !detached || defer,
+                connection: None,
             };
             // `spawn` forks the session off and returns here in the launching
             // process. By default we then attach to it (the common case: start a

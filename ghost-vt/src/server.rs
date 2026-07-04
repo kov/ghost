@@ -32,8 +32,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct SpawnOpts {
     /// Session name (used for the socket and pidfile).
     pub name: String,
-    /// Command and arguments to run; empty means `$SHELL` (then `/bin/sh`).
+    /// Command and arguments to run; empty means `$SHELL` (then `/bin/sh`),
+    /// unless `connection` is set (which derives the child argv instead).
     pub command: Vec<String>,
+    /// A remote connection this session realizes: when set, the child is the
+    /// launcher (`ssh`/`mosh`) derived from the spec, and `command` must be
+    /// empty (the two are mutually exclusive; a spec + non-empty command is
+    /// rejected at spawn). `None` for an ordinary local session. See
+    /// [`crate::connection`].
+    #[serde(default)]
+    pub connection: Option<crate::connection::ConnectionSpec>,
     /// Initial terminal size as `(cols, rows)`.
     pub size: (u16, u16),
     /// Where to start the child, overriding the spawner's own current
@@ -385,6 +393,12 @@ fn host_main(
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
 
+    // The child argv, resolved once: a connection spec derives the launcher
+    // (`ssh …`), otherwise the literal command. Rejects a spec + command clash
+    // before anything is written. `meta.command` keeps the *literal* command
+    // (empty for a connection session — the spec is the authoritative record).
+    let child_command = effective_command(&opts.command, opts.connection.as_ref())?;
+
     // Descriptive metadata for discovery (the GUI sidebar). Created time and
     // command are fixed; the title is refreshed below whenever it changes.
     // Built before the child can spawn: the spawn also writes the durable
@@ -401,6 +415,7 @@ fn host_main(
         title: String::new(),
         display_name: String::new(),
         size: opts.size,
+        connection: opts.connection.clone(),
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
@@ -415,7 +430,7 @@ fn host_main(
     let mut desc_cwd: Option<std::path::PathBuf> = None;
     if !opts.start_on_attach {
         child = Some(spawn_child(
-            &opts.command,
+            &child_command,
             launch_dir,
             pts.take().expect("slave present before first spawn"),
         )?);
@@ -870,7 +885,7 @@ fn host_main(
         // them. Eager sessions already have a child, so this never fires.
         if child.is_none() && client.as_ref().is_some_and(|c| c.resynced) {
             child = Some(spawn_child(
-                &opts.command,
+                &child_command,
                 launch_dir,
                 pts.take()
                     .expect("slave present until the deferred child spawns"),
@@ -1288,6 +1303,7 @@ fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path:
             cwd,
             created_at: meta.created_at,
             display_name: meta.display_name.clone(),
+            connection: meta.connection.clone(),
         },
     );
 }
@@ -1315,6 +1331,24 @@ fn split_command(command: &[String]) -> (String, Vec<String>) {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             (shell, Vec::new())
         }
+    }
+}
+
+/// The child argv for a session: a connection spec (if any) wins and derives
+/// its own launcher argv; otherwise the literal command (empty is left as-is,
+/// resolved to `$SHELL` by [`split_command`] at spawn). A spec paired with a
+/// non-empty command is contradictory and rejected.
+fn effective_command(
+    command: &[String],
+    connection: Option<&crate::connection::ConnectionSpec>,
+) -> io::Result<Vec<String>> {
+    match connection {
+        Some(_) if !command.is_empty() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a session with a connection cannot also set a command",
+        )),
+        Some(spec) => Ok(spec.argv()),
+        None => Ok(command.to_vec()),
     }
 }
 
@@ -1368,7 +1402,25 @@ unsafe fn daemonize_and_exec(exe: &CStr, argv: &[*const libc::c_char]) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionSpec;
     use crate::record::DEFAULT_MAX_RECORDING_BYTES;
+
+    #[test]
+    fn effective_command_resolves_spec_command_and_shell() {
+        // No connection, empty command: left empty for `split_command` → $SHELL.
+        assert_eq!(effective_command(&[], None).unwrap(), Vec::<String>::new());
+        // No connection, explicit command: used verbatim.
+        let cmd = vec!["vim".to_string(), "main.rs".to_string()];
+        assert_eq!(effective_command(&cmd, None).unwrap(), cmd);
+        // A connection derives the launcher argv and beats an empty command.
+        let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+        assert_eq!(
+            effective_command(&[], Some(&spec)).unwrap(),
+            vec!["ssh", "kov@box"]
+        );
+        // A connection *and* a command is contradictory → rejected.
+        assert!(effective_command(&cmd, Some(&spec)).is_err());
+    }
 
     #[test]
     fn checkpoint_interval_scales_with_cap_and_clamps() {
