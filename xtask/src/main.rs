@@ -4,6 +4,11 @@
 //!   `target/release/ghost.app`.
 //! * `cargo xtask install` — bundle, then copy the `.app` into `/Applications`.
 //! * `cargo xtask icon`    — regenerate `assets/ghost.icns` from the SVG.
+//! * `cargo xtask prebuilt [<triple>…]` — cross-build the headless `ghost-host`
+//!   for each target and drop it in the prebuilt dir as `ghost-<os>-<arch>`, where
+//!   staging's resolver finds it. No triples ⇒ this host OS's two arches. Set
+//!   `GHOST_ZIGBUILD=1` to build through `cargo zigbuild` (bundles its own
+//!   sysroots, so cross-OS builds need no system cross-toolchain).
 //!
 //! The bundle is **relocatable and launcher-free**: the `ghost` binary has no
 //! non-system dylib dependencies, falls through to the GUI when launched with no
@@ -70,9 +75,12 @@ fn run() -> R<()> {
             let icns = generate_icon()?;
             println!("generated {}", icns.display());
         }
+        Some("prebuilt") => {
+            build_prebuilts(&std::env::args().skip(2).collect::<Vec<_>>())?;
+        }
         other => {
             return Err(format!(
-                "unknown command {:?}; use `bundle`, `install` or `icon`",
+                "unknown command {:?}; use `bundle`, `install`, `icon` or `prebuilt`",
                 other.unwrap_or("")
             )
             .into());
@@ -246,6 +254,145 @@ fn build_release(ws: &Path) -> R<PathBuf> {
     Ok(bin)
 }
 
+// --- prebuilt cross-builds (headless `ghost-host` for staging) --------------
+
+/// Cross-build the headless `ghost-host` for each `triple` and copy it into the
+/// prebuilt dir as `ghost-<os>-<arch>`, the exact name staging's resolver looks
+/// for. No triples ⇒ this host OS's two arches. Builds continue past a failing
+/// target (a missing toolchain) and the failures are reported at the end.
+fn build_prebuilts(triples: &[String]) -> R<()> {
+    let ws = workspace_dir();
+    let defaults;
+    let triples = if triples.is_empty() {
+        defaults = default_triples();
+        &defaults[..]
+    } else {
+        triples
+    };
+    // Validate every triple up front, so a typo fails before any long build.
+    for t in triples {
+        if triple_to_name(t).is_none() {
+            return Err(format!("unsupported target triple: {t}").into());
+        }
+    }
+
+    let out = prebuilt_dir();
+    fs::create_dir_all(&out)?;
+    // `cargo zigbuild` bundles sysroots for cross-OS; plain `cargo build` uses the
+    // system toolchain (fine for a same-OS arch flip when it's installed).
+    let subcommand = if std::env::var_os("GHOST_ZIGBUILD").is_some() {
+        "zigbuild"
+    } else {
+        "build"
+    };
+
+    let host = host_triple();
+    let mut failed = Vec::new();
+    for triple in triples {
+        let name = triple_to_name(triple).expect("validated above");
+        println!("building ghost-host for {triple}…");
+        // Building for the host's own triple: drop `--target`. A plain build uses
+        // the native `cc`, whereas an explicit host target makes cc-rs reach for a
+        // triple-prefixed cross compiler (`x86_64-linux-gnu-gcc`) that may be
+        // absent or broken — so the "cross-build to your own arch" would fail where
+        // a normal build succeeds.
+        let native = host.as_deref() == Some(triple.as_str());
+        let mut cmd = Command::new(cargo());
+        cmd.current_dir(&ws)
+            .args([subcommand, "--release", "-p", "ghost-host"]);
+        if !native {
+            cmd.args(["--target", triple]);
+        }
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!("  ✗ {triple}: build failed");
+            failed.push(triple.clone());
+            continue;
+        }
+        let bin = if native {
+            ws.join("target/release/ghost-host")
+        } else {
+            ws.join(format!("target/{triple}/release/ghost-host"))
+        };
+        let dest = out.join(&name);
+        fs::copy(&bin, &dest)?;
+        println!("  ✓ {triple} → {}", dest.display());
+    }
+
+    println!(
+        "\nprebuilts in {} ({} of {} target(s) built)",
+        out.display(),
+        triples.len() - failed.len(),
+        triples.len()
+    );
+    if !failed.is_empty() {
+        return Err(format!(
+            "could not build {} — install the target's toolchain, or set GHOST_ZIGBUILD=1",
+            failed.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The Rust host target triple (`rustc -vV`'s `host:` line), so a request for the
+/// host's own arch can build without `--target`. `None` if `rustc` can't be run.
+fn host_triple() -> Option<String> {
+    let out = Command::new("rustc").arg("-vV").output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: ").map(|s| s.trim().to_string()))
+}
+
+/// This host OS's two arches — the same-OS arch flip that a normal toolchain
+/// cross-builds (both apple arches on macOS, both linux arches on Linux). Cross-OS
+/// targets must be named explicitly (and generally need `GHOST_ZIGBUILD=1`).
+fn default_triples() -> Vec<String> {
+    match std::env::consts::OS {
+        "macos" => vec!["aarch64-apple-darwin".into(), "x86_64-apple-darwin".into()],
+        _ => vec![
+            "x86_64-unknown-linux-gnu".into(),
+            "aarch64-unknown-linux-gnu".into(),
+        ],
+    }
+}
+
+/// Map a Rust target triple to the `ghost-<os>-<arch>` prebuilt filename staging's
+/// resolver looks for, or `None` for a target ghost doesn't support.
+fn triple_to_name(triple: &str) -> Option<String> {
+    let arch = match triple.split('-').next()? {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    let os = if triple.contains("linux") {
+        "linux"
+    } else if triple.contains("darwin") {
+        "macos"
+    } else {
+        return None;
+    };
+    Some(format!("ghost-{os}-{arch}"))
+}
+
+/// Where prebuilts land: `GHOST_PREBUILT_DIR` if set (the resolver's first search
+/// dir), else `<data_dir>/ghost/prebuilt` (its durable fallback). Mirrors
+/// `ghost_vt::paths::data_dir` by hand — xtask stays zero-dependency on purpose.
+fn prebuilt_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("GHOST_PREBUILT_DIR") {
+        return PathBuf::from(d);
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".local").join("share")
+        });
+    base.join("ghost").join("prebuilt")
+}
+
 /// `version` from the `[package]` table of a `Cargo.toml`.
 fn read_version(manifest: &Path) -> String {
     let txt = fs::read_to_string(manifest).unwrap_or_default();
@@ -324,6 +471,39 @@ fn copy_dir(src: &Path, dst: &Path) -> R<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prebuilt_tests {
+    use super::*;
+
+    #[test]
+    fn triple_to_name_maps_supported_targets_and_rejects_others() {
+        assert_eq!(
+            triple_to_name("x86_64-unknown-linux-gnu").as_deref(),
+            Some("ghost-linux-x86_64")
+        );
+        assert_eq!(
+            triple_to_name("aarch64-unknown-linux-gnu").as_deref(),
+            Some("ghost-linux-aarch64")
+        );
+        assert_eq!(
+            triple_to_name("aarch64-apple-darwin").as_deref(),
+            Some("ghost-macos-aarch64")
+        );
+        assert_eq!(
+            triple_to_name("x86_64-apple-darwin").as_deref(),
+            Some("ghost-macos-x86_64")
+        );
+        // musl is still linux.
+        assert_eq!(
+            triple_to_name("x86_64-unknown-linux-musl").as_deref(),
+            Some("ghost-linux-x86_64")
+        );
+        // Unsupported arch or OS ⇒ no mapping.
+        assert_eq!(triple_to_name("riscv64gc-unknown-linux-gnu"), None);
+        assert_eq!(triple_to_name("x86_64-pc-windows-msvc"), None);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
