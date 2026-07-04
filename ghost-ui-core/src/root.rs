@@ -529,6 +529,13 @@ impl RootModel {
     /// first session — so the adopt's registry save persists it.
     pub fn set_group_connection(&mut self, connection: Option<ConnectionSpec>) {
         self.my_group.connection = connection;
+        // Mirror it into the fleet's copy: a fresh ssh window is in fleet mode, and
+        // the next adopt reads `self.my_group` back from `f.my_group()` (root.rs's
+        // Fleet→Single hand-off) — so without this the connection is clobbered
+        // before `claim_member` persists it, and the group loses its ssh identity.
+        if let Mode::Fleet(f) = &mut self.mode {
+            f.set_my_group(self.my_group.clone());
+        }
     }
 
     pub fn window_record(&self) -> crate::workspace::WindowRecord {
@@ -2563,6 +2570,29 @@ mod tests {
         assert_eq!(cmds, vec![Cmd::ConnectSshWindow(spec)]);
         // The prompt is gone — the window falls back to its (empty) live view.
         assert!(!scene_has(&r, "Connect"), "prompt cleared after submit");
+    }
+
+    #[test]
+    fn connecting_an_ssh_window_persists_the_group_connection() {
+        // Mirror the shell's Cmd::ConnectSshWindow: mark the (fleet-mode) window's
+        // group an ssh group, then adopt its freshly spawned first session. The
+        // adopt's registry save must carry the connection — else the group loses
+        // its ssh identity on disk and never shows the badge.
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        let spec = ghost_vt::connection::ConnectionSpec::parse_target("kov@box").unwrap();
+        r.set_group_connection(Some(spec.clone()));
+        let cmds = r.update(UiEvent::AdoptSession("s1".into()));
+        let saved = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::SaveGroups(gs) => Some(gs),
+                _ => None,
+            })
+            .expect("the adopt saves the group registry");
+        assert!(
+            saved.iter().any(|g| g.connection.as_ref() == Some(&spec)),
+            "the persisted group carries the ssh connection: {saved:?}"
+        );
     }
 
     #[test]
