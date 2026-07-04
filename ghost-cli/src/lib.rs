@@ -152,6 +152,11 @@ enum Command {
         /// Immutable id of the session to relay to.
         name: String,
     },
+    /// Stream this machine's session listing (JSON per line) — once now, then on
+    /// every change. The far end of the fleet's push updates, run over ssh as
+    /// `ssh <host> -- ghost __watch`. An internal plumbing command; not for direct use.
+    #[command(name = "__watch", hide = true)]
+    Watch,
     /// Print a machine-readable marker identifying this as a ghost that can host
     /// sessions over the SSH transport (with its protocol level). The initiator
     /// runs it over ssh to decide transport-vs-ssh-child. Internal.
@@ -350,6 +355,11 @@ fn dispatch(command: Command) {
         // name (no display-name resolution).
         Command::Pipe { name } => {
             if let Err(e) = ghost_vt::pipe::run(&name) {
+                fail(&e.to_string());
+            }
+        }
+        Command::Watch => {
+            if let Err(e) = ghost_vt::watch::run() {
                 fail(&e.to_string());
             }
         }

@@ -30,6 +30,7 @@ pub mod session;
 mod signals;
 pub mod terminfo;
 pub mod transport;
+pub mod watch;
 
 /// ghost's terminal-emulator core (`ghost-term`, forked from asciinema's `avt`),
 /// used as the authoritative server-side screen and scrollback state.

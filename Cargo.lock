@@ -1093,6 +1093,7 @@ dependencies = [
  "ghost-term",
  "libc",
  "nix",
+ "notify",
  "postcard",
  "pty-process",
  "rustix 1.1.4",

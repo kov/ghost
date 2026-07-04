@@ -354,6 +354,13 @@ impl RemoteSsh {
     pub fn pipe_command(&self, remote_ghost: &str, name: &str) -> Command {
         self.command(&[remote_ghost, "__pipe", name])
     }
+
+    /// The `ssh … <remote_ghost> __watch` command whose stdout streams the host's
+    /// session listing (one JSON line per change) — the fleet's push channel for
+    /// this host, replacing the periodic `list_sessions` poll.
+    pub fn watch_command(&self, remote_ghost: &str) -> Command {
+        self.command(&[remote_ghost, "__watch"])
+    }
 }
 
 /// Make a target safe for a filename (control-socket path): keep it short and
@@ -435,6 +442,15 @@ mod tests {
         assert_eq!(
             &r.argv(&["ghost", "rename", "old", "new"])[9..],
             &["kov@box", "'ghost'", "'rename'", "'old'", "'new'"]
+        );
+    }
+
+    #[test]
+    fn watch_command_runs_ghost_watch_over_the_shared_connection() {
+        let r = remote("kov@box");
+        assert_eq!(
+            &r.argv(&["ghost", "__watch"])[9..],
+            &["kov@box", "'ghost'", "'__watch'"]
         );
     }
 
