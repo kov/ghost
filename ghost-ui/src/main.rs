@@ -3083,12 +3083,13 @@ impl App {
     }
 }
 
-impl ApplicationHandler<UserEvent> for App {
-    /// A native menu selection posted from AppKit's main thread. Each action is
-    /// turned back into the effect a keystroke would have produced, so the pure
-    /// core stays the single source of truth (see [`menu::menu_intent`]).
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let fe = WinitFrontend { event_loop };
+impl App {
+    /// The `user_event` handler, over the [`Frontend`] seam so a headless test can
+    /// inject a `UserEvent` directly: a native menu selection (turned back into the
+    /// effect a keystroke would have produced, keeping the pure core the single
+    /// source of truth — see [`menu::menu_intent`]), a remote host's latest listing
+    /// from the poller, or a connect worker's result.
+    fn on_user_event(&mut self, fe: &dyn Frontend, event: UserEvent) {
         let action = match event {
             UserEvent::Menu(action) => action,
             // The poller thread delivered a remote host's latest listing: stash it
@@ -3108,7 +3109,7 @@ impl ApplicationHandler<UserEvent> for App {
                 name,
                 outcome,
             } => {
-                self.finish_connect(wid, spec, name, outcome, &fe);
+                self.finish_connect(wid, spec, name, outcome, fe);
                 return;
             }
             // Staging byte-progress from the connect worker: update the bar.
@@ -3122,10 +3123,10 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
-            MenuIntent::NewWindow => self.open_launch_window(&fe),
+            MenuIntent::NewWindow => self.open_launch_window(fe),
             MenuIntent::FocusedCmd(cmd) => {
                 if let Some(wid) = self.focused_window() {
-                    self.exec(wid, vec![cmd], &fe);
+                    self.exec(wid, vec![cmd], fe);
                 }
             }
             MenuIntent::FocusedKey(key, mods) => {
@@ -3138,11 +3139,19 @@ impl ApplicationHandler<UserEvent> for App {
                             kind: KeyEventKind::Press,
                             alts: None,
                         },
-                        &fe,
+                        fe,
                     );
                 }
             }
         }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    /// A native menu selection posted from AppKit's main thread — delegated to
+    /// [`App::on_user_event`] over the production frontend.
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        self.on_user_event(&WinitFrontend { event_loop }, event);
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -3640,6 +3649,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 #[cfg(test)]
 mod tests {
+    use super::menu::UserEvent;
     use super::{
         App, HeadlessFrontend, REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode,
         choose_surface_format, home_launch_dir, inherited_connection, local_only,
@@ -3689,6 +3699,82 @@ mod tests {
             assert!(win.gfx.is_none(), "a headless window carries no surface");
             assert!(win.root.is_fleet(), "it opened in the fleet overview");
             assert!(!fe.exited.get(), "opening a window does not quit the app");
+        });
+    }
+
+    #[test]
+    fn on_user_event_merges_a_remote_listing_under_composite_ids() {
+        // The real shell handles a poller delivery headlessly: a host's listing is
+        // stashed and its ids resolve back to (target, real) — the identity path a
+        // past bug broke (a window mistook its own remote session for a foreign
+        // one). No window, disk, or network needed.
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        // The poller posts already-namespaced infos (see `spawn_remote_poller`).
+        let infos = namespace_remote_infos("kov@box", vec![info("work", false)]);
+        app.on_user_event(
+            &fe,
+            UserEvent::RemoteSessions {
+                target: "kov@box".to_string(),
+                infos,
+            },
+        );
+
+        assert!(
+            app.remote_infos.contains_key("kov@box"),
+            "the host's listing is stashed"
+        );
+        let composite = format!("kov@box{REMOTE_ID_SEP}work");
+        assert_eq!(
+            app.remote_index.get(&composite),
+            Some(&("kov@box".to_string(), "work".to_string())),
+            "the namespaced fleet id resolves back to (target, real id)"
+        );
+        assert!(
+            app.sessions_changed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a re-enumeration is hinted so the fleet merges the remote sessions"
+        );
+    }
+
+    #[test]
+    fn prune_remotes_drops_hosts_no_live_window_references() {
+        // Closing the window onto a host must stop polling it. Drive the real shell:
+        // two connected hosts, one referenced by an ssh-group window, the other by
+        // nothing — prune keeps the first and drops the second (and its listing).
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+
+            let a = ConnectionSpec::parse_target("kov@a").unwrap();
+            let b = ConnectionSpec::parse_target("kov@b").unwrap();
+            app.register_remote(&a, "ghost");
+            app.register_remote(&b, "ghost");
+            app.remote_infos.insert("kov@a".to_string(), Vec::new());
+            app.remote_infos.insert("kov@b".to_string(), Vec::new());
+
+            // A window that is an ssh group for host A references it; B is orphaned.
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .root
+                .set_group_connection(Some(a.clone()));
+
+            app.prune_remotes();
+
+            let remotes = app.remotes.lock().unwrap();
+            assert!(remotes.contains_key("kov@a"), "the referenced host stays");
+            assert!(
+                !remotes.contains_key("kov@b"),
+                "the unreferenced host is dropped"
+            );
+            assert!(app.remote_infos.contains_key("kov@a"));
+            assert!(
+                !app.remote_infos.contains_key("kov@b"),
+                "its cached listing is dropped too"
+            );
         });
     }
 
