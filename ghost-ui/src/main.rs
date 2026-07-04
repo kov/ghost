@@ -573,10 +573,15 @@ fn restore_plan(
 }
 
 /// The spawn options for relaunching a dead session `id` from its descriptor.
-/// A relaunch runs a fresh shell (empty command = the user's `$SHELL`), never
-/// `descriptor.command`: it restores the last screen and scrollback (seeded from
-/// the recording, when one exists) and drops you at a prompt below them — it does
-/// not re-run what died. The child is deferred to the first attach.
+///
+/// A relaunch restores the session's *substrate*, never its *workload*: it
+/// always drops the recorded `descriptor.command` (so a reboot doesn't re-run
+/// dev servers), and seeds the last screen and scrollback from the recording so
+/// you land at a prompt below them. For a local session that substrate is a
+/// fresh `$SHELL` (empty command); for a connection session it is a fresh login
+/// to the same host — the connection is carried forward so the relaunch
+/// reconnects rather than dropping to a useless local shell over frozen remote
+/// scrollback. The child is deferred to the first attach.
 fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathBuf) -> SpawnOpts {
     let seed_from = recording.exists().then(|| recording.clone());
     SpawnOpts {
@@ -589,9 +594,9 @@ fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathB
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
         start_on_attach: true,
-        // Phase 1: a relaunch stays local. Phase 3 copies `d.connection` here so
-        // a dead ssh session reconnects instead of dropping to a local shell.
-        connection: None,
+        // Carry the connection forward: a dead ssh session reconnects on
+        // relaunch (substrate), while a local session stays `None` → `$SHELL`.
+        connection: d.connection.clone(),
     }
 }
 
@@ -2682,6 +2687,34 @@ mod tests {
             "a missing recording seeds nothing"
         );
         assert_eq!(opts.name, "phoenix");
+        assert!(
+            opts.connection.is_none(),
+            "a local session's relaunch carries no connection"
+        );
+    }
+
+    #[test]
+    fn a_dead_ssh_session_relaunches_by_reconnecting() {
+        // The substrate-not-workload rule: a connection session relaunches by
+        // re-establishing the connection (not a local shell), still seeded from
+        // the recording so the old screen shows above the fresh login.
+        use ghost_vt::descriptor::Descriptor;
+        use std::path::PathBuf;
+        let d = Descriptor {
+            command: Vec::new(),
+            connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
+            ..Default::default()
+        };
+        let opts = respawn_opts(
+            "ssh-box",
+            &d,
+            PathBuf::from("/nonexistent/ssh-box.ghostrec"),
+        );
+        assert!(opts.command.is_empty(), "a relaunch never sets a command");
+        let spec = opts
+            .connection
+            .expect("the connection is carried into the relaunch");
+        assert_eq!(spec.target(), "kov@box");
     }
 
     #[test]

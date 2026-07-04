@@ -78,6 +78,12 @@ enum Command {
         /// Start the session in the background without attaching to it.
         #[arg(short = 'd', long)]
         detached: bool,
+        /// Seed the session's screen and scrollback from a predecessor's
+        /// recording — reconnecting a dead ssh session with its history in
+        /// place. An implementation detail (mirrors `new`'s `--seed-from`),
+        /// hidden from help.
+        #[arg(long, hide = true)]
+        seed_from: Option<std::path::PathBuf>,
         /// Port to connect to (`ssh -p`).
         #[arg(short = 'p', long)]
         port: Option<u16>,
@@ -199,6 +205,7 @@ fn dispatch(command: Command) {
             target,
             name,
             detached,
+            seed_from,
             port,
             identity,
             jump,
@@ -234,7 +241,7 @@ fn dispatch(command: Command) {
                 size: (80, 24),
                 cwd: None,
                 record: Some(ghost_vt::paths::recording_path(&name)),
-                seed_from: None,
+                seed_from,
                 scrollback: ghost_vt::screen::DEFAULT_SCROLLBACK,
                 max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
                 // Attached (the default) starts ssh on the attach handshake so
@@ -383,6 +390,7 @@ mod tests {
             target,
             name,
             detached,
+            seed_from,
             port,
             identity,
             jump,
@@ -394,6 +402,7 @@ mod tests {
         assert_eq!(target, "dev@box");
         assert_eq!(name.as_deref(), Some("work"));
         assert!(detached);
+        assert_eq!(seed_from, None, "seed_from is an internal reconnect flag");
         assert_eq!(port, Some(2222));
         assert_eq!(
             identity.as_deref(),
