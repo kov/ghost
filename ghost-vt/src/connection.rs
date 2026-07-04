@@ -105,26 +105,43 @@ impl ConnectionSpec {
         }
     }
 
-    /// The argv that tunnels the protocol to a *remote ghost host* over ssh:
-    /// the ssh connection (options + destination) followed by the remote command
-    /// `<remote_ghost> __pipe <name>`, whose stdio relays to the remote session's
-    /// control socket ([`crate::pipe`]). This is the SSH-as-transport realization
-    /// — distinct from [`argv`](Self::argv), which builds the local ssh *child*.
-    /// `remote_ghost` is the ghost binary on the remote (`"ghost"` when it is on
-    /// the remote `PATH`). The reach is always ssh here; a spec's
-    /// [`ConnectionKind`] selects the *child* launcher, not the host transport.
-    pub fn transport_argv(&self, remote_ghost: &str, name: &str) -> Vec<String> {
-        let mut v = self.ssh_argv();
-        v.push(remote_ghost.to_string());
-        v.push("__pipe".to_string());
-        v.push(name.to_string());
+    /// An `ssh` command line reaching this host and running `remote` there:
+    /// `ssh [connection opts] <target> [remote…]`. The single place the spec's
+    /// ssh options and destination are assembled for a *remote command* — the
+    /// SSH-as-transport building block (probe, spawn-host, `__pipe`). `extra_opts`
+    /// are inserted before the destination (e.g. `ControlMaster` flags the
+    /// initiator adds). The reach is always ssh here; a spec's [`ConnectionKind`]
+    /// selects the local *child* launcher ([`argv`](Self::argv)), not this.
+    pub fn ssh_command(&self, extra_opts: &[String], remote: &[&str]) -> Vec<String> {
+        let mut v = vec!["ssh".to_string()];
+        v.extend(extra_opts.iter().cloned());
+        v.extend(self.ssh_opts_and_target());
+        v.extend(remote.iter().map(|s| s.to_string()));
         v
     }
 
-    /// `ssh [-p PORT] [-i IDENTITY] [-J JUMP] [extra…] <target>` — options
-    /// before the destination, as ssh requires.
+    /// The argv that tunnels the protocol to a *remote ghost host* over ssh:
+    /// the ssh connection followed by `<remote_ghost> __pipe <name>`, whose stdio
+    /// relays to the remote session's control socket ([`crate::pipe`]).
+    /// `remote_ghost` is the ghost binary on the remote (`"ghost"` when on the
+    /// remote `PATH`).
+    pub fn transport_argv(&self, remote_ghost: &str, name: &str) -> Vec<String> {
+        self.ssh_command(&[], &[remote_ghost, "__pipe", name])
+    }
+
+    /// `ssh [-p PORT] [-i IDENTITY] [-J JUMP] [extra…] <target>` — the local ssh
+    /// *child* command (an interactive login), options before the destination.
     fn ssh_argv(&self) -> Vec<String> {
         let mut v = vec!["ssh".to_string()];
+        v.extend(self.ssh_opts_and_target());
+        v
+    }
+
+    /// The spec's ssh options followed by the destination — `[-p PORT] [-i ID]
+    /// [-J JUMP] [extra…] <target>`, without the leading `ssh`. Shared by the
+    /// child command and every remote-command form.
+    fn ssh_opts_and_target(&self) -> Vec<String> {
+        let mut v = Vec::new();
         if let Some(p) = self.port {
             v.push("-p".into());
             v.push(p.to_string());

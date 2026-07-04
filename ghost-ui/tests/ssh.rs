@@ -25,6 +25,9 @@ fn shim_dir() -> tempfile::TempDir {
     std::fs::write(
         &ssh,
         "#!/bin/sh\n\
+         # Model a host WITHOUT ghost: reject the transport probe (so `ghost ssh`\n\
+         # falls back to the ssh child) and don't count it against the run number.\n\
+         case \"$*\" in *__probe*) exit 1 ;; esac\n\
          n=$(cat \"$SSH_SHIM_COUNT\" 2>/dev/null || echo 0); n=$((n+1))\n\
          echo \"$n\" > \"$SSH_SHIM_COUNT\"\n\
          echo \"SSH-SHIM #$n: $*\"\n\

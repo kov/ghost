@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ghost_vt::client::Session;
 use ghost_vt::connection::ConnectionSpec;
+use ghost_vt::descriptor::Descriptor;
 use ghost_vt::screen::Screen;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
@@ -22,7 +23,8 @@ const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 /// A fake `ssh`: consume ssh options (with `-p/-i/-J/-o` taking a value) and the
 /// destination, then `exec` whatever remote command follows — locally. That
 /// remote command is `<ghost> __pipe <name>`, so it relays to the local session
-/// socket exactly as a remote ghost would to its own.
+/// socket exactly as a remote ghost would to its own. With no remote command
+/// (the ssh *child* form, `ssh <target>`), it drops into a shell like real ssh.
 fn shim_ssh() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let ssh = dir.path().join("ssh");
@@ -36,6 +38,7 @@ fn shim_ssh() -> tempfile::TempDir {
          \x20   *) shift; break ;;\n\
          \x20 esac\n\
          done\n\
+         [ $# -eq 0 ] && exec sh\n\
          exec \"$@\"\n",
     )
     .unwrap();
@@ -161,6 +164,97 @@ fn attaching_over_the_ssh_transport_shows_the_remote_hosts_screen() {
         "input never round-tripped over the ssh transport; saw:\n{}",
         screen.text().join("\n")
     );
+}
+
+/// `ghost ssh <target>` invoked with the shim as `ssh` and this binary as the
+/// remote ghost. `remote_ghost` sets `GHOST_REMOTE_GHOST` (a real path uses the
+/// transport; a bogus one forces negotiation to fail → the ssh-child fallback).
+fn ghost_ssh(xdg: &Path, shim: &Path, remote_ghost: &str, args: &[&str]) -> std::process::Output {
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut c = Command::new(GHOST);
+    c.arg("ssh")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("PATH", path)
+        .env("GHOST_REMOTE_GHOST", remote_ghost);
+    c.output().expect("run `ghost ssh`")
+}
+
+fn descriptor(xdg: &Path, name: &str) -> Descriptor {
+    // The host writes its descriptor asynchronously after spawn; wait for it.
+    let path = xdg.join("data/ghost/sessions").join(format!("{name}.json"));
+    assert!(
+        wait_until(Duration::from_secs(5), || path.exists()),
+        "descriptor for '{name}' was never written"
+    );
+    serde_json::from_slice(&std::fs::read(&path).expect("descriptor written")).unwrap()
+}
+
+#[test]
+fn ghost_ssh_uses_the_transport_when_the_remote_has_ghost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let shim = shim_ssh();
+
+    // The probe (`ghost __probe`) succeeds via the shim, so `ghost ssh` takes
+    // the transport: it spawns a real remote host rather than an ssh child.
+    let out = ghost_ssh(xdg, shim.path(), GHOST, &["dev@example", "-d"]);
+    assert!(
+        out.status.success(),
+        "`ghost ssh` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("ssh-example")),
+        "the remote host was never created"
+    );
+
+    // A transport session is a plain ghost host (its child is the remote $SHELL),
+    // so its descriptor carries NO connection — that's the tell that distinguishes
+    // it from the ssh-child fallback, which stores the spec.
+    assert!(
+        descriptor(xdg, "ssh-example").connection.is_none(),
+        "a transport session is a plain host, not an ssh child"
+    );
+}
+
+#[test]
+fn ghost_ssh_falls_back_to_the_ssh_child_when_the_remote_lacks_ghost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let shim = shim_ssh();
+
+    // The probe runs a binary that isn't there, so negotiation fails and
+    // `ghost ssh` falls back to the local ssh child — which records the
+    // connection spec (the ssh child's tell).
+    let out = ghost_ssh(
+        xdg,
+        shim.path(),
+        "/nonexistent/ghost",
+        &["dev@example", "-d"],
+    );
+    assert!(
+        out.status.success(),
+        "`ghost ssh` fallback failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+    let spec = descriptor(xdg, "ssh-example")
+        .connection
+        .expect("the ssh-child fallback records the connection");
+    assert_eq!(spec.target(), "dev@example");
 }
 
 /// A `__pipe` to a session that isn't there fails cleanly rather than hanging.

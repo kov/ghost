@@ -133,6 +133,11 @@ enum Command {
         /// Immutable id of the session to relay to.
         name: String,
     },
+    /// Print a machine-readable marker identifying this as a ghost that can host
+    /// sessions over the SSH transport (with its protocol level). The initiator
+    /// runs it over ssh to decide transport-vs-ssh-child. Internal.
+    #[command(name = "__probe", hide = true)]
+    Probe,
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -243,28 +248,30 @@ fn dispatch(command: Command) {
                 }
                 None => unique_ssh_name(&spec.host, &taken),
             };
-            let opts = SpawnOpts {
-                name: name.clone(),
-                // Empty: the connection derives the child argv (`ssh …`).
-                command: Vec::new(),
-                size: (80, 24),
-                cwd: None,
-                record: Some(ghost_vt::paths::recording_path(&name)),
-                seed_from,
-                scrollback: ghost_vt::screen::DEFAULT_SCROLLBACK,
-                max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
-                // Attached (the default) starts ssh on the attach handshake so
-                // its terminal queries reach a real client; `-d` starts it now.
-                start_on_attach: !detached,
-                connection: Some(spec),
+
+            // Prefer the transport: a real ghost host running on the remote,
+            // reached by tunnelling our protocol over ssh. Fall back to the local
+            // ssh *child* only when the remote can't host ghost.
+            let remote = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
+                Ok(r) => r,
+                Err(e) => fail(&e.to_string()),
             };
-            if let Err(e) = server::spawn(opts) {
-                fail(&e.to_string());
-            }
-            if detached {
-                println!("started session '{name}'");
-            } else if let Err(e) = client::attach(&name) {
-                fail(&format!("session '{name}' started but attach failed: {e}"));
+            match remote.negotiate() {
+                Some(remote_ghost) => {
+                    if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
+                        fail(&format!("failed to start the remote host: {e}"));
+                    }
+                    if detached {
+                        println!("started remote session '{name}' on {}", spec.target());
+                    } else if let Err(e) =
+                        client::attach_ssh(remote.pipe_command(&remote_ghost, &name))
+                    {
+                        fail(&format!(
+                            "remote session '{name}' started but attach failed: {e}"
+                        ));
+                    }
+                }
+                None => ssh_child_fallback(spec, name, detached, seed_from),
             }
         }
         Command::Ls => match session::list() {
@@ -308,6 +315,7 @@ fn dispatch(command: Command) {
                 fail(&e.to_string());
             }
         }
+        Command::Probe => println!("{}", ghost_vt::remote::probe_line()),
     }
 }
 
@@ -356,6 +364,41 @@ fn unique_ssh_name(host: &str, taken: &[String]) -> String {
         .map(|n| format!("{base}-{n}"))
         .find(|cand| !taken.iter().any(|t| t == cand))
         .expect("an unused suffix always exists")
+}
+
+/// The local ssh-*child* realization of a connection (a session whose child is
+/// `ssh <target>`): the fallback when the remote can't host a ghost. This is the
+/// original `ghost ssh` behaviour (P1–P5); the connection is stored so a dead
+/// session reconnects on relaunch and new sessions in its group inherit it.
+fn ssh_child_fallback(
+    spec: ConnectionSpec,
+    name: String,
+    detached: bool,
+    seed_from: Option<std::path::PathBuf>,
+) {
+    let opts = SpawnOpts {
+        name: name.clone(),
+        // Empty: the connection derives the child argv (`ssh …`).
+        command: Vec::new(),
+        size: (80, 24),
+        cwd: None,
+        record: Some(ghost_vt::paths::recording_path(&name)),
+        seed_from,
+        scrollback: ghost_vt::screen::DEFAULT_SCROLLBACK,
+        max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
+        // Attached (the default) starts ssh on the attach handshake so its
+        // terminal queries reach a real client; `-d` starts it now.
+        start_on_attach: !detached,
+        connection: Some(spec),
+    };
+    if let Err(e) = server::spawn(opts) {
+        fail(&e.to_string());
+    }
+    if detached {
+        println!("started session '{name}'");
+    } else if let Err(e) = client::attach(&name) {
+        fail(&format!("session '{name}' started but attach failed: {e}"));
+    }
 }
 
 fn fail(msg: &str) -> ! {

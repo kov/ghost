@@ -397,8 +397,19 @@ impl Session {
 /// Attach to the named session, returning when the user detaches or the session
 /// ends.
 pub fn attach(name: &str) -> io::Result<()> {
-    let mut client = Client::connect(name)?;
+    run_attach(Client::connect(name)?)
+}
 
+/// Attach to a *remote* session over the SSH transport: `cmd` is the
+/// `ssh … -- ghost __pipe <name>` whose stdio tunnels to the remote host. The
+/// terminal pipe is identical to a local attach — only the transport differs.
+pub fn attach_ssh(cmd: std::process::Command) -> io::Result<()> {
+    run_attach(Client::connect_ssh(cmd)?)
+}
+
+/// The raw-mode terminal pipe shared by [`attach`] and [`attach_ssh`]: forward
+/// stdin<->host until the user detaches or the session ends.
+fn run_attach(mut client: Client) -> io::Result<()> {
     let stdin = rustix::stdio::stdin();
 
     // Raw mode, restored on return via the guard's Drop.

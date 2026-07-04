@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod pty;
 pub mod query;
 pub mod record;
+pub mod remote;
 pub mod screen;
 pub mod server;
 pub mod session;
