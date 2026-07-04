@@ -46,6 +46,10 @@ pub struct SessionInfo {
     /// before (or without) observing it. `None` when unrecorded (metadata
     /// written before the field existed).
     pub size: Option<(u16, u16)>,
+    /// The session's remote connection, if it is an ssh/mosh session (from
+    /// [`crate::connection`]); `None` for a local session. Lets a fleet mark
+    /// remote sessions. Read from the host's `meta`.
+    pub connection: Option<crate::connection::ConnectionSpec>,
 }
 
 impl SessionInfo {
@@ -129,6 +133,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     display_name: meta.display_name,
                     cwd: None, // filled by [`list`] from the descriptor
                     size: Some(meta.size).filter(|&s| s != (0, 0)),
+                    connection: meta.connection,
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -306,6 +311,7 @@ mod tests {
             display_name: String::new(),
             cwd: None,
             size: None,
+            connection: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
@@ -344,6 +350,39 @@ mod tests {
             sessions[0].size,
             Some((120, 60)),
             "the grid size travels from meta into the listing"
+        );
+        assert_eq!(
+            sessions[0].connection, None,
+            "a local session lists no connection"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn list_in_reports_an_ssh_sessions_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("sess-ssh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = std::fs::File::create(dir.join("lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        std::fs::write(dir.join("pid"), std::process::id().to_string()).unwrap();
+        crate::meta::write(
+            &dir.join("meta"),
+            &crate::meta::Meta {
+                created_at: 1,
+                connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let sessions = list_in(root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].connection.as_ref().map(|c| c.target()),
+            Some("kov@box".to_string()),
+            "the connection travels from meta into the listing"
         );
         drop(lock);
     }

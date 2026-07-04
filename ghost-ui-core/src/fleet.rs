@@ -390,6 +390,9 @@ struct Tile {
     /// The session's working directory (display form, `~`-abbreviated), from
     /// the listing's descriptor read; `None` when unknown.
     cwd: Option<String>,
+    /// Whether this is a remote (ssh/mosh) session, from the listing's
+    /// connection — drives the "ssh" tile marker.
+    ssh: bool,
     /// A dead-but-remembered group member: its session is gone, but the tile
     /// stays in its group's block (previewing its recording's last screen)
     /// and activating it recreates the session. Never observed or attached;
@@ -747,6 +750,7 @@ impl FleetModel {
             frame_dirty: true,
             progress: None,
             cwd: None,
+            ssh: false,
             dead: false,
             holder: None,
         });
@@ -1144,6 +1148,7 @@ impl FleetModel {
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
                 tile.cwd = info.cwd.clone();
+                tile.ssh = info.connection.is_some();
                 tile.model.set_display_name(info.display_name.clone());
             } else {
                 // Born at the session's listed grid, so the tile has its real
@@ -1163,7 +1168,9 @@ impl FleetModel {
                     info.pid,
                     info.created_at,
                 );
-                self.tiles.last_mut().expect("just pushed").cwd = info.cwd.clone();
+                let t = self.tiles.last_mut().expect("just pushed");
+                t.cwd = info.cwd.clone();
+                t.ssh = info.connection.is_some();
                 dirty = true;
             }
         }
@@ -3202,6 +3209,11 @@ impl FleetModel {
                             let (before, after) = b.halves();
                             format!("{before}\u{2588}{after}")
                         }
+                        // An ssh group is marked on its header so the whole
+                        // window reads as remote at a glance.
+                        _ if group.connection.is_some() => {
+                            format!("{} \u{b7} ssh", group.name)
+                        }
                         _ => group.name.clone(),
                     };
                     items.push(SceneItem::Text {
@@ -3300,7 +3312,8 @@ impl FleetModel {
                         &tile.command,
                         0,
                         tile.cwd.clone(),
-                        None
+                        None,
+                        tile.ssh,
                     )
                 ),
                 None => card_meta(
@@ -3309,6 +3322,7 @@ impl FleetModel {
                     tile.pid,
                     tile.cwd.clone(),
                     tile.model.screen().vt().progress(),
+                    tile.ssh,
                 ),
             };
             // Clipped to the card: a narrow (aspect-locked) card cannot show a
@@ -3588,8 +3602,14 @@ fn card_meta(
     pid: i32,
     cwd: Option<String>,
     progress: Option<ghost_term::Progress>,
+    ssh: bool,
 ) -> String {
     let mut s = id.to_string();
+    // Mark a remote session right after its name (its command is empty — the
+    // connection derives the child — so nothing else would signal it).
+    if ssh {
+        s.push_str(" \u{b7} ssh");
+    }
     if !command.is_empty() {
         s.push_str(" \u{b7} ");
         s.push_str(&command.join(" "));
@@ -3682,6 +3702,7 @@ mod tests {
             display_name: String::new(),
             cwd: None,
             size: None,
+            connection: None,
         }
     }
 
@@ -7090,8 +7111,47 @@ mod tests {
                 12,
                 Some("~/x".into()),
                 Some(ghost_term::Progress::Normal(3)),
+                false,
             ),
             "a \u{b7} vim \u{b7} ~/x \u{b7} 12 \u{b7} 3%"
+        );
+    }
+
+    #[test]
+    fn an_ssh_sessions_tile_meta_is_marked() {
+        let mut m = fleet();
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![SessionInfo {
+            connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
+            ..info("remote")
+        }]));
+        let scene = m.view();
+        assert!(
+            scene.layers[0].items.iter().any(|it| matches!(it,
+                SceneItem::Text { runs, .. }
+                    if runs[0].text.starts_with("remote") && runs[0].text.contains("ssh"))),
+            "the ssh tile's meta line is marked ssh"
+        );
+    }
+
+    #[test]
+    fn an_ssh_groups_header_is_marked() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        m.update(UiEvent::GroupsLoaded(vec![Group {
+            id: "g2".into(),
+            name: "green".into(),
+            color: 1,
+            members: vec!["x".into(), "y".into()],
+            connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
+        }]));
+        m.update(UiEvent::SessionList(vec![info("x"), info("y")]));
+        assert!(
+            header_labels(&m)
+                .iter()
+                .any(|l| l.contains("green") && l.contains("ssh")),
+            "the ssh group's header is marked ssh: {:?}",
+            header_labels(&m)
         );
     }
 
@@ -7143,16 +7203,28 @@ mod tests {
     fn card_metadata_omits_the_shell_command() {
         // A shell session (empty command) shows just name · pid — no "$SHELL".
         assert_eq!(
-            card_meta("build", &[], 4012, None, None),
+            card_meta("build", &[], 4012, None, None, false),
             "build \u{b7} 4012"
         );
         // A real command is shown.
         assert_eq!(
-            card_meta("edit", &["nvim".into(), "x.rs".into()], 40, None, None),
+            card_meta(
+                "edit",
+                &["nvim".into(), "x.rs".into()],
+                40,
+                None,
+                None,
+                false
+            ),
             "edit \u{b7} nvim x.rs \u{b7} 40"
         );
         // Unknown pid is omitted too.
-        assert_eq!(card_meta("s", &[], 0, None, None), "s");
+        assert_eq!(card_meta("s", &[], 0, None, None, false), "s");
+        // A remote session is marked "ssh" right after its name.
+        assert_eq!(
+            card_meta("ssh-box", &[], 4012, None, None, true),
+            "ssh-box \u{b7} ssh \u{b7} 4012"
+        );
     }
 
     #[test]
@@ -7160,19 +7232,19 @@ mod tests {
         use ghost_term::Progress;
         // The suffix formats per OSC 9;4 state.
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Normal(42))),
+            card_meta("b", &[], 0, None, Some(Progress::Normal(42)), false),
             "b \u{b7} 42%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Error(90))),
+            card_meta("b", &[], 0, None, Some(Progress::Error(90)), false),
             "b \u{b7} \u{2717} 90%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Indeterminate)),
+            card_meta("b", &[], 0, None, Some(Progress::Indeterminate), false),
             "b \u{b7} \u{2026}"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Paused(10))),
+            card_meta("b", &[], 0, None, Some(Progress::Paused(10)), false),
             "b \u{b7} \u{23f8} 10%"
         );
 

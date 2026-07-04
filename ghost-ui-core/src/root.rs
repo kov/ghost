@@ -1416,6 +1416,7 @@ mod tests {
             display_name: String::new(),
             cwd: None,
             size: None,
+            connection: None,
         }
     }
 
@@ -1790,6 +1791,7 @@ mod tests {
                 display_name: String::new(),
                 cwd: None,
                 size: None,
+                connection: None,
             }
         }
         let mut r = root(); // owns "alpha"
@@ -2450,6 +2452,7 @@ mod tests {
             display_name: String::new(),
             cwd: None,
             size: None,
+            connection: None,
         }
     }
 

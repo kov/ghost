@@ -1110,6 +1110,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         display_name: String::new(),
         cwd: None,
         size: None,
+        connection: None,
     }
 }
 
