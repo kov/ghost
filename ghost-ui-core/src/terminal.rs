@@ -121,13 +121,18 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
     if !primary {
         return None;
     }
+    // Quit is Cmd+Q (macOS) or bare Ctrl+Q on every platform, mirroring Cmd+Q.
+    // Ctrl+Shift+Q is deliberately NOT quit — it's the escape hatch that falls
+    // through to the encoder and still sends XON (0x11) to the child.
+    if matches!(key, Key::Char(s) if s.eq_ignore_ascii_case("q"))
+        && (mods.sup || (mods.ctrl && !mods.shift))
+    {
+        return Some(Shortcut::Quit);
+    }
     if mods.sup || mods.shift {
         match key {
             Key::Char(s) if s.eq_ignore_ascii_case("v") => return Some(Shortcut::Paste),
             Key::Char(s) if s.eq_ignore_ascii_case("c") => return Some(Shortcut::Copy),
-            // Cmd+Q (macOS) / Ctrl+Shift+Q (elsewhere) quits — never bare Ctrl+Q,
-            // which must stay XOFF flow control.
-            Key::Char(s) if s.eq_ignore_ascii_case("q") => return Some(Shortcut::Quit),
             // Window management, same Cmd / Ctrl+Shift gating. Bare Ctrl+N/W stay
             // terminal input.
             Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
@@ -2206,23 +2211,24 @@ mod tests {
     }
 
     #[test]
-    fn quit_shortcut_is_cmd_q_or_ctrl_shift_q_never_bare_ctrl_q() {
+    fn quit_shortcut_is_cmd_q_or_ctrl_q_while_ctrl_shift_q_sends_xon() {
         let mut m = model();
         assert_eq!(
             key(&mut m, Key::Char("q".into()), Mods::SUPER),
             vec![Cmd::Quit],
             "Cmd+Q quits"
         );
-        assert_eq!(
-            key(&mut m, Key::Char("q".into()), Mods::CTRL | Mods::SHIFT),
-            vec![Cmd::Quit],
-            "Ctrl+Shift+Q quits"
-        );
-        // Bare Ctrl+Q must stay XOFF flow control (0x11), not quit.
+        // Bare Ctrl+Q quits, mirroring Cmd+Q on every platform.
         assert_eq!(
             key(&mut m, Key::Char("q".into()), Mods::CTRL),
+            vec![Cmd::Quit],
+            "bare Ctrl+Q quits"
+        );
+        // Ctrl+Shift+Q is the escape hatch that still sends XON (0x11) to the child.
+        assert_eq!(
+            key(&mut m, Key::Char("q".into()), Mods::CTRL | Mods::SHIFT),
             vec![sent("alpha", b"\x11")],
-            "bare Ctrl+Q is XOFF, not quit"
+            "Ctrl+Shift+Q sends XON, not quit"
         );
     }
 
