@@ -1452,7 +1452,7 @@ impl App {
                             .foreground()
                             .and_then(|id| ghost_vt::descriptor::read(id))
                             .and_then(|d| d.connection);
-                        inherited_connection(None, foreground.as_ref())
+                        inherited_connection(w.root.group_connection(), foreground.as_ref())
                     });
                     spawn_session(&name, vec![], connection);
                     if self.attach_into(wid, &name) {
@@ -2613,6 +2613,7 @@ mod tests {
             name: "blue".to_string(),
             color: 0,
             members: members.iter().map(|m| m.to_string()).collect(),
+            connection: None,
         }
     }
 

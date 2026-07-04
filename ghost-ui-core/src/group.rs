@@ -42,6 +42,14 @@ pub struct Group {
     /// Member session ids (immutable spawn-time names). The set is what
     /// matters; display order is the fleet's stable spatial order.
     pub members: Vec<SessionId>,
+    /// The remote connection every new session in this group inherits — set only
+    /// when the group is explicitly an "ssh group", never inferred from adopted
+    /// members. `None` for an ordinary local group. Last field so TOML emits its
+    /// nested table after the group's scalar fields; skipped when absent to keep
+    /// existing `groups.toml` files clean (groups never travel over postcard, so
+    /// `skip_serializing_if` is safe here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ghost_vt::connection::ConnectionSpec>,
 }
 
 /// The window-group id embedded in a display client's self-reported identity
@@ -67,6 +75,7 @@ impl Group {
             name: GROUP_COLOR_NAMES[color as usize % GROUP_COLOR_NAMES.len()].to_string(),
             color,
             members: Vec::new(),
+            connection: None,
         }
     }
 

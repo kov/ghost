@@ -831,18 +831,21 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
             name: "blue".to_string(),
             color: 0,
             members: vec!["edit".to_string(), "build".to_string(), "db".to_string()],
+            connection: None,
         },
         ghost_ui_core::Group {
             id: "win-shot-1".to_string(),
             name: "green".to_string(),
             color: 1,
             members: vec!["logs".to_string()],
+            connection: None,
         },
         ghost_ui_core::Group {
             id: "win-shot-2".to_string(),
             name: "purple".to_string(),
             color: 3,
             members: vec!["batch".to_string()],
+            connection: None,
         },
     ]);
     fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {

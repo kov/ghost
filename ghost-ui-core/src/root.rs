@@ -500,6 +500,13 @@ impl RootModel {
         self.primary.as_ref()
     }
 
+    /// The window group's own connection, if it is an explicit "ssh group" — the
+    /// default every new session in the window inherits (winning over the
+    /// foreground session's).
+    pub fn group_connection(&self) -> Option<&ghost_vt::connection::ConnectionSpec> {
+        self.my_group.connection.as_ref()
+    }
+
     pub fn window_record(&self) -> crate::workspace::WindowRecord {
         let (cols, rows) = self.grid();
         let mut attached: Vec<SessionId> = self.mine.iter().cloned().collect();
@@ -1354,6 +1361,7 @@ mod tests {
             name: "green".into(),
             color: 1,
             members: vec!["x".into(), "y".into()],
+            connection: None,
         }]));
         r.update(UiEvent::SessionList(vec![
             sess("x", false, 1),
@@ -1402,6 +1410,7 @@ mod tests {
             name: "infra".into(),
             color: 0,
             members: vec!["beta".into()],
+            connection: None,
         };
         // Loaded before the fleet ever opens: seeds the next opening. (A
         // foreign group draws no block of its own yet, so assert on the
@@ -1429,6 +1438,7 @@ mod tests {
             name: "web".into(),
             color: 0,
             members: vec!["alpha".into()],
+            connection: None,
         }]));
         assert!(r.mine.contains("alpha"));
         // The driven, grouped member dies: the fleet keeps a dead tile and
@@ -1458,6 +1468,7 @@ mod tests {
             name: "web".into(),
             color: 0,
             members: vec!["alpha".into(), "gamma".into()],
+            connection: None,
         }]));
         // Ctrl-Enter on the focused member opens the whole group; the shell
         // answers each take-over with an adopt, in command order.

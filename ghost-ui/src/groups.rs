@@ -69,21 +69,39 @@ mod tests {
     fn groups_round_trip_through_the_toml_file() {
         let dir = tempfile::tempdir().unwrap();
         let groups = vec![
+            // An ssh group: its connection must survive the nested TOML table.
             Group {
                 id: "w1".into(),
                 name: "web".into(),
                 color: 0,
                 members: vec!["alpha".into(), "beta".into()],
+                connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
             },
             Group {
                 id: "w2".into(),
                 name: "infra".into(),
                 color: 3,
                 members: vec!["gamma".into()],
+                connection: None,
             },
         ];
         save_in(dir.path(), &groups).unwrap();
         assert_eq!(load_from(dir.path()), groups);
+    }
+
+    #[test]
+    fn a_group_without_a_connection_loads_as_local() {
+        // Existing group files predate the connection field: they must parse,
+        // with the group defaulting to a plain local group.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            file_in(dir.path()),
+            "[[group]]\nid = \"w1\"\nname = \"blue\"\ncolor = 0\nmembers = [\"alpha\"]\n",
+        )
+        .unwrap();
+        let loaded = load_from(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].connection, None);
     }
 
     #[test]

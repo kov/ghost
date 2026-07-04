@@ -3888,6 +3888,7 @@ mod tests {
             name: name.to_string(),
             color: 1,
             members: members.iter().map(|s| s.to_string()).collect(),
+            connection: None,
         });
         m.update(UiEvent::GroupsLoaded(groups));
     }
@@ -4631,6 +4632,7 @@ mod tests {
             name: "blue".into(),
             color: 0,
             members: vec!["a".into(), "x".into()],
+            connection: None,
         }]);
         m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
         m.update(UiEvent::DeadSessions(vec![dead_info(
