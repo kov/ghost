@@ -287,6 +287,15 @@ struct RemoteHost {
 /// collides with a local id or another host's.
 const REMOTE_ID_SEP: char = '\u{1f}';
 
+/// The fleet id for remote session `real` on `target` — the composite a remote
+/// session is known by *locally* (window client key, `mine`, fleet tile id), so a
+/// session this window drives over the transport and the same session the poller
+/// discovers share one identity. Recovered to `(target, real)` via
+/// `App.remote_index`; only the transport layer uses the bare `real` id.
+fn remote_fleet_id(target: &str, real: &str) -> String {
+    format!("{target}{REMOTE_ID_SEP}{real}")
+}
+
 /// How often the poller re-lists each connected remote host.
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -307,7 +316,7 @@ fn namespace_remote_infos(
             } else {
                 i.display_name.clone()
             };
-            i.name = format!("{target}{REMOTE_ID_SEP}{}", i.name);
+            i.name = remote_fleet_id(target, &i.name);
             i.display_name = display;
             i.connection = spec.clone();
             i
@@ -2065,11 +2074,19 @@ impl App {
                 if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
                     return self.connect_fail(wid, format!("could not start the remote host: {e}"));
                 }
-                if self.attach_ssh_into(wid, &name, remote.pipe_command(&remote_ghost, &name)) {
+                // Drive it under the SAME composite id the poller will discover it
+                // by (`<target>␟<name>`), so the window recognizes its own session
+                // as this-window in the fleet instead of as a foreign duplicate. The
+                // transport still addresses the bare remote name.
+                let target = setup.spec.target();
+                let local_id = remote_fleet_id(&target, &name);
+                self.remote_index
+                    .insert(local_id.clone(), (target, name.clone()));
+                if self.attach_ssh_into(wid, &local_id, remote.pipe_command(&remote_ghost, &name)) {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.root.end_connect();
                     }
-                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
                 } else {
                     self.connect_fail(wid, "could not attach to the remote session".into());
                 }
