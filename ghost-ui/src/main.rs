@@ -255,6 +255,24 @@ fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Sessio
     Ok(s)
 }
 
+/// [`attach`] to a *remote* session over the SSH transport: `cmd` is the
+/// `ssh … __pipe <name>` tunnel. The handshake is identical — only the transport
+/// differs — so the window drives the returned [`Session`] like any local one.
+fn attach_over_ssh(
+    cmd: std::process::Command,
+    name: &str,
+    cols: u16,
+    rows: u16,
+    identity: &str,
+) -> io::Result<Session> {
+    let mut s = Session::attach_deferred_ssh(cmd, name)?;
+    s.set_read_timeout(Some(Duration::from_millis(1)))?;
+    s.resize(cols, rows)?;
+    s.report_theme(session_theme())?;
+    s.hello(identity)?;
+    Ok(s)
+}
+
 /// The identity reported by attaches with no window behind them (the
 /// headless bench harness); real windows report their group-derived identity
 /// ([`ghost_ui_core::group::window_identity`]) instead.
@@ -1435,18 +1453,8 @@ impl App {
                 }
                 Cmd::NewWindow => self.open_launch_window(event_loop),
                 Cmd::NewSshWindow => self.open_connect_window(event_loop),
-                Cmd::ConnectSshWindow(spec) => {
-                    // The connect prompt resolved: make this window an ssh group
-                    // (set before the adopt so its registry save persists the
-                    // connection), then spawn and show its first ssh session.
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.root.set_group_connection(Some(spec.clone()));
-                    }
-                    let name = self.unique_session_name();
-                    spawn_session(&name, vec![], Some(spec));
-                    if self.attach_into(wid, &name) {
-                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
-                    }
+                Cmd::ConnectSshWindow { spec, password } => {
+                    self.connect_ssh_window(wid, spec, password, event_loop);
                 }
                 Cmd::CloseWindow => {
                     self.close_window(wid);
@@ -1684,6 +1692,85 @@ impl App {
             Err(e) => {
                 eprintln!("could not attach to session '{name}': {e}");
                 false
+            }
+        }
+    }
+
+    /// [`attach_into`](Self::attach_into) over the SSH transport: attach a remote
+    /// session (reached by `cmd`, an `ssh … __pipe`) into window `wid`.
+    fn attach_ssh_into(&mut self, wid: WindowId, name: &str, cmd: std::process::Command) -> bool {
+        let Some(w) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        if w.sessions.contains_key(name) {
+            return true;
+        }
+        let (cols, rows) = w.root.grid();
+        match attach_over_ssh(cmd, name, cols, rows, &w.root.client_identity()) {
+            Ok(s) => {
+                w.sessions.insert(name.to_string(), s);
+                true
+            }
+            Err(e) => {
+                eprintln!("could not attach to remote session '{name}': {e}");
+                false
+            }
+        }
+    }
+
+    /// Connect this window to a remote host over the SSH transport (the connect
+    /// prompt resolved): negotiate a remote ghost — staging the binary if needed —
+    /// spawn a detached host there, and attach the window over the `__pipe` tunnel.
+    /// Falls back to the local ssh *child* when the remote can't host ghost.
+    ///
+    /// Blocking: the ssh round-trips (and a first-time binary stage) run inline, so
+    /// the window is unresponsive until the connection is up — acceptable for a
+    /// deliberate connect action; making it async is a polish item.
+    fn connect_ssh_window(
+        &mut self,
+        wid: WindowId,
+        spec: ConnectionSpec,
+        password: Option<String>,
+        event_loop: &ActiveEventLoop,
+    ) {
+        // Mark the window's group an ssh group first, so the adopt's registry save
+        // persists the connection (later sessions in it inherit it).
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.root.set_group_connection(Some(spec.clone()));
+        }
+        let name = self.unique_session_name();
+
+        // The initiator, carrying the typed password for ssh's askpass (the GUI
+        // has no tty). No password ⇒ key/agent auth.
+        let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).and_then(|r| match &password {
+            Some(pw) => r.with_askpass(pw.clone()),
+            None => Ok(r),
+        });
+        let remote = match remote {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("could not prepare the ssh connection: {e}");
+                return;
+            }
+        };
+
+        match remote.negotiate() {
+            Some(remote_ghost) => {
+                if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
+                    eprintln!("could not start the remote host: {e}");
+                    return;
+                }
+                if self.attach_ssh_into(wid, &name, remote.pipe_command(&remote_ghost, &name)) {
+                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                }
+            }
+            // The remote can't host ghost: fall back to a local ssh child (it runs
+            // in a PTY, so ssh prompts for the password in the terminal itself).
+            None => {
+                spawn_session(&name, vec![], Some(spec));
+                if self.attach_into(wid, &name) {
+                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                }
             }
         }
     }

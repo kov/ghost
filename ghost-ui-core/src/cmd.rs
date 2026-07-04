@@ -74,10 +74,15 @@ pub enum Cmd {
     /// host entry; on submit the window emits [`Cmd::ConnectSshWindow`].
     NewSshWindow,
     /// The connect prompt was submitted: make this window an ssh group for
-    /// `spec` and spawn its first ssh session. The shell records the group's
-    /// connection (so later sessions in it inherit it), spawns + attaches the
-    /// ssh session, and replies `UiEvent::AdoptSession` to switch to it.
-    ConnectSshWindow(ghost_vt::connection::ConnectionSpec),
+    /// `spec` and open its first remote session. The shell records the group's
+    /// connection (so later sessions in it inherit it), connects over the
+    /// transport (with `password` for auth, `None` = key/agent), and replies
+    /// `UiEvent::AdoptSession` to switch to it.
+    ConnectSshWindow {
+        spec: ghost_vt::connection::ConnectionSpec,
+        /// The password typed in the prompt, or `None` for key/agent auth.
+        password: Option<String>,
+    },
     /// Close the window this command came from. The shell detaches the window's
     /// sessions (they keep running) — the "close = detach" default.
     CloseWindow,
