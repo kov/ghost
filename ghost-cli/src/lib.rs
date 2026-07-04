@@ -123,6 +123,19 @@ enum Command {
         /// New session name.
         new: String,
     },
+    /// Search recorded session output for text — a grep over what your sessions
+    /// rendered (recordings are compressed, so a plain `grep` can't). Prints one
+    /// `session:line: text` per matching line, in `session` order.
+    Search {
+        /// Text to look for (substring match against each rendered line).
+        pattern: String,
+        /// Search only this session's recording instead of all of them.
+        #[arg(long)]
+        session: Option<String>,
+        /// Match case-insensitively.
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+    },
     /// Export a session's recording as an asciicast (asciinema) stream.
     Export {
         /// Name of the recorded session.
@@ -313,6 +326,21 @@ fn dispatch(command: Command) {
             Ok(()) => println!("renamed '{old}' to '{new}'"),
             Err(e) => fail(&e.to_string()),
         },
+        Command::Search {
+            pattern,
+            session,
+            ignore_case,
+        } => {
+            let only = session.as_deref().map(resolve);
+            match ghost_vt::search::search(&pattern, ignore_case, only.as_deref()) {
+                Ok(hits) => {
+                    for hit in &hits {
+                        println!("{}:{}: {}", hit.session, hit.line, hit.text);
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Command::Export { name, output } => {
             if let Err(e) = export(&resolve(&name), output.as_deref()) {
                 fail(&e.to_string());
@@ -506,6 +534,33 @@ mod tests {
             unique_ssh_name("box", &["ssh-box".to_string(), "ssh-box-2".to_string()],),
             "ssh-box-3"
         );
+    }
+
+    #[test]
+    fn search_parses_pattern_flags_and_session() {
+        let cli = Cli::try_parse_from(["ghost", "search", "boom"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Search {
+                pattern,
+                session: None,
+                ignore_case: false,
+            }) if pattern == "boom"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["ghost", "search", "-i", "--session", "web", "warn"]).unwrap();
+        let Some(Command::Search {
+            pattern,
+            session,
+            ignore_case,
+        }) = cli.command
+        else {
+            panic!("expected a search command");
+        };
+        assert_eq!(pattern, "warn");
+        assert_eq!(session.as_deref(), Some("web"));
+        assert!(ignore_case);
     }
 
     #[test]

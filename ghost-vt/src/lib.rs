@@ -24,6 +24,7 @@ pub mod query;
 pub mod record;
 pub mod remote;
 pub mod screen;
+pub mod search;
 pub mod server;
 pub mod session;
 mod signals;

@@ -138,11 +138,14 @@ pub fn config_dir() -> PathBuf {
     base.join("ghost")
 }
 
+/// The directory holding session recordings (`<data>/ghost/recordings`).
+pub fn recordings_dir() -> PathBuf {
+    data_dir().join("recordings")
+}
+
 /// Path of the recording for the named session.
 pub fn recording_path(name: &str) -> PathBuf {
-    data_dir()
-        .join("recordings")
-        .join(format!("{name}.ghostrec"))
+    recordings_dir().join(format!("{name}.ghostrec"))
 }
 
 #[cfg(test)]

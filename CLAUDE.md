@@ -18,6 +18,14 @@ timeout (`wait_until`), never fixed sleeps. XDG dirs are redirected to a tempdir
 (`set_xdg`) so the suite never touches real sessions or recordings. Reuse those
 helpers.
 
+## Searching recorded output
+
+Don't `grep` the recording files — they're framed-zstd, so a raw grep finds
+nothing. Use `ghost search <pattern>` (`-i` for case-insensitive, `--session
+<name>` to scope to one). It replays each recording through the emulator and
+greps the *rendered* lines, printing `session:line: text`. Reach for it whenever
+you'd otherwise hunt through `~/.local/share/ghost/recordings`.
+
 ## `ghost-term` — our owned terminal core (forked from avt)
 
 `ghost-term/` began as a fork of asciinema's `avt`; it is now **ours**. Diverge
