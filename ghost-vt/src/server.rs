@@ -188,6 +188,18 @@ struct HostArgs {
 /// caller — so this is safe to call even from a multithreaded process such as a
 /// GUI front-end.
 pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
+    // The name becomes a directory and a socket filename, so it must be a safe
+    // path component. Guard here — the single chokepoint every spawn funnels
+    // through — so no caller (CLI, GUI, ssh) can create an unsafe id.
+    if !crate::session::valid_name(&opts.name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' is not a valid session name (letters, digits, '-', '_', '.')",
+                opts.name
+            ),
+        ));
+    }
     paths::ensure_session_dir(&opts.name)?;
 
     // Acquire the session's lifetime lock. Held by the host across the fork+exec

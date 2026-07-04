@@ -80,6 +80,31 @@ fn session_lifecycle_new_ls_kill() {
 }
 
 #[test]
+fn new_refuses_an_unsafe_session_id() {
+    // Unlike a display name, the session *id* becomes a directory and socket, so
+    // it must stay a safe path component. `ghost new` refuses an unsafe one and
+    // creates nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    let out = ghost(xdg)
+        .args(["new", "bad name", "-d", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an unsafe id must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a valid session name"),
+        "expected a helpful error, got: {stderr}"
+    );
+    assert!(
+        !ls(xdg).contains("bad name"),
+        "no session should have been created: {}",
+        ls(xdg)
+    );
+}
+
+#[test]
 fn rename_allows_spaces_in_the_display_name() {
     // The display name is a label, not a path component (the session keeps its
     // immutable id), so spaces and other human-friendly characters are fine.
