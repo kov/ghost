@@ -5,6 +5,8 @@ members = [
     "ghost-vt",
     "ghost-render",
     "ghost-cli",
+    # Headless ghost (host + transport, no GUI) — the binary staged to remotes.
+    "ghost-host",
     # The custom GPU frontend (winit/wgpu/swash). First-class workspace members:
     # `ghost` (the GUI binary) is the headline product; the rest are its crates.
     "ghost-ui-core",
