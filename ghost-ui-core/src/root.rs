@@ -297,19 +297,27 @@ pub struct RootModel {
     connect: Option<ConnectPrompt>,
 }
 
-/// Which field of the connect prompt has focus.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConnectField {
+/// The stage of the "connect to a host over SSH" flow — a small state machine
+/// the shell drives as ssh auth progresses. The password field only appears when
+/// ssh actually asks (the [`Password`](ConnectPhase::Password) phase), in place
+/// of the host field.
+enum ConnectPhase {
+    /// Typing the `[user@]host` (the initial phase).
     Host,
-    Password,
+    /// The host was submitted; ssh auth is in flight, nothing to type yet.
+    Connecting,
+    /// ssh asked for a secret (`prompt` is its wording, e.g. a passphrase); the
+    /// masked password field is shown in place of the host.
+    Password { prompt: String },
+    /// Auth failed; `message` is shown and Enter returns to the host field.
+    Error { message: String },
 }
 
-/// The "connect to a host over SSH" prompt state: a `[user@]host` entry and a
-/// password (masked; empty = key/agent auth), with Tab moving focus between them.
+/// The "connect to a host over SSH" prompt state.
 struct ConnectPrompt {
     host: TextInput,
     password: TextInput,
-    field: ConnectField,
+    phase: ConnectPhase,
 }
 
 impl ConnectPrompt {
@@ -317,24 +325,8 @@ impl ConnectPrompt {
         ConnectPrompt {
             host: TextInput::new(String::new()),
             password: TextInput::new(String::new()),
-            field: ConnectField::Host,
+            phase: ConnectPhase::Host,
         }
-    }
-
-    /// The focused text entry (where typing and edit chords go).
-    fn focused(&mut self) -> &mut TextInput {
-        match self.field {
-            ConnectField::Host => &mut self.host,
-            ConnectField::Password => &mut self.password,
-        }
-    }
-
-    /// Move focus to the other field.
-    fn toggle_field(&mut self) {
-        self.field = match self.field {
-            ConnectField::Host => ConnectField::Password,
-            ConnectField::Password => ConnectField::Host,
-        };
     }
 }
 
@@ -562,6 +554,34 @@ impl RootModel {
     /// The shell calls this on a freshly-opened, sessionless ssh window.
     pub fn begin_connect(&mut self) {
         self.connect = Some(ConnectPrompt::new());
+    }
+
+    /// ssh asked for a password/passphrase mid-connect: show the (masked)
+    /// password field in place of the host, labelled with ssh's own `prompt`.
+    /// A fresh field each time, so a retry after a wrong password starts empty.
+    pub fn connect_request_password(&mut self, prompt: String) {
+        if let Some(p) = &mut self.connect {
+            p.password = TextInput::new(String::new());
+            p.phase = ConnectPhase::Password { prompt };
+        }
+    }
+
+    /// The connect attempt failed (bad password, unreachable host, …): show
+    /// `message`; Enter returns to the host field to try again.
+    pub fn connect_failed(&mut self, message: String) {
+        if let Some(p) = &mut self.connect {
+            p.phase = ConnectPhase::Error { message };
+        }
+    }
+
+    /// The connect resolved (the remote session is attaching): dismiss the prompt.
+    pub fn end_connect(&mut self) {
+        self.connect = None;
+    }
+
+    /// Whether this window is mid-connect (the prompt owns the view).
+    pub fn is_connecting(&self) -> bool {
+        self.connect.is_some()
     }
 
     /// Mark this window's group an explicit "ssh group" for `connection` (or
@@ -1123,64 +1143,50 @@ impl RootModel {
         self.live_scene()
     }
 
-    /// Keyboard for the connect prompt: printable keys and pasted/IME text insert
-    /// into the focused field; Tab moves between the host and password entries;
-    /// the [`TextInput`] chords edit and navigate; Enter submits (a valid
-    /// `[user@]host` opens the ssh window with the typed password, an empty or
-    /// invalid host keeps prompting); Escape cancels and closes the window.
+    /// Keyboard for the connect prompt, routed by phase. In [`Host`] typing goes
+    /// to the host entry and Enter submits a valid `[user@]host` (beginning ssh
+    /// auth). In [`Password`] typing goes to the masked password entry and Enter
+    /// feeds it to the in-flight auth. [`Connecting`] swallows typing (auth is
+    /// running). [`Error`] shows the failure until Enter returns to the host.
+    /// Escape always cancels and closes the window.
+    ///
+    /// [`Host`]: ConnectPhase::Host
+    /// [`Password`]: ConnectPhase::Password
+    /// [`Connecting`]: ConnectPhase::Connecting
+    /// [`Error`]: ConnectPhase::Error
     fn connect_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        // The entry the current phase types into, if any.
+        fn entry(p: &mut ConnectPrompt) -> Option<&mut TextInput> {
+            match p.phase {
+                ConnectPhase::Host => Some(&mut p.host),
+                ConnectPhase::Password { .. } => Some(&mut p.password),
+                ConnectPhase::Connecting | ConnectPhase::Error { .. } => None,
+            }
+        }
         match ev {
             UiEvent::Text(s) => {
-                if let Some(p) = &mut self.connect {
-                    p.focused().insert(&s);
+                if let Some(e) = self.connect.as_mut().and_then(entry) {
+                    e.insert(&s);
                 }
                 vec![Cmd::Redraw]
             }
             UiEvent::Key {
                 key, mods, kind, ..
             } if kind.is_down() => match key {
-                // A host/password has no control chars, so only plain printable
-                // keys type; Ctrl/Cmd chords are shortcuts, not text.
                 Key::Char(s) if !mods.ctrl && !mods.sup => {
-                    if let Some(p) = &mut self.connect {
-                        p.focused().insert(&s);
+                    if let Some(e) = self.connect.as_mut().and_then(entry) {
+                        e.insert(&s);
                     }
                     vec![Cmd::Redraw]
                 }
-                Key::Named(NamedKey::Tab) => {
-                    if let Some(p) = &mut self.connect {
-                        p.toggle_field();
-                    }
-                    vec![Cmd::Redraw]
-                }
-                Key::Named(NamedKey::Enter) => {
-                    let host = self
-                        .connect
-                        .as_ref()
-                        .map(|p| p.host.text().to_string())
-                        .unwrap_or_default();
-                    match ConnectionSpec::parse_target(&host) {
-                        Some(spec) => {
-                            // An empty password means key/agent auth, not a blank.
-                            let password = self
-                                .connect
-                                .as_ref()
-                                .map(|p| p.password.text().to_string())
-                                .filter(|s| !s.is_empty());
-                            self.connect = None;
-                            vec![Cmd::ConnectSshWindow { spec, password }]
-                        }
-                        // Empty or otherwise unparseable host: stay in the prompt.
-                        None => vec![Cmd::Redraw],
-                    }
-                }
+                Key::Named(NamedKey::Enter) => self.connect_submit(),
                 Key::Named(NamedKey::Escape) => {
                     self.connect = None;
                     vec![Cmd::CloseWindow]
                 }
                 key => {
-                    if let Some(p) = &mut self.connect
-                        && p.focused().key(&key, mods)
+                    if let Some(e) = self.connect.as_mut().and_then(entry)
+                        && e.key(&key, mods)
                     {
                         vec![Cmd::Redraw]
                     } else {
@@ -1192,17 +1198,47 @@ impl RootModel {
         }
     }
 
-    /// The "connect to a host" overlay: a full-window scrim, a title, a host and
-    /// a (masked) password field — the focused one outlined bright — and a hint
-    /// line, centered at the modal scale.
+    /// Enter in the connect prompt, by phase: submit the host (→ begin auth),
+    /// submit the password (→ feed the in-flight auth), or retry from an error.
+    fn connect_submit(&mut self) -> Vec<Cmd> {
+        let Some(p) = &mut self.connect else {
+            return Vec::new();
+        };
+        match &p.phase {
+            ConnectPhase::Host => match ConnectionSpec::parse_target(p.host.text()) {
+                Some(spec) => {
+                    p.phase = ConnectPhase::Connecting;
+                    vec![Cmd::ConnectSshWindow { spec }]
+                }
+                // Empty or unparseable host: stay in the prompt.
+                None => vec![Cmd::Redraw],
+            },
+            ConnectPhase::Password { .. } => {
+                let password = p.password.text().to_string();
+                p.phase = ConnectPhase::Connecting;
+                vec![Cmd::ConnectPassword(password)]
+            }
+            // Retry: back to the host field (its text is preserved).
+            ConnectPhase::Error { .. } => {
+                p.phase = ConnectPhase::Host;
+                vec![Cmd::Redraw]
+            }
+            ConnectPhase::Connecting => Vec::new(),
+        }
+    }
+
+    /// The "connect to a host" overlay: a full-window scrim, a title, and — by
+    /// phase — the host field, a "connecting…" line, the masked password field
+    /// (in place of the host, only when ssh asks), or an error, plus a hint line;
+    /// centered at the modal scale.
     fn connect_scene(&self, prompt: &ConnectPrompt) -> Scene {
         use crate::Rgba;
         const SCRIM: Rgba = [0.04, 0.04, 0.06, 1.0];
         const FG: Rgba = [0.92, 0.94, 0.97, 1.0];
         const HINT: Rgba = [0.60, 0.63, 0.68, 1.0];
+        const ERR: Rgba = [0.95, 0.55, 0.45, 1.0];
         const FIELD_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
         const BORDER: Rgba = [0.30, 0.60, 0.95, 1.0];
-        const BORDER_DIM: Rgba = [0.28, 0.30, 0.35, 1.0];
         const SCALE: f32 = 1.5;
 
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
@@ -1251,12 +1287,8 @@ impl RootModel {
             }
         };
 
-        let host_shown = shown(&prompt.host, false, prompt.field == ConnectField::Host);
-        let pw_shown = shown(
-            &prompt.password,
-            true,
-            prompt.field == ConnectField::Password,
-        );
+        let host_shown = shown(&prompt.host, false, true);
+        let pw_shown = shown(&prompt.password, true, true);
         let field_w = (28.0 * m.advance).clamp(
             text_w(&host_shown).max(text_w(&pw_shown)) + 2.0 * m.advance,
             (w * 0.9).max(1.0),
@@ -1275,12 +1307,13 @@ impl RootModel {
             radius: 0.0,
         }];
 
-        // Enough vertical room for title + two labeled fields + hint, centered.
-        let ty = ((h - m.line_height * 9.0) * 0.5).max(0.0);
+        // Enough vertical room for title + one labeled field/message + hint,
+        // centered.
+        let ty = ((h - m.line_height * 6.0) * 0.5).max(0.0);
         items.push(line(ty, "Connect to a host over SSH", FG));
 
-        // Push a labeled, bordered field at `y`; return the y below it.
-        let field = |items: &mut Vec<SceneItem>, y: f32, label: &str, text: &str, focus: bool| {
+        // Push the sole labeled, bordered field at `y`; return the y below it.
+        let field = |items: &mut Vec<SceneItem>, y: f32, label: &str, text: &str| {
             items.push(line(y, label, HINT));
             let fy = y + m.line_height * 1.1;
             let rect = RectPx {
@@ -1298,7 +1331,7 @@ impl RootModel {
             items.push(SceneItem::Border {
                 id: SceneId::NavBar,
                 rect,
-                color: if focus { BORDER } else { BORDER_DIM },
+                color: BORDER,
                 width: 2.0,
             });
             items.push(SceneItem::Text {
@@ -1317,26 +1350,34 @@ impl RootModel {
             fy + field_h
         };
 
-        let after_host = field(
-            &mut items,
-            ty + m.line_height * 1.8,
-            "Host",
-            &host_shown,
-            prompt.field == ConnectField::Host,
-        );
-        let after_pw = field(
-            &mut items,
-            after_host + m.line_height * 0.9,
-            "Password (blank for key/agent)",
-            &pw_shown,
-            prompt.field == ConnectField::Password,
-        );
+        // The body depends on the phase: the host field, a "connecting…" line,
+        // the masked password field (in place of the host, only when ssh asks),
+        // or the error message. Each yields the y below it and its hint.
+        let by = ty + m.line_height * 1.8;
+        let (after, hint) = match &prompt.phase {
+            ConnectPhase::Host => (
+                field(&mut items, by, "Host", &host_shown),
+                "Enter to connect · Esc to cancel",
+            ),
+            ConnectPhase::Connecting => {
+                let host = prompt.host.text();
+                items.push(line(by, &format!("Connecting to {host}\u{2026}"), FG));
+                (by + m.line_height, "Esc to cancel")
+            }
+            ConnectPhase::Password { prompt: label } => {
+                let label = if label.is_empty() { "Password" } else { label };
+                (
+                    field(&mut items, by, label, &pw_shown),
+                    "Enter to submit · Esc to cancel",
+                )
+            }
+            ConnectPhase::Error { message } => {
+                items.push(line(by, message, ERR));
+                (by + m.line_height, "Enter to retry · Esc to cancel")
+            }
+        };
 
-        items.push(line(
-            after_pw + m.line_height * 0.9,
-            "Tab to switch · Enter to connect · Esc to cancel",
-            HINT,
-        ));
+        items.push(line(after + m.line_height * 0.9, hint, HINT));
 
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer::new(0, items));
@@ -2661,31 +2702,36 @@ mod tests {
     }
 
     #[test]
-    fn submitting_a_host_opens_the_ssh_window_and_leaves_the_prompt() {
+    fn submitting_a_host_begins_connecting_over_the_transport() {
         let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
         r.begin_connect();
         typed(&mut r, "dev@example");
         let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
         let spec = ghost_vt::connection::ConnectionSpec::parse_target("dev@example").unwrap();
-        // No password typed → key/agent auth (None).
-        assert_eq!(
-            cmds,
-            vec![Cmd::ConnectSshWindow {
-                spec,
-                password: None
-            }]
-        );
-        // The prompt is gone — the window falls back to its (empty) live view.
-        assert!(!scene_has(&r, "Connect"), "prompt cleared after submit");
+        // Submitting the host begins the transport connect — no password inline.
+        assert_eq!(cmds, vec![Cmd::ConnectSshWindow { spec }]);
+        // The prompt stays up in its "connecting" phase (auth may still ask).
+        assert!(scene_has(&r, "Connecting"), "shows the connecting phase");
+        assert!(r.is_connecting());
     }
 
     #[test]
-    fn the_connect_prompt_takes_a_masked_password_and_submits_it() {
+    fn ssh_asking_shows_a_masked_password_field_and_submits_it() {
         let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
         r.begin_connect();
-        typed(&mut r, "dev@example"); // focus starts on the host field
-        // Tab to the password field and type; it renders masked, not in the clear.
-        key(&mut r, Key::Named(NamedKey::Tab), Mods::NONE);
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+
+        // The shell relays ssh's own prompt; the password field appears in place
+        // of the host, labelled with that wording.
+        r.connect_request_password("dev@example's password:".into());
+        assert!(scene_has(&r, "password:"), "ssh's prompt labels the field");
+        assert!(
+            !scene_has(&r, "dev@example") || scene_has(&r, "dev@example's password:"),
+            "the host field is gone (only the prompt label mentions the host)"
+        );
+
+        // Typing renders masked, never in the clear.
         typed(&mut r, "s3cret");
         assert!(
             !scene_has(&r, "s3cret"),
@@ -2693,15 +2739,30 @@ mod tests {
         );
         assert!(scene_has(&r, "\u{2022}"), "the password renders as bullets");
 
+        // Enter feeds the secret straight through to the in-flight auth.
         let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
-        let spec = ghost_vt::connection::ConnectionSpec::parse_target("dev@example").unwrap();
-        assert_eq!(
-            cmds,
-            vec![Cmd::ConnectSshWindow {
-                spec,
-                password: Some("s3cret".to_string())
-            }]
+        assert_eq!(cmds, vec![Cmd::ConnectPassword("s3cret".to_string())]);
+        assert!(
+            scene_has(&r, "Connecting"),
+            "back to connecting after submit"
         );
+    }
+
+    #[test]
+    fn a_failed_connect_shows_the_error_and_enter_retries_from_the_host() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+        r.connect_failed("Permission denied".into());
+        assert!(scene_has(&r, "Permission denied"), "the error shows");
+        // Enter returns to the host field (its text preserved) to try again.
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        assert!(
+            scene_has(&r, "dev@example"),
+            "host text preserved for a retry"
+        );
+        assert!(scene_has(&r, "Host"), "back on the host field");
     }
 
     #[test]

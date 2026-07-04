@@ -273,6 +273,43 @@ fn attach_over_ssh(
     Ok(s)
 }
 
+/// Put a fd (a connect warm-up's PTY) into non-blocking mode so the event loop
+/// can drain it without stalling.
+fn set_nonblocking(fd: impl std::os::fd::AsFd) -> io::Result<()> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let flags = fcntl_getfl(&fd).map_err(io::Error::from)?;
+    fcntl_setfl(&fd, flags | OFlags::NONBLOCK).map_err(io::Error::from)?;
+    Ok(())
+}
+
+/// ssh's password/passphrase prompt, if the warm-up output `buf` ends on one:
+/// the last non-empty line, when it mentions a password or passphrase. Used to
+/// surface the connect prompt's password field labelled with ssh's own wording.
+fn password_prompt(buf: &str) -> Option<String> {
+    let tail = buf.rsplit(['\n', '\r']).find(|l| !l.trim().is_empty())?;
+    let low = tail.to_ascii_lowercase();
+    (low.contains("password:") || low.contains("passphrase")).then(|| tail.trim().to_string())
+}
+
+/// A concise failure message from a warm-up ssh's output: its "Permission
+/// denied" line if present, else the last non-empty line, else a generic note.
+fn auth_error_message(buf: &str) -> String {
+    if let Some(l) = buf
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.contains("Permission denied"))
+    {
+        return l.to_string();
+    }
+    buf.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "ssh connection failed".to_string())
+}
+
 /// The identity reported by attaches with no window behind them (the
 /// headless bench harness); real windows report their group-derived identity
 /// ([`ghost_ui_core::group::window_identity`]) instead.
@@ -984,6 +1021,36 @@ fn open_url(url: &str) {
     }
 }
 
+/// A GUI ssh connect in flight for a window: the warm-up `ssh … true` running in
+/// a PTY, which opens (and authenticates) the shared ControlMaster the later
+/// transport steps reuse. Pumped from [`about_to_wait`](App::about_to_wait): its
+/// output is scanned for ssh's password/passphrase prompt (surfaced to the connect
+/// prompt so the user types into the window), and its exit drives the connect to
+/// completion (negotiate → spawn → attach) or failure. Dropping it kills the ssh.
+struct ConnectSetup {
+    remote: ghost_vt::remote::RemoteSsh,
+    spec: ConnectionSpec,
+    /// The remote session name to spawn and attach once auth succeeds.
+    name: String,
+    pty: pty_process::blocking::Pty,
+    child: std::process::Child,
+    /// Warm-up output accumulated so far, scanned for the ssh password prompt.
+    buf: String,
+    /// True once the current prompt has been surfaced to the window, so echoed
+    /// bytes don't re-ask; cleared when the user submits a password (a re-prompt
+    /// then means the password was wrong and asks again).
+    asked: bool,
+}
+
+impl Drop for ConnectSetup {
+    fn drop(&mut self) {
+        // Cancelled mid-auth (window closed / Escape): kill the warm-up ssh so it
+        // doesn't linger prompting on a PTY nothing reads.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Per-window state: the GPU surface and pure model, plus the input bookkeeping
 /// that is inherently per-window (focus modifiers, pointer position, click
 /// detection, and the model's scheduled tick).
@@ -1035,6 +1102,10 @@ struct WindowState {
     /// mid-run comes up blank (only its title bar) until an unrelated event forces a
     /// redraw. Set once, on the first successful present.
     presented_ok: bool,
+    /// A GUI ssh connect in flight (the window is showing the connect prompt).
+    /// Present from the `Cmd::ConnectSshWindow` handler until auth resolves; its
+    /// PTY is pumped each `about_to_wait` pass.
+    connect: Option<ConnectSetup>,
 }
 
 impl WindowState {
@@ -1453,8 +1524,11 @@ impl App {
                 }
                 Cmd::NewWindow => self.open_launch_window(event_loop),
                 Cmd::NewSshWindow => self.open_connect_window(event_loop),
-                Cmd::ConnectSshWindow { spec, password } => {
-                    self.connect_ssh_window(wid, spec, password, event_loop);
+                Cmd::ConnectSshWindow { spec } => {
+                    self.connect_ssh_window(wid, spec);
+                }
+                Cmd::ConnectPassword(password) => {
+                    self.connect_feed_password(wid, &password);
                 }
                 Cmd::CloseWindow => {
                     self.close_window(wid);
@@ -1718,60 +1792,188 @@ impl App {
         }
     }
 
-    /// Connect this window to a remote host over the SSH transport (the connect
-    /// prompt resolved): negotiate a remote ghost — staging the binary if needed —
-    /// spawn a detached host there, and attach the window over the `__pipe` tunnel.
-    /// Falls back to the local ssh *child* when the remote can't host ghost.
+    /// Begin connecting this window to a remote host over the SSH transport (the
+    /// connect prompt's host was submitted): open a PTY and start the warm-up
+    /// `ssh … true` in it. ssh authenticates there — prompting for a password on
+    /// the tty, which the user types into the window and [`about_to_wait`] feeds
+    /// through ([`pump_connect`](Self::pump_connect)). When it exits the connect
+    /// finishes over the now-open ControlMaster ([`finish_connect`]).
     ///
-    /// Blocking: the ssh round-trips (and a first-time binary stage) run inline, so
-    /// the window is unresponsive until the connection is up — acceptable for a
-    /// deliberate connect action; making it async is a polish item.
-    fn connect_ssh_window(
-        &mut self,
-        wid: WindowId,
-        spec: ConnectionSpec,
-        password: Option<String>,
-        event_loop: &ActiveEventLoop,
-    ) {
-        // Mark the window's group an ssh group first, so the adopt's registry save
-        // persists the connection (later sessions in it inherit it).
+    /// [`about_to_wait`]: App::about_to_wait
+    /// [`finish_connect`]: App::finish_connect
+    fn connect_ssh_window(&mut self, wid: WindowId, spec: ConnectionSpec) {
+        // Mark the window's group an ssh group first, so a later adopt's registry
+        // save persists the connection (sessions in it inherit it).
         if let Some(w) = self.windows.get_mut(&wid) {
             w.root.set_group_connection(Some(spec.clone()));
         }
         let name = self.unique_session_name();
 
-        // The initiator, carrying the typed password for ssh's askpass (the GUI
-        // has no tty). No password ⇒ key/agent auth.
-        let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).and_then(|r| match &password {
-            Some(pw) => r.with_askpass(pw.clone()),
-            None => Ok(r),
-        });
-        let remote = match remote {
+        let remote = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
             Ok(r) => r,
-            Err(e) => {
-                eprintln!("could not prepare the ssh connection: {e}");
+            Err(e) => return self.connect_fail(wid, format!("could not prepare ssh: {e}")),
+        };
+        match Self::start_connect(remote, spec, name) {
+            Ok(setup) => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.connect = Some(setup);
+                }
+            }
+            Err(e) => self.connect_fail(wid, format!("could not start ssh: {e}")),
+        }
+    }
+
+    /// Open a PTY and spawn the warm-up `ssh … true` on it (set non-blocking so
+    /// the event loop can pump it), returning the in-flight [`ConnectSetup`].
+    fn start_connect(
+        remote: ghost_vt::remote::RemoteSsh,
+        spec: ConnectionSpec,
+        name: String,
+    ) -> io::Result<ConnectSetup> {
+        let (pty, pts) = pty_process::blocking::open().map_err(io::Error::other)?;
+        pty.resize(pty_process::Size::new(24, 80))
+            .map_err(io::Error::other)?;
+        set_nonblocking(&pty)?;
+        let argv = remote.warmup_argv();
+        let child = pty_process::blocking::Command::new(&argv[0])
+            .args(&argv[1..])
+            .spawn(pts)
+            .map_err(io::Error::other)?;
+        Ok(ConnectSetup {
+            remote,
+            spec,
+            name,
+            pty,
+            child,
+            buf: String::new(),
+            asked: false,
+        })
+    }
+
+    /// Feed the password the user typed into the connect prompt to the in-flight
+    /// warm-up ssh over its PTY. Clears the scan buffer and re-arms prompt
+    /// detection so a re-prompt (a wrong password) asks again.
+    fn connect_feed_password(&mut self, wid: WindowId, password: &str) {
+        use std::io::Write as _;
+        if let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.as_mut()) {
+            let mut pty = &setup.pty;
+            let _ = pty.write_all(password.as_bytes());
+            let _ = pty.write_all(b"\n");
+            setup.buf.clear();
+            setup.asked = false;
+        }
+    }
+
+    /// Pump a window's in-flight connect once (called each `about_to_wait` pass):
+    /// drain the warm-up ssh's PTY, surface a password prompt to the window when
+    /// ssh asks, and act on the ssh exit — finish over the open master on success,
+    /// or show the error on failure.
+    fn pump_connect(&mut self, wid: WindowId, event_loop: &ActiveEventLoop) {
+        use std::io::Read as _;
+        enum Step {
+            Wait,
+            Redraw,
+            Done,
+            Failed(String),
+        }
+        let step = {
+            let Some(w) = self.windows.get_mut(&wid) else {
                 return;
+            };
+            let Some(setup) = w.connect.as_mut() else {
+                return;
+            };
+            let mut redraw = false;
+            let mut b = [0u8; 4096];
+            loop {
+                match (&setup.pty).read(&mut b) {
+                    Ok(0) => break,
+                    Ok(n) => setup.buf.push_str(&String::from_utf8_lossy(&b[..n])),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            if !setup.asked
+                && let Some(prompt) = password_prompt(&setup.buf)
+            {
+                setup.asked = true;
+                w.root.connect_request_password(prompt);
+                redraw = true;
+            }
+            match setup.child.try_wait() {
+                Ok(Some(status)) if status.success() => Step::Done,
+                Ok(Some(_)) => Step::Failed(auth_error_message(&setup.buf)),
+                Ok(None) if redraw => Step::Redraw,
+                Ok(None) => Step::Wait,
+                Err(e) => Step::Failed(format!("ssh error: {e}")),
             }
         };
+        match step {
+            Step::Wait => {}
+            Step::Redraw => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.gfx.window.request_redraw();
+                }
+            }
+            Step::Failed(msg) => self.connect_fail(wid, msg),
+            Step::Done => {
+                if let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take()) {
+                    self.finish_connect(wid, setup, event_loop);
+                }
+            }
+        }
+    }
 
+    /// The warm-up ssh authenticated and the shared ControlMaster is open: reuse
+    /// it (no re-auth) to negotiate a remote ghost — staging the binary if needed —
+    /// spawn a detached host, and attach the window over the `__pipe` tunnel. Falls
+    /// back to a local ssh *child* when the remote can't host ghost.
+    ///
+    /// Blocking: negotiate (and a first-time binary stage) run inline over the open
+    /// master, so the window is briefly busy — acceptable; making it async is a
+    /// polish item.
+    fn finish_connect(&mut self, wid: WindowId, setup: ConnectSetup, event_loop: &ActiveEventLoop) {
+        // Borrow the connection (its ssh calls take `&self`); `setup` — and its
+        // now-exited warm-up child — drop at the end.
+        let remote = &setup.remote;
+        let name = setup.name.clone();
         match remote.negotiate() {
             Some(remote_ghost) => {
                 if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
-                    eprintln!("could not start the remote host: {e}");
-                    return;
+                    return self.connect_fail(wid, format!("could not start the remote host: {e}"));
                 }
                 if self.attach_ssh_into(wid, &name, remote.pipe_command(&remote_ghost, &name)) {
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.root.end_connect();
+                    }
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                } else {
+                    self.connect_fail(wid, "could not attach to the remote session".into());
                 }
             }
             // The remote can't host ghost: fall back to a local ssh child (it runs
-            // in a PTY, so ssh prompts for the password in the terminal itself).
+            // in its own PTY view and prompts for the password there).
             None => {
-                spawn_session(&name, vec![], Some(spec));
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.root.end_connect();
+                }
+                spawn_session(&name, vec![], Some(setup.spec.clone()));
                 if self.attach_into(wid, &name) {
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                 }
             }
+        }
+    }
+
+    /// Abandon a window's in-flight connect and show `msg` on the prompt (Enter
+    /// then retries from the host field). Dropping the [`ConnectSetup`] kills the
+    /// warm-up ssh.
+    fn connect_fail(&mut self, wid: WindowId, msg: String) {
+        eprintln!("ghost: ssh connect failed: {msg}");
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.connect = None;
+            w.root.connect_failed(msg);
+            w.gfx.window.request_redraw();
         }
     }
 
@@ -1885,6 +2087,7 @@ impl App {
                 stats: framestats::FrameStats::from_env(),
                 needs_surface_sync: true,
                 presented_ok: false,
+                connect: None,
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -2093,6 +2296,7 @@ impl App {
                 stats: framestats::FrameStats::from_env(),
                 needs_surface_sync: true,
                 presented_ok: false,
+                connect: None,
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -2332,6 +2536,17 @@ impl ApplicationHandler<UserEvent> for App {
         }
         for (wid, ev) in observed {
             self.dispatch(wid, ev, event_loop);
+        }
+        // Pump any in-flight ssh connects: drain the warm-up ssh's PTY, surface a
+        // password prompt when ssh asks, and finish (or fail) the connect on exit.
+        let connecting: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.connect.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in connecting {
+            self.pump_connect(wid, event_loop);
         }
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.
@@ -2697,8 +2912,9 @@ impl ApplicationHandler<UserEvent> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir,
-        new_window_choice, respawn_opts, restore_plan, should_restore, startup_choice,
+        StartupChoice, auth_error_message, choose_alpha_mode, choose_surface_format,
+        home_launch_dir, new_window_choice, password_prompt, respawn_opts, restore_plan,
+        should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::session::SessionInfo;
@@ -2721,6 +2937,38 @@ mod tests {
             size: None,
             connection: None,
         }
+    }
+
+    #[test]
+    fn password_prompt_matches_ssh_password_and_passphrase_asks() {
+        // ssh writes the prompt with no trailing newline; the tail line is it.
+        assert_eq!(
+            password_prompt("Warning: blah\r\nclaude@host's password: ").as_deref(),
+            Some("claude@host's password:")
+        );
+        assert_eq!(
+            password_prompt("Enter passphrase for key '/home/k/.ssh/id_ed25519': ").as_deref(),
+            Some("Enter passphrase for key '/home/k/.ssh/id_ed25519':")
+        );
+        // Ordinary output (or nothing yet) is not a prompt.
+        assert_eq!(password_prompt("Last login: Tue\r\n"), None);
+        assert_eq!(password_prompt("   \n\n"), None);
+        assert_eq!(password_prompt(""), None);
+    }
+
+    #[test]
+    fn auth_error_message_prefers_the_permission_denied_line() {
+        assert_eq!(
+            auth_error_message("foo\r\nPermission denied, please try again.\r\nbar\r\n"),
+            "Permission denied, please try again."
+        );
+        // No denial line: the last non-empty line stands in.
+        assert_eq!(
+            auth_error_message("ssh: connect: no route\r\n"),
+            "ssh: connect: no route"
+        );
+        // Nothing at all: a generic note, never an empty string.
+        assert_eq!(auth_error_message(""), "ssh connection failed");
     }
 
     fn group(id: &str, members: &[&str]) -> ghost_ui_core::Group {

@@ -138,15 +138,6 @@ enum Command {
     /// runs it over ssh to decide transport-vs-ssh-child. Internal.
     #[command(name = "__probe", hide = true)]
     Probe,
-    /// The `SSH_ASKPASS` helper: echo the password ghost stashed in the
-    /// environment, so ssh can authenticate from the GUI (which has no tty).
-    /// ssh passes its prompt as an argument, which is ignored. Internal.
-    #[command(name = "__askpass", hide = true)]
-    Askpass {
-        /// ssh's prompt text (ignored).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        prompt: Vec<String>,
-    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -325,11 +316,6 @@ fn dispatch(command: Command) {
             }
         }
         Command::Probe => println!("{}", ghost_vt::remote::probe_line()),
-        Command::Askpass { .. } => match ghost_vt::remote::askpass_reply() {
-            Some(secret) => println!("{secret}"),
-            // No secret stashed: fail so ssh's auth fails fast instead of hanging.
-            None => std::process::exit(1),
-        },
     }
 }
 

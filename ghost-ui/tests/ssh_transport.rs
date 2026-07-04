@@ -311,27 +311,6 @@ fn ghost_ssh_falls_back_to_the_ssh_child_when_no_transport_is_possible() {
     assert_eq!(spec.target(), "dev@example");
 }
 
-#[test]
-fn askpass_echoes_the_stashed_secret_and_fails_without_one() {
-    // ssh runs `$SSH_ASKPASS "<prompt>"`; ghost's helper echoes the secret from
-    // the environment (the prompt argument is ignored).
-    let with = Command::new(GHOST)
-        .args(["__askpass", "claude@host's password:"])
-        .env("GHOST_ASKPASS_SECRET", "hunter2")
-        .output()
-        .expect("run `ghost __askpass`");
-    assert!(with.status.success());
-    assert_eq!(String::from_utf8_lossy(&with.stdout).trim_end(), "hunter2");
-
-    // No secret stashed: fail (non-zero) so ssh's auth fails fast, never hangs.
-    let without = Command::new(GHOST)
-        .args(["__askpass", "prompt"])
-        .env_remove("GHOST_ASKPASS_SECRET")
-        .output()
-        .expect("run `ghost __askpass`");
-    assert!(!without.status.success());
-}
-
 /// A `__pipe` to a session that isn't there fails cleanly rather than hanging.
 #[test]
 fn piping_to_a_missing_session_fails() {

@@ -73,16 +73,18 @@ pub enum Cmd {
     /// (Cmd+S / Ctrl+Shift+S). The shell opens a sessionless window showing the
     /// host entry; on submit the window emits [`Cmd::ConnectSshWindow`].
     NewSshWindow,
-    /// The connect prompt was submitted: make this window an ssh group for
-    /// `spec` and open its first remote session. The shell records the group's
-    /// connection (so later sessions in it inherit it), connects over the
-    /// transport (with `password` for auth, `None` = key/agent), and replies
-    /// `UiEvent::AdoptSession` to switch to it.
+    /// The connect prompt's host was submitted: make this window an ssh group for
+    /// `spec` and begin connecting over the transport. The shell records the
+    /// group's connection (so later sessions inherit it) and starts ssh auth in a
+    /// PTY; if ssh asks for a password it drives the prompt back to its password
+    /// field ([`UiEvent`]-side `connect_request_password`), and on success replies
+    /// `UiEvent::AdoptSession` to switch to the remote session.
     ConnectSshWindow {
         spec: ghost_vt::connection::ConnectionSpec,
-        /// The password typed in the prompt, or `None` for key/agent auth.
-        password: Option<String>,
     },
+    /// The connect prompt's password was submitted: the shell feeds it to the
+    /// in-flight ssh auth (over its PTY). Not stored — written straight through.
+    ConnectPassword(String),
     /// Close the window this command came from. The shell detaches the window's
     /// sessions (they keep running) — the "close = detach" default.
     CloseWindow,
