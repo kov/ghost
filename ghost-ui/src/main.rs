@@ -952,6 +952,7 @@ fn interactive(fresh: bool) {
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    let poller_proxy = proxy.clone();
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
@@ -965,7 +966,7 @@ fn interactive(fresh: bool) {
         next_group_color,
         bench: harness,
         focused: None,
-        proxy,
+        proxy: Some(proxy),
         remotes,
         remote_infos: HashMap::new(),
         remote_index: HashMap::new(),
@@ -980,7 +981,7 @@ fn interactive(fresh: bool) {
     };
     // The remote-fleet poller: lists each connected host's sessions off the event
     // loop and posts them back as `UserEvent::RemoteSessions`.
-    spawn_remote_poller(app.remotes.clone(), app.proxy.clone());
+    spawn_remote_poller(app.remotes.clone(), poller_proxy);
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -1283,6 +1284,82 @@ impl Frontend for WinitFrontend<'_> {
     }
 }
 
+/// A headless [`Frontend`] for tests: mints surface-less windows so the App's
+/// behaviour runs offscreen and deterministically, and records a quit so a test
+/// can assert on it. No winit, no GPU.
+#[cfg(test)]
+struct HeadlessFrontend {
+    /// Mints distinct synthetic [`WindowId`]s for the surface-less windows.
+    next_id: std::cell::Cell<u64>,
+    /// Set when the App asks to quit ([`Frontend::exit`]).
+    exited: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl HeadlessFrontend {
+    fn new() -> Self {
+        Self {
+            next_id: std::cell::Cell::new(1),
+            exited: std::cell::Cell::new(false),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Frontend for HeadlessFrontend {
+    fn open_window(&self, spec: WindowSpec) -> NewWindow {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        // Physical size == logical at scale 1.0, sized exactly as `Graphics::new`.
+        let m = metrics();
+        let w = (f64::from(spec.cols) * f64::from(m.advance) + 2.0 * f64::from(spec.pad)) as u32;
+        let h =
+            (f64::from(spec.rows) * f64::from(m.line_height) + 2.0 * f64::from(spec.pad)) as u32;
+        NewWindow {
+            id: WindowId::from(id),
+            gfx: None,
+            size_px: (w.max(1), h.max(1)),
+            scale: 1.0,
+        }
+    }
+
+    fn exit(&self) {
+        self.exited.set(true);
+    }
+
+    fn set_control_flow(&self, _flow: ControlFlow) {}
+}
+
+#[cfg(test)]
+impl App {
+    /// A behaviour-only App: no event loop, GPU, watcher, or poller — the seam a
+    /// [`HeadlessFrontend`] plugs into. Drive it with the App's own methods
+    /// (`open_fleet_window`, `dispatch`, `on_*`) and assert on its state.
+    fn headless() -> Self {
+        App {
+            windows: HashMap::new(),
+            clipboard: None,
+            start: Instant::now(),
+            startup: Startup::Fleet,
+            next_session_seq: 0,
+            next_group_seq: 0,
+            next_group_color: 0,
+            bench: None,
+            focused: None,
+            proxy: None,
+            remotes: Arc::default(),
+            remote_infos: HashMap::new(),
+            remote_index: HashMap::new(),
+            subs: HashMap::new(),
+            groups: Vec::new(),
+            _watcher: None,
+            sessions_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_workspace: Vec::new(),
+            workspace_dirty: false,
+        }
+    }
+}
+
 /// The scheme's default fg/bg handed to the models, so apps that query their
 /// terminal colors (OSC 10/11/12 — vim, fzf) see the configured theme. Ghost
 /// paints the cursor with the theme foreground, so that is its query color.
@@ -1470,8 +1547,9 @@ struct App {
     focused: Option<WindowId>,
     /// Proxy for posting messages into the event loop from another thread: native
     /// menu selections (AppKit's main thread, macOS) and the remote-fleet poller's
-    /// listings ([`UserEvent::RemoteSessions`]).
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    /// listings ([`UserEvent::RemoteSessions`]). `None` under a headless
+    /// [`Frontend`], where no threads post back into the loop.
+    proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
     /// Remote hosts reached over the ssh transport, keyed by target — retained
     /// after a successful connect and shared with the poller thread that lists
     /// their sessions. A host stays until its last window/session is gone.
@@ -2311,13 +2389,10 @@ impl App {
                 // the window stays live; the worker posts `ConnectFinished` back and
                 // `finish_connect` attaches on the main thread. The prompt stays in
                 // its "Connecting" phase meanwhile.
-                if let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take()) {
-                    spawn_connect_worker(
-                        self.proxy.clone(),
-                        wid,
-                        setup.spec.clone(),
-                        setup.name.clone(),
-                    );
+                if let Some(proxy) = self.proxy.clone()
+                    && let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take())
+                {
+                    spawn_connect_worker(proxy, wid, setup.spec.clone(), setup.name.clone());
                     // `setup` drops here — the warm-up PTY/child are done with.
                 }
             }
@@ -3095,7 +3170,9 @@ impl ApplicationHandler<UserEvent> for App {
         // ghost's File / Edit / View / Window submenus to the App submenu winit
         // set up in applicationDidFinishLaunching).
         #[cfg(target_os = "macos")]
-        menu::install(self.proxy.clone());
+        if let Some(proxy) = self.proxy.clone() {
+            menu::install(proxy);
+        }
         // Bench mode: populate the fleet and load every preview before any animation.
         if self.bench.is_some()
             && let Some(wid) = self.windows.keys().next().copied()
@@ -3564,10 +3641,10 @@ impl ApplicationHandler<UserEvent> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode, choose_surface_format,
-        home_launch_dir, inherited_connection, local_only, local_only_groups,
-        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, should_restore, startup_choice,
+        App, HeadlessFrontend, REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode,
+        choose_surface_format, home_launch_dir, inherited_connection, local_only,
+        local_only_groups, namespace_remote_infos, new_window_choice, password_prompt,
+        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -3577,6 +3654,43 @@ mod tests {
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
+
+    /// Run `f` with `$XDG_*` redirected to a throwaway dir, serialized against
+    /// other App tests (the env is process-global). So the shell's disk writes
+    /// (groups, workspace) never touch the developer's real ghost state.
+    fn with_isolated_xdg<T>(f: impl FnOnce() -> T) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded within the lock; no other thread reads the env
+        // concurrently (App tests are the only ones that touch XDG, and they hold
+        // this same lock).
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
+        }
+        f()
+    }
+
+    #[test]
+    fn headless_frontend_opens_a_surfaceless_fleet_window() {
+        // The Phase-1 proof: the real App shell runs offscreen. Opening a fleet
+        // window through the headless frontend creates a live, surface-less window
+        // whose model is in the fleet overview — no GPU, no event loop.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+
+            let win = app.windows.get(&wid).expect("the window was inserted");
+            assert!(win.gfx.is_none(), "a headless window carries no surface");
+            assert!(win.root.is_fleet(), "it opened in the fleet overview");
+            assert!(!fe.exited.get(), "opening a window does not quit the app");
+        });
+    }
 
     #[test]
     fn a_new_session_routes_onto_a_connected_remote_host_only() {
