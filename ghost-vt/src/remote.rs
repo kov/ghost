@@ -25,10 +25,37 @@ fn staged_dir(home: &str) -> String {
 }
 
 /// Where a staged ghost lands on the remote (absolute, so it needs no shell
-/// tilde/`$HOME` expansion at exec time), version-stamped so a mismatched build
-/// never gets reused and each version is provisioned once.
-fn staged_path(home: &str) -> String {
-    format!("{}/ghost-{}", staged_dir(home), env!("CARGO_PKG_VERSION"))
+/// tilde/`$HOME` expansion at exec time), stamped with the version *and* a hash
+/// of this binary's contents so a *changed* build never reuses a stale copy —
+/// crucial during development, where the version string doesn't move between
+/// builds but the binary (and its features) do.
+fn staged_path(home: &str, stamp: &str) -> String {
+    format!(
+        "{}/ghost-{}-{stamp}",
+        staged_dir(home),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// A short content hash of this running binary, cached for the process. Stamps
+/// the staged path so a rebuilt binary re-stages (identical contents reuse the
+/// existing copy). `"unknown"` if the executable can't be read — staging then
+/// falls back to version-only stamping for this process.
+fn local_build_stamp() -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            std::env::current_exe()
+                .and_then(std::fs::read)
+                .map(|bytes| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    format!("{:016x}", h.finish())
+                })
+                .unwrap_or_else(|_| "unknown".into())
+        })
+        .clone()
 }
 
 /// Whether a remote `uname -s -m` names the same OS+arch as this build — the gate
@@ -144,7 +171,7 @@ impl RemoteSsh {
         }
         // Staging needs an absolute path, so learn the remote home first.
         let home = self.remote_home()?;
-        let staged = staged_path(&home);
+        let staged = staged_path(&home, &local_build_stamp());
         if self.probe(&staged) {
             return Some(staged);
         }
@@ -370,14 +397,17 @@ mod tests {
     }
 
     #[test]
-    fn staged_path_is_absolute_and_version_stamped_under_the_remote_home() {
-        let p = staged_path("/home/claude");
+    fn staged_path_is_absolute_and_version_and_build_stamped_under_the_remote_home() {
+        let p = staged_path("/home/claude", "deadbeefcafef00d");
         assert_eq!(
             p,
             format!(
-                "/home/claude/.cache/ghost/bin/ghost-{}",
+                "/home/claude/.cache/ghost/bin/ghost-{}-deadbeefcafef00d",
                 env!("CARGO_PKG_VERSION")
             )
         );
+        // A different build stamp routes to a different path, so a changed binary
+        // never reuses a stale staged copy.
+        assert_ne!(p, staged_path("/home/claude", "0000000000000000"));
     }
 }
