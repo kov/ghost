@@ -45,7 +45,7 @@ use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
-use menu::{MenuIntent, UserEvent};
+use menu::{ConnectOutcome, MenuIntent, UserEvent};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -356,6 +356,39 @@ fn spawn_remote_poller(
             }
             std::thread::sleep(REMOTE_POLL_INTERVAL);
         }
+    });
+}
+
+/// The off-loop half of an ssh connect: with the ControlMaster already open (the
+/// PTY warm-up authenticated), negotiate a remote ghost — staging the ~126 MiB
+/// binary if the host lacks it, the slow part — and spawn the detached host, then
+/// post the [`ConnectOutcome`] back so the main loop attaches. Runs on its own
+/// thread so the window stays responsive throughout (it shows "Connecting…").
+fn spawn_connect_worker(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    wid: WindowId,
+    spec: ConnectionSpec,
+    name: String,
+) {
+    std::thread::spawn(move || {
+        let outcome = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
+            Ok(remote) => match remote.negotiate() {
+                Some(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
+                    Ok(()) => ConnectOutcome::Transport { remote_ghost },
+                    Err(e) => {
+                        ConnectOutcome::Error(format!("could not start the remote host: {e}"))
+                    }
+                },
+                None => ConnectOutcome::Fallback,
+            },
+            Err(e) => ConnectOutcome::Error(format!("could not open the ssh connection: {e}")),
+        };
+        let _ = proxy.send_event(UserEvent::ConnectFinished {
+            wid,
+            spec,
+            name,
+            outcome,
+        });
     });
 }
 
@@ -1119,7 +1152,7 @@ fn open_url(url: &str) {
 /// prompt so the user types into the window), and its exit drives the connect to
 /// completion (negotiate → spawn → attach) or failure. Dropping it kills the ssh.
 struct ConnectSetup {
-    remote: ghost_vt::remote::RemoteSsh,
+    /// The target to connect to; handed to the connect worker once auth succeeds.
     spec: ConnectionSpec,
     /// The remote session name to spawn and attach once auth succeeds.
     name: String,
@@ -1970,7 +2003,6 @@ impl App {
             .spawn(pts)
             .map_err(io::Error::other)?;
         Ok(ConnectSetup {
-            remote,
             spec,
             name,
             pty,
@@ -1996,9 +2028,9 @@ impl App {
 
     /// Pump a window's in-flight connect once (called each `about_to_wait` pass):
     /// drain the warm-up ssh's PTY, surface a password prompt to the window when
-    /// ssh asks, and act on the ssh exit — finish over the open master on success,
-    /// or show the error on failure.
-    fn pump_connect(&mut self, wid: WindowId, event_loop: &ActiveEventLoop) {
+    /// ssh asks, and on the ssh exit hand off to the connect worker (success) or
+    /// show the error (failure).
+    fn pump_connect(&mut self, wid: WindowId) {
         use std::io::Read as _;
         enum Step {
             Wait,
@@ -2047,41 +2079,54 @@ impl App {
             }
             Step::Failed(msg) => self.connect_fail(wid, msg),
             Step::Done => {
+                // Auth succeeded and the shared ControlMaster is open. Run the rest —
+                // negotiate, a possible 126 MiB stage, spawn — OFF the event loop so
+                // the window stays live; the worker posts `ConnectFinished` back and
+                // `finish_connect` attaches on the main thread. The prompt stays in
+                // its "Connecting" phase meanwhile.
                 if let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take()) {
-                    self.finish_connect(wid, setup, event_loop);
+                    spawn_connect_worker(
+                        self.proxy.clone(),
+                        wid,
+                        setup.spec.clone(),
+                        setup.name.clone(),
+                    );
+                    // `setup` drops here — the warm-up PTY/child are done with.
                 }
             }
         }
     }
 
-    /// The warm-up ssh authenticated and the shared ControlMaster is open: reuse
-    /// it (no re-auth) to negotiate a remote ghost — staging the binary if needed —
-    /// spawn a detached host, and attach the window over the `__pipe` tunnel. Falls
-    /// back to a local ssh *child* when the remote can't host ghost.
-    ///
-    /// Blocking: negotiate (and a first-time binary stage) run inline over the open
-    /// master, so the window is briefly busy — acceptable; making it async is a
-    /// polish item.
-    fn finish_connect(&mut self, wid: WindowId, setup: ConnectSetup, event_loop: &ActiveEventLoop) {
-        // Borrow the connection (its ssh calls take `&self`); `setup` — and its
-        // now-exited warm-up child — drop at the end.
-        let remote = &setup.remote;
-        let name = setup.name.clone();
-        match remote.negotiate() {
-            Some(remote_ghost) => {
+    /// Finish an ssh connect on the main thread once its worker reported the
+    /// outcome ([`ConnectOutcome`]): attach the window over the transport (the fast,
+    /// main-thread part), fall back to a local ssh child, or show the error. A
+    /// window closed while the worker ran is simply dropped.
+    fn finish_connect(
+        &mut self,
+        wid: WindowId,
+        spec: ConnectionSpec,
+        name: String,
+        outcome: ConnectOutcome,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if !self.windows.contains_key(&wid) {
+            return; // the window was closed mid-connect
+        }
+        match outcome {
+            ConnectOutcome::Transport { remote_ghost } => {
                 // Retain the host so the fleet polls its other sessions too.
-                self.register_remote(&setup.spec, &remote_ghost);
-                if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
-                    return self.connect_fail(wid, format!("could not start the remote host: {e}"));
-                }
+                self.register_remote(&spec, &remote_ghost);
                 // Drive it under the SAME composite id the poller will discover it
                 // by (`<target>␟<name>`), so the window recognizes its own session
                 // as this-window in the fleet instead of as a foreign duplicate. The
                 // transport still addresses the bare remote name.
-                let target = setup.spec.target();
+                let target = spec.target();
                 let local_id = remote_fleet_id(&target, &name);
                 self.remote_index
                     .insert(local_id.clone(), (target, name.clone()));
+                let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec) else {
+                    return self.connect_fail(wid, "could not open the ssh connection".into());
+                };
                 if self.attach_ssh_into(wid, &local_id, remote.pipe_command(&remote_ghost, &name)) {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.root.end_connect();
@@ -2093,15 +2138,16 @@ impl App {
             }
             // The remote can't host ghost: fall back to a local ssh child (it runs
             // in its own PTY view and prompts for the password there).
-            None => {
+            ConnectOutcome::Fallback => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.root.end_connect();
                 }
-                spawn_session(&name, vec![], Some(setup.spec.clone()));
+                spawn_session(&name, vec![], Some(spec));
                 if self.attach_into(wid, &name) {
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                 }
             }
+            ConnectOutcome::Error(msg) => self.connect_fail(wid, msg),
         }
     }
 
@@ -2619,6 +2665,17 @@ impl ApplicationHandler<UserEvent> for App {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
+            // The connect worker finished (negotiate/stage/spawn ran off-loop):
+            // attach the window over the result on the main thread.
+            UserEvent::ConnectFinished {
+                wid,
+                spec,
+                name,
+                outcome,
+            } => {
+                self.finish_connect(wid, spec, name, outcome, event_loop);
+                return;
+            }
         };
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
@@ -2765,7 +2822,7 @@ impl ApplicationHandler<UserEvent> for App {
             .map(|(id, _)| *id)
             .collect();
         for wid in connecting {
-            self.pump_connect(wid, event_loop);
+            self.pump_connect(wid);
         }
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.

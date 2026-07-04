@@ -30,7 +30,7 @@ use ghost_ui_core::input::{Key, Mods, NamedKey};
 /// The `Menu` variant is only ever constructed by the macOS-only [`imp`] target;
 /// off macOS nothing posts it, so it's allowed to go unconstructed there without
 /// tripping `-D warnings`. `RemoteSessions` is posted by the remote-fleet poller
-/// thread with a host's latest session listing.
+/// thread; `ConnectFinished` by the ssh-connect worker thread.
 #[derive(Clone, Debug)]
 pub enum UserEvent {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -40,6 +40,28 @@ pub enum UserEvent {
         target: String,
         infos: Vec<ghost_vt::session::SessionInfo>,
     },
+    /// The background half of an ssh connect finished (negotiate/stage/spawn ran
+    /// off the event loop): the main loop attaches the window over the result.
+    ConnectFinished {
+        wid: winit::window::WindowId,
+        spec: ghost_vt::connection::ConnectionSpec,
+        /// The session name spawned on the remote (bare, transport-addressed).
+        name: String,
+        outcome: ConnectOutcome,
+    },
+}
+
+/// The result of the off-loop half of an ssh connect (after auth): what the main
+/// loop should do to finish it.
+#[derive(Clone, Debug)]
+pub enum ConnectOutcome {
+    /// A remote ghost was negotiated (staged if needed) and the host spawned;
+    /// attach the window over the transport using this remote binary.
+    Transport { remote_ghost: String },
+    /// The remote can't host ghost — fall back to a local ssh child.
+    Fallback,
+    /// The setup failed; show the message on the connect prompt.
+    Error(String),
 }
 
 /// A custom menu item that maps back onto a ghost command. The native window
