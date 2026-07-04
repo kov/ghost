@@ -1213,6 +1213,76 @@ impl Graphics {
     }
 }
 
+/// What a new window should open as, handed to [`Frontend::open_window`].
+struct WindowSpec {
+    theme: ghost_renderer::Theme,
+    option_as_meta: bool,
+    cols: u16,
+    rows: u16,
+    pad: f32,
+}
+
+/// A realized window handed back by the [`Frontend`]: its id, physical size, and
+/// scale (enough to size a model), plus its GPU graphics — `None` when the
+/// frontend is headless (a behaviour-only window with no surface).
+struct NewWindow {
+    id: WindowId,
+    gfx: Option<Graphics>,
+    size_px: (u32, u32),
+    scale: f64,
+}
+
+/// The windowing backend the [`App`] drives, behind a seam so its behaviour can
+/// run without winit. The production impl ([`WinitFrontend`]) wraps a winit
+/// `ActiveEventLoop`; the test impl ([`HeadlessFrontend`]) mints surface-less
+/// windows so `App` logic (sessions, remotes, the fleet) is exercised offscreen
+/// and deterministically. The App threads `&dyn Frontend` where it used to thread
+/// `&ActiveEventLoop`.
+trait Frontend {
+    /// Realize a new window (a real OS window + GPU surface, or a headless stub).
+    fn open_window(&self, spec: WindowSpec) -> NewWindow;
+    /// Leave the event loop (quit).
+    fn exit(&self);
+    /// Set when the loop next wakes.
+    fn set_control_flow(&self, flow: ControlFlow);
+}
+
+/// The production [`Frontend`]: a thin wrapper over the live winit event loop,
+/// constructed fresh at each `ApplicationHandler` entry point.
+struct WinitFrontend<'a> {
+    event_loop: &'a ActiveEventLoop,
+}
+
+impl Frontend for WinitFrontend<'_> {
+    fn open_window(&self, spec: WindowSpec) -> NewWindow {
+        let gfx = Graphics::new(
+            self.event_loop,
+            spec.theme,
+            spec.option_as_meta,
+            spec.cols,
+            spec.rows,
+            spec.pad,
+        );
+        let id = gfx.window.id();
+        let scale = gfx.window.scale_factor();
+        let size_px = gfx.size();
+        NewWindow {
+            id,
+            gfx: Some(gfx),
+            size_px,
+            scale,
+        }
+    }
+
+    fn exit(&self) {
+        self.event_loop.exit();
+    }
+
+    fn set_control_flow(&self, flow: ControlFlow) {
+        self.event_loop.set_control_flow(flow);
+    }
+}
+
 /// The scheme's default fg/bg handed to the models, so apps that query their
 /// terminal colors (OSC 10/11/12 — vim, fzf) see the configured theme. Ghost
 /// paints the cursor with the theme foreground, so that is its query color.
@@ -1280,7 +1350,10 @@ impl Drop for ConnectSetup {
 /// that is inherently per-window (focus modifiers, pointer position, click
 /// detection, and the model's scheduled tick).
 struct WindowState {
-    gfx: Graphics,
+    /// The window's GPU graphics (surface + winit window), or `None` when driven
+    /// by a headless [`Frontend`] — a behaviour-only window with no surface, so
+    /// the render/redraw paths are inert (see [`WindowState::request_redraw`]).
+    gfx: Option<Graphics>,
     root: RootModel,
     /// This window's own session clients (the single-view session plus any fleet
     /// previews). Dropping the window drops these, which detaches every session
@@ -1334,6 +1407,14 @@ struct WindowState {
 }
 
 impl WindowState {
+    /// Request a repaint, if this window has a surface. A no-op for a headless
+    /// window (no [`Graphics`]), so behaviour paths can call it unconditionally.
+    fn request_redraw(&self) {
+        if let Some(gfx) = &self.gfx {
+            gfx.window.request_redraw();
+        }
+    }
+
     /// Click count for a press of `button` at the current pointer position: a
     /// repeat of the same button within 400ms and a few pixels increments the
     /// count (double-, triple-click), otherwise it resets to 1.
@@ -1455,7 +1536,7 @@ impl App {
         &mut self,
         wid: WindowId,
         live: &[ghost_vt::session::SessionInfo],
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
     ) {
         let live_names: HashSet<&str> = live.iter().map(|i| i.name.as_str()).collect();
         let mut dead: Vec<ghost_ui_core::DeadSession> = Vec::new();
@@ -1542,7 +1623,7 @@ impl App {
     /// Drain every subscription and fan its pushes out to all windows (each
     /// window's fleet keeps its own tiles). A subscription ending usually
     /// means the session died: drop it and hint a re-enumeration.
-    fn pump_subscriptions(&mut self, event_loop: &ActiveEventLoop) {
+    fn pump_subscriptions(&mut self, event_loop: &dyn Frontend) {
         let mut pushes: Vec<(String, SessionPush)> = Vec::new();
         let mut any_ended = false;
         self.subs.retain(|name, sub| {
@@ -1584,7 +1665,7 @@ impl App {
     }
 
     /// Feed an event to window `wid`'s model and execute the effects it returns.
-    fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &ActiveEventLoop) {
+    fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(ev),
             None => return,
@@ -1595,7 +1676,7 @@ impl App {
         self.workspace_dirty = true;
     }
 
-    fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
+    fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
@@ -1882,13 +1963,13 @@ impl App {
                     height,
                     rgba,
                 } => {
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.gfx.renderer.upload_image(id, width, height, &rgba);
+                    if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
+                        gfx.renderer.upload_image(id, width, height, &rgba);
                     }
                 }
                 Cmd::RequestAttention => {
-                    if let Some(w) = self.windows.get(&wid) {
-                        w.gfx.window.request_user_attention(Some(
+                    if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        gfx.window.request_user_attention(Some(
                             winit::window::UserAttentionType::Informational,
                         ));
                     }
@@ -1901,14 +1982,14 @@ impl App {
                     }
                 }
                 Cmd::SetTitle(t) => {
-                    if let Some(w) = self.windows.get(&wid) {
-                        w.gfx.window.set_title(&t);
+                    if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        gfx.window.set_title(&t);
                     }
                 }
                 Cmd::OpenUrl(url) => open_url(&url),
                 Cmd::PointerIcon(icon) => {
-                    if let Some(w) = self.windows.get(&wid) {
-                        w.gfx.window.set_cursor(match icon {
+                    if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        gfx.window.set_cursor(match icon {
                             ghost_ui_core::PointerIcon::Pointer => {
                                 winit::window::CursorIcon::Pointer
                             }
@@ -1993,7 +2074,7 @@ impl App {
     /// last has settled, or exit when the run is done. The single bench window's
     /// `is_animating` gates the script (so one only starts once the prior finishes);
     /// dispatched F9 / tile-selects / Ctrl-Tabs drive the real render+present path.
-    fn drive_bench(&mut self, event_loop: &ActiveEventLoop) {
+    fn drive_bench(&mut self, event_loop: &dyn Frontend) {
         let Some(wid) = self.windows.keys().next().copied() else {
             return;
         };
@@ -2220,7 +2301,7 @@ impl App {
             Step::Wait => {}
             Step::Redraw => {
                 if let Some(w) = self.windows.get_mut(&wid) {
-                    w.gfx.window.request_redraw();
+                    w.request_redraw();
                 }
             }
             Step::Failed(msg) => self.connect_fail(wid, msg),
@@ -2253,7 +2334,7 @@ impl App {
         spec: ConnectionSpec,
         name: String,
         outcome: ConnectOutcome,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
     ) {
         if !self.windows.contains_key(&wid) {
             return; // the window was closed mid-connect
@@ -2305,7 +2386,7 @@ impl App {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.connect = None;
             w.root.connect_failed(msg);
-            w.gfx.window.request_redraw();
+            w.request_redraw();
         }
     }
 
@@ -2352,7 +2433,7 @@ impl App {
         id: &str,
         target: &str,
         real: &str,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
     ) {
         let held = self
             .windows
@@ -2387,7 +2468,7 @@ impl App {
         wid: WindowId,
         target: &str,
         name: &str,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
     ) {
         let host = self
             .remotes
@@ -2481,7 +2562,7 @@ impl App {
         w_px: u32,
         h_px: u32,
         scale: f64,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
     ) {
         let now_ms = self.now_ms();
         let step = {
@@ -2489,27 +2570,29 @@ impl App {
                 return;
             };
             let step = w.resize.note(now_ms, w_px, h_px, scale);
-            match step {
-                // Isolated resize (maximize / snap / un-maximize / a drag's first
-                // grab): drop any snapshot and resize the surface now; the real
-                // relayout is dispatched below, crisply.
-                resize::Step::CommitNow((cw, ch, _)) => {
-                    w.gfx.renderer.clear_snapshot();
-                    w.gfx.resize(cw, ch);
-                }
-                // A drag is streaming: capture the last crisp frame once, then
-                // stretch-blit it cheaply until the gesture settles (the real
-                // resize is committed from `about_to_wait`).
-                resize::Step::Defer => {
-                    if !w.gfx.renderer.has_snapshot() {
-                        let scene = w.root.view();
-                        let font_px = size_px() * w.root.render_scale();
-                        w.gfx
-                            .renderer
-                            .capture_snapshot(&scene, w.gfx.fonts, font_px);
+            // A headless window has no surface to resize; the model still re-grids
+            // below via the dispatched `Resize`.
+            if let Some(gfx) = w.gfx.as_mut() {
+                match step {
+                    // Isolated resize (maximize / snap / un-maximize / a drag's first
+                    // grab): drop any snapshot and resize the surface now; the real
+                    // relayout is dispatched below, crisply.
+                    resize::Step::CommitNow((cw, ch, _)) => {
+                        gfx.renderer.clear_snapshot();
+                        gfx.resize(cw, ch);
                     }
-                    w.gfx.resize(w_px, h_px);
-                    w.gfx.blit_snapshot();
+                    // A drag is streaming: capture the last crisp frame once, then
+                    // stretch-blit it cheaply until the gesture settles (the real
+                    // resize is committed from `about_to_wait`).
+                    resize::Step::Defer => {
+                        if !gfx.renderer.has_snapshot() {
+                            let scene = w.root.view();
+                            let font_px = size_px() * w.root.render_scale();
+                            gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
+                        }
+                        gfx.resize(w_px, h_px);
+                        gfx.blit_snapshot();
+                    }
                 }
             }
             step
@@ -2532,23 +2615,24 @@ impl App {
     /// when `None`). The user spawns or takes over a session from there.
     fn open_fleet_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
         group: ghost_ui_core::Group,
         size: Option<(u16, u16)>,
     ) -> WindowId {
         let cfg = config::UiConfig::load();
         let (req_cols, req_rows) = size.unwrap_or((cfg.columns(), cfg.rows()));
-        let gfx = Graphics::new(
-            event_loop,
-            cfg.theme(),
-            cfg.option_as_meta(),
-            req_cols,
-            req_rows,
-            cfg.padding(),
-        );
-        let wid = gfx.window.id();
-        let scale = gfx.window.scale_factor();
-        let (w, h) = gfx.size();
+        let NewWindow {
+            id: wid,
+            gfx,
+            size_px: (w, h),
+            scale,
+        } = event_loop.open_window(WindowSpec {
+            theme: cfg.theme(),
+            option_as_meta: cfg.option_as_meta(),
+            cols: req_cols,
+            rows: req_rows,
+            pad: cfg.padding(),
+        });
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
@@ -2604,12 +2688,12 @@ impl App {
     /// Ctrl+Shift+S): a fresh fleet window on its own group, flipped into the
     /// connect state so it captures a `[user@]host` and, on submit, becomes an
     /// ssh window (see the `Cmd::ConnectSshWindow` handler).
-    fn open_connect_window(&mut self, event_loop: &ActiveEventLoop) {
+    fn open_connect_window(&mut self, event_loop: &dyn Frontend) {
         let group = self.mint_group();
         let wid = self.open_fleet_window(event_loop, group, None);
         if let Some(w) = self.windows.get_mut(&wid) {
             w.root.begin_connect();
-            w.gfx.window.request_redraw();
+            w.request_redraw();
         }
     }
 
@@ -2618,7 +2702,7 @@ impl App {
     /// remembers a dead one, otherwise spawn a fresh session and show it as a single
     /// view. Runs in this same process, so the new window shares the clipboard,
     /// clock, and menu with the others.
-    fn open_launch_window(&mut self, event_loop: &ActiveEventLoop) {
+    fn open_launch_window(&mut self, event_loop: &dyn Frontend) {
         let sessions = session::list().unwrap_or_default();
         match new_window_choice(&sessions, &self.groups) {
             StartupChoice::Fleet => {
@@ -2688,7 +2772,7 @@ impl App {
     /// The single quit path: record the open windows, then leave the event loop.
     /// Every user-initiated quit (Cmd/Ctrl+Q, closing the last window) funnels
     /// through here so the workspace is flushed before exit.
-    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+    fn shutdown(&mut self, event_loop: &dyn Frontend) {
         self.save_workspace();
         event_loop.exit();
     }
@@ -2735,9 +2819,9 @@ impl App {
         ids.sort();
         let cur = ids.iter().position(|w| *w == current);
         if let Some(next) = cycle_index(ids.len(), cur, forward)
-            && let Some(w) = self.windows.get(&ids[next])
+            && let Some(gfx) = self.windows.get(&ids[next]).and_then(|w| w.gfx.as_ref())
         {
-            w.gfx.window.focus_window();
+            gfx.window.focus_window();
         }
     }
 }
@@ -2749,24 +2833,25 @@ impl App {
     /// the new window's id, or `None` if the attach fails.
     fn open_single_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
         name: &str,
         group: ghost_ui_core::Group,
         size: Option<(u16, u16)>,
     ) -> Option<WindowId> {
         let cfg = config::UiConfig::load();
         let (req_cols, req_rows) = size.unwrap_or((cfg.columns(), cfg.rows()));
-        let gfx = Graphics::new(
-            event_loop,
-            cfg.theme(),
-            cfg.option_as_meta(),
-            req_cols,
-            req_rows,
-            cfg.padding(),
-        );
-        let wid = gfx.window.id();
-        let scale = gfx.window.scale_factor();
-        let (w, h) = gfx.size();
+        let NewWindow {
+            id: wid,
+            gfx,
+            size_px: (w, h),
+            scale,
+        } = event_loop.open_window(WindowSpec {
+            theme: cfg.theme(),
+            option_as_meta: cfg.option_as_meta(),
+            cols: req_cols,
+            rows: req_rows,
+            pad: cfg.padding(),
+        });
         let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
         // The window's group identity — reclaimed for a restored window, freshly
         // minted otherwise — so the very first attach reports the right group.
@@ -2789,7 +2874,9 @@ impl App {
         // Title the window with the session up front (its label or name until the
         // app sets an OSC title), so the initial view follows the foreground like
         // every switch does — not a static "ghost".
-        gfx.window.set_title(&model.title());
+        if let Some(g) = &gfx {
+            g.window.set_title(&model.title());
+        }
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
@@ -2853,7 +2940,7 @@ impl App {
     /// an empty workspace slipped through), so the app never comes up windowless.
     fn restore_workspace(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn Frontend,
         records: Vec<ghost_ui_core::WindowRecord>,
     ) {
         let sessions = session::list().unwrap_or_default();
@@ -2869,7 +2956,7 @@ impl App {
     /// grid it was sized to; relaunch dead members (shell + seeded recording) then
     /// attach every member, adopting them in order so the foreground (ordered last)
     /// ends up focused; and restore the fleet overview if that is how it was left.
-    fn restore_window(&mut self, event_loop: &ActiveEventLoop, plan: WindowPlan) {
+    fn restore_window(&mut self, event_loop: &dyn Frontend, plan: WindowPlan) {
         let WindowPlan {
             group,
             cols,
@@ -2926,6 +3013,7 @@ impl ApplicationHandler<UserEvent> for App {
     /// turned back into the effect a keystroke would have produced, so the pure
     /// core stays the single source of truth (see [`menu::menu_intent`]).
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let fe = WinitFrontend { event_loop };
         let action = match event {
             UserEvent::Menu(action) => action,
             // The poller thread delivered a remote host's latest listing: stash it
@@ -2945,24 +3033,24 @@ impl ApplicationHandler<UserEvent> for App {
                 name,
                 outcome,
             } => {
-                self.finish_connect(wid, spec, name, outcome, event_loop);
+                self.finish_connect(wid, spec, name, outcome, &fe);
                 return;
             }
             // Staging byte-progress from the connect worker: update the bar.
             UserEvent::ConnectProgress { wid, sent, total } => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.root.connect_progress(sent, total);
-                    w.gfx.window.request_redraw();
+                    w.request_redraw();
                 }
                 return;
             }
         };
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
-            MenuIntent::NewWindow => self.open_launch_window(event_loop),
+            MenuIntent::NewWindow => self.open_launch_window(&fe),
             MenuIntent::FocusedCmd(cmd) => {
                 if let Some(wid) = self.focused_window() {
-                    self.exec(wid, vec![cmd], event_loop);
+                    self.exec(wid, vec![cmd], &fe);
                 }
             }
             MenuIntent::FocusedKey(key, mods) => {
@@ -2975,7 +3063,7 @@ impl ApplicationHandler<UserEvent> for App {
                             kind: KeyEventKind::Press,
                             alts: None,
                         },
-                        event_loop,
+                        &fe,
                     );
                 }
             }
@@ -2983,24 +3071,22 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let fe = WinitFrontend { event_loop };
         if !self.windows.is_empty() {
             return;
         }
         // Consumed once (this guard keeps `resumed` from re-running); the
         // placeholder is never used.
         match std::mem::replace(&mut self.startup, Startup::Fleet) {
-            Startup::Restore(records) => self.restore_workspace(event_loop, records),
+            Startup::Restore(records) => self.restore_workspace(&fe, records),
             Startup::Fleet => {
                 let group = self.mint_group();
-                self.open_fleet_window(event_loop, group, None);
+                self.open_fleet_window(&fe, group, None);
             }
             Startup::Single(name) => {
                 let group = self.mint_group();
-                if self
-                    .open_single_window(event_loop, &name, group, None)
-                    .is_none()
-                {
-                    event_loop.exit();
+                if self.open_single_window(&fe, &name, group, None).is_none() {
+                    fe.exit();
                     return;
                 }
             }
@@ -3015,13 +3101,14 @@ impl ApplicationHandler<UserEvent> for App {
             && let Some(wid) = self.windows.keys().next().copied()
         {
             for ev in self.bench.as_ref().expect("bench present").setup_events() {
-                self.dispatch(wid, ev, event_loop);
+                self.dispatch(wid, ev, &fe);
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+        fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let fe = WinitFrontend { event_loop };
         // Flush the workspace snapshot once per wake if a handled event or a
         // window open/close marked it dirty (write-on-change guards the disk).
         if self.workspace_dirty {
@@ -3048,7 +3135,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         for (wid, name, bytes, ended) in pumped {
-            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, event_loop);
+            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, &fe);
         }
         // Pump each window's read-only observers: mirrored output feeds its
         // fleet tiles as `SessionData`, and only the `Resized` event is
@@ -3091,7 +3178,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         for (wid, ev) in observed {
-            self.dispatch(wid, ev, event_loop);
+            self.dispatch(wid, ev, &fe);
         }
         // Pump any in-flight ssh connects: drain the warm-up ssh's PTY, surface a
         // password prompt when ssh asks, and finish (or fail) the connect on exit.
@@ -3106,7 +3193,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.
-        self.pump_subscriptions(event_loop);
+        self.pump_subscriptions(&fe);
         // Fire any per-window ticks that are now due.
         let now = Instant::now();
         let due: Vec<WindowId> = self
@@ -3120,12 +3207,12 @@ impl ApplicationHandler<UserEvent> for App {
                 w.next_tick = None;
             }
             let now_ms = self.now_ms();
-            self.dispatch(wid, UiEvent::Tick { now_ms }, event_loop);
+            self.dispatch(wid, UiEvent::Tick { now_ms }, &fe);
         }
         // Bench mode: advance the scripted animation (after ticks, so `is_animating`
         // reflects this turn's animation state).
         if self.bench.is_some() {
-            self.drive_bench(event_loop);
+            self.drive_bench(&fe);
         }
         // A session ending never closes its window: the model has already switched
         // to the next attached session (or the fleet), so the window lives on until
@@ -3141,8 +3228,8 @@ impl ApplicationHandler<UserEvent> for App {
             .filter_map(|(id, w)| w.resize.poll(now_ms).map(|(cw, ch, cs)| (*id, cw, ch, cs)))
             .collect();
         for (wid, cw, ch, cs) in commits {
-            if let Some(w) = self.windows.get_mut(&wid) {
-                w.gfx.renderer.clear_snapshot();
+            if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
+                gfx.renderer.clear_snapshot();
             }
             self.dispatch(
                 wid,
@@ -3151,7 +3238,7 @@ impl ApplicationHandler<UserEvent> for App {
                     h_px: ch,
                     scale: cs,
                 },
-                event_loop,
+                &fe,
             );
         }
         // Release any paced repaint that the frame budget now allows. The loop
@@ -3165,50 +3252,59 @@ impl ApplicationHandler<UserEvent> for App {
                 // isn't acquirable, so the present is silently skipped). Keep asking every
                 // pass until one lands, rather than trusting the pacer's single request —
                 // else the window sits blank (title bar only) until an unrelated event.
-                w.gfx.window.request_redraw();
+                w.request_redraw();
             } else if w.pacer.release(now_ms) {
-                w.gfx.window.request_redraw();
+                w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+        fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let fe = WinitFrontend { event_loop };
         match event {
             WindowEvent::CloseRequested => {
                 // Close = detach: dropping the window drops its session clients
                 // (the hosts keep the sessions running). Exit with the last one.
                 self.close_window(id);
                 if self.windows.is_empty() {
-                    self.shutdown(event_loop);
+                    self.shutdown(&fe);
                 }
             }
             WindowEvent::Resized(size) => {
                 // Defer the costly relayout: capture + stretch-blit now, commit the
                 // real resize once the drag settles (see `resize_step`).
-                let Some(scale) = self.windows.get(&id).map(|w| w.gfx.window.scale_factor()) else {
+                let Some(scale) = self
+                    .windows
+                    .get(&id)
+                    .and_then(|w| w.gfx.as_ref())
+                    .map(|g| g.window.scale_factor())
+                else {
                     return;
                 };
-                self.resize_step(id, size.width.max(1), size.height.max(1), scale, event_loop);
+                self.resize_step(id, size.width.max(1), size.height.max(1), scale, &fe);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // The display's DPI changed (e.g. the window moved to another
                 // monitor). Treat it like a resize step against the window's actual
                 // new physical size, deferring the re-grid at the new scale.
-                let Some(s) = self.windows.get(&id).map(|w| w.gfx.window.inner_size()) else {
+                let Some(s) = self
+                    .windows
+                    .get(&id)
+                    .and_then(|w| w.gfx.as_ref())
+                    .map(|g| g.window.inner_size())
+                else {
                     return;
                 };
-                self.resize_step(
-                    id,
-                    s.width.max(1),
-                    s.height.max(1),
-                    scale_factor,
-                    event_loop,
-                );
+                self.resize_step(id, s.width.max(1), s.height.max(1), scale_factor, &fe);
             }
             WindowEvent::RedrawRequested => {
                 let now_ms = self.now_ms();
                 if let Some(win) = self.windows.get_mut(&id) {
+                    // A headless window has no surface; there is nothing to paint.
+                    let Some(gfx) = win.gfx.as_mut() else {
+                        return;
+                    };
                     // First paint of a window created mid-run: recreate the swapchain
                     // before drawing. The initial configure in `Graphics::new` can run
                     // before the window is on screen, leaving a Metal drawable whose
@@ -3219,14 +3315,14 @@ impl ApplicationHandler<UserEvent> for App {
                     // the surface matching the model's layout, so no re-grid is needed.
                     if win.needs_surface_sync {
                         win.needs_surface_sync = false;
-                        let (w, h) = win.gfx.size();
-                        win.gfx.resize(w, h);
+                        let (w, h) = gfx.size();
+                        gfx.resize(w, h);
                     }
-                    if win.gfx.renderer.has_snapshot() {
+                    if gfx.renderer.has_snapshot() {
                         // A resize is in flight: blit the snapshot to the current
                         // surface rather than render a scene whose size no longer
                         // matches it (the model resize is deferred until settle).
-                        win.gfx.blit_snapshot();
+                        gfx.blit_snapshot();
                         // Keep the blits paced during the drag; the commit at settle
                         // dispatches the real resize, whose Redraw re-arms the pacer.
                         win.pacer.painted(now_ms);
@@ -3239,18 +3335,18 @@ impl ApplicationHandler<UserEvent> for App {
                         // cached surface as a placeholder and is warmed one-per-frame below,
                         // so the animation never stalls on a slow session's raster.
                         let animating = win.root.is_animating();
-                        win.gfx.renderer.set_deferring(animating);
+                        gfx.renderer.set_deferring(animating);
                         // Rasterize at the model's render scale (device × zoom) so
                         // glyph size matches the grid the scene was laid out for.
                         let font_px = size_px() * win.root.render_scale();
                         // Keep the IME candidate window pinned to the text cursor.
                         if let Some(a) = win.root.ime_cursor_area() {
-                            win.gfx.window.set_ime_cursor_area(
+                            gfx.window.set_ime_cursor_area(
                                 PhysicalPosition::new(a.x, a.y),
                                 PhysicalSize::new(a.w, a.h),
                             );
                         }
-                        match win.gfx.render(&scene, font_px) {
+                        match gfx.render(&scene, font_px) {
                             FrameOutcome::Presented { build, present } => {
                                 // A frame landed: the pending repaint is satisfied, and
                                 // the first-present retry loop below can stop.
@@ -3282,7 +3378,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .as_mut()
                                     .is_some_and(|h| h.record_stream_present(build, present))
                                 {
-                                    event_loop.exit();
+                                    fe.exit();
                                 }
                             }
                             FrameOutcome::Clean => {
@@ -3303,7 +3399,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // frame rasterizing a heavy session inline. The animation's own
                         // ticks drive the redraws that keep draining this.
                         if animating {
-                            win.gfx.renderer.warm_next(win.gfx.fonts);
+                            gfx.renderer.warm_next(gfx.fonts);
                         }
                     }
                 }
@@ -3345,20 +3441,20 @@ impl ApplicationHandler<UserEvent> for App {
                         kind,
                         alts,
                     },
-                    event_loop,
+                    &fe,
                 );
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.dispatch(id, UiEvent::Text(text), event_loop);
+                self.dispatch(id, UiEvent::Text(text), &fe);
             }
             WindowEvent::Ime(Ime::Preedit(text, _cursor)) => {
                 // Track the in-progress composition so the model suppresses the
                 // raw keystrokes driving it; an empty string ends it.
-                self.dispatch(id, UiEvent::Preedit(text), event_loop);
+                self.dispatch(id, UiEvent::Preedit(text), &fe);
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 // Composition aborted (focus lost, IME toggled off): clear it.
-                self.dispatch(id, UiEvent::Preedit(String::new()), event_loop);
+                self.dispatch(id, UiEvent::Preedit(String::new()), &fe);
             }
             WindowEvent::Ime(Ime::Enabled) => {}
             WindowEvent::Occluded(occluded) => {
@@ -3382,7 +3478,7 @@ impl ApplicationHandler<UserEvent> for App {
                         w.pacer.request();
                     }
                 }
-                self.dispatch(id, UiEvent::Focus(focused), event_loop);
+                self.dispatch(id, UiEvent::Focus(focused), &fe);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let Some((pos, mods)) = self.windows.get_mut(&id).map(|w| {
@@ -3404,7 +3500,7 @@ impl ApplicationHandler<UserEvent> for App {
                         wheel_dy: 0.0,
                         clicks: 1,
                     },
-                    event_loop,
+                    &fe,
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -3431,7 +3527,7 @@ impl ApplicationHandler<UserEvent> for App {
                             wheel_dy: 0.0,
                             clicks,
                         },
-                        event_loop,
+                        &fe,
                     );
                 }
             }
@@ -3457,7 +3553,7 @@ impl ApplicationHandler<UserEvent> for App {
                         wheel_dy: dy,
                         clicks: 1,
                     },
-                    event_loop,
+                    &fe,
                 );
             }
             _ => {}
