@@ -19,6 +19,14 @@ use std::process::{Command, Stdio};
 /// is used as-is.
 const REMOTE_GHOST_ENV: &str = "GHOST_REMOTE_GHOST";
 
+/// Progress of a staging copy: `sent` of `total` bytes written toward the remote.
+/// Reported by [`RemoteSsh::negotiate_with_progress`] so a GUI can draw a copy bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageProgress {
+    pub sent: u64,
+    pub total: u64,
+}
+
 /// The remote directory a staged ghost lands in, under the given remote `$HOME`.
 fn staged_dir(home: &str) -> String {
     format!("{home}/.cache/ghost/bin")
@@ -153,6 +161,12 @@ impl RemoteSsh {
         c
     }
 
+    /// [`negotiate_with_progress`](Self::negotiate_with_progress) without progress
+    /// reporting — for callers (the CLI) that don't render a staging bar.
+    pub fn negotiate(&self) -> Option<String> {
+        self.negotiate_with_progress(&mut |_| {})
+    }
+
     /// Find (or provision) a usable remote ghost. `Some(remote_ghost)` ⇒ use the
     /// transport with that binary; `None` ⇒ fall back to the local ssh child. This
     /// is also where the shared connection first authenticates. In order:
@@ -162,7 +176,13 @@ impl RemoteSsh {
     /// 2. `ghost` on the remote `PATH`.
     /// 3. an already-staged, version-stamped copy in the remote cache.
     /// 4. staging: copy our own binary over (OS+arch permitting), then re-probe.
-    pub fn negotiate(&self) -> Option<String> {
+    ///
+    /// `on_progress` is called during staging (step 4) with the running byte count,
+    /// so a GUI can show a copy progress bar; it's a no-op for the other steps.
+    pub fn negotiate_with_progress(
+        &self,
+        on_progress: &mut dyn FnMut(StageProgress),
+    ) -> Option<String> {
         if let Ok(path) = std::env::var(REMOTE_GHOST_ENV) {
             return self.probe(&path).then_some(path);
         }
@@ -175,7 +195,7 @@ impl RemoteSsh {
         if self.probe(&staged) {
             return Some(staged);
         }
-        match self.stage(&home, &staged) {
+        match self.stage(&home, &staged, on_progress) {
             Ok(()) if self.probe(&staged) => Some(staged),
             Ok(()) => None,
             Err(e) => {
@@ -211,8 +231,14 @@ impl RemoteSsh {
     /// Copy this binary to `staged` on the remote (OS+arch permitting), so a host
     /// that lacks ghost can still run one. Cross-arch staging is rejected — that
     /// needs prebuilt binaries per platform (future). Terminfo is not shipped: the
-    /// remote host self-provisions it on first run (needs remote `tic`).
-    fn stage(&self, home: &str, staged: &str) -> io::Result<()> {
+    /// remote host self-provisions it on first run (needs remote `tic`). Reports
+    /// byte progress through `on_progress` so a GUI can draw a copy bar.
+    fn stage(
+        &self,
+        home: &str,
+        staged: &str,
+        on_progress: &mut dyn FnMut(StageProgress),
+    ) -> io::Result<()> {
         let uname = self.command(&["uname", "-s", "-m"]).output()?;
         if !uname.status.success() {
             return Err(io::Error::other("remote `uname` failed"));
@@ -229,6 +255,7 @@ impl RemoteSsh {
 
         let exe = std::env::current_exe()?;
         let bytes = std::fs::read(&exe)?;
+        let total = bytes.len() as u64;
         eprintln!(
             "ghost: staging ghost ({} MiB) to {}…",
             bytes.len() / (1 << 20),
@@ -245,7 +272,18 @@ impl RemoteSsh {
             .command(&["sh", "-c", &script])
             .stdin(Stdio::piped())
             .spawn()?;
-        child.stdin.take().expect("piped stdin").write_all(&bytes)?;
+        // Stream in chunks and report progress; the pipe's bounded buffer makes
+        // each `write_all` block until ssh forwards it, so the count tracks the
+        // upload closely enough for a bar. `sent == total` marks the copy done.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        on_progress(StageProgress { sent: 0, total });
+        let mut sent = 0u64;
+        for chunk in bytes.chunks(1 << 20) {
+            stdin.write_all(chunk)?;
+            sent += chunk.len() as u64;
+            on_progress(StageProgress { sent, total });
+        }
+        drop(stdin); // close the pipe so the remote `cat` sees EOF and exits
         if !child.wait()?.success() {
             return Err(io::Error::other("copying the binary to the remote failed"));
         }

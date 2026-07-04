@@ -304,13 +304,23 @@ pub struct RootModel {
 enum ConnectPhase {
     /// Typing the `[user@]host` (the initial phase).
     Host,
-    /// The host was submitted; ssh auth is in flight, nothing to type yet.
-    Connecting,
+    /// The host was submitted; auth/setup is in flight, nothing to type yet.
+    /// `status` reports what it's doing (plain connecting, or staging the binary
+    /// with a byte count) so the overlay can show a progress bar.
+    Connecting { status: ConnectStatus },
     /// ssh asked for a secret (`prompt` is its wording, e.g. a passphrase); the
     /// masked password field is shown in place of the host.
     Password { prompt: String },
     /// Auth failed; `message` is shown and Enter returns to the host field.
     Error { message: String },
+}
+
+/// What the [`Connecting`](ConnectPhase::Connecting) phase is currently doing.
+enum ConnectStatus {
+    /// Authenticating / negotiating — no measurable progress to show.
+    Working,
+    /// Copying the ghost binary to the remote: `sent` of `total` bytes.
+    Staging { sent: u64, total: u64 },
 }
 
 /// The "connect to a host over SSH" prompt state.
@@ -563,6 +573,18 @@ impl RootModel {
         if let Some(p) = &mut self.connect {
             p.password = TextInput::new(String::new());
             p.phase = ConnectPhase::Password { prompt };
+        }
+    }
+
+    /// Staging progress from the connect worker (copying the binary to the
+    /// remote): show a progress bar. Ignored unless the prompt is mid-connect.
+    pub fn connect_progress(&mut self, sent: u64, total: u64) {
+        if let Some(p) = &mut self.connect
+            && matches!(p.phase, ConnectPhase::Connecting { .. })
+        {
+            p.phase = ConnectPhase::Connecting {
+                status: ConnectStatus::Staging { sent, total },
+            };
         }
     }
 
@@ -1160,7 +1182,7 @@ impl RootModel {
             match p.phase {
                 ConnectPhase::Host => Some(&mut p.host),
                 ConnectPhase::Password { .. } => Some(&mut p.password),
-                ConnectPhase::Connecting | ConnectPhase::Error { .. } => None,
+                ConnectPhase::Connecting { .. } | ConnectPhase::Error { .. } => None,
             }
         }
         match ev {
@@ -1207,7 +1229,9 @@ impl RootModel {
         match &p.phase {
             ConnectPhase::Host => match ConnectionSpec::parse_target(p.host.text()) {
                 Some(spec) => {
-                    p.phase = ConnectPhase::Connecting;
+                    p.phase = ConnectPhase::Connecting {
+                        status: ConnectStatus::Working,
+                    };
                     vec![Cmd::ConnectSshWindow { spec }]
                 }
                 // Empty or unparseable host: stay in the prompt.
@@ -1215,7 +1239,9 @@ impl RootModel {
             },
             ConnectPhase::Password { .. } => {
                 let password = p.password.text().to_string();
-                p.phase = ConnectPhase::Connecting;
+                p.phase = ConnectPhase::Connecting {
+                    status: ConnectStatus::Working,
+                };
                 vec![Cmd::ConnectPassword(password)]
             }
             // Retry: back to the host field (its text is preserved).
@@ -1223,7 +1249,7 @@ impl RootModel {
                 p.phase = ConnectPhase::Host;
                 vec![Cmd::Redraw]
             }
-            ConnectPhase::Connecting => Vec::new(),
+            ConnectPhase::Connecting { .. } => Vec::new(),
         }
     }
 
@@ -1359,10 +1385,57 @@ impl RootModel {
                 field(&mut items, by, "Host", &host_shown),
                 "Enter to connect · Esc to cancel",
             ),
-            ConnectPhase::Connecting => {
+            ConnectPhase::Connecting { status } => {
                 let host = prompt.host.text();
-                items.push(line(by, &format!("Connecting to {host}\u{2026}"), FG));
-                (by + m.line_height, "Esc to cancel")
+                match status {
+                    ConnectStatus::Working => {
+                        items.push(line(by, &format!("Connecting to {host}\u{2026}"), FG));
+                        (by + m.line_height, "Esc to cancel")
+                    }
+                    ConnectStatus::Staging { sent, total } => {
+                        let frac = if *total > 0 {
+                            (*sent as f32 / *total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let pct = (frac * 100.0).round() as u32;
+                        items.push(line(
+                            by,
+                            &format!("Staging ghost to {host}\u{2026} {pct}%"),
+                            FG,
+                        ));
+                        // A rounded track with a proportional fill, field-width.
+                        let bar_y = by + m.line_height * 1.3;
+                        let bar_h = m.line_height * 0.5;
+                        let track = RectPx {
+                            x: center_x(field_w),
+                            y: bar_y,
+                            w: field_w,
+                            h: bar_h,
+                        };
+                        items.push(SceneItem::Rect {
+                            id: SceneId::NavBar,
+                            rect: track,
+                            color: FIELD_BG,
+                            radius: bar_h * 0.5,
+                        });
+                        let fill_w = field_w * frac;
+                        if fill_w > 0.5 {
+                            items.push(SceneItem::Rect {
+                                id: SceneId::NavBar,
+                                rect: RectPx {
+                                    x: center_x(field_w),
+                                    y: bar_y,
+                                    w: fill_w,
+                                    h: bar_h,
+                                },
+                                color: BORDER,
+                                radius: bar_h * 0.5,
+                            });
+                        }
+                        (bar_y + bar_h, "Esc to cancel")
+                    }
+                }
             }
             ConnectPhase::Password { prompt: label } => {
                 let label = if label.is_empty() { "Password" } else { label };
@@ -2763,6 +2836,42 @@ mod tests {
             "host text preserved for a retry"
         );
         assert!(scene_has(&r, "Host"), "back on the host field");
+    }
+
+    #[test]
+    fn staging_progress_shows_a_percentage_and_a_bar() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting (Working)
+        assert!(
+            scene_has(&r, "Connecting"),
+            "plain connecting before staging"
+        );
+
+        // A staging update switches the line to a percentage and draws a bar.
+        r.connect_progress(3, 4);
+        assert!(scene_has(&r, "Staging"), "shows the staging line");
+        assert!(scene_has(&r, "75%"), "shows the byte percentage");
+        // The bar is a filled rect on the modal layer, narrower than the track.
+        let scene = r.view();
+        let rects: Vec<f32> = scene.layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Rect { rect, .. } => Some(rect.w),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rects.len() >= 2,
+            "a track and a fill rect are present: {rects:?}"
+        );
+
+        // Progress is ignored once we're no longer connecting.
+        r.connect_failed("nope".into());
+        r.connect_progress(1, 4);
+        assert!(scene_has(&r, "nope"), "progress doesn't clobber the error");
     }
 
     #[test]

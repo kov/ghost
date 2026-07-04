@@ -372,15 +372,25 @@ fn spawn_connect_worker(
 ) {
     std::thread::spawn(move || {
         let outcome = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
-            Ok(remote) => match remote.negotiate() {
-                Some(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
-                    Ok(()) => ConnectOutcome::Transport { remote_ghost },
-                    Err(e) => {
-                        ConnectOutcome::Error(format!("could not start the remote host: {e}"))
-                    }
-                },
-                None => ConnectOutcome::Fallback,
-            },
+            Ok(remote) => {
+                // Forward staging byte-progress to the connect prompt's bar.
+                let mut on_progress = |p: ghost_vt::remote::StageProgress| {
+                    let _ = proxy.send_event(UserEvent::ConnectProgress {
+                        wid,
+                        sent: p.sent,
+                        total: p.total,
+                    });
+                };
+                match remote.negotiate_with_progress(&mut on_progress) {
+                    Some(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
+                        Ok(()) => ConnectOutcome::Transport { remote_ghost },
+                        Err(e) => {
+                            ConnectOutcome::Error(format!("could not start the remote host: {e}"))
+                        }
+                    },
+                    None => ConnectOutcome::Fallback,
+                }
+            }
             Err(e) => ConnectOutcome::Error(format!("could not open the ssh connection: {e}")),
         };
         let _ = proxy.send_event(UserEvent::ConnectFinished {
@@ -2674,6 +2684,14 @@ impl ApplicationHandler<UserEvent> for App {
                 outcome,
             } => {
                 self.finish_connect(wid, spec, name, outcome, event_loop);
+                return;
+            }
+            // Staging byte-progress from the connect worker: update the bar.
+            UserEvent::ConnectProgress { wid, sent, total } => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.root.connect_progress(sent, total);
+                    w.gfx.window.request_redraw();
+                }
                 return;
             }
         };

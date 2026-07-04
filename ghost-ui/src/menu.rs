@@ -49,6 +49,13 @@ pub enum UserEvent {
         name: String,
         outcome: ConnectOutcome,
     },
+    /// Staging progress for an in-flight connect: `sent` of `total` bytes copied
+    /// to the remote. Drives the connect prompt's progress bar.
+    ConnectProgress {
+        wid: winit::window::WindowId,
+        sent: u64,
+        total: u64,
+    },
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main
