@@ -41,6 +41,7 @@ use ghost_ui_core::{
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
+use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::screen;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
@@ -433,10 +434,10 @@ fn capture(path: PathBuf) {
 
 // ---- interactive mode (window) -----------------------------------------
 
-fn spawn_session(name: &str, command: Vec<String>) {
+fn spawn_session(name: &str, command: Vec<String>, connection: Option<ConnectionSpec>) {
     server::spawn(SpawnOpts {
         name: name.to_string(),
-        command, // empty => $SHELL
+        command, // empty => $SHELL (unless `connection` derives an `ssh …` child)
         size: (COLS, ROWS),
         cwd: None,
         // Record like the CLI does (`--no-record` is its opt-out): the
@@ -447,9 +448,20 @@ fn spawn_session(name: &str, command: Vec<String>) {
         scrollback: screen::DEFAULT_SCROLLBACK,
         max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
         start_on_attach: true,
-        connection: None,
+        connection,
     })
     .expect("spawn session");
+}
+
+/// The connection a new terminal in a window inherits: the window group's own
+/// connection wins (an explicit "ssh group", set in a later phase), else the
+/// session it was spawned from (the foreground), else none — a local `$SHELL`.
+/// Read only from stored data, never scraped from a live command line.
+fn inherited_connection(
+    group: Option<&ConnectionSpec>,
+    foreground: Option<&ConnectionSpec>,
+) -> Option<ConnectionSpec> {
+    group.or(foreground).cloned()
 }
 
 /// How a freshly-launched window should start.
@@ -649,7 +661,7 @@ fn interactive(fresh: bool) {
                     StartupChoice::Fleet => Startup::Fleet,
                     StartupChoice::Spawn => {
                         let n = format!("ghost-ui-{}", std::process::id());
-                        spawn_session(&n, vec![]);
+                        spawn_session(&n, vec![], None);
                         Startup::Single(n)
                     }
                 },
@@ -1411,7 +1423,7 @@ impl App {
                     }
                 }
                 Cmd::Spawn { name, command } => {
-                    spawn_session(&name, command);
+                    spawn_session(&name, command, None);
                     // Best-effort attach; a later reconcile re-attaches if it lost the race.
                     if let Some(w) = self.windows.get_mut(&wid) {
                         // Handshake at the window's real grid (see `attach_into`).
@@ -1430,7 +1442,19 @@ impl App {
                 }
                 Cmd::SpawnSession => {
                     let name = self.unique_session_name();
-                    spawn_session(&name, vec![]);
+                    // Inherit the window's ssh connection: from the session this
+                    // one branches off (the foreground), or the window group's own
+                    // connection (a P5 "ssh group", None for now). Read from the
+                    // foreground's stored descriptor, never its live command line.
+                    let connection = self.windows.get(&wid).and_then(|w| {
+                        let foreground = w
+                            .root
+                            .foreground()
+                            .and_then(|id| ghost_vt::descriptor::read(id))
+                            .and_then(|d| d.connection);
+                        inherited_connection(None, foreground.as_ref())
+                    });
+                    spawn_session(&name, vec![], connection);
                     if self.attach_into(wid, &name) {
                         self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                     }
@@ -1793,7 +1817,9 @@ impl App {
             }
             StartupChoice::Spawn => {
                 let name = self.unique_session_name();
-                spawn_session(&name, vec![]);
+                // A fresh window starts a local session (no foreground to inherit
+                // an ssh connection from; a P5 ssh group would set one here).
+                spawn_session(&name, vec![], None);
                 let group = self.mint_group();
                 self.open_single_window(event_loop, &name, group, None);
             }
@@ -2691,6 +2717,30 @@ mod tests {
             opts.connection.is_none(),
             "a local session's relaunch carries no connection"
         );
+    }
+
+    #[test]
+    fn inherited_connection_prefers_group_then_foreground_then_local() {
+        use super::inherited_connection;
+        use ghost_vt::connection::ConnectionSpec;
+        let group = ConnectionSpec::parse_target("ops@gateway");
+        let foreground = ConnectionSpec::parse_target("dev@box");
+        // An explicit group connection wins for every new terminal in the window.
+        assert_eq!(
+            inherited_connection(group.as_ref(), foreground.as_ref())
+                .unwrap()
+                .target(),
+            "ops@gateway"
+        );
+        // Otherwise the session it branches off — the foreground.
+        assert_eq!(
+            inherited_connection(None, foreground.as_ref())
+                .unwrap()
+                .target(),
+            "dev@box"
+        );
+        // Neither: a plain local session.
+        assert_eq!(inherited_connection(None, None), None);
     }
 
     #[test]

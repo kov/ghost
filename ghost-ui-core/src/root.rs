@@ -494,6 +494,12 @@ impl RootModel {
     /// identity, the grid it is sized to, its view mode, the foreground session,
     /// and the set it drives (sorted so the file is stable). See
     /// [`crate::workspace`].
+    /// The window's foreground session (shown in single view / the dive target),
+    /// if any — the session a new terminal inherits its connection from.
+    pub fn foreground(&self) -> Option<&SessionId> {
+        self.primary.as_ref()
+    }
+
     pub fn window_record(&self) -> crate::workspace::WindowRecord {
         let (cols, rows) = self.grid();
         let mut attached: Vec<SessionId> = self.mine.iter().cloned().collect();
