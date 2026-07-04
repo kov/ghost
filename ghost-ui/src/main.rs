@@ -702,6 +702,20 @@ fn inherited_connection(
     group.or(foreground).cloned()
 }
 
+/// The connected remote host a new inheriting session should be created *on*, if
+/// any — the inherited `connection`'s target when we already hold a live
+/// transport to it (`connected` = the currently-connected targets). `Some(target)`
+/// routes the spawn onto the remote (a real remote ghost session over the
+/// transport); `None` keeps it local — a plain `$SHELL`, or an `ssh` child for an
+/// ssh connection to a host we are not transported to.
+fn remote_spawn_target(
+    connection: Option<&ConnectionSpec>,
+    connected: &HashSet<String>,
+) -> Option<String> {
+    let target = connection?.target();
+    connected.contains(&target).then_some(target)
+}
+
 /// How a freshly-launched window should start.
 enum StartupChoice {
     /// Attach to a specific, explicitly-requested session (single view).
@@ -1806,8 +1820,8 @@ impl App {
                     let name = self.unique_session_name();
                     // Inherit the window's ssh connection: from the session this
                     // one branches off (the foreground), or the window group's own
-                    // connection (a P5 "ssh group", None for now). Read from the
-                    // foreground's stored descriptor, never its live command line.
+                    // connection (an "ssh group"). Read from the foreground's stored
+                    // descriptor, never its live command line.
                     let connection = self.windows.get(&wid).and_then(|w| {
                         let foreground = w
                             .root
@@ -1816,9 +1830,23 @@ impl App {
                             .and_then(|d| d.connection);
                         inherited_connection(w.root.group_connection(), foreground.as_ref())
                     });
-                    spawn_session(&name, vec![], connection);
-                    if self.attach_into(wid, &name) {
-                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    // Inheritance-over-remote: if the inherited host is one we already
+                    // hold a live transport to, create the session ON it (a real
+                    // remote ghost session), matching the group's other sessions —
+                    // not a local `ssh` child.
+                    let connected: HashSet<String> = self
+                        .remotes
+                        .lock()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    match remote_spawn_target(connection.as_ref(), &connected) {
+                        Some(target) => self.spawn_remote_session(wid, &target, &name, event_loop),
+                        None => {
+                            spawn_session(&name, vec![], connection);
+                            if self.attach_into(wid, &name) {
+                                self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                            }
+                        }
                     }
                 }
                 Cmd::TakeOver(id) => {
@@ -2337,6 +2365,46 @@ impl App {
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
         if self.attach_ssh_into(wid, id, cmd) {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
+        }
+    }
+
+    /// Create a NEW session on a connected remote host (inheritance-over-remote):
+    /// `ghost new -d <name>` over the transport, then attach it as this-window
+    /// under the fleet-namespaced id — the same shape as a fresh connect or a
+    /// take-over, so the new session is a full remote ghost session rather than a
+    /// local `ssh` child. `target` must be a currently-connected host.
+    fn spawn_remote_session(
+        &mut self,
+        wid: WindowId,
+        target: &str,
+        name: &str,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned());
+        let Some(host) = host else {
+            eprintln!("ghost: no live connection to {target} to open a session on");
+            return;
+        };
+        if let Err(e) = host.remote.spawn_host(&host.remote_ghost, name) {
+            eprintln!("ghost: could not open a session on {target}: {e}");
+            return;
+        }
+        // Drive it under the composite id the poller will discover it by, so the
+        // window owns its own new session in the fleet (the transport uses the bare
+        // name); see [`finish_connect`](Self::finish_connect).
+        let local_id = remote_fleet_id(target, name);
+        self.remote_index
+            .insert(local_id.clone(), (target.to_string(), name.to_string()));
+        let cmd = host.remote.pipe_command(&host.remote_ghost, name);
+        if self.attach_ssh_into(wid, &local_id, cmd) {
+            self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
+        } else {
+            self.remote_index.remove(&local_id);
+            eprintln!("ghost: opened a session on {target} but could not attach to it");
         }
     }
 
@@ -3392,15 +3460,39 @@ impl ApplicationHandler<UserEvent> for App {
 mod tests {
     use super::{
         REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode, choose_surface_format,
-        home_launch_dir, local_only, local_only_groups, namespace_remote_infos, new_window_choice,
-        password_prompt, respawn_opts, restore_plan, should_restore, startup_choice,
+        home_launch_dir, inherited_connection, local_only, local_only_groups,
+        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
+        respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
+    use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
+    use std::collections::HashSet;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
+
+    #[test]
+    fn a_new_session_routes_onto_a_connected_remote_host_only() {
+        let spec = ConnectionSpec::parse_target("kov@box").expect("valid target");
+        let inherited = inherited_connection(Some(&spec), None);
+        assert!(inherited.is_some(), "the group connection is inherited");
+
+        let mut connected = HashSet::new();
+        // An ssh connection to a host we are NOT transported to → local (ssh child).
+        assert_eq!(remote_spawn_target(inherited.as_ref(), &connected), None);
+
+        // Once we hold a live transport to that host → route the spawn onto it.
+        connected.insert("kov@box".to_string());
+        assert_eq!(
+            remote_spawn_target(inherited.as_ref(), &connected),
+            Some("kov@box".to_string())
+        );
+
+        // No inherited connection → a plain local `$SHELL`.
+        assert_eq!(remote_spawn_target(None, &connected), None);
+    }
 
     fn info(name: &str, attached: bool) -> SessionInfo {
         SessionInfo {
