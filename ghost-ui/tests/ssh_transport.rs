@@ -339,6 +339,131 @@ fn ghost_ssh_stages_the_binary_when_the_remote_lacks_ghost() {
     );
 }
 
+/// [`shim_ssh`] plus a fake `uname` on the same PATH that reports
+/// `$GHOST_FAKE_UNAME` instead of this host's real platform — so a test can make
+/// the "remote" look like a different OS/arch and exercise cross-arch staging.
+fn shim_ssh_faking_uname() -> tempfile::TempDir {
+    let dir = shim_ssh();
+    let uname = dir.path().join("uname");
+    std::fs::write(&uname, "#!/bin/sh\nprintf '%s\\n' \"$GHOST_FAKE_UNAME\"\n").unwrap();
+    std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// A `(uname string, prebuilt filename)` for a platform guaranteed different from
+/// this host's — the OS is always flipped, so it's cross-arch no matter where the
+/// suite runs (including the user's mac/arm64).
+fn foreign_platform() -> (String, String) {
+    let (sys, os) = if cfg!(target_os = "linux") {
+        ("Darwin", "macos")
+    } else {
+        ("Linux", "linux")
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    (format!("{sys} {arch}"), format!("ghost-{os}-{arch}"))
+}
+
+#[test]
+fn ghost_ssh_stages_a_cross_arch_prebuilt_when_the_remote_differs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let prebuilt = tempfile::tempdir().unwrap();
+    let shim = shim_ssh_faking_uname();
+
+    // The "remote" reports a foreign platform; a prebuilt for it sits in the
+    // search dir — actually a copy of our own binary, so once staged it runs and
+    // answers `__probe` when the (locally-exec'd) remote checks the staged copy.
+    let (fake_uname, prebuilt_name) = foreign_platform();
+    std::fs::copy(GHOST, prebuilt.path().join(&prebuilt_name)).unwrap();
+
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env("GHOST_FAKE_UNAME", &fake_uname)
+        .env("GHOST_PREBUILT_DIR", prebuilt.path())
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` (cross-arch staging) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+
+    // The cross-arch prebuilt was staged under the remote home cache…
+    let bin_dir = home.path().join(".cache/ghost/bin");
+    assert!(
+        std::fs::read_dir(&bin_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("ghost-")),
+        "the cross-arch prebuilt was not staged under the remote cache"
+    );
+    // …and a real remote host is running from it (a plain host, no recorded
+    // connection — the tell that the transport was used, not the ssh child).
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("ssh-example")),
+        "the remote host was never created from the prebuilt"
+    );
+    assert!(
+        descriptor(xdg, "ssh-example").connection.is_none(),
+        "a transport session is a plain host, not an ssh child"
+    );
+}
+
+#[test]
+fn ghost_ssh_falls_back_to_the_ssh_child_when_no_prebuilt_matches_the_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let prebuilt = tempfile::tempdir().unwrap(); // empty: no prebuilt for any platform
+    let shim = shim_ssh_faking_uname();
+
+    // A foreign remote but no matching prebuilt, no override, no ghost on PATH →
+    // negotiation finds nothing stageable and falls back to the local ssh child,
+    // which records the connection spec (the ssh-child tell).
+    let (fake_uname, _) = foreign_platform();
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env("GHOST_FAKE_UNAME", &fake_uname)
+        .env("GHOST_PREBUILT_DIR", prebuilt.path())
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` fallback failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+    let spec = descriptor(xdg, "ssh-example")
+        .connection
+        .expect("the ssh-child fallback records the connection");
+    assert_eq!(spec.target(), "dev@example");
+}
+
 #[test]
 fn staging_prunes_older_cached_binaries_keeping_the_newest_few() {
     use std::time::{Duration, SystemTime};

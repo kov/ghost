@@ -9,9 +9,10 @@
 //! re-auth (without it a password-auth host would prompt on every invocation).
 
 use crate::connection::ConnectionSpec;
+use std::collections::HashMap;
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Env override for the remote ghost binary. Points the initiator at a specific
@@ -65,46 +66,107 @@ fn prune_script(dir: &str, keep: usize) -> String {
     )
 }
 
-/// A short content hash of this running binary, cached for the process. Stamps
-/// the staged path so a rebuilt binary re-stages (identical contents reuse the
-/// existing copy). `"unknown"` if the executable can't be read — staging then
-/// falls back to version-only stamping for this process.
-fn local_build_stamp() -> String {
+/// A short content hash of the ghost binary at `path`, memoized per path for the
+/// process. Stamps the staged path so a *changed* build re-stages while an
+/// identical one reuses the existing copy — crucial in development, where the
+/// version string doesn't move between builds. `"unknown"` if the file can't be
+/// read (staging then falls back to version-only stamping for that binary).
+fn build_stamp(path: &Path) -> String {
     use std::hash::{Hash as _, Hasher as _};
-    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    STAMP
-        .get_or_init(|| {
-            std::env::current_exe()
-                .and_then(std::fs::read)
-                .map(|bytes| {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    bytes.hash(&mut h);
-                    format!("{:016x}", h.finish())
-                })
-                .unwrap_or_else(|_| "unknown".into())
+    static STAMPS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    let cache = STAMPS.get_or_init(Default::default);
+    if let Some(s) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+        return s.clone();
+    }
+    let stamp = std::fs::read(path)
+        .map(|bytes| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            format!("{:016x}", h.finish())
         })
-        .clone()
+        .unwrap_or_else(|_| "unknown".into());
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), stamp.clone());
+    stamp
 }
 
-/// Whether a remote `uname -s -m` names the same OS+arch as this build — the gate
-/// for copying our own binary over (cross-arch staging needs a build matrix,
-/// which is future work).
-fn remote_matches_local(uname_sm: &str) -> bool {
+/// A machine's OS + arch in Rust's [`std::env::consts`] vocabulary
+/// (`os` = `linux`/`macos`, `arch` = `x86_64`/`aarch64`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Platform {
+    os: &'static str,
+    arch: &'static str,
+}
+
+/// This build's own platform.
+fn local_platform() -> Platform {
+    Platform {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+    }
+}
+
+/// Parse a remote `uname -s -m` into a [`Platform`]. `None` for anything we don't
+/// map (an unknown OS/arch, or malformed output) — the caller then can't stage.
+fn parse_platform(uname_sm: &str) -> Option<Platform> {
     let mut it = uname_sm.split_whitespace();
-    let (Some(sys), Some(machine)) = (it.next(), it.next()) else {
-        return false;
-    };
+    let (sys, machine) = (it.next()?, it.next()?);
     let os = match sys {
         "Linux" => "linux",
         "Darwin" => "macos",
-        _ => return false,
+        _ => return None,
     };
     let arch = match machine {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
-        _ => return false,
+        _ => return None,
     };
-    os == std::env::consts::OS && arch == std::env::consts::ARCH
+    Some(Platform { os, arch })
+}
+
+/// Where to look for a cross-arch prebuilt ghost, in order: the
+/// `GHOST_PREBUILT_DIR` override, then the durable cache `<data_dir>/prebuilt`. A
+/// file named `ghost-<os>-<arch>` (e.g. `ghost-macos-aarch64`) in one of these is
+/// staged to a remote of that platform. A future network provider would fetch into
+/// the cache dir and be found here with no other change.
+fn prebuilt_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(d) = std::env::var_os("GHOST_PREBUILT_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    dirs.push(crate::paths::data_dir().join("prebuilt"));
+    dirs
+}
+
+/// Pick the local ghost binary to stage to a `target` remote: our own executable
+/// when the remote matches this build, else the first `ghost-<os>-<arch>` prebuilt
+/// found in `search`. `None` ⇒ nothing stageable (the caller falls back to the ssh
+/// child). Split out from [`resolve_ghost_binary`] so it's testable without env.
+fn resolve_for(
+    target: Platform,
+    local: Platform,
+    current_exe: Option<&Path>,
+    search: &[PathBuf],
+) -> Option<PathBuf> {
+    if target == local {
+        return current_exe.map(Path::to_path_buf);
+    }
+    let file = format!("ghost-{}-{}", target.os, target.arch);
+    search.iter().map(|d| d.join(&file)).find(|c| c.is_file())
+}
+
+/// The ghost binary to stage to a `target` remote, resolved against this build and
+/// the real [`prebuilt_search_dirs`]. `None` ⇒ fall back to the ssh child.
+fn resolve_ghost_binary(target: Platform) -> Option<PathBuf> {
+    resolve_for(
+        target,
+        local_platform(),
+        std::env::current_exe().ok().as_deref(),
+        &prebuilt_search_dirs(),
+    )
 }
 
 /// The marker line `ghost __probe` prints, so the initiator can tell a real
@@ -209,13 +271,16 @@ impl RemoteSsh {
         if self.probe("ghost") {
             return Some("ghost".to_string());
         }
-        // Staging needs an absolute path, so learn the remote home first.
+        // Staging needs the remote home (for an absolute path) and its platform
+        // (to pick the binary — our own exe for a matching host, else a prebuilt).
         let home = self.remote_home()?;
-        let staged = staged_path(&home, &local_build_stamp());
+        let platform = self.remote_platform()?;
+        let binary = resolve_ghost_binary(platform)?;
+        let staged = staged_path(&home, &build_stamp(&binary));
         if self.probe(&staged) {
             return Some(staged);
         }
-        match self.stage(&home, &staged, on_progress) {
+        match self.stage(&binary, &home, &staged, on_progress) {
             Ok(()) if self.probe(&staged) => Some(staged),
             Ok(()) => None,
             Err(e) => {
@@ -236,6 +301,14 @@ impl RemoteSsh {
         (out.status.success() && !home.is_empty()).then_some(home)
     }
 
+    /// The remote's OS+arch from `uname -s -m`, so staging can pick a binary for
+    /// it. `None` if the command fails or names a platform we don't map.
+    fn remote_platform(&self) -> Option<Platform> {
+        let out = self.command(&["uname", "-s", "-m"]).output().ok()?;
+        out.status.success().then_some(())?;
+        parse_platform(&String::from_utf8_lossy(&out.stdout))
+    }
+
     /// Run `<candidate> __probe` and confirm the reply carries the
     /// [`PROBE_MARKER`] — a clean exit is not enough (a shell that echoed the
     /// command line would pass a looser check).
@@ -248,33 +321,20 @@ impl RemoteSsh {
             .unwrap_or(false)
     }
 
-    /// Copy this binary to `staged` on the remote (OS+arch permitting), so a host
-    /// that lacks ghost can still run one. Cross-arch staging is rejected — that
-    /// needs prebuilt binaries per platform (future). Terminfo is not shipped: the
-    /// remote host self-provisions it on first run (needs remote `tic`). Reports
-    /// byte progress through `on_progress` so a GUI can draw a copy bar.
+    /// Copy `binary` (the resolver's pick — our own exe or a prebuilt for the
+    /// remote's platform) to `staged` on the remote, so a host that lacks ghost can
+    /// still run one. Terminfo is not shipped: the remote host self-provisions it on
+    /// first run (needs remote `tic`). Reports byte progress through `on_progress`
+    /// so a GUI can draw a copy bar. A wrong binary that copies fine still fails the
+    /// caller's post-stage `probe`, so it falls back cleanly.
     fn stage(
         &self,
+        binary: &Path,
         home: &str,
         staged: &str,
         on_progress: &mut dyn FnMut(StageProgress),
     ) -> io::Result<()> {
-        let uname = self.command(&["uname", "-s", "-m"]).output()?;
-        if !uname.status.success() {
-            return Err(io::Error::other("remote `uname` failed"));
-        }
-        let uname = String::from_utf8_lossy(&uname.stdout);
-        if !remote_matches_local(&uname) {
-            return Err(io::Error::other(format!(
-                "remote is '{}' but this ghost is {}/{} — cross-platform staging is not supported yet",
-                uname.trim(),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-            )));
-        }
-
-        let exe = std::env::current_exe()?;
-        let bytes = std::fs::read(&exe)?;
+        let bytes = std::fs::read(binary)?;
         let total = bytes.len() as u64;
         eprintln!(
             "ghost: staging ghost ({} MiB) to {}…",
@@ -492,33 +552,58 @@ mod tests {
     }
 
     #[test]
-    fn remote_matches_local_maps_uname_to_this_platform() {
-        // The pair that names *this* build's platform matches; every other does
-        // not (cross-arch staging is gated off).
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
-        let sys = match os {
-            "linux" => "Linux",
-            "macos" => "Darwin",
-            other => other,
+    fn parse_platform_maps_uname_and_rejects_the_unknown() {
+        let linux = Platform {
+            os: "linux",
+            arch: "x86_64",
         };
-        // uname's machine string equals Rust's ARCH for the platforms we accept.
-        let machine = arch;
-        assert!(remote_matches_local(&format!("{sys} {machine}")));
-        assert!(remote_matches_local(&format!("{sys}\n{machine}\n")));
+        let mac = Platform {
+            os: "macos",
+            arch: "aarch64",
+        };
+        assert_eq!(parse_platform("Linux x86_64"), Some(linux));
+        assert_eq!(parse_platform("Linux amd64"), Some(linux)); // the amd64 alias
+        assert_eq!(parse_platform("Darwin arm64"), Some(mac)); // the arm64 alias
+        assert_eq!(parse_platform("Darwin aarch64"), Some(mac));
+        // Trailing newline / extra columns are tolerated (first two tokens count).
+        assert_eq!(parse_platform("Linux x86_64\n"), Some(linux));
+        // Unknown OS or arch, and malformed input, don't map.
+        assert_eq!(parse_platform("Plan9 sparc"), None);
+        assert_eq!(parse_platform("Linux riscv64"), None);
+        assert_eq!(parse_platform("Linux"), None);
+        assert_eq!(parse_platform(""), None);
+    }
 
-        // A different OS or arch, and malformed input, never match. Derive the
-        // "other" values from this platform so the test holds on any host.
-        let other_sys = if os == "linux" { "Darwin" } else { "Linux" };
-        let other_machine = if arch == "x86_64" {
-            "aarch64"
-        } else {
-            "x86_64"
+    #[test]
+    fn resolve_for_uses_the_exe_locally_and_a_prebuilt_cross_arch() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Platform {
+            os: "linux",
+            arch: "x86_64",
         };
-        assert!(!remote_matches_local(&format!("{other_sys} {machine}")));
-        assert!(!remote_matches_local(&format!("{sys} {other_machine}")));
-        assert!(!remote_matches_local("Plan9 sparc"));
-        assert!(!remote_matches_local(""));
+        let foreign = Platform {
+            os: "macos",
+            arch: "aarch64",
+        };
+        let exe = PathBuf::from("/proc/self/exe");
+        let search = [dir.path().to_path_buf()];
+
+        // Same platform ⇒ our own executable, no prebuilt needed.
+        assert_eq!(
+            resolve_for(local, local, Some(&exe), &search),
+            Some(exe.clone())
+        );
+
+        // Cross platform with no matching prebuilt ⇒ nothing to stage.
+        assert_eq!(resolve_for(foreign, local, Some(&exe), &search), None);
+
+        // Drop in a prebuilt named for the foreign platform ⇒ it's picked.
+        let prebuilt = dir.path().join("ghost-macos-aarch64");
+        std::fs::write(&prebuilt, b"binary").unwrap();
+        assert_eq!(
+            resolve_for(foreign, local, Some(&exe), &search),
+            Some(prebuilt)
+        );
     }
 
     #[test]
