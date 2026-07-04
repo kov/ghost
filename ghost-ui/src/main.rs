@@ -490,6 +490,26 @@ fn new_window_choice(
     startup_choice(None, sessions, groups)
 }
 
+/// The spawn options for relaunching a dead session `id` from its descriptor.
+/// A relaunch runs a fresh shell (empty command = the user's `$SHELL`), never
+/// `descriptor.command`: it restores the last screen and scrollback (seeded from
+/// the recording, when one exists) and drops you at a prompt below them — it does
+/// not re-run what died. The child is deferred to the first attach.
+fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathBuf) -> SpawnOpts {
+    let seed_from = recording.exists().then(|| recording.clone());
+    SpawnOpts {
+        name: id.to_string(),
+        command: Vec::new(),
+        size: (COLS, ROWS),
+        cwd: d.cwd.clone(),
+        record: Some(recording),
+        seed_from,
+        scrollback: screen::DEFAULT_SCROLLBACK,
+        max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
+        start_on_attach: true,
+    }
+}
+
 fn interactive() {
     // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
     // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
@@ -1462,27 +1482,16 @@ impl App {
         ghost_ui_core::Group::auto(format!("win-{}-{}", std::process::id(), seq), color)
     }
 
-    /// Attach window `wid`'s own client to `name` (no-op if it already holds one).
-    /// Returns whether the window now has a client for it.
-    /// Respawn a dead session under its old name: the durable descriptor says
-    /// what to run and where, and the previous life's recording seeds the
-    /// screen and scrollback (the host reads it before the new recording
-    /// replaces it). The child command itself is deferred to the first attach.
+    /// Respawn a dead session under its old name: a fresh shell seeded from the
+    /// previous life's recording, so its last screen and scrollback come back and
+    /// you land at a prompt below them. Deliberately a shell, never
+    /// `descriptor.command` — a relaunch restores context, it does not re-run what
+    /// died (which could be anything, and re-running it unbidden is the surprise
+    /// we avoid). The child is deferred to the first attach (`start_on_attach`).
     fn respawn_dead(&mut self, wid: WindowId, id: &str) -> bool {
         let d = ghost_vt::descriptor::read(id).unwrap_or_default();
         let recording = ghost_vt::paths::recording_path(id);
-        let seed_from = recording.exists().then(|| recording.clone());
-        let spawned = server::spawn(SpawnOpts {
-            name: id.to_string(),
-            command: d.command,
-            size: (COLS, ROWS),
-            cwd: d.cwd,
-            record: Some(recording),
-            seed_from,
-            scrollback: screen::DEFAULT_SCROLLBACK,
-            max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
-            start_on_attach: true,
-        });
+        let spawned = server::spawn(respawn_opts(id, &d, recording));
         match spawned {
             Err(e) => {
                 eprintln!("ghost: recreating '{id}' failed: {e}");
@@ -2330,7 +2339,7 @@ impl ApplicationHandler<UserEvent> for App {
 mod tests {
     use super::{
         StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir,
-        new_window_choice, startup_choice,
+        new_window_choice, respawn_opts, startup_choice,
     };
     use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
@@ -2360,6 +2369,37 @@ mod tests {
             color: 0,
             members: members.iter().map(|m| m.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn a_relaunch_runs_a_shell_seeded_from_the_recording_not_the_old_command() {
+        use ghost_vt::descriptor::Descriptor;
+        use std::path::{Path, PathBuf};
+        let d = Descriptor {
+            command: vec!["vim".into(), "notes.md".into()],
+            cwd: Some(PathBuf::from("/home/kov/proj")),
+            ..Default::default()
+        };
+        // No recording on disk → no seed, but it's still a shell in the old cwd.
+        let opts = respawn_opts(
+            "phoenix",
+            &d,
+            PathBuf::from("/nonexistent/phoenix.ghostrec"),
+        );
+        assert!(
+            opts.command.is_empty(),
+            "a relaunch runs the shell, not the recorded command"
+        );
+        assert_eq!(opts.cwd.as_deref(), Some(Path::new("/home/kov/proj")));
+        assert!(
+            opts.start_on_attach,
+            "the child is deferred to first attach"
+        );
+        assert!(
+            opts.seed_from.is_none(),
+            "a missing recording seeds nothing"
+        );
+        assert_eq!(opts.name, "phoenix");
     }
 
     #[test]
