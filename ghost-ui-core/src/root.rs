@@ -490,6 +490,24 @@ impl RootModel {
         (cols, rows)
     }
 
+    /// Snapshot this window's restorable state for the workspace file: its group
+    /// identity, the grid it is sized to, its view mode, the foreground session,
+    /// and the set it drives (sorted so the file is stable). See
+    /// [`crate::workspace`].
+    pub fn window_record(&self) -> crate::workspace::WindowRecord {
+        let (cols, rows) = self.grid();
+        let mut attached: Vec<SessionId> = self.mine.iter().cloned().collect();
+        attached.sort();
+        crate::workspace::WindowRecord {
+            group_id: self.my_group.id.clone(),
+            cols,
+            rows,
+            fleet: self.is_fleet(),
+            foreground: self.primary.clone(),
+            attached,
+        }
+    }
+
     /// Set the foreground terminal's inner padding (logical px per side), propagating
     /// it to the live foreground and every warm mirror so a Ctrl-Tab switch keeps the
     /// border. The shell calls this once at construction from `[window] padding`; it
@@ -1220,6 +1238,25 @@ mod tests {
         // Unfocused, but someone else's session: not this window's news.
         r.update(UiEvent::Focus(false));
         assert!(!bell(&mut r, "beta").contains(&Cmd::RequestAttention));
+    }
+
+    #[test]
+    fn window_record_captures_the_windows_restorable_state() {
+        let mut r = root(); // single view, owns "alpha"
+        r.set_my_group(crate::Group::auto("w1".into(), 2));
+        let rec = r.window_record();
+        assert_eq!(rec.group_id, "w1");
+        assert_eq!((rec.cols, rec.rows), r.grid(), "sized to the window grid");
+        assert!(rec.cols > 0 && rec.rows > 0);
+        assert!(!rec.fleet, "single view");
+        assert_eq!(rec.foreground.as_deref(), Some("alpha"));
+        assert_eq!(rec.attached, vec!["alpha".to_string()]);
+        // Diving to the fleet flips the mode; the owned set and group persist.
+        dive_out(&mut r, &[sess("alpha", true, 1)]);
+        let rec = r.window_record();
+        assert!(rec.fleet, "fleet overview");
+        assert_eq!(rec.group_id, "w1");
+        assert_eq!(rec.attached, vec!["alpha".to_string()]);
     }
 
     #[test]

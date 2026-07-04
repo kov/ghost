@@ -26,6 +26,7 @@ mod groups;
 mod menu;
 mod pacer;
 mod resize;
+mod windows;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -548,6 +549,10 @@ fn interactive() {
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
         sessions_changed,
+        // Seed the write-on-change baseline with what's already persisted, so the
+        // first save only rewrites the file once the live windows diverge from it.
+        last_workspace: windows::load(),
+        workspace_dirty: false,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -940,6 +945,13 @@ struct App {
     /// The watch itself; dropping it stops event delivery. `None` when the
     /// runtime dir cannot be watched — the floor tick still reconciles.
     _watcher: Option<notify::RecommendedWatcher>,
+    /// The workspace snapshot last written to disk, so a rebuild that matches it
+    /// skips the write. Kept current as windows change so a crash or reboot still
+    /// restores what was open (see [`App::save_workspace`]).
+    last_workspace: Vec<ghost_ui_core::WindowRecord>,
+    /// Set when a window's set or state may have changed; the loop flushes the
+    /// workspace snapshot once per wake rather than on every nested dispatch.
+    workspace_dirty: bool,
 }
 
 impl App {
@@ -1106,6 +1118,9 @@ impl App {
             None => return,
         };
         self.exec(wid, cmds, event_loop);
+        // A handled event may have changed a window's foreground, view, grid, or
+        // membership; mark the workspace for the loop's once-per-wake flush.
+        self.workspace_dirty = true;
     }
 
     fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &ActiveEventLoop) {
@@ -1265,7 +1280,7 @@ impl App {
                 Cmd::CloseWindow => {
                     self.close_window(wid);
                     if self.windows.is_empty() {
-                        event_loop.exit();
+                        self.shutdown(event_loop);
                     }
                 }
                 Cmd::SpawnSession => {
@@ -1342,7 +1357,7 @@ impl App {
                         });
                     }
                 }
-                Cmd::Quit => event_loop.exit(),
+                Cmd::Quit => self.shutdown(event_loop),
             }
         }
     }
@@ -1657,6 +1672,39 @@ impl App {
     /// the "close = detach" default.
     fn close_window(&mut self, wid: WindowId) {
         self.windows.remove(&wid);
+        // A closed window drops out of the restorable set.
+        self.workspace_dirty = true;
+    }
+
+    /// The single quit path: record the open windows, then leave the event loop.
+    /// Every user-initiated quit (Cmd/Ctrl+Q, closing the last window) funnels
+    /// through here so the workspace is flushed before exit.
+    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        self.save_workspace();
+        event_loop.exit();
+    }
+
+    /// Rebuild the workspace snapshot from the live windows and persist it if it
+    /// changed. Idempotent and cheap (a dirty flag flushes it once per loop
+    /// wake). Skips bench runs, whose synthetic sessions must never overwrite
+    /// the real workspace.
+    fn save_workspace(&mut self) {
+        self.workspace_dirty = false;
+        if self.bench.is_some() {
+            return;
+        }
+        let mut records: Vec<ghost_ui_core::WindowRecord> = self
+            .windows
+            .values()
+            .map(|w| w.root.window_record())
+            .collect();
+        // Stable order so an unchanged workspace serialises identically and the
+        // write-on-change guard holds.
+        records.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+        if records != self.last_workspace {
+            windows::save(&records);
+            self.last_workspace = records;
+        }
     }
 
     /// The window a "current window" menu action should target: the last-focused
@@ -1846,6 +1894,11 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Flush the workspace snapshot once per wake if a handled event or a
+        // window open/close marked it dirty (write-on-change guards the disk).
+        if self.workspace_dirty {
+            self.save_workspace();
+        }
         // Pump each window's own session clients and route the output back to
         // that window (a window only holds clients for sessions it's showing).
         let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
@@ -1988,7 +2041,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // (the hosts keep the sessions running). Exit with the last one.
                 self.close_window(id);
                 if self.windows.is_empty() {
-                    event_loop.exit();
+                    self.shutdown(event_loop);
                 }
             }
             WindowEvent::Resized(size) => {

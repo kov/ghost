@@ -20,6 +20,7 @@ pub mod mouse;
 pub mod root;
 pub mod terminal;
 pub mod text_input;
+pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};
 pub use event::{DeadSession, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent};
@@ -32,6 +33,7 @@ pub use root::RootModel;
 pub use terminal::{
     Shortcut, TerminalModel, bracket_paste, classify_shortcut, query_replies, selection_text,
 };
+pub use workspace::{WindowRecord, WorkspaceSnapshot};
 
 /// A session's stable identity (its name). Focus and input routing key on this,
 /// never a list index — so reordering tiles can't silently retarget input.
