@@ -1588,9 +1588,16 @@ impl RootModel {
         let mut cmds = vec![Cmd::Redraw];
         if done {
             self.anim = None;
-            if let Mode::Fleet(f) = &mut self.mode {
-                cmds.extend(f.update(UiEvent::Tick { now_ms }));
-            }
+            // Hand the settling tick back to whichever view is now live. The
+            // animation owned the tick stream while it played, so a foreground
+            // terminal holding a synchronized-output frame (DEC 2026) never saw
+            // its release tick — forward one now, or the hold latches and the
+            // view stays frozen on the pre-frame content until some input forces
+            // a repaint. The fleet needs it too, to resume its periodic refresh.
+            cmds.extend(match &mut self.mode {
+                Mode::Fleet(f) => f.update(UiEvent::Tick { now_ms }),
+                Mode::Single(m) => m.update(UiEvent::Tick { now_ms }),
+            });
         } else {
             cmds.push(Cmd::ScheduleTick {
                 after_ms: ANIM_TICK_MS,
@@ -3371,6 +3378,52 @@ mod tests {
         assert!(ticks > 1, "the slide ran for several frames, not one");
         assert_eq!(r.view().terminals().count(), 1, "settles to one view");
         assert_eq!(foreground(&mut r), "alpha");
+    }
+
+    #[test]
+    fn a_settling_slide_releases_the_foregrounds_synchronized_hold() {
+        // The freeze this reproduces: a session repositioning mid-frame emits DEC
+        // 2026 (begin synchronized output) and pauses before the matching reset,
+        // so the terminal correctly holds its repaint pending a release tick. But
+        // while a slide plays, the animation owns the tick stream (`tick_anim`) and
+        // swallows every tick — including that release. On completion the tick must
+        // be handed back to the foreground, or the hold latches: a still-held
+        // session never re-arms its backstop, so later output accumulates unseen
+        // and the view stays frozen until some input forces a full repaint. The
+        // user hit exactly this — a terminal stuck until a scroll revived it.
+        let mut r = root();
+        with_three(&mut r); // owns alpha, beta, gamma; foreground gamma
+
+        // Ctrl-Shift-Tab slides backward into beta, which becomes the foreground
+        // (see `ctrl_shift_tab_cycles_to_the_previous_attached_session`).
+        ctrl_tab(&mut r, true); // gamma -> beta
+        assert!(r.is_animating(), "the cycle plays a slide");
+
+        // Mid-slide beta opens a synchronized frame and stops before closing it:
+        // the repaint is held (no redraw) and a release backstop is scheduled.
+        let held = feed(&mut r, "beta", b"\x1b[?2026hhello");
+        assert!(
+            !held.contains(&Cmd::Redraw),
+            "a mid-frame feed is held, not painted: {held:?}"
+        );
+        assert!(
+            held.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the hold arms a release backstop: {held:?}"
+        );
+
+        // The slide settles; its final tick must release beta's hold.
+        settle(&mut r);
+        assert!(!r.is_animating(), "the slide completed");
+
+        // Further held output must still be able to arm a backstop — proof the
+        // hold was released at settle rather than latched. With the bug (tick_anim
+        // drops the completion tick in the single view) beta stays held and
+        // schedules nothing, so its screen never catches up.
+        let more = feed(&mut r, "beta", b"world");
+        assert!(
+            more.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "a settled slide must release the sync hold so later frames re-arm a backstop: {more:?}"
+        );
     }
 
     #[test]
