@@ -340,6 +340,78 @@ fn ghost_ssh_stages_the_binary_when_the_remote_lacks_ghost() {
 }
 
 #[test]
+fn staging_prunes_older_cached_binaries_keeping_the_newest_few() {
+    use std::time::{Duration, SystemTime};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let shim = shim_ssh();
+
+    // Pre-seed the remote cache with several older staged builds (empty stand-ins,
+    // distinct increasing mtimes so `old-1` is the oldest). They accumulate the way
+    // a dev's rebuild-reconnect loop leaves a ~126 MiB copy per build.
+    let bin_dir = home.path().join(".cache/ghost/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fakes = 6;
+    for i in 1..=fakes {
+        let f = std::fs::File::create(bin_dir.join(format!("ghost-old-{i}"))).unwrap();
+        // old-1 = now-9h … old-6 = now-4h — all older than the fresh stage below.
+        let mtime = SystemTime::now() - Duration::from_secs((10 - i as u64) * 3600);
+        f.set_modified(mtime).unwrap();
+    }
+
+    // A stage: no ghost on PATH, none staged under this hash, no override — so the
+    // fresh build copies over (arch matches; same machine) and then sweeps the dir.
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` (staging) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+
+    let names: Vec<String> = std::fs::read_dir(&bin_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("ghost-"))
+        .collect();
+
+    // The freshly-staged real binary survived (it's the newest)…
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with(&format!("ghost-{}-", env!("CARGO_PKG_VERSION")))),
+        "the freshly-staged binary is gone; dir holds {names:?}"
+    );
+    // …the oldest pre-seeded copy was pruned…
+    assert!(
+        !names.iter().any(|n| n == "ghost-old-1"),
+        "the oldest cached binary was not pruned; dir holds {names:?}"
+    );
+    // …and a sweep happened rather than unbounded accumulation (well under the
+    // seeded pile: at most a couple of recent fakes survive alongside the real one).
+    assert!(
+        names.len() < fakes,
+        "no pruning happened — dir still holds {} entries: {names:?}",
+        names.len()
+    );
+}
+
+#[test]
 fn ghost_ssh_falls_back_to_the_ssh_child_when_no_transport_is_possible() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

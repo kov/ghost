@@ -45,6 +45,26 @@ fn staged_path(home: &str, stamp: &str) -> String {
     )
 }
 
+/// How many staged binaries to keep in the remote cache after a stage: the
+/// just-copied one plus a couple of recent builds, so flipping between two builds
+/// doesn't re-copy while a dev's rebuild-reconnect loop can't pile up ~126 MiB
+/// per build forever.
+const STAGED_KEEP: usize = 3;
+
+/// A POSIX-sh one-liner (run on the remote after a stage) that keeps the newest
+/// `keep` `ghost-*` files in `dir` and deletes the older ones. No-ops on a missing
+/// dir or an empty match (`ls` errors are swallowed). Unlinking a binary a running
+/// remote host still uses is safe on Unix — the inode lives until that process
+/// exits, and a later connect for that exact build just re-stages it.
+fn prune_script(dir: &str, keep: usize) -> String {
+    format!(
+        "cd {dir} 2>/dev/null || exit 0; \
+         ls -t ghost-* 2>/dev/null | tail -n +{} | \
+         while IFS= read -r f; do rm -f -- \"$f\"; done",
+        keep + 1
+    )
+}
+
 /// A short content hash of this running binary, cached for the process. Stamps
 /// the staged path so a rebuilt binary re-stages (identical contents reuse the
 /// existing copy). `"unknown"` if the executable can't be read — staging then
@@ -287,7 +307,17 @@ impl RemoteSsh {
         if !child.wait()?.success() {
             return Err(io::Error::other("copying the binary to the remote failed"));
         }
+        self.prune_staged(&dir);
         Ok(())
+    }
+
+    /// Sweep older staged binaries out of `dir`, keeping the newest [`STAGED_KEEP`]
+    /// (the just-staged one plus a couple of recent builds). Best-effort: a failure
+    /// here never fails a connect, so it's fire-and-forget over the shared conn.
+    fn prune_staged(&self, dir: &str) {
+        let _ = self
+            .command(&["sh", "-c", &prune_script(dir, STAGED_KEEP)])
+            .output();
     }
 
     /// Enumerate the remote host's sessions by running `<remote_ghost> ls --json`
@@ -504,5 +534,20 @@ mod tests {
         // A different build stamp routes to a different path, so a changed binary
         // never reuses a stale staged copy.
         assert_ne!(p, staged_path("/home/claude", "0000000000000000"));
+    }
+
+    #[test]
+    fn prune_script_keeps_the_newest_and_removes_the_rest() {
+        let s = prune_script("/home/claude/.cache/ghost/bin", 3);
+        // Enters the dir, tolerates it being absent.
+        assert!(s.contains("cd /home/claude/.cache/ghost/bin"));
+        // Newest-first, scoped to our staged binaries.
+        assert!(s.contains("ls -t ghost-*"));
+        // Keeps 3 → deletes from the 4th oldest-ward line on.
+        assert!(
+            s.contains("tail -n +4"),
+            "keep=3 must skip the newest 3: {s}"
+        );
+        assert!(s.contains("rm -f"));
     }
 }
