@@ -390,9 +390,10 @@ struct Tile {
     /// The session's working directory (display form, `~`-abbreviated), from
     /// the listing's descriptor read; `None` when unknown.
     cwd: Option<String>,
-    /// Whether this is a remote (ssh/mosh) session, from the listing's
-    /// connection — drives the "ssh" tile marker.
-    ssh: bool,
+    /// The session's connection target (`user@host`) when it is a remote
+    /// (ssh/mosh) session, from the listing's connection; `None` for a local
+    /// session. Drives the tile's host badge.
+    host: Option<String>,
     /// A dead-but-remembered group member: its session is gone, but the tile
     /// stays in its group's block (previewing its recording's last screen)
     /// and activating it recreates the session. Never observed or attached;
@@ -750,7 +751,7 @@ impl FleetModel {
             frame_dirty: true,
             progress: None,
             cwd: None,
-            ssh: false,
+            host: None,
             dead: false,
             holder: None,
         });
@@ -1148,7 +1149,7 @@ impl FleetModel {
                 tile.pid = info.pid;
                 tile.created_at = info.created_at;
                 tile.cwd = info.cwd.clone();
-                tile.ssh = info.connection.is_some();
+                tile.host = info.connection.as_ref().map(|c| c.target());
                 tile.model.set_display_name(info.display_name.clone());
             } else {
                 // Born at the session's listed grid, so the tile has its real
@@ -1170,7 +1171,7 @@ impl FleetModel {
                 );
                 let t = self.tiles.last_mut().expect("just pushed");
                 t.cwd = info.cwd.clone();
-                t.ssh = info.connection.is_some();
+                t.host = info.connection.as_ref().map(|c| c.target());
                 dirty = true;
             }
         }
@@ -3209,10 +3210,16 @@ impl FleetModel {
                             let (before, after) = b.halves();
                             format!("{before}\u{2588}{after}")
                         }
-                        // An ssh group is marked on its header so the whole
-                        // window reads as remote at a glance.
+                        // An ssh group is marked on its header with its target so
+                        // the whole window reads as remote (and which host) at a
+                        // glance.
                         _ if group.connection.is_some() => {
-                            format!("{} \u{b7} ssh", group.name)
+                            let target = group
+                                .connection
+                                .as_ref()
+                                .map(|c| c.target())
+                                .unwrap_or_default();
+                            format!("{} \u{b7} {target}", group.name)
                         }
                         _ => group.name.clone(),
                     };
@@ -3313,7 +3320,7 @@ impl FleetModel {
                         0,
                         tile.cwd.clone(),
                         None,
-                        tile.ssh,
+                        tile.host.as_deref(),
                     )
                 ),
                 None => card_meta(
@@ -3322,7 +3329,7 @@ impl FleetModel {
                     tile.pid,
                     tile.cwd.clone(),
                     tile.model.screen().vt().progress(),
-                    tile.ssh,
+                    tile.host.as_deref(),
                 ),
             };
             // Clipped to the card: a narrow (aspect-locked) card cannot show a
@@ -3602,13 +3609,14 @@ fn card_meta(
     pid: i32,
     cwd: Option<String>,
     progress: Option<ghost_term::Progress>,
-    ssh: bool,
+    host: Option<&str>,
 ) -> String {
     let mut s = id.to_string();
-    // Mark a remote session right after its name (its command is empty — the
-    // connection derives the child — so nothing else would signal it).
-    if ssh {
-        s.push_str(" \u{b7} ssh");
+    // Mark a remote session with its connection target right after the name, so
+    // one can tell which host it lives on (and remote tiles apart from local).
+    if let Some(host) = host {
+        s.push_str(" \u{b7} ");
+        s.push_str(host);
     }
     if !command.is_empty() {
         s.push_str(" \u{b7} ");
@@ -7111,14 +7119,14 @@ mod tests {
                 12,
                 Some("~/x".into()),
                 Some(ghost_term::Progress::Normal(3)),
-                false,
+                None
             ),
             "a \u{b7} vim \u{b7} ~/x \u{b7} 12 \u{b7} 3%"
         );
     }
 
     #[test]
-    fn an_ssh_sessions_tile_meta_is_marked() {
+    fn an_ssh_sessions_tile_meta_shows_its_host() {
         let mut m = fleet();
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![SessionInfo {
@@ -7129,13 +7137,13 @@ mod tests {
         assert!(
             scene.layers[0].items.iter().any(|it| matches!(it,
                 SceneItem::Text { runs, .. }
-                    if runs[0].text.starts_with("remote") && runs[0].text.contains("ssh"))),
-            "the ssh tile's meta line is marked ssh"
+                    if runs[0].text.starts_with("remote") && runs[0].text.contains("kov@box"))),
+            "the ssh tile's meta line names its host"
         );
     }
 
     #[test]
-    fn an_ssh_groups_header_is_marked() {
+    fn an_ssh_groups_header_shows_its_host() {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         m.update(UiEvent::GroupsLoaded(vec![Group {
@@ -7149,8 +7157,8 @@ mod tests {
         assert!(
             header_labels(&m)
                 .iter()
-                .any(|l| l.contains("green") && l.contains("ssh")),
-            "the ssh group's header is marked ssh: {:?}",
+                .any(|l| l.contains("green") && l.contains("kov@box")),
+            "the ssh group's header names its host: {:?}",
             header_labels(&m)
         );
     }
@@ -7203,7 +7211,7 @@ mod tests {
     fn card_metadata_omits_the_shell_command() {
         // A shell session (empty command) shows just name · pid — no "$SHELL".
         assert_eq!(
-            card_meta("build", &[], 4012, None, None, false),
+            card_meta("build", &[], 4012, None, None, None),
             "build \u{b7} 4012"
         );
         // A real command is shown.
@@ -7214,16 +7222,16 @@ mod tests {
                 40,
                 None,
                 None,
-                false
+                None
             ),
             "edit \u{b7} nvim x.rs \u{b7} 40"
         );
         // Unknown pid is omitted too.
-        assert_eq!(card_meta("s", &[], 0, None, None, false), "s");
-        // A remote session is marked "ssh" right after its name.
+        assert_eq!(card_meta("s", &[], 0, None, None, None), "s");
+        // A remote session names its host right after its name.
         assert_eq!(
-            card_meta("ssh-box", &[], 4012, None, None, true),
-            "ssh-box \u{b7} ssh \u{b7} 4012"
+            card_meta("ssh-box", &[], 4012, None, None, Some("kov@box")),
+            "ssh-box \u{b7} kov@box \u{b7} 4012"
         );
     }
 
@@ -7232,19 +7240,19 @@ mod tests {
         use ghost_term::Progress;
         // The suffix formats per OSC 9;4 state.
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Normal(42)), false),
+            card_meta("b", &[], 0, None, Some(Progress::Normal(42)), None),
             "b \u{b7} 42%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Error(90)), false),
+            card_meta("b", &[], 0, None, Some(Progress::Error(90)), None),
             "b \u{b7} \u{2717} 90%"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Indeterminate), false),
+            card_meta("b", &[], 0, None, Some(Progress::Indeterminate), None),
             "b \u{b7} \u{2026}"
         );
         assert_eq!(
-            card_meta("b", &[], 0, None, Some(Progress::Paused(10)), false),
+            card_meta("b", &[], 0, None, Some(Progress::Paused(10)), None),
             "b \u{b7} \u{23f8} 10%"
         );
 
