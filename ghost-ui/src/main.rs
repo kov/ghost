@@ -1434,6 +1434,20 @@ impl App {
                     }
                 }
                 Cmd::NewWindow => self.open_launch_window(event_loop),
+                Cmd::NewSshWindow => self.open_connect_window(event_loop),
+                Cmd::ConnectSshWindow(spec) => {
+                    // The connect prompt resolved: make this window an ssh group
+                    // (set before the adopt so its registry save persists the
+                    // connection), then spawn and show its first ssh session.
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.root.set_group_connection(Some(spec.clone()));
+                    }
+                    let name = self.unique_session_name();
+                    spawn_session(&name, vec![], Some(spec));
+                    if self.attach_into(wid, &name) {
+                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    }
+                }
                 Cmd::CloseWindow => {
                     self.close_window(wid);
                     if self.windows.is_empty() {
@@ -1740,7 +1754,7 @@ impl App {
         event_loop: &ActiveEventLoop,
         group: ghost_ui_core::Group,
         size: Option<(u16, u16)>,
-    ) {
+    ) -> WindowId {
         let cfg = config::UiConfig::load();
         let (req_cols, req_rows) = size.unwrap_or((cfg.columns(), cfg.rows()));
         let gfx = Graphics::new(
@@ -1801,6 +1815,20 @@ impl App {
         // Seed the persisted groups so the overview shows them from the start.
         let groups = self.groups.clone();
         self.dispatch(wid, UiEvent::GroupsLoaded(groups), event_loop);
+        wid
+    }
+
+    /// Open a new window showing the "connect to a host" prompt (Cmd+S /
+    /// Ctrl+Shift+S): a fresh fleet window on its own group, flipped into the
+    /// connect state so it captures a `[user@]host` and, on submit, becomes an
+    /// ssh window (see the `Cmd::ConnectSshWindow` handler).
+    fn open_connect_window(&mut self, event_loop: &ActiveEventLoop) {
+        let group = self.mint_group();
+        let wid = self.open_fleet_window(event_loop, group, None);
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.root.begin_connect();
+            w.gfx.window.request_redraw();
+        }
     }
 
     /// Open a new window that behaves exactly like a fresh launch (File > New Window

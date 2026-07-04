@@ -80,6 +80,9 @@ pub enum Shortcut {
     Quit,
     /// Open a new window (Cmd+N / Ctrl+Shift+N).
     NewWindow,
+    /// Open a new window connected to a host over SSH (Cmd+S / Ctrl+Shift+S).
+    /// Not bare Ctrl+S — that stays terminal flow control (XOFF).
+    NewSshWindow,
     /// Close this window (Cmd+W / Ctrl+Shift+W).
     CloseWindow,
     /// Spawn a fresh session in this window and switch to it (Cmd+T / Alt+T).
@@ -136,6 +139,9 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
             // Window management, same Cmd / Ctrl+Shift gating. Bare Ctrl+N/W stay
             // terminal input.
             Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
+            // New SSH window: Cmd+S / Ctrl+Shift+S. The Shift gate keeps bare
+            // Ctrl+S as terminal flow control (XOFF).
+            Key::Char(s) if s.eq_ignore_ascii_case("s") => return Some(Shortcut::NewSshWindow),
             Key::Char(s) if s.eq_ignore_ascii_case("w") => return Some(Shortcut::CloseWindow),
             _ => {}
         }
@@ -833,6 +839,7 @@ impl TerminalModel {
             // these before delegation, so these arms are the safety net that
             // keeps the chords from ever leaking to the child as input.
             Some(Shortcut::NewWindow) => vec![Cmd::NewWindow],
+            Some(Shortcut::NewSshWindow) => vec![Cmd::NewSshWindow],
             Some(Shortcut::CloseWindow) => vec![Cmd::CloseWindow],
             Some(Shortcut::NewSession) => vec![Cmd::SpawnSession],
             None => {

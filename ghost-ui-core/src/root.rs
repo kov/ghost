@@ -13,9 +13,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
+use crate::text_input::TextInput;
 use crate::{
-    CellMetrics, Cmd, FleetModel, Scene, SceneItem, SessionId, TerminalModel, Transform, UiEvent,
+    CellMetrics, Cmd, FleetModel, Layer, RectPx, Run, Scene, SceneId, SceneItem, SessionId, Style,
+    TerminalModel, Transform, UiEvent,
 };
+use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::query::ThemeColors;
 
 enum Mode {
@@ -288,6 +291,10 @@ pub struct RootModel {
     /// the window edges. Applied to the foreground/warm models and folded into
     /// [`Self::grid`] so the attach handshake matches. 0 = flush (the historic look).
     pad: f32,
+    /// When set, this window is showing the "connect to a host" prompt (a new
+    /// ssh window before its first session): it swallows the keyboard into the
+    /// entry and renders the prompt overlay instead of the live view.
+    connect: Option<TextInput>,
 }
 
 /// Resize a model to the window (physical px + scale), first stamping the inner
@@ -337,6 +344,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
+            connect: None,
         }
     }
 
@@ -361,6 +369,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
+            connect: None,
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
@@ -503,8 +512,23 @@ impl RootModel {
     /// The window group's own connection, if it is an explicit "ssh group" — the
     /// default every new session in the window inherits (winning over the
     /// foreground session's).
-    pub fn group_connection(&self) -> Option<&ghost_vt::connection::ConnectionSpec> {
+    pub fn group_connection(&self) -> Option<&ConnectionSpec> {
         self.my_group.connection.as_ref()
+    }
+
+    /// Open the "connect to a host" prompt: the window shows a host entry and
+    /// swallows the keyboard until the user submits (Enter) or cancels (Escape).
+    /// The shell calls this on a freshly-opened, sessionless ssh window.
+    pub fn begin_connect(&mut self) {
+        self.connect = Some(TextInput::new(String::new()));
+    }
+
+    /// Mark this window's group an explicit "ssh group" for `connection` (or
+    /// clear it): every new session opened in the window then inherits it. The
+    /// shell sets this when the connect prompt resolves, before adopting the
+    /// first session — so the adopt's registry save persists it.
+    pub fn set_group_connection(&mut self, connection: Option<ConnectionSpec>) {
+        self.my_group.connection = connection;
     }
 
     pub fn window_record(&self) -> crate::workspace::WindowRecord {
@@ -557,6 +581,12 @@ impl RootModel {
         {
             return self.tick_anim(*now_ms);
         }
+        // The connect prompt swallows keyboard and text while it is open, so the
+        // typed host never reaches the (empty) view beneath it; resizes and the
+        // like still pass through to keep the window sized.
+        if self.connect.is_some() && matches!(ev, UiEvent::Key { .. } | UiEvent::Text(_)) {
+            return self.connect_input(ev);
+        }
         if let UiEvent::Key {
             key, mods, kind, ..
         } = &ev
@@ -579,6 +609,7 @@ impl RootModel {
             match classify_shortcut(key, *mods) {
                 Some(Shortcut::Quit) => return vec![Cmd::Quit],
                 Some(Shortcut::NewWindow) => return vec![Cmd::NewWindow],
+                Some(Shortcut::NewSshWindow) => return vec![Cmd::NewSshWindow],
                 Some(Shortcut::CloseWindow) => return vec![Cmd::CloseWindow],
                 Some(Shortcut::NewSession) => return vec![Cmd::SpawnSession],
                 _ => {} // Copy/Paste/Zoom are per-terminal: delegate below.
@@ -1020,6 +1051,11 @@ impl RootModel {
     }
 
     pub fn view(&self) -> Scene {
+        // The connect prompt owns the whole window until it resolves.
+        if let Some(entry) = &self.connect {
+            return self.connect_scene(entry);
+        }
+
         // An animation owns the frame while it plays — the composed timeline frame.
         if let Some(anim) = &self.anim {
             return anim.scene();
@@ -1037,6 +1073,167 @@ impl RootModel {
         }
 
         self.live_scene()
+    }
+
+    /// Keyboard for the connect prompt: printable keys and pasted/IME text
+    /// insert into the host entry; the [`TextInput`] chords edit and navigate;
+    /// Enter submits (a valid `[user@]host` opens the ssh window, an empty or
+    /// invalid entry keeps prompting); Escape cancels and closes the window.
+    fn connect_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        match ev {
+            UiEvent::Text(s) => {
+                if let Some(e) = &mut self.connect {
+                    e.insert(&s);
+                }
+                vec![Cmd::Redraw]
+            }
+            UiEvent::Key {
+                key, mods, kind, ..
+            } if kind.is_down() => match key {
+                // A host has no spaces or control chars, so only plain printable
+                // keys type; Ctrl/Cmd chords are shortcuts, not text.
+                Key::Char(s) if !mods.ctrl && !mods.sup => {
+                    if let Some(e) = &mut self.connect {
+                        e.insert(&s);
+                    }
+                    vec![Cmd::Redraw]
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let text = self
+                        .connect
+                        .as_ref()
+                        .map(|e| e.text().to_string())
+                        .unwrap_or_default();
+                    match ConnectionSpec::parse_target(&text) {
+                        Some(spec) => {
+                            self.connect = None;
+                            vec![Cmd::ConnectSshWindow(spec)]
+                        }
+                        // Empty or otherwise unparseable: stay in the prompt.
+                        None => vec![Cmd::Redraw],
+                    }
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.connect = None;
+                    vec![Cmd::CloseWindow]
+                }
+                key => {
+                    if let Some(e) = &mut self.connect
+                        && e.key(&key, mods)
+                    {
+                        vec![Cmd::Redraw]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// The "connect to a host" overlay: a full-window scrim, a title, the host
+    /// entry with a block caret, and a hint line — centered, at the modal scale.
+    fn connect_scene(&self, entry: &TextInput) -> Scene {
+        use crate::Rgba;
+        const SCRIM: Rgba = [0.04, 0.04, 0.06, 1.0];
+        const FG: Rgba = [0.92, 0.94, 0.97, 1.0];
+        const HINT: Rgba = [0.60, 0.63, 0.68, 1.0];
+        const FIELD_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
+        const BORDER: Rgba = [0.30, 0.60, 0.95, 1.0];
+        const SCALE: f32 = 1.5;
+
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let m = CellMetrics {
+            advance: self.metrics.advance * SCALE,
+            line_height: self.metrics.line_height * SCALE,
+        };
+        let text_w = |s: &str| s.chars().count() as f32 * m.advance;
+        let center_x = |tw: f32| ((w - tw) * 0.5).max(0.0);
+        let run = |s: &str| Run {
+            start_col: 0,
+            width_cols: s.chars().count(),
+            text: s.to_string(),
+            style: Style::default(),
+        };
+        let line = |y: f32, s: &str, color: Rgba| SceneItem::Text {
+            id: SceneId::NavBar,
+            rect: RectPx {
+                x: center_x(text_w(s)),
+                y,
+                w: text_w(s).max(1.0),
+                h: m.line_height,
+            },
+            runs: vec![run(s)],
+            metrics: m,
+            color,
+            scale: SCALE,
+        };
+
+        let mut items = vec![SceneItem::Rect {
+            id: SceneId::Sidebar,
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+            },
+            color: SCRIM,
+            radius: 0.0,
+        }];
+
+        let title = "Connect to a host over SSH";
+        let ty = ((h - m.line_height * 5.0) * 0.5).max(0.0);
+        items.push(line(ty, title, FG));
+
+        // The host entry: a bordered field showing the typed text with a block
+        // caret spliced in at the cursor.
+        let (before, after) = entry.halves();
+        let shown = format!("{before}\u{2588}{after}");
+        let field_w =
+            (28.0 * m.advance).clamp(text_w(&shown) + 2.0 * m.advance, (w * 0.9).max(1.0));
+        let field_h = m.line_height * 1.6;
+        let fy = ty + m.line_height * 1.8;
+        let field = RectPx {
+            x: center_x(field_w),
+            y: fy,
+            w: field_w,
+            h: field_h,
+        };
+        items.push(SceneItem::Rect {
+            id: SceneId::NavBar,
+            rect: field,
+            color: FIELD_BG,
+            radius: 5.0,
+        });
+        items.push(SceneItem::Border {
+            id: SceneId::NavBar,
+            rect: field,
+            color: BORDER,
+            width: 2.0,
+        });
+        items.push(SceneItem::Text {
+            id: SceneId::NavBar,
+            rect: RectPx {
+                x: field.x + m.advance * 0.5,
+                y: fy + (field_h - m.line_height) * 0.5,
+                w: (field_w - m.advance).max(1.0),
+                h: m.line_height,
+            },
+            runs: vec![run(&shown)],
+            metrics: m,
+            color: FG,
+            scale: SCALE,
+        });
+
+        items.push(line(
+            fy + field_h + m.line_height * 0.8,
+            "Enter to connect · Esc to cancel",
+            HINT,
+        ));
+
+        let mut scene = Scene::new(self.size_px);
+        scene.layers.push(Layer::new(0, items));
+        scene
     }
 
     /// Tell the live foreground session its view was just composited, so its next
@@ -2269,7 +2466,18 @@ mod tests {
                 key(&mut r, Key::Char("w".into()), chord),
                 vec![Cmd::CloseWindow]
             );
+            assert_eq!(
+                key(&mut r, Key::Char("s".into()), chord),
+                vec![Cmd::NewSshWindow],
+                "Cmd+S / Ctrl+Shift+S opens a new ssh window"
+            );
         }
+        // Bare Ctrl+S is NOT a shortcut — it stays terminal flow control (XOFF).
+        let mut r = root();
+        assert!(matches!(
+            key(&mut r, Key::Char("s".into()), Mods::CTRL).as_slice(),
+            [Cmd::SendInput { .. }]
+        ));
         // New session is Cmd+T on macOS, Alt+T elsewhere.
         let new_session = if cfg!(target_os = "macos") {
             Mods::SUPER
@@ -2299,6 +2507,73 @@ mod tests {
             key(&mut r, Key::Char("n".into()), Mods::CTRL).as_slice(),
             [Cmd::SendInput { .. }]
         ));
+    }
+
+    /// Does any Text run in the current scene contain `needle`?
+    fn scene_has(r: &RootModel, needle: &str) -> bool {
+        r.view().layers.iter().any(|l| {
+            l.items.iter().any(|it| {
+                matches!(it, SceneItem::Text { runs, .. }
+                    if runs.iter().any(|run| run.text.contains(needle)))
+            })
+        })
+    }
+
+    fn typed(r: &mut RootModel, s: &str) {
+        for ch in s.chars() {
+            key(r, Key::Char(ch.to_string()), Mods::NONE);
+        }
+    }
+
+    #[test]
+    fn the_connect_prompt_captures_typing_and_shows_the_host() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        assert!(scene_has(&r, "Connect"), "the prompt title shows");
+        typed(&mut r, "kov@box");
+        assert!(
+            scene_has(&r, "kov@box"),
+            "the typed host shows in the field"
+        );
+        // Editing chords work: backspace trims the last char.
+        key(&mut r, Key::Named(NamedKey::Backspace), Mods::NONE);
+        assert!(scene_has(&r, "kov@bo") && !scene_has(&r, "kov@box"));
+    }
+
+    #[test]
+    fn submitting_a_host_opens_the_ssh_window_and_leaves_the_prompt() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        let spec = ghost_vt::connection::ConnectionSpec::parse_target("dev@example").unwrap();
+        assert_eq!(cmds, vec![Cmd::ConnectSshWindow(spec)]);
+        // The prompt is gone — the window falls back to its (empty) live view.
+        assert!(!scene_has(&r, "Connect"), "prompt cleared after submit");
+    }
+
+    #[test]
+    fn an_empty_or_invalid_host_keeps_prompting() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ConnectSshWindow(_))),
+            "an empty host does not open a window"
+        );
+        assert!(scene_has(&r, "Connect"), "still prompting");
+    }
+
+    #[test]
+    fn escape_cancels_the_connect_prompt_and_closes_the_window() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "abc");
+        assert_eq!(
+            key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE),
+            vec![Cmd::CloseWindow]
+        );
+        assert!(!scene_has(&r, "Connect"), "prompt cleared on cancel");
     }
 
     #[test]

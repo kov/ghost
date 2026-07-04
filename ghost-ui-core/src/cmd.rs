@@ -69,6 +69,15 @@ pub enum Cmd {
     /// Open a new window. The shell creates it in the fleet overview (it starts
     /// owning no session); the user spawns or takes one over from there.
     NewWindow,
+    /// Open a new window that starts in the "connect to a host" prompt
+    /// (Cmd+S / Ctrl+Shift+S). The shell opens a sessionless window showing the
+    /// host entry; on submit the window emits [`Cmd::ConnectSshWindow`].
+    NewSshWindow,
+    /// The connect prompt was submitted: make this window an ssh group for
+    /// `spec` and spawn its first ssh session. The shell records the group's
+    /// connection (so later sessions in it inherit it), spawns + attaches the
+    /// ssh session, and replies `UiEvent::AdoptSession` to switch to it.
+    ConnectSshWindow(ghost_vt::connection::ConnectionSpec),
     /// Close the window this command came from. The shell detaches the window's
     /// sessions (they keep running) — the "close = detach" default.
     CloseWindow,
