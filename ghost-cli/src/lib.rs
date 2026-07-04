@@ -6,6 +6,7 @@
 
 use clap::{Parser, Subcommand};
 use ghost_vt::client;
+use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
 
@@ -63,6 +64,32 @@ enum Command {
         /// Command to run instead of $SHELL (everything after `--`).
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Connect to a host over SSH in a new session and attach to it. The
+    /// session's child is `ssh <target>`; it records and reattaches like any
+    /// session, and a new session spawned in its window/group inherits the same
+    /// connection (see the SSH sessions feature).
+    Ssh {
+        /// The host to connect to, as `[user@]host`.
+        target: String,
+        /// Session name (defaults to `ssh-<host>`, uniquified).
+        #[arg(long)]
+        name: Option<String>,
+        /// Start the session in the background without attaching to it.
+        #[arg(short = 'd', long)]
+        detached: bool,
+        /// Port to connect to (`ssh -p`).
+        #[arg(short = 'p', long)]
+        port: Option<u16>,
+        /// Identity file (`ssh -i`).
+        #[arg(short = 'i', long)]
+        identity: Option<std::path::PathBuf>,
+        /// Jump host (`ssh -J`).
+        #[arg(short = 'J', long)]
+        jump: Option<String>,
+        /// Extra arguments passed through to ssh verbatim (everything after `--`).
+        #[arg(last = true)]
+        extra: Vec<String>,
     },
     /// List running sessions.
     Ls,
@@ -168,6 +195,62 @@ fn dispatch(command: Command) {
                 fail(&format!("session '{name}' started but attach failed: {e}"));
             }
         }
+        Command::Ssh {
+            target,
+            name,
+            detached,
+            port,
+            identity,
+            jump,
+            extra,
+        } => {
+            let Some(mut spec) = ConnectionSpec::parse_target(&target) else {
+                fail(&format!("invalid ssh target '{target}'"));
+            };
+            spec.port = port;
+            spec.identity = identity;
+            spec.jump = jump;
+            spec.extra = extra;
+            // A given name must be free (like `ghost new`); a derived name is
+            // uniquified instead — repeat connections to one host are routine.
+            let taken: Vec<String> = session::list()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|s| [s.display().to_string(), s.name])
+                .collect();
+            let name = match name {
+                Some(n) => {
+                    if taken.contains(&n) {
+                        fail(&format!("a session named '{n}' already exists"));
+                    }
+                    n
+                }
+                None => unique_ssh_name(&spec.host, &taken),
+            };
+            let opts = SpawnOpts {
+                name: name.clone(),
+                // Empty: the connection derives the child argv (`ssh …`).
+                command: Vec::new(),
+                size: (80, 24),
+                cwd: None,
+                record: Some(ghost_vt::paths::recording_path(&name)),
+                seed_from: None,
+                scrollback: ghost_vt::screen::DEFAULT_SCROLLBACK,
+                max_recording_bytes: Some(ghost_vt::record::DEFAULT_MAX_RECORDING_BYTES),
+                // Attached (the default) starts ssh on the attach handshake so
+                // its terminal queries reach a real client; `-d` starts it now.
+                start_on_attach: !detached,
+                connection: Some(spec),
+            };
+            if let Err(e) = server::spawn(opts) {
+                fail(&e.to_string());
+            }
+            if detached {
+                println!("started session '{name}'");
+            } else if let Err(e) = client::attach(&name) {
+                fail(&format!("session '{name}' started but attach failed: {e}"));
+            }
+        }
         Command::Ls => match session::list() {
             Ok(sessions) => {
                 for s in sessions {
@@ -238,6 +321,20 @@ fn default_name() -> String {
     format!("ghost-{}", std::process::id())
 }
 
+/// A session name for an ssh connection to `host`: `ssh-<host>`, or
+/// `ssh-<host>-N` if that (or a lower suffix) is already `taken` — repeat
+/// connections to one host are routine, so we uniquify rather than refuse.
+fn unique_ssh_name(host: &str, taken: &[String]) -> String {
+    let base = format!("ssh-{host}");
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|cand| !taken.iter().any(|t| t == cand))
+        .expect("an unused suffix always exists")
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("ghost: {msg}");
     std::process::exit(1);
@@ -260,6 +357,77 @@ mod tests {
         let cli = Cli::try_parse_from(["ghost", "--fresh"]).unwrap();
         assert!(cli.command.is_none(), "--fresh is not a subcommand");
         assert!(cli.fresh);
+    }
+
+    #[test]
+    fn ssh_parses_target_and_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ghost",
+            "ssh",
+            "dev@box",
+            "-p",
+            "2222",
+            "-i",
+            "/home/k/id",
+            "-J",
+            "bastion",
+            "--name",
+            "work",
+            "-d",
+            "--",
+            "-o",
+            "ForwardAgent=yes",
+        ])
+        .unwrap();
+        let Some(Command::Ssh {
+            target,
+            name,
+            detached,
+            port,
+            identity,
+            jump,
+            extra,
+        }) = cli.command
+        else {
+            panic!("expected an ssh command");
+        };
+        assert_eq!(target, "dev@box");
+        assert_eq!(name.as_deref(), Some("work"));
+        assert!(detached);
+        assert_eq!(port, Some(2222));
+        assert_eq!(
+            identity.as_deref(),
+            Some(std::path::Path::new("/home/k/id"))
+        );
+        assert_eq!(jump.as_deref(), Some("bastion"));
+        assert_eq!(extra, vec!["-o", "ForwardAgent=yes"]);
+    }
+
+    #[test]
+    fn ssh_takes_a_bare_host() {
+        let cli = Cli::try_parse_from(["ghost", "ssh", "box"]).unwrap();
+        let Some(Command::Ssh {
+            target, port, name, ..
+        }) = cli.command
+        else {
+            panic!("expected an ssh command");
+        };
+        assert_eq!(target, "box");
+        assert_eq!(port, None);
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn unique_ssh_name_derives_and_uniquifies() {
+        assert_eq!(unique_ssh_name("box", &[]), "ssh-box");
+        assert_eq!(
+            unique_ssh_name("box", &["ssh-box".to_string()]),
+            "ssh-box-2"
+        );
+        assert_eq!(
+            unique_ssh_name("box", &["ssh-box".to_string(), "ssh-box-2".to_string()],),
+            "ssh-box-3"
+        );
     }
 
     #[test]

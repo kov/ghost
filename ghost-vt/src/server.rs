@@ -1406,6 +1406,31 @@ mod tests {
     use crate::record::DEFAULT_MAX_RECORDING_BYTES;
 
     #[test]
+    fn spawn_opts_with_a_connection_round_trip_through_postcard() {
+        // SpawnOpts crosses to the re-exec'd host as a postcard blob
+        // (`encode_host_args`); a connection spec must survive that intact, or
+        // the host silently drops the spawn.
+        let opts = SpawnOpts {
+            name: "work".into(),
+            command: Vec::new(),
+            size: (80, 24),
+            cwd: None,
+            record: None,
+            seed_from: None,
+            scrollback: 100,
+            max_recording_bytes: None,
+            start_on_attach: true,
+            connection: ConnectionSpec::parse_target("dev@example").map(|mut s| {
+                s.port = Some(2222);
+                s
+            }),
+        };
+        let bytes = postcard::to_allocvec(&opts).unwrap();
+        let back: SpawnOpts = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.connection, opts.connection);
+    }
+
+    #[test]
     fn effective_command_resolves_spec_command_and_shell() {
         // No connection, empty command: left empty for `split_command` → $SHELL.
         assert_eq!(effective_command(&[], None).unwrap(), Vec::<String>::new());

@@ -33,25 +33,30 @@ pub enum ConnectionKind {
 }
 
 /// A remote connection, launcher-agnostic and durable.
+///
+/// The fields carry `#[serde(default)]` (so pre-existing JSON descriptors/meta
+/// parse) but deliberately **not** `skip_serializing_if`: a spec rides inside
+/// `SpawnOpts` through postcard — a non-self-describing format — where a skipped
+/// field desyncs the byte stream and silently drops the whole spawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSpec {
     /// Hostname, IP, or an `ssh_config` alias (passed through verbatim).
     pub host: String,
     /// Login user; `None` uses the launcher's own default (local user /
     /// `ssh_config`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub user: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub port: Option<u16>,
     /// Identity file (`ssh -i`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub identity: Option<PathBuf>,
     /// Jump host (`ssh -J`), kept as the user typed it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub jump: Option<String>,
     /// Extra ssh-flavored arguments passed through verbatim (e.g.
     /// `-o ForwardAgent=yes`). The escape hatch.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub extra: Vec<String>,
     /// Which launcher realizes the connection.
     #[serde(default)]
@@ -230,14 +235,19 @@ mod tests {
     }
 
     #[test]
-    fn defaulted_fields_are_omitted_from_json() {
-        // A bare host must not emit null user/port/identity/jump/extra — legacy
-        // and forward compatibility both rely on the small form.
-        let spec = ConnectionSpec::parse_target("box").unwrap();
-        assert_eq!(
-            serde_json::to_string(&spec).unwrap(),
-            r#"{"host":"box","kind":"ssh"}"#
-        );
+    fn a_spec_round_trips_through_postcard() {
+        // A spec rides inside SpawnOpts through postcard (non-self-describing),
+        // so partially-set specs must survive it — a skipped field would desync
+        // the stream and drop the spawn (regression guard).
+        let spec = ConnectionSpec {
+            host: "box".into(),
+            user: Some("kov".into()),
+            port: Some(2222),
+            ..Default::default()
+        };
+        let bytes = postcard::to_allocvec(&spec).unwrap();
+        let back: ConnectionSpec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, spec);
     }
 
     #[test]
