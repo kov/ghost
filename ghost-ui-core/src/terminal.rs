@@ -16,7 +16,6 @@
 use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
-use ghost_term::terminal::Cursor;
 use ghost_term::{ClipboardSelection, Line, MouseProtocol};
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
@@ -241,15 +240,6 @@ pub struct TerminalModel {
     /// unlabeled. A human-facing label only: `session` stays the immutable id
     /// every effect routes by. Feeds the [`Self::title`] fallback.
     display_name: String,
-    /// The text cursor (0-based, with visibility and shape) as of the previous feed.
-    /// Moving the cursor writes no cell, so a bare CUP/CUF — common in full-screen
-    /// apps whose differential renderers reposition without rewriting — leaves
-    /// `Screen::feed` reporting no dirty row. Diffing against this makes a cursor
-    /// change its own damage (the row it left + the row it entered) and repaint
-    /// trigger, so the block never lags the child (the "space doesn't advance the
-    /// cursor" jank). Visibility and shape count too: hiding or reshaping the cursor
-    /// changes the drawn frame without touching a cell.
-    prev_cursor: Cursor,
 }
 
 /// How long a synchronized-output hold may last before the scheduled tick
@@ -278,7 +268,6 @@ impl TerminalModel {
             (f32::from(rows) * metrics.line_height) as u32,
         );
         let screen = Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK);
-        let prev_cursor = screen.vt().cursor();
         TerminalModel {
             session,
             metrics,
@@ -309,7 +298,6 @@ impl TerminalModel {
             theme: ThemeColors::default(),
             hovered_link: None,
             display_name: String::new(),
-            prev_cursor,
         }
     }
 
@@ -1079,37 +1067,21 @@ impl TerminalModel {
             let colors_changed = colors_before != self.render_colors();
             // The cursor is part of the drawn frame, but moving it writes no cell, so a
             // bare CUP/CUF (how full-screen apps like an editor or Claude Code reposition
-            // between keystrokes) leaves `Screen::feed` reporting no dirty row. Treat a
-            // change in the *drawn* cursor as its own damage so the block never lags the
-            // child: dirty the row it left and the row it entered, and force a repaint.
-            // Only matters at the live bottom — scrolled into history the cursor isn't
-            // drawn, and a scroll is already a full repaint. Visibility and shape count
-            // too: hiding or reshaping the cursor changes the frame without touching a
-            // cell. Always advance the baseline so the next feed measures from here.
+            // between keystrokes) dirties no content row. `Screen::feed` tracks the drawn
+            // cursor and reports the move as its own damage (the row it left + entered);
+            // fold that in — but only at the live bottom, since scrolled into history the
+            // cursor isn't drawn (and a scroll is already a full repaint). `Screen`
+            // advances its own baseline every feed, so there's nothing to do when scrolled.
             let cursor_redrawn = if self.scroll_offset == 0 {
-                let now = self.screen.vt().cursor();
-                let prev = std::mem::replace(&mut self.prev_cursor, now);
-                if now != prev {
-                    // Clamp to the live viewport: `prev` can name a row past the bottom
-                    // after a shrink that reflowed the cursor up, and the band feeds the
-                    // renderer's row range directly.
-                    let max_row = self.rows.saturating_sub(1) as usize;
-                    if prev.visible {
-                        let r = prev.row.min(max_row);
-                        self.accumulate_dirty(r, r);
-                    }
-                    if now.visible {
-                        let r = now.row.min(max_row);
-                        self.accumulate_dirty(r, r);
-                    }
-                    // A repaint is only needed when the block was or is drawn; a move that
-                    // stays hidden the whole time paints nothing.
-                    prev.visible || now.visible
-                } else {
-                    false
+                let cursor = self.screen.cursor_damage();
+                if let Some(r) = cursor.left {
+                    self.accumulate_dirty(r, r);
                 }
+                if let Some(r) = cursor.entered {
+                    self.accumulate_dirty(r, r);
+                }
+                cursor.repaint
             } else {
-                self.prev_cursor = self.screen.vt().cursor();
                 false
             };
             let want_redraw = viewport_changed

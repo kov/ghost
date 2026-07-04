@@ -18,6 +18,26 @@ use ghost_term::Vt;
 /// viewport itself is always reconstructable regardless of this limit.
 pub const DEFAULT_SCROLLBACK: usize = 1000;
 
+/// The rows the drawn cursor implicitly redrew by *moving* on the last
+/// [`feed`](Screen::feed) — as opposed to the cell content [`feed`](Screen::feed)
+/// returns. `feed`'s row hint covers only printed glyphs; a bare CUP/CUF, a
+/// scroll of the cursor, or a DECTCEM show/hide repositions or repaints the block
+/// without touching a line, so a caller that draws a cursor folds these rows into
+/// its damage. Both rows are `None` when the cursor did not change; rows are
+/// clamped to the current viewport. Whether the cursor is *actually* on screen
+/// (e.g. the caller scrolled back into history) is the caller's call — see
+/// [`repaint`](CursorDamage::repaint).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CursorDamage {
+    /// Row the cursor left, when it was drawn (visible) there.
+    pub left: Option<usize>,
+    /// Row the cursor entered, when it is drawn (visible) there.
+    pub entered: Option<usize>,
+    /// Whether the change warrants a repaint at all — true when the block was or
+    /// is visible, false for a move that stayed hidden the whole time.
+    pub repaint: bool,
+}
+
 pub struct Screen {
     vt: Vt,
     cols: u16,
@@ -27,6 +47,11 @@ pub struct Screen {
     /// Reused scratch for the viewport rows the last [`feed`](Screen::feed)
     /// changed, so reporting damage costs no per-feed allocation.
     dirty_rows: Vec<usize>,
+    /// The drawn cursor after the previous [`feed`](Screen::feed), for diffing a
+    /// bare cursor move (which dirties no content row) into [`cursor_damage`].
+    prev_cursor: ghost_term::terminal::Cursor,
+    /// The cursor-move damage from the last [`feed`](Screen::feed).
+    cursor_damage: CursorDamage,
 }
 
 impl Screen {
@@ -35,12 +60,15 @@ impl Screen {
             .size(cols as usize, rows as usize)
             .scrollback_limit(scrollback_limit)
             .build();
+        let prev_cursor = vt.cursor();
         Screen {
             vt,
             cols,
             rows,
             pending: Vec::new(),
             dirty_rows: Vec::new(),
+            prev_cursor,
+            cursor_damage: CursorDamage::default(),
         }
     }
 
@@ -128,7 +156,32 @@ impl Screen {
         }
         self.dirty_rows.sort_unstable();
         self.dirty_rows.dedup();
+        // The drawn cursor is part of the frame but moving it writes no cell, so
+        // this feed's content hint above misses it. Diff the cursor (position +
+        // visibility + shape) against the last feed and report the row it left
+        // and the row it entered as their own damage — clamped to the viewport,
+        // since a shrink can strand a stale row past the bottom.
+        let now = self.vt.cursor();
+        let prev = std::mem::replace(&mut self.prev_cursor, now);
+        self.cursor_damage = if now == prev {
+            CursorDamage::default()
+        } else {
+            let max_row = self.rows.saturating_sub(1) as usize;
+            CursorDamage {
+                left: prev.visible.then(|| prev.row.min(max_row)),
+                entered: now.visible.then(|| now.row.min(max_row)),
+                repaint: prev.visible || now.visible,
+            }
+        };
         &self.dirty_rows
+    }
+
+    /// The [`CursorDamage`] from the most recent [`feed`](Screen::feed): the rows
+    /// a bare cursor move repainted, which the content hint `feed` returns does
+    /// not cover. A caller that draws the cursor folds these into its damage
+    /// (gating on whether the cursor is on screen — see [`CursorDamage`]).
+    pub fn cursor_damage(&self) -> CursorDamage {
+        self.cursor_damage
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -283,6 +336,45 @@ mod tests {
 
         // An incomplete trailing UTF-8 byte is held back: nothing changed yet.
         assert!(s.feed(&[0xE2]).is_empty());
+    }
+
+    #[test]
+    fn feed_reports_cursor_moves_as_damage() {
+        let mut s = Screen::new(20, 4, 100);
+        // Printing advances the cursor within row 0 (and dirties it as content):
+        // establish a known baseline before the bare-move cases.
+        s.feed(b"x");
+
+        // A bare CUP to row 3 (1-based) prints nothing — no content row is
+        // dirtied — but the drawn cursor left row 0 and entered row 2.
+        assert!(
+            s.feed(b"\x1b[3;1H").is_empty(),
+            "a cursor move dirties no content row"
+        );
+        assert_eq!(
+            s.cursor_damage(),
+            CursorDamage {
+                left: Some(0),
+                entered: Some(2),
+                repaint: true,
+            }
+        );
+
+        // Hiding the cursor (DECTCEM) touches no cell: the row it was drawn on
+        // repairs, nothing is entered, and a repaint is still warranted.
+        assert!(s.feed(b"\x1b[?25l").is_empty());
+        assert_eq!(
+            s.cursor_damage(),
+            CursorDamage {
+                left: Some(2),
+                entered: None,
+                repaint: true,
+            }
+        );
+
+        // A query that moves nothing reports no cursor damage.
+        s.feed(b"\x1b[6n");
+        assert_eq!(s.cursor_damage(), CursorDamage::default());
     }
 
     #[test]
