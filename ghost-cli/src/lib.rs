@@ -21,6 +21,10 @@ use ghost_vt::session;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Skip restoring the windows open at last quit; start fresh. Only meaningful
+    /// for a bare launch (with a subcommand there is nothing to restore).
+    #[arg(long, global = true)]
+    fresh: bool,
 }
 
 #[derive(Subcommand)]
@@ -89,17 +93,28 @@ enum Command {
     },
 }
 
-/// Parse the command line; if it names a subcommand, run it and return `true` (the
-/// caller should exit). With no subcommand, return `false` so the caller launches
-/// the GUI. The session-host re-exec check must already have run (it consumes the
-/// internal `__host` argv that clap would otherwise reject).
-pub fn run_subcommand() -> bool {
-    match Cli::parse().command {
+/// What a parsed command line asks the `ghost` binary to do.
+pub enum Launch {
+    /// A subcommand ran to completion; the process should exit.
+    Handled,
+    /// No subcommand — launch the windowed UI. `fresh` skips restoring the
+    /// windows open at last quit.
+    Gui { fresh: bool },
+}
+
+/// Parse the command line; if it names a subcommand, run it and return
+/// [`Launch::Handled`] (the caller should exit). With no subcommand, return
+/// [`Launch::Gui`] so the caller launches the GUI. The session-host re-exec check
+/// must already have run (it consumes the internal `__host` argv that clap would
+/// otherwise reject).
+pub fn run_subcommand() -> Launch {
+    let cli = Cli::parse();
+    match cli.command {
         Some(command) => {
             dispatch(command);
-            true
+            Launch::Handled
         }
-        None => false,
+        None => Launch::Gui { fresh: cli.fresh },
     }
 }
 
@@ -225,4 +240,33 @@ fn default_name() -> String {
 fn fail(msg: &str) -> ! {
     eprintln!("ghost: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bare_launch_parses_with_fresh_off() {
+        let cli = Cli::try_parse_from(["ghost"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.fresh);
+    }
+
+    #[test]
+    fn a_bare_fresh_flag_falls_through_to_the_gui() {
+        let cli = Cli::try_parse_from(["ghost", "--fresh"]).unwrap();
+        assert!(cli.command.is_none(), "--fresh is not a subcommand");
+        assert!(cli.fresh);
+    }
+
+    #[test]
+    fn fresh_is_global_so_it_can_follow_a_subcommand() {
+        // `global = true` means the flag is accepted anywhere; it just has no
+        // effect with a subcommand present (nothing to restore).
+        let cli = Cli::try_parse_from(["ghost", "ls", "--fresh"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Ls)));
+        assert!(cli.fresh);
+    }
 }

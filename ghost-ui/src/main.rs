@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
-    RootModel, Scene, SessionPush, TerminalModel, UiEvent,
+    RootModel, Scene, SessionPush, TerminalModel, UiEvent, WindowRecord,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -124,10 +124,12 @@ fn main() {
     server::run_host_if_invoked();
 
     // `ghost <subcommand>` (ls/attach/new/…) is the CLI; it runs and exits. A bare
-    // `ghost` has no subcommand and falls through to the windowed UI below.
-    if ghost_cli::run_subcommand() {
-        return;
-    }
+    // `ghost` has no subcommand and falls through to the windowed UI below, carrying
+    // the `--fresh` flag (skip restoring the last-quit windows) into it.
+    let fresh = match ghost_cli::run_subcommand() {
+        ghost_cli::Launch::Handled => return,
+        ghost_cli::Launch::Gui { fresh } => fresh,
+    };
 
     // A bundled launch (Finder/launchd) lands us at `/`; point new GUI sessions at
     // the user's home instead. `server::spawn` reads our cwd when it starts each
@@ -153,7 +155,7 @@ fn main() {
     if let Some(path) = std::env::var_os("GHOST_CAPTURE") {
         capture(PathBuf::from(path));
     } else {
-        interactive();
+        interactive(fresh);
     }
 }
 
@@ -490,6 +492,13 @@ fn new_window_choice(
     startup_choice(None, sessions, groups)
 }
 
+/// Whether a bare launch should recreate the windows open at last quit: only
+/// when there is a saved workspace, no explicit `$GHOST_SESSION` request (which
+/// opens just that session), and `--fresh` was not passed to start clean.
+fn should_restore(fresh: bool, requested: Option<&str>, workspace: &[WindowRecord]) -> bool {
+    !fresh && requested.is_none() && !workspace.is_empty()
+}
+
 /// One member a restored window should drive.
 struct PlanMember {
     id: String,
@@ -595,7 +604,7 @@ fn spawn_dead(id: &str) -> bool {
     }
 }
 
-fn interactive() {
+fn interactive(fresh: bool) {
     // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
     // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
     // instrumented code stays free in normal runs.
@@ -617,22 +626,24 @@ fn interactive() {
     } else {
         let requested = std::env::var("GHOST_SESSION").ok();
         let sessions = session::list().unwrap_or_default();
-        match requested {
-            // An explicit `$GHOST_SESSION` opens just that session and skips
-            // workspace restore.
-            Some(name) => Startup::Single(name),
-            // A bare launch with saved windows recreates them, taking precedence
-            // over the reconnect-through-the-fleet default below.
-            None if !workspace.is_empty() => Startup::Restore(workspace.clone()),
-            None => match startup_choice(None, &sessions, &groups) {
-                StartupChoice::Attach(name) => Startup::Single(name),
-                StartupChoice::Fleet => Startup::Fleet,
-                StartupChoice::Spawn => {
-                    let n = format!("ghost-ui-{}", std::process::id());
-                    spawn_session(&n, vec![]);
-                    Startup::Single(n)
-                }
-            },
+        // A bare launch with saved windows recreates them, taking precedence over
+        // the reconnect-through-the-fleet default below; `--fresh` or an explicit
+        // `$GHOST_SESSION` skip that and open just what was asked for.
+        if should_restore(fresh, requested.as_deref(), &workspace) {
+            Startup::Restore(workspace.clone())
+        } else {
+            match requested {
+                Some(name) => Startup::Single(name),
+                None => match startup_choice(None, &sessions, &groups) {
+                    StartupChoice::Attach(name) => Startup::Single(name),
+                    StartupChoice::Fleet => Startup::Fleet,
+                    StartupChoice::Spawn => {
+                        let n = format!("ghost-ui-{}", std::process::id());
+                        spawn_session(&n, vec![]);
+                        Startup::Single(n)
+                    }
+                },
+            }
         }
     };
 
@@ -1325,18 +1336,28 @@ impl App {
                     }
                 }
                 Cmd::SaveGroups(new_groups) => {
-                    // Persist, then rebroadcast to the *other* windows so every
-                    // open fleet agrees (the sender already holds this state).
-                    groups::save(&new_groups);
-                    self.groups = new_groups.clone();
-                    let others: Vec<WindowId> = self
-                        .windows
-                        .keys()
-                        .copied()
-                        .filter(|&other| other != wid)
-                        .collect();
-                    for other in others {
-                        self.dispatch(other, UiEvent::GroupsLoaded(new_groups.clone()), event_loop);
+                    // Write-on-change: reclaiming the same memberships (every
+                    // window during a multi-window restore re-asserts the groups
+                    // it loaded) yields identical state, so skip the redundant
+                    // disk write and rebroadcast. Only a real change persists,
+                    // then rebroadcasts to the *other* windows so every open fleet
+                    // agrees (the sender already holds this state).
+                    if new_groups != self.groups {
+                        groups::save(&new_groups);
+                        self.groups = new_groups.clone();
+                        let others: Vec<WindowId> = self
+                            .windows
+                            .keys()
+                            .copied()
+                            .filter(|&other| other != wid)
+                            .collect();
+                        for other in others {
+                            self.dispatch(
+                                other,
+                                UiEvent::GroupsLoaded(new_groups.clone()),
+                                event_loop,
+                            );
+                        }
                     }
                 }
                 Cmd::Detach(id) => {
@@ -2526,7 +2547,7 @@ impl ApplicationHandler<UserEvent> for App {
 mod tests {
     use super::{
         StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir,
-        new_window_choice, respawn_opts, restore_plan, startup_choice,
+        new_window_choice, respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::session::SessionInfo;
@@ -2610,6 +2631,21 @@ mod tests {
         assert!(w2.fleet);
         assert_eq!(w2.members.len(), 1);
         assert!(w2.members[0].dead, "gamma has no live session → relaunch");
+    }
+
+    #[test]
+    fn should_restore_only_on_a_bare_launch_with_a_saved_workspace() {
+        let saved = [record("win-1", 80, 24, false, Some("alpha"), &["alpha"])];
+
+        // The one case that restores: bare launch, not fresh, workspace present.
+        assert!(should_restore(false, None, &saved));
+
+        // --fresh always starts clean, even with a saved workspace.
+        assert!(!should_restore(true, None, &saved));
+        // An explicit $GHOST_SESSION opens just that session, skipping restore.
+        assert!(!should_restore(false, Some("alpha"), &saved));
+        // Nothing to restore.
+        assert!(!should_restore(false, None, &[]));
     }
 
     #[test]
