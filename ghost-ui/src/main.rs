@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 
 use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
-    CellMetrics, Cmd, KeyEventKind, PointPx, PointerButton, PointerPhase, RootModel, Scene,
-    SessionPush, TerminalModel, UiEvent,
+    CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
+    RootModel, Scene, SessionPush, TerminalModel, UiEvent,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -490,6 +490,77 @@ fn new_window_choice(
     startup_choice(None, sessions, groups)
 }
 
+/// One member a restored window should drive.
+struct PlanMember {
+    id: String,
+    /// The session's host is not currently alive, so it must be relaunched
+    /// (shell + seeded recording) before attaching.
+    dead: bool,
+}
+
+/// One window to recreate at startup: its reclaimed group, the grid to open at,
+/// its view mode, and the members to drive — ordered foreground-LAST so adopting
+/// them in order leaves the right one focused.
+struct WindowPlan {
+    group: ghost_ui_core::Group,
+    cols: u16,
+    rows: u16,
+    fleet: bool,
+    members: Vec<PlanMember>,
+}
+
+/// How the app should open its first window(s), decided at launch.
+enum Startup {
+    /// Recreate the saved workspace: one window per record (via [`restore_plan`]).
+    Restore(Vec<ghost_ui_core::WindowRecord>),
+    /// Open a single view attached to this session (an explicit `$GHOST_SESSION`
+    /// request or a freshly-spawned one).
+    Single(String),
+    /// Open the fleet overview — something to reconnect to, or nothing saved.
+    Fleet,
+}
+
+/// Turn the saved workspace into a per-window restore plan. A record whose group
+/// is gone from the registry (all its members were killed/forgotten) can't be
+/// restored, so it is dropped. Members are the window's attached set with the
+/// foreground moved last (adopting in order then leaves it foreground), each
+/// flagged dead when no live session by that name exists.
+fn restore_plan(
+    records: &[ghost_ui_core::WindowRecord],
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> Vec<WindowPlan> {
+    let alive = |id: &str| sessions.iter().any(|s| s.name == id);
+    records
+        .iter()
+        .filter_map(|rec| {
+            let group = groups.iter().find(|g| g.id == rec.group_id)?.clone();
+            let mut ids: Vec<String> = rec.attached.clone();
+            // Foreground last, but only if it was actually one of the driven set.
+            if let Some(fg) = &rec.foreground
+                && ids.iter().any(|a| a == fg)
+            {
+                ids.retain(|id| id != fg);
+                ids.push(fg.clone());
+            }
+            let members = ids
+                .into_iter()
+                .map(|id| PlanMember {
+                    dead: !alive(&id),
+                    id,
+                })
+                .collect();
+            Some(WindowPlan {
+                group,
+                cols: rec.cols,
+                rows: rec.rows,
+                fleet: rec.fleet,
+                members,
+            })
+        })
+        .collect()
+}
+
 /// The spawn options for relaunching a dead session `id` from its descriptor.
 /// A relaunch runs a fresh shell (empty command = the user's `$SHELL`), never
 /// `descriptor.command`: it restores the last screen and scrollback (seeded from
@@ -510,6 +581,20 @@ fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathB
     }
 }
 
+/// Relaunch a dead session `id`'s host from its descriptor (see [`respawn_opts`]).
+/// Best-effort: a failed spawn is logged and the caller simply skips it.
+fn spawn_dead(id: &str) -> bool {
+    let d = ghost_vt::descriptor::read(id).unwrap_or_default();
+    let recording = ghost_vt::paths::recording_path(id);
+    match server::spawn(respawn_opts(id, &d, recording)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("ghost: relaunching '{id}' failed: {e}");
+            false
+        }
+    }
+}
+
 fn interactive() {
     // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
     // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
@@ -526,19 +611,28 @@ fn interactive() {
     // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
     let groups = groups::load();
-    let initial_name = if harness.is_some() {
-        None // open the fleet; the harness populates and dives it
+    let workspace = windows::load();
+    let startup = if harness.is_some() {
+        Startup::Fleet // the harness populates and dives it
     } else {
         let requested = std::env::var("GHOST_SESSION").ok();
         let sessions = session::list().unwrap_or_default();
-        match startup_choice(requested, &sessions, &groups) {
-            StartupChoice::Attach(name) => Some(name),
-            StartupChoice::Fleet => None,
-            StartupChoice::Spawn => {
-                let n = format!("ghost-ui-{}", std::process::id());
-                spawn_session(&n, vec![]);
-                Some(n)
-            }
+        match requested {
+            // An explicit `$GHOST_SESSION` opens just that session and skips
+            // workspace restore.
+            Some(name) => Startup::Single(name),
+            // A bare launch with saved windows recreates them, taking precedence
+            // over the reconnect-through-the-fleet default below.
+            None if !workspace.is_empty() => Startup::Restore(workspace.clone()),
+            None => match startup_choice(None, &sessions, &groups) {
+                StartupChoice::Attach(name) => Startup::Single(name),
+                StartupChoice::Fleet => Startup::Fleet,
+                StartupChoice::Spawn => {
+                    let n = format!("ghost-ui-{}", std::process::id());
+                    spawn_session(&n, vec![]);
+                    Startup::Single(n)
+                }
+            },
         }
     };
 
@@ -557,7 +651,7 @@ fn interactive() {
         windows: HashMap::new(),
         clipboard: None,
         start: Instant::now(),
-        initial_name,
+        startup,
         next_session_seq: 0,
         next_group_seq: 0,
         next_group_color,
@@ -571,7 +665,7 @@ fn interactive() {
         sessions_changed,
         // Seed the write-on-change baseline with what's already persisted, so the
         // first save only rewrites the file once the live windows diverge from it.
-        last_workspace: windows::load(),
+        last_workspace: workspace,
         workspace_dirty: false,
     };
     event_loop.run_app(&mut app).expect("run app");
@@ -927,10 +1021,10 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     /// Start of the monotonic clock injected into models via `Tick`.
     start: Instant,
-    /// How the first window starts, set at construction and consumed by the first
-    /// `resumed`: `Some(name)` opens a single view attached to that session; `None`
-    /// opens the fleet (chosen when detached sessions exist to reconnect to).
-    initial_name: Option<String>,
+    /// How the first window(s) start, set at construction and consumed by the
+    /// first `resumed`: restore the saved workspace, attach a single session, or
+    /// open the fleet.
+    startup: Startup,
     /// Per-process counter making spawned session names unique.
     next_session_seq: u64,
     /// Per-process counter making minted window-group ids unique, and the
@@ -1489,23 +1583,15 @@ impl App {
     /// died (which could be anything, and re-running it unbidden is the surprise
     /// we avoid). The child is deferred to the first attach (`start_on_attach`).
     fn respawn_dead(&mut self, wid: WindowId, id: &str) -> bool {
-        let d = ghost_vt::descriptor::read(id).unwrap_or_default();
-        let recording = ghost_vt::paths::recording_path(id);
-        let spawned = server::spawn(respawn_opts(id, &d, recording));
-        match spawned {
-            Err(e) => {
-                eprintln!("ghost: recreating '{id}' failed: {e}");
-                false
-            }
-            Ok(()) => {
-                // Its tile previews the OLD recording; a fresh death after
-                // this new life must re-feed.
-                if let Some(w) = self.windows.get_mut(&wid) {
-                    w.dead_fed.remove(id);
-                }
-                true
-            }
+        if !spawn_dead(id) {
+            return false;
         }
+        // Its tile previews the OLD recording; a fresh death after this new life
+        // must re-feed.
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.dead_fed.remove(id);
+        }
+        true
     }
 
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
@@ -1591,16 +1677,23 @@ impl App {
         }
     }
 
-    /// Open a new window in the fleet overview (owning no session yet). The user
-    /// spawns or takes over a session from there.
-    fn open_fleet_window(&mut self, event_loop: &ActiveEventLoop) {
+    /// Open a new window in the fleet overview (owning no session yet), carrying
+    /// `group` as its identity and opening at `size` cells (its configured default
+    /// when `None`). The user spawns or takes over a session from there.
+    fn open_fleet_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        group: ghost_ui_core::Group,
+        size: Option<(u16, u16)>,
+    ) {
         let cfg = config::UiConfig::load();
+        let (req_cols, req_rows) = size.unwrap_or((cfg.columns(), cfg.rows()));
         let gfx = Graphics::new(
             event_loop,
             cfg.theme(),
             cfg.option_as_meta(),
-            cfg.columns(),
-            cfg.rows(),
+            req_cols,
+            req_rows,
             cfg.padding(),
         );
         let wid = gfx.window.id();
@@ -1609,8 +1702,9 @@ impl App {
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         root.set_theme(theme_colors(&cfg.theme()));
         root.set_padding(cfg.padding());
-        let group = self.mint_group();
-        let claims = root.set_my_group(group); // fresh fleet: owns nothing yet
+        // A fleet window owns nothing yet, so reclaiming a group here just adopts
+        // its identity — the members come from the loaded registry below.
+        let claims = root.set_my_group(group);
         debug_assert!(claims.is_empty());
         apply_anim_ms(&mut root);
         self.windows.insert(
@@ -1662,16 +1756,21 @@ impl App {
     fn open_launch_window(&mut self, event_loop: &ActiveEventLoop) {
         let sessions = session::list().unwrap_or_default();
         match new_window_choice(&sessions, &self.groups) {
-            StartupChoice::Fleet => self.open_fleet_window(event_loop),
+            StartupChoice::Fleet => {
+                let group = self.mint_group();
+                self.open_fleet_window(event_loop, group, None);
+            }
             StartupChoice::Spawn => {
                 let name = self.unique_session_name();
                 spawn_session(&name, vec![]);
-                self.open_single_window(event_loop, &name);
+                let group = self.mint_group();
+                self.open_single_window(event_loop, &name, group, None);
             }
             // new_window_choice never asks to attach a specific session, but keep the
             // match exhaustive: an explicit name would open that session's single view.
             StartupChoice::Attach(name) => {
-                self.open_single_window(event_loop, &name);
+                let group = self.mint_group();
+                self.open_single_window(event_loop, &name, group, None);
             }
         }
     }
@@ -1743,31 +1842,39 @@ impl App {
 }
 
 impl App {
-    /// Open the first window as a single-session view attached to `name`. Returns
-    /// false if the attach fails (the caller exits the app).
-    fn open_single_window(&mut self, event_loop: &ActiveEventLoop, name: &str) -> bool {
+    /// Open a single-session view attached to `name`, carrying `group` as the
+    /// window's identity and opening at `size` cells (its configured default when
+    /// `None`; a restored window passes the grid it was last sized to). Returns
+    /// the new window's id, or `None` if the attach fails.
+    fn open_single_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        name: &str,
+        group: ghost_ui_core::Group,
+        size: Option<(u16, u16)>,
+    ) -> Option<WindowId> {
         let cfg = config::UiConfig::load();
+        let (req_cols, req_rows) = size.unwrap_or((cfg.columns(), cfg.rows()));
         let gfx = Graphics::new(
             event_loop,
             cfg.theme(),
             cfg.option_as_meta(),
-            cfg.columns(),
-            cfg.rows(),
+            req_cols,
+            req_rows,
             cfg.padding(),
         );
         let wid = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let (w, h) = gfx.size();
         let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
-        // Mint the window's group up front: the very first attach already
-        // reports the group-embedding identity.
-        let group = self.mint_group();
+        // The window's group identity — reclaimed for a restored window, freshly
+        // minted otherwise — so the very first attach reports the right group.
         let identity = ghost_ui_core::group::window_identity(&group.id);
         let session = match attach(name, cols, rows, &identity) {
             Ok(session) => session,
             Err(e) => {
                 eprintln!("could not attach to session '{name}': {e}");
-                return false;
+                return None;
             }
         };
         let mut model = TerminalModel::new(name.to_string(), cols, rows, metrics());
@@ -1836,7 +1943,79 @@ impl App {
         // Persist (and broadcast) the initial session joining this window's
         // group — the registry itself was seeded before the claim.
         self.exec(wid, claims, event_loop);
-        true
+        Some(wid)
+    }
+
+    /// Recreate the saved workspace: one window per restorable record. Falls back
+    /// to a normal launch if nothing could be restored (every group was pruned, or
+    /// an empty workspace slipped through), so the app never comes up windowless.
+    fn restore_workspace(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        records: Vec<ghost_ui_core::WindowRecord>,
+    ) {
+        let sessions = session::list().unwrap_or_default();
+        for plan in restore_plan(&records, &sessions, &self.groups) {
+            self.restore_window(event_loop, plan);
+        }
+        if self.windows.is_empty() {
+            self.open_launch_window(event_loop);
+        }
+    }
+
+    /// Recreate one window from its plan: open it on the group it reclaims, at the
+    /// grid it was sized to; relaunch dead members (shell + seeded recording) then
+    /// attach every member, adopting them in order so the foreground (ordered last)
+    /// ends up focused; and restore the fleet overview if that is how it was left.
+    fn restore_window(&mut self, event_loop: &ActiveEventLoop, plan: WindowPlan) {
+        let WindowPlan {
+            group,
+            cols,
+            rows,
+            fleet,
+            members,
+        } = plan;
+        let size = Some((cols, rows));
+        let mut members = members.into_iter();
+        // A window that drove nothing comes back as an empty fleet on its group.
+        let Some(first) = members.next() else {
+            self.open_fleet_window(event_loop, group, size);
+            return;
+        };
+        if first.dead {
+            spawn_dead(&first.id);
+        }
+        // Clone the group for the first attach so a failure can still fall back to
+        // an empty fleet window rather than lose the group's identity.
+        let wid = match self.open_single_window(event_loop, &first.id, group.clone(), size) {
+            Some(wid) => wid,
+            None => {
+                self.open_fleet_window(event_loop, group, size);
+                return;
+            }
+        };
+        for m in members {
+            if m.dead {
+                spawn_dead(&m.id);
+            }
+            if self.attach_into(wid, &m.id) {
+                self.dispatch(wid, UiEvent::AdoptSession(m.id), event_loop);
+            }
+        }
+        if fleet {
+            // Re-enter the fleet overview the same way the user would (F9); the
+            // window is not yet on screen, so the brief single view never shows.
+            self.dispatch(
+                wid,
+                UiEvent::Key {
+                    key: Key::Named(NamedKey::F9),
+                    mods: Mods::NONE,
+                    kind: KeyEventKind::Press,
+                    alts: None,
+                },
+                event_loop,
+            );
+        }
     }
 }
 
@@ -1875,12 +2054,20 @@ impl ApplicationHandler<UserEvent> for App {
         if !self.windows.is_empty() {
             return;
         }
-        // `Some(name)` → single view of that session; `None` → fleet (chosen at
-        // launch when there were detached sessions to reconnect to).
-        match self.initial_name.take() {
-            None => self.open_fleet_window(event_loop),
-            Some(name) => {
-                if !self.open_single_window(event_loop, &name) {
+        // Consumed once (this guard keeps `resumed` from re-running); the
+        // placeholder is never used.
+        match std::mem::replace(&mut self.startup, Startup::Fleet) {
+            Startup::Restore(records) => self.restore_workspace(event_loop, records),
+            Startup::Fleet => {
+                let group = self.mint_group();
+                self.open_fleet_window(event_loop, group, None);
+            }
+            Startup::Single(name) => {
+                let group = self.mint_group();
+                if self
+                    .open_single_window(event_loop, &name, group, None)
+                    .is_none()
+                {
                     event_loop.exit();
                     return;
                 }
@@ -2339,8 +2526,9 @@ impl ApplicationHandler<UserEvent> for App {
 mod tests {
     use super::{
         StartupChoice, choose_alpha_mode, choose_surface_format, home_launch_dir,
-        new_window_choice, respawn_opts, startup_choice,
+        new_window_choice, respawn_opts, restore_plan, startup_choice,
     };
+    use ghost_ui_core::WindowRecord;
     use ghost_vt::session::SessionInfo;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
     use wgpu::TextureFormat::{
@@ -2369,6 +2557,59 @@ mod tests {
             color: 0,
             members: members.iter().map(|m| m.to_string()).collect(),
         }
+    }
+
+    fn record(
+        group_id: &str,
+        cols: u16,
+        rows: u16,
+        fleet: bool,
+        fg: Option<&str>,
+        att: &[&str],
+    ) -> WindowRecord {
+        WindowRecord {
+            group_id: group_id.into(),
+            cols,
+            rows,
+            fleet,
+            foreground: fg.map(str::to_string),
+            attached: att.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn restore_plan_reclaims_groups_orders_foreground_last_and_flags_dead() {
+        let records = [
+            record("win-1", 120, 40, false, Some("beta"), &["alpha", "beta"]),
+            // Group pruned from the registry → this window can't be restored.
+            record("win-9", 80, 24, false, Some("ghost"), &["ghost"]),
+            record("win-2", 90, 30, true, Some("gamma"), &["gamma"]),
+        ];
+        let sessions = [info("alpha", false), info("beta", false)]; // gamma is dead
+        let groups = [
+            group("win-1", &["alpha", "beta"]),
+            group("win-2", &["gamma"]),
+        ];
+
+        let plans = restore_plan(&records, &sessions, &groups);
+        assert_eq!(plans.len(), 2, "the pruned-group window is dropped");
+
+        let w1 = &plans[0];
+        assert_eq!(w1.group.id, "win-1");
+        assert_eq!((w1.cols, w1.rows), (120, 40));
+        assert!(!w1.fleet);
+        let ids: Vec<&str> = w1.members.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "beta"], "foreground (beta) ordered last");
+        assert!(
+            w1.members.iter().all(|m| !m.dead),
+            "both sessions are alive"
+        );
+
+        let w2 = &plans[1];
+        assert_eq!(w2.group.id, "win-2");
+        assert!(w2.fleet);
+        assert_eq!(w2.members.len(), 1);
+        assert!(w2.members[0].dead, "gamma has no live session → relaunch");
     }
 
     #[test]
