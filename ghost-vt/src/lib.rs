@@ -17,6 +17,7 @@ pub mod descriptor;
 pub mod keys;
 pub mod meta;
 pub mod paths;
+pub mod pipe;
 pub mod protocol;
 pub mod pty;
 pub mod query;

@@ -105,6 +105,22 @@ impl ConnectionSpec {
         }
     }
 
+    /// The argv that tunnels the protocol to a *remote ghost host* over ssh:
+    /// the ssh connection (options + destination) followed by the remote command
+    /// `<remote_ghost> __pipe <name>`, whose stdio relays to the remote session's
+    /// control socket ([`crate::pipe`]). This is the SSH-as-transport realization
+    /// — distinct from [`argv`](Self::argv), which builds the local ssh *child*.
+    /// `remote_ghost` is the ghost binary on the remote (`"ghost"` when it is on
+    /// the remote `PATH`). The reach is always ssh here; a spec's
+    /// [`ConnectionKind`] selects the *child* launcher, not the host transport.
+    pub fn transport_argv(&self, remote_ghost: &str, name: &str) -> Vec<String> {
+        let mut v = self.ssh_argv();
+        v.push(remote_ghost.to_string());
+        v.push("__pipe".to_string());
+        v.push(name.to_string());
+        v
+    }
+
     /// `ssh [-p PORT] [-i IDENTITY] [-J JUMP] [extra…] <target>` — options
     /// before the destination, as ssh requires.
     fn ssh_argv(&self) -> Vec<String> {
@@ -198,6 +214,28 @@ mod tests {
                 "ForwardAgent=yes",
                 "kov@box",
             ]
+        );
+    }
+
+    #[test]
+    fn transport_argv_appends_the_remote_pipe_command() {
+        // SSH-as-transport: the ssh connection, then the remote relay command.
+        let spec = ConnectionSpec {
+            host: "box".into(),
+            user: Some("kov".into()),
+            port: Some(2222),
+            ..Default::default()
+        };
+        assert_eq!(
+            spec.transport_argv("ghost", "work"),
+            vec!["ssh", "-p", "2222", "kov@box", "ghost", "__pipe", "work"]
+        );
+        // An explicit remote binary path (a staged ghost) is honoured verbatim.
+        assert_eq!(
+            ConnectionSpec::parse_target("box")
+                .unwrap()
+                .transport_argv("/opt/ghost/bin/ghost", "s1"),
+            vec!["ssh", "box", "/opt/ghost/bin/ghost", "__pipe", "s1"]
         );
     }
 

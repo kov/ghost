@@ -114,7 +114,9 @@ const HOST_ARG: &str = "__host";
 /// A single attached client connection: the framed [`Conn`] plus a little
 /// attach state.
 struct Client {
-    conn: Conn,
+    // Host-side connections are always accepted local `UnixStream`s (the ssh
+    // tunnel terminates at the *client*, over `Conn<AnyTransport>`).
+    conn: Conn<UnixStream>,
     /// Whether the initial repaint has been sent. The first thing a client
     /// sends is its size; we hold back live output and the resync until then,
     /// so the repaint is laid out at the client's real geometry and the client

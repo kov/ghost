@@ -58,6 +58,18 @@ impl Client {
         })
     }
 
+    /// Tunnel to a remote session host over SSH: `cmd` is the `ssh … -- ghost
+    /// __pipe <name>` whose stdio relays to the remote host's control socket.
+    /// The remote ghost is staged version-matched to us, so it speaks our own
+    /// [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL) — there is no local `proto`
+    /// marker to read for a remote session.
+    pub fn connect_ssh(cmd: std::process::Command) -> io::Result<Self> {
+        Ok(Client {
+            conn: Conn::connect_ssh(cmd)?,
+            proto: crate::protocol::PROTO_LEVEL,
+        })
+    }
+
     /// The connection's file descriptor, for a poll/epoll/GLib main-loop watch.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.conn.as_fd()
@@ -255,6 +267,29 @@ impl Session {
         Ok(Session {
             name: name.to_string(),
             client,
+        })
+    }
+
+    /// Attach to a remote session over an SSH tunnel (`cmd` = `ssh … -- ghost
+    /// __pipe <name>`), completing the handshake at `cols`x`rows`. The remote
+    /// host is a real ghost host; only the transport differs from
+    /// [`attach`](Session::attach).
+    pub fn attach_ssh(
+        cmd: std::process::Command,
+        name: &str,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<Session> {
+        Self::from_client(Client::connect_ssh(cmd)?, name, cols, rows)
+    }
+
+    /// [`attach_deferred`](Session::attach_deferred) over an SSH tunnel: connect
+    /// but send no size until the caller's first [`resize`](Session::resize), so
+    /// the remote repaint is generated at the GUI's real geometry.
+    pub fn attach_deferred_ssh(cmd: std::process::Command, name: &str) -> io::Result<Session> {
+        Ok(Session {
+            name: name.to_string(),
+            client: Client::connect_ssh(cmd)?,
         })
     }
 

@@ -124,6 +124,15 @@ enum Command {
         /// Output file; writes to stdout if omitted.
         output: Option<std::path::PathBuf>,
     },
+    /// Relay stdin/stdout to a local session's control socket — the far end of
+    /// the SSH transport, run on the host machine as
+    /// `ssh <host> -- ghost __pipe <name>`. An internal plumbing command; not
+    /// for direct use.
+    #[command(name = "__pipe", hide = true)]
+    Pipe {
+        /// Immutable id of the session to relay to.
+        name: String,
+    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -289,6 +298,13 @@ fn dispatch(command: Command) {
         },
         Command::Export { name, output } => {
             if let Err(e) = export(&resolve(&name), output.as_deref()) {
+                fail(&e.to_string());
+            }
+        }
+        // The transport addresses sessions by immutable id, so relay to the raw
+        // name (no display-name resolution).
+        Command::Pipe { name } => {
+            if let Err(e) = ghost_vt::pipe::run(&name) {
                 fail(&e.to_string());
             }
         }
