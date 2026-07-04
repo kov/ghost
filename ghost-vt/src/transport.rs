@@ -351,4 +351,19 @@ mod tests {
         }
         assert_eq!(got, vec![ClientMsg::Input(b"ping".to_vec())]);
     }
+
+    #[test]
+    fn a_nonblocking_recv_returns_at_once_when_no_data_is_ready() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut ca = Conn::new(a);
+        ca.set_nonblocking(true).unwrap();
+        // Keep the peer open so the read is "no data yet", not EOF.
+        let _peer = b;
+        // With nothing buffered, recv must not block: it yields an empty batch
+        // (would-block mapped to "drained"), never `None` (that is EOF) and
+        // never hangs. This is what lets a front-end pump a pool of idle
+        // sessions each frame without a per-session read stalling the loop.
+        let got: Option<Vec<ClientMsg>> = ca.recv().unwrap();
+        assert_eq!(got, Some(vec![]));
+    }
 }

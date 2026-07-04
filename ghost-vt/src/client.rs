@@ -113,6 +113,14 @@ impl Client {
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.conn.set_read_timeout(timeout)
     }
+
+    /// Put the connection into (non-)blocking mode. A front-end that pumps a
+    /// whole pool of clients on one event-loop cadence wants this so an idle
+    /// client's [`recv_ready`](Client::recv_ready) returns at once instead of
+    /// blocking — the same choice [`Subscriber`] makes.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.conn.set_nonblocking(nonblocking)
+    }
 }
 
 /// Ready state drained from a [`Subscriber`] by [`pump`](Subscriber::pump).
@@ -337,6 +345,14 @@ impl Session {
     /// blocks until readable.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.client.set_read_timeout(timeout)
+    }
+
+    /// Put the session's socket into (non-)blocking mode. A GUI pumps every
+    /// attached session on its frame loop, so non-blocking is what keeps an idle
+    /// session's [`pump`](Session::pump) from stalling the loop — see
+    /// [`Client::set_nonblocking`].
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.client.set_nonblocking(nonblocking)
     }
 
     /// Send user input (keystrokes, mouse reports, paste, query replies) to the

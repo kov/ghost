@@ -248,7 +248,12 @@ fn write_png(path: &Path, img: &Rendered) {
 /// so other windows' fleets can bucket the session under its block.
 fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Session> {
     let mut s = Session::attach_deferred(name)?;
-    s.set_read_timeout(Some(Duration::from_millis(1)))?;
+    // Non-blocking, not a 1 ms read timeout: `about_to_wait` pumps every attached
+    // session each 8 ms frame, and the socket doesn't wake the winit loop, so a
+    // blocking read only ever burns up to 1 ms per idle session per frame with no
+    // latency gain. Mirror the observer pool, which is non-blocking for the same
+    // reason (a whole pool's idle reads would otherwise add up on the loop).
+    s.set_nonblocking(true)?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
     s.hello(identity)?;
@@ -266,7 +271,11 @@ fn attach_over_ssh(
     identity: &str,
 ) -> io::Result<Session> {
     let mut s = Session::attach_deferred_ssh(cmd, name)?;
-    s.set_read_timeout(Some(Duration::from_millis(1)))?;
+    // Non-blocking, like the local [`attach`]: `about_to_wait` pumps this session
+    // on the frame loop and the ssh pipe never wakes winit, so a bounded wait buys
+    // no latency. (On the ssh transport `set_read_timeout(Some(_))` already maps to
+    // non-blocking; spell it the same way as `attach` so the two don't drift.)
+    s.set_nonblocking(true)?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
     s.hello(identity)?;
