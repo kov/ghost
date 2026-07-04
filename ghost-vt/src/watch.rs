@@ -58,6 +58,12 @@ pub fn run() -> io::Result<()> {
     Ok(())
 }
 
+/// Parse one line of [`run`]'s output back into a session listing — the reader's
+/// inverse of [`emit`], so the JSON shape stays owned here.
+pub fn parse_listing(line: &str) -> serde_json::Result<Vec<session::SessionInfo>> {
+    serde_json::from_str(line)
+}
+
 /// Write the current session listing as one line of JSON (the same shape as
 /// `ghost ls --json`), newline-terminated and flushed.
 pub fn emit(out: &mut impl Write) -> io::Result<()> {

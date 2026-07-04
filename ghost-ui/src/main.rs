@@ -283,7 +283,7 @@ fn attach_over_ssh(
 }
 
 /// A remote host reached over the ssh transport, retained so the fleet can poll
-/// it. `remote` is shared with the poller thread; `remote_ghost` is the negotiated
+/// it. `remote` is shared with the watcher thread; `remote_ghost` is the negotiated
 /// remote binary path both the poll and any attach reuse.
 #[derive(Clone)]
 struct RemoteHost {
@@ -298,7 +298,7 @@ const REMOTE_ID_SEP: char = '\u{1f}';
 
 /// The fleet id for remote session `real` on `target` — the composite a remote
 /// session is known by *locally* (window client key, `mine`, fleet tile id), so a
-/// session this window drives over the transport and the same session the poller
+/// session this window drives over the transport and the same session the watcher
 /// discovers share one identity. Recovered to `(target, real)` via
 /// `App.remote_index`; only the transport layer uses the bare `real` id.
 fn remote_fleet_id(target: &str, real: &str) -> String {
@@ -307,7 +307,7 @@ fn remote_fleet_id(target: &str, real: &str) -> String {
 
 /// Whether a fleet id names a *remote* session — one carrying the `<target>␟<real>`
 /// namespacing [`remote_fleet_id`] gives an ssh host's sessions. Remote sessions
-/// live on their host and are re-discovered live by the poller: they are never
+/// live on their host and are re-discovered live by the watcher: they are never
 /// persisted into the local workspace, never a durable group member on disk, and
 /// never spawned as a local process. Every local-only path checks this.
 fn is_remote_id(id: &str) -> bool {
@@ -316,7 +316,7 @@ fn is_remote_id(id: &str) -> bool {
 
 /// Project a saved window record to its *local* sessions only. A persisted
 /// workspace is a local restore plan, and a remote session can't be restored
-/// without its host (it reappears live via the poller on reconnect), so its id is
+/// without its host (it reappears live via the watcher on reconnect), so its id is
 /// dropped from the driven set and cleared if it was the foreground. The record is
 /// kept even when it empties out — a fleet-overview window has no attached set.
 fn local_only(mut rec: WindowRecord) -> WindowRecord {
@@ -341,12 +341,14 @@ fn local_only_groups(groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Grou
         .collect()
 }
 
-/// How often the poller re-lists each connected remote host.
-const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// Floor between reconnect attempts of a host's watch stream, so a host whose
+/// `ghost __watch` exits at once can't spin.
+const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
 
-/// Consecutive poll failures before a remote host's tiles are cleared (a grace
-/// period so a momentary network blip doesn't flicker the fleet).
-const REMOTE_POLL_MAX_FAILURES: u32 = 3;
+/// Consecutive dropped watch streams (no listing pushed in between) before a
+/// remote host's tiles are cleared — a grace period so a momentary blip doesn't
+/// flicker the fleet.
+const REMOTE_WATCH_MAX_FAILURES: u32 = 3;
 
 /// Rewrite a remote host's listing for the local fleet: give each session a
 /// fleet-unique id (`<target>␟<real id>`) so it never collides, keep its real id
@@ -373,53 +375,129 @@ fn namespace_remote_infos(
         .collect()
 }
 
-/// Spawn the remote-fleet poller: one background thread that periodically lists
-/// every connected host's sessions over its (already-authenticated) ssh
-/// ControlMaster and posts each result to the event loop as
-/// [`UserEvent::RemoteSessions`] (fleet-namespaced). Runs for the app's life,
-/// idling cheaply while no host is connected; listing happens off the event loop
-/// so a slow or blocked ssh never stalls the UI. Ends when the event loop is gone.
-fn spawn_remote_poller(
-    remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>>,
+/// A live pushed session-set watch for one connected host: a background thread
+/// runs `ghost __watch` over the (already-authenticated) transport and streams
+/// each listing back as a [`UserEvent::RemoteSessions`], so the fleet updates the
+/// instant a remote session changes rather than on a timer. Dropping the handle
+/// stops it — the flag ends the loop and killing the in-flight ssh unwinds a read
+/// blocked between listings — so a watcher lives exactly as long as its host is in
+/// [`App::remotes`] (until the last window referencing it closes, or the app exits).
+struct RemoteWatcher {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The currently-running `ghost __watch` child, shared so a stop can kill it
+    /// mid-read (the reader is otherwise blocked until the next listing).
+    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+impl Drop for RemoteWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut g) = self.child.lock()
+            && let Some(c) = g.as_mut()
+        {
+            let _ = c.kill();
+        }
+    }
+}
+
+/// Start a [`RemoteWatcher`] for `host`: its thread reconnects the `ghost __watch`
+/// stream (with a floor between attempts) until stopped, posting each fresh
+/// listing and clearing the host's tiles once it has been unreachable for a grace
+/// period. Off the event loop, so a slow or blocked ssh never stalls the UI.
+fn start_remote_watcher(
+    target: String,
+    host: RemoteHost,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-) {
+) -> RemoteWatcher {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child: Arc<std::sync::Mutex<Option<std::process::Child>>> = Arc::default();
+    let (t_stop, t_child) = (stop.clone(), child.clone());
     std::thread::spawn(move || {
-        // Consecutive poll failures per host, so a host that goes unreachable has
-        // its stale tiles cleared (after a grace period) rather than lingering.
-        let mut failures: HashMap<String, u32> = HashMap::new();
-        loop {
-            // Snapshot under the lock, then list without holding it (ssh blocks).
-            let hosts: Vec<(String, RemoteHost)> = match remotes.lock() {
-                Ok(g) => g.iter().map(|(t, h)| (t.clone(), h.clone())).collect(),
-                Err(_) => return, // a poisoned lock means the app is tearing down
-            };
-            // Forget failure counts for hosts no longer registered.
-            failures.retain(|t, _| hosts.iter().any(|(ht, _)| ht == t));
-            for (target, host) in hosts {
-                let event = match host.remote.list_sessions(&host.remote_ghost) {
-                    Ok(infos) => {
-                        failures.insert(target.clone(), 0);
-                        Some(namespace_remote_infos(&target, infos))
-                    }
-                    // A momentary blip keeps the last listing; only after a grace
-                    // period of failures do we clear the tiles (empty listing).
-                    Err(_) => {
-                        let n = failures.entry(target.clone()).or_insert(0);
-                        *n += 1;
-                        (*n >= REMOTE_POLL_MAX_FAILURES).then(Vec::new)
-                    }
-                };
-                if let Some(infos) = event
+        let mut failures: u32 = 0;
+        while !t_stop.load(Relaxed) {
+            let pushed = watch_stream_once(&target, &host, &proxy, &t_stop, &t_child);
+            if t_stop.load(Relaxed) {
+                break;
+            }
+            if pushed {
+                failures = 0;
+            } else {
+                failures = failures.saturating_add(1);
+                // Unreachable for a grace period: clear the host's stale tiles.
+                if failures >= REMOTE_WATCH_MAX_FAILURES
                     && proxy
-                        .send_event(UserEvent::RemoteSessions { target, infos })
+                        .send_event(UserEvent::RemoteSessions {
+                            target: target.clone(),
+                            infos: Vec::new(),
+                        })
                         .is_err()
                 {
-                    return; // the event loop closed
+                    break; // the event loop closed
                 }
             }
-            std::thread::sleep(REMOTE_POLL_INTERVAL);
+            std::thread::sleep(REMOTE_WATCH_RETRY);
         }
     });
+    RemoteWatcher { stop, child }
+}
+
+/// Run one `ghost __watch` stream to completion — it closes when the host exits,
+/// the connection drops, or a stop kills the child — posting each JSON listing as
+/// a namespaced [`UserEvent::RemoteSessions`]. Returns whether any listing was
+/// pushed, so the caller tells a live host from a dead one.
+fn watch_stream_once(
+    target: &str,
+    host: &RemoteHost,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    stop: &std::sync::atomic::AtomicBool,
+    child_slot: &std::sync::Mutex<Option<std::process::Child>>,
+) -> bool {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut cmd = host.remote.watch_command(&host.remote_ghost);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut proc = match cmd.spawn() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let Some(stdout) = proc.stdout.take() else {
+        return false;
+    };
+    if let Ok(mut g) = child_slot.lock() {
+        *g = Some(proc);
+    }
+    let mut pushed = false;
+    for line in std::io::BufReader::new(stdout).lines() {
+        if stop.load(Relaxed) {
+            break;
+        }
+        let Ok(line) = line else { break };
+        let Ok(infos) = ghost_vt::watch::parse_listing(&line) else {
+            continue;
+        };
+        pushed = true;
+        let infos = namespace_remote_infos(target, infos);
+        if proxy
+            .send_event(UserEvent::RemoteSessions {
+                target: target.to_string(),
+                infos,
+            })
+            .is_err()
+        {
+            stop.store(true, Relaxed); // event loop gone: end the whole watcher
+            break;
+        }
+    }
+    // Reap our child (a concurrent stop may already have killed it).
+    if let Ok(mut g) = child_slot.lock()
+        && let Some(mut c) = g.take()
+    {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    pushed
 }
 
 /// The off-loop half of an ssh connect: with the ControlMaster already open (the
@@ -828,7 +906,7 @@ fn restore_plan(
                 ids.push(fg.clone());
             }
             // A remote member can't be restored without its host — it comes back
-            // live via the poller on reconnect — so drop it; a window left with
+            // live via the watcher on reconnect — so drop it; a window left with
             // nothing local to restore is dropped entirely.
             let members: Vec<PlanMember> = ids
                 .into_iter()
@@ -952,7 +1030,6 @@ fn interactive(fresh: bool) {
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let poller_proxy = proxy.clone();
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
@@ -970,6 +1047,7 @@ fn interactive(fresh: bool) {
         remotes,
         remote_infos: HashMap::new(),
         remote_index: HashMap::new(),
+        remote_watchers: HashMap::new(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -979,9 +1057,8 @@ fn interactive(fresh: bool) {
         last_workspace: workspace,
         workspace_dirty: false,
     };
-    // The remote-fleet poller: lists each connected host's sessions off the event
-    // loop and posts them back as `UserEvent::RemoteSessions`.
-    spawn_remote_poller(app.remotes.clone(), poller_proxy);
+    // Each host gets a pushed `ghost __watch` stream started on connect (see
+    // `App::register_remote`); nothing to poll here.
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -1332,7 +1409,7 @@ impl Frontend for HeadlessFrontend {
 
 #[cfg(test)]
 impl App {
-    /// A behaviour-only App: no event loop, GPU, watcher, or poller — the seam a
+    /// A behaviour-only App: no event loop, GPU, watcher, or watcher — the seam a
     /// [`HeadlessFrontend`] plugs into. Drive it with the App's own methods
     /// (`open_fleet_window`, `dispatch`, `on_*`) and assert on its state.
     fn headless() -> Self {
@@ -1350,6 +1427,7 @@ impl App {
             remotes: Arc::default(),
             remote_infos: HashMap::new(),
             remote_index: HashMap::new(),
+            remote_watchers: HashMap::new(),
             subs: HashMap::new(),
             groups: Vec::new(),
             _watcher: None,
@@ -1546,21 +1624,26 @@ struct App {
     /// across focus loss; a stale id is filtered out at use (see `focused_window`).
     focused: Option<WindowId>,
     /// Proxy for posting messages into the event loop from another thread: native
-    /// menu selections (AppKit's main thread, macOS) and the remote-fleet poller's
+    /// menu selections (AppKit's main thread, macOS) and the remote-fleet watcher's
     /// listings ([`UserEvent::RemoteSessions`]). `None` under a headless
     /// [`Frontend`], where no threads post back into the loop.
     proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
     /// Remote hosts reached over the ssh transport, keyed by target — retained
-    /// after a successful connect and shared with the poller thread that lists
+    /// after a successful connect and shared with the watcher thread that lists
     /// their sessions. A host stays until its last window/session is gone.
     remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>>,
     /// The latest remote listing per host (fleet-namespaced ids), delivered by the
-    /// poller and merged into every `Cmd::ListSessions` reply.
+    /// watcher and merged into every `Cmd::ListSessions` reply.
     remote_infos: HashMap<String, Vec<ghost_vt::session::SessionInfo>>,
     /// Maps a namespaced remote fleet id back to `(target, real id)`, so a
     /// take-over/observe of a remote tile reaches the right host and session.
     /// Rebuilt whenever `remote_infos` changes.
     remote_index: HashMap<String, (String, String)>,
+    /// One live `ghost __watch` stream per connected host, keyed by target: the
+    /// push that keeps `remote_infos` fresh. Dropping an entry stops its thread,
+    /// so a watcher ends exactly when its host leaves `remotes` (window close /
+    /// app exit).
+    remote_watchers: HashMap<String, RemoteWatcher>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -1798,7 +1881,7 @@ impl App {
                         // remote sessions have no local socket/descriptor/recording.
                         self.sync_subscriptions(&infos);
                     }
-                    // Merge the connected hosts' latest listings (poller-fed) so
+                    // Merge the connected hosts' latest listings (watcher-fed) so
                     // the fleet shows local and remote sessions together.
                     let mut combined = infos.clone();
                     for r in self.remote_infos.values() {
@@ -1918,7 +2001,7 @@ impl App {
                 }
                 Cmd::Kill(id) if self.remote_index.contains_key(&id) => {
                     // Kill the remote session over its host's transport (off-loop),
-                    // then drop any client we hold; the poller drops the tile.
+                    // then drop any client we hold; the watcher drops the tile.
                     if let Some((target, real)) = self.remote_index.get(&id).cloned() {
                         self.spawn_remote_kill(&target, &real);
                     }
@@ -2418,7 +2501,7 @@ impl App {
             ConnectOutcome::Transport { remote_ghost } => {
                 // Retain the host so the fleet polls its other sessions too.
                 self.register_remote(&spec, &remote_ghost);
-                // Drive it under the SAME composite id the poller will discover it
+                // Drive it under the SAME composite id the watcher will discover it
                 // by (`<target>␟<name>`), so the window recognizes its own session
                 // as this-window in the fleet instead of as a foreign duplicate. The
                 // transport still addresses the bare remote name.
@@ -2465,9 +2548,10 @@ impl App {
         }
     }
 
-    /// Retain a connected host so the fleet polls its sessions. Builds a fresh
-    /// `RemoteSsh` from the spec — its control-socket path is deterministic, so it
-    /// shares the ControlMaster the connect already opened (no re-auth).
+    /// Retain a connected host so the fleet tracks its sessions, and start its
+    /// pushed `ghost __watch` stream. Builds a fresh `RemoteSsh` from the spec — its
+    /// control-socket path is deterministic, so it shares the ControlMaster the
+    /// connect already opened (no re-auth).
     fn register_remote(&mut self, spec: &ConnectionSpec, remote_ghost: &str) {
         let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) else {
             return;
@@ -2481,6 +2565,29 @@ impl App {
                 },
             );
         }
+        self.ensure_remote_watcher(&spec.target());
+    }
+
+    /// Start a host's pushed `ghost __watch` stream if it isn't already running —
+    /// the push that keeps its fleet tiles fresh. A no-op without an event-loop
+    /// proxy (a headless test posts `RemoteSessions` itself).
+    fn ensure_remote_watcher(&mut self, target: &str) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        if self.remote_watchers.contains_key(target) {
+            return;
+        }
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned());
+        let Some(host) = host else {
+            return;
+        };
+        let watcher = start_remote_watcher(target.to_string(), host, proxy);
+        self.remote_watchers.insert(target.to_string(), watcher);
     }
 
     /// Rebuild the namespaced-id → `(target, real id)` index from the current
@@ -2558,7 +2665,7 @@ impl App {
             eprintln!("ghost: could not open a session on {target}: {e}");
             return;
         }
-        // Drive it under the composite id the poller will discover it by, so the
+        // Drive it under the composite id the watcher will discover it by, so the
         // window owns its own new session in the fleet (the transport uses the bare
         // name); see [`finish_connect`](Self::finish_connect).
         let local_id = remote_fleet_id(target, name);
@@ -2587,7 +2694,7 @@ impl App {
     }
 
     /// Kill remote session `real` on `target` over its host's transport, off the
-    /// event loop (one ssh command over the open master). The poller reflects the
+    /// event loop (one ssh command over the open master). The watcher reflects the
     /// removal within a poll.
     fn spawn_remote_kill(&self, target: &str, real: &str) {
         let Some(host) = self
@@ -2607,7 +2714,7 @@ impl App {
     }
 
     /// Rename remote session `real` on `target` to `new` over its host's transport,
-    /// off the event loop. The poller reflects the new label within a poll.
+    /// off the event loop. The watcher reflects the new label on the next push.
     fn spawn_remote_rename(&self, target: &str, real: &str, new: &str) {
         let Some(host) = self
             .remotes
@@ -2833,7 +2940,7 @@ impl App {
     }
 
     /// Drop remote hosts (and their cached listings) that no live window
-    /// references any more, so the poller stops listing them and their fleet tiles
+    /// references any more, so the watcher stops listing them and their fleet tiles
     /// disappear.
     fn prune_remotes(&mut self) {
         let in_use = self.in_use_targets();
@@ -2841,6 +2948,8 @@ impl App {
             m.retain(|t, _| in_use.contains(t));
         }
         self.remote_infos.retain(|t, _| in_use.contains(t));
+        // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
+        self.remote_watchers.retain(|t, _| in_use.contains(t));
         self.rebuild_remote_index();
     }
 
@@ -3088,11 +3197,11 @@ impl App {
     /// inject a `UserEvent` directly: a native menu selection (turned back into the
     /// effect a keystroke would have produced, keeping the pure core the single
     /// source of truth — see [`menu::menu_intent`]), a remote host's latest listing
-    /// from the poller, or a connect worker's result.
+    /// from the watcher, or a connect worker's result.
     fn on_user_event(&mut self, fe: &dyn Frontend, event: UserEvent) {
         let action = match event {
             UserEvent::Menu(action) => action,
-            // The poller thread delivered a remote host's latest listing: stash it
+            // The watcher thread delivered a remote host's latest listing: stash it
             // and hint a re-enumeration so the fleet merges it in.
             UserEvent::RemoteSessions { target, infos } => {
                 self.remote_infos.insert(target, infos);
@@ -3704,13 +3813,13 @@ mod tests {
 
     #[test]
     fn on_user_event_merges_a_remote_listing_under_composite_ids() {
-        // The real shell handles a poller delivery headlessly: a host's listing is
+        // The real shell handles a watcher delivery headlessly: a host's listing is
         // stashed and its ids resolve back to (target, real) — the identity path a
         // past bug broke (a window mistook its own remote session for a foreign
         // one). No window, disk, or network needed.
         let mut app = App::headless();
         let fe = HeadlessFrontend::new();
-        // The poller posts already-namespaced infos (see `spawn_remote_poller`).
+        // The watcher posts already-namespaced infos (see `watch_stream_once`).
         let infos = namespace_remote_infos("kov@box", vec![info("work", false)]);
         app.on_user_event(
             &fe,
@@ -4049,7 +4158,7 @@ mod tests {
     fn restore_plan_never_locally_restores_a_remote_session() {
         // A window that held a local session and a remote (ssh) one: the remote
         // member can't be restored without its host — it reappears live via the
-        // poller on reconnect — so the plan drops it, keeping only the local set.
+        // watcher on reconnect — so the plan drops it, keeping only the local set.
         // A window whose only member was remote can't be restored at all.
         let rem = remote("work");
         let records = [
