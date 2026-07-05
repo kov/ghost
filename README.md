@@ -112,14 +112,20 @@ Generate them with xtask:
 ```sh
 cargo xtask prebuilt                        # this OS's two arches → the prebuilt dir
 cargo xtask prebuilt aarch64-apple-darwin   # a specific target
-GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # cross-build via cargo-zigbuild — bundles
-                                            # sysroots, so cross-OS builds (and hosts
-                                            # missing the target C toolchain) just work
+GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # build via cargo-zigbuild (for a cross-OS
+                                            # target, e.g. a Linux prebuilt from a Mac)
 ```
 
-`ghost-host` is GUI-free (no font/window libraries), a few MB, and the only thing
-staged to the remote. With no matching prebuilt ghost falls back to the ssh child,
-so a missing one never breaks a connection — it only unlocks the richer host path.
+`ghost-host` is pure Rust and GUI-free, so cross-building needs no C toolchain or
+sysroot. On Linux the default targets are **static musl** binaries: `rustup target
+add` is the only setup (xtask does it), they link with the bundled `rust-lld`, and
+being static they run on any remote regardless of its glibc. On macOS the native
+Apple toolchain builds both arches. Only cross-*OS* builds (a Linux binary from a
+Mac, or vice-versa) want `GHOST_ZIGBUILD=1`.
+
+The binary is a few MB and is the only thing staged to the remote. With no matching
+prebuilt ghost falls back to the ssh child, so a missing one never breaks a
+connection — it only unlocks the richer host path.
 
 ## How it works
 

@@ -291,17 +291,32 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
     for triple in triples {
         let name = triple_to_name(triple).expect("validated above");
         println!("building ghost-host for {triple}…");
-        // Building for the host's own triple: drop `--target`. A plain build uses
-        // the native `cc`, whereas an explicit host target makes cc-rs reach for a
-        // triple-prefixed cross compiler (`x86_64-linux-gnu-gcc`) that may be
-        // absent or broken — so the "cross-build to your own arch" would fail where
-        // a normal build succeeds.
+        // Building for the host's own triple: drop `--target` so the build reuses
+        // the host's configured linker and `target/release/`. Everything else is a
+        // cross build; make the target available first (idempotent).
         let native = host.as_deref() == Some(triple.as_str());
         let mut cmd = Command::new(cargo());
         cmd.current_dir(&ws)
             .args([subcommand, "--release", "-p", "ghost-host"]);
         if !native {
+            let _ = Command::new("rustup")
+                .args(["target", "add", triple])
+                .status();
             cmd.args(["--target", triple]);
+        }
+        // ghost-host is pure Rust, so a musl target links self-contained with the
+        // bundled `rust-lld` — no C toolchain or sysroot. Force that linker via the
+        // whole-invocation RUSTFLAGS (which *replaces* any config rustflags) so a
+        // host-wide `[target.'cfg(target_os="linux")']` linker setting doesn't feed
+        // the cross build its host-arch linker. A per-target override would instead
+        // *combine* with that config and pass e.g. `-fuse-ld=mold` on to rust-lld.
+        if triple.contains("musl") && subcommand == "build" {
+            let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
+            if !flags.is_empty() {
+                flags.push(' ');
+            }
+            flags.push_str("-C linker=rust-lld");
+            cmd.env("RUSTFLAGS", flags);
         }
         let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
         if !ok {
@@ -327,7 +342,8 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
     );
     if !failed.is_empty() {
         return Err(format!(
-            "could not build {} — install the target's toolchain, or set GHOST_ZIGBUILD=1",
+            "could not build {} — for a cross-OS target (e.g. macOS from Linux) set \
+             GHOST_ZIGBUILD=1, or install that target's toolchain",
             failed.join(", ")
         )
         .into());
@@ -344,15 +360,18 @@ fn host_triple() -> Option<String> {
         .find_map(|l| l.strip_prefix("host: ").map(|s| s.trim().to_string()))
 }
 
-/// This host OS's two arches — the same-OS arch flip that a normal toolchain
-/// cross-builds (both apple arches on macOS, both linux arches on Linux). Cross-OS
-/// targets must be named explicitly (and generally need `GHOST_ZIGBUILD=1`).
+/// This host OS's two arches. Linux uses the **musl** targets: they link
+/// self-contained with the bundled `rust-lld` (so `rustup target add` is the only
+/// setup — no C toolchain or sysroot) and produce a static binary that runs on any
+/// remote regardless of its glibc — ideal for staging. macOS uses the native
+/// darwin targets (Apple's toolchain cross-builds both arches). Cross-OS targets
+/// must be named explicitly (and generally want `GHOST_ZIGBUILD=1`).
 fn default_triples() -> Vec<String> {
     match std::env::consts::OS {
         "macos" => vec!["aarch64-apple-darwin".into(), "x86_64-apple-darwin".into()],
         _ => vec![
-            "x86_64-unknown-linux-gnu".into(),
-            "aarch64-unknown-linux-gnu".into(),
+            "x86_64-unknown-linux-musl".into(),
+            "aarch64-unknown-linux-musl".into(),
         ],
     }
 }
