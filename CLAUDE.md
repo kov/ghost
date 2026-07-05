@@ -20,7 +20,7 @@ helpers.
 
 ## Searching recorded output
 
-Don't `grep` the recording files — they're framed-zstd, so a raw grep finds
+Don't `grep` the recording files — they're framed-brotli, so a raw grep finds
 nothing. Use `ghost search <pattern>` (`-i` for case-insensitive, `--session
 <name>` to scope to one). It replays each recording through the emulator and
 greps the *rendered* lines, printing `session:line: text`. Reach for it whenever

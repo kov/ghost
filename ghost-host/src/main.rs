@@ -7,9 +7,9 @@
 //! (`__watch`), the transport probe (`__probe`), and the plain admin commands
 //! (`ls`/`new`/`kill`/`rename`). None of that needs winit/wgpu/swash/fontconfig,
 //! so keeping it in its own crate (deps: only `ghost-vt` + `ghost-cli`) means the
-//! staged binary is a fraction of the full GUI build, cross-compiles with just a
-//! Rust target (plus a C toolchain for zstd), and drags no font/window libraries
-//! onto the remote.
+//! staged binary is a fraction of the full GUI build, is pure Rust (no C deps —
+//! recordings use brotli), so it cross-compiles with just `rustup target add`,
+//! and drags no font/window libraries onto the remote.
 //!
 //! It shares the *exact* entry points the full `ghost` binary uses
 //! ([`ghost_vt::server::run_host_if_invoked`] + [`ghost_cli::run_subcommand`]),

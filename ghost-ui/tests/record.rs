@@ -1,5 +1,5 @@
 //! End-to-end tests for session recording: the host writes a durable,
-//! framed-zstd recording of session output that can be decoded back.
+//! framed-brotli recording of session output that can be decoded back.
 //!
 //! The recorded children end themselves with a SIGTERM (`kill $$`) rather
 //! than exiting cleanly: a clean exit is an explicit end and discards the

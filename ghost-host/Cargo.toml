@@ -7,9 +7,9 @@ description = "Headless ghost: the session host + SSH-transport relay, without t
 publish = false
 
 # Deliberately GUI-free: only the backend (`ghost-vt`) and the CLI dispatch
-# (`ghost-cli`). No winit/wgpu/swash/fontconfig — so this cross-compiles with
-# essentially just a Rust target (plus a C toolchain for zstd) and needs no
-# windowing/font libraries on the remote. This is what staging copies over.
+# (`ghost-cli`). No winit/wgpu/swash/fontconfig, and no C deps (recordings use
+# pure-Rust brotli) — so this cross-compiles with just `rustup target add` and
+# needs no windowing/font libraries on the remote. This is what staging copies.
 [dependencies]
 ghost-cli = { path = "../ghost-cli" }
 ghost-vt = { path = "../ghost-vt" }

@@ -1,5 +1,10 @@
-//! The on-disk recording: a framed, per-frame zstd-compressed asciicast with
+//! The on-disk recording: a framed, per-frame brotli-compressed asciicast with
 //! periodic state checkpoints, supporting append, seek, and tail-on-attach.
+//!
+//! Compression is brotli (pure Rust, no C toolchain): on terminal output it
+//! matches zstd-3's ratio while staying far above any real output rate, so the
+//! whole crate — and the headless binary staged to remotes — builds with just a
+//! Rust target. The codec is confined to [`compress`]/[`decompress`].
 //!
 //! The recording (archival, raw bytes) and the resync (emulator state) are
 //! distinct roles that share this format: a checkpoint is the emulator's
@@ -9,14 +14,14 @@
 //!
 //! ```text
 //! magic  "GHOSTREC"            8 bytes
-//! ver    u8                    format version (2)
+//! ver    u8                    format version (3)
 //! header u32 len + postcard(Header)
 //! frame* repeated until EOF:
 //!          kind  u8            (0 = events, 1 = checkpoint, 2 = images)
 //!          clen  u32 LE        compressed payload length
-//!          data  [clen]        zstd( postcard(Vec<Event>) )      for kind 0
-//!                              zstd( postcard(Checkpoint) )       for kind 1
-//!                              zstd( postcard(Vec<ImageBlob>) )   for kind 2
+//!          data  [clen]        brotli( postcard(Vec<Event>) )    for kind 0
+//!                              brotli( postcard(Checkpoint) )     for kind 1
+//!                              brotli( postcard(Vec<ImageBlob>) ) for kind 2
 //! ```
 //!
 //! A checkpoint frame carries an emulator dump (minus kitty-graphics image
@@ -37,23 +42,44 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"GHOSTREC";
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const FRAME_EVENTS: u8 = 0;
 const FRAME_CHECKPOINT: u8 = 1;
 /// A content-addressed image store: kitty-graphics image bytes written once and
 /// referenced by hash from later checkpoints, so a recording bakes images in
 /// without re-inlining them in every checkpoint.
 const FRAME_IMAGES: u8 = 2;
-const ZSTD_LEVEL: i32 = 3;
+/// Brotli quality for frame payloads. On terminal output q4 matches (slightly
+/// beats) zstd-3's ratio at ~140 MB/s — orders of magnitude above real output
+/// rates, so recording stays real-time. Window/buffer are brotli defaults.
+const BROTLI_QUALITY: u32 = 4;
+const BROTLI_LGWIN: u32 = 22;
+const BROTLI_BUF: usize = 8 * 1024;
 /// Flush a frame once this many bytes of output have accumulated.
 const FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Compress a frame payload. The recording's one codec seam: brotli (pure Rust)
+/// in, [`decompress`] out. In-memory, so it only errors on OOM.
+fn compress(raw: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    brotli::CompressorReader::new(raw, BROTLI_BUF, BROTLI_QUALITY, BROTLI_LGWIN)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Decompress a frame payload written by [`compress`].
+fn decompress(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    brotli::Decompressor::new(payload, BROTLI_BUF).read_to_end(&mut out)?;
+    Ok(out)
+}
 
 /// Default cap on a recording's on-disk size. When exceeded, the oldest
 /// pre-checkpoint history is dropped (see [`FileRecorder`]).
@@ -311,7 +337,7 @@ fn stored_image_hashes(bytes: &[u8]) -> HashSet<u64> {
         };
         pos = next;
         if kind == FRAME_IMAGES
-            && let Ok(raw) = zstd::decode_all(payload)
+            && let Ok(raw) = decompress(payload)
             && let Ok(list) = postcard::from_bytes::<Vec<ImageBlob>>(&raw)
         {
             for b in list {
@@ -402,7 +428,7 @@ impl<W: Write> Recorder<W> {
             }
         }
         if !new_blobs.is_empty() {
-            let compressed = zstd::encode_all(&to_postcard(&new_blobs)?[..], ZSTD_LEVEL)?;
+            let compressed = compress(&to_postcard(&new_blobs)?[..])?;
             self.writer.write_all(&[FRAME_IMAGES])?;
             write_len_prefixed(&mut self.writer, &compressed)?;
         }
@@ -414,7 +440,7 @@ impl<W: Write> Recorder<W> {
             dump: dump.to_vec(),
             images: refs,
         };
-        let compressed = zstd::encode_all(&to_postcard(&ckpt)?[..], ZSTD_LEVEL)?;
+        let compressed = compress(&to_postcard(&ckpt)?[..])?;
         self.writer.write_all(&[FRAME_CHECKPOINT])?;
         write_len_prefixed(&mut self.writer, &compressed)?;
         Ok(())
@@ -435,7 +461,7 @@ impl<W: Write> Recorder<W> {
             return Ok(());
         }
         let raw = to_postcard(&self.pending)?;
-        let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL)?;
+        let compressed = compress(&raw[..])?;
         self.writer.write_all(&[FRAME_EVENTS])?;
         write_len_prefixed(&mut self.writer, &compressed)?;
         self.pending.clear();
@@ -530,7 +556,7 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
         pos = next;
         match kind {
             FRAME_EVENTS => {
-                let raw = zstd::decode_all(payload)?;
+                let raw = decompress(payload)?;
                 let frame: Vec<Event> = postcard::from_bytes(&raw).map_err(io::Error::other)?;
                 for e in frame {
                     items.push(match e.body {
@@ -544,14 +570,14 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
                 }
             }
             FRAME_IMAGES => {
-                let raw = zstd::decode_all(payload)?;
+                let raw = decompress(payload)?;
                 let blobs: Vec<ImageBlob> = postcard::from_bytes(&raw).map_err(io::Error::other)?;
                 for blob in blobs {
                     image_store.insert(blob.hash, blob);
                 }
             }
             FRAME_CHECKPOINT => {
-                let raw = zstd::decode_all(payload)?;
+                let raw = decompress(payload)?;
                 let c: Checkpoint = postcard::from_bytes(&raw).map_err(io::Error::other)?;
                 // Reconstruct the full dump: re-transmit the referenced images
                 // (resolved from the store) before the transmit-free dump, so the
@@ -658,7 +684,7 @@ pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
     for f in &frames {
         match f.kind {
             FRAME_IMAGES => {
-                let raw = zstd::decode_all(f.payload).ok()?;
+                let raw = decompress(f.payload).ok()?;
                 let list: Vec<ImageBlob> = postcard::from_bytes(&raw).ok()?;
                 for b in list {
                     if f.start >= cut {
@@ -668,7 +694,7 @@ pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
                 }
             }
             FRAME_CHECKPOINT if f.start >= cut => {
-                let raw = zstd::decode_all(f.payload).ok()?;
+                let raw = decompress(f.payload).ok()?;
                 let c: Checkpoint = postcard::from_bytes(&raw).ok()?;
                 for r in c.images {
                     if needed_seen.insert(r.hash) {
@@ -688,7 +714,7 @@ pub fn truncate_to_fit(bytes: &[u8], target_bytes: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(frames_start + (len - cut) + 64);
     out.extend_from_slice(&bytes[..frames_start]);
     if !reemit.is_empty() {
-        let compressed = zstd::encode_all(&to_postcard(&reemit).ok()?[..], ZSTD_LEVEL).ok()?;
+        let compressed = compress(&to_postcard(&reemit).ok()?[..]).ok()?;
         out.push(FRAME_IMAGES);
         out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         out.extend_from_slice(&compressed);
@@ -911,7 +937,7 @@ mod tests {
         // matters is that its blob frame exists, then is dropped, then is needed).
         let img = "\x1b_Gi=7,a=T,f=24,s=2,v=1,c=1,r=1;/wAAAP8A\x1b\\";
         // Incompressible filler so a recorded output frame actually grows the file
-        // past the cap (zstd would crush repetitive text away).
+        // past the cap (compression would crush repetitive text away).
         let filler = |seed: u32, n: usize| -> Vec<u8> {
             let mut x = seed;
             (0..n)

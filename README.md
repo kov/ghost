@@ -150,7 +150,7 @@ macOS (no `signalfd`/`kqueue` split).
   label in its metadata, so these files never move and attached clients are
   never disturbed.
 - Recordings: `$XDG_DATA_HOME/ghost/recordings/<name>.ghostrec` (falls back to
-  `~/.local/share/ghost/…`; archival, survives reboot). A framed, per-frame-zstd
+  `~/.local/share/ghost/…`; archival, survives reboot). A framed, per-frame-brotli
   asciicast with periodic checkpoints; `ghost export` turns it into a standard
   asciicast that `asciinema play` can replay.
 

@@ -1,6 +1,6 @@
 //! Full-text search over recorded session output.
 //!
-//! Recordings are framed-zstd binaries (see [`crate::record`]), so a plain
+//! Recordings are framed-brotli binaries (see [`crate::record`]), so a plain
 //! `grep` over the files finds nothing useful. This module replays each
 //! recording through the terminal emulator ([`Screen`]) and searches the
 //! resulting text — the same lines you would have seen scroll by — so a match is

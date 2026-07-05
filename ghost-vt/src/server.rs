@@ -78,7 +78,7 @@ const MAX_CHECKPOINT_INTERVAL_BYTES: usize = 2 * 1024 * 1024;
 
 /// How many bytes of output to emit between recording checkpoints.
 ///
-/// A checkpoint serializes and zstd-compresses the *entire* emulator state, so
+/// A checkpoint serializes and compresses the *entire* emulator state, so
 /// under high-throughput output (a big `find`, `cat` of a large file) frequent
 /// checkpoints dominate the host's CPU — re-compressing roughly as many bytes as
 /// the output stream itself. Spacing them out cuts that cost sharply.
