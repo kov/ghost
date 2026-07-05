@@ -763,6 +763,30 @@ impl FleetModel {
         self.focused.as_deref()
     }
 
+    /// The session a toggle-back (F9/Esc) should return to: `prefer` when it is an
+    /// owned, present tile, else any tile this window drives, else `None` — an
+    /// overview-only window with nothing of its own to dive into. Deliberately
+    /// never a foreign tile: returning one would adopt a session attached in
+    /// another window. Opening a specific tile is Enter/click ([`adopt`]), not this.
+    ///
+    /// [`adopt`]: crate::RootModel
+    pub fn owned_tile(&self, prefer: Option<&str>) -> Option<SessionId> {
+        let is_owned = |id: &str| {
+            self.tiles
+                .iter()
+                .any(|t| t.id == id && t.locality == Locality::ThisWindow)
+        };
+        if let Some(p) = prefer
+            && is_owned(p)
+        {
+            return Some(p.to_string());
+        }
+        self.tiles
+            .iter()
+            .find(|t| t.locality == Locality::ThisWindow)
+            .map(|t| t.id.clone())
+    }
+
     /// Whether a modal (inline rename, confirm dialog, or the group-name
     /// prompt) is capturing input — keys like Escape belong to it, not to
     /// whoever hosts the fleet.
@@ -950,6 +974,18 @@ impl FleetModel {
         let mut warm = Vec::new();
         for tile in self.tiles {
             if Some(&tile.id) == keep.as_ref() {
+                // Adopting a session as the foreground claims it into this
+                // window's group. Doing that to a session attached in another
+                // window would leave it attached twice, in two groups — the
+                // "should not happen" corruption this guards against. Multi-client
+                // attach is a future feature that needs designing; until then,
+                // crash loudly rather than silently double-attach.
+                assert_ne!(
+                    tile.locality,
+                    Locality::Elsewhere,
+                    "refusing to adopt session '{}': it is attached in another window",
+                    tile.id,
+                );
                 kept = Some(tile.model);
             } else if mine.contains(&tile.id) {
                 warm.push(tile.model); // a driven session: keep it warm
@@ -2547,7 +2583,13 @@ impl FleetModel {
         let p = self.pending.take().expect("pending checked by caller");
         let mut cmds = match (&p.target, p.action) {
             (PendingTarget::Session(id), PendingAction::TakeOver) => {
-                vec![Cmd::TakeOver(id.clone())]
+                // Claim the tile NOW — flip it to ThisWindow — before the dive,
+                // exactly as group-open and multi-select already do. Diving on a
+                // still-Elsewhere tile trips the "attached in another window" guard
+                // in `extract` (the adopt that follows the TakeOver reaches it).
+                let mut cmds = self.claim_session(id);
+                cmds.push(Cmd::TakeOver(id.clone()));
+                cmds
             }
             (PendingTarget::Session(id), PendingAction::Kill) => {
                 self.kill_sessions(std::slice::from_ref(id))
@@ -7551,6 +7593,46 @@ mod tests {
         assert_eq!(m.locality_of("foreign"), Some(Locality::Elsewhere));
         assert_eq!(m.locality_of("mine-detached"), Some(Locality::Detached));
         assert_eq!(m.tile_count(), 2); // both shown, as placeholder tiles
+    }
+
+    #[test]
+    #[should_panic(expected = "attached in another window")]
+    fn adopting_a_session_attached_elsewhere_panics_loudly() {
+        // A window owning nothing, previewing a session that is attached in
+        // another window. Extracting it as the foreground would double-attach it
+        // (in two groups); the guard crashes rather than silently corrupt state.
+        let mut f = fleet();
+        f.update(UiEvent::SessionList(vec![sinfo("ghost-mac", true)]));
+        let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
+    }
+
+    #[test]
+    fn taking_over_a_session_held_elsewhere_claims_it_before_the_dive() {
+        // The counterpart to the panic above: a window owning nothing, previewing a
+        // session attached in another window. CONFIRMING the take-over must claim the
+        // tile — flip it to ThisWindow — so the adopt that follows never reaches the
+        // "attached in another window" guard (unlike group-open and multi-select, the
+        // single-session take-over used to skip the claim and dive on an Elsewhere tile).
+        let mut f = fleet(); // owns nothing
+        widen(&mut f);
+        f.update(UiEvent::SessionList(vec![sinfo("ghost-mac", true)]));
+        assert_eq!(f.locality_of("ghost-mac"), Some(Locality::Elsewhere));
+        reveal(&mut f); // the "attached elsewhere" pool is folded by default
+        focus(&mut f, "ghost-mac");
+        // Enter opens the take-over confirm modal; Space confirms it.
+        key(&mut f, Key::Named(NamedKey::Enter));
+        let cmds = key(&mut f, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::TakeOver("ghost-mac".to_string())),
+            "confirming steals the held session: {cmds:?}"
+        );
+        assert_eq!(
+            f.locality_of("ghost-mac"),
+            Some(Locality::ThisWindow),
+            "the take-over must claim the tile before the dive"
+        );
+        // Proof the guard is satisfied: extracting it as the foreground no longer panics.
+        let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
     }
 
     #[test]

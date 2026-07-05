@@ -1777,15 +1777,20 @@ impl RootModel {
                 self.my_group = f.my_group().clone();
                 // Dive in: snapshot the fleet world so the whole grid stays visible
                 // while we descend into the tile we land on, then take over with the
-                // live single view once the dive lands.
-                let target = self
-                    .primary
-                    .clone()
-                    .or_else(|| f.focused().map(str::to_string));
-                let to = target.as_deref().and_then(|t| f.dive_camera(t));
+                // live single view once the dive lands. Return only to a session
+                // THIS window drives; an overview-only window (nothing owned) has
+                // nothing to return to, so F9/Esc stays in the fleet rather than
+                // adopting a foreign tile — which would attach that session here
+                // while it's still attached in its own window, in two groups.
+                // Choosing a specific tile to open is Enter/click, not F9/Esc.
+                let Some(target) = f.owned_tile(self.primary.as_deref()) else {
+                    self.mode = Mode::Fleet(f);
+                    return Vec::new();
+                };
+                let to = f.dive_camera(&target);
                 let anim = to.map(|to| Anim::dive(f.view(), Transform::IDENTITY, to, dur));
                 let (model, warm, mut cmds) =
-                    f.into_single_keeping(self.primary.clone(), self.size_px, self.scale);
+                    f.into_single_adopting(target.clone(), self.size_px, self.scale);
                 // The extracted session becomes the foreground; the rest of the
                 // window's driven sessions stay warm in the background. Own them
                 // too: a group-open claims sessions fleet-side, and this is where
@@ -1956,6 +1961,40 @@ mod tests {
         assert!(rec.fleet, "fleet overview");
         assert_eq!(rec.group_id, "w1");
         assert_eq!(rec.attached, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn f9_in_an_overview_only_window_adopts_nothing_and_stays_in_the_fleet() {
+        // A freshly-opened overview window owns no session; the fleet lists one
+        // that is attached in another window ("ghost-mac", attached elsewhere).
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.update(UiEvent::SessionList(vec![sess("ghost-mac", true, 1)]));
+        // F9 must not dive into — and thereby adopt — that foreign session. With
+        // nothing of its own to return to, the window stays in the overview
+        // rather than attaching a session that's already attached (in two groups).
+        let cmds = key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet(), "F9 with no owned session stays in the fleet");
+        assert!(
+            r.primary.is_none(),
+            "no foreign session is adopted as foreground"
+        );
+        assert!(
+            !r.mine.contains("ghost-mac"),
+            "the foreign session is not claimed by this window"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::SetTitle(_) | Cmd::SaveGroups(_))),
+            "no dive-in / group-claim side effects: {cmds:?}"
+        );
+        // Esc routes through the same dive-back and is likewise inert here.
+        key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(
+            r.is_fleet(),
+            "Esc with no owned session also stays in the fleet"
+        );
+        assert!(r.primary.is_none() && !r.mine.contains("ghost-mac"));
     }
 
     #[test]

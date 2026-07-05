@@ -98,9 +98,12 @@ fn f9_from_single_dives_out_to_the_fleet_then_settles() {
 
 #[test]
 fn f9_round_trips_single_to_fleet_to_single() {
-    // Two live-ish sessions; adopt one so there's a single view to dive out of.
+    // Two sessions this window adopts (from the detached pool) and feeds, so there's
+    // a live single view to dive out of. They are NOT attached elsewhere: adopting a
+    // session held by another window without taking it over would double-attach it —
+    // the case the fleet's extract guard now refuses.
     let mut h = Harness::fleet(METRICS, (1400, 900), 1.0);
-    h.set_sessions(vec![info("alpha", true, 1), info("beta", true, 2)]);
+    h.set_sessions(vec![info("alpha", false, 1), info("beta", false, 2)]);
     for n in ["alpha", "beta"] {
         h.inject(UiEvent::AdoptSession(n.into()));
         h.inject(UiEvent::SessionData {
