@@ -82,6 +82,14 @@ impl TextInput {
                 let to = self.next_char();
                 self.text.drain(self.cursor..to);
             }
+            // Emacs/readline line motion — the same on Linux and macOS, where
+            // Ctrl+A/Ctrl+E are the system beginning/end-of-line chords. They
+            // arrive as the letter with Ctrl held; other Ctrl-chords fall through.
+            Key::Char(s) if mods.ctrl && !mods.sup => match s.to_ascii_lowercase().as_str() {
+                "a" => self.cursor = 0,
+                "e" => self.cursor = self.text.len(),
+                _ => return false,
+            },
             _ => return false,
         }
         true
@@ -201,6 +209,23 @@ mod tests {
         t.key(&named(NamedKey::ArrowLeft), Mods::ALT);
         t.key(&named(NamedKey::Backspace), Mods::SUPER);
         assert_eq!(t.text(), "two", "Cmd-Backspace deletes to the start");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_the_line_edges() {
+        // Emacs/readline line motion, expected on both Linux and macOS. These
+        // arrive as a Char with Ctrl held (the letter itself, not a control code).
+        let mut t = TextInput::new("kov@box".into());
+        assert!(t.key(&Key::Char("a".into()), Mods::CTRL), "Ctrl+A handled");
+        assert_eq!(t.halves().0, "", "Ctrl+A jumps to the start");
+        assert!(t.key(&Key::Char("e".into()), Mods::CTRL), "Ctrl+E handled");
+        assert_eq!(t.halves().1, "", "Ctrl+E jumps to the end");
+        // Case-insensitive, so Ctrl+Shift+E still reaches the end.
+        t.key(&Key::Char("a".into()), Mods::CTRL);
+        assert!(t.key(&Key::Char("E".into()), Mods::CTRL | Mods::SHIFT));
+        assert_eq!(t.halves().1, "");
+        // Other Ctrl-chords stay unhandled (so they aren't silently swallowed).
+        assert!(!t.key(&Key::Char("x".into()), Mods::CTRL));
     }
 
     #[test]
