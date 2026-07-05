@@ -879,10 +879,28 @@ struct WindowPlan {
     cols: u16,
     rows: u16,
     fleet: bool,
+    /// The window's saved foreground session, if it was one of the driven set —
+    /// so a remote reconnect knows whether to foreground it or keep it warm.
+    foreground: Option<String>,
     /// Local members to attach now (dead ones relaunched first).
     locals: Vec<PlanMember>,
     /// Remote (transport) member ids (`<target>␟<real>`) to reconnect + re-adopt.
     remotes: Vec<String>,
+}
+
+/// A remote member a startup restore is waiting to re-adopt into a window once
+/// its host reconnects (queued in [`App::pending_remote_restores`], drained by
+/// [`App::finish_remote_reconnect`]).
+struct PendingRemote {
+    wid: WindowId,
+    /// The composite id `<target>␟<real>`.
+    composite: String,
+    /// The window was saved in the fleet overview → observe the tile in place
+    /// (the fleet's own observe path); else drive it into the single view.
+    fleet: bool,
+    /// This session was the window's saved foreground → drive+foreground it; else
+    /// attach it as a background (warm) mirror without stealing the live foreground.
+    foreground: bool,
 }
 
 /// How the app should open its first window(s), decided at launch.
@@ -942,6 +960,7 @@ fn restore_plan(
                 cols: rec.cols,
                 rows: rec.rows,
                 fleet: rec.fleet,
+                foreground: rec.foreground.clone(),
                 locals,
                 remotes,
             })
@@ -1692,17 +1711,15 @@ struct App {
     /// so a watcher ends exactly when its host leaves `remotes` (window close /
     /// app exit).
     remote_watchers: HashMap<String, RemoteWatcher>,
-    /// Remote members a startup restore is waiting to re-adopt, keyed by target:
-    /// each `(window, composite id, saved-in-fleet)` is attached once its host
-    /// reconnects (see [`App::reconnect_restored_remotes`] /
-    /// [`App::finish_remote_reconnect`]). The bool carries the window's SAVED view
-    /// mode — a fleet window observes its tile in place, a single-view one drives
-    /// and foregrounds it. It can't be read back from the live window: a restored
-    /// remote-only window always opens as a fleet (no local tile to dive into, so
-    /// F9 can't force it single), so the saved intent must ride along here.
-    /// An entry for a host that never reconnects (password/unreachable) just
-    /// lingers, drained only on a successful reconnect.
-    pending_remote_restores: HashMap<String, Vec<(WindowId, String, bool)>>,
+    /// Remote members a startup restore is waiting to re-adopt, keyed by target
+    /// (see [`PendingRemote`], [`App::reconnect_restored_remotes`] /
+    /// [`App::finish_remote_reconnect`]). Each carries the window's SAVED view mode
+    /// and foreground flag, which can't be read back from the live window: a
+    /// restored remote-only window always opens as a fleet (no local tile to dive
+    /// into, so F9 can't force it single), so the saved intent must ride along here.
+    /// An entry for a host that never reconnects (password/unreachable) just lingers,
+    /// drained on a successful reconnect or when its window closes.
+    pending_remote_restores: HashMap<String, Vec<PendingRemote>>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -2692,7 +2709,13 @@ impl App {
         let Some(host) = host else {
             return;
         };
-        for (wid, composite, saved_fleet) in pending {
+        for PendingRemote {
+            wid,
+            composite,
+            fleet: saved_fleet,
+            foreground,
+        } in pending
+        {
             if !self.windows.contains_key(&wid) {
                 continue;
             }
@@ -2719,8 +2742,27 @@ impl App {
                 continue;
             }
             let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
-            if self.attach_ssh_into(wid, &composite, cmd) {
+            if !self.attach_ssh_into(wid, &composite, cmd) {
+                continue;
+            }
+            if foreground {
+                // The window's saved foreground: adopt it to the front.
                 self.dispatch(wid, UiEvent::AdoptSession(composite), event_loop);
+            } else {
+                // A background member (a lone remote in a window that also drives a
+                // local foreground, or another remote): adopt it into the window's
+                // warm set, then re-adopt the previous foreground so the reconnect
+                // doesn't yank focus off it. Single→single adopts don't animate, so
+                // the round-trip is invisible. If the window has no foreground yet
+                // (nothing else driven), the adopt simply brings it to the front.
+                let keep = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|w| w.root.foreground().cloned());
+                self.dispatch(wid, UiEvent::AdoptSession(composite), event_loop);
+                if let Some(keep) = keep {
+                    self.dispatch(wid, UiEvent::AdoptSession(keep), event_loop);
+                }
             }
         }
     }
@@ -3164,6 +3206,13 @@ impl App {
     /// the "close = detach" default.
     fn close_window(&mut self, wid: WindowId) {
         self.windows.remove(&wid);
+        // Drop any remote reconnects still queued for this window: it is gone, so a
+        // late host reconnect has nowhere to land (`finish_remote_reconnect` would
+        // skip it), and a host that never returns would leak the entry forever.
+        for queued in self.pending_remote_restores.values_mut() {
+            queued.retain(|p| p.wid != wid);
+        }
+        self.pending_remote_restores.retain(|_, q| !q.is_empty());
         // A closed window drops out of the restorable set.
         self.workspace_dirty = true;
         // It may have been the last window referencing a remote host; stop polling
@@ -3401,6 +3450,7 @@ impl App {
             cols,
             rows,
             fleet,
+            foreground,
             locals,
             remotes,
         } = plan;
@@ -3440,10 +3490,16 @@ impl App {
             let Some((target, _)) = id.split_once(REMOTE_ID_SEP) else {
                 continue;
             };
+            let is_foreground = foreground.as_deref() == Some(id.as_str());
             self.pending_remote_restores
                 .entry(target.to_string())
                 .or_default()
-                .push((wid, id, fleet));
+                .push(PendingRemote {
+                    wid,
+                    composite: id,
+                    fleet,
+                    foreground: is_foreground,
+                });
         }
         // End in the overview iff the window was left in it — but only for a window
         // that opened on a LOCAL member. That branch opens a single view, so F9
@@ -4054,10 +4110,10 @@ impl ApplicationHandler<UserEvent> for App {
 mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
-        App, HeadlessFrontend, REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode,
-        choose_surface_format, connect_outcome_wanted, home_launch_dir, inherited_connection,
-        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, should_restore, startup_choice,
+        App, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice, auth_error_message,
+        choose_alpha_mode, choose_surface_format, connect_outcome_wanted, home_launch_dir,
+        inherited_connection, namespace_remote_infos, new_window_choice, password_prompt,
+        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -4678,8 +4734,34 @@ mod tests {
                 .get("kov@box")
                 .expect("its host is queued for reconnect");
             assert!(
-                pending.iter().any(|(_, id, _)| id == &rem),
-                "the remote member is queued, not spawned locally: {pending:?}"
+                pending.iter().any(|p| p.composite == rem),
+                "the remote member is queued, not spawned locally"
+            );
+        });
+    }
+
+    #[test]
+    fn closing_a_window_drops_its_queued_remote_reconnects() {
+        // A window waiting on a remote host to reconnect is closed before the host
+        // comes back: its queued reconnect must be dropped — the session has nowhere
+        // to land now — not left to linger for a host that may never return.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let rem = remote("work"); // kov@box␟work
+            app.groups = vec![group("g1", &[&rem])];
+            let records = vec![record("g1", 80, 24, true, None, &[&rem])];
+            app.restore_workspace(&fe, records);
+
+            let wid = *app.windows.keys().next().unwrap();
+            assert!(
+                app.pending_remote_restores.contains_key("kov@box"),
+                "the remote reconnect is queued while the window is open"
+            );
+            app.close_window(wid);
+            assert!(
+                !app.pending_remote_restores.contains_key("kov@box"),
+                "closing the window drops its queued remote reconnect"
             );
         });
     }
@@ -4700,10 +4782,23 @@ mod tests {
             let wid = app.open_fleet_window(&fe, group, None);
             let one = remote("one");
             let two = remote("two");
-            // Saved in the fleet overview (true) → observed in place, not driven.
+            // Saved in the fleet overview (fleet: true) → observed in place, not driven.
             app.pending_remote_restores.insert(
                 "kov@box".to_string(),
-                vec![(wid, one.clone(), true), (wid, two.clone(), true)],
+                vec![
+                    PendingRemote {
+                        wid,
+                        composite: one.clone(),
+                        fleet: true,
+                        foreground: false,
+                    },
+                    PendingRemote {
+                        wid,
+                        composite: two.clone(),
+                        fleet: true,
+                        foreground: false,
+                    },
+                ],
             );
 
             app.finish_remote_reconnect(spec, "ghost".to_string(), &fe);
@@ -4770,8 +4865,15 @@ mod tests {
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
             let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
-            app.pending_remote_restores
-                .insert("kov@box".to_string(), vec![(wid, composite.clone(), false)]);
+            app.pending_remote_restores.insert(
+                "kov@box".to_string(),
+                vec![PendingRemote {
+                    wid,
+                    composite: composite.clone(),
+                    fleet: false,
+                    foreground: true,
+                }],
+            );
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
             let held = app.windows[&wid].sessions.contains_key(&composite);
@@ -4796,6 +4898,91 @@ mod tests {
                 "driving the reconnected session dove the window out of the fleet into its single view"
             );
             assert!(drained, "the target is drained from the pending set");
+        });
+    }
+
+    #[test]
+    fn a_reconnecting_background_remote_does_not_steal_the_foreground() {
+        // A window driving two remote sessions, saved in single view with ONE of them
+        // foreground. When the host reconnects, the foreground session is driven to the
+        // front and the OTHER attaches as a warm background mirror — it must NOT yank
+        // the foreground onto itself. (A mixed local-foreground + remote-background
+        // window takes the identical branch in `finish_remote_reconnect`.)
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+
+            // Two sessions survived on the host.
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), "fg-1")
+                .unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), "bg-1")
+                .unwrap();
+
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let fg = format!("kov@box{REMOTE_ID_SEP}fg-1");
+            let bg = format!("kov@box{REMOTE_ID_SEP}bg-1");
+            // Saved single (drive): fg is the foreground, bg a background member.
+            app.pending_remote_restores.insert(
+                "kov@box".to_string(),
+                vec![
+                    PendingRemote {
+                        wid,
+                        composite: fg.clone(),
+                        fleet: false,
+                        foreground: true,
+                    },
+                    PendingRemote {
+                        wid,
+                        composite: bg.clone(),
+                        fleet: false,
+                        foreground: false,
+                    },
+                ],
+            );
+
+            app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
+            let held_fg = app.windows[&wid].sessions.contains_key(&fg);
+            let held_bg = app.windows[&wid].sessions.contains_key(&bg);
+            let foreground = app.windows[&wid].root.foreground().cloned();
+
+            let _ = ghost_vt::session::kill_session("fg-1");
+            let _ = ghost_vt::session::kill_session("bg-1");
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(
+                held_fg && held_bg,
+                "both remote sessions are attached over the transport"
+            );
+            assert_eq!(
+                foreground.as_deref(),
+                Some(fg.as_str()),
+                "the saved foreground stays in front; the background reconnect must not steal it"
+            );
         });
     }
 
