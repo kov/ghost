@@ -56,10 +56,14 @@ const FRAME_CHECKPOINT: u8 = 1;
 /// referenced by hash from later checkpoints, so a recording bakes images in
 /// without re-inlining them in every checkpoint.
 const FRAME_IMAGES: u8 = 2;
-/// Brotli quality for frame payloads. On terminal output q4 matches (slightly
-/// beats) zstd-3's ratio at ~140 MB/s — orders of magnitude above real output
-/// rates, so recording stays real-time. Window/buffer are brotli defaults.
-const BROTLI_QUALITY: u32 = 4;
+/// Brotli quality. q2 matches the zstd-3 ratio this replaced (~4.4× on terminal
+/// output) at ~180 MB/s encode — far above any real output rate, so recording
+/// stays real-time — while costing ~⅓ less host CPU than q4 for the same ratio
+/// (a flood-CPU benchmark showed frame compression, not checkpoints, dominates,
+/// and higher quality bought no ratio worth its CPU). Decode speed is
+/// quality-independent. The full-state checkpoint uses the same quality; at the
+/// adaptive cadence its cost is negligible.
+const BROTLI_QUALITY: u32 = 2;
 const BROTLI_LGWIN: u32 = 22;
 const BROTLI_BUF: usize = 8 * 1024;
 /// Flush a frame once this many bytes of output have accumulated.
