@@ -500,6 +500,15 @@ fn watch_stream_once(
     pushed
 }
 
+/// Whether a connect worker's finished outcome should still be adopted: only when
+/// its window still exists (`current_gen` is `Some`) and no cancel bumped that
+/// window's connect generation past the value the worker stamped (`finished_gen`).
+/// A closed window (`None`) or a mismatched generation means the connect was
+/// superseded and its result must be discarded.
+fn connect_outcome_wanted(current_gen: Option<u64>, finished_gen: u64) -> bool {
+    current_gen == Some(finished_gen)
+}
+
 /// The off-loop half of an ssh connect: with the ControlMaster already open (the
 /// PTY warm-up authenticated), negotiate a remote ghost — staging the ~126 MiB
 /// binary if the host lacks it, the slow part — and spawn the detached host, then
@@ -508,6 +517,7 @@ fn watch_stream_once(
 fn spawn_connect_worker(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     wid: WindowId,
+    generation: u64,
     spec: ConnectionSpec,
     name: String,
 ) {
@@ -536,6 +546,7 @@ fn spawn_connect_worker(
         };
         let _ = proxy.send_event(UserEvent::ConnectFinished {
             wid,
+            generation,
             spec,
             name,
             outcome,
@@ -1559,6 +1570,13 @@ struct WindowState {
     /// Present from the `Cmd::ConnectSshWindow` handler until auth resolves; its
     /// PTY is pumped each `about_to_wait` pass.
     connect: Option<ConnectSetup>,
+    /// Monotonic generation for in-flight connects, bumped whenever one is
+    /// cancelled ([`Cmd::CancelConnect`]). The off-thread connect worker stamps
+    /// the current value when it starts; [`finish_connect`](App::finish_connect)
+    /// adopts its result only if the stamp still matches, so a cancel that lands
+    /// during staging drops (and kills) the now-unwanted remote session instead of
+    /// adopting it.
+    connect_gen: u64,
 }
 
 impl WindowState {
@@ -2069,8 +2087,12 @@ impl App {
                     // Drop the in-flight connect without closing the window; the
                     // `ConnectSetup`'s `Drop` kills the warm-up ssh. The core already
                     // dismissed the prompt, so the window returns to its session.
+                    // Bump the connect generation so a worker already past auth (its
+                    // remote session spawned) is recognized as stale in `finish_connect`
+                    // and its orphan is killed rather than adopted.
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.connect = None;
+                        w.connect_gen = w.connect_gen.wrapping_add(1);
                         w.request_redraw();
                     }
                 }
@@ -2507,10 +2529,17 @@ impl App {
                 // the window stays live; the worker posts `ConnectFinished` back and
                 // `finish_connect` attaches on the main thread. The prompt stays in
                 // its "Connecting" phase meanwhile.
+                let generation = self.windows.get(&wid).map(|w| w.connect_gen).unwrap_or(0);
                 if let Some(proxy) = self.proxy.clone()
                     && let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take())
                 {
-                    spawn_connect_worker(proxy, wid, setup.spec.clone(), setup.name.clone());
+                    spawn_connect_worker(
+                        proxy,
+                        wid,
+                        generation,
+                        setup.spec.clone(),
+                        setup.name.clone(),
+                    );
                     // `setup` drops here — the warm-up PTY/child are done with.
                 }
             }
@@ -2519,18 +2548,30 @@ impl App {
 
     /// Finish an ssh connect on the main thread once its worker reported the
     /// outcome ([`ConnectOutcome`]): attach the window over the transport (the fast,
-    /// main-thread part), fall back to a local ssh child, or show the error. A
-    /// window closed while the worker ran is simply dropped.
+    /// main-thread part), fall back to a local ssh child, or show the error.
+    ///
+    /// If the connect was superseded while the worker ran — its window closed, or a
+    /// cancel bumped the window's connect generation past `gen` — the outcome is
+    /// dropped; and because a `Transport` worker already spawned the detached remote
+    /// session, that now-orphaned session is killed so it doesn't linger.
     fn finish_connect(
         &mut self,
         wid: WindowId,
+        generation: u64,
         spec: ConnectionSpec,
         name: String,
         outcome: ConnectOutcome,
         event_loop: &dyn Frontend,
     ) {
-        if !self.windows.contains_key(&wid) {
-            return; // the window was closed mid-connect
+        let current_gen = self.windows.get(&wid).map(|w| w.connect_gen);
+        if !connect_outcome_wanted(current_gen, generation) {
+            // Cancelled or closed mid-staging. Only a `Transport` worker got as far
+            // as spawning a remote session; kill that orphan. `Fallback` spawns its
+            // local child here (skipped by returning), and `Error` created nothing.
+            if let ConnectOutcome::Transport { remote_ghost } = outcome {
+                self.kill_orphaned_remote(spec, name, remote_ghost);
+            }
+            return;
         }
         match outcome {
             ConnectOutcome::Transport { remote_ghost } => {
@@ -2748,6 +2789,24 @@ impl App {
         });
     }
 
+    /// Kill a detached remote session that a connect worker spawned but that we no
+    /// longer want — the connect was cancelled, or its window closed, while staging
+    /// ran (see [`finish_connect`](Self::finish_connect)). Off the event loop and
+    /// best-effort; a fresh [`RemoteSsh`] reuses the spec's still-open ControlMaster
+    /// (no re-auth), so this works even though the host was never registered.
+    fn kill_orphaned_remote(&self, spec: ConnectionSpec, name: String, remote_ghost: String) {
+        std::thread::spawn(move || match ghost_vt::remote::RemoteSsh::new(spec) {
+            Ok(remote) => {
+                if let Err(e) = remote.kill_session(&remote_ghost, &name) {
+                    eprintln!("ghost: could not kill orphaned remote session '{name}': {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("ghost: could not open ssh to kill orphaned session '{name}': {e}")
+            }
+        });
+    }
+
     /// Rename remote session `real` on `target` to `new` over its host's transport,
     /// off the event loop. The watcher reflects the new label on the next push.
     fn spawn_remote_rename(&self, target: &str, real: &str, new: &str) {
@@ -2881,6 +2940,7 @@ impl App {
                 needs_surface_sync: true,
                 presented_ok: false,
                 connect: None,
+                connect_gen: 0,
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -3139,6 +3199,7 @@ impl App {
                 needs_surface_sync: true,
                 presented_ok: false,
                 connect: None,
+                connect_gen: 0,
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale
@@ -3259,11 +3320,12 @@ impl App {
             // attach the window over the result on the main thread.
             UserEvent::ConnectFinished {
                 wid,
+                generation,
                 spec,
                 name,
                 outcome,
             } => {
-                self.finish_connect(wid, spec, name, outcome, fe);
+                self.finish_connect(wid, generation, spec, name, outcome, fe);
                 return;
             }
             // Staging byte-progress from the connect worker: update the bar.
@@ -3803,11 +3865,11 @@ impl ApplicationHandler<UserEvent> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::menu::UserEvent;
+    use super::menu::{ConnectOutcome, UserEvent};
     use super::{
         App, HeadlessFrontend, REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode,
-        choose_surface_format, home_launch_dir, inherited_connection, local_only,
-        local_only_groups, namespace_remote_infos, new_window_choice, password_prompt,
+        choose_surface_format, connect_outcome_wanted, home_launch_dir, inherited_connection,
+        local_only, local_only_groups, namespace_remote_infos, new_window_choice, password_prompt,
         remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
@@ -3991,6 +4053,112 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_superseded_or_orphaned_connect_outcome_is_not_wanted() {
+        // A live window whose connect generation still matches → adopt.
+        assert!(connect_outcome_wanted(Some(3), 3));
+        // Window-flow cancel: the window was closed while staging ran (no window) →
+        // the outcome is stale, must not be adopted.
+        assert!(!connect_outcome_wanted(None, 0));
+        // Session-flow cancel: the window lives on, but Escape bumped its connect
+        // generation past the one the worker stamped → stale, must not be adopted.
+        assert!(!connect_outcome_wanted(Some(1), 0));
+    }
+
+    #[test]
+    fn a_cancelled_connect_kills_the_orphaned_remote_session() {
+        // The worker spawns the detached remote session before it reports back, so a
+        // cancel that lands during staging would otherwise leave it running. Drive
+        // the real shell over the shim: create the remote session, cancel (bump the
+        // window's connect gen), then deliver the stale outcome — finish_connect must
+        // neither adopt the tab nor leave the session alive.
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+
+            let listed = |n: &str| {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == n)
+            };
+            // Poll a condition on the session listing (spawn/kill are async).
+            let wait_until = |want: bool, n: &str| {
+                for _ in 0..100 {
+                    if listed(n) == want {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                false
+            };
+
+            // Stand in for the worker: create the detached remote (shim → local)
+            // session, exactly as `spawn_host` does when a connect commits.
+            let name = "orphan-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .unwrap();
+            let created = wait_until(true, name);
+
+            // The user cancelled while staging ran: bump the window's connect gen so
+            // the worker's (pre-cancel) outcome is now stale.
+            app.windows.get_mut(&wid).unwrap().connect_gen += 1;
+
+            app.finish_connect(
+                wid,
+                0, // the generation the worker stamped, before the cancel bumped it
+                spec.clone(),
+                name.to_string(),
+                ConnectOutcome::Transport {
+                    remote_ghost: ghost_bin.to_str().unwrap().to_string(),
+                },
+                &fe,
+            );
+
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let adopted = app.windows[&wid].sessions.contains_key(&composite);
+
+            // The orphan kill is best-effort off-thread; poll until it's gone.
+            let gone = wait_until(false, name);
+
+            // Cleanup + restore PATH before asserting so a failure never leaks state.
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(created, "the remote session was created");
+            assert!(!adopted, "a cancelled connect does not adopt its tab");
+            assert!(
+                gone,
+                "the orphaned remote session was killed, not left running"
+            );
+        });
     }
 
     #[test]

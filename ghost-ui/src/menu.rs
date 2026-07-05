@@ -44,6 +44,9 @@ pub enum UserEvent {
     /// off the event loop): the main loop attaches the window over the result.
     ConnectFinished {
         wid: winit::window::WindowId,
+        /// The window's connect generation when this worker started; the outcome is
+        /// stale (cancelled mid-staging) if the window's has moved on since.
+        generation: u64,
         spec: ghost_vt::connection::ConnectionSpec,
         /// The session name spawned on the remote (bare, transport-addressed).
         name: String,
