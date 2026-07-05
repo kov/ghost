@@ -86,6 +86,41 @@ except the detach/kill trigger, a tmux-style prefix (`Ctrl-\` by default):
 `--scrollback N` (replayed history bound, default 1000 lines),
 `--max-recording-size BYTES` (on-disk cap, default 64 MiB).
 
+## Remote sessions (SSH)
+
+`ghost ssh [USER@]HOST` opens a session on another machine. If that machine can
+run ghost, the session is a real ghost *host* there — full recording, detach, and
+fleet visibility — tunnelled over a single SSH connection (a `ControlMaster`, so
+you authenticate once). If it can't, ghost falls back to a plain `ssh` child.
+
+The host path needs a `ghost` binary on the remote. ghost finds one in order:
+`ghost` on the remote `PATH`, an already-staged copy, or — failing those — by
+**staging** its own binary over the connection (same OS+arch only).
+
+### Cross-architecture staging (prebuilts)
+
+To reach a remote of a *different* OS/arch (say, an arm64 Mac from an x86-64 Linux
+box), give ghost a prebuilt of the small headless binary (`ghost-host`) for that
+platform. It looks for a file named `ghost-<os>-<arch>` — `os` ∈ `linux`/`macos`,
+`arch` ∈ `x86_64`/`aarch64` — in, in order:
+
+1. `$GHOST_PREBUILT_DIR`, then
+2. `$XDG_DATA_HOME/ghost/prebuilt/` (`~/.local/share/ghost/prebuilt/`).
+
+Generate them with xtask:
+
+```sh
+cargo xtask prebuilt                        # this OS's two arches → the prebuilt dir
+cargo xtask prebuilt aarch64-apple-darwin   # a specific target
+GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # cross-build via cargo-zigbuild — bundles
+                                            # sysroots, so cross-OS builds (and hosts
+                                            # missing the target C toolchain) just work
+```
+
+`ghost-host` is GUI-free (no font/window libraries), a few MB, and the only thing
+staged to the remote. With no matching prebuilt ghost falls back to the ssh child,
+so a missing one never breaks a connection — it only unlocks the richer host path.
+
 ## How it works
 
 Each session is its own background process (double-forked daemon) owning one PTY
