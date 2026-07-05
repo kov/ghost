@@ -1510,10 +1510,13 @@ impl RootModel {
 
         let (host_shown, host_caret) = shown(&prompt.host, false, true);
         let (pw_shown, pw_caret) = shown(&prompt.password, true, true);
-        let field_w = (28.0 * m.advance).clamp(
-            text_w(&host_shown).max(text_w(&pw_shown)) + 2.0 * m.advance,
-            (w * 0.9).max(1.0),
-        );
+        // Ideal 28 columns, widened to fit the content but never past 90% of the
+        // window. Written as `.max(min).min(cap)` — NOT `clamp(min, cap)` — so a
+        // host wide enough that its content exceeds the cap yields the cap rather
+        // than panicking (clamp panics when its low bound exceeds its high bound).
+        let field_w = (28.0 * m.advance)
+            .max(text_w(&host_shown).max(text_w(&pw_shown)) + 2.0 * m.advance)
+            .min((w * 0.9).max(1.0));
         let field_h = m.line_height * 1.6;
 
         let mut items = vec![SceneItem::Rect {
@@ -3109,6 +3112,19 @@ mod tests {
             !scene_has(&r, "\u{2588}"),
             "the caret is a block overlay rect, not a glyph spliced into the text"
         );
+    }
+
+    #[test]
+    fn a_very_long_host_does_not_panic_the_connect_overlay() {
+        // A host long enough that its rendered field would exceed the window cap
+        // made `field_w`'s lower bound (content width) exceed its upper bound
+        // (90% of the window), and `f32::clamp` panics when min > max. The field
+        // is capped at the window instead. Regression for that panic.
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, &"a".repeat(300));
+        // Rendering drives the `field_w` computation; it must not panic.
+        let _ = r.view();
     }
 
     #[test]
