@@ -2125,18 +2125,10 @@ impl App {
                 }
                 Cmd::SpawnSession => {
                     let name = self.unique_session_name();
-                    // Inherit the window's ssh connection: from the session this
-                    // one branches off (the foreground), or the window group's own
-                    // connection (an "ssh group"). Read from the foreground's stored
-                    // descriptor, never its live command line.
-                    let connection = self.windows.get(&wid).and_then(|w| {
-                        let foreground = w
-                            .root
-                            .foreground()
-                            .and_then(|id| ghost_vt::descriptor::read(id))
-                            .and_then(|d| d.connection);
-                        inherited_connection(w.root.group_connection(), foreground.as_ref())
-                    });
+                    // Inherit the window's ssh connection (group's own, else the
+                    // foreground session's) so a new terminal follows the one it
+                    // branches off onto the same host.
+                    let connection = self.inherited_spawn_connection(wid);
                     // Inheritance-over-remote: if the inherited host is one we already
                     // hold a live transport to, create the session ON it (a real
                     // remote ghost session), matching the group's other sessions —
@@ -2643,6 +2635,39 @@ impl App {
             w.root.connect_failed(msg);
             w.request_redraw();
         }
+    }
+
+    /// The ssh connection a new session spawned into `wid` inherits: the window
+    /// group's own connection (an "ssh group") wins, else the foreground session's.
+    /// `None` ⇒ a plain local `$SHELL`. This is what makes a new terminal follow
+    /// the one it branches off onto the same host.
+    fn inherited_spawn_connection(&self, wid: WindowId) -> Option<ConnectionSpec> {
+        let w = self.windows.get(&wid)?;
+        let group = w.root.group_connection().cloned();
+        // Clone the foreground id out first so the `&self.windows` borrow ends
+        // before `foreground_connection` takes its own `&self`.
+        let fg_id = w.root.foreground().cloned();
+        let foreground = fg_id
+            .as_deref()
+            .and_then(|id| self.foreground_connection(id));
+        inherited_connection(group.as_ref(), foreground.as_ref())
+    }
+
+    /// The ssh connection an owned foreground session `id` carries, if any — read
+    /// from stored data, never a live command line. A session driven over the
+    /// transport (`<target>␟<real>`) has no local descriptor, so its spec comes
+    /// from the live remote host; a local session (including an `ssh` child) reads
+    /// its stored descriptor.
+    fn foreground_connection(&self, id: &str) -> Option<ConnectionSpec> {
+        if let Some((target, _)) = id.split_once(REMOTE_ID_SEP) {
+            return self
+                .remotes
+                .lock()
+                .ok()?
+                .get(target)
+                .map(|h| h.remote.spec().clone());
+        }
+        ghost_vt::descriptor::read(id).and_then(|d| d.connection)
     }
 
     /// Retain a connected host so the fleet tracks its sessions, and start its
@@ -4519,6 +4544,33 @@ mod tests {
             opts.connection.is_none(),
             "a local session's relaunch carries no connection"
         );
+    }
+
+    #[test]
+    fn a_remote_foreground_inherits_ssh_from_the_live_host() {
+        // A session driven over the transport is keyed by a composite id and has NO
+        // local descriptor, so `descriptor::read` finds nothing. Its connection —
+        // what a new session (Cmd+T) branching off it inherits — must resolve from
+        // the live remote host instead, so a non-ssh window whose foreground is a
+        // remote tab still spawns its next session ON that host, not a local shell.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, "ghost");
+            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            assert_eq!(
+                app.foreground_connection(&composite),
+                Some(spec),
+                "the remote foreground's host resolves from the live transport"
+            );
+            // A remote id for a host we hold no transport to → nothing to inherit.
+            assert_eq!(
+                app.foreground_connection(&format!("gone@host{REMOTE_ID_SEP}x")),
+                None
+            );
+            // A plain local id with no descriptor → nothing (the pre-existing path).
+            assert_eq!(app.foreground_connection("local-only"), None);
+        });
     }
 
     #[test]

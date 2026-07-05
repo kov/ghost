@@ -202,6 +202,13 @@ impl RemoteSsh {
         self.spec.target()
     }
 
+    /// The connection spec this transport was opened for — so a session driven
+    /// over it can hand its host down to a new session that inherits it (a remote
+    /// session has no local descriptor to read the spec from).
+    pub fn spec(&self) -> &ConnectionSpec {
+        &self.spec
+    }
+
     /// The argv of the one-shot ssh that opens (and authenticates) the shared
     /// ControlMaster: it runs `true` on the host and exits. Spawn it on a PTY so
     /// ssh prompts for a password on the tty, which the caller feeds through; once
