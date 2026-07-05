@@ -323,19 +323,35 @@ enum ConnectStatus {
     Staging { sent: u64, total: u64 },
 }
 
+/// What a resolved connect prompt produces — and how Escape backs out of it.
+#[derive(Clone, Copy, PartialEq)]
+enum ConnectTarget {
+    /// A new ssh *window* (Cmd+S): submit makes this (freshly opened, empty)
+    /// window an ssh group; Escape closes it.
+    Window,
+    /// A new ssh *session* in the current window (Cmd+G): submit adopts the
+    /// remote session as an additional tab and leaves the window a normal group;
+    /// Escape just dismisses the prompt, returning to the existing session.
+    Session,
+}
+
 /// The "connect to a host over SSH" prompt state.
 struct ConnectPrompt {
     host: TextInput,
     password: TextInput,
     phase: ConnectPhase,
+    /// Whether submitting opens a new window or a session in this one, and what
+    /// Escape does — set when the prompt is opened, preserved across retries.
+    target: ConnectTarget,
 }
 
 impl ConnectPrompt {
-    fn new() -> Self {
+    fn new(target: ConnectTarget) -> Self {
         ConnectPrompt {
             host: TextInput::new(String::new()),
             password: TextInput::new(String::new()),
             phase: ConnectPhase::Host,
+            target,
         }
     }
 }
@@ -561,9 +577,18 @@ impl RootModel {
 
     /// Open the "connect to a host" prompt: the window shows a host entry and
     /// swallows the keyboard until the user submits (Enter) or cancels (Escape).
-    /// The shell calls this on a freshly-opened, sessionless ssh window.
+    /// The shell calls this on a freshly-opened, sessionless ssh window — submit
+    /// makes it an ssh group, Escape closes it.
     pub fn begin_connect(&mut self) {
-        self.connect = Some(ConnectPrompt::new());
+        self.connect = Some(ConnectPrompt::new(ConnectTarget::Window));
+    }
+
+    /// Open the same prompt for a new ssh *session* in this window (Cmd+G): submit
+    /// adopts the remote session as an additional tab (the window stays a normal
+    /// group), and Escape dismisses the prompt back to the existing session rather
+    /// than closing the window.
+    pub fn begin_connect_session(&mut self) {
+        self.connect = Some(ConnectPrompt::new(ConnectTarget::Session));
     }
 
     /// ssh asked for a password/passphrase mid-connect: show the (masked)
@@ -700,6 +725,7 @@ impl RootModel {
                 Some(Shortcut::Quit) => return vec![Cmd::Quit],
                 Some(Shortcut::NewWindow) => return vec![Cmd::NewWindow],
                 Some(Shortcut::NewSshWindow) => return vec![Cmd::NewSshWindow],
+                Some(Shortcut::NewSshSession) => return vec![Cmd::NewSshSession],
                 Some(Shortcut::CloseWindow) => return vec![Cmd::CloseWindow],
                 Some(Shortcut::NewSession) => return vec![Cmd::SpawnSession],
                 _ => {} // Copy/Paste/Zoom are per-terminal: delegate below.
@@ -1203,8 +1229,15 @@ impl RootModel {
                 }
                 Key::Named(NamedKey::Enter) => self.connect_submit(),
                 Key::Named(NamedKey::Escape) => {
+                    // A new-window connect closes its (empty) window; a new-session
+                    // connect only dismisses the prompt and tells the shell to abort
+                    // the in-flight ssh, keeping the window's existing session.
+                    let target = self.connect.as_ref().map(|p| p.target);
                     self.connect = None;
-                    vec![Cmd::CloseWindow]
+                    match target {
+                        Some(ConnectTarget::Session) => vec![Cmd::CancelConnect],
+                        _ => vec![Cmd::CloseWindow],
+                    }
                 }
                 key => {
                     if let Some(e) = self.connect.as_mut().and_then(entry)
@@ -1229,10 +1262,16 @@ impl RootModel {
         match &p.phase {
             ConnectPhase::Host => match ConnectionSpec::parse_target(p.host.text()) {
                 Some(spec) => {
+                    let target = p.target;
                     p.phase = ConnectPhase::Connecting {
                         status: ConnectStatus::Working,
                     };
-                    vec![Cmd::ConnectSshWindow { spec }]
+                    // A new-window connect makes the window an ssh group; a
+                    // new-session connect adopts a tab into this window instead.
+                    match target {
+                        ConnectTarget::Window => vec![Cmd::ConnectSshWindow { spec }],
+                        ConnectTarget::Session => vec![Cmd::ConnectSshSession { spec }],
+                    }
                 }
                 // Empty or unparseable host: stay in the prompt.
                 None => vec![Cmd::Redraw],
@@ -2928,6 +2967,78 @@ mod tests {
             vec![Cmd::CloseWindow]
         );
         assert!(!scene_has(&r, "Connect"), "prompt cleared on cancel");
+    }
+
+    #[test]
+    fn new_ssh_session_is_bound_to_the_go_key() {
+        // "go" mnemonic: Cmd+G (macOS) / Ctrl+Shift+G elsewhere opens the connect
+        // prompt in THIS window (a new ssh session/tab), mirroring the Cmd+S gating
+        // that keeps a control char free — here bare Ctrl+G must stay BEL.
+        for chord in [Mods::SUPER, Mods::CTRL | Mods::SHIFT] {
+            let mut r = root();
+            assert_eq!(
+                key(&mut r, Key::Char("g".into()), chord),
+                vec![Cmd::NewSshSession],
+                "Cmd+G / Ctrl+Shift+G opens a new ssh session in this window"
+            );
+        }
+        // Bare Ctrl+G is NOT a shortcut — it stays BEL (^G) to the child.
+        let mut r = root();
+        assert!(matches!(
+            key(&mut r, Key::Char("g".into()), Mods::CTRL).as_slice(),
+            [Cmd::SendInput { .. }]
+        ));
+        // On Linux, Alt+G also opens a new ssh session (mirroring Alt+S); on macOS
+        // Alt stays Option/Meta and is encoded to the child instead.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut r = root();
+            assert_eq!(
+                key(&mut r, Key::Char("g".into()), Mods::ALT),
+                vec![Cmd::NewSshSession]
+            );
+        }
+        // Like the other window/session chords, it also fires in the fleet overview.
+        let (mut f, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        assert_eq!(
+            key(&mut f, Key::Char("g".into()), Mods::SUPER),
+            vec![Cmd::NewSshSession]
+        );
+    }
+
+    #[test]
+    fn a_session_connect_submits_to_this_window_not_a_new_one() {
+        // The connect prompt opened for a new *session* (Cmd+G) submits
+        // `ConnectSshSession` — the shell adopts the remote session as a tab in this
+        // window, and (unlike ConnectSshWindow) does NOT make the window an ssh group.
+        let mut r = root();
+        r.begin_connect_session();
+        typed(&mut r, "dev@example");
+        let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        let spec = ghost_vt::connection::ConnectionSpec::parse_target("dev@example").unwrap();
+        assert_eq!(cmds, vec![Cmd::ConnectSshSession { spec }]);
+        assert!(scene_has(&r, "Connecting"), "shows the connecting phase");
+        assert!(r.is_connecting());
+    }
+
+    #[test]
+    fn escape_in_a_session_connect_dismisses_without_closing_the_window() {
+        // Escaping a new-session connect must NOT close the window (it holds a live
+        // session): it cancels the in-flight connect and returns to that session.
+        let mut r = root();
+        r.begin_connect_session();
+        typed(&mut r, "abc");
+        let cmds = key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert_eq!(cmds, vec![Cmd::CancelConnect]);
+        assert!(!scene_has(&r, "Connect"), "prompt cleared on cancel");
+        assert!(!r.is_connecting());
+        // The window-mode escape still closes the (empty) ssh window — regression guard.
+        let (mut w, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        w.begin_connect();
+        assert_eq!(
+            key(&mut w, Key::Named(NamedKey::Escape), Mods::NONE),
+            vec![Cmd::CloseWindow]
+        );
     }
 
     #[test]

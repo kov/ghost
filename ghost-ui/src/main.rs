@@ -2055,11 +2055,24 @@ impl App {
                 }
                 Cmd::NewWindow => self.open_launch_window(event_loop),
                 Cmd::NewSshWindow => self.open_connect_window(event_loop),
+                Cmd::NewSshSession => self.open_connect_session(wid),
                 Cmd::ConnectSshWindow { spec } => {
                     self.connect_ssh_window(wid, spec);
                 }
+                Cmd::ConnectSshSession { spec } => {
+                    self.connect_ssh_session(wid, spec);
+                }
                 Cmd::ConnectPassword(password) => {
                     self.connect_feed_password(wid, &password);
+                }
+                Cmd::CancelConnect => {
+                    // Drop the in-flight connect without closing the window; the
+                    // `ConnectSetup`'s `Drop` kills the warm-up ssh. The core already
+                    // dismissed the prompt, so the window returns to its session.
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.connect = None;
+                        w.request_redraw();
+                    }
                 }
                 Cmd::CloseWindow => {
                     self.close_window(wid);
@@ -2360,6 +2373,28 @@ impl App {
         }
         let name = self.unique_session_name();
 
+        let remote = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
+            Ok(r) => r,
+            Err(e) => return self.connect_fail(wid, format!("could not prepare ssh: {e}")),
+        };
+        match Self::start_connect(remote, spec, name) {
+            Ok(setup) => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.connect = Some(setup);
+                }
+            }
+            Err(e) => self.connect_fail(wid, format!("could not start ssh: {e}")),
+        }
+    }
+
+    /// Begin an ssh connect that lands as a new *session* in this window (Cmd+G).
+    /// Identical to [`connect_ssh_window`](Self::connect_ssh_window) except it does
+    /// NOT mark the window's group an ssh group: the window keeps its identity and
+    /// simply gains a remote tab when the shared connect path
+    /// ([`pump_connect`](Self::pump_connect) → [`finish_connect`](Self::finish_connect))
+    /// attaches and adopts the session.
+    fn connect_ssh_session(&mut self, wid: WindowId, spec: ConnectionSpec) {
+        let name = self.unique_session_name();
         let remote = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
             Ok(r) => r,
             Err(e) => return self.connect_fail(wid, format!("could not prepare ssh: {e}")),
@@ -2875,6 +2910,16 @@ impl App {
         let wid = self.open_fleet_window(event_loop, group, None);
         if let Some(w) = self.windows.get_mut(&wid) {
             w.root.begin_connect();
+            w.request_redraw();
+        }
+    }
+
+    /// Open the "connect to a host" prompt in *this* window (Cmd+G / Ctrl+Shift+G /
+    /// Alt+G): no new window — the current window shows the prompt and, on submit,
+    /// adopts the remote session as an additional tab (see `Cmd::ConnectSshSession`).
+    fn open_connect_session(&mut self, wid: WindowId) {
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.root.begin_connect_session();
             w.request_redraw();
         }
     }
@@ -3808,6 +3853,32 @@ mod tests {
             assert!(win.gfx.is_none(), "a headless window carries no surface");
             assert!(win.root.is_fleet(), "it opened in the fleet overview");
             assert!(!fe.exited.get(), "opening a window does not quit the app");
+        });
+    }
+
+    #[test]
+    fn new_ssh_session_opens_the_prompt_in_this_window_not_a_new_one() {
+        // Cmd+G opens the connect prompt in the *current* window — no new window —
+        // unlike Cmd+S / `open_connect_window`, which mints a fresh ssh window. Drive
+        // the real shell: one window, then a new-ssh-session request must reuse it.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            assert_eq!(app.windows.len(), 1);
+
+            app.open_connect_session(wid);
+
+            assert_eq!(
+                app.windows.len(),
+                1,
+                "a new ssh session reuses this window — it opens no new window"
+            );
+            assert!(
+                app.windows.get(&wid).unwrap().root.is_connecting(),
+                "this window now shows the connect prompt"
+            );
         });
     }
 

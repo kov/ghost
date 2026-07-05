@@ -73,6 +73,12 @@ pub enum Cmd {
     /// (Cmd+S / Ctrl+Shift+S). The shell opens a sessionless window showing the
     /// host entry; on submit the window emits [`Cmd::ConnectSshWindow`].
     NewSshWindow,
+    /// Open the "connect to a host" prompt in *this* window (Cmd+G / Ctrl+Shift+G /
+    /// Alt+G — "go"). Unlike [`NewSshWindow`](Cmd::NewSshWindow) it opens no new
+    /// window: the current window (which already owns a session) shows the host
+    /// entry, and on submit emits [`Cmd::ConnectSshSession`] to adopt the remote
+    /// session as an additional tab.
+    NewSshSession,
     /// The connect prompt's host was submitted: make this window an ssh group for
     /// `spec` and begin connecting over the transport. The shell records the
     /// group's connection (so later sessions inherit it) and starts ssh auth in a
@@ -82,9 +88,23 @@ pub enum Cmd {
     ConnectSshWindow {
         spec: ghost_vt::connection::ConnectionSpec,
     },
+    /// The connect prompt's host was submitted for a *new session* (Cmd+G): begin
+    /// connecting to `spec` and, on success, adopt the remote session as an
+    /// additional session in this window. Unlike [`ConnectSshWindow`](Cmd::ConnectSshWindow)
+    /// the window is *not* marked an ssh group — it just gains a remote tab; the
+    /// shared connect/auth path (password prompt, staging, attach) is otherwise
+    /// identical.
+    ConnectSshSession {
+        spec: ghost_vt::connection::ConnectionSpec,
+    },
     /// The connect prompt's password was submitted: the shell feeds it to the
     /// in-flight ssh auth (over its PTY). Not stored — written straight through.
     ConnectPassword(String),
+    /// Abort an in-flight connect *without* closing the window (the new-session
+    /// flow's Escape): the shell drops the warm-up ssh (its `Drop` kills the
+    /// child) and returns to the window's existing session. The window-flow Escape
+    /// uses [`CloseWindow`](Cmd::CloseWindow) instead, which drops the whole window.
+    CancelConnect,
     /// Close the window this command came from. The shell detaches the window's
     /// sessions (they keep running) — the "close = detach" default.
     CloseWindow,
