@@ -23,6 +23,7 @@ mod config;
 mod font;
 mod from_winit;
 mod groups;
+mod instance;
 mod menu;
 mod pacer;
 mod resize;
@@ -1005,6 +1006,18 @@ fn interactive(fresh: bool) {
     // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
     // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
+    // Single-instance guard (skipped in bench mode, a dev tool that must run in
+    // its own process): if a ghost UI already owns the runtime dir, forward a
+    // new-window request to it and exit — BEFORE the session enumeration below,
+    // which would otherwise adopt (steal) the running instance's sessions.
+    let (_instance_lock, instance_listener) = if harness.is_some() {
+        (None, None)
+    } else {
+        match instance::acquire() {
+            instance::Role::Secondary => return,
+            instance::Role::Primary { _lock, listener } => (_lock, listener),
+        }
+    };
     let groups = groups::load();
     let workspace = windows::load();
     let startup = if harness.is_some() {
@@ -1041,6 +1054,14 @@ fn interactive(fresh: bool) {
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    // As the owner, accept new-window requests forwarded by later launches and
+    // turn each into a fresh window (like File > New Window) on the event loop.
+    if let Some(listener) = instance_listener {
+        let proxy = proxy.clone();
+        instance::serve(listener, move || {
+            let _ = proxy.send_event(UserEvent::OpenWindow);
+        });
+    }
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
@@ -3334,6 +3355,14 @@ impl App {
                     w.root.connect_progress(sent, total);
                     w.request_redraw();
                 }
+                return;
+            }
+            // A second launch forwarded a new-window request to us (the owner):
+            // open one (exactly like File > New Window) and bring the app forward,
+            // so the new window lands in front even if we were buried.
+            UserEvent::OpenWindow => {
+                self.open_launch_window(fe);
+                menu::activate();
                 return;
             }
         };

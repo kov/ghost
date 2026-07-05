@@ -59,6 +59,10 @@ pub enum UserEvent {
         sent: u64,
         total: u64,
     },
+    /// A second `ghost` launch asked this (owning) instance to open a new window
+    /// instead of starting a rival process — posted from the single-instance
+    /// listener thread (see [`crate::instance`]).
+    OpenWindow,
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main
@@ -161,7 +165,12 @@ pub fn menu_intent(action: MenuAction) -> MenuIntent {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{dump, install};
+pub use imp::{activate, dump, install};
+
+/// Bring the app to the foreground (macOS only; a no-op elsewhere, where the
+/// window manager foregrounds a newly opened window on its own).
+#[cfg(not(target_os = "macos"))]
+pub fn activate() {}
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -494,6 +503,22 @@ mod imp {
         unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), title, Some(selector), key)
         }
+    }
+
+    /// Bring the app to the foreground, raising all its windows above other apps.
+    /// Called when a second `ghost` launch forwards a new-window request to this
+    /// (owning) instance (see [`crate::instance`]), so the window it opens lands
+    /// in front even if the app was buried. Must run on the main thread; a no-op
+    /// off it (the app just wasn't foregrounded).
+    pub fn activate() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // `activate()` (unconditional) is macOS 14+; `activateIgnoringOtherApps:`
+        // is the portable spelling across our baseline.
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 
     /// Print the installed menu bar's structure to stdout (one `MENU` line per
