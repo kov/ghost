@@ -15,8 +15,8 @@ use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::text_input::TextInput;
 use crate::{
-    CellMetrics, Cmd, FleetModel, Layer, RectPx, Run, Scene, SceneId, SceneItem, SessionId, Style,
-    TerminalModel, Transform, UiEvent,
+    CellMetrics, Cmd, FleetModel, Layer, PointPx, PointerButton, PointerPhase, RectPx, Run, Scene,
+    SceneId, SceneItem, SessionId, Style, TerminalModel, Transform, UiEvent,
 };
 use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::query::ThemeColors;
@@ -335,6 +335,35 @@ enum ConnectTarget {
     Session,
 }
 
+/// The modal scale of the connect overlay, shared by its rendering
+/// ([`RootModel::connect_scene`]) and its hit-testing
+/// ([`RootModel::connect_error_rect`]) so a click lands on the drawn text.
+const CONNECT_SCALE: f32 = 1.5;
+
+/// How long (ms) the "Copied" confirmation flashes after the error is copied.
+const COPIED_FLASH_MS: u64 = 1_200;
+
+/// The transient "Copied" confirmation shown after the error is lifted to the
+/// clipboard. A copy is triggered by a key/click that carries no timestamp, so
+/// the flash *arms* immediately (shown at once) and the next tick — the clock —
+/// stamps its expiry deadline; it clears on the first tick past that deadline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopiedFlash {
+    /// Just copied; awaiting a tick to stamp the deadline from a fresh clock.
+    Arming,
+    /// Shown until this monotonic-ms deadline.
+    Until(u64),
+}
+
+/// The hint under a connect error names the copy chord for the platform (a
+/// click on the message copies it too). ⌘C on macOS; Ctrl+Shift+C elsewhere,
+/// matching [`classify_shortcut`]'s copy chord.
+const CONNECT_ERROR_HINT: &str = if cfg!(target_os = "macos") {
+    "Enter to retry · Esc to cancel · ⌘C or click to copy"
+} else {
+    "Enter to retry · Esc to cancel · Ctrl+Shift+C or click to copy"
+};
+
 /// The "connect to a host over SSH" prompt state.
 struct ConnectPrompt {
     host: TextInput,
@@ -343,6 +372,8 @@ struct ConnectPrompt {
     /// Whether submitting opens a new window or a session in this one, and what
     /// Escape does — set when the prompt is opened, preserved across retries.
     target: ConnectTarget,
+    /// The transient "Copied" flash, present while it shows (see [`CopiedFlash`]).
+    copied: Option<CopiedFlash>,
 }
 
 impl ConnectPrompt {
@@ -352,6 +383,7 @@ impl ConnectPrompt {
             password: TextInput::new(String::new()),
             phase: ConnectPhase::Host,
             target,
+            copied: None,
         }
     }
 }
@@ -618,6 +650,8 @@ impl RootModel {
     pub fn connect_failed(&mut self, message: String) {
         if let Some(p) = &mut self.connect {
             p.phase = ConnectPhase::Error { message };
+            // A fresh failure clears any lingering flash from a prior copy.
+            p.copied = None;
         }
     }
 
@@ -696,10 +730,23 @@ impl RootModel {
         {
             return self.tick_anim(*now_ms);
         }
-        // The connect prompt swallows keyboard and text while it is open, so the
-        // typed host never reaches the (empty) view beneath it; resizes and the
-        // like still pass through to keep the window sized.
-        if self.connect.is_some() && matches!(ev, UiEvent::Key { .. } | UiEvent::Text(_)) {
+        // Arm/expire the connect "Copied" flash on the clock. Computed here, but
+        // the tick still flows on to the view beneath (fleet refresh); these
+        // commands are appended to the final result below.
+        let flash_cmds = match &ev {
+            UiEvent::Tick { now_ms } => self.tick_copied_flash(*now_ms),
+            _ => Vec::new(),
+        };
+        // The connect prompt is modal: while it is open it swallows keyboard,
+        // text, and pointer input, so neither the typed host nor a stray click
+        // reaches the view beneath it (a click on the error copies it). Resizes
+        // and the like still pass through to keep the window sized.
+        if self.connect.is_some()
+            && matches!(
+                ev,
+                UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }
+            )
+        {
             return self.connect_input(ev);
         }
         if let UiEvent::Key {
@@ -871,7 +918,32 @@ impl RootModel {
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
+        cmds.extend(flash_cmds);
         cmds
+    }
+
+    /// Advance the connect "Copied" flash on a clock tick: stamp the expiry
+    /// deadline from this fresh `now_ms` when it was just armed, then clear it
+    /// once a later tick passes that deadline. Returns the commands to keep it
+    /// ticking (a `ScheduleTick` to arrive at the deadline) or to redraw when it
+    /// clears; empty when there's nothing to do.
+    fn tick_copied_flash(&mut self, now_ms: u64) -> Vec<Cmd> {
+        let Some(p) = &mut self.connect else {
+            return Vec::new();
+        };
+        match p.copied {
+            Some(CopiedFlash::Arming) => {
+                p.copied = Some(CopiedFlash::Until(now_ms + COPIED_FLASH_MS));
+                vec![Cmd::ScheduleTick {
+                    after_ms: COPIED_FLASH_MS,
+                }]
+            }
+            Some(CopiedFlash::Until(deadline)) if now_ms >= deadline => {
+                p.copied = None;
+                vec![Cmd::Redraw]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Mirror the fleet's group identity: opening a closed group from an
@@ -1220,37 +1292,97 @@ impl RootModel {
             }
             UiEvent::Key {
                 key, mods, kind, ..
-            } if kind.is_down() => match key {
-                Key::Char(s) if !mods.ctrl && !mods.sup => {
-                    if let Some(e) = self.connect.as_mut().and_then(entry) {
-                        e.insert(&s);
-                    }
-                    vec![Cmd::Redraw]
+            } if kind.is_down() => {
+                // The copy chord (⌘C / Ctrl+Shift+C / Alt+C) lifts the error out
+                // to the clipboard — there's no OS text layer to select it in.
+                if matches!(classify_shortcut(&key, mods), Some(Shortcut::Copy))
+                    && let Some(msg) = self.connect_error_message()
+                {
+                    return self.copy_error(msg);
                 }
-                Key::Named(NamedKey::Enter) => self.connect_submit(),
-                Key::Named(NamedKey::Escape) => {
-                    // A new-window connect closes its (empty) window; a new-session
-                    // connect only dismisses the prompt and tells the shell to abort
-                    // the in-flight ssh, keeping the window's existing session.
-                    let target = self.connect.as_ref().map(|p| p.target);
-                    self.connect = None;
-                    match target {
-                        Some(ConnectTarget::Session) => vec![Cmd::CancelConnect],
-                        _ => vec![Cmd::CloseWindow],
-                    }
-                }
-                key => {
-                    if let Some(e) = self.connect.as_mut().and_then(entry)
-                        && e.key(&key, mods)
-                    {
+                match key {
+                    Key::Char(s) if !mods.ctrl && !mods.sup => {
+                        if let Some(e) = self.connect.as_mut().and_then(entry) {
+                            e.insert(&s);
+                        }
                         vec![Cmd::Redraw]
-                    } else {
-                        Vec::new()
+                    }
+                    Key::Named(NamedKey::Enter) => self.connect_submit(),
+                    Key::Named(NamedKey::Escape) => {
+                        // A new-window connect closes its (empty) window; a new-session
+                        // connect only dismisses the prompt and tells the shell to abort
+                        // the in-flight ssh, keeping the window's existing session.
+                        let target = self.connect.as_ref().map(|p| p.target);
+                        self.connect = None;
+                        match target {
+                            Some(ConnectTarget::Session) => vec![Cmd::CancelConnect],
+                            _ => vec![Cmd::CloseWindow],
+                        }
+                    }
+                    key => {
+                        if let Some(e) = self.connect.as_mut().and_then(entry)
+                            && e.key(&key, mods)
+                        {
+                            vec![Cmd::Redraw]
+                        } else {
+                            Vec::new()
+                        }
                     }
                 }
-            },
+            }
+            // A left-click on the shown error copies it (the mouse counterpart of
+            // the copy chord); every other pointer event is just swallowed so the
+            // modal doesn't leak clicks to the view beneath.
+            UiEvent::Pointer {
+                phase: PointerPhase::Press,
+                button: Some(PointerButton::Left),
+                pos,
+                ..
+            } => {
+                if self.connect_error_hit(pos)
+                    && let Some(msg) = self.connect_error_message()
+                {
+                    return self.copy_error(msg);
+                }
+                Vec::new()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// The error message currently shown by the connect prompt, if it's in its
+    /// [`Error`](ConnectPhase::Error) phase — the text the copy chord and a click
+    /// on the message lift to the clipboard.
+    fn connect_error_message(&self) -> Option<String> {
+        match &self.connect {
+            Some(ConnectPrompt {
+                phase: ConnectPhase::Error { message },
+                ..
+            }) => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether `pos` falls on the shown connect error (its click-to-copy target).
+    fn connect_error_hit(&self, pos: PointPx) -> bool {
+        self.connect
+            .as_ref()
+            .and_then(|p| self.connect_error_rect(p))
+            .is_some_and(|r| r.contains(pos.x as f32, pos.y as f32))
+    }
+
+    /// Copy the error to the clipboard and arm the transient "Copied" flash: it
+    /// shows at once, and the next tick stamps its expiry (see [`CopiedFlash`]),
+    /// so an immediate tick is requested to stamp it promptly.
+    fn copy_error(&mut self, msg: String) -> Vec<Cmd> {
+        if let Some(p) = &mut self.connect {
+            p.copied = Some(CopiedFlash::Arming);
+        }
+        vec![
+            Cmd::WriteClipboard(msg),
+            Cmd::ScheduleTick { after_ms: 0 },
+            Cmd::Redraw,
+        ]
     }
 
     /// Enter in the connect prompt, by phase: submit the host (→ begin auth),
@@ -1292,6 +1424,30 @@ impl RootModel {
         }
     }
 
+    /// The physical-pixel rect of the connect error line — the exact geometry
+    /// [`connect_scene`](Self::connect_scene) draws it at (both scale by
+    /// [`CONNECT_SCALE`] and share these formulas), so click-to-copy lands on the
+    /// shown text. `None` unless the prompt is in its [`Error`] phase.
+    ///
+    /// [`Error`]: ConnectPhase::Error
+    fn connect_error_rect(&self, prompt: &ConnectPrompt) -> Option<RectPx> {
+        let ConnectPhase::Error { message } = &prompt.phase else {
+            return None;
+        };
+        let advance = self.metrics.advance * CONNECT_SCALE;
+        let line_height = self.metrics.line_height * CONNECT_SCALE;
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let tw = (message.chars().count() as f32 * advance).max(1.0);
+        let ty = ((h - line_height * 6.0) * 0.5).max(0.0);
+        let by = ty + line_height * 1.8;
+        Some(RectPx {
+            x: ((w - tw) * 0.5).max(0.0),
+            y: by,
+            w: tw,
+            h: line_height,
+        })
+    }
+
     /// The "connect to a host" overlay: a full-window scrim, a title, and — by
     /// phase — the host field, a "connecting…" line, the masked password field
     /// (in place of the host, only when ssh asks), or an error, plus a hint line;
@@ -1302,9 +1458,10 @@ impl RootModel {
         const FG: Rgba = [0.92, 0.94, 0.97, 1.0];
         const HINT: Rgba = [0.60, 0.63, 0.68, 1.0];
         const ERR: Rgba = [0.95, 0.55, 0.45, 1.0];
+        const OK: Rgba = [0.45, 0.85, 0.60, 1.0];
         const FIELD_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
         const BORDER: Rgba = [0.30, 0.60, 0.95, 1.0];
-        const SCALE: f32 = 1.5;
+        const SCALE: f32 = CONNECT_SCALE;
 
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
         let m = CellMetrics {
@@ -1333,9 +1490,11 @@ impl RootModel {
             scale: SCALE,
         };
 
-        // A field's shown text: the typed value (password masked as bullets),
-        // with a block caret spliced at the cursor when the field has focus.
-        let shown = |entry: &TextInput, mask: bool, focused: bool| -> String {
+        // A field's shown text (password masked as bullets) plus the caret's
+        // char-column when focused. The caret is drawn as a block *over* its cell
+        // (in `field` below), never spliced into the string, so the text stays
+        // put as the caret moves and the block sits on the character, not between.
+        let shown = |entry: &TextInput, mask: bool, focused: bool| -> (String, Option<usize>) {
             let (before, after) = entry.halves();
             let (before, after) = if mask {
                 (
@@ -1345,15 +1504,12 @@ impl RootModel {
             } else {
                 (before.to_string(), after.to_string())
             };
-            if focused {
-                format!("{before}\u{2588}{after}")
-            } else {
-                format!("{before}{after}")
-            }
+            let caret = focused.then(|| before.chars().count());
+            (format!("{before}{after}"), caret)
         };
 
-        let host_shown = shown(&prompt.host, false, true);
-        let pw_shown = shown(&prompt.password, true, true);
+        let (host_shown, host_caret) = shown(&prompt.host, false, true);
+        let (pw_shown, pw_caret) = shown(&prompt.password, true, true);
         let field_w = (28.0 * m.advance).clamp(
             text_w(&host_shown).max(text_w(&pw_shown)) + 2.0 * m.advance,
             (w * 0.9).max(1.0),
@@ -1378,42 +1534,74 @@ impl RootModel {
         items.push(line(ty, "Connect to a host over SSH", FG));
 
         // Push the sole labeled, bordered field at `y`; return the y below it.
-        let field = |items: &mut Vec<SceneItem>, y: f32, label: &str, text: &str| {
-            items.push(line(y, label, HINT));
-            let fy = y + m.line_height * 1.1;
-            let rect = RectPx {
-                x: center_x(field_w),
-                y: fy,
-                w: field_w,
-                h: field_h,
+        // `caret` (a char-column, when focused) is rendered as a block over its
+        // cell with the underlying glyph inverted, so it reads like a terminal
+        // cursor sitting on the character rather than a bar wedged between two.
+        let field =
+            |items: &mut Vec<SceneItem>, y: f32, label: &str, text: &str, caret: Option<usize>| {
+                items.push(line(y, label, HINT));
+                let fy = y + m.line_height * 1.1;
+                let rect = RectPx {
+                    x: center_x(field_w),
+                    y: fy,
+                    w: field_w,
+                    h: field_h,
+                };
+                items.push(SceneItem::Rect {
+                    id: SceneId::NavBar,
+                    rect,
+                    color: FIELD_BG,
+                    radius: 5.0,
+                });
+                items.push(SceneItem::Border {
+                    id: SceneId::NavBar,
+                    rect,
+                    color: BORDER,
+                    width: 2.0,
+                });
+                let tx = rect.x + m.advance * 0.5;
+                let ty = fy + (field_h - m.line_height) * 0.5;
+                items.push(SceneItem::Text {
+                    id: SceneId::NavBar,
+                    rect: RectPx {
+                        x: tx,
+                        y: ty,
+                        w: (field_w - m.advance).max(1.0),
+                        h: m.line_height,
+                    },
+                    runs: vec![run(text)],
+                    metrics: m,
+                    color: FG,
+                    scale: SCALE,
+                });
+                // The block caret, over the cell at `caret`, and the glyph under it
+                // redrawn in the field colour so it stays legible (an inverted cell).
+                if let Some(col) = caret {
+                    let cell = RectPx {
+                        x: tx + col as f32 * m.advance,
+                        y: ty,
+                        w: m.advance,
+                        h: m.line_height,
+                    };
+                    items.push(SceneItem::Rect {
+                        id: SceneId::NavBar,
+                        rect: cell,
+                        color: FG,
+                        radius: 0.0,
+                    });
+                    if let Some(ch) = text.chars().nth(col) {
+                        items.push(SceneItem::Text {
+                            id: SceneId::NavBar,
+                            rect: cell,
+                            runs: vec![run(&ch.to_string())],
+                            metrics: m,
+                            color: FIELD_BG,
+                            scale: SCALE,
+                        });
+                    }
+                }
+                fy + field_h
             };
-            items.push(SceneItem::Rect {
-                id: SceneId::NavBar,
-                rect,
-                color: FIELD_BG,
-                radius: 5.0,
-            });
-            items.push(SceneItem::Border {
-                id: SceneId::NavBar,
-                rect,
-                color: BORDER,
-                width: 2.0,
-            });
-            items.push(SceneItem::Text {
-                id: SceneId::NavBar,
-                rect: RectPx {
-                    x: rect.x + m.advance * 0.5,
-                    y: fy + (field_h - m.line_height) * 0.5,
-                    w: (field_w - m.advance).max(1.0),
-                    h: m.line_height,
-                },
-                runs: vec![run(text)],
-                metrics: m,
-                color: FG,
-                scale: SCALE,
-            });
-            fy + field_h
-        };
 
         // The body depends on the phase: the host field, a "connecting…" line,
         // the masked password field (in place of the host, only when ssh asks),
@@ -1421,7 +1609,7 @@ impl RootModel {
         let by = ty + m.line_height * 1.8;
         let (after, hint) = match &prompt.phase {
             ConnectPhase::Host => (
-                field(&mut items, by, "Host", &host_shown),
+                field(&mut items, by, "Host", &host_shown, host_caret),
                 "Enter to connect · Esc to cancel",
             ),
             ConnectPhase::Connecting { status } => {
@@ -1479,13 +1667,19 @@ impl RootModel {
             ConnectPhase::Password { prompt: label } => {
                 let label = if label.is_empty() { "Password" } else { label };
                 (
-                    field(&mut items, by, label, &pw_shown),
+                    field(&mut items, by, label, &pw_shown, pw_caret),
                     "Enter to submit · Esc to cancel",
                 )
             }
             ConnectPhase::Error { message } => {
                 items.push(line(by, message, ERR));
-                (by + m.line_height, "Enter to retry · Esc to cancel")
+                // A line under the message is reserved for the transient "Copied"
+                // flash, so the hint below doesn't jump as it comes and goes.
+                let flash_y = by + m.line_height;
+                if prompt.copied.is_some() {
+                    items.push(line(flash_y, "✓ Copied", OK));
+                }
+                (flash_y + m.line_height, CONNECT_ERROR_HINT)
             }
         };
 
@@ -1669,6 +1863,30 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         })
+    }
+
+    fn click(r: &mut RootModel, x: f32, y: f32) -> Vec<Cmd> {
+        r.update(UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(PointerButton::Left),
+            pos: crate::PointPx {
+                x: x as f64,
+                y: y as f64,
+            },
+            mods: Mods::NONE,
+            wheel_dy: 0.0,
+            clicks: 1,
+        })
+    }
+
+    /// The platform's copy chord (⌘C on macOS; Alt+C elsewhere — both resolve to
+    /// [`Shortcut::Copy`] in [`classify_shortcut`]).
+    fn copy_mods() -> Mods {
+        if cfg!(target_os = "macos") {
+            Mods::SUPER
+        } else {
+            Mods::ALT
+        }
     }
 
     fn sess(name: &str, attached: bool, created_at: i64) -> ghost_vt::session::SessionInfo {
@@ -2868,6 +3086,32 @@ mod tests {
     }
 
     #[test]
+    fn the_host_field_caret_is_a_block_overlay_that_does_not_shift_the_text() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "asdasd");
+        // Move the caret to the start. The text must stay put — no spliced cell
+        // that pushes it right — and the block caret must not be a text glyph.
+        key(&mut r, Key::Named(NamedKey::Home), Mods::NONE);
+        let has_exact_run = |needle: &str| {
+            r.view().layers.iter().any(|l| {
+                l.items.iter().any(|it| {
+                    matches!(it, SceneItem::Text { runs, .. }
+                    if runs.iter().any(|run| run.text == needle))
+                })
+            })
+        };
+        assert!(
+            has_exact_run("asdasd"),
+            "the field text renders unshifted, as one run"
+        );
+        assert!(
+            !scene_has(&r, "\u{2588}"),
+            "the caret is a block overlay rect, not a glyph spliced into the text"
+        );
+    }
+
+    #[test]
     fn a_failed_connect_shows_the_error_and_enter_retries_from_the_host() {
         let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
         r.begin_connect();
@@ -2882,6 +3126,111 @@ mod tests {
             "host text preserved for a retry"
         );
         assert!(scene_has(&r, "Host"), "back on the host field");
+    }
+
+    #[test]
+    fn the_copy_chord_lifts_the_connect_error_to_the_clipboard() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+        let msg = "command-line line 0: keyword controlpath extra arguments at end of line";
+        r.connect_failed(msg.into());
+        let cmds = key(&mut r, Key::Char("c".into()), copy_mods());
+        assert!(
+            cmds.contains(&Cmd::WriteClipboard(msg.to_string())),
+            "the copy chord copies the shown error: {cmds:?}"
+        );
+        // Back on the host field there's no error, so the chord copies nothing.
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // retry → Host
+        let cmds = key(&mut r, Key::Char("c".into()), copy_mods());
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::WriteClipboard(_))),
+            "nothing to copy outside the error phase: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_connect_error_copies_it_and_other_clicks_are_swallowed() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+        let msg = "keyword controlpath extra arguments at end of line";
+        r.connect_failed(msg.into());
+        // Click where the error is actually drawn: this proves the hit rect
+        // (connect_error_rect) agrees with what connect_scene renders.
+        let rect = r
+            .view()
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|it| match it {
+                SceneItem::Text { rect, runs, .. } if runs.iter().any(|run| run.text == msg) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the error line is drawn");
+        let cmds = click(&mut r, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        assert!(
+            cmds.contains(&Cmd::WriteClipboard(msg.to_string())),
+            "clicking the error copies it: {cmds:?}"
+        );
+        // A click away from the message copies nothing and doesn't leak to the
+        // view beneath (the modal is exclusive while open).
+        let cmds = click(&mut r, 1.0, 1.0);
+        assert!(
+            cmds.is_empty(),
+            "a click off the message is inert: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn copying_the_error_flashes_a_transient_copied_confirmation() {
+        let (mut r, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+        r.connect_failed("boom".into());
+        assert!(!scene_has(&r, "Copied"), "no confirmation before a copy");
+
+        // Copying arms the flash: it shows at once (before any clock tick) and
+        // asks for an immediate tick to stamp its deadline.
+        let cmds = key(&mut r, Key::Char("c".into()), copy_mods());
+        assert!(cmds.contains(&Cmd::WriteClipboard("boom".into())));
+        assert!(
+            cmds.contains(&Cmd::ScheduleTick { after_ms: 0 }),
+            "an immediate tick is requested to stamp the deadline: {cmds:?}"
+        );
+        assert!(scene_has(&r, "Copied"), "the confirmation shows right away");
+
+        // The first tick stamps the deadline (and schedules the tick that clears
+        // it); the flash stays up until then.
+        let cmds = r.update(UiEvent::Tick { now_ms: 1_000 });
+        assert!(
+            cmds.contains(&Cmd::ScheduleTick {
+                after_ms: COPIED_FLASH_MS
+            }),
+            "the clearing tick is scheduled from a fresh clock: {cmds:?}"
+        );
+        assert!(
+            scene_has(&r, "Copied"),
+            "still shown within the flash window"
+        );
+
+        // A stray tick before the deadline must NOT clear it early (this is why
+        // the deadline is stamped from a real clock, not the copy-time state).
+        r.update(UiEvent::Tick {
+            now_ms: 1_000 + COPIED_FLASH_MS - 1,
+        });
+        assert!(scene_has(&r, "Copied"), "not cleared before the deadline");
+
+        // A tick past the deadline clears it.
+        r.update(UiEvent::Tick {
+            now_ms: 1_000 + COPIED_FLASH_MS,
+        });
+        assert!(!scene_has(&r, "Copied"), "the confirmation is transient");
     }
 
     #[test]
