@@ -221,7 +221,12 @@ impl RemoteSsh {
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
-            format!("ControlPath={}", self.control_path.display()),
+            // Double-quote the path: ssh parses each `-o` as a config line and
+            // splits the value on whitespace, so an unquoted path with a space
+            // (macOS's `~/Library/Application Support/ghost`) trips "keyword
+            // controlpath extra arguments at end of line". Quotes are stripped by
+            // ssh's own parser, so this is a no-op for space-free paths.
+            format!("ControlPath=\"{}\"", self.control_path.display()),
             "-o".into(),
             "ControlPersist=60".into(),
             "-o".into(),
@@ -483,7 +488,7 @@ mod tests {
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=/run/ghost/ssh-box.ctl",
+                "ControlPath=\"/run/ghost/ssh-box.ctl\"",
                 "-o",
                 "ControlPersist=60",
                 "-o",
@@ -507,7 +512,7 @@ mod tests {
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=/run/ghost/ssh-box.ctl",
+                "ControlPath=\"/run/ghost/ssh-box.ctl\"",
                 "-o",
                 "ControlPersist=60",
                 "-o",
@@ -541,6 +546,28 @@ mod tests {
         assert_eq!(
             &r.argv(&["ghost", "__watch"])[9..],
             &["kov@box", "'ghost'", "'__watch'"]
+        );
+    }
+
+    #[test]
+    fn control_path_is_double_quoted_so_a_space_in_the_path_parses() {
+        // macOS has no XDG_RUNTIME_DIR, so the runtime base is the data-local dir
+        // `~/Library/Application Support/ghost` — whose space makes ssh's `-o`
+        // config parser see two words and bail with "keyword controlpath extra
+        // arguments at end of line". The value must be double-quoted so ssh reads
+        // the whole path. Regression test for that macOS failure.
+        let r = RemoteSsh {
+            spec: ConnectionSpec::parse_target("kov@box").unwrap(),
+            control_path: PathBuf::from("/Users/kov/Library/Application Support/ghost/ssh-box.ctl"),
+        };
+        let cp = r
+            .argv(&["true"])
+            .into_iter()
+            .find(|a| a.starts_with("ControlPath="))
+            .expect("ControlPath option present");
+        assert_eq!(
+            cp,
+            "ControlPath=\"/Users/kov/Library/Application Support/ghost/ssh-box.ctl\""
         );
     }
 
