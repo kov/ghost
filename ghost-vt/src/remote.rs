@@ -261,6 +261,33 @@ impl RemoteSsh {
         self.negotiate_with_progress(&mut |_| {})
     }
 
+    /// Open the shared ControlMaster non-interactively, for a background reconnect
+    /// (startup restore) where there is no tty to prompt on. `BatchMode=yes` makes
+    /// a host that needs a password fail fast instead of hanging or popping an
+    /// askpass dialog; `ConnectTimeout` bounds an unreachable host; null stdio so
+    /// the backgrounded master holds no captured pipe open. Returns whether the
+    /// master opened — key/agent auth only. A later [`negotiate`](Self::negotiate)
+    /// reuses the now-open master with no further auth. Not for the interactive
+    /// flow, which opens the master on a PTY so ssh CAN prompt.
+    pub fn open_master_batch(&self) -> bool {
+        let mut opts = self.control_opts();
+        opts.extend([
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+        ]);
+        let argv = self.spec.ssh_command(&opts, &["true"]);
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     /// Find (or provision) a usable remote ghost. `Some(remote_ghost)` ⇒ use the
     /// transport with that binary; `None` ⇒ fall back to the local ssh child. This
     /// is also where the shared connection first authenticates. In order:

@@ -529,6 +529,28 @@ fn spawn_connect_worker(
     });
 }
 
+/// Reconnect to `spec`'s host in the background for a startup restore: open the
+/// ControlMaster non-interactively (key/agent auth only — a password or
+/// unreachable host fails fast and is simply given up on, its tiles staying cold),
+/// negotiate a usable remote ghost, then post [`UserEvent::RemoteReconnected`] so
+/// the main loop re-adopts the host's remembered sessions. No PTY, no prompt.
+fn spawn_remote_reconnect(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    spec: ConnectionSpec,
+) {
+    std::thread::spawn(move || {
+        let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) else {
+            return;
+        };
+        if !remote.open_master_batch() {
+            return; // password/unreachable — deferred, degrade to cold tiles
+        }
+        if let Some(remote_ghost) = remote.negotiate() {
+            let _ = proxy.send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+        }
+    });
+}
+
 /// Put a fd (a connect warm-up's PTY) into non-blocking mode so the event loop
 /// can drain it without stalling.
 fn set_nonblocking(fd: impl std::os::fd::AsFd) -> io::Result<()> {
@@ -847,14 +869,20 @@ struct PlanMember {
 }
 
 /// One window to recreate at startup: its reclaimed group, the grid to open at,
-/// its view mode, and the members to drive — ordered foreground-LAST so adopting
-/// them in order leaves the right one focused.
+/// its view mode, and the members to drive — each list ordered foreground-LAST so
+/// adopting in order leaves the right one focused. Local and remote members are
+/// split because they restore by different paths: locals are attached (dead ones
+/// relaunched) synchronously; remotes are reconnected to their host and re-adopted
+/// asynchronously, never spawned locally.
 struct WindowPlan {
     group: ghost_ui_core::Group,
     cols: u16,
     rows: u16,
     fleet: bool,
-    members: Vec<PlanMember>,
+    /// Local members to attach now (dead ones relaunched first).
+    locals: Vec<PlanMember>,
+    /// Remote (transport) member ids (`<target>␟<real>`) to reconnect + re-adopt.
+    remotes: Vec<String>,
 }
 
 /// How the app should open its first window(s), decided at launch.
@@ -891,18 +919,22 @@ fn restore_plan(
                 ids.retain(|id| id != fg);
                 ids.push(fg.clone());
             }
-            // A remote member can't be restored without its host — it comes back
-            // live via the watcher on reconnect — so drop it; a window left with
-            // nothing local to restore is dropped entirely.
-            let members: Vec<PlanMember> = ids
+            // Split by transport: a remote member reconnects to its host and is
+            // re-adopted asynchronously (never spawned locally); locals attach now,
+            // dead ones relaunched. `partition` preserves the foreground-last order
+            // within each list.
+            let (remotes, locals): (Vec<String>, Vec<String>) =
+                ids.into_iter().partition(|id| is_remote_id(id));
+            let locals: Vec<PlanMember> = locals
                 .into_iter()
-                .filter(|id| !is_remote_id(id))
                 .map(|id| PlanMember {
                     dead: !alive(&id),
                     id,
                 })
                 .collect();
-            if members.is_empty() {
+            // Nothing to restore at all → drop the window; a remote-only window is
+            // kept so its host is reconnected and its sessions re-adopted.
+            if locals.is_empty() && remotes.is_empty() {
                 return None;
             }
             Some(WindowPlan {
@@ -910,7 +942,8 @@ fn restore_plan(
                 cols: rec.cols,
                 rows: rec.rows,
                 fleet: rec.fleet,
-                members,
+                locals,
+                remotes,
             })
         })
         .collect()
@@ -1054,6 +1087,7 @@ fn interactive(fresh: bool) {
         remote_infos: HashMap::new(),
         remote_index: HashMap::new(),
         remote_watchers: HashMap::new(),
+        pending_remote_restores: HashMap::new(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -1434,6 +1468,7 @@ impl App {
             remote_infos: HashMap::new(),
             remote_index: HashMap::new(),
             remote_watchers: HashMap::new(),
+            pending_remote_restores: HashMap::new(),
             subs: HashMap::new(),
             groups: Vec::new(),
             _watcher: None,
@@ -1657,6 +1692,17 @@ struct App {
     /// so a watcher ends exactly when its host leaves `remotes` (window close /
     /// app exit).
     remote_watchers: HashMap<String, RemoteWatcher>,
+    /// Remote members a startup restore is waiting to re-adopt, keyed by target:
+    /// each `(window, composite id, saved-in-fleet)` is attached once its host
+    /// reconnects (see [`App::reconnect_restored_remotes`] /
+    /// [`App::finish_remote_reconnect`]). The bool carries the window's SAVED view
+    /// mode — a fleet window observes its tile in place, a single-view one drives
+    /// and foregrounds it. It can't be read back from the live window: a restored
+    /// remote-only window always opens as a fleet (no local tile to dive into, so
+    /// F9 can't force it single), so the saved intent must ride along here.
+    /// An entry for a host that never reconnects (password/unreachable) just
+    /// lingers, drained only on a successful reconnect.
+    pending_remote_restores: HashMap<String, Vec<(WindowId, String, bool)>>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -2598,6 +2644,87 @@ impl App {
         }
     }
 
+    /// Eagerly reconnect every host a startup restore is waiting on (the targets
+    /// queued in `pending_remote_restores`), one background worker each. The full
+    /// spec comes from a matching ssh-group `connection`, else is reconstructed
+    /// from the target (`user@host`); a per-target spec sidecar would also carry a
+    /// custom port/identity for a Cmd+G tab whose host isn't an ssh group — a
+    /// deferred refinement. A no-op under a headless frontend (no proxy to post
+    /// back on).
+    fn reconnect_restored_remotes(&self) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        for target in self.pending_remote_restores.keys() {
+            let spec = self
+                .groups
+                .iter()
+                .filter_map(|g| g.connection.clone())
+                .find(|c| &c.target() == target)
+                .or_else(|| ConnectionSpec::parse_target(target));
+            if let Some(spec) = spec {
+                spawn_remote_reconnect(proxy.clone(), spec);
+            }
+        }
+    }
+
+    /// A background restore reconnect reached `spec`'s host: register it (starting
+    /// its watcher) and attach every remembered session queued for it in
+    /// `pending_remote_restores` into its restored window, adopting so the window
+    /// shows it. A session gone from the remote just fails to attach (its tile
+    /// stays cold); the drain clears the target either way.
+    fn finish_remote_reconnect(
+        &mut self,
+        spec: ConnectionSpec,
+        remote_ghost: String,
+        event_loop: &dyn Frontend,
+    ) {
+        self.register_remote(&spec, &remote_ghost);
+        let target = spec.target();
+        let Some(pending) = self.pending_remote_restores.remove(&target) else {
+            return;
+        };
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&target).cloned());
+        let Some(host) = host else {
+            return;
+        };
+        for (wid, composite, saved_fleet) in pending {
+            if !self.windows.contains_key(&wid) {
+                continue;
+            }
+            let Some((_, real)) = composite.split_once(REMOTE_ID_SEP) else {
+                continue;
+            };
+            let real = real.to_string();
+            // Index the composite id either way so its tile can route over the
+            // transport (the fleet's observe path, or a later take-over dive).
+            self.remote_index
+                .insert(composite.clone(), (target.clone(), real.clone()));
+            // A window SAVED in the fleet overview comes back in it: its tile goes
+            // live through the fleet's own observe path (`register_remote` above
+            // started the watcher; `reconcile` will `Cmd::Observe` this foreign
+            // tile). Do NOT attach+adopt here — adopting dives out of the fleet
+            // into the session, and driving without adopting double-feeds the tile
+            // (owned pump + observer). Only a single-view window (a lone remote
+            // session) drives+foregrounds it. We key on the SAVED mode, not the
+            // live one: a remote-only window is always restored into a fleet (it
+            // owns no tile to dive into, so F9 can't force it single), so the
+            // single-view intent rides in from `pending_remote_restores`; the adopt
+            // then dives it out.
+            if saved_fleet {
+                continue;
+            }
+            let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
+            if self.attach_ssh_into(wid, &composite, cmd) {
+                self.dispatch(wid, UiEvent::AdoptSession(composite), event_loop);
+            }
+        }
+    }
+
     /// Abandon a window's in-flight connect and show `msg` on the prompt (Enter
     /// then retries from the host field). Dropping the [`ConnectSetup`] kills the
     /// warm-up ssh.
@@ -3256,6 +3383,9 @@ impl App {
         for plan in restore_plan(&records, &sessions, &self.groups) {
             self.restore_window(event_loop, plan);
         }
+        // Every restored window has queued its remote members; reconnect their
+        // hosts now so the sessions come back live and re-adopt into their windows.
+        self.reconnect_restored_remotes();
         if self.windows.is_empty() {
             self.open_launch_window(event_loop);
         }
@@ -3271,48 +3401,72 @@ impl App {
             cols,
             rows,
             fleet,
-            members,
+            locals,
+            remotes,
         } = plan;
         let size = Some((cols, rows));
-        let mut members = members.into_iter();
-        // A window that drove nothing comes back as an empty fleet on its group.
-        let Some(first) = members.next() else {
-            self.open_fleet_window(event_loop, group, size);
-            return;
+        let had_locals = !locals.is_empty();
+        let mut locals = locals.into_iter();
+        // Open on the first LOCAL member (a single view); a window with no local
+        // member (remote-only) comes back as a fleet on its group — its remote
+        // members come alive once their host reconnects. Clone the group for the
+        // first attach so a failure still falls back to a fleet rather than losing
+        // the group's identity.
+        let wid = match locals.next() {
+            Some(first) => {
+                if first.dead {
+                    spawn_dead(&first.id);
+                }
+                match self.open_single_window(event_loop, &first.id, group.clone(), size) {
+                    Some(wid) => {
+                        for m in locals {
+                            if m.dead {
+                                spawn_dead(&m.id);
+                            }
+                            if self.attach_into(wid, &m.id) {
+                                self.dispatch(wid, UiEvent::AdoptSession(m.id), event_loop);
+                            }
+                        }
+                        wid
+                    }
+                    None => self.open_fleet_window(event_loop, group, size),
+                }
+            }
+            None => self.open_fleet_window(event_loop, group, size),
         };
-        if first.dead {
-            spawn_dead(&first.id);
+        // Queue remote members to attach once their host reconnects (kicked by
+        // `reconnect_restored_remotes`, drained by `finish_remote_reconnect`).
+        for id in remotes {
+            let Some((target, _)) = id.split_once(REMOTE_ID_SEP) else {
+                continue;
+            };
+            self.pending_remote_restores
+                .entry(target.to_string())
+                .or_default()
+                .push((wid, id, fleet));
         }
-        // Clone the group for the first attach so a failure can still fall back to
-        // an empty fleet window rather than lose the group's identity.
-        let wid = match self.open_single_window(event_loop, &first.id, group.clone(), size) {
-            Some(wid) => wid,
-            None => {
-                self.open_fleet_window(event_loop, group, size);
-                return;
+        // End in the overview iff the window was left in it — but only for a window
+        // that opened on a LOCAL member. That branch opens a single view, so F9
+        // (a toggle) reaches the fleet, and the owned tile makes it dive back. A
+        // remote-only window has no owned tile: it opens as a fleet and F9 can't
+        // dive it, so its final view is decided when its remote reconnects — a
+        // saved-fleet one stays put, a saved-single one is driven out to single by
+        // `finish_remote_reconnect` (which carries the saved mode). The window is
+        // off-screen, so no transient view shows.
+        if had_locals {
+            let in_fleet_now = self.windows.get(&wid).is_some_and(|w| w.root.is_fleet());
+            if fleet != in_fleet_now {
+                self.dispatch(
+                    wid,
+                    UiEvent::Key {
+                        key: Key::Named(NamedKey::F9),
+                        mods: Mods::NONE,
+                        kind: KeyEventKind::Press,
+                        alts: None,
+                    },
+                    event_loop,
+                );
             }
-        };
-        for m in members {
-            if m.dead {
-                spawn_dead(&m.id);
-            }
-            if self.attach_into(wid, &m.id) {
-                self.dispatch(wid, UiEvent::AdoptSession(m.id), event_loop);
-            }
-        }
-        if fleet {
-            // Re-enter the fleet overview the same way the user would (F9); the
-            // window is not yet on screen, so the brief single view never shows.
-            self.dispatch(
-                wid,
-                UiEvent::Key {
-                    key: Key::Named(NamedKey::F9),
-                    mods: Mods::NONE,
-                    kind: KeyEventKind::Press,
-                    alts: None,
-                },
-                event_loop,
-            );
         }
     }
 }
@@ -3361,6 +3515,12 @@ impl App {
             UserEvent::OpenWindow => {
                 self.open_launch_window(fe);
                 menu::activate();
+                return;
+            }
+            // A startup restore reconnect reached a host: register it and re-adopt
+            // its remembered sessions into their restored windows.
+            UserEvent::RemoteReconnected { spec, remote_ghost } => {
+                self.finish_remote_reconnect(spec, remote_ghost, fe);
                 return;
             }
         };
@@ -4402,18 +4562,15 @@ mod tests {
         assert_eq!(w1.group.id, "win-1");
         assert_eq!((w1.cols, w1.rows), (120, 40));
         assert!(!w1.fleet);
-        let ids: Vec<&str> = w1.members.iter().map(|m| m.id.as_str()).collect();
+        let ids: Vec<&str> = w1.locals.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "beta"], "foreground (beta) ordered last");
-        assert!(
-            w1.members.iter().all(|m| !m.dead),
-            "both sessions are alive"
-        );
+        assert!(w1.locals.iter().all(|m| !m.dead), "both sessions are alive");
 
         let w2 = &plans[1];
         assert_eq!(w2.group.id, "win-2");
         assert!(w2.fleet);
-        assert_eq!(w2.members.len(), 1);
-        assert!(w2.members[0].dead, "gamma has no live session → relaunch");
+        assert_eq!(w2.locals.len(), 1);
+        assert!(w2.locals[0].dead, "gamma has no live session → relaunch");
     }
 
     fn remote(sess: &str) -> String {
@@ -4421,23 +4578,50 @@ mod tests {
     }
 
     #[test]
-    fn restore_plan_never_locally_restores_a_remote_session() {
-        // A window that held a local session and a remote (ssh) one: the remote
-        // member can't be restored without its host — it reappears live via the
-        // watcher on reconnect — so the plan drops it, keeping only the local set.
-        // A window whose only member was remote can't be restored at all.
+    fn restore_plan_splits_local_and_remote_members() {
+        // A window with a local session and a remote (transport) one: the local is
+        // planned for local restore; the remote is planned SEPARATELY (reconnected
+        // and re-adopted asynchronously, never spawned locally). A window whose only
+        // member is remote is kept (not dropped) so its host is reconnected.
         let rem = remote("work");
+        let rem2 = remote("build");
         let records = [
             record("win-1", 80, 24, false, Some(&rem), &["alpha", &rem]),
-            record("win-2", 80, 24, false, Some(&rem), &[&rem]),
+            record("win-2", 80, 24, true, None, &[&rem2]),
         ];
         let sessions = [info("alpha", false)];
-        let groups = [group("win-1", &["alpha"]), group("win-2", &[])];
+        let groups = [group("win-1", &["alpha", &rem]), group("win-2", &[&rem2])];
 
         let plans = restore_plan(&records, &sessions, &groups);
-        assert_eq!(plans.len(), 1, "the all-remote window is dropped");
-        let ids: Vec<&str> = plans[0].members.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["alpha"], "only the local session is restored");
+        assert_eq!(
+            plans.len(),
+            2,
+            "the remote-only window is kept, not dropped"
+        );
+
+        let w1 = &plans[0];
+        let locals: Vec<&str> = w1.locals.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            locals,
+            vec!["alpha"],
+            "only the local session is a local member"
+        );
+        assert_eq!(
+            w1.remotes,
+            vec![rem.clone()],
+            "the remote session is a remote member"
+        );
+
+        let w2 = &plans[1];
+        assert!(
+            w2.locals.is_empty(),
+            "the remote-only window has no local members"
+        );
+        assert_eq!(
+            w2.remotes,
+            vec![rem2.clone()],
+            "its remote member is planned"
+        );
     }
 
     #[test]
@@ -4468,6 +4652,150 @@ mod tests {
                         || r.attached.contains(&rem)),
                 "the remote session is remembered in its window: {records:?}"
             );
+        });
+    }
+
+    #[test]
+    fn restore_queues_a_remote_only_window_for_reconnect() {
+        // A window whose only member is a remote (transport) session is remembered:
+        // restore opens it (a fleet on its group) and QUEUES the remote member for
+        // its host's reconnect — it is never spawned locally.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let rem = remote("work"); // kov@box␟work
+            app.groups = vec![group("g1", &[&rem])];
+            let records = vec![record("g1", 80, 24, true, None, &[&rem])];
+            app.restore_workspace(&fe, records);
+
+            assert_eq!(app.windows.len(), 1, "the remote-only window is opened");
+            assert!(
+                app.windows.values().next().unwrap().root.is_fleet(),
+                "a remote-only window left in the fleet overview stays in it"
+            );
+            let pending = app
+                .pending_remote_restores
+                .get("kov@box")
+                .expect("its host is queued for reconnect");
+            assert!(
+                pending.iter().any(|(_, id, _)| id == &rem),
+                "the remote member is queued, not spawned locally: {pending:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_fleet_reconnect_observes_its_remote_group_without_diving() {
+        // A window left in the fleet overview reconnects its remote group: it stays
+        // in the overview (no dive), and its members become *observed* tiles — the
+        // window does NOT drive them (driving without adopting would double-feed the
+        // tile; adopting would dive out). The host is registered so the observe path
+        // and later take-overs can route. No transport is opened, so this is a pure
+        // headless test.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let one = remote("one");
+            let two = remote("two");
+            // Saved in the fleet overview (true) → observed in place, not driven.
+            app.pending_remote_restores.insert(
+                "kov@box".to_string(),
+                vec![(wid, one.clone(), true), (wid, two.clone(), true)],
+            );
+
+            app.finish_remote_reconnect(spec, "ghost".to_string(), &fe);
+
+            let w = &app.windows[&wid];
+            assert!(w.root.is_fleet(), "the fleet window stays in the overview");
+            assert!(
+                w.sessions.is_empty(),
+                "its remote members are observed, not driven: {:?}",
+                w.sessions.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                app.remote_index.contains_key(&one) && app.remote_index.contains_key(&two),
+                "both members are indexed so their tiles can route over the transport"
+            );
+            assert!(
+                app.remotes.lock().unwrap().contains_key("kov@box"),
+                "the host is registered (its watcher/observe path is live)"
+            );
+            assert!(
+                !app.pending_remote_restores.contains_key("kov@box"),
+                "the target is drained from the pending set"
+            );
+        });
+    }
+
+    #[test]
+    fn a_single_remote_window_drives_its_session_on_reconnect() {
+        // The single-view counterpart: a lone remote-session window SAVED in single
+        // view reconnects its one session and DRIVES + foregrounds it, diving out of
+        // the fleet it was restored into (a real `ghost new -d` on the host + attach
+        // through `ghost __pipe` over the shim). A remote-only window owns no tile, so
+        // F9 can't force it single — the saved single mode rides in the pending entry
+        // (false) and `finish_remote_reconnect` drives + dives on it.
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+
+            // The session survived the restart on the host (shim → a real local one).
+            let real = "restored-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), real)
+                .unwrap();
+
+            // A restored remote-only window is waiting to re-adopt it: opened as a
+            // fleet on its group (no local member to open a single view on), with the
+            // remote queued carrying its SAVED single mode (false = drive, not observe).
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
+            app.pending_remote_restores
+                .insert("kov@box".to_string(), vec![(wid, composite.clone(), false)]);
+
+            app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
+            let held = app.windows[&wid].sessions.contains_key(&composite);
+            let single = !app.windows[&wid].root.is_fleet();
+            let drained = !app.pending_remote_restores.contains_key("kov@box");
+
+            let _ = ghost_vt::session::kill_session(real);
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(
+                held,
+                "the saved-single window drives the remembered remote session over the transport"
+            );
+            assert!(
+                single,
+                "driving the reconnected session dove the window out of the fleet into its single view"
+            );
+            assert!(drained, "the target is drained from the pending set");
         });
     }
 

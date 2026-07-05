@@ -63,6 +63,14 @@ pub enum UserEvent {
     /// instead of starting a rival process — posted from the single-instance
     /// listener thread (see [`crate::instance`]).
     OpenWindow,
+    /// A background restore reconnect reached a remote host (its ControlMaster is
+    /// open and `remote_ghost` is usable) — posted by the reconnect worker thread
+    /// so the main loop registers the host and re-adopts its remembered sessions
+    /// into their restored windows (see `App::finish_remote_reconnect`).
+    RemoteReconnected {
+        spec: ghost_vt::connection::ConnectionSpec,
+        remote_ghost: String,
+    },
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main
