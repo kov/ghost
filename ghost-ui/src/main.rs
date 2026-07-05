@@ -308,38 +308,12 @@ fn remote_fleet_id(target: &str, real: &str) -> String {
 
 /// Whether a fleet id names a *remote* session — one carrying the `<target>␟<real>`
 /// namespacing [`remote_fleet_id`] gives an ssh host's sessions. Remote sessions
-/// live on their host and are re-discovered live by the watcher: they are never
-/// persisted into the local workspace, never a durable group member on disk, and
-/// never spawned as a local process. Every local-only path checks this.
+/// live on their host and are re-discovered live by the watcher on reconnect, but
+/// they ARE remembered across a restart: persisted as group members and window
+/// records, and reconnected + re-adopted at startup. Restore checks this to route
+/// a remote member through the reconnect path rather than a local relaunch.
 fn is_remote_id(id: &str) -> bool {
     id.contains(REMOTE_ID_SEP)
-}
-
-/// Project a saved window record to its *local* sessions only. A persisted
-/// workspace is a local restore plan, and a remote session can't be restored
-/// without its host (it reappears live via the watcher on reconnect), so its id is
-/// dropped from the driven set and cleared if it was the foreground. The record is
-/// kept even when it empties out — a fleet-overview window has no attached set.
-fn local_only(mut rec: WindowRecord) -> WindowRecord {
-    rec.attached.retain(|id| !is_remote_id(id));
-    if rec.foreground.as_deref().is_some_and(is_remote_id) {
-        rec.foreground = None;
-    }
-    rec
-}
-
-/// Strip remote members from every group before persisting. Remote ownership is
-/// live-only — re-established when the host reconnects and its session is
-/// re-adopted — so the on-disk group registry only ever names local sessions.
-fn local_only_groups(groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Group> {
-    groups
-        .iter()
-        .map(|g| {
-            let mut g = g.clone();
-            g.members.retain(|m| !is_remote_id(m));
-            g
-        })
-        .collect()
 }
 
 /// Floor between reconnect attempts of a host's watch stream, so a host whose
@@ -2010,11 +1984,10 @@ impl App {
                     // then rebroadcasts to the *other* windows so every open fleet
                     // agrees (the sender already holds this state).
                     if new_groups != self.groups {
-                        // Persist only local membership: a remote session is a
-                        // live-only member, re-established on reconnect. Adopting
-                        // one is itself a group change, so this also self-heals any
-                        // composite id an older build left in `groups.toml`.
-                        groups::save(&local_only_groups(&new_groups));
+                        // Persist the full membership, remote sessions included, so a
+                        // group is remembered across a restart and its remote members
+                        // rejoin it on reconnect (see restore).
+                        groups::save(&new_groups);
                         self.groups = new_groups.clone();
                         let others: Vec<WindowId> = self
                             .windows
@@ -3124,7 +3097,7 @@ impl App {
         let mut records: Vec<ghost_ui_core::WindowRecord> = self
             .windows
             .values()
-            .map(|w| local_only(w.root.window_record()))
+            .map(|w| w.root.window_record())
             .collect();
         // Stable order so an unchanged workspace serialises identically and the
         // write-on-change guard holds.
@@ -3923,8 +3896,8 @@ mod tests {
     use super::{
         App, HeadlessFrontend, REMOTE_ID_SEP, StartupChoice, auth_error_message, choose_alpha_mode,
         choose_surface_format, connect_outcome_wanted, home_launch_dir, inherited_connection,
-        local_only, local_only_groups, namespace_remote_infos, new_window_choice, password_prompt,
-        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
+        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
+        respawn_opts, restore_plan, should_restore, startup_choice,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -4468,32 +4441,34 @@ mod tests {
     }
 
     #[test]
-    fn local_only_drops_remote_sessions_from_a_persisted_record() {
-        let rem = remote("work");
-        // Remote foreground and a remote member fall away; the local set stays,
-        // and an empty (fleet-overview) record survives.
-        let rec = local_only(record("win-1", 80, 24, false, Some(&rem), &["alpha", &rem]));
-        assert_eq!(rec.attached, vec!["alpha".to_string()]);
-        assert_eq!(rec.foreground, None, "a remote foreground is cleared");
+    fn a_remote_session_and_its_group_are_remembered_across_a_save() {
+        // Remote (transport) sessions used to be stripped from persistence, so a
+        // restart forgot them and — worse — the groups they belonged to. They are
+        // now first-class: adopting one records it in the window's group (→ persisted
+        // groups.toml) and as the window's foreground (→ persisted windows.toml).
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let rem = format!("kov@box{REMOTE_ID_SEP}work");
+            app.dispatch(wid, ghost_ui_core::UiEvent::AdoptSession(rem.clone()), &fe);
+            app.save_workspace();
 
-        let fleet = local_only(record("win-2", 90, 30, true, None, &[&rem]));
-        assert!(
-            fleet.attached.is_empty(),
-            "a lone remote member is stripped"
-        );
-        assert!(fleet.fleet, "the fleet-overview window itself is kept");
-    }
-
-    #[test]
-    fn local_only_groups_strips_remote_membership_before_persisting() {
-        let rem = remote("work");
-        let groups = [group("win-1", &["alpha", &rem])];
-        let out = local_only_groups(&groups);
-        assert_eq!(
-            out[0].members,
-            vec!["alpha".to_string()],
-            "remote membership is live-only, never persisted"
-        );
+            let groups = super::groups::load();
+            assert!(
+                groups.iter().any(|g| g.members.contains(&rem)),
+                "the remote session is remembered as a group member: {groups:?}"
+            );
+            let records = super::windows::load();
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.foreground.as_deref() == Some(rem.as_str())
+                        || r.attached.contains(&rem)),
+                "the remote session is remembered in its window: {records:?}"
+            );
+        });
     }
 
     #[test]
