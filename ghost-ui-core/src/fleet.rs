@@ -307,6 +307,24 @@ struct Renaming {
     buffer: TextInput,
 }
 
+/// How long a committed rename's optimistic label is defended against a listing
+/// that still shows the old name. A local rename confirms on the very next
+/// listing (the shell re-reads meta fresh); a remote one confirms once the change
+/// propagates back over the transport. Past this the host's truth wins, so a
+/// refused name (e.g. a remote collision) doesn't stick forever.
+const RENAME_CONFIRM_TIMEOUT_MS: u64 = 5_000;
+
+/// A just-committed rename whose new label is shown optimistically until a
+/// listing confirms it (or the deadline passes). Suppresses the reconcile's
+/// unconditional overwrite of the tile's display name from a not-yet-caught-up
+/// listing, so the name doesn't flicker back to the old one and heal only later.
+struct PendingRename {
+    /// The optimistic new label (empty means "unlabelled back to the id").
+    name: String,
+    /// Absolute `now_ms` past which the optimistic label yields to the listing.
+    deadline_ms: u64,
+}
+
 /// Which window owns or sees a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Locality {
@@ -405,6 +423,11 @@ struct Tile {
     /// until a snapshot lands, for an identity-less client, or when nobody
     /// is attached.
     holder: Option<GroupId>,
+    /// A just-committed rename awaiting confirmation from a listing; while set,
+    /// reconcile keeps the optimistic label instead of reverting it to a listing
+    /// that hasn't caught up. Cleared when a listing confirms the new name or the
+    /// deadline passes.
+    pending_rename: Option<PendingRename>,
 }
 
 pub struct FleetModel {
@@ -476,6 +499,9 @@ pub struct FleetModel {
     /// The in-flight pointer press, if any (see [`Grab`]): a click waiting for
     /// its release, or a tile drag in progress.
     grab: Option<Grab>,
+    /// The latest `now_ms` from a [`UiEvent::Tick`], so reconcile (which runs off
+    /// the decoupled `SessionList`) can age out a [`PendingRename`] deadline.
+    now_ms: u64,
 }
 
 /// Greedily pack cards of the given widths into rows: `(start, end, row_width)`
@@ -630,6 +656,7 @@ impl FleetModel {
             saved_groups: Vec::new(),
             my_group: Group::auto(String::new(), 0),
             grab: None,
+            now_ms: 0,
         }
     }
 
@@ -754,6 +781,7 @@ impl FleetModel {
             host: None,
             dead: false,
             holder: None,
+            pending_rename: None,
         });
     }
 
@@ -1044,8 +1072,12 @@ impl FleetModel {
                 // at draw time, so a window resize just repaints.
                 vec![Cmd::Redraw]
             }
-            // Re-enumerate on the scheduled refresh tick.
-            UiEvent::Tick { .. } => vec![Cmd::ListSessions],
+            // Re-enumerate on the scheduled refresh tick; keep the clock current
+            // so reconcile can age out a pending rename.
+            UiEvent::Tick { now_ms } => {
+                self.now_ms = now_ms;
+                vec![Cmd::ListSessions]
+            }
             // Track IME composition so an inline rename can suppress the raw keys
             // driving it (the commit arrives separately as `Text`).
             UiEvent::Preedit(s) => {
@@ -1152,12 +1184,30 @@ impl FleetModel {
         // fleet never attaches sessions itself — only sessions this window
         // already drives (fed by the shell) get a live preview; the rest stay
         // placeholders until the snapshot follow-up.
+        let now_ms = self.now_ms;
         for info in &infos {
             if self.killed.contains(&info.name) {
                 continue;
             }
             let locality = locality_for(&self.mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
+                // A just-committed rename defends its optimistic label: don't let a
+                // listing that hasn't caught up (a remote rename still in flight)
+                // revert it. Confirm-and-clear when the listing shows the new name;
+                // yield to the listing once the deadline passes (a refused name);
+                // otherwise keep the optimistic label this round.
+                let apply_display = match &tile.pending_rename {
+                    Some(p) if info.display_name == p.name => {
+                        tile.pending_rename = None;
+                        true
+                    }
+                    Some(p) if now_ms >= p.deadline_ms => {
+                        tile.pending_rename = None;
+                        true
+                    }
+                    Some(_) => false,
+                    None => true,
+                };
                 if tile.dead
                     || tile.bell != info.bell
                     || tile.locality != locality
@@ -1165,7 +1215,7 @@ impl FleetModel {
                     || tile.pid != info.pid
                     || tile.created_at != info.created_at
                     || tile.cwd != info.cwd
-                    || tile.model.display_name() != info.display_name
+                    || (apply_display && tile.model.display_name() != info.display_name)
                 {
                     // A creation-time change reorders the grid (it's the sort key),
                     // so it warrants a repaint just like locality/metadata changes.
@@ -1186,7 +1236,9 @@ impl FleetModel {
                 tile.created_at = info.created_at;
                 tile.cwd = info.cwd.clone();
                 tile.host = info.connection.as_ref().map(|c| c.target());
-                tile.model.set_display_name(info.display_name.clone());
+                if apply_display {
+                    tile.model.set_display_name(info.display_name.clone());
+                }
             } else {
                 // Born at the session's listed grid, so the tile has its real
                 // aspect before the observer's first snapshot lands — a dive-out
@@ -2813,19 +2865,29 @@ impl FleetModel {
                 Key::Named(NamedKey::Enter) => {
                     let r = self.renaming.take().expect("renaming checked by caller");
                     let name = r.buffer.into_text();
+                    let deadline_ms = self.now_ms + RENAME_CONFIRM_TIMEOUT_MS;
                     let tile = self.tiles.iter_mut().find(|t| t.id == r.id);
                     let unchanged = tile.as_ref().is_some_and(|t| t.model.display() == name);
                     if name.is_empty() || unchanged {
                         vec![Cmd::Redraw]
                     } else {
-                        // Show the new display name immediately; the host is the
-                        // authority and the next reconcile confirms (or reverts,
-                        // if it refused the name).
+                        // Show the new display name immediately, and defend it: a
+                        // remote rename propagates over the transport, so the next
+                        // few listings still carry the old label — without a pending
+                        // mark, reconcile would revert the name and it would "heal"
+                        // only later. The host stays authoritative: the mark clears
+                        // when a listing confirms the new name, or after the timeout
+                        // if it refused it.
+                        let label = if name == r.id {
+                            String::new() // renaming back to the id unlabels
+                        } else {
+                            name.clone()
+                        };
                         if let Some(t) = tile {
-                            t.model.set_display_name(if name == r.id {
-                                String::new() // renaming back to the id unlabels
-                            } else {
-                                name.clone()
+                            t.model.set_display_name(label.clone());
+                            t.pending_rename = Some(PendingRename {
+                                name: label,
+                                deadline_ms,
                             });
                         }
                         vec![
@@ -6684,6 +6746,84 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Rename { .. })),
             "a modifier chord must not type into the rename: {cmds:?}"
+        );
+    }
+
+    /// The name a tile currently shows (its optimistic-or-confirmed label).
+    fn tile_display(m: &FleetModel, id: &str) -> String {
+        m.tiles
+            .iter()
+            .find(|t| t.id == id)
+            .expect("tile present")
+            .model
+            .display()
+            .to_string()
+    }
+
+    /// Commit an inline rename of tile `id` to `new` through the real input flow:
+    /// open the editor, clear the buffer, type `new` via a Text commit, Enter.
+    fn commit_rename(m: &mut FleetModel, id: &str, new: &str) {
+        let r = button_rect(m, id, Button::Rename);
+        press_at(m, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        for _ in 0..64 {
+            m.update(UiEvent::Key {
+                key: Key::Named(NamedKey::Backspace),
+                mods: crate::Mods::NONE,
+                kind: KeyEventKind::Press,
+                alts: None,
+            });
+        }
+        m.update(UiEvent::Text(new.into()));
+        key(m, Key::Named(NamedKey::Enter));
+    }
+
+    #[test]
+    fn a_committed_rename_survives_a_stale_listing_until_confirmed() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        commit_rename(&mut m, "a", "newname");
+        assert_eq!(
+            tile_display(&m, "a"),
+            "newname",
+            "the rename shows optimistically"
+        );
+
+        // The listing has not caught up yet (a remote rename propagates over the
+        // transport): a stale entry still carrying the OLD label must NOT revert the
+        // optimistic name out from under the user.
+        list(&mut m, &["a"]);
+        assert_eq!(
+            tile_display(&m, "a"),
+            "newname",
+            "a stale listing reverted the just-committed rename"
+        );
+
+        // Once the listing confirms the new label, it sticks (and the pending mark
+        // is cleared, so a subsequent revert-to-old would take effect).
+        m.update(UiEvent::SessionList(vec![SessionInfo {
+            display_name: "newname".into(),
+            ..info("a")
+        }]));
+        assert_eq!(tile_display(&m, "a"), "newname");
+    }
+
+    #[test]
+    fn an_unconfirmed_rename_eventually_yields_to_the_hosts_truth() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        m.update(UiEvent::Tick { now_ms: 1_000 });
+        commit_rename(&mut m, "a", "newname");
+
+        // Well past the confirmation deadline with the listing still disagreeing
+        // (e.g. the host refused the name): the optimistic label yields to reality.
+        m.update(UiEvent::Tick {
+            now_ms: 1_000 + RENAME_CONFIRM_TIMEOUT_MS + 1,
+        });
+        list(&mut m, &["a"]);
+        assert_eq!(
+            tile_display(&m, "a"),
+            "a",
+            "an unconfirmed rename must eventually yield to the host's truth"
         );
     }
 
