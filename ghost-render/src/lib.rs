@@ -465,10 +465,71 @@ fn cells_for(px: f32, cell: f32) -> usize {
     (px / cell).ceil().max(1.0) as usize
 }
 
+/// The first viewport row whose laid-out content differs between frames `a` and `b`
+/// and lies OUTSIDE `band` — an inclusive `(lo, hi)` row range the renderer is about
+/// to re-raster anyway (`None` excuses no rows). `None` means every differing row is
+/// covered, so a damage claim of "only these rows changed" holds. Differing
+/// dimensions report row 0 (a structural change that should have rendered in full).
+///
+/// The renderer's `verify` mode uses this to catch a [`TermDamage`] under-report — a
+/// distinct frame stamped `None`/`Rows` whose supposedly-untouched rows actually
+/// changed — which is what leaves a stale texture on screen until a scroll forces a
+/// full render. Compares only laid-out row content; cursor-only or color changes are
+/// carried by other frame fields (and forced to whole-frame damage upstream).
+pub fn rows_differ_outside(a: &Frame, b: &Frame, band: Option<(usize, usize)>) -> Option<usize> {
+    if a.cols != b.cols || a.rows != b.rows || a.rows_layout.len() != b.rows_layout.len() {
+        return Some(0);
+    }
+    let excused = |r: usize| band.is_some_and(|(lo, hi)| lo <= r && r <= hi);
+    a.rows_layout
+        .iter()
+        .zip(&b.rows_layout)
+        .enumerate()
+        .find(|&(r, (ra, rb))| !excused(r) && ra != rb)
+        .map(|(r, _)| r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ghost_term::Vt;
+
+    const TM: CellMetrics = CellMetrics {
+        advance: 9.0,
+        line_height: 18.0,
+    };
+
+    #[test]
+    fn rows_differ_outside_flags_an_under_reported_row() {
+        let mut a = Vt::new(10, 3);
+        a.feed_str("r0\r\nr1\r\nr2");
+        let fa = layout_frame(&a, TM);
+        // Identical content: no difference, regardless of band.
+        let mut b = Vt::new(10, 3);
+        b.feed_str("r0\r\nr1\r\nr2");
+        assert_eq!(rows_differ_outside(&fa, &layout_frame(&b, TM), None), None);
+
+        // b changes only row 2.
+        let mut b = Vt::new(10, 3);
+        b.feed_str("r0\r\nr1\r\nXX");
+        let fb = layout_frame(&b, TM);
+        // A claim of "nothing changed" (no band) catches the changed row.
+        assert_eq!(rows_differ_outside(&fa, &fb, None), Some(2));
+        // A band covering row 2 excuses it — the renderer re-rasters that row.
+        assert_eq!(rows_differ_outside(&fa, &fb, Some((2, 2))), None);
+        // A band elsewhere does NOT excuse it: this is the under-report we hunt.
+        assert_eq!(rows_differ_outside(&fa, &fb, Some((0, 1))), Some(2));
+    }
+
+    #[test]
+    fn rows_differ_outside_flags_a_dimension_change() {
+        let a = Vt::new(10, 3);
+        let b = Vt::new(10, 4);
+        assert_eq!(
+            rows_differ_outside(&layout_frame(&a, TM), &layout_frame(&b, TM), None),
+            Some(0)
+        );
+    }
 
     #[test]
     fn dynamic_colors_are_captured_on_the_frame() {

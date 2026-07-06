@@ -1264,6 +1264,14 @@ pub struct Renderer {
     /// only some rows re-rasterizes just those rows into its persistent texture instead
     /// of a full re-render. A test asserts a one-row change band-updates, not re-renders.
     surface_band_updates: u32,
+    /// `GHOST_RENDER_TRACE=verify`: cross-check the model's `TermDamage` against the
+    /// actual frame content before trusting a texture-reuse/band plan. Diagnostic for
+    /// the foreground-stall bug — an under-reported damage presents a stale texture.
+    /// Off by default (one bool check per surface when off); log-only, never heals.
+    verify: bool,
+    /// Frames where `verify` caught a row changing outside the claimed damage (a
+    /// stale-texture bug). A test asserts it fires on an under-report.
+    verify_violations: u64,
     /// The session whose `Surface` is the current foreground (the last steady single view
     /// presented through the banded path). A foreground switch always passes through a
     /// full redraw (a slide), so it's only read to defensively force a full re-render if
@@ -1649,6 +1657,8 @@ impl Renderer {
             warm_queue: Vec::new(),
             surface_quads: None,
             surface_band_updates: 0,
+            verify: std::env::var("GHOST_RENDER_TRACE").as_deref() == Ok("verify"),
+            verify_violations: 0,
             foreground_session: None,
             image_bind_groups: HashMap::new(),
             image_draws: Vec::new(),
@@ -1971,6 +1981,31 @@ impl Renderer {
             }
             _ => Plan::Full,
         };
+        // Verify mode (GHOST_RENDER_TRACE=verify): before trusting a reuse/band plan,
+        // check the model's damage claim against the actual content. A Current plan
+        // claims nothing changed (excuse no rows); a Band claims only [lo,hi] did. If a
+        // row changed OUTSIDE that claim, the plan is about to present a stale texture —
+        // the foreground-stall signature that no present-timestamp watchdog can see.
+        // Log-only: we NEVER upgrade the plan (that would mask the bug we're hunting).
+        if self.verify && !matches!(plan, Plan::Full) {
+            let band = match plan {
+                Plan::Band(lo, hi) => Some((lo, hi)),
+                _ => None,
+            };
+            if let Some(c) = self.surfaces.get(&key)
+                && !Rc::ptr_eq(&c.frame, frame)
+                && let Some(row) = ghost_render::rows_differ_outside(&c.frame, frame, band)
+            {
+                self.verify_violations += 1;
+                tracing::warn!(
+                    target: "ghost::render",
+                    session,
+                    row,
+                    damage = ?damage,
+                    "TermDamage under-report: a row changed outside the claimed damage (stale texture until a full redraw)"
+                );
+            }
+        }
         // Mid-animation, a full raster is DEFERRED: it would stall the frame loop, so
         // enqueue it and blit the best already-cached surface (this exact size if we have
         // it — same content, maybe a tick stale — else any size, stretched) as a
@@ -2428,6 +2463,13 @@ impl Renderer {
     /// a live session's one-row change band-updates rather than fully re-rastering.
     pub fn surface_band_updates(&self) -> u32 {
         self.surface_band_updates
+    }
+
+    /// Frames where verify mode (`GHOST_RENDER_TRACE=verify`) caught a row changing
+    /// outside the model's claimed [`TermDamage`] — a stale-texture under-report.
+    /// Always 0 unless verify is on; a test drives an under-report and asserts it fires.
+    pub fn verify_violations(&self) -> u64 {
+        self.verify_violations
     }
 
     /// Pre-shape the distinct runs in `rows` of `frame` that aren't cached yet, in
@@ -4852,6 +4894,59 @@ mod tests {
             r.surface_renders(),
             1,
             "the texture follows the session across the id change — no re-raster"
+        );
+    }
+
+    #[test]
+    fn verify_mode_flags_an_under_reported_damage() {
+        // A distinct frame whose model damage claims nothing changed, yet a row did —
+        // the stale-texture signature of the foreground-stall bug. Verify mode must
+        // catch it. It is LOG-ONLY: the reuse plan is still trusted (the texture stays
+        // stale), because the point is to REPORT the under-report, not silently heal it.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (cols, rows) = (40usize, 24usize);
+        let (w, h) = (cols as u32 * 9, rows as u32 * 18);
+        // Quarter-size → the surface path (native-res texture), where damage is trusted.
+        let rect = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: w as f32 / 4.0,
+            h: h as f32 / 4.0,
+        };
+        let sess = session_key("stall");
+        let tile = |f: Frame, damage: TermDamage| Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Tile(1),
+                    session: sess,
+                    rect,
+                    frame: std::rc::Rc::new(f),
+                    selection: None,
+                    dim: false,
+                    damage,
+                }],
+            )],
+        };
+        let fa = frame(cols, rows, "aaaa\r\nbbbb\r\ncccc\r\nORIGINAL\r\neeee");
+        let fb = frame(cols, rows, "aaaa\r\nbbbb\r\ncccc\r\nCHANGED\r\neeee");
+
+        let mut r = Renderer::headless(Theme::default());
+        r.verify = true;
+        let _ = r.render_offscreen_scene(&tile(fa, TermDamage::All), font, SIZE_PX);
+        assert_eq!(
+            r.verify_violations(),
+            0,
+            "the first full paint has no prior frame to contradict"
+        );
+
+        // The model claims NOTHING changed (TermDamage::None), but row 3 did.
+        let _ = r.render_offscreen_scene(&tile(fb, TermDamage::None), font, SIZE_PX);
+        assert_eq!(
+            r.verify_violations(),
+            1,
+            "verify catches the row that changed outside the claimed (empty) damage"
         );
     }
 
