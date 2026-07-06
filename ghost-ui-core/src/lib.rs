@@ -31,7 +31,8 @@ pub use group::Group;
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{
-    Shortcut, TerminalModel, bracket_paste, classify_shortcut, query_replies, selection_text,
+    Shortcut, TermTrace, TerminalModel, bracket_paste, classify_shortcut, query_replies,
+    selection_text,
 };
 pub use workspace::{WindowRecord, WorkspaceSnapshot};
 

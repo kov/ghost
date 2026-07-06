@@ -248,12 +248,45 @@ pub struct TerminalModel {
     /// unlabeled. A human-facing label only: `session` stays the immutable id
     /// every effect routes by. Feeds the [`Self::title`] fallback.
     display_name: String,
+    /// Render-gate counters (see [`TermTrace`]). Only `feeds_seen`, `visible_feeds`,
+    /// `redraws_emitted`, the sync-hold tallies, and `presents_marked` are stored
+    /// here; the live `sync_held`/`feed_dirty` are folded in by [`Self::trace`].
+    trace: TermTrace,
 }
 
 /// How long a synchronized-output hold may last before the scheduled tick
 /// releases it anyway. Generous for an atomic repaint burst, short enough that
 /// an app dying between BSU and ESU reads as a hiccup, not a hang.
 const SYNC_RELEASE_MS: u64 = 150;
+
+/// Always-maintained counters over the foreground render gates, snapshotted by
+/// the shell's render trace to diagnose a stalled single view — feeds arriving
+/// while the foreground stops presenting (the recurring "Claude Code freezes,
+/// preview stays live, a scroll fixes it" bug). Pure integer counters, no clock,
+/// so the model stays deterministic; the shell timestamps them (`ghost::render`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermTrace {
+    /// `session_data` feeds carrying bytes for this session.
+    pub feeds_seen: u64,
+    /// Of those, feeds that changed something visible (`want_redraw`).
+    pub visible_feeds: u64,
+    /// Repaints this model emitted from the feed/tick path (`Cmd::Redraw`).
+    pub redraws_emitted: u64,
+    /// The live synchronized-output (DEC 2026) hold flag.
+    pub sync_held: bool,
+    /// Synchronized-output holds entered.
+    pub sync_holds: u64,
+    /// Holds released by the mode resetting (2026l).
+    pub sync_released_by_reset: u64,
+    /// Holds released by the backstop or an animation tick.
+    pub sync_released_by_tick: u64,
+    /// Visible feeds swallowed by an open hold (their repaint deferred).
+    pub feeds_while_held: u64,
+    /// Accumulated feed damage awaiting the next present.
+    pub feed_dirty: Option<(usize, usize)>,
+    /// `mark_presented` calls (a present the shell confirmed).
+    pub presents_marked: u64,
+}
 
 /// Snapshot of the view-shaping state at a present (see [`TerminalModel::presented`]).
 #[derive(Clone, PartialEq)]
@@ -306,6 +339,7 @@ impl TerminalModel {
             theme: ThemeColors::default(),
             hovered_link: None,
             display_name: String::new(),
+            trace: TermTrace::default(),
         }
     }
 
@@ -363,6 +397,17 @@ impl TerminalModel {
             colors: self.render_colors(),
         });
         self.feed_dirty = None;
+        self.trace.presents_marked += 1;
+    }
+
+    /// A snapshot of this session's render-gate counters, with the live
+    /// `sync_held`/`feed_dirty` folded in (see [`TermTrace`]).
+    pub fn trace(&self) -> TermTrace {
+        TermTrace {
+            sync_held: self.sync_held,
+            feed_dirty: self.feed_dirty,
+            ..self.trace
+        }
     }
 
     /// The app-set dynamic colors (OSC 10/11/12) the renderer paints with —
@@ -507,6 +552,8 @@ impl TerminalModel {
             // selection autoscroll.
             UiEvent::Tick { .. } => {
                 let mut cmds = if std::mem::take(&mut self.sync_held) {
+                    self.trace.sync_released_by_tick += 1;
+                    self.trace.redraws_emitted += 1;
                     vec![Cmd::Redraw]
                 } else {
                     Vec::new()
@@ -977,6 +1024,7 @@ impl TerminalModel {
         }
         let mut cmds = Vec::new();
         if !bytes.is_empty() {
+            self.trace.feeds_seen += 1;
             let before = self.screen.vt().lines_scrolled_off();
             let colors_before = self.render_colors();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
@@ -1098,6 +1146,9 @@ impl TerminalModel {
                 || images_added
                 || colors_changed
                 || cursor_redrawn;
+            if want_redraw {
+                self.trace.visible_feeds += 1;
+            }
             // Synchronized output (DEC 2026): between set and reset the app is
             // composing one atomic frame, so hold the repaint (damage keeps
             // accumulating above) and schedule a release tick as the backstop.
@@ -1106,12 +1157,25 @@ impl TerminalModel {
             let sync = self.screen.vt().synchronized_output();
             if sync && want_redraw && !self.sync_held {
                 self.sync_held = true;
+                self.trace.sync_holds += 1;
                 cmds.push(Cmd::ScheduleTick {
                     after_ms: SYNC_RELEASE_MS,
                 });
             }
-            if !sync && (want_redraw || std::mem::take(&mut self.sync_held)) {
-                cmds.push(Cmd::Redraw);
+            if sync && want_redraw {
+                // The repaint is deferred by the open hold — counted so the render
+                // trace can see feeds piling up behind a latched 2026 frame.
+                self.trace.feeds_while_held += 1;
+            }
+            if !sync {
+                let released = std::mem::take(&mut self.sync_held);
+                if released {
+                    self.trace.sync_released_by_reset += 1;
+                }
+                if want_redraw || released {
+                    cmds.push(Cmd::Redraw);
+                    self.trace.redraws_emitted += 1;
+                }
             }
         }
         if ended {
@@ -2651,6 +2715,50 @@ mod tests {
         assert!(
             !cmds.contains(&Cmd::Redraw),
             "a feed that changes no viewport row must not repaint: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn trace_counts_visible_versus_invisible_feeds() {
+        let mut m = model();
+        feed(&mut m, b"hello"); // a visible feed
+        feed(&mut m, &[0xf0]); // an incomplete UTF-8 lead: bytes, but nothing visible
+        let t = m.trace();
+        assert_eq!(t.feeds_seen, 2, "both feeds carried bytes");
+        assert_eq!(
+            t.visible_feeds, 1,
+            "only the printing feed changed the viewport"
+        );
+        assert_eq!(
+            t.redraws_emitted, 1,
+            "only the visible feed drove a repaint"
+        );
+    }
+
+    #[test]
+    fn trace_counts_a_latched_synchronized_hold() {
+        let mut m = model();
+        // A synchronized-output frame opens and content lands but never resets:
+        // the hold latches — this is the shape of the freeze bug.
+        feed(&mut m, b"\x1b[?2026hhello");
+        let t = m.trace();
+        assert_eq!(t.feeds_seen, 1);
+        assert_eq!(t.visible_feeds, 1);
+        assert!(t.sync_held, "the hold is latched");
+        assert_eq!(t.sync_holds, 1);
+        assert_eq!(
+            t.feeds_while_held, 1,
+            "the visible feed was swallowed by the hold"
+        );
+        assert_eq!(t.redraws_emitted, 0, "no repaint is emitted while held");
+        // A tick (the backstop, or an animation tick) releases it.
+        m.update(UiEvent::Tick { now_ms: 1_000 });
+        let t = m.trace();
+        assert!(!t.sync_held, "the tick released the hold");
+        assert_eq!(t.sync_released_by_tick, 1);
+        assert_eq!(
+            t.redraws_emitted, 1,
+            "the release drove the deferred repaint"
         );
     }
 

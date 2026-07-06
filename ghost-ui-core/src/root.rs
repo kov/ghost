@@ -1708,6 +1708,17 @@ impl RootModel {
         }
     }
 
+    /// A snapshot of the live foreground session's render-gate counters, for the
+    /// shell's render trace (see [`TermTrace`](crate::TermTrace)). `None` in the
+    /// fleet overview — no single foreground there; its tiles feed themselves. Pure:
+    /// never calls `view`, so reading it can't perturb the timing it measures.
+    pub fn foreground_trace(&self) -> Option<crate::TermTrace> {
+        match &self.mode {
+            Mode::Single(m) => Some(m.trace()),
+            Mode::Fleet(_) => None,
+        }
+    }
+
     /// Combined render scale (device × zoom) of the active view, so the shell
     /// rasterizes glyphs at the size the current scene was laid out for.
     pub fn render_scale(&self) -> f32 {
@@ -3563,6 +3574,32 @@ mod tests {
         assert!(
             r.is_animating(),
             "the zoom plays, with content already on the preview"
+        );
+    }
+
+    #[test]
+    fn foreground_trace_is_the_single_view_session_only() {
+        let mut r = root(); // single view of alpha
+        assert!(
+            r.foreground_trace().is_some(),
+            "the single view exposes its foreground's render counters"
+        );
+        r.update(UiEvent::SessionData {
+            name: "alpha".into(),
+            bytes: b"hi".to_vec(),
+            ended: false,
+        });
+        assert_eq!(
+            r.foreground_trace().unwrap().feeds_seen,
+            1,
+            "feeding the foreground advances its counters through the trace"
+        );
+        // In the fleet overview there is no single foreground to trace.
+        key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
+        assert!(r.is_fleet());
+        assert!(
+            r.foreground_trace().is_none(),
+            "the fleet overview has no single foreground to trace"
         );
     }
 
