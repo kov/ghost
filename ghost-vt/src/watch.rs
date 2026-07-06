@@ -21,12 +21,24 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// into a single listing.
 const COALESCE: Duration = Duration::from_millis(50);
 
-/// Stream the session listing to stdout: once now, then on every runtime-dir
-/// change (coalesced) and on a [`HEARTBEAT`] tick, until the reader goes away.
+/// Whether a filesystem event should wake the emit loop. A bare read (`Access`)
+/// must not: [`emit`] opens the runtime dir and every `<session>/meta` to build
+/// the listing, and under the recursive watch those reads would feed straight
+/// back in as events, spinning the loop forever. Only a mutation — a session dir
+/// created/removed, or a `meta`/marker file written (a label/title change, an
+/// attach/bell toggle) — changes what a listing reports, so only mutations wake.
+fn wakes(kind: &notify::EventKind) -> bool {
+    !matches!(kind, notify::EventKind::Access(_))
+}
+
+/// Stream the session listing to stdout: once now, then on every runtime-tree
+/// mutation (coalesced, and only when the listing actually changed) and on a
+/// [`HEARTBEAT`] tick, until the reader goes away.
 pub fn run() -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    emit(&mut out)?;
+    let mut last = listing_line()?;
+    write_line(&mut out, &last)?;
 
     let dir = paths::runtime_dir();
     // The dir may not exist before the first session; create it so the watch binds.
@@ -34,23 +46,40 @@ pub fn run() -> io::Result<()> {
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let _ = tx.send(res.is_ok());
+        if let Ok(ev) = res
+            && wakes(&ev.kind)
+        {
+            let _ = tx.send(());
+        }
     })
     .map_err(io::Error::other)?;
     use notify::Watcher;
+    // Recursive: a label or title change rewrites `<session>/meta`, a write one
+    // level below the runtime dir that a non-recursive watch never sees — so a
+    // rename/retitle would otherwise not propagate until the next heartbeat.
     watcher
-        .watch(&dir, notify::RecursiveMode::NonRecursive)
+        .watch(&dir, notify::RecursiveMode::Recursive)
         .map_err(io::Error::other)?;
 
     loop {
         match rx.recv_timeout(HEARTBEAT) {
-            // A change: coalesce the burst, then emit the fresh listing once.
+            // A mutation: coalesce the burst, then emit the fresh listing — but
+            // only if it actually changed, so a write that doesn't alter the
+            // listing (or an already-coalesced burst) costs no push over the pipe.
             Ok(_) => {
                 while rx.recv_timeout(COALESCE).is_ok() {}
-                emit(&mut out)?;
+                let line = listing_line()?;
+                if line != last {
+                    write_line(&mut out, &line)?;
+                    last = line;
+                }
             }
-            // Keepalive: re-emit (and detect a closed pipe via the failing write).
-            Err(mpsc::RecvTimeoutError::Timeout) => emit(&mut out)?,
+            // Keepalive: always re-emit, even unchanged — it refreshes the listing
+            // and detects a closed pipe via the failing write.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                last = listing_line()?;
+                write_line(&mut out, &last)?;
+            }
             // The watcher was dropped — cannot happen while `watcher` is held.
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -64,14 +93,24 @@ pub fn parse_listing(line: &str) -> serde_json::Result<Vec<session::SessionInfo>
     serde_json::from_str(line)
 }
 
-/// Write the current session listing as one line of JSON (the same shape as
-/// `ghost ls --json`), newline-terminated and flushed.
-pub fn emit(out: &mut impl Write) -> io::Result<()> {
+/// The current session listing as one line of JSON (the same shape as
+/// `ghost ls --json`), without the trailing newline.
+fn listing_line() -> io::Result<String> {
     let sessions = session::list().unwrap_or_default();
-    let line = serde_json::to_string(&sessions).map_err(io::Error::other)?;
+    serde_json::to_string(&sessions).map_err(io::Error::other)
+}
+
+/// Write one listing line, newline-terminated and flushed.
+fn write_line(out: &mut impl Write, line: &str) -> io::Result<()> {
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     out.flush()
+}
+
+/// Write the current session listing as one line of JSON (the same shape as
+/// `ghost ls --json`), newline-terminated and flushed.
+pub fn emit(out: &mut impl Write) -> io::Result<()> {
+    write_line(out, &listing_line()?)
 }
 
 #[cfg(test)]
