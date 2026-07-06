@@ -26,6 +26,7 @@ mod groups;
 mod instance;
 mod menu;
 mod pacer;
+mod rendertrace;
 mod resize;
 mod windows;
 
@@ -1596,6 +1597,10 @@ struct WindowState {
     /// Rate-limits repaints so output floods / held keys can't drive a software
     /// rasterizer at the 8 ms poll rate (see [`pacer`]).
     pacer: pacer::FramePacer,
+    /// Foreground render-stall watchdog (see [`rendertrace`]). Timestamps the repaint
+    /// pipeline and classifies a foreground that stops presenting while its session
+    /// keeps feeding. Inert unless `RUST_LOG=ghost::render=trace`.
+    render_trace: rendertrace::RenderTrace,
     /// Defers the costly relayout/reflow during an interactive resize, stretching
     /// the last crisp frame in the meantime (see [`resize`]).
     resize: resize::ResizeCoalescer,
@@ -1914,6 +1919,7 @@ impl App {
     }
 
     fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
+        let now_ms = self.now_ms();
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
@@ -2224,6 +2230,7 @@ impl App {
                     // release it within the frame budget (coalescing bursts).
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.pacer.request();
+                        w.render_trace.saw_redraw_cmd(now_ms);
                     }
                 }
                 Cmd::SetTitle(t) => {
@@ -2255,6 +2262,7 @@ impl App {
                             Some(t) if t < due => t,
                             _ => due,
                         });
+                        w.render_trace.saw_tick_scheduled(now_ms);
                     }
                 }
                 Cmd::Quit => self.shutdown(event_loop),
@@ -2313,6 +2321,18 @@ impl App {
 
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Timestamp user input on a window's render trace — the "kick" label that lets a
+    /// recovered-stall report say whether a present self-recovered or needed an input
+    /// (a scroll). Gated so a normal run does nothing.
+    fn note_input(&mut self, id: WindowId) {
+        if tracing::enabled!(target: "ghost::render", tracing::Level::TRACE) {
+            let now_ms = self.now_ms();
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.render_trace.saw_input(now_ms);
+            }
+        }
     }
 
     /// Advance the bench harness one turn: fire the next scripted animation when the
@@ -3119,6 +3139,7 @@ impl App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
+                render_trace: rendertrace::RenderTrace::new(),
                 resize: resize::ResizeCoalescer::new(
                     resize::SETTLE_MS,
                     resize::MAX_MS,
@@ -3385,6 +3406,7 @@ impl App {
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
+                render_trace: rendertrace::RenderTrace::new(),
                 resize: resize::ResizeCoalescer::new(
                     resize::SETTLE_MS,
                     resize::MAX_MS,
@@ -3748,10 +3770,11 @@ impl ApplicationHandler<UserEvent> for App {
             .map(|(id, _)| *id)
             .collect();
         for wid in due {
+            let now_ms = self.now_ms();
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.next_tick = None;
+                w.render_trace.saw_tick_fired(now_ms);
             }
-            let now_ms = self.now_ms();
             self.dispatch(wid, UiEvent::Tick { now_ms }, &fe);
         }
         // Bench mode: advance the scripted animation (after ticks, so `is_animating`
@@ -3790,6 +3813,7 @@ impl ApplicationHandler<UserEvent> for App {
         // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
+        let trace_on = tracing::enabled!(target: "ghost::render", tracing::Level::TRACE);
         for w in self.windows.values_mut() {
             if !w.presented_ok {
                 // The opening frame hasn't landed yet: a window created mid-run can drop
@@ -3799,7 +3823,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // else the window sits blank (title bar only) until an unrelated event.
                 w.request_redraw();
             } else if w.pacer.release(now_ms) {
+                w.render_trace.saw_release(now_ms);
                 w.request_redraw();
+            }
+            // Once per pass, classify a foreground stall from the folded gate state and
+            // leave a breadcrumb. Gated so a normal run does no fold/verdict work.
+            if trace_on {
+                let core = w.root.foreground_trace();
+                let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
+                let pending = w.pacer.pending();
+                if let Some(report) = w.render_trace.poll(now_ms, core, pending, has_snapshot) {
+                    tracing::trace!(target: "ghost::render", %report, "foreground render stall");
+                }
             }
         }
         fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
@@ -3845,7 +3880,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let now_ms = self.now_ms();
+                let trace_on = tracing::enabled!(target: "ghost::render", tracing::Level::TRACE);
                 if let Some(win) = self.windows.get_mut(&id) {
+                    if trace_on {
+                        win.render_trace.saw_redraw_event(now_ms);
+                    }
                     // A headless window has no surface; there is nothing to paint.
                     let Some(gfx) = win.gfx.as_mut() else {
                         return;
@@ -3905,6 +3944,25 @@ impl ApplicationHandler<UserEvent> for App {
                                 // Model-side cache line (fleet preview frames) under
                                 // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
                                 win.root.emit_cache_trace();
+                                // The kick oracle: a present that ends an armed stall
+                                // reports the frozen state it just recovered (warn — the
+                                // self-reported bug report at the moment of the scroll).
+                                if trace_on {
+                                    let core = win.root.foreground_trace();
+                                    let pending = win.pacer.pending();
+                                    if let Some(report) = win.render_trace.saw_outcome(
+                                        rendertrace::Outcome::Presented,
+                                        now_ms,
+                                        core,
+                                        pending,
+                                    ) {
+                                        tracing::warn!(
+                                            target: "ghost::render",
+                                            %report,
+                                            "foreground render stall recovered"
+                                        );
+                                    }
+                                }
                                 // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
                                 // this frame and print a summary when a dive ends.
                                 if let Some(summary) = win.stats.record(
@@ -3930,6 +3988,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 // Nothing to draw: what's on screen already matches the
                                 // scene, so the pending repaint is satisfied.
                                 win.pacer.painted(now_ms);
+                                if trace_on {
+                                    let core = win.root.foreground_trace();
+                                    let pending = win.pacer.pending();
+                                    win.render_trace.saw_outcome(
+                                        rendertrace::Outcome::Clean,
+                                        now_ms,
+                                        core,
+                                        pending,
+                                    );
+                                }
                             }
                             FrameOutcome::Lost => {
                                 // The surface wasn't acquirable, so nothing was presented.
@@ -3937,6 +4005,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 // frame lands — this is what recovers a window whose
                                 // redraws the platform dropped while it was occluded.
                                 win.pacer.request();
+                                if trace_on {
+                                    let core = win.root.foreground_trace();
+                                    let pending = win.pacer.pending();
+                                    win.render_trace.saw_outcome(
+                                        rendertrace::Outcome::Lost,
+                                        now_ms,
+                                        core,
+                                        pending,
+                                    );
+                                }
                             }
                         }
                         // Warm ONE deferred surface off the just-finished frame's slack, so
@@ -3955,6 +4033,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                self.note_input(id);
                 let Some(mods_state) = self.windows.get(&id).map(|w| w.mods) else {
                     return;
                 };
@@ -4049,6 +4128,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                self.note_input(id);
                 if let Some(b) = map_button(button) {
                     let pressed = state == ElementState::Pressed;
                     let phase = if pressed {
@@ -4077,6 +4157,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.note_input(id);
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y,

@@ -40,9 +40,10 @@ notify = "8.2"
 # that PTY non-blocking so `about_to_wait` can pump it without stalling.
 pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["fs"] }
-# Cache-efficiency (and any future) instrumentation is emitted via `tracing`; this
-# installs the subscriber that turns `RUST_LOG` into filtered stderr output. Off by
-# default (no target enabled), so instrumented code stays free in normal runs.
+# Cache-efficiency and render-stall instrumentation is emitted via `tracing`; the
+# subscriber turns `RUST_LOG` into filtered stderr output. Off by default (no target
+# enabled), so instrumented code stays free in normal runs.
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Resolve a configured `[font] family` to a font file. fontconfig is the Linux font

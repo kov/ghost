@@ -83,6 +83,12 @@ impl FramePacer {
         self.pending = false;
     }
 
+    /// Whether a repaint is pending — requested but not yet confirmed painted.
+    /// The render trace reads it to tell a stuck pacer from a stuck platform.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
     /// One decision per event-loop pass: should the shell call
     /// `window.request_redraw()` now? Does NOT mark anything painted — that
     /// happens only when the resulting `RedrawRequested` is actually handled
