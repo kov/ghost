@@ -317,6 +317,16 @@ fn is_remote_id(id: &str) -> bool {
     id.contains(REMOTE_ID_SEP)
 }
 
+/// How a session id should be reached for a control action (rename/kill). A
+/// remote id is *self-describing* — [`remote_fleet_id`] formats it as
+/// `<target>␟<real>` — so its host and real name are recovered from the id itself,
+/// with no dependence on `remote_index` staying populated. A remote id is thus
+/// ALWAYS routed over the transport, never spoken to a local control socket (a
+/// bogus local socket yields a misleading "hosted by an older ghost" error).
+fn remote_id_parts(id: &str) -> Option<(&str, &str)> {
+    id.split_once(REMOTE_ID_SEP)
+}
+
 /// Floor between reconnect attempts of a host's watch stream, so a host whose
 /// `ghost __watch` exits at once can't spin.
 const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
@@ -2114,11 +2124,12 @@ impl App {
                 Cmd::Rename { session, name } => {
                     // A remote session renames over its host's transport (off-loop);
                     // a local one over its control connection. Either works whether
-                    // or not this window holds it. On refusal (e.g. a host too old
-                    // for label renames) the fleet's optimistic label reverts on the
-                    // next reconcile; log the reason it didn't stick.
-                    if let Some((target, real)) = self.remote_index.get(&session).cloned() {
-                        self.spawn_remote_rename(&target, &real, &name);
+                    // or not this window holds it. Route by the id itself: a remote
+                    // id carries its own host+name, so it never falls through to the
+                    // local path (whose bogus socket would report a misleading "older
+                    // ghost" error). On refusal the fleet's optimistic label reverts.
+                    if let Some((target, real)) = remote_id_parts(&session) {
+                        self.spawn_remote_rename(target, real, &name);
                     } else if let Err(e) = ghost_vt::client::rename(&session, &name) {
                         eprintln!("ghost: rename failed: {e}");
                     }
@@ -2887,6 +2898,20 @@ impl App {
                 }
             }
         }
+        // Keep every remote session a window is actively driving, even one its
+        // host hasn't listed yet (a fresh connect/spawn indexes it before the
+        // watcher reports it). Without this, a rebuild triggered by another host's
+        // push would drop the driven id and its rename/kill/observe would misroute
+        // to the local path. The composite id carries its own (target, real).
+        for w in self.windows.values() {
+            for id in w.sessions.keys() {
+                if let Some((target, real)) = id.split_once(REMOTE_ID_SEP) {
+                    self.remote_index
+                        .entry(id.clone())
+                        .or_insert_with(|| (target.to_string(), real.to_string()));
+                }
+            }
+        }
     }
 
     /// Take over a remote session (a fleet tile on a connected host) into window
@@ -3024,6 +3049,10 @@ impl App {
             .ok()
             .and_then(|m| m.get(target).cloned())
         else {
+            // No live transport to the host — the rename can't be delivered. Say so
+            // (the fleet's optimistic label will revert once the timeout lapses)
+            // rather than dropping it silently.
+            eprintln!("ghost: no live connection to {target} to rename its session");
             return;
         };
         let (real, new) = (real.to_string(), new.to_string());
@@ -4546,6 +4575,91 @@ mod tests {
                 "the driven session is indexed back to its host"
             );
         });
+    }
+
+    #[test]
+    fn a_driven_remote_session_stays_indexed_across_another_hosts_rebuild() {
+        // `rebuild_remote_index` rebuilds from the watcher's listings. A freshly
+        // spawned/connected remote session is driven (in `window.sessions`) and
+        // indexed before its OWN host has listed it — so a push from another host
+        // (or an empty listing) that triggers a rebuild must not drop it, or its
+        // rename/kill/observe would misroute to the local path and fail.
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .root
+                .set_group_connection(Some(spec.clone()));
+
+            let name = "hr-route-1";
+            app.spawn_remote_session(wid, "kov@box", name, &fe);
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+
+            // Another host pushes a listing before kov@box has listed our session,
+            // triggering a rebuild of the index.
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteSessions {
+                    target: "kov@other".to_string(),
+                    infos: Vec::new(),
+                },
+            );
+            let indexed = app.remote_index.get(&composite).cloned();
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert_eq!(
+                indexed,
+                Some(("kov@box".to_string(), name.to_string())),
+                "a driven remote session must stay indexed across another host's rebuild"
+            );
+        });
+    }
+
+    #[test]
+    fn a_remote_id_always_renames_over_the_transport_never_locally() {
+        // A plain id renames over its local control socket.
+        assert!(
+            super::remote_id_parts("plain-session").is_none(),
+            "a local id has no host parts"
+        );
+        // A namespaced remote id is self-describing: its host + real name come from
+        // the id itself, so a rename ALWAYS routes over the transport even if the
+        // index has since dropped it — never the local path (whose bogus socket
+        // reports a misleading "older ghost" error).
+        let composite = format!("kov@box{REMOTE_ID_SEP}work");
+        assert_eq!(
+            super::remote_id_parts(&composite),
+            Some(("kov@box", "work")),
+            "a remote id recovers (target, real) from the composite itself"
+        );
     }
 
     #[test]
