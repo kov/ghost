@@ -1,9 +1,12 @@
-# Shell in the ghost
+# Shell in the Ghost
 
-A windowed GPU terminal whose sessions outlive their windows. The name inverts
-*Ghost in the Shell*: detach or close a window and a **ghost** is left behind — a
-session that keeps running, with a shell alive inside it — ready to be reattached
-later without losing a byte of state.
+*Ghost in the Shell*, but inverted: detach or close a window and a **ghost** is left
+behind with a shell inside it! It can be reattached later without losing a byte
+of state. And everything the terminal shows is recorded, so any session can be
+searched or replayed later.
+
+Ghost can be used as a CLI in your favorite terminal (see [The CLI](#the-cli)
+below), but the author's main use case is running it as a terminal.
 
 ghost is a mix of [dtach], [asciinema], and [mosh], wrapped in a fleet manager. A
 session keeps running in its own background process after you detach; reattaching
@@ -113,7 +116,7 @@ option_as_meta = true   # macOS: treat Option as Meta
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
 ```
 
-## The CLI (`ghost <subcommand>`)
+## The CLI
 
 ```sh
 ghost new [NAME]               # start a session running $SHELL and attach to it
