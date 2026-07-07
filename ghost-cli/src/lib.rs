@@ -110,10 +110,15 @@ enum Command {
         /// Name of the session to attach to.
         name: Option<String>,
     },
-    /// Kill a session and its process.
+    /// Kill one or more sessions by name, or all running local sessions.
+    #[command(group(clap::ArgGroup::new("target").required(true)))]
     Kill {
-        /// Name of the session to kill.
-        name: String,
+        /// Session names to kill (one or more).
+        #[arg(group = "target", num_args = 1..)]
+        names: Vec<String>,
+        /// Kill every running local session (remote sessions are out of scope).
+        #[arg(short = 'a', long, group = "target", conflicts_with = "names")]
+        all: bool,
     },
     /// Rename a running session (sets its display name; the session itself —
     /// socket, recording, attach state — is untouched).
@@ -322,11 +327,61 @@ fn dispatch(command: Command) {
                 fail(&e.to_string());
             }
         }
-        Command::Kill { name } => match session::kill_session(&resolve(&name)) {
-            Ok(true) => println!("killed session '{name}'"),
-            Ok(false) => fail(&format!("no such session '{name}'")),
-            Err(e) => fail(&e.to_string()),
-        },
+        Command::Kill { names, all } => {
+            // Build the ordered list of (immutable_id, display_label) pairs.
+            let mut targets: Vec<(String, String)> = if all {
+                match session::list() {
+                    Ok(list) if list.is_empty() => {
+                        println!("no sessions to kill");
+                        return;
+                    }
+                    Ok(list) => list
+                        .iter()
+                        .map(|s| (s.name.clone(), s.display().to_string()))
+                        .collect(),
+                    Err(e) => fail(&e.to_string()),
+                }
+            } else {
+                // Resolve and dedup; first occurrence wins.
+                let mut seen = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for name in &names {
+                    let id = resolve(name);
+                    if seen.insert(id.clone()) {
+                        result.push((id, name.clone()));
+                    }
+                }
+                result
+            };
+
+            // If we are running inside a ghost session, kill it last so this
+            // process survives long enough to print every outcome line.
+            if let Ok(own_id) = std::env::var("GHOST_SESSION_ID")
+                && let Some(pos) = targets.iter().position(|(id, _)| *id == own_id)
+            {
+                let self_entry = targets.remove(pos);
+                targets.push(self_entry);
+            }
+
+            let mut had_failure = false;
+            for (id, label) in &targets {
+                match session::kill_session(id) {
+                    Ok(true) => println!("killed session '{label}'"),
+                    Ok(false) => {
+                        if !all {
+                            eprintln!("ghost: no such session '{label}'");
+                            had_failure = true;
+                        }
+                        // --all: session died between list() and kill — benign skip.
+                    }
+                    Err(e) => {
+                        eprintln!("ghost: {e}");
+                        had_failure = true;
+                    }
+                }
+            }
+            std::process::exit(if had_failure { 1 } else { 0 });
+        }
         Command::Rename { old, new } => match client::rename(&resolve(&old), &new) {
             Ok(()) => println!("renamed '{old}' to '{new}'"),
             Err(e) => fail(&e.to_string()),

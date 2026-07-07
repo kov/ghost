@@ -445,6 +445,7 @@ fn host_main(
     if !opts.start_on_attach {
         child = Some(spawn_child(
             &child_command,
+            current_name,
             launch_dir,
             pts.take().expect("slave present before first spawn"),
         )?);
@@ -900,6 +901,7 @@ fn host_main(
         if child.is_none() && client.as_ref().is_some_and(|c| c.resynced) {
             child = Some(spawn_child(
                 &child_command,
+                current_name,
                 launch_dir,
                 pts.take()
                     .expect("slave present until the deferred child spawns"),
@@ -1264,6 +1266,7 @@ fn discard_traces(name: &str, record: Option<&std::path::Path>) {
 /// launch directory. Shared by eager start and deferred (first-attach) start.
 fn spawn_child(
     command: &[String],
+    session_name: &str,
     launch_dir: Option<&std::path::Path>,
     pts: pty_process::blocking::Pts,
 ) -> io::Result<std::process::Child> {
@@ -1279,7 +1282,10 @@ fn spawn_child(
     // terminfo entry itself (bundled or compiled on first use) and handing
     // the child that database via TERMINFO_DIRS.
     let term = crate::terminfo::session_term();
-    cmd = cmd.env("TERM", &term.term).env("COLORTERM", "truecolor");
+    cmd = cmd
+        .env("TERM", &term.term)
+        .env("COLORTERM", "truecolor")
+        .env("GHOST_SESSION_ID", session_name);
     if let Some(dirs) = &term.terminfo_dirs {
         cmd = cmd.env("TERMINFO_DIRS", dirs);
     }
