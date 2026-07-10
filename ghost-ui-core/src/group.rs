@@ -12,6 +12,24 @@ use serde::{Deserialize, Serialize};
 /// window ever claims.
 pub type GroupId = String;
 
+/// The unit separator between a target and a real session id inside a fleet id —
+/// a byte that never appears in either, so the composite `<target>␟<real>` a
+/// remote session is known by *locally* is unambiguous and never collides with a
+/// local id or another host's. Canonical here (the fleet reasons about it); the
+/// shell re-exports it as `ghost_ui_core::REMOTE_ID_SEP`.
+pub const REMOTE_ID_SEP: char = '\u{1f}';
+
+/// Whether a session id names a *remote* session — one carrying the
+/// `<target>␟<real>` namespacing an ssh host's sessions get. Remote sessions live
+/// on their host and are re-discovered live by the watcher on reconnect, but they
+/// ARE remembered across an outage and a restart: persisted as group members and
+/// reconnected + re-adopted. So the local dead-descriptor sweep — which has no
+/// visibility into them — must never evict one as if it were a discarded local
+/// session; only the transport (a live/dead tile) is authoritative for it.
+pub fn is_remote_id(id: &str) -> bool {
+    id.contains(REMOTE_ID_SEP)
+}
+
 /// Accent colors assigned to groups round-robin at creation, referenced by
 /// index so a future restyle recolors existing groups.
 pub const GROUP_PALETTE: [[f32; 4]; 6] = [

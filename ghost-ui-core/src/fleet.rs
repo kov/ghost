@@ -1320,15 +1320,32 @@ impl FleetModel {
             .collect();
         for g in &mut self.groups {
             let before = g.members.len();
-            g.members
-                .retain(|m| live.contains(m.as_str()) || named.contains(m.as_str()));
+            // A remote member (<target>␟<real>) is transport-governed, not swept: the
+            // local descriptor scan never names it, so judging it by that scan would
+            // evict it the moment its host went unreachable (its tile goes dead → not
+            // `live`, never `named`) and dissolve the group over a passing network
+            // blip. Keep it; the watcher marks it cold and revives it on reconnect.
+            g.members.retain(|m| {
+                crate::group::is_remote_id(m)
+                    || live.contains(m.as_str())
+                    || named.contains(m.as_str())
+            });
             dirty |= g.members.len() != before;
         }
         self.groups
             .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
+        // Keep a dead tile that is still a group member (a swept-but-remembered local
+        // one, or a remote one gone cold) so it stays visible for respawn/reconnect;
+        // drop the rest (a dead tile whose membership just went).
+        let grouped: HashSet<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
+            .collect();
         let before = self.tiles.len();
-        self.tiles
-            .retain(|t| !t.dead || named.contains(t.id.as_str()));
+        self.tiles.retain(|t| {
+            !t.dead || named.contains(t.id.as_str()) || grouped.contains(t.id.as_str())
+        });
         dirty |= self.tiles.len() != before;
         for d in dead {
             if !self.groups.iter().any(|g| g.members.contains(&d.name)) {
@@ -5470,6 +5487,47 @@ mod tests {
             cmds.iter()
                 .any(|c| matches!(c, Cmd::SaveGroups(gs) if gs.iter().all(|g| g.id != "g-web"))),
             "the forgetting persists: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_dead_sweep_keeps_a_remote_member_it_cannot_see() {
+        // A remote session (<target>␟<real>) has NO local descriptor, so the shell's
+        // dead-descriptor sweep never names it. It must not be evicted for that: its
+        // liveness is the transport's business (a cold tile while its host is
+        // unreachable, live again on reconnect). A transient network drop must NOT
+        // dissolve its group — the twin of `the_dead_sweep_forgets_members_it_no_longer_names`
+        // for a member the local sweep has no authority over.
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        let remote = format!("box{}work", crate::group::REMOTE_ID_SEP);
+        seed_group(&mut m, "g-remote", "remote", &[&remote]);
+        // Host reachable: the watcher lists the session, so it is a live tile.
+        list(&mut m, &[&remote]);
+        assert!(
+            m.tiles.iter().any(|t| t.id == remote && !t.dead),
+            "precondition: the remote session is live"
+        );
+        // Host unreachable: the watcher posts an empty listing, so its grouped tile
+        // goes dead-but-remembered.
+        list(&mut m, &[]);
+        assert!(
+            m.tiles.iter().any(|t| t.id == remote && t.dead),
+            "unreachable → a cold, remembered tile"
+        );
+        // The local dead sweep runs and, as always, does not (cannot) name a remote
+        // session. It must be left alone.
+        m.update(UiEvent::DeadSessions(Vec::new()));
+        assert!(
+            m.groups()
+                .iter()
+                .any(|g| g.id == "g-remote" && g.members.contains(&remote)),
+            "the remote member survives a sweep that cannot see it: {:?}",
+            m.groups()
+        );
+        assert!(
+            m.tiles.iter().any(|t| t.id == remote),
+            "its cold tile is kept, ready to go live again on reconnect"
         );
     }
 

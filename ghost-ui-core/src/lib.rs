@@ -27,7 +27,7 @@ pub use event::{DeadSession, PointPx, PointerButton, PointerPhase, SessionPush, 
 pub use fleet::{FleetModel, Locality};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
 pub use ghost_vt::query::ThemeColors;
-pub use group::Group;
+pub use group::{Group, REMOTE_ID_SEP, is_remote_id};
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::RootModel;
 pub use terminal::{

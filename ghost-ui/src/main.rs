@@ -293,10 +293,10 @@ struct RemoteHost {
     remote_ghost: String,
 }
 
-/// The unit separator between a target and a real session id inside a fleet id —
-/// a byte that never appears in either, so the composite is unambiguous and never
-/// collides with a local id or another host's.
-const REMOTE_ID_SEP: char = '\u{1f}';
+/// The unit separator (and the `is_remote_id` predicate) are canonical in
+/// `ghost_ui_core` now — the fleet reasons about remote membership too — and
+/// re-exported here so this module's id helpers read unchanged.
+use ghost_ui_core::{REMOTE_ID_SEP, is_remote_id};
 
 /// The fleet id for remote session `real` on `target` — the composite a remote
 /// session is known by *locally* (window client key, `mine`, fleet tile id), so a
@@ -305,16 +305,6 @@ const REMOTE_ID_SEP: char = '\u{1f}';
 /// `App.remote_index`; only the transport layer uses the bare `real` id.
 fn remote_fleet_id(target: &str, real: &str) -> String {
     format!("{target}{REMOTE_ID_SEP}{real}")
-}
-
-/// Whether a fleet id names a *remote* session — one carrying the `<target>␟<real>`
-/// namespacing [`remote_fleet_id`] gives an ssh host's sessions. Remote sessions
-/// live on their host and are re-discovered live by the watcher on reconnect, but
-/// they ARE remembered across a restart: persisted as group members and window
-/// records, and reconnected + re-adopted at startup. Restore checks this to route
-/// a remote member through the reconnect path rather than a local relaunch.
-fn is_remote_id(id: &str) -> bool {
-    id.contains(REMOTE_ID_SEP)
 }
 
 /// How a session id should be reached for a control action (rename/kill). A
@@ -3283,8 +3273,11 @@ impl App {
         self.prune_remotes();
     }
 
-    /// The set of remote targets still referenced by a live window — either the
-    /// window is an ssh group for it, or it drives a session on it.
+    /// The set of remote targets still referenced by a live window — the window is an
+    /// ssh group for it, it drives a session on it, or a group still remembers a
+    /// (possibly cold) session on it. The last keeps a host's watcher retrying across
+    /// an outage, so a dropped connection reconnects and its remembered members go
+    /// live again rather than being pruned and orphaned.
     fn in_use_targets(&self) -> HashSet<String> {
         let mut targets = HashSet::new();
         for w in self.windows.values() {
@@ -3294,7 +3287,16 @@ impl App {
             // A driven remote session's id is `<target>␟<real>`; read the target
             // straight off it (not via the index, which a poll failure can clear).
             for name in w.sessions.keys() {
-                if let Some((target, _)) = name.split_once(REMOTE_ID_SEP) {
+                if let Some((target, _)) = remote_id_parts(name) {
+                    targets.insert(target.to_string());
+                }
+            }
+        }
+        // A group still remembering a remote member keeps its host in use even when no
+        // window drives it right now (the session went cold during an outage).
+        for g in &self.groups {
+            for m in &g.members {
+                if let Some((target, _)) = remote_id_parts(m) {
                     targets.insert(target.to_string());
                 }
             }
@@ -4395,6 +4397,30 @@ mod tests {
             assert!(
                 !app.remote_infos.contains_key("kov@b"),
                 "its cached listing is dropped too"
+            );
+        });
+    }
+
+    #[test]
+    fn in_use_targets_keeps_a_host_a_group_still_remembers() {
+        // A group that still remembers a cold remote member must keep its host "in
+        // use", so a dropped connection keeps its watcher retrying and the remembered
+        // session reappears on reconnect — rather than being pruned and orphaned.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            // A group whose only member is a remote session on kov@c — no ssh-group
+            // connection to it, no window driving it (the outage went that far).
+            app.groups = vec![ghost_ui_core::Group {
+                id: "w1".into(),
+                name: "blue".into(),
+                color: 0,
+                members: vec![format!("kov@c{REMOTE_ID_SEP}work")],
+                connection: None,
+            }];
+            assert!(
+                app.in_use_targets().contains("kov@c"),
+                "a host a group still remembers stays in use: {:?}",
+                app.in_use_targets()
             );
         });
     }
