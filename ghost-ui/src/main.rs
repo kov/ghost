@@ -797,15 +797,22 @@ fn spawn_session(name: &str, command: Vec<String>, connection: Option<Connection
     .expect("spawn session");
 }
 
-/// The connection a new terminal in a window inherits: the window group's own
-/// connection wins (an explicit "ssh group", set in a later phase), else the
-/// session it was spawned from (the foreground), else none — a local `$SHELL`.
-/// Read only from stored data, never scraped from a live command line.
+/// The connection a new terminal in a window inherits: the session it was spawned
+/// from (the foreground) wins — a new terminal is a sibling of what you're looking
+/// at — else the window group's own connection (an explicit "ssh group"), else none
+/// (a local `$SHELL`). Read only from stored data, never scraped from a live command
+/// line.
+///
+/// Foreground-first matters after a cross-host fleet take-over: adopting another
+/// host's session into a window leaves the group's stored `connection` naming the
+/// OLD host (it is "never inferred from adopted members", see [`Group::connection`]),
+/// so letting it win would spawn the next session on the wrong host. A local
+/// foreground carries no connection, so an ssh group still spawns onto its host.
 fn inherited_connection(
     group: Option<&ConnectionSpec>,
     foreground: Option<&ConnectionSpec>,
 ) -> Option<ConnectionSpec> {
-    group.or(foreground).cloned()
+    foreground.or(group).cloned()
 }
 
 /// The connected remote host a new inheriting session should be created *on*, if
@@ -2815,10 +2822,10 @@ impl App {
         }
     }
 
-    /// The ssh connection a new session spawned into `wid` inherits: the window
-    /// group's own connection (an "ssh group") wins, else the foreground session's.
+    /// The ssh connection a new session spawned into `wid` inherits: the foreground
+    /// session's connection wins, else the window group's own ("ssh group") connection.
     /// `None` ⇒ a plain local `$SHELL`. This is what makes a new terminal follow
-    /// the one it branches off onto the same host.
+    /// the one it branches off onto the same host (see [`inherited_connection`]).
     fn inherited_spawn_connection(&self, wid: WindowId) -> Option<ConnectionSpec> {
         let w = self.windows.get(&wid)?;
         let group = w.root.group_connection().cloned();
@@ -5278,19 +5285,28 @@ mod tests {
     }
 
     #[test]
-    fn inherited_connection_prefers_group_then_foreground_then_local() {
+    fn inherited_connection_prefers_foreground_then_group_then_local() {
         use super::inherited_connection;
         use ghost_vt::connection::ConnectionSpec;
         let group = ConnectionSpec::parse_target("ops@gateway");
         let foreground = ConnectionSpec::parse_target("dev@box");
-        // An explicit group connection wins for every new terminal in the window.
+        // The session you're branching off (the foreground) wins: a new terminal is a
+        // sibling of what you're looking at, even when the group's own connection names
+        // a different host. This is what keeps a "new session" off the wrong host after
+        // a cross-host fleet take-over adopted a session whose group connection is stale.
         assert_eq!(
             inherited_connection(group.as_ref(), foreground.as_ref())
                 .unwrap()
                 .target(),
+            "dev@box"
+        );
+        // A local foreground carries no connection, so an explicit "ssh group" still
+        // spawns its next session onto the group's host, not a local shell.
+        assert_eq!(
+            inherited_connection(group.as_ref(), None).unwrap().target(),
             "ops@gateway"
         );
-        // Otherwise the session it branches off — the foreground.
+        // The foreground alone (an ordinary window whose foreground is a remote tab).
         assert_eq!(
             inherited_connection(None, foreground.as_ref())
                 .unwrap()
