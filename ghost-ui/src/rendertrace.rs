@@ -61,11 +61,19 @@ pub enum StallClass {
     /// Feeds keep arriving but none change anything visible — the core's per-feed
     /// dirty-row hint is dropping updates, so no repaint is even requested.
     FeedsNotVisible,
-    /// The core produced visible changes but the window hasn't presented in a while
-    /// — a redraw request the platform dropped, a false scene-equality skip, or a
-    /// stuck pacer. The report's `pacer_pending`, `last_release`, `last_redraw_event`
-    /// and `last_outcome` discriminate among them.
+    /// The core produced visible changes and the surface DID acquire, but the window
+    /// still hasn't presented in a while — a redraw request the platform dropped, a
+    /// false scene-equality skip, or a stuck pacer. This is the recurring foreground
+    /// bug. The report's `pacer_pending`, `last_release`, `last_redraw_event` and
+    /// `last_outcome` discriminate among them.
     StaleNoPresent,
+    /// The core produced visible changes but every present attempt comes back `Lost`
+    /// — the surface isn't acquirable, so the platform (not our repaint pipeline) is
+    /// withholding the drawable: the window is occluded / minimized / on another
+    /// Space, or the display is asleep. Split from [`StallClass::StaleNoPresent`] so a
+    /// `stale-no-present` line means acquire SUCCEEDED yet nothing painted — the bug
+    /// worth chasing — and this benign, self-correcting condition doesn't drown it.
+    SurfaceLost,
 }
 
 impl std::fmt::Display for StallClass {
@@ -74,6 +82,7 @@ impl std::fmt::Display for StallClass {
             StallClass::HeldTooLong => "held-too-long",
             StallClass::FeedsNotVisible => "feeds-not-visible",
             StallClass::StaleNoPresent => "stale-no-present",
+            StallClass::SurfaceLost => "surface-lost",
         };
         f.write_str(s)
     }
@@ -212,50 +221,78 @@ impl RenderTrace {
         pacer_pending: bool,
     ) -> Option<RenderReport> {
         self.last_outcome = Some(outcome);
-        if outcome != Outcome::Presented {
-            return None;
+        match outcome {
+            // A frame was drawn: the surface now shows this scene. Advance the present
+            // baseline, and a present that ends an armed stall is the kick oracle —
+            // report the frozen state it just recovered (the user's scroll).
+            Outcome::Presented => {
+                self.last_present_ms = Some(now_ms);
+                if let Some(c) = core {
+                    self.visible_at_last_present = c.visible_feeds;
+                }
+                self.stalled.take().map(|(class, since)| {
+                    self.build_report(
+                        class,
+                        now_ms,
+                        now_ms.saturating_sub(since),
+                        core,
+                        pacer_pending,
+                    )
+                })
+            }
+            // Nothing to draw: the renderer compared the scene byte-for-byte and it
+            // already matches what's on screen, so the display is provably up to date
+            // as of now. Advance the baseline too (else an idle window that settles
+            // into Clean frames looks permanently stale — the pending-visible gap is a
+            // fossil), and silently disarm any false alarm: a Clean confirms the screen
+            // is correct, it is not a recovery worth a "recovered" line.
+            Outcome::Clean => {
+                self.last_present_ms = Some(now_ms);
+                if let Some(c) = core {
+                    self.visible_at_last_present = c.visible_feeds;
+                }
+                self.stalled = None;
+                None
+            }
+            // The surface wasn't acquirable: nothing landed and the baseline is
+            // unchanged, so an ongoing stall stays armed (and classifies SurfaceLost).
+            Outcome::Lost => None,
         }
-        self.last_present_ms = Some(now_ms);
-        if let Some(c) = core {
-            self.visible_at_last_present = c.visible_feeds;
-        }
-        // Recovery: a present ended whatever we had flagged.
-        self.stalled.take().map(|(class, since)| {
-            self.build_report(
-                class,
-                now_ms,
-                now_ms.saturating_sub(since),
-                core,
-                pacer_pending,
-            )
-        })
     }
 
     /// Once per event-loop pass: fold the foreground's core counters, classify, and
     /// return a report to emit when a stall is newly detected or continues past the
-    /// re-emit interval. `core` is `None` in the fleet overview (no single
-    /// foreground) — the trace resets and never fires there.
+    /// re-emit interval. `core` is `None` in the fleet overview (no single foreground)
+    /// and `visible` is `false` when the window is occluded — in either case the trace
+    /// resets and never fires, since a non-presenting hidden surface isn't our bug.
     pub fn poll(
         &mut self,
         now_ms: u64,
         core: Option<TermTrace>,
         pacer_pending: bool,
         has_snapshot: bool,
+        visible: bool,
     ) -> Option<RenderReport> {
-        let Some(core) = core else {
-            // Fleet overview (or no session): nothing to stall. Re-baseline every
-            // derived timestamp so returning to a single view starts clean — no
-            // stall fires until a genuine new one develops (needs a fresh present
-            // baseline; the opening-frame path handles a never-presenting window).
-            self.stalled = None;
-            self.last_core = TermTrace::default();
-            self.feeds_at_last_visible = 0;
-            self.visible_at_last_present = 0;
-            self.last_feed_ms = None;
-            self.last_visible_feed_ms = None;
-            self.last_present_ms = None;
-            self.held_since_ms = None;
-            return None;
+        // Nothing to watchdog when there is no single foreground (the fleet overview,
+        // `core: None`) OR the window can't present at all (occluded / minimized / on
+        // another Space — `visible: false`): the platform withholds the drawable there,
+        // so a "stall" would be expected, not our bug. Re-baseline every derived
+        // timestamp so returning to a visible single view starts clean — no stall fires
+        // until a genuine new one develops (needs a fresh present baseline; the
+        // opening-frame path handles a never-presenting window).
+        let core = match core {
+            Some(c) if visible => c,
+            _ => {
+                self.stalled = None;
+                self.last_core = TermTrace::default();
+                self.feeds_at_last_visible = 0;
+                self.visible_at_last_present = 0;
+                self.last_feed_ms = None;
+                self.last_visible_feed_ms = None;
+                self.last_present_ms = None;
+                self.held_since_ms = None;
+                return None;
+            }
         };
         // Fold the core deltas into timestamps.
         if core.feeds_seen > self.last_core.feeds_seen {
@@ -338,7 +375,16 @@ impl RenderTrace {
                 .is_some_and(|p| now_ms.saturating_sub(p) >= STALL_QUIET_MS)
         {
             let _ = pacer_pending; // carried into the report, not the decision
-            return Some(StallClass::StaleNoPresent);
+            // Discriminate the two shapes of "visible but not presented": a surface
+            // stuck returning `Lost` is unpresentable (occluded/off-Space/asleep) — the
+            // platform withholding the drawable, self-correcting on visibility — while
+            // any other last outcome means acquire SUCCEEDED yet the frame never landed:
+            // the real repaint bug (dropped redraw, false scene-equality, stuck pacer).
+            return Some(if self.last_outcome == Some(Outcome::Lost) {
+                StallClass::SurfaceLost
+            } else {
+                StallClass::StaleNoPresent
+            });
         }
         None
     }
@@ -404,7 +450,10 @@ mod tests {
                 None
             );
             now += 8;
-            assert_eq!(t.poll(now, Some(core(i, i, false)), false, false), None);
+            assert_eq!(
+                t.poll(now, Some(core(i, i, false)), false, false, true),
+                None
+            );
             now += 8;
         }
     }
@@ -413,12 +462,15 @@ mod tests {
     fn a_latched_hold_is_flagged_only_after_the_backstop_window() {
         let mut t = RenderTrace::new();
         // The hold opens at t=0 and stays set.
-        assert_eq!(t.poll(0, Some(core(1, 1, true)), false, false), None);
+        assert_eq!(t.poll(0, Some(core(1, 1, true)), false, false, true), None);
         // Within the backstop window: still healthy (a real frame releases in 150 ms).
-        assert_eq!(t.poll(500, Some(core(2, 2, true)), false, false), None);
+        assert_eq!(
+            t.poll(500, Some(core(2, 2, true)), false, false, true),
+            None
+        );
         // Past a second still held: stuck.
         let r = t
-            .poll(1_100, Some(core(3, 3, true)), false, false)
+            .poll(1_100, Some(core(3, 3, true)), false, false, true)
             .expect("a latched hold is a stall");
         assert_eq!(r.class, StallClass::HeldTooLong);
         assert!(r.held_for_ms.unwrap() >= 1_000);
@@ -429,14 +481,17 @@ mod tests {
         let mut t = RenderTrace::new();
         // One visible feed to baseline, presented.
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         // Then a flood of invisible feeds (feeds_seen climbs, visible frozen).
         for i in 2..=25 {
-            assert_eq!(t.poll(10 * i, Some(core(i, 1, false)), false, false), None);
+            assert_eq!(
+                t.poll(10 * i, Some(core(i, 1, false)), false, false, true),
+                None
+            );
         }
         // >20 invisible feeds and >2 s since the last visible one: flagged.
         let r = t
-            .poll(3_000, Some(core(30, 1, false)), false, false)
+            .poll(3_000, Some(core(30, 1, false)), false, false, true)
             .expect("feeds not becoming visible is a stall");
         assert_eq!(r.class, StallClass::FeedsNotVisible);
     }
@@ -446,11 +501,14 @@ mod tests {
         let mut t = RenderTrace::new();
         // Present once to set a baseline present time and visible count.
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         // Visible feeds keep coming, but no present lands.
-        assert_eq!(t.poll(500, Some(core(2, 2, false)), true, false), None);
+        assert_eq!(
+            t.poll(500, Some(core(2, 2, false)), true, false, true),
+            None
+        );
         let r = t
-            .poll(2_600, Some(core(5, 5, false)), true, false)
+            .poll(2_600, Some(core(5, 5, false)), true, false, true)
             .expect("visible output with no present is a stall");
         assert_eq!(r.class, StallClass::StaleNoPresent);
     }
@@ -459,11 +517,11 @@ mod tests {
     fn a_resize_snapshot_suppresses_the_no_present_stall() {
         let mut t = RenderTrace::new();
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         // Same stale-no-present shape, but a resize blit is intentionally holding the
         // last frame — not a stall.
         assert_eq!(
-            t.poll(2_600, Some(core(5, 5, false)), true, true),
+            t.poll(2_600, Some(core(5, 5, false)), true, true, true),
             None,
             "a mid-resize blit is not a foreground stall"
         );
@@ -473,9 +531,9 @@ mod tests {
     fn a_present_recovers_and_reports_a_stall() {
         let mut t = RenderTrace::new();
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         // Fall into a stale-no-present stall.
-        let r = t.poll(2_600, Some(core(5, 5, false)), true, false);
+        let r = t.poll(2_600, Some(core(5, 5, false)), true, false, true);
         assert_eq!(r.unwrap().class, StallClass::StaleNoPresent);
         // The recovering present reports the stall it ended (the kick oracle).
         let recovered = t
@@ -494,20 +552,20 @@ mod tests {
     fn a_continuing_stall_re_emits_only_on_the_interval() {
         let mut t = RenderTrace::new();
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         // Enter the stall (first emit).
         assert!(
-            t.poll(2_600, Some(core(5, 5, false)), true, false)
+            t.poll(2_600, Some(core(5, 5, false)), true, false, true)
                 .is_some()
         );
         // Shortly after: still stalled, but within the re-emit interval → quiet.
         assert!(
-            t.poll(3_000, Some(core(6, 6, false)), true, false)
+            t.poll(3_000, Some(core(6, 6, false)), true, false, true)
                 .is_none()
         );
         // Past the interval: one more breadcrumb.
         assert!(
-            t.poll(7_700, Some(core(9, 9, false)), true, false)
+            t.poll(7_700, Some(core(9, 9, false)), true, false, true)
                 .is_some()
         );
     }
@@ -517,18 +575,88 @@ mod tests {
         let mut t = RenderTrace::new();
         // Build up a stall in the single view.
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
-        t.poll(0, Some(core(1, 1, false)), false, false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
         assert!(
-            t.poll(2_600, Some(core(5, 5, false)), true, false)
+            t.poll(2_600, Some(core(5, 5, false)), true, false, true)
                 .is_some()
         );
         // Switch to the fleet: no foreground, so no stall and the state resets.
-        assert_eq!(t.poll(2_700, None, false, false), None);
+        assert_eq!(t.poll(2_700, None, false, false, true), None);
         // Back in a single view, the deltas start clean (a fresh baseline present).
         assert_eq!(
-            t.poll(2_800, Some(core(5, 1, false)), false, false),
+            t.poll(2_800, Some(core(5, 1, false)), false, false, true),
             None,
             "returning to a single view re-baselines rather than firing immediately"
+        );
+    }
+
+    #[test]
+    fn a_lost_surface_is_surface_lost_not_the_repaint_bug() {
+        let mut t = RenderTrace::new();
+        // Baseline present, then every present attempt comes back Lost: the surface
+        // isn't acquirable (occluded/off-Space/display asleep) — the platform, not our
+        // pipeline, is withholding the drawable.
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        t.saw_outcome(Outcome::Lost, 100, Some(core(2, 2, false)), true);
+        let r = t
+            .poll(2_600, Some(core(5, 5, false)), true, false, true)
+            .expect("a surface stuck Lost is still flagged");
+        assert_eq!(
+            r.class,
+            StallClass::SurfaceLost,
+            "a Lost-looping surface is not the stale-no-present repaint bug"
+        );
+    }
+
+    #[test]
+    fn acquire_ok_but_no_present_is_still_the_repaint_bug() {
+        let mut t = RenderTrace::new();
+        // The last present succeeded (acquire OK), then visible output piles up with no
+        // present: this is the real foreground bug, kept distinct from SurfaceLost.
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        let r = t
+            .poll(2_600, Some(core(5, 5, false)), true, false, true)
+            .expect("visible output with no present is a stall");
+        assert_eq!(r.class, StallClass::StaleNoPresent);
+    }
+
+    #[test]
+    fn a_clean_present_refreshes_the_baseline_so_idle_windows_dont_stall() {
+        let mut t = RenderTrace::new();
+        // A visible feed lands and is presented.
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        // More visible feeds arrive, then the renderer confirms the scene is byte-for-
+        // byte unchanged (Clean) — the screen is up to date — and the window goes idle.
+        t.poll(100, Some(core(3, 3, false)), true, false, true);
+        t.saw_outcome(Outcome::Clean, 120, Some(core(3, 3, false)), false);
+        // Long after, still idle (no new feeds): a Clean means the screen matches the
+        // scene, so this must NOT be reported as a stall.
+        assert_eq!(
+            t.poll(5_000, Some(core(3, 3, false)), false, false, true),
+            None,
+            "a Clean present confirms the screen is current — an idle window is not stalled"
+        );
+    }
+
+    #[test]
+    fn an_occluded_window_never_stalls_and_re_baselines() {
+        let mut t = RenderTrace::new();
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        // While occluded (visible=false) the surface can't present and feeds pile up,
+        // but it must not be flagged — the platform is withholding, not our pipeline.
+        assert_eq!(
+            t.poll(3_000, Some(core(9, 9, false)), true, false, false),
+            None
+        );
+        // Coming back visible re-baselines: no immediate fire from the hidden backlog.
+        assert_eq!(
+            t.poll(3_100, Some(core(9, 1, false)), false, false, true),
+            None,
+            "returning from occlusion re-baselines rather than firing on the hidden backlog"
         );
     }
 }

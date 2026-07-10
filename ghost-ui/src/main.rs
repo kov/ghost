@@ -1630,6 +1630,11 @@ struct WindowState {
     /// mid-run comes up blank (only its title bar) until an unrelated event forces a
     /// redraw. Set once, on the first successful present.
     presented_ok: bool,
+    /// Whether the platform has told us this window is occluded (fully hidden: another
+    /// Space, minimized, behind an opaque window). Tracked from `WindowEvent::Occluded`
+    /// so the foreground render-stall watchdog can skip it — an occluded surface can't
+    /// present, so its "stall" is the platform withholding the drawable, not our bug.
+    occluded: bool,
     /// A GUI ssh connect in flight (the window is showing the connect prompt).
     /// Present from the `Cmd::ConnectSshWindow` handler until auth resolves; its
     /// PTY is pumped each `about_to_wait` pass.
@@ -3177,6 +3182,7 @@ impl App {
                 stats: framestats::FrameStats::from_env(),
                 needs_surface_sync: true,
                 presented_ok: false,
+                occluded: false,
                 connect: None,
                 connect_gen: 0,
             },
@@ -3444,6 +3450,7 @@ impl App {
                 stats: framestats::FrameStats::from_env(),
                 needs_surface_sync: true,
                 presented_ok: false,
+                occluded: false,
                 connect: None,
                 connect_gen: 0,
             },
@@ -3843,7 +3850,7 @@ impl ApplicationHandler<UserEvent> for App {
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
         let trace_on = tracing::enabled!(target: "ghost::render", tracing::Level::TRACE);
-        for w in self.windows.values_mut() {
+        for (id, w) in self.windows.iter_mut() {
             if !w.presented_ok {
                 // The opening frame hasn't landed yet: a window created mid-run can drop
                 // its first present(s) while macOS finishes compositing it (the drawable
@@ -3856,13 +3863,18 @@ impl ApplicationHandler<UserEvent> for App {
                 w.request_redraw();
             }
             // Once per pass, classify a foreground stall from the folded gate state and
-            // leave a breadcrumb. Gated so a normal run does no fold/verdict work.
+            // leave a breadcrumb. Gated so a normal run does no fold/verdict work. The
+            // window id separates concurrent windows' tracks in a multi-window log.
             if trace_on {
                 let core = w.root.foreground_trace();
                 let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
                 let pending = w.pacer.pending();
-                if let Some(report) = w.render_trace.poll(now_ms, core, pending, has_snapshot) {
-                    tracing::trace!(target: "ghost::render", %report, "foreground render stall");
+                let visible = !w.occluded;
+                if let Some(report) =
+                    w.render_trace
+                        .poll(now_ms, core, pending, has_snapshot, visible)
+                {
+                    tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
                 }
             }
         }
@@ -3987,6 +3999,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     ) {
                                         tracing::warn!(
                                             target: "ghost::render",
+                                            window = ?id,
                                             %report,
                                             "foreground render stall recovered"
                                         );
@@ -4116,8 +4129,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // can throttle the poll loop on top. Becoming visible again therefore
                 // re-arms a repaint: if content really did change while hidden it
                 // paints, and an unchanged scene is a cheap `Clean` skip.
-                if !occluded && let Some(w) = self.windows.get_mut(&id) {
-                    w.pacer.request();
+                if let Some(w) = self.windows.get_mut(&id) {
+                    // Record it so the render-stall watchdog skips a window that can't
+                    // present (its Lost-looping surface is the platform withholding the
+                    // drawable, not our repaint bug).
+                    w.occluded = occluded;
+                    if !occluded {
+                        w.pacer.request();
+                    }
                 }
             }
             WindowEvent::Focused(focused) => {
