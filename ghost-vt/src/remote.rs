@@ -13,7 +13,40 @@ use std::collections::HashMap;
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a control-socket health check (`ssh -O check`) may run before we treat
+/// the master as wedged. A healthy master answers in milliseconds; a master whose
+/// TCP died (laptop slept, network changed) but whose process lingers under
+/// `ControlPersist` hangs — this bounds that hang.
+const MASTER_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a `__probe` reusing the master may run before we give up. A backstop:
+/// [`RemoteSsh::reap_wedged_master`] normally clears a dead master first, so a probe
+/// runs over a fresh one; this only bites if a master wedges mid-negotiation.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wait for `child`, killing it (and returning `None`) if it outruns `timeout`.
+/// Polls rather than blocking so a wedged ssh can't hang the caller forever. Used
+/// only where the child produces little output (a control command, a probe line), so
+/// its pipe never fills while we poll.
+fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
 
 /// Env override for the remote ghost binary. Points the initiator at a specific
 /// remote path (e.g. a shared build); when set, staging is skipped and the path
@@ -238,7 +271,71 @@ impl RemoteSsh {
             "ControlPersist=60".into(),
             "-o".into(),
             "StrictHostKeyChecking=accept-new".into(),
+            // Keepalives so a persisting master notices a dead peer (laptop slept /
+            // network changed) and EXITS after ~45 s, rather than lingering wedged for
+            // the next reuse to hang on. Harmless on a multiplexed client (the master
+            // owns the TCP); the point is the master it opens carries them.
+            "-o".into(),
+            "ServerAliveInterval=15".into(),
+            "-o".into(),
+            "ServerAliveCountMax=3".into(),
         ]
+    }
+
+    /// Argv for an ssh control command (`-O <op>`, e.g. `check` / `exit`) against
+    /// this connection's master socket. Only the `ControlPath` matters for `-O`, in
+    /// the same double-quoted form (a space in the macOS runtime path).
+    fn control_argv(&self, op: &str) -> Vec<String> {
+        vec![
+            "ssh".into(),
+            "-o".into(),
+            format!("ControlPath=\"{}\"", self.control_path.display()),
+            "-O".into(),
+            op.into(),
+            self.spec.target(),
+        ]
+    }
+
+    /// Whether the shared master is alive and answering — `ssh -O check`, bounded so a
+    /// wedged master (process up, TCP dead) reads as not-alive instead of hanging.
+    fn master_alive(&self) -> bool {
+        let argv = self.control_argv("check");
+        let Ok(mut child) = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        matches!(wait_bounded(&mut child, MASTER_CHECK_TIMEOUT), Some(s) if s.success())
+    }
+
+    /// Clear a wedged master before reusing the connection: if a control socket exists
+    /// but its master no longer answers ([`master_alive`](Self::master_alive) is false
+    /// — the TCP died while `ControlPersist` kept the process, or the socket is stale),
+    /// ask it to exit and remove the socket so the next `ControlMaster=auto` opens a
+    /// FRESH master. Without this, every reuse (probe, warmup, attach) multiplexes onto
+    /// the dead master and hangs forever. A healthy master is left untouched; a fresh
+    /// connect (no socket yet) is a no-op — no ssh is spawned.
+    fn reap_wedged_master(&self) {
+        if !self.control_path.exists() || self.master_alive() {
+            return;
+        }
+        let argv = self.control_argv("exit");
+        if let Ok(mut child) = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let _ = wait_bounded(&mut child, MASTER_CHECK_TIMEOUT);
+        }
+        // Belt and braces: `-O exit` normally removes the socket, but a truly stale one
+        // (no master to answer) needs the file cleared so a fresh master can bind it.
+        let _ = std::fs::remove_file(&self.control_path);
     }
 
     /// The full ssh argv running `remote` on the host over the shared connection.
@@ -270,6 +367,10 @@ impl RemoteSsh {
     /// reuses the now-open master with no further auth. Not for the interactive
     /// flow, which opens the master on a PTY so ssh CAN prompt.
     pub fn open_master_batch(&self) -> bool {
+        // A master left wedged by a prior run (its TCP died while `ControlPersist` kept
+        // the process) would make this `true` multiplex onto it and hang; clear it so we
+        // open a fresh one.
+        self.reap_wedged_master();
         let mut opts = self.control_opts();
         opts.extend([
             "-o".into(),
@@ -304,6 +405,9 @@ impl RemoteSsh {
         &self,
         on_progress: &mut dyn FnMut(StageProgress),
     ) -> Option<String> {
+        // Clear a wedged master up front so the probes below open (and reuse) a fresh
+        // one instead of hanging on a dead socket left by a prior run.
+        self.reap_wedged_master();
         if let Ok(path) = std::env::var(REMOTE_GHOST_ENV) {
             return self.probe(&path).then_some(path);
         }
@@ -352,12 +456,24 @@ impl RemoteSsh {
     /// [`PROBE_MARKER`] — a clean exit is not enough (a shell that echoed the
     /// command line would pass a looser check).
     fn probe(&self, candidate: &str) -> bool {
-        self.command(&[candidate, "__probe"])
-            .output()
-            .map(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(PROBE_MARKER)
-            })
-            .unwrap_or(false)
+        let mut cmd = self.command(&[candidate, "__probe"]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            return false;
+        };
+        // Bounded so a master that wedged mid-negotiation can't hang the probe forever
+        // (`reap_wedged_master` clears a KNOWN-dead master up front; this is a backstop).
+        if !matches!(wait_bounded(&mut child, PROBE_TIMEOUT), Some(s) if s.success()) {
+            return false;
+        }
+        let mut buf = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read as _;
+            let _ = out.read_to_string(&mut buf);
+        }
+        buf.contains(PROBE_MARKER)
     }
 
     /// Copy `binary` (the resolver's pick — our own exe or a prebuilt for the
@@ -527,6 +643,10 @@ mod tests {
                 "ControlPersist=60",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
                 "kov@box",
                 // Remote words are single-quoted (ssh reparses them remotely).
                 "'ghost'",
@@ -551,6 +671,10 @@ mod tests {
                 "ControlPersist=60",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
                 "kov@box",
                 "'ghost'",
                 "'ls'",
@@ -565,11 +689,11 @@ mod tests {
         // quoted, like every other invocation (ssh reparses them remotely).
         let r = remote("kov@box");
         assert_eq!(
-            &r.argv(&["ghost", "kill", "work"])[9..],
+            &r.argv(&["ghost", "kill", "work"])[13..],
             &["kov@box", "'ghost'", "'kill'", "'work'"]
         );
         assert_eq!(
-            &r.argv(&["ghost", "rename", "old", "new"])[9..],
+            &r.argv(&["ghost", "rename", "old", "new"])[13..],
             &["kov@box", "'ghost'", "'rename'", "'old'", "'new'"]
         );
     }
@@ -578,7 +702,7 @@ mod tests {
     fn watch_command_runs_ghost_watch_over_the_shared_connection() {
         let r = remote("kov@box");
         assert_eq!(
-            &r.argv(&["ghost", "__watch"])[9..],
+            &r.argv(&["ghost", "__watch"])[13..],
             &["kov@box", "'ghost'", "'__watch'"]
         );
     }
@@ -695,5 +819,71 @@ mod tests {
             "keep=3 must skip the newest 3: {s}"
         );
         assert!(s.contains("rm -f"));
+    }
+
+    #[test]
+    fn control_opts_ask_the_master_to_self_reap_a_dead_peer() {
+        // ServerAlive* make a persisting master notice a dead peer (the laptop slept /
+        // the network changed) and exit, instead of lingering wedged for the next reuse
+        // to hang on. Regression guard for the wedged-mux connect hang.
+        let opts = remote("kov@box").argv(&["true"]);
+        assert!(
+            opts.windows(2)
+                .any(|w| w == ["-o", "ServerAliveInterval=15"]),
+            "opts carry ServerAliveInterval: {opts:?}"
+        );
+        assert!(
+            opts.windows(2)
+                .any(|w| w == ["-o", "ServerAliveCountMax=3"]),
+            "opts carry ServerAliveCountMax: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn wait_bounded_kills_a_child_that_overruns_its_deadline() {
+        use std::time::{Duration, Instant};
+        // A child outrunning the timeout is killed and reported None, promptly — not
+        // after its own runtime. This is what stops a wedged ssh hanging the connect.
+        let mut slow = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let t = Instant::now();
+        assert!(wait_bounded(&mut slow, Duration::from_millis(150)).is_none());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "returned at the deadline, not after the child's 30s"
+        );
+        // A fast child is waited normally and its status returned.
+        let mut quick = Command::new("true").spawn().expect("spawn true");
+        assert!(wait_bounded(&mut quick, Duration::from_secs(5)).is_some_and(|s| s.success()));
+    }
+
+    #[test]
+    fn a_stale_control_socket_is_reaped_before_reuse() {
+        // A leftover socket whose master no longer answers must be removed so the next
+        // connect opens a FRESH master rather than multiplexing onto a dead one. A plain
+        // file stands in for a stale socket: `ssh -O check` against a non-socket fails
+        // locally (no network), so `master_alive` is false and reap removes it.
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = dir.path().join("ssh-box.ctl");
+        std::fs::write(&ctl, b"stale").unwrap();
+        let r = RemoteSsh {
+            spec: ConnectionSpec::parse_target("box").unwrap(),
+            control_path: ctl.clone(),
+        };
+        assert!(!r.master_alive(), "a non-socket path is not a live master");
+        r.reap_wedged_master();
+        assert!(!ctl.exists(), "the stale socket was removed");
+    }
+
+    #[test]
+    fn reap_is_a_no_op_when_there_is_no_socket() {
+        // A fresh connect (no socket yet) must not spawn an ssh, error, or block.
+        let r = RemoteSsh {
+            spec: ConnectionSpec::parse_target("box").unwrap(),
+            control_path: PathBuf::from("/nonexistent/ghost/ssh-box.ctl"),
+        };
+        r.reap_wedged_master();
     }
 }
