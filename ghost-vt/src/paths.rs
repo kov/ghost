@@ -148,6 +148,54 @@ pub fn recording_path(name: &str) -> PathBuf {
     recordings_dir().join(format!("{name}.ghostrec"))
 }
 
+/// A short, filesystem-safe tag for *this* machine — the creator's short
+/// hostname — used to namespace the session names the GUI mints so two ghosts
+/// on different machines sharing a home (or reconnecting a remote fleet) can't
+/// clash on `<host>-<pid>-<seq>`. Computed once and cached; empty/degenerate
+/// hostnames degrade to `"ghost"` (see [`sanitize_host`]).
+pub fn host_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| sanitize_host(&raw_hostname()))
+}
+
+/// This machine's hostname as the OS reports it, or `""` if the call fails.
+/// Kept separate from [`sanitize_host`] so the cleaning is pure and testable
+/// without touching the real host.
+fn raw_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Reduce a raw hostname to a short, lowercase, filesystem-safe tag: drop the
+/// domain (everything after the first `.`, so `kov-mbp.local` and a tailnet
+/// FQDN both collapse to their leaf), lowercase, map any non-`[a-z0-9-]` to `-`,
+/// and trim leading/trailing `-`. An empty or all-separator result degrades to
+/// `"ghost"` so a name is never left dangling on a bare `-`.
+fn sanitize_host(raw: &str) -> String {
+    let short = raw.split('.').next().unwrap_or(raw);
+    let cleaned: String = short
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "ghost".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +241,41 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share")),
         );
         assert_eq!(got, PathBuf::from("/home/u/.local/state/ghost"));
+    }
+
+    #[test]
+    fn sanitize_host_shortens_lowercases_and_cleans() {
+        // A plain short name passes through untouched.
+        assert_eq!(sanitize_host("alface"), "alface");
+        // The domain is dropped and the leaf lowercased (macOS `.local`).
+        assert_eq!(sanitize_host("Kov-MBP.local"), "kov-mbp");
+        // A tailnet FQDN collapses to its leaf label.
+        assert_eq!(sanitize_host("host.tailnet.ts.net"), "host");
+        // Illegal characters become separators.
+        assert_eq!(sanitize_host("weird_host!"), "weird-host");
+    }
+
+    #[test]
+    fn sanitize_host_degrades_degenerate_input_to_ghost() {
+        // A hostname that cleans to nothing must never leave a name dangling on
+        // a bare separator — it degrades to the "ghost" tag instead.
+        assert_eq!(sanitize_host(""), "ghost");
+        assert_eq!(sanitize_host("..."), "ghost");
+        assert_eq!(sanitize_host("--x--"), "x");
+        assert_eq!(sanitize_host("___"), "ghost");
+    }
+
+    #[test]
+    fn host_tag_is_nonempty_and_clean() {
+        // Whatever this machine is called, the tag is a usable name fragment:
+        // non-empty, lowercase, and only `[a-z0-9-]` with no edge separators.
+        let tag = host_tag();
+        assert!(!tag.is_empty());
+        assert_eq!(tag, &tag.to_ascii_lowercase());
+        assert!(
+            tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "tag {tag:?} has illegal characters"
+        );
+        assert!(!tag.starts_with('-') && !tag.ends_with('-'));
     }
 }

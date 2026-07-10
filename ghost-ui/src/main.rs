@@ -677,7 +677,7 @@ fn exec_headless(session: &mut Session, cmds: &[Cmd]) {
 }
 
 fn capture(path: PathBuf) {
-    let name = format!("ghost-ui-cap-{}", std::process::id());
+    let name = format!("{}-cap-{}", ghost_vt::paths::host_tag(), std::process::id());
     let command = match std::env::var("GHOST_CMD") {
         Ok(c) => vec!["sh".to_string(), "-c".to_string(), c],
         Err(_) => vec![
@@ -1071,7 +1071,7 @@ fn interactive(fresh: bool) {
                     StartupChoice::Attach(name) => Startup::Single(name),
                     StartupChoice::Fleet => Startup::Fleet,
                     StartupChoice::Spawn => {
-                        let n = format!("ghost-ui-{}", std::process::id());
+                        let n = format!("{}-{}", ghost_vt::paths::host_tag(), std::process::id());
                         spawn_session(&n, vec![], None);
                         Startup::Single(n)
                     }
@@ -2381,7 +2381,12 @@ impl App {
     fn unique_session_name(&mut self) -> String {
         let seq = self.next_session_seq;
         self.next_session_seq += 1;
-        format!("ghost-ui-{}-{}", std::process::id(), seq)
+        format!(
+            "{}-{}-{}",
+            ghost_vt::paths::host_tag(),
+            std::process::id(),
+            seq
+        )
     }
 
     /// Mint a new window's group identity: a process-unique durable id and
@@ -4297,6 +4302,25 @@ mod tests {
             assert!(win.root.is_fleet(), "it opened in the fleet overview");
             assert!(!fe.exited.get(), "opening a window does not quit the app");
         });
+    }
+
+    #[test]
+    fn unique_session_name_prefixes_the_creator_host_and_increments() {
+        // Session names are namespaced by *this* machine's host tag (so two
+        // ghosts on different hosts sharing a home can't clash) followed by
+        // `<pid>-<seq>`, where seq increments per mint.
+        let mut app = App::headless();
+        let host = ghost_vt::paths::host_tag();
+        let pid = std::process::id();
+
+        let first = app.unique_session_name();
+        let second = app.unique_session_name();
+
+        assert_eq!(first, format!("{host}-{pid}-0"));
+        assert_eq!(second, format!("{host}-{pid}-1"));
+        assert_ne!(first, second);
+        // The legacy hardcoded prefix is gone.
+        assert!(!first.starts_with("ghost-ui-"));
     }
 
     #[test]
