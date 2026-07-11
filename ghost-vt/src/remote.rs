@@ -319,7 +319,14 @@ impl RemoteSsh {
     /// FRESH master. Without this, every reuse (probe, warmup, attach) multiplexes onto
     /// the dead master and hangs forever. A healthy master is left untouched; a fresh
     /// connect (no socket yet) is a no-op — no ssh is spawned.
-    fn reap_wedged_master(&self) {
+    ///
+    /// Public for callers that open the master *themselves* rather than through
+    /// [`open_master_batch`](Self::open_master_batch) / [`negotiate`](Self::negotiate)
+    /// — the GUI's interactive connect spawns [`warmup_argv`](Self::warmup_argv) on a
+    /// PTY, and a stale socket there would make ssh "disable multiplexing": the
+    /// warm-up would authenticate a one-shot connection and leave no master for the
+    /// PTY-less probes that follow.
+    pub fn reap_wedged_master(&self) {
         if !self.control_path.exists() || self.master_alive() {
             return;
         }

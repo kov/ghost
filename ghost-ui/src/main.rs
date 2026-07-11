@@ -2525,6 +2525,15 @@ impl App {
         spec: ConnectionSpec,
         name: String,
     ) -> io::Result<ConnectSetup> {
+        // A stale/wedged master would derail the warm-up: ssh "disables
+        // multiplexing" against a dead socket, authenticating a one-shot connection
+        // and leaving NO master for the PTY-less worker probes that follow (fatal
+        // on a password-auth host). Clear it first — the same guard
+        // `open_master_batch` and `negotiate` apply to their flows — so the warm-up
+        // itself opens the fresh master under the user's PTY auth. Cheap on the
+        // event loop: a healthy master answers `-O check` in milliseconds and a
+        // dead socket refuses instantly.
+        remote.reap_wedged_master();
         let (pty, pts) = pty_process::blocking::open().map_err(io::Error::other)?;
         pty.resize(pty_process::Size::new(24, 80))
             .map_err(io::Error::other)?;
@@ -4346,6 +4355,34 @@ mod tests {
                 app.windows.get(&wid).unwrap().root.is_connecting(),
                 "this window now shows the connect prompt"
             );
+        });
+    }
+
+    #[test]
+    fn start_connect_reaps_a_stale_control_socket_before_the_warmup() {
+        // A stale control socket (a crashed or rebooted master — the runtime dir is
+        // durable on macOS, so the file survives) makes the warm-up ssh "disable
+        // multiplexing": it authenticates a one-shot connection and leaves NO
+        // master, so the connect worker's PTY-less probes cannot re-auth on a
+        // password host and the transport silently degrades to the ssh child. The
+        // interactive connect must clear a dead socket up front — the same guard
+        // `open_master_batch` and `negotiate` apply to their flows — so the warm-up
+        // itself opens the fresh master under the user's PTY auth.
+        with_isolated_xdg(|| {
+            let spec = ConnectionSpec::parse_target("ghost-reap-test.invalid").unwrap();
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            // The per-target control path is deterministic (non-alphanumerics
+            // become `_`; see `control_path_sanitizes_the_target` in ghost-vt).
+            let ctl = ghost_vt::paths::runtime_dir().join("ssh-ghost_reap_test_invalid.ctl");
+            std::fs::write(&ctl, b"stale").unwrap();
+            // The warm-up targets an unresolvable host so it exits on its own;
+            // the setup's Drop kills it regardless.
+            let setup = App::start_connect(remote, spec, "s".into());
+            assert!(
+                !ctl.exists(),
+                "the stale control socket was reaped before the warm-up spawned"
+            );
+            drop(setup);
         });
     }
 
