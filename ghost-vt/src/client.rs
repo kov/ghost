@@ -245,9 +245,16 @@ impl Subscriber {
 pub struct Pump {
     /// Child output bytes to render, in arrival order.
     pub output: Vec<u8>,
-    /// `true` once the session has ended — the child exited or the host closed
-    /// the connection. No further output will arrive.
+    /// `true` once no further output will arrive on this transport — either the
+    /// child exited ([`ServerMsg::Exited`]) or the connection closed (EOF).
     pub ended: bool,
+    /// Set alongside `ended` **only** when the end was the transport closing (EOF)
+    /// rather than an explicit [`ServerMsg::Exited`]. For a *local* session these
+    /// are the same thing (the host process is gone), but for a *remote* session an
+    /// EOF is a lost connection whose session may still be alive on the far side —
+    /// so the caller can try to reconnect and resync instead of tearing the tile
+    /// down. A clean child exit leaves this `false`.
+    pub disconnected: bool,
 }
 
 /// An attached session for an event-loop front-end (a GUI): attach and
@@ -401,7 +408,12 @@ impl Session {
     pub fn pump(&mut self) -> io::Result<Pump> {
         let mut pump = Pump::default();
         match self.client.recv_ready()? {
-            None => pump.ended = true,
+            None => {
+                // The transport closed with no `Exited` — a lost connection, not a
+                // clean end (a remote session may still be alive to reconnect to).
+                pump.ended = true;
+                pump.disconnected = true;
+            }
             Some(msgs) => {
                 for msg in msgs {
                     match msg {
@@ -751,5 +763,54 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = tcsetattr(self.fd, OptionalActions::Now, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::AnyTransport;
+    use std::os::unix::net::UnixStream;
+
+    /// A `Session` on one end of a socketpair, plus a [`Conn`] on the other end
+    /// standing in for the host — send `ServerMsg`s or drop it to close.
+    fn paired_session() -> (Conn<AnyTransport>, Session) {
+        let (host, cli) = UnixStream::pair().unwrap();
+        cli.set_nonblocking(true).unwrap();
+        let host = Conn::new(AnyTransport::Unix(host));
+        let session = Session {
+            name: "t".into(),
+            client: Client {
+                conn: Conn::new(AnyTransport::Unix(cli)),
+                proto: crate::protocol::PROTO_LEVEL,
+            },
+        };
+        (host, session)
+    }
+
+    /// The distinction the mid-session reconnect feature turns on: `pump` must tell
+    /// a lost connection (transport EOF → `disconnected`, the session may still live
+    /// on the far side) from a clean child exit (`ServerMsg::Exited` → not
+    /// `disconnected`, the child is gone). Before this split both were an
+    /// undifferentiated `ended`, so a dropped remote connection was torn down like
+    /// an exit and never reconnected.
+    #[test]
+    fn pump_flags_a_dropped_connection_but_not_a_clean_exit() {
+        // A clean exit: an explicit `Exited` frame ends the session, not dropped.
+        let (mut host, mut session) = paired_session();
+        host.send(&ServerMsg::Exited(0)).unwrap();
+        let p = session.pump().unwrap();
+        assert!(p.ended, "an Exited frame ends the session");
+        assert!(!p.disconnected, "a clean exit is not a dropped connection");
+
+        // A lost connection: the peer closes with no `Exited` → disconnected.
+        let (host, mut session) = paired_session();
+        drop(host);
+        let p = session.pump().unwrap();
+        assert!(p.ended, "a closed connection ends the session");
+        assert!(
+            p.disconnected,
+            "a closed connection is flagged disconnected"
+        );
     }
 }

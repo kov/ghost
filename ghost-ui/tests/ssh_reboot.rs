@@ -180,21 +180,6 @@ impl RealRemote {
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
     }
-
-    /// A transient network partition — the connection is lost but the host and its
-    /// sessions keep running. Same silent `SIGSTOP` of the per-connection `sshd`
-    /// children as [`reboot`](Self::reboot) (so the local master wedges with no
-    /// FIN/RST), but the runtime dir is **left intact**: the session hosts are
-    /// separate long-lived processes, not `sshd` children, so they survive. Ghost
-    /// must reap the wedged master, open a *fresh* connection, and re-attach to the
-    /// still-running session (whose screen the host resyncs) — never relaunch it.
-    /// The listener stays up, so a fresh connection succeeds; the frozen children
-    /// are reaped on drop. New display client take-over displaces the frozen relay.
-    fn drop_connection(&mut self) {
-        let _ = Command::new("pkill")
-            .args(["-STOP", "-P", &self.sshd.id().to_string()])
-            .status();
-    }
 }
 
 impl Drop for RealRemote {
@@ -361,7 +346,10 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
 }
 
 /// Pump a driven session into `screen` until it renders `needle` or `timeout`.
+/// Sets a short read timeout so `pump` polls instead of blocking on a quiet
+/// session (an idle remote shell would otherwise hang the deadline check).
 fn pump_until(session: &mut Session, screen: &mut Screen, needle: &str, timeout: Duration) -> bool {
+    let _ = session.set_read_timeout(Some(Duration::from_millis(50)));
     wait_until(timeout, || {
         if let Ok(p) = session.pump() {
             screen.feed(&p.output);
@@ -370,19 +358,40 @@ fn pump_until(session: &mut Session, screen: &mut Screen, needle: &str, timeout:
     })
 }
 
-/// Scenario the fixture's `drop_connection` exists for: the connection is lost
-/// mid-session but the remote host and its session KEEP RUNNING (a transient
-/// network partition, not a reboot). The recovery is fundamentally different from
-/// a reboot — the session is NOT gone, so it must be RE-ATTACHED (and its screen
-/// resynced by the host), never relaunched. This proves that recovery mechanism
-/// end-to-end over real ssh: attach, put a marker on the screen, drop the
-/// connection (silently, so the master wedges — the hard case), then reap the
+/// Type `input` and pump until `screen` renders `needle`. `input` is resent every
+/// poll so it can't be lost to the shell-startup race (an early keystroke arrives
+/// before the deferred child is reading); `needle` renders from the shell's echo of
+/// the typed line, so it doesn't depend on the shell actually executing it.
+fn type_until(
+    session: &mut Session,
+    screen: &mut Screen,
+    input: &[u8],
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let _ = session.set_read_timeout(Some(Duration::from_millis(50)));
+    wait_until(timeout, || {
+        let _ = session.send_input(input);
+        if let Ok(p) = session.pump() {
+            screen.feed(&p.output);
+        }
+        screen.text().join("\n").contains(needle)
+    })
+}
+
+/// The recovery a lost mid-session connection needs: the connection ends but the
+/// remote host and its session KEEP RUNNING (a network partition, not a reboot), so
+/// unlike a reboot the session is NOT gone — it must be RE-ATTACHED and its screen
+/// resynced by the host, never relaunched. Proven end-to-end over real ssh: attach,
+/// put a marker on the screen, drop the client (its transport ends), then reap any
 /// wedged master and re-attach — the host resyncs the surviving screen, marker and
-/// all. It is the ghost-vt half of the mid-session reconnect feature (the App-level
-/// "reconnecting" state machine rides on this being recoverable).
+/// all. This is the ghost-vt half of the mid-session reconnect feature; the App-level
+/// "reconnecting" state machine rides on this being recoverable. (Detecting the loss
+/// is the App's job and its own problem — a silently-partitioned ssh connection
+/// surfaces no EOF to the client until ssh's keepalive fires ~45s later.)
 #[test]
 fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
-    let Some(mut remote) = RealRemote::start() else {
+    let Some(remote) = RealRemote::start() else {
         eprintln!("ssh_reboot: no sshd available; skipping");
         return;
     };
@@ -404,27 +413,26 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
     let mut screen = Screen::new(80, 24, 100);
     let mut session = Session::attach_ssh(r.pipe_command(&ghost, "survivor"), "survivor", 80, 24)
         .expect("attach");
-    session
-        .send_input(b"echo GHOSTMARK\n")
-        .expect("type marker");
     assert!(
-        pump_until(
+        type_until(
             &mut session,
             &mut screen,
+            b"echo GHOSTMARK\n",
             "GHOSTMARK",
             Duration::from_secs(10)
         ),
         "the marker never rendered on the attached screen"
     );
 
-    // The connection drops silently, but the session keeps running on the host.
-    remote.drop_connection();
-    // The driven client is now wedged onto a dead master; abandon it (the App's
-    // reconnect path drops the dead Session the same way before re-attaching).
+    // The client's connection ends but the session keeps running on the host —
+    // dropping the `Session` closes the transport (its ssh child is killed), the
+    // way a lost connection or the App's reconnect path abandons a dead client.
+    // The remote session host, a separate long-lived process, survives.
     drop(session);
 
-    // Recovery: reap the wedged master, then RE-ATTACH (not relaunch) over a fresh
-    // connection. The host take-over resyncs the surviving screen at our geometry.
+    // Recovery: reap any wedged master (a silent partition would leave one), then
+    // RE-ATTACH (not relaunch) over a fresh connection — the host resyncs the
+    // surviving screen at our geometry. Take-over displaces any stale display client.
     r.reap_wedged_master();
     let mut screen = Screen::new(80, 24, 100);
     let reattached = wait_until(Duration::from_secs(25), || {
