@@ -2572,6 +2572,39 @@ impl App {
         }
     }
 
+    /// A single-view restored remote session whose host is reachable but whose
+    /// session is GONE — the host rebooted while ghost was off, wiping its tmpfs
+    /// sessions. Relaunch it on the host and re-attach, the startup-restore
+    /// counterpart of respawning a dead LOCAL session (a local dead session is
+    /// relaunched+seeded on restore; a remote one must be recreated on its host).
+    /// `ghost new -d` returns before the session is fully listening, so re-attach
+    /// is retried on a tight budget; a lasting failure returns false and leaves the
+    /// tile cold. Blocking, but bounded and only on the restore path — which already
+    /// does synchronous ssh handshakes here. Returns whether the tile is now driven.
+    fn relaunch_remote_and_attach(
+        &mut self,
+        wid: WindowId,
+        host: &RemoteHost,
+        composite: &str,
+        real: &str,
+    ) -> bool {
+        host.remote.reap_wedged_master();
+        if host.remote.spawn_host(&host.remote_ghost, real).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let cmd = host.remote.pipe_command(&host.remote_ghost, real);
+            if self.attach_ssh_into(wid, composite, cmd) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
         let Some(w) = self.windows.get_mut(&wid) else {
             return false;
@@ -2943,7 +2976,11 @@ impl App {
                 continue;
             }
             let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
-            if !self.attach_ssh_into(wid, &composite, cmd) {
+            if !self.attach_ssh_into(wid, &composite, cmd)
+                && !self.relaunch_remote_and_attach(wid, &host, &composite, &real)
+            {
+                // Host reachable but the session is gone AND could not be
+                // relaunched — leave the tile cold, as before.
                 continue;
             }
             if foreground {
