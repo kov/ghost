@@ -1163,6 +1163,14 @@ fn choose_alpha_mode(
     modes[0]
 }
 
+/// Whether to request compositor backdrop-blur for a window. Blur is only
+/// meaningful behind a translucent surface (the compositor blurs what shows
+/// through), so it rides on the same `want_transparent` gate as the window's
+/// alpha — an opaque window never asks for it, even if the config opts in.
+fn want_blur(want_transparent: bool, cfg_blur: bool) -> bool {
+    want_transparent && cfg_blur
+}
+
 /// Pick the surface (swapchain) format. Our shader writes colours that are
 /// already sRGB-encoded 8-bit bytes — the offscreen golden target is
 /// [`ghost_renderer::FORMAT`] (`Rgba8Unorm`) — so the swapchain must be a plain
@@ -1207,14 +1215,15 @@ struct Graphics {
 }
 
 impl Graphics {
-    fn new(
-        event_loop: &ActiveEventLoop,
-        theme: ghost_renderer::Theme,
-        option_as_meta: bool,
-        cols: u16,
-        rows: u16,
-        pad: f32,
-    ) -> Self {
+    fn new(event_loop: &ActiveEventLoop, spec: WindowSpec) -> Self {
+        let WindowSpec {
+            theme,
+            option_as_meta,
+            blur,
+            cols,
+            rows,
+            pad,
+        } = spec;
         // Open sized to `cols`x`rows` cells at the base font, plus the padding border on
         // each side, so the configured grid fits inside it (padding surrounds, not eats
         // into, the grid). A LOGICAL size (not physical) so winit scales it by the monitor
@@ -1232,11 +1241,15 @@ impl Graphics {
         // Bench mode measures the render path at a realistic size, so open maximized
         // (the small default grid would understate per-frame raster cost).
         let maximized = std::env::var_os("GHOST_BENCH").is_some();
+        // Ask the compositor for backdrop-blur only when the window is both
+        // translucent and configured for it — blur without transparency is a
+        // no-op state (see `want_blur`), and honoured only on KWin/macOS anyway.
         let attrs = Window::default_attributes()
             .with_title("ghost")
             .with_inner_size(size)
             .with_maximized(maximized)
-            .with_transparent(want_transparent);
+            .with_transparent(want_transparent)
+            .with_blur(want_blur(want_transparent, blur));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
         // On macOS, optionally treat Option as Meta (ESC-prefix) rather than
@@ -1362,6 +1375,9 @@ impl Graphics {
 struct WindowSpec {
     theme: ghost_renderer::Theme,
     option_as_meta: bool,
+    /// Request compositor backdrop-blur ("frosted glass") behind the translucent
+    /// background. Inert unless the theme is translucent; see [`want_blur`].
+    blur: bool,
     cols: u16,
     rows: u16,
     pad: f32,
@@ -1400,14 +1416,7 @@ struct WinitFrontend<'a> {
 
 impl Frontend for WinitFrontend<'_> {
     fn open_window(&self, spec: WindowSpec) -> NewWindow {
-        let gfx = Graphics::new(
-            self.event_loop,
-            spec.theme,
-            spec.option_as_meta,
-            spec.cols,
-            spec.rows,
-            spec.pad,
-        );
+        let gfx = Graphics::new(self.event_loop, spec);
         let id = gfx.window.id();
         let scale = gfx.window.scale_factor();
         let size_px = gfx.size();
@@ -3167,6 +3176,7 @@ impl App {
         } = event_loop.open_window(WindowSpec {
             theme: cfg.theme(),
             option_as_meta: cfg.option_as_meta(),
+            blur: cfg.blur(),
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
@@ -3420,6 +3430,7 @@ impl App {
         } = event_loop.open_window(WindowSpec {
             theme: cfg.theme(),
             option_as_meta: cfg.option_as_meta(),
+            blur: cfg.blur(),
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
@@ -4274,7 +4285,7 @@ mod tests {
         App, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice, auth_error_message,
         choose_alpha_mode, choose_surface_format, connect_outcome_wanted, home_launch_dir,
         inherited_connection, namespace_remote_infos, new_window_choice, password_prompt,
-        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
+        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice, want_blur,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -5587,6 +5598,17 @@ mod tests {
             choose_alpha_mode(&[Opaque, PreMultiplied], false, Metal),
             Opaque
         );
+    }
+
+    #[test]
+    fn blur_requested_only_when_translucent_and_configured() {
+        // Blur rides on transparency: it's requested only when the window is
+        // both translucent AND the config opts in. The full 2×2 truth table
+        // pins the AND against a future edit that drops the transparency gate.
+        assert!(want_blur(true, true));
+        assert!(!want_blur(true, false));
+        assert!(!want_blur(false, true));
+        assert!(!want_blur(false, false));
     }
 
     #[test]

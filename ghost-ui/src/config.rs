@@ -165,6 +165,11 @@ struct Window {
     /// Background opacity, 0.0..=1.0 (clamped on apply). Only the default
     /// background goes translucent; SGR-coloured cells stay opaque. 1.0 = solid.
     opacity: f32,
+    /// Request compositor backdrop-blur behind the translucent background
+    /// ("frosted glass"). Honoured on KDE/KWin (and other `org_kde_kwin_blur`
+    /// compositors) and macOS; a no-op elsewhere. Only meaningful when `opacity`
+    /// is below 1.0. Off by default.
+    blur: bool,
     /// Initial window grid in character cells (clamped on apply). The window opens
     /// sized to hold this many columns/rows at the base font; it can be resized after.
     columns: u16,
@@ -178,6 +183,7 @@ impl Default for Window {
     fn default() -> Self {
         Window {
             opacity: 1.0,
+            blur: false,
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
             padding: DEFAULT_PADDING,
@@ -267,6 +273,12 @@ impl UiConfig {
             1.0
         };
         theme
+    }
+
+    /// Whether to request compositor backdrop-blur behind the translucent
+    /// background. Off by default; a no-op on compositors without blur support.
+    pub fn blur(&self) -> bool {
+        self.window.blur
     }
 
     /// The persisted font zoom (raw; the model clamps it to its bounds). 1.0
@@ -481,6 +493,24 @@ mod tests {
                 .unwrap()
                 .option_as_meta()
         );
+    }
+
+    #[test]
+    fn window_blur_parses_and_defaults_off() {
+        // Default, empty, and a present-but-empty [window] table request no blur.
+        assert!(!UiConfig::default().blur());
+        assert!(!UiConfig::parse("").unwrap().blur());
+        assert!(!UiConfig::parse("[window]\n").unwrap().blur());
+        // An explicit opt-in asks the compositor for backdrop blur.
+        assert!(UiConfig::parse("[window]\nblur = true\n").unwrap().blur());
+        assert!(!UiConfig::parse("[window]\nblur = false\n").unwrap().blur());
+        // Blur coexists with the rest of the [window] table (it's meaningful
+        // only alongside a translucent opacity, but parses independently).
+        let both =
+            UiConfig::parse("[window]\nopacity = 0.8\nblur = true\ncolumns = 120\n").unwrap();
+        assert!(both.blur());
+        assert_eq!(both.theme().bg_alpha, 0.8);
+        assert_eq!(both.columns(), 120);
     }
 
     #[test]
