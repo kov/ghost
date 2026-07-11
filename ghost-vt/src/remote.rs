@@ -25,6 +25,12 @@ const MASTER_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`RemoteSsh::reap_wedged_master`] normally clears a dead master first, so a probe
 /// runs over a fresh one; this only bites if a master wedges mid-negotiation.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a no-op forced over the existing master may run before we treat the
+/// master as wedged. `ssh -O check` can't see a peer that vanished silently (a
+/// remote reboot / partition drops the link with no FIN/RST), so
+/// [`RemoteSsh::master_alive`] confirms with this bounded round-trip; a healthy
+/// master answers in milliseconds.
+const WEDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Wait for `child`, killing it (and returning `None`) if it outruns `timeout`.
 /// Polls rather than blocking so a wedged ssh can't hang the caller forever. Used
@@ -224,8 +230,14 @@ impl RemoteSsh {
     /// A connection to `spec`'s host, with a per-target control socket under the
     /// runtime dir (created if missing).
     pub fn new(spec: ConnectionSpec) -> io::Result<Self> {
-        let dir = crate::paths::runtime_dir();
-        std::fs::create_dir_all(&dir)?;
+        Self::new_in(spec, &crate::paths::runtime_dir())
+    }
+
+    /// Like [`new`](Self::new) but with an explicit directory for the control
+    /// socket. Tests inject a short path: a unix socket's `sun_path` is capped at
+    /// 108 bytes, so a deep tempdir would overflow `ControlPath`.
+    pub fn new_in(spec: ConnectionSpec, dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
         let control_path = dir.join(format!("ssh-{}.ctl", sanitize(&spec.target())));
         Ok(RemoteSsh { spec, control_path })
     }
@@ -296,10 +308,9 @@ impl RemoteSsh {
         ]
     }
 
-    /// Whether the shared master is alive and answering — `ssh -O check`, bounded so a
-    /// wedged master (process up, TCP dead) reads as not-alive instead of hanging.
-    fn master_alive(&self) -> bool {
-        let argv = self.control_argv("check");
+    /// Spawn `argv` with null stdio and return whether it exits 0 within `bound`
+    /// ([`wait_bounded`] kills and reports false on overrun).
+    fn run_bounded(&self, argv: &[String], bound: Duration) -> bool {
         let Ok(mut child) = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
@@ -309,7 +320,38 @@ impl RemoteSsh {
         else {
             return false;
         };
-        matches!(wait_bounded(&mut child, MASTER_CHECK_TIMEOUT), Some(s) if s.success())
+        matches!(wait_bounded(&mut child, bound), Some(s) if s.success())
+    }
+
+    /// Whether the shared master is alive AND its connection is actually usable.
+    ///
+    /// `ssh -O check` proves only that the local master PROCESS answers the control
+    /// socket. A master whose peer vanished *silently* — a remote reboot or network
+    /// partition drops the link with no FIN/RST — keeps reporting "running" for the
+    /// whole `ServerAlive` keepalive window (~45s). Trusting `-O check` there leaves
+    /// [`reap_wedged_master`](Self::reap_wedged_master) skipping the corpse, so every
+    /// reuse (and every reconnect after the host returns) multiplexes onto a dead
+    /// connection and hangs. So confirm with a bounded no-op forced *over* the
+    /// existing master (`ControlMaster=no` reuses it, never opens a fresh one): a
+    /// healthy master answers in milliseconds; a wedged one hangs until the bound
+    /// and reads as not-alive, so the master is reaped and the next connect opens a
+    /// fresh one.
+    fn master_alive(&self) -> bool {
+        if !self.run_bounded(&self.control_argv("check"), MASTER_CHECK_TIMEOUT) {
+            return false;
+        }
+        let opts = vec![
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            format!("ControlPath=\"{}\"", self.control_path.display()),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ];
+        self.run_bounded(
+            &self.spec.ssh_command(&opts, &["true"]),
+            WEDGE_PROBE_TIMEOUT,
+        )
     }
 
     /// Clear a wedged master before reusing the connection: if a control socket exists
