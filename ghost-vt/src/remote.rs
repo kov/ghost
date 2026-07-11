@@ -645,8 +645,17 @@ impl RemoteSsh {
 
     /// The `ssh … <remote_ghost> __pipe <name>` command whose stdio the client
     /// attaches over — the far end relays it to the remote host's control socket.
+    ///
+    /// The relay's stderr is discarded: when the session is gone (e.g. right after
+    /// a remote reboot) `ghost __pipe` prints "cannot reach session …", ssh forwards
+    /// it to our stderr, and the observe/attach retries turn it into a storm. The
+    /// local side already reports any attach/observe failure, so the far-side copy is
+    /// pure noise. ssh's OWN diagnostics (host-key, auth) aren't lost — they belong
+    /// to the warmup/negotiate ssh that opens the master, not this reuse of it.
     pub fn pipe_command(&self, remote_ghost: &str, name: &str) -> Command {
-        self.command(&[remote_ghost, "__pipe", name])
+        let mut c = self.command(&[remote_ghost, "__pipe", name]);
+        c.stderr(Stdio::null());
+        c
     }
 
     /// The `ssh … <remote_ghost> __watch` command whose stdout streams the host's
