@@ -288,3 +288,49 @@ fn ghost_reconnects_a_remote_after_a_reboot() {
          reconnect, but it never did within 20s"
     );
 }
+
+/// The recovery *mechanism* a dead REMOTE tile relies on: a session on the remote
+/// is lost when the reboot wipes its tmpfs runtime dir, but ghost can recreate it
+/// on the returned host over the transport (`spawn_host` = `ghost new -d`). That's
+/// what `Cmd::Recreate`/`Cmd::Resurrect` route a remote id to (ghost-ui/src/main.rs)
+/// instead of the local `spawn_dead` that refuses a remote id. Proven end-to-end
+/// over real ssh, riding the same silent-reboot reconnect as the test above.
+#[test]
+fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
+    let Some(mut remote) = RealRemote::start() else {
+        eprintln!("ssh_reboot: no sshd available; skipping");
+        return;
+    };
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+    let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+    let ghost = r.negotiate().expect("initial negotiate");
+
+    let listed = |ghost: &str| {
+        r.list_sessions(ghost)
+            .map(|s| s.iter().any(|i| i.name == "recovered"))
+            .unwrap_or(false)
+    };
+
+    // A session exists on the remote before the reboot.
+    r.spawn_host(&ghost, "recovered")
+        .expect("spawn remote session");
+    assert!(
+        wait_until(Duration::from_secs(5), || listed(&ghost)),
+        "the session was never listed on the remote before the reboot"
+    );
+
+    remote.reboot(); // wipes the runtime dir → the session's socket is gone
+
+    // Recovery mirrors exactly what App::respawn_remote_dead / spawn_remote_session
+    // now do: reap the wedged master, then relaunch on the host over a fresh
+    // connection — reusing the known remote-ghost path, NOT re-negotiating (the
+    // recovery path holds the already-negotiated host). Pre-fix this failed: the
+    // relaunch multiplexed onto the wedged master.
+    r.reap_wedged_master();
+    r.spawn_host(&ghost, "recovered")
+        .expect("relaunch on the returned host");
+    assert!(
+        wait_until(Duration::from_secs(10), || listed(&ghost)),
+        "the remote session did not come back after relaunch on its host"
+    );
+}

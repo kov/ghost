@@ -2221,8 +2221,16 @@ impl App {
                     }
                 }
                 Cmd::Recreate(id) => {
-                    // Bring a dead session back and step into it.
-                    if self.respawn_dead(wid, &id) && self.attach_into(wid, &id) {
+                    // Bring a dead session back and step into it. A REMOTE tile is
+                    // recreated on ITS HOST over the transport, never as a local
+                    // shell — route by the self-describing composite id (like
+                    // Cmd::Kill below); `spawn_remote_session` recreates + attaches +
+                    // adopts, the remote counterpart of the local branch here.
+                    if let Some((target, real)) =
+                        remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
+                    {
+                        self.spawn_remote_session(wid, &target, &real, event_loop);
+                    } else if self.respawn_dead(wid, &id) && self.attach_into(wid, &id) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
@@ -2231,8 +2239,17 @@ impl App {
                     // back (serving its seeded screen), but nothing attaches —
                     // the child command starts when the user first opens the
                     // session, and the runtime-dir watcher's re-list revives
-                    // the tile. A failed spawn just leaves the tile dead.
-                    self.respawn_dead(wid, &id);
+                    // the tile. A failed spawn just leaves the tile dead. A REMOTE
+                    // member is recreated on its host over the transport, not locally
+                    // (a remote reboot wipes the host's sessions — this is what brings
+                    // them back).
+                    if let Some((target, real)) =
+                        remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
+                    {
+                        self.respawn_remote_dead(&target, &real);
+                    } else {
+                        self.respawn_dead(wid, &id);
+                    }
                 }
                 Cmd::Rename { session, name } => {
                     // A remote session renames over its host's transport (off-loop);
@@ -2527,6 +2544,32 @@ impl App {
             w.dead_fed.remove(id);
         }
         true
+    }
+
+    /// Relaunch a dead REMOTE session on its host over the transport (`ghost new
+    /// -d <real>`), the remote counterpart of [`respawn_dead`](Self::respawn_dead):
+    /// a remote reboot wipes the host's tmpfs sessions, so recovery must recreate
+    /// them on the host, never as a local shell (which `spawn_dead` refuses).
+    /// Best-effort and attach-free — the watcher's next listing revives the tile
+    /// (the background half of a group relaunch); the interactive Recreate uses
+    /// [`spawn_remote_session`](Self::spawn_remote_session), which also steps in.
+    fn respawn_remote_dead(&self, target: &str, real: &str) {
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned());
+        let Some(host) = host else {
+            eprintln!("ghost: no live connection to {target} to relaunch '{real}'");
+            return;
+        };
+        // A silent remote reboot leaves the shared master wedged (TCP dead, process
+        // kept by ControlPersist); clear it so the relaunch opens a fresh connection
+        // instead of multiplexing onto the corpse.
+        host.remote.reap_wedged_master();
+        if let Err(e) = host.remote.spawn_host(&host.remote_ghost, real) {
+            eprintln!("ghost: could not relaunch remote session '{real}' on {target}: {e}");
+        }
     }
 
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
@@ -3097,6 +3140,10 @@ impl App {
             eprintln!("ghost: no live connection to {target} to open a session on");
             return;
         };
+        // Recovery (a dead remote tile's Recreate) reaches here after a reboot may
+        // have wedged the shared master; clear it so the spawn opens a fresh
+        // connection. A no-op on the healthy interactive new-session path.
+        host.remote.reap_wedged_master();
         if let Err(e) = host.remote.spawn_host(&host.remote_ghost, name) {
             eprintln!("ghost: could not open a session on {target}: {e}");
             return;
