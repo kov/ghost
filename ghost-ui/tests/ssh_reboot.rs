@@ -28,10 +28,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use ghost_vt::client::Session;
 use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::remote::RemoteSsh;
+use ghost_vt::screen::Screen;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
+
+/// `GHOST_REMOTE_GHOST` is a process-global env var each test points at its own
+/// isolated remote wrapper, so these real-`sshd` tests must not run concurrently or
+/// they'd read each other's remote binary. Serialize them (recovering from a
+/// poisoned lock so one test's panic doesn't cascade into "all skipped").
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Locate an `sshd` binary, or `None` so the caller can skip on a host without one.
 fn find_sshd() -> Option<PathBuf> {
@@ -172,6 +180,21 @@ impl RealRemote {
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
     }
+
+    /// A transient network partition — the connection is lost but the host and its
+    /// sessions keep running. Same silent `SIGSTOP` of the per-connection `sshd`
+    /// children as [`reboot`](Self::reboot) (so the local master wedges with no
+    /// FIN/RST), but the runtime dir is **left intact**: the session hosts are
+    /// separate long-lived processes, not `sshd` children, so they survive. Ghost
+    /// must reap the wedged master, open a *fresh* connection, and re-attach to the
+    /// still-running session (whose screen the host resyncs) — never relaunch it.
+    /// The listener stays up, so a fresh connection succeeds; the frozen children
+    /// are reaped on drop. New display client take-over displaces the frozen relay.
+    fn drop_connection(&mut self) {
+        let _ = Command::new("pkill")
+            .args(["-STOP", "-P", &self.sshd.id().to_string()])
+            .status();
+    }
 }
 
 impl Drop for RealRemote {
@@ -272,6 +295,7 @@ fn ghost_reconnects_a_remote_after_a_reboot() {
         return;
     };
     // Point negotiation at the isolated remote binary. This binary's only test.
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
@@ -301,6 +325,7 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
         eprintln!("ssh_reboot: no sshd available; skipping");
         return;
     };
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     let ghost = r.negotiate().expect("initial negotiate");
@@ -332,5 +357,86 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
     assert!(
         wait_until(Duration::from_secs(10), || listed(&ghost)),
         "the remote session did not come back after relaunch on its host"
+    );
+}
+
+/// Pump a driven session into `screen` until it renders `needle` or `timeout`.
+fn pump_until(session: &mut Session, screen: &mut Screen, needle: &str, timeout: Duration) -> bool {
+    wait_until(timeout, || {
+        if let Ok(p) = session.pump() {
+            screen.feed(&p.output);
+        }
+        screen.text().join("\n").contains(needle)
+    })
+}
+
+/// Scenario the fixture's `drop_connection` exists for: the connection is lost
+/// mid-session but the remote host and its session KEEP RUNNING (a transient
+/// network partition, not a reboot). The recovery is fundamentally different from
+/// a reboot — the session is NOT gone, so it must be RE-ATTACHED (and its screen
+/// resynced by the host), never relaunched. This proves that recovery mechanism
+/// end-to-end over real ssh: attach, put a marker on the screen, drop the
+/// connection (silently, so the master wedges — the hard case), then reap the
+/// wedged master and re-attach — the host resyncs the surviving screen, marker and
+/// all. It is the ghost-vt half of the mid-session reconnect feature (the App-level
+/// "reconnecting" state machine rides on this being recoverable).
+#[test]
+fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
+    let Some(mut remote) = RealRemote::start() else {
+        eprintln!("ssh_reboot: no sshd available; skipping");
+        return;
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+    let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+    let ghost = r.negotiate().expect("initial negotiate");
+
+    // A live session with recognizable content on its screen.
+    r.spawn_host(&ghost, "survivor")
+        .expect("spawn remote session");
+    assert!(
+        wait_until(Duration::from_secs(5), || r
+            .list_sessions(&ghost)
+            .map(|s| s.iter().any(|i| i.name == "survivor"))
+            .unwrap_or(false)),
+        "the session was never listed on the remote"
+    );
+    let mut screen = Screen::new(80, 24, 100);
+    let mut session = Session::attach_ssh(r.pipe_command(&ghost, "survivor"), "survivor", 80, 24)
+        .expect("attach");
+    session
+        .send_input(b"echo GHOSTMARK\n")
+        .expect("type marker");
+    assert!(
+        pump_until(
+            &mut session,
+            &mut screen,
+            "GHOSTMARK",
+            Duration::from_secs(10)
+        ),
+        "the marker never rendered on the attached screen"
+    );
+
+    // The connection drops silently, but the session keeps running on the host.
+    remote.drop_connection();
+    // The driven client is now wedged onto a dead master; abandon it (the App's
+    // reconnect path drops the dead Session the same way before re-attaching).
+    drop(session);
+
+    // Recovery: reap the wedged master, then RE-ATTACH (not relaunch) over a fresh
+    // connection. The host take-over resyncs the surviving screen at our geometry.
+    r.reap_wedged_master();
+    let mut screen = Screen::new(80, 24, 100);
+    let reattached = wait_until(Duration::from_secs(25), || {
+        let Ok(mut s) = Session::attach_ssh(r.pipe_command(&ghost, "survivor"), "survivor", 80, 24)
+        else {
+            return false;
+        };
+        pump_until(&mut s, &mut screen, "GHOSTMARK", Duration::from_secs(5))
+    });
+    assert!(
+        reattached,
+        "after the connection dropped and was reaped, re-attaching to the surviving \
+         session never resynced its screen (marker never came back)"
     );
 }
