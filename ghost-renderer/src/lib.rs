@@ -1927,6 +1927,32 @@ impl Renderer {
         self.selection = selection;
     }
 
+    /// Swap the renderer's theme live (a config hot-reload) and invalidate
+    /// everything that baked the old one in. Each cached per-session surface was
+    /// cleared to the old `bg_alpha`/`bg` and drawn with the old `palette`
+    /// (`clear_color` + resolved glyph colours), and its cache key `(session,
+    /// size)` is UNCHANGED by a theme swap — so a later `ensure_surface` would hit
+    /// the stale texture and blit the old colours. Drop every surface and the
+    /// foreground / snapshot / warm fast-path state they seed, forcing a full
+    /// re-raster at the new theme on the next present. (Only a lone `frost` change
+    /// wouldn't strictly need this, since frost is composite-time; reload is rare,
+    /// so always invalidate.) The caller must also `SceneCache::invalidate` its
+    /// window and request a redraw — the `Scene` is theme-independent, so an
+    /// identical scene would otherwise be skipped as unchanged.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        let dropped = self.surfaces.len() as u64;
+        self.surfaces.clear();
+        if dropped > 0 {
+            self.stats.surface.evict(dropped);
+        }
+        self.foreground_valid = false;
+        self.foreground_session = None;
+        self.snapshot = None;
+        self.warm_queue.clear();
+        self.deferring = false;
+    }
+
     /// Cache a kitty-graphics image's pixels on the GPU as its own RGBA texture,
     /// keyed by `id`, so the (potentially large) upload happens once. `rgba` is
     /// straight-alpha `Rgba8` packed row-major, `width * height * 4` bytes.

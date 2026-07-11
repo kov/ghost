@@ -674,6 +674,72 @@ fn frost_survives_the_resize_snapshot_blit() {
 }
 
 #[test]
+fn set_theme_invalidates_cached_surfaces_and_recomposites() {
+    // A live theme change (config reload) must drop cached surfaces: they baked
+    // the old bg_alpha/palette under an (session, size) key a theme swap doesn't
+    // change, so a stale cache hit would blit the OLD theme. Re-raster at the new
+    // theme instead, and let the new opacity reach the composited pixels.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let frame = {
+        let mut vt = Vt::new(80, 24); // 720x432 px at METRICS
+        vt.feed_str("surface content => fn main() { let answer = 42; }");
+        layout_frame(&vt, METRICS)
+    };
+    // Two downscaled tiles (0.5x) — the size that goes through the surface cache.
+    let tile = |id, x: f32| SceneItem::Terminal {
+        id,
+        session: session_key(&format!("{id:?}")),
+        rect: RectPx {
+            x,
+            y: 0.0,
+            w: 360.0,
+            h: 216.0,
+        },
+        frame: std::rc::Rc::new(frame.clone()),
+        selection: None,
+        dim: false,
+        damage: TermDamage::All,
+    };
+    let mut scene = Scene::new((800, 240));
+    scene.layers.push(Layer::new(
+        0,
+        vec![tile(SceneId::Tile(0), 0.0), tile(SceneId::Tile(1), 380.0)],
+    ));
+
+    let mut r = Renderer::headless(Theme::default()); // opaque
+    let first = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        r.surface_renders(),
+        2,
+        "the first paint renders both surface textures"
+    );
+    // A blank scene pixel (right of both tiles) carries the opaque theme clear.
+    assert_eq!(
+        px(&first, 770, 120)[3],
+        255,
+        "precondition: the opaque theme clears fully opaque"
+    );
+
+    // Reload to a translucent theme.
+    r.set_theme(Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    });
+    let second = r.render_offscreen_scene(&scene, font, 15.0);
+    assert_eq!(
+        r.surface_renders(),
+        4,
+        "set_theme must drop the cache so both surfaces re-raster at the new theme"
+    );
+    // The blank clear is now translucent — the reloaded opacity reached the pixels.
+    let a = px(&second, 770, 120)[3] as u32;
+    assert!(
+        (100..=160).contains(&a),
+        "the reloaded opacity should composite see-through, got alpha {a}"
+    );
+}
+
+#[test]
 fn an_uncovered_glyph_falls_back_to_a_face_that_has_it() {
     // Fira Code has no ★ (U+2605): shaping it yields .notdef, drawn as the tofu box.
     // With a fallback resolver that points ★ at DejaVu Sans Mono (which covers it), the
