@@ -813,6 +813,29 @@ impl RootModel {
                 Mode::Single(_) => Vec::new(),
             };
         }
+        // A driven session's transport dropped (or came back): put it — or its
+        // warm background mirror — into the reconnecting hold and back, WITHOUT the
+        // ended/teardown path (the session isn't gone, the shell is re-attaching).
+        if matches!(
+            ev,
+            UiEvent::SessionDisconnected { .. } | UiEvent::SessionReattached { .. }
+        ) {
+            let name = match &ev {
+                UiEvent::SessionDisconnected { name } | UiEvent::SessionReattached { name } => {
+                    name.clone()
+                }
+                _ => unreachable!(),
+            };
+            if let Mode::Single(m) = &mut self.mode
+                && m.session() == name
+            {
+                return m.update(ev);
+            }
+            if let Some(m) = self.warm.get_mut(&name) {
+                return m.update(ev);
+            }
+            return Vec::new();
+        }
         // The foreground session's child exited (the shell was quit). Exiting a
         // shell never quits the app: switch to the next attached session, or drop
         // to the fleet overview when this window has none left.
@@ -1895,6 +1918,57 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         })
+    }
+
+    fn foreground_dimmed(r: &RootModel) -> bool {
+        r.view()
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|it| match it {
+                crate::SceneItem::Terminal { dim, .. } => Some(*dim),
+                _ => None,
+            })
+            .expect("a terminal item")
+    }
+
+    #[test]
+    fn a_disconnected_foreground_holds_reconnecting_but_an_exit_drops_to_the_fleet() {
+        let mut r = root(); // single view of alpha
+        r.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"live".to_vec(),
+            ended: false,
+        });
+        assert!(!r.is_fleet());
+
+        // A dropped connection must NOT fall back to the fleet the way an exit does
+        // — it holds the single view, dimmed, while the shell re-attaches.
+        r.update(UiEvent::SessionDisconnected {
+            name: "alpha".to_string(),
+        });
+        assert!(
+            !r.is_fleet(),
+            "a dropped connection holds the single view, never drops to the fleet"
+        );
+        assert!(
+            foreground_dimmed(&r),
+            "the foreground dims while reconnecting"
+        );
+
+        // Reattach clears the hold; the resync then repaints live.
+        r.update(UiEvent::SessionReattached {
+            name: "alpha".to_string(),
+        });
+        assert!(!foreground_dimmed(&r));
+
+        // Contrast — a genuine child exit still tears down to the fleet overview.
+        r.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: Vec::new(),
+            ended: true,
+        });
+        assert!(r.is_fleet(), "a real exit still drops to the fleet");
     }
 
     fn click(r: &mut RootModel, x: f32, y: f32) -> Vec<Cmd> {

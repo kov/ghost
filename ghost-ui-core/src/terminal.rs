@@ -223,6 +223,12 @@ pub struct TerminalModel {
     /// viewport) for placeholder ids to upload.
     last_image_count: usize,
     ended: bool,
+    /// The transport dropped but the session may still be alive on the far side
+    /// (a remote session over ssh): the screen is frozen and dimmed while the shell
+    /// retries the attach. Cleared when it re-attaches ([`UiEvent::SessionReattached`]),
+    /// whose resync repaints the recovered screen. Distinct from `ended` — this
+    /// session is NOT gone, so it must never tear the tile down.
+    reconnecting: bool,
     /// Viewport rows dirtied by feeds since the last present, from the core's per-feed
     /// hint (`Screen::feed`) — the localizable part of the [`TermDamage`] `view` reports.
     /// `None` = no feed changed the viewport; a range accumulates across coalesced feeds.
@@ -333,6 +339,7 @@ impl TerminalModel {
             uploaded_images: HashSet::new(),
             last_image_count: 0,
             ended: false,
+            reconnecting: false,
             feed_dirty: None,
             presented: None,
             sync_held: false,
@@ -524,6 +531,22 @@ impl TerminalModel {
         self.ended
     }
 
+    /// Whether the transport dropped and the shell is retrying (frozen + dimmed).
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting
+    }
+
+    /// Enter or leave the reconnecting hold for `name` (a no-op for another
+    /// session). A redraw repaints the dim; the reconnected resync repaints the
+    /// recovered screen. Never sets `ended` — the session isn't gone.
+    fn set_reconnecting(&mut self, name: &str, on: bool) -> Vec<Cmd> {
+        if name != self.session || self.reconnecting == on {
+            return Vec::new();
+        }
+        self.reconnecting = on;
+        vec![Cmd::Redraw]
+    }
+
     /// Apply an event, returning the effects to perform.
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         match ev {
@@ -548,6 +571,8 @@ impl TerminalModel {
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
+            UiEvent::SessionDisconnected { name } => self.set_reconnecting(&name, true),
+            UiEvent::SessionReattached { name } => self.set_reconnecting(&name, false),
             // The clock releases a synchronized-output hold and steps an armed
             // selection autoscroll.
             UiEvent::Tick { .. } => {
@@ -652,7 +677,8 @@ impl TerminalModel {
             rect,
             frame,
             selection: self.selection(),
-            dim: false,
+            // Dim the frozen screen while the connection is being re-established.
+            dim: self.reconnecting,
             damage: self.damage(),
         }];
         items.extend(self.hover_underlines());
@@ -2688,6 +2714,55 @@ mod tests {
         // cursor after "hi" is col 3, row 1 -> CSI 1;3 R, plus a redraw.
         assert_eq!(cmds, vec![sent("alpha", b"\x1b[1;3R"), Cmd::Redraw]);
         assert!(m.screen().text()[0].starts_with("hi"));
+    }
+
+    fn is_dimmed(m: &TerminalModel) -> bool {
+        match &m.view().layers[0].items[0] {
+            SceneItem::Terminal { dim, .. } => *dim,
+            other => panic!("expected a terminal item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_dims_into_the_reconnecting_hold_until_reattach() {
+        let mut m = model();
+        feed(&mut m, b"work in progress");
+        assert!(!m.reconnecting());
+        assert!(!is_dimmed(&m));
+
+        // The transport drops: enter the hold (frozen + dimmed), never `ended`.
+        let cmds = m.update(UiEvent::SessionDisconnected {
+            name: "alpha".to_string(),
+        });
+        assert_eq!(cmds, vec![Cmd::Redraw]);
+        assert!(m.reconnecting());
+        assert!(
+            !m.ended(),
+            "a dropped connection must never end the session"
+        );
+        assert!(is_dimmed(&m), "the frozen screen dims while reconnecting");
+        assert!(
+            m.screen().text()[0].starts_with("work in progress"),
+            "the screen is frozen, preserved for the resync"
+        );
+
+        // Reattaching clears the hold; the host's resync then repaints normally.
+        let cmds = m.update(UiEvent::SessionReattached {
+            name: "alpha".to_string(),
+        });
+        assert_eq!(cmds, vec![Cmd::Redraw]);
+        assert!(!m.reconnecting());
+        assert!(!is_dimmed(&m));
+    }
+
+    #[test]
+    fn a_disconnect_for_another_session_is_ignored() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionDisconnected {
+            name: "other".to_string(),
+        });
+        assert!(cmds.is_empty());
+        assert!(!m.reconnecting());
     }
 
     #[test]

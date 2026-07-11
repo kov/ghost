@@ -101,6 +101,19 @@ pub enum UiEvent {
         bytes: Vec<u8>,
         ended: bool,
     },
+    /// A driven session's transport dropped without the child exiting — a lost
+    /// connection whose session may still be alive on the far side (a remote
+    /// session over ssh). The tile enters a *reconnecting* hold (frozen, dimmed)
+    /// instead of tearing down; the shell retries the attach and, on success,
+    /// sends [`SessionReattached`](UiEvent::SessionReattached).
+    SessionDisconnected {
+        name: SessionId,
+    },
+    /// A reconnecting session's transport is back (the shell re-attached and the
+    /// host is resyncing its screen): clear the reconnecting hold.
+    SessionReattached {
+        name: SessionId,
+    },
     /// Reply to `Cmd::ListSessions`.
     SessionList(Vec<SessionInfo>),
     /// A state push from `name`'s subscription. State reaches the fleet the
