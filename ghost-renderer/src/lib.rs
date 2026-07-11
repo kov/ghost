@@ -4382,6 +4382,11 @@ impl Renderer {
         self.prepare_snapshot_blit(w, h);
         let cb = self.encode_snapshot(view);
         self.gpu.queue.submit([cb]);
+        // Frost fresh at the blit target's resolution, so the grain stays crisp
+        // through a resize rather than stretching with the snapshot (or popping
+        // out until the drag commits). The snapshot is premultiplied over a
+        // transparent clear, so its see-through areas keep alpha < 1 for dest-over.
+        self.apply_frost(view);
     }
 
     /// Stretch-blit the captured snapshot to a fresh `w`×`h` offscreen target and
@@ -4395,6 +4400,7 @@ impl Renderer {
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let cb = self.encode_snapshot(&view);
         self.gpu.queue.submit([cb]);
+        self.apply_frost(&view);
         let rgba = read_back(&self.gpu, &target, w, h);
         Rendered {
             width: w,

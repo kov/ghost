@@ -615,6 +615,65 @@ fn frost_grains_only_the_translucent_background() {
 }
 
 #[test]
+fn frost_survives_the_resize_snapshot_blit() {
+    // During an interactive resize the window stretch-blits a captured snapshot
+    // instead of re-rendering (see a_resize_blit_scales_the_snapshot_without_reshaping).
+    // The frost is applied fresh at surface resolution after that blit, so the
+    // grain stays visible (and crisp, not stretched) through a drag rather than
+    // popping out until the resize commits.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA"); // hide cursor; "A" on a blue bg in col 0
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18);
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("a"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: w as f32,
+                    h: h as f32,
+                },
+                frame: frame.clone(),
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        )],
+    };
+    let alpha_range = |img: &Rendered| -> u32 {
+        let (mut lo, mut hi) = (255u32, 0u32);
+        for x in 20..350 {
+            let a = px(img, x, 9)[3] as u32;
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        hi - lo
+    };
+    let frosted = Theme {
+        bg_alpha: 0.5,
+        frost: 1.0,
+        ..Theme::default()
+    };
+
+    let mut r = Renderer::headless(frosted);
+    r.capture_snapshot(&scene, font, 15.0);
+    // Blit the snapshot 1:1 (the resize path also stretches, but the frost is
+    // applied at the blit target's resolution either way).
+    let img = r.blit_snapshot_offscreen(w, h);
+    assert!(
+        alpha_range(&img) > 40,
+        "frost should grain the snapshot-blitted background too, got alpha range {}",
+        alpha_range(&img)
+    );
+}
+
+#[test]
 fn an_uncovered_glyph_falls_back_to_a_face_that_has_it() {
     // Fira Code has no ★ (U+2605): shaping it yields .notdef, drawn as the tofu box.
     // With a fallback resolver that points ★ at DejaVu Sans Mono (which covers it), the
