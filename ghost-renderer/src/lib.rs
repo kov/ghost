@@ -697,9 +697,15 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
 /// sampler; 256 is wide enough that the tiling isn't perceptible as a pattern.
 const NOISE_DIM: u32 = 256;
 
-/// Per-frame frost overlay parameters. `tint` is the (linear-0..1) colour the
-/// grain is drawn in — the current background — and `frost` its intensity. Laid
-/// out to match the WGSL `FrostU` uniform (vec3 + f32 = 16 bytes).
+/// Colour the frost grain is drawn in — a soft near-white, so the grain reads as
+/// a milky frosted-glass haze (lightening the see-through background) rather than
+/// tinting it toward the terminal's own dark background. Fixed rather than
+/// theme-derived: frosted glass is milk-white regardless of the scheme.
+const FROST_TINT: [u8; 3] = [0xdc, 0xdc, 0xe0];
+
+/// Per-frame frost overlay parameters. `tint` is the (0..1) colour the grain is
+/// drawn in ([`FROST_TINT`]) and `frost` its intensity. Laid out to match the
+/// WGSL `FrostU` uniform (vec3 + f32 = 16 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct FrostUniforms {
@@ -4070,10 +4076,10 @@ impl Renderer {
         if self.theme.frost <= 0.0 || self.theme.bg_alpha >= 1.0 {
             return;
         }
-        // Tint the grain in the theme's default background, scaled to 0..1 and
+        // Draw the grain in a fixed milk-white ([`FROST_TINT`]), scaled to 0..1 and
         // premultiplied by intensity in the shader. Clamp defensively so a stray
         // out-of-range frost can't over-drive the blend.
-        let tint = self.theme.bg;
+        let tint = FROST_TINT;
         let uniforms = FrostUniforms {
             tint: [
                 f32::from(tint[0]) / 255.0,
