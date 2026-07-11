@@ -552,6 +552,68 @@ fn spawn_remote_reconnect(
     });
 }
 
+/// The retry floor / cap for a reconnecting session: doubles from 1s to 30s so a
+/// drop of seconds or of days recovers, without hammering an unreachable host.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Probe a dropped remote session's host in the background until it is reachable
+/// again and the session `real` still exists, then post
+/// [`UserEvent::RemoteReattachReady`] so the main loop re-attaches at the current
+/// grid. Retries forever with a capped backoff — a partition of minutes or days
+/// recovers when the host returns — reaping the wedged master each round (a silent
+/// drop leaves one, and only a fresh probe can tell the host is back). Stops when
+/// `stop` is set (the window closed or the session was reattached elsewhere). The
+/// blocking `ssh` (which can hang on an unreachable host) must stay off the loop.
+fn spawn_reconnect_probe(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    host: RemoteHost,
+    wid: WindowId,
+    name: String,
+    real: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut backoff = RECONNECT_BACKOFF;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            host.remote.reap_wedged_master();
+            match host.remote.list_sessions(&host.remote_ghost) {
+                // Host reachable and the session survived: re-attach and resync.
+                Ok(list) if list.iter().any(|i| i.name == real) => {
+                    let _ = proxy.send_event(UserEvent::RemoteReattachReady { wid, name });
+                    return;
+                }
+                // Host reachable but the session is GONE — the host rebooted and
+                // wiped it (as opposed to a mere network partition). Waiting can't
+                // bring it back, so end the hold; the tile falls to the fleet, where
+                // the dead session can be relaunched.
+                Ok(_) => {
+                    let _ = proxy.send_event(UserEvent::RemoteSessionGone { wid, name });
+                    return;
+                }
+                // Unreachable (still partitioned): keep waiting — this is the
+                // survive-a-long-drop path.
+                Err(_) => {}
+            }
+            // Sleep the backoff in short chunks so a stop is noticed promptly.
+            let mut slept = Duration::ZERO;
+            while slept < backoff {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let chunk = Duration::from_millis(250).min(backoff - slept);
+                std::thread::sleep(chunk);
+                slept += chunk;
+            }
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        }
+    });
+}
+
 /// Put a fd (a connect warm-up's PTY) into non-blocking mode so the event loop
 /// can drain it without stalling.
 fn set_nonblocking(fd: impl std::os::fd::AsFd) -> io::Result<()> {
@@ -668,9 +730,26 @@ fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {
     }
 }
 
-/// Drain up to `max` pending reads off a session, returning the accumulated
-/// output and whether it ended.
-fn pump(session: &mut Session, max: usize) -> (Vec<u8>, bool) {
+/// How a [`pump`] drain finished: still live, the child exited, or the transport
+/// dropped (a lost connection whose remote session may still be alive — the cue to
+/// hold and reconnect rather than tear the tile down).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    Live,
+    Exited,
+    Disconnected,
+}
+
+impl PumpEnd {
+    /// Whether the session is over on this transport (either way, drop the client).
+    fn is_end(self) -> bool {
+        !matches!(self, PumpEnd::Live)
+    }
+}
+
+/// Drain up to `max` pending reads off a session, returning the accumulated output
+/// and how it ended. A read error is a transport failure, i.e. `Disconnected`.
+fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd) {
     let mut bytes = Vec::new();
     for _ in 0..max {
         match session.pump() {
@@ -680,16 +759,23 @@ fn pump(session: &mut Session, max: usize) -> (Vec<u8>, bool) {
                     bytes.extend_from_slice(&p.output);
                 }
                 if p.ended {
-                    return (bytes, true);
+                    return (
+                        bytes,
+                        if p.disconnected {
+                            PumpEnd::Disconnected
+                        } else {
+                            PumpEnd::Exited
+                        },
+                    );
                 }
                 if empty {
                     break;
                 }
             }
-            Err(_) => return (bytes, true),
+            Err(_) => return (bytes, PumpEnd::Disconnected),
         }
     }
-    (bytes, false)
+    (bytes, PumpEnd::Live)
 }
 
 // ---- capture mode (headless) -------------------------------------------
@@ -744,7 +830,8 @@ fn capture(path: PathBuf) {
     let start = Instant::now();
     let mut last_change = Instant::now();
     loop {
-        let (bytes, ended) = pump(&mut session, 64);
+        let (bytes, end) = pump(&mut session, 64);
+        let ended = end.is_end();
         if !bytes.is_empty() || ended {
             last_change = if bytes.is_empty() {
                 last_change
@@ -1144,6 +1231,7 @@ fn interactive(fresh: bool) {
         remote_index: HashMap::new(),
         remote_watchers: HashMap::new(),
         pending_remote_restores: HashMap::new(),
+        reconnecting: HashMap::new(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -1538,6 +1626,7 @@ impl App {
             remote_index: HashMap::new(),
             remote_watchers: HashMap::new(),
             pending_remote_restores: HashMap::new(),
+            reconnecting: HashMap::new(),
             subs: HashMap::new(),
             groups: Vec::new(),
             _watcher: None,
@@ -1781,6 +1870,13 @@ struct App {
     /// An entry for a host that never reconnects (password/unreachable) just lingers,
     /// drained on a successful reconnect or when its window closes.
     pending_remote_restores: HashMap<String, Vec<PendingRemote>>,
+    /// Remote sessions whose transport dropped and are holding in the reconnecting
+    /// state, keyed by `(window, composite id)`. Each value is the stop flag for its
+    /// background probe thread (`spawn_reconnect_probe`): set it and drop the entry
+    /// to cancel (the window closed, or the session reattached). Presence also
+    /// dedupes — a repeated drop won't start a second probe. See
+    /// [`begin_reconnect`](App::begin_reconnect) / [`finish_reattach`](App::finish_reattach).
+    reconnecting: HashMap<(WindowId, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -2603,6 +2699,90 @@ impl App {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// A driven remote session's transport just dropped: start (or keep) the
+    /// reconnecting hold. Spawns a background probe that waits for the host to come
+    /// back and the session to still exist, then posts
+    /// [`UserEvent::RemoteReattachReady`]. Idempotent — a session already holding
+    /// (a repeated drop before the probe finishes) is left alone. The tile's visible
+    /// hold is set by the `SessionDisconnected` the caller already dispatched.
+    fn begin_reconnect(&mut self, wid: WindowId, name: String) {
+        if self.reconnecting.contains_key(&(wid, name.clone())) {
+            return;
+        }
+        let Some((target, real)) =
+            remote_id_parts(&name).map(|(t, r)| (t.to_string(), r.to_string()))
+        else {
+            return;
+        };
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&target).cloned());
+        let (Some(host), Some(proxy)) = (host, self.proxy.clone()) else {
+            return;
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.reconnecting.insert((wid, name.clone()), stop.clone());
+        spawn_reconnect_probe(proxy, host, wid, name, real, stop);
+    }
+
+    /// The probe says a reconnecting session's host is back and the session still
+    /// exists: re-attach at the window's CURRENT grid (so the host resyncs to the
+    /// size we'll show) and clear the hold with [`UiEvent::SessionReattached`], whose
+    /// resync repaints the recovered screen. If the attach races and fails (the
+    /// session vanished in the gap), keep holding and re-probe. Stale readys — the
+    /// window closed, or we're no longer holding this — are dropped.
+    fn finish_reattach(&mut self, wid: WindowId, name: String, event_loop: &dyn Frontend) {
+        let Some(stop) = self.reconnecting.get(&(wid, name.clone())).cloned() else {
+            return;
+        };
+        let dead_end = |app: &mut Self| {
+            app.reconnecting.remove(&(wid, name.clone()));
+        };
+        let Some((target, real)) =
+            remote_id_parts(&name).map(|(t, r)| (t.to_string(), r.to_string()))
+        else {
+            dead_end(self);
+            return;
+        };
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&target).cloned());
+        let Some(host) = host else {
+            dead_end(self);
+            return;
+        };
+        let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
+        if self.attach_ssh_into(wid, &name, cmd) {
+            self.reconnecting.remove(&(wid, name.clone()));
+            self.dispatch(wid, UiEvent::SessionReattached { name }, event_loop);
+        } else if let Some(proxy) = self.proxy.clone() {
+            // Raced: keep the hold, probe again from the floor.
+            spawn_reconnect_probe(proxy, host, wid, name, real, stop);
+        }
+    }
+
+    /// The probe reached the host but the session is gone (a reboot wiped it): end
+    /// the reconnecting hold as a normal exit, so the window falls back to the fleet
+    /// where the now-dead session can be relaunched. Waiting couldn't recover it.
+    fn end_reconnect_gone(&mut self, wid: WindowId, name: String, event_loop: &dyn Frontend) {
+        if let Some(stop) = self.reconnecting.remove(&(wid, name.clone())) {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.dispatch(
+            wid,
+            UiEvent::SessionData {
+                name,
+                bytes: Vec::new(),
+                ended: true,
+            },
+            event_loop,
+        );
     }
 
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
@@ -3482,6 +3662,16 @@ impl App {
             queued.retain(|p| p.wid != wid);
         }
         self.pending_remote_restores.retain(|_, q| !q.is_empty());
+        // Cancel any reconnect probes for this window (stop their threads) — the tile
+        // they'd reattach into is gone.
+        self.reconnecting.retain(|(w, _), stop| {
+            if *w == wid {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        });
         // A closed window drops out of the restorable set.
         self.workspace_dirty = true;
         // It may have been the last window referencing a remote host; stop polling
@@ -3515,6 +3705,14 @@ impl App {
                 if let Some((target, _)) = remote_id_parts(m) {
                     targets.insert(target.to_string());
                 }
+            }
+        }
+        // A reconnecting session's client is dropped while it holds, so it no longer
+        // appears in `w.sessions` — but its host must stay so the probe can reach it
+        // and `finish_reattach` can find it. Keep it in use until the hold clears.
+        for (_, name) in self.reconnecting.keys() {
+            if let Some((target, _)) = remote_id_parts(name) {
+                targets.insert(target.to_string());
             }
         }
         targets
@@ -3863,6 +4061,17 @@ impl App {
                 self.finish_remote_reconnect(spec, remote_ghost, fe);
                 return;
             }
+            // A dropped remote session's host is back: re-attach it at the current
+            // grid and clear the reconnecting hold.
+            UserEvent::RemoteReattachReady { wid, name } => {
+                self.finish_reattach(wid, name, fe);
+                return;
+            }
+            // The host is back but the session is gone (rebooted): end the hold.
+            UserEvent::RemoteSessionGone { wid, name } => {
+                self.end_reconnect_gone(wid, name, fe);
+                return;
+            }
         };
         match menu::menu_intent(action) {
             // Opening a window needs no focused target — it always works.
@@ -3946,10 +4155,20 @@ impl ApplicationHandler<UserEvent> for App {
         // Pump each window's own session clients and route the output back to
         // that window (a window only holds clients for sessions it's showing).
         let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
+        let mut dropped: Vec<(WindowId, String, Vec<u8>)> = Vec::new();
         for (wid, w) in self.windows.iter_mut() {
             let mut dead = Vec::new();
             for (name, s) in w.sessions.iter_mut() {
-                let (bytes, ended) = pump(s, 32);
+                let (bytes, end) = pump(s, 32);
+                // A REMOTE session whose transport dropped is held and reconnected,
+                // not torn down — its session may still be alive on the far side. A
+                // local EOF (the host process is gone) is a genuine end, as before.
+                if end == PumpEnd::Disconnected && is_remote_id(name) {
+                    dropped.push((*wid, name.clone(), bytes));
+                    dead.push(name.clone());
+                    continue;
+                }
+                let ended = end.is_end();
                 if !bytes.is_empty() || ended {
                     pumped.push((*wid, name.clone(), bytes, ended));
                 }
@@ -3965,6 +4184,24 @@ impl ApplicationHandler<UserEvent> for App {
         }
         for (wid, name, bytes, ended) in pumped {
             self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, &fe);
+        }
+        // A dropped remote session: flush its last bytes, put its tile into the
+        // reconnecting hold (frozen + dimmed, not torn down), and start retrying.
+        for (wid, name, bytes) in dropped {
+            if !bytes.is_empty() {
+                let ev = UiEvent::SessionData {
+                    name: name.clone(),
+                    bytes,
+                    ended: false,
+                };
+                self.dispatch(wid, ev, &fe);
+            }
+            self.dispatch(
+                wid,
+                UiEvent::SessionDisconnected { name: name.clone() },
+                &fe,
+            );
+            self.begin_reconnect(wid, name);
         }
         // Pump each window's read-only observers: mirrored output feeds its
         // fleet tiles as `SessionData`, and only the `Resized` event is

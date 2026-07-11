@@ -71,6 +71,20 @@ pub enum UserEvent {
         spec: ghost_vt::connection::ConnectionSpec,
         remote_ghost: String,
     },
+    /// A dropped remote session's host is reachable again and the session still
+    /// exists — posted by its reconnect probe thread so the main loop re-attaches
+    /// at the window's current grid (see `App::finish_reattach`).
+    RemoteReattachReady {
+        wid: winit::window::WindowId,
+        name: String,
+    },
+    /// A dropped remote session's host came back but the session is gone (the host
+    /// rebooted): posted by the probe so the main loop ends the reconnecting hold
+    /// (see `App::end_reconnect_gone`).
+    RemoteSessionGone {
+        wid: winit::window::WindowId,
+        name: String,
+    },
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main
