@@ -459,6 +459,12 @@ pub struct Theme {
     /// with an explicit SGR background stay opaque; only the default-bg areas
     /// (where no quad is drawn) become translucent. 1.0 is fully opaque.
     pub bg_alpha: f32,
+    /// Frosted-glass intensity, 0.0..=1.0. When above 0 (and the background is
+    /// translucent), a fixed noise grain is composited *under* the frame in the
+    /// see-through default-background areas — grain and a slight milkiness that
+    /// reads as frosted glass. Opaque cells (SGR backgrounds, glyphs) are
+    /// untouched. 0.0 disables it (the default). See [`Renderer::present_scene`].
+    pub frost: f32,
 }
 
 impl Default for Theme {
@@ -469,6 +475,7 @@ impl Default for Theme {
             selection: [0x3a, 0x53, 0x7a],
             palette: ANSI_16,
             bg_alpha: 1.0,
+            frost: 0.0,
         }
     }
 }
@@ -684,6 +691,73 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(atlas, samp, in.uv) * in.color.a;
 }
 "#;
+
+/// Edge length of the tiling noise texture used by the frost overlay. A power of
+/// two so the fragment's `pixel / NOISE_DIM` UV tiles seamlessly under the Repeat
+/// sampler; 256 is wide enough that the tiling isn't perceptible as a pattern.
+const NOISE_DIM: u32 = 256;
+
+/// Per-frame frost overlay parameters. `tint` is the (linear-0..1) colour the
+/// grain is drawn in — the current background — and `frost` its intensity. Laid
+/// out to match the WGSL `FrostU` uniform (vec3 + f32 = 16 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct FrostUniforms {
+    tint: [f32; 3],
+    frost: f32,
+}
+
+/// The frost overlay: a fullscreen triangle that composites a fixed noise grain
+/// *under* the already-drawn frame (the pipeline uses dest-over blending), so it
+/// only tints the see-through default-background areas and leaves opaque pixels
+/// untouched. `NOISE_DIM` is patched in at build time.
+const FROST_WGSL: &str = r#"
+struct FrostU { tint: vec3<f32>, frost: f32 };
+@group(0) @binding(0) var<uniform> u: FrostU;
+@group(0) @binding(1) var noise: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+// A single triangle covering the whole clip volume — no vertex buffer needed.
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(p[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // Sample the noise 1:1 with framebuffer pixels; the Repeat sampler tiles it
+    // across a window wider/taller than the texture.
+    let uv = pos.xy / __NOISE_DIM__;
+    let n = textureSample(noise, samp, uv).r;
+    // Premultiplied output: alpha is the grain, colour the tint scaled by it. The
+    // dest-over blend then admits this only where the frame left alpha < 1.
+    let a = u.frost * n;
+    return vec4<f32>(u.tint * a, a);
+}
+"#;
+
+/// Fill an `NOISE_DIM`×`NOISE_DIM` R8 tile with deterministic white noise. A
+/// cheap integer hash of the texel coordinates — no RNG, so the grain is fixed
+/// across runs (golden tests depend on it) and identical on every machine.
+fn noise_tile() -> Vec<u8> {
+    let mut data = vec![0u8; (NOISE_DIM * NOISE_DIM) as usize];
+    for (i, texel) in data.iter_mut().enumerate() {
+        let x = (i as u32) % NOISE_DIM;
+        let y = (i as u32) / NOISE_DIM;
+        // A small mix (a la Wang/xxHash finalizer) so adjacent texels don't
+        // correlate — enough decorrelation for a visual grain.
+        let mut h = x
+            .wrapping_mul(374_761_393)
+            .wrapping_add(y.wrapping_mul(668_265_263));
+        h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+        h ^= h >> 16;
+        *texel = (h & 0xff) as u8;
+    }
+    data
+}
 
 /// One kitty-graphics image to paint this frame: which uploaded image (by id),
 /// its pixel rect already translated into viewport space, the scissor it clips
@@ -1153,6 +1227,12 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     atlas: wgpu::Texture,
+    /// Frosted-glass overlay: a fullscreen pass compositing a fixed noise grain
+    /// under the frame (dest-over) in the see-through background. Active only when
+    /// the theme is both translucent and has `frost > 0`. See [`Renderer::apply_frost`].
+    frost_pipeline: wgpu::RenderPipeline,
+    frost_bind_group: wgpu::BindGroup,
+    frost_uniform_buf: wgpu::Buffer,
     theme: Theme,
     /// The app-set default bg (OSC 11) of the frame last passed to `prepare`,
     /// so `encode`'s pass clear matches the frame it draws (the frame path has
@@ -1618,12 +1698,179 @@ impl Renderer {
                 cache: None,
             });
 
+        // ---- frost overlay -------------------------------------------------
+        // A tiling noise texture sampled 1:1 with framebuffer pixels, a dedicated
+        // Repeat sampler so it tiles across the window, a small per-frame uniform
+        // (tint + intensity), and a fullscreen-triangle pipeline that composites
+        // the grain UNDER the frame with dest-over blending. See `apply_frost`.
+        let noise_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frost noise"),
+            size: wgpu::Extent3d {
+                width: NOISE_DIM,
+                height: NOISE_DIM,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &noise_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &noise_tile(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(NOISE_DIM),
+                rows_per_image: Some(NOISE_DIM),
+            },
+            wgpu::Extent3d {
+                width: NOISE_DIM,
+                height: NOISE_DIM,
+                depth_or_array_layers: 1,
+            },
+        );
+        let noise_view = noise_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let noise_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("frost sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let frost_uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frost uniforms"),
+            size: std::mem::size_of::<FrostUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frost_bind_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("frost bind layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let frost_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frost bind group"),
+            layout: &frost_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frost_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&noise_sampler),
+                },
+            ],
+        });
+        let frost_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("frost shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    FROST_WGSL
+                        .replace("__NOISE_DIM__", &format!("{:.1}", NOISE_DIM as f32))
+                        .into(),
+                ),
+            });
+        let frost_pipeline_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("frost pipeline layout"),
+                    bind_group_layouts: &[Some(&frost_bind_layout)],
+                    immediate_size: 0,
+                });
+        let frost_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("frost pipeline"),
+                layout: Some(&frost_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &frost_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &frost_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        // Dest-over: the grain goes UNDER the frame, so it only
+                        // shows where the frame left alpha < 1 (the see-through
+                        // default background). An opaque pixel (dstA = 1) is
+                        // untouched: src is scaled by (1 - dstA) = 0.
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Renderer {
             gpu,
             pipeline,
             bind_group,
             uniform_buf,
             atlas,
+            frost_pipeline,
+            frost_bind_group,
+            frost_uniform_buf,
             theme,
             frame_bg: None,
             scene_bg: None,
@@ -3812,6 +4059,62 @@ impl Renderer {
         encoder.finish()
     }
 
+    /// Composite the frosted-glass grain onto `view`, if the theme asks for it —
+    /// the theme is translucent (`bg_alpha < 1`) AND `frost > 0`. A single
+    /// fullscreen dest-over pass that loads the just-composited frame and admits a
+    /// fixed noise grain only where the frame left alpha below 1 (the see-through
+    /// default background); opaque pixels (SGR backgrounds, glyphs) are untouched.
+    /// A no-op — no pass, no submit — when frost is off, so opaque or unfrosted
+    /// windows pay nothing. Called at the tail of both `present_scene` branches.
+    fn apply_frost(&self, view: &wgpu::TextureView) {
+        if self.theme.frost <= 0.0 || self.theme.bg_alpha >= 1.0 {
+            return;
+        }
+        // Tint the grain in the theme's default background, scaled to 0..1 and
+        // premultiplied by intensity in the shader. Clamp defensively so a stray
+        // out-of-range frost can't over-drive the blend.
+        let tint = self.theme.bg;
+        let uniforms = FrostUniforms {
+            tint: [
+                f32::from(tint[0]) / 255.0,
+                f32::from(tint[1]) / 255.0,
+                f32::from(tint[2]) / 255.0,
+            ],
+            frost: self.theme.frost.clamp(0.0, 1.0),
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.frost_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frost"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frost"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.frost_pipeline);
+            pass.set_bind_group(0, &self.frost_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
     /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
     ///
     /// A lone opaque terminal — the steady single view, and bulk output — is rendered
@@ -3847,6 +4150,7 @@ impl Renderer {
             // Surfaces itself.
             self.render_scene_to_view(view, scene, font, size_px);
             self.foreground_valid = false;
+            self.apply_frost(view);
             return;
         };
         // The terminal occupies its scene rect, which the model insets by the window
@@ -3888,6 +4192,7 @@ impl Renderer {
             let cb = self.encode_surface_blit(view, &s.bind_group, frame);
             self.gpu.queue.submit([cb]);
         }
+        self.apply_frost(view);
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a

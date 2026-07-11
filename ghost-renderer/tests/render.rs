@@ -515,6 +515,106 @@ fn a_translucent_lone_terminal_composites_see_through() {
 }
 
 #[test]
+fn frost_grains_only_the_translucent_background() {
+    // Frost composites a fixed noise grain UNDER the frame in the see-through
+    // default-background areas, so those pixels vary per-pixel (grain) and grow a
+    // touch more opaque (milkiness), while opaque SGR cells stay byte-identical.
+    // It acts only through the live composite path (`present_scene`), so drive it
+    // via `present_offscreen` like the translucency test above.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA"); // hide cursor; "A" on a blue bg in col 0
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18);
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("a"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: w as f32,
+                    h: h as f32,
+                },
+                frame: frame.clone(),
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        )],
+    };
+    // Alpha range across a blank default-background strip (x >= 9 is past the
+    // col-0 glyph/blue cell), on the row's mid-line.
+    let alpha_range = |img: &Rendered| -> u32 {
+        let (mut lo, mut hi) = (255u32, 0u32);
+        for x in 20..350 {
+            let a = px(img, x, 9)[3] as u32;
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        hi - lo
+    };
+
+    let translucent = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+    let frosted = Theme {
+        bg_alpha: 0.5,
+        frost: 1.0,
+        ..Theme::default()
+    };
+    let plain_img = Renderer::headless(translucent).present_offscreen(&scene, font, 15.0);
+    let frost_img = Renderer::headless(frosted).present_offscreen(&scene, font, 15.0);
+    write_png("frost.png", &frost_img);
+
+    // Without frost the see-through background is a flat clear: constant alpha.
+    assert!(
+        alpha_range(&plain_img) <= 1,
+        "a plain translucent background should be flat, got alpha range {}",
+        alpha_range(&plain_img)
+    );
+    // With frost it grains: the blank background's alpha varies widely per pixel.
+    assert!(
+        alpha_range(&frost_img) > 40,
+        "frost should grain the translucent background, got alpha range {}",
+        alpha_range(&frost_img)
+    );
+
+    // An opaque SGR cell (col 0, blue bg) is byte-identical with and without frost —
+    // frost composites strictly under the frame, so a fully-opaque pixel is untouched.
+    assert_eq!(
+        px(&plain_img, 4, 9),
+        px(&frost_img, 4, 9),
+        "frost must not touch an opaque SGR background"
+    );
+
+    // The grain is a fixed seed: two renders of the same frosted theme are identical.
+    let frost_img2 = Renderer::headless(frosted).present_offscreen(&scene, font, 15.0);
+    assert_eq!(
+        frost_img.rgba, frost_img2.rgba,
+        "frost must be deterministic (fixed noise seed)"
+    );
+
+    // Frost is inert behind a fully-opaque background (nothing shows through to
+    // frost): an opaque theme renders identically whether frost is set or not.
+    let opaque = Theme::default();
+    let opaque_frost = Theme {
+        frost: 1.0,
+        ..Theme::default()
+    };
+    let opaque_img = Renderer::headless(opaque).present_offscreen(&scene, font, 15.0);
+    let opaque_frost_img = Renderer::headless(opaque_frost).present_offscreen(&scene, font, 15.0);
+    assert_eq!(
+        opaque_img.rgba, opaque_frost_img.rgba,
+        "frost behind an opaque background must be a no-op"
+    );
+}
+
+#[test]
 fn an_uncovered_glyph_falls_back_to_a_face_that_has_it() {
     // Fira Code has no ★ (U+2605): shaping it yields .notdef, drawn as the tofu box.
     // With a fallback resolver that points ★ at DejaVu Sans Mono (which covers it), the

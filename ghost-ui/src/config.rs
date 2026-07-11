@@ -170,6 +170,11 @@ struct Window {
     /// compositors) and macOS; a no-op elsewhere. Only meaningful when `opacity`
     /// is below 1.0. Off by default.
     blur: bool,
+    /// Frosted-glass grain intensity, 0.0..=1.0 (clamped on apply). Above 0, a
+    /// fixed noise grain is rendered into the see-through default-background areas
+    /// — a self-drawn frosting that shows even where the compositor can't `blur`.
+    /// Only meaningful when `opacity` is below 1.0. Off (0.0) by default.
+    frost: f32,
     /// Initial window grid in character cells (clamped on apply). The window opens
     /// sized to hold this many columns/rows at the base font; it can be resized after.
     columns: u16,
@@ -184,6 +189,7 @@ impl Default for Window {
         Window {
             opacity: 1.0,
             blur: false,
+            frost: 0.0,
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
             padding: DEFAULT_PADDING,
@@ -271,6 +277,13 @@ impl UiConfig {
             self.window.opacity.clamp(0.0, 1.0)
         } else {
             1.0
+        };
+        // Frost rides on the same non-finite guard: a NaN must never reach the
+        // blend as an intensity, so fall back to off.
+        theme.frost = if self.window.frost.is_finite() {
+            self.window.frost.clamp(0.0, 1.0)
+        } else {
+            0.0
         };
         theme
     }
@@ -511,6 +524,46 @@ mod tests {
         assert!(both.blur());
         assert_eq!(both.theme().bg_alpha, 0.8);
         assert_eq!(both.columns(), 120);
+    }
+
+    #[test]
+    fn window_frost_parses_clamps_and_defaults_off() {
+        // Default, empty, and a present-but-empty [window] table have no frost.
+        assert_eq!(UiConfig::default().theme().frost, 0.0);
+        assert_eq!(UiConfig::parse("").unwrap().theme().frost, 0.0);
+        assert_eq!(UiConfig::parse("[window]\n").unwrap().theme().frost, 0.0);
+        // A set value flows to the theme's frost intensity.
+        assert_eq!(
+            UiConfig::parse("[window]\nfrost = 0.3\n")
+                .unwrap()
+                .theme()
+                .frost,
+            0.3
+        );
+        // Out-of-range frost clamps into 0.0..=1.0.
+        assert_eq!(
+            UiConfig::parse("[window]\nfrost = 2.0\n")
+                .unwrap()
+                .theme()
+                .frost,
+            1.0
+        );
+        assert_eq!(
+            UiConfig::parse("[window]\nfrost = -1.0\n")
+                .unwrap()
+                .theme()
+                .frost,
+            0.0
+        );
+        // A non-finite frost (valid TOML) falls back to off, never poisoning the pass.
+        let c = UiConfig::parse("[window]\nfrost = nan\n").unwrap();
+        assert!(c.theme().frost.is_finite());
+        assert_eq!(c.theme().frost, 0.0);
+        // Frost coexists with opacity/blur in the same table.
+        let all = UiConfig::parse("[window]\nopacity = 0.8\nblur = true\nfrost = 0.2\n").unwrap();
+        assert_eq!(all.theme().bg_alpha, 0.8);
+        assert!(all.blur());
+        assert_eq!(all.theme().frost, 0.2);
     }
 
     #[test]
