@@ -9,7 +9,7 @@ use core_graphics::display::{CGDisplay, CGPoint};
 use monitor::VideoModeHandle;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAppKitVersionNumber10_12, NSAppearance, NSAppearanceCustomization,
     NSAppearanceNameAqua, NSApplication, NSApplicationPresentationOptions, NSBackingStoreType,
@@ -763,6 +763,13 @@ impl WindowDelegate {
             delegate.set_blur(attrs.blur);
         }
 
+        if attrs.transparent {
+            // A translucent window's content fills every pixel, so its blurred
+            // backdrop and drop shadow would trace a rectangle — round the
+            // content view's bottom corners to the frame so they don't.
+            delegate.update_corner_mask();
+        }
+
         if let Some(dim) = attrs.min_inner_size {
             delegate.set_min_inner_size(Some(dim));
         }
@@ -885,6 +892,10 @@ impl WindowDelegate {
         };
 
         self.window().setBackgroundColor(Some(&color));
+
+        // Rounding the content view only bites once the window is translucent;
+        // re-apply (or clear) it whenever transparency toggles.
+        self.update_corner_mask();
     }
 
     pub fn set_blur(&self, blur: bool) {
@@ -898,6 +909,60 @@ impl WindowDelegate {
                 window_number,
                 radius,
             );
+        }
+    }
+
+    /// The system window-frame corner radius, so the content clip lines up with
+    /// the titlebar's rounded top. Reads the theme frame's private
+    /// `_cornerRadius` when it answers (the radius grew on macOS 26 Tahoe),
+    /// otherwise falls back to the Big Sur–Sequoia value.
+    fn window_corner_radius(&self) -> CGFloat {
+        const FALLBACK: CGFloat = 10.0;
+        unsafe {
+            let content: *mut AnyObject = msg_send![self.window(), contentView];
+            if content.is_null() {
+                return FALLBACK;
+            }
+            let frame: *mut AnyObject = msg_send![content, superview];
+            if frame.is_null() {
+                return FALLBACK;
+            }
+            let responds: bool = msg_send![frame, respondsToSelector: sel!(_cornerRadius)];
+            if responds {
+                let radius: CGFloat = msg_send![frame, _cornerRadius];
+                if radius > 0.0 {
+                    return radius;
+                }
+            }
+        }
+        FALLBACK
+    }
+
+    /// Clip the layer-backed content view to the window's rounded BOTTOM corners
+    /// (the native titlebar rounds the top itself) and recompute the drop shadow,
+    /// so a translucent or backdrop-blurred window keeps macOS's rounded shape
+    /// instead of squaring the corners off into a fully-blurred rectangle.
+    /// A no-op while the window is opaque (radius 0, clipping off).
+    fn update_corner_mask(&self) {
+        // Under `WinitView`'s flipped geometry, MaxY is the visual bottom:
+        // kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner.
+        const BOTTOM_CORNERS: usize = (1 << 2) | (1 << 3);
+        let view = self.view();
+        unsafe {
+            let layer: *mut AnyObject = msg_send![&*view, layer];
+            if layer.is_null() {
+                return;
+            }
+            let opaque: bool = msg_send![self.window(), isOpaque];
+            let radius: CGFloat = if opaque {
+                0.0
+            } else {
+                self.window_corner_radius()
+            };
+            let _: () = msg_send![layer, setCornerRadius: radius];
+            let _: () = msg_send![layer, setMasksToBounds: !opaque];
+            let _: () = msg_send![layer, setMaskedCorners: BOTTOM_CORNERS];
+            let _: () = msg_send![self.window(), invalidateShadow];
         }
     }
 
