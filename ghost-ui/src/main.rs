@@ -2092,11 +2092,16 @@ impl App {
                         w.sessions.remove(&id);
                     }
                 }
-                Cmd::Kill(id) if self.remote_index.contains_key(&id) => {
+                Cmd::Kill(id) if is_remote_id(&id) => {
                     // Kill the remote session over its host's transport (off-loop),
                     // then drop any client we hold; the watcher drops the tile.
-                    if let Some((target, real)) = self.remote_index.get(&id).cloned() {
-                        self.spawn_remote_kill(&target, &real);
+                    // Route by the id itself, like Rename below: a remote id is
+                    // self-describing, and the one most worth killing — a cold tile
+                    // whose host dropped — is neither driven nor listed, so the
+                    // index does not hold it and gating on it would misroute the
+                    // kill to the local path (bogus socket, kill silently dropped).
+                    if let Some((target, real)) = remote_id_parts(&id) {
+                        self.spawn_remote_kill(target, real);
                     }
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.sessions.remove(&id);
@@ -3028,6 +3033,10 @@ impl App {
             .ok()
             .and_then(|m| m.get(target).cloned())
         else {
+            // No live transport to the host — the kill can't be delivered. Say so
+            // (like the rename twin below) rather than dropping it silently; the
+            // fleet has already forgotten the tile either way.
+            eprintln!("ghost: no live connection to {target} to kill its session");
             return;
         };
         let real = real.to_string();
@@ -4757,16 +4766,19 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_id_always_renames_over_the_transport_never_locally() {
-        // A plain id renames over its local control socket.
+    fn a_remote_id_always_routes_control_actions_over_the_transport() {
+        // A plain id renames/kills over its local control socket.
         assert!(
             super::remote_id_parts("plain-session").is_none(),
             "a local id has no host parts"
         );
         // A namespaced remote id is self-describing: its host + real name come from
-        // the id itself, so a rename ALWAYS routes over the transport even if the
-        // index has since dropped it — never the local path (whose bogus socket
-        // reports a misleading "older ghost" error).
+        // the id itself, so a rename or kill ALWAYS routes over the transport even
+        // if the index has since dropped it — never the local path (whose bogus
+        // socket reports a misleading "older ghost" error). Kill matters most for a
+        // COLD remote tile (its host dropped, so it is neither driven nor listed —
+        // exactly the ids the index does not hold), whose manual kill is the one
+        // cleanup for a lingering dead remote member.
         let composite = format!("kov@box{REMOTE_ID_SEP}work");
         assert_eq!(
             super::remote_id_parts(&composite),
