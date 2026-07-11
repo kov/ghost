@@ -6,6 +6,9 @@
 //! closing one repaint-suppression path (a synchronized-output hold that never
 //! releases, a dropped `request_redraw`, a feed dirty-hint that missed a row, a
 //! scene-equality skip). We still can't SEE which gate is stuck when it recurs.
+//! (A recurrence of the scene-equality class is the one gate this watchdog cannot
+//! flag: it reports `Clean`, which re-baselines by design — see
+//! [`StallClass::StaleNoPresent`].)
 //!
 //! [`RenderTrace`] is a per-window watchdog + kick oracle. The shell timestamps the
 //! foreground repaint pipeline (redraw commands, release ticks, present outcomes,
@@ -62,10 +65,14 @@ pub enum StallClass {
     /// dirty-row hint is dropping updates, so no repaint is even requested.
     FeedsNotVisible,
     /// The core produced visible changes and the surface DID acquire, but the window
-    /// still hasn't presented in a while — a redraw request the platform dropped, a
-    /// false scene-equality skip, or a stuck pacer. This is the recurring foreground
-    /// bug. The report's `pacer_pending`, `last_release`, `last_redraw_event` and
-    /// `last_outcome` discriminate among them.
+    /// still hasn't presented in a while — a redraw request the platform dropped or a
+    /// stuck pacer. This is the recurring foreground bug. The report's
+    /// `pacer_pending`, `last_release`, `last_redraw_event` and `last_outcome`
+    /// discriminate among them. Note the one blind spot: a repaint that DID run but
+    /// skipped on scene equality reports `Clean`, which re-baselines and disarms —
+    /// the compare is exact (`SceneCache::damage` is `PartialEq`, never a hash), so
+    /// a Clean loop hiding a stale *scene build* is invisible here by design (the
+    /// alternative false-alarms on every redundant-content feed, e.g. a spinner).
     StaleNoPresent,
     /// The core produced visible changes but every present attempt comes back `Lost`
     /// — the surface isn't acquirable, so the platform (not our repaint pipeline) is
@@ -362,8 +369,9 @@ impl RenderTrace {
         {
             return Some(StallClass::FeedsNotVisible);
         }
-        // Visible changes produced but not presented for a while: a dropped redraw,
-        // a false scene-equality skip, or a stuck pacer. Suppressed mid-resize (the
+        // Visible changes produced but not presented for a while: a dropped redraw
+        // or a stuck pacer (a scene-equality skip lands as Clean, which re-baselines
+        // — see `StallClass::StaleNoPresent`). Suppressed mid-resize (the
         // stretch-blit snapshot is intentionally holding the last frame).
         let visible_pending = core
             .visible_feeds
@@ -379,7 +387,7 @@ impl RenderTrace {
             // stuck returning `Lost` is unpresentable (occluded/off-Space/asleep) — the
             // platform withholding the drawable, self-correcting on visibility — while
             // any other last outcome means acquire SUCCEEDED yet the frame never landed:
-            // the real repaint bug (dropped redraw, false scene-equality, stuck pacer).
+            // the real repaint bug (a dropped redraw or a stuck pacer).
             return Some(if self.last_outcome == Some(Outcome::Lost) {
                 StallClass::SurfaceLost
             } else {
