@@ -459,12 +459,19 @@ pub struct Theme {
     /// with an explicit SGR background stay opaque; only the default-bg areas
     /// (where no quad is drawn) become translucent. 1.0 is fully opaque.
     pub bg_alpha: f32,
-    /// Frosted-glass intensity, 0.0..=1.0. When above 0 (and the background is
-    /// translucent), a fixed noise grain is composited *under* the frame in the
-    /// see-through default-background areas — grain and a slight milkiness that
-    /// reads as frosted glass. Opaque cells (SGR backgrounds, glyphs) are
+    /// Frosted-glass density, 0.0..=1.0. When above 0 (and the background is
+    /// translucent), a smooth tinted glass fill is composited *under* the frame in
+    /// the see-through default-background areas: it raises them toward opaque,
+    /// dimming/obscuring whatever shows through (the frosted-glass cue we can't get
+    /// from a real backdrop blur where the compositor doesn't offer one), with a
+    /// subtle grain riding on top. Opaque cells (SGR backgrounds, glyphs) are
     /// untouched. 0.0 disables it (the default). See [`Renderer::present_scene`].
     pub frost: f32,
+    /// Colour of the frost glass. `None` (the default) derives it from [`Self::bg`]
+    /// — the scheme's background nudged toward white — so a dark theme frosts dark
+    /// and a light theme frosts light. `Some` is a config override (`[window]
+    /// frost_tint`). See [`derive_frost_tint`].
+    pub frost_tint: Option<[u8; 3]>,
 }
 
 impl Default for Theme {
@@ -476,6 +483,7 @@ impl Default for Theme {
             palette: ANSI_16,
             bg_alpha: 1.0,
             frost: 0.0,
+            frost_tint: None,
         }
     }
 }
@@ -697,20 +705,38 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
 /// sampler; 256 is wide enough that the tiling isn't perceptible as a pattern.
 const NOISE_DIM: u32 = 256;
 
-/// Colour the frost grain is drawn in — a soft near-white, so the grain reads as
-/// a milky frosted-glass haze (lightening the see-through background) rather than
-/// tinting it toward the terminal's own dark background. Fixed rather than
-/// theme-derived: frosted glass is milk-white regardless of the scheme.
-const FROST_TINT: [u8; 3] = [0xdc, 0xdc, 0xe0];
+/// Grain amount riding on the flat frost fill: the glass alpha is modulated by
+/// `±FROST_GRAIN/2` of the baked noise, so the surface has a hint of ground-glass
+/// texture without the fill reading as static. Small on purpose.
+const FROST_GRAIN: f32 = 0.18;
 
-/// Per-frame frost overlay parameters. `tint` is the (0..1) colour the grain is
-/// drawn in ([`FROST_TINT`]) and `frost` its intensity. Laid out to match the
-/// WGSL `FrostU` uniform (vec3 + f32 = 16 bytes).
+/// Fraction of white mixed into the theme background to derive the default frost
+/// tint — the faint luminance lift real scattering gives frosted glass, kept small
+/// so dark schemes stay dark glass and light schemes light glass.
+const FROST_TINT_LIFT: f32 = 0.08;
+
+/// The default frost tint for a background colour: `bg` nudged toward white by
+/// [`FROST_TINT_LIFT`]. Used when [`Theme::frost_tint`] is `None`.
+fn derive_frost_tint(bg: [u8; 3]) -> [u8; 3] {
+    bg.map(|c| {
+        let lifted = f32::from(c) * (1.0 - FROST_TINT_LIFT) + 255.0 * FROST_TINT_LIFT;
+        lifted.round().clamp(0.0, 255.0) as u8
+    })
+}
+
+/// Per-frame frost overlay parameters, laid out to match the WGSL `FrostU`
+/// uniform. `tint` is the (0..1) glass colour, `frost` the fill density, `grain`
+/// the noise-modulation amount ([`FROST_GRAIN`]), and `scale` the display scale
+/// factor so the grain keeps a fixed *logical* size on HiDPI. `_pad` rounds the
+/// struct to a 16-byte multiple (uniform-buffer requirement).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct FrostUniforms {
     tint: [f32; 3],
     frost: f32,
+    grain: f32,
+    scale: f32,
+    _pad: [f32; 2],
 }
 
 /// The frost overlay: a fullscreen triangle that composites a fixed noise grain
@@ -718,7 +744,7 @@ struct FrostUniforms {
 /// only tints the see-through default-background areas and leaves opaque pixels
 /// untouched. `NOISE_DIM` is patched in at build time.
 const FROST_WGSL: &str = r#"
-struct FrostU { tint: vec3<f32>, frost: f32 };
+struct FrostU { tint: vec3<f32>, frost: f32, grain: f32, scale: f32 };
 @group(0) @binding(0) var<uniform> u: FrostU;
 @group(0) @binding(1) var noise: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -734,33 +760,59 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    // Sample the noise 1:1 with framebuffer pixels; the Repeat sampler tiles it
-    // across a window wider/taller than the texture.
-    let uv = pos.xy / __NOISE_DIM__;
+    // Sample the baked ground-glass noise, tiled by the Repeat sampler. Dividing by
+    // the display scale keeps the grain a fixed *logical* size on HiDPI (pos.xy is
+    // physical pixels); the LINEAR sampler smooths the low-frequency lattice.
+    let uv = pos.xy / (__NOISE_DIM__ * u.scale);
     let n = textureSample(noise, samp, uv).r;
-    // Premultiplied output: alpha is the grain, colour the tint scaled by it. The
-    // dest-over blend then admits this only where the frame left alpha < 1.
-    let a = u.frost * n;
+    // A smooth flat glass fill of density `frost`, with a subtle grain riding on it
+    // (mean noise is ~0.5, so `n - 0.5` is a zero-mean modulation). Premultiplied
+    // output; the dest-over blend admits it only where the frame left alpha < 1.
+    let a = clamp(u.frost * (1.0 + u.grain * (n - 0.5)), 0.0, 1.0);
     return vec4<f32>(u.tint * a, a);
 }
 "#;
 
-/// Fill an `NOISE_DIM`×`NOISE_DIM` R8 tile with deterministic white noise. A
-/// cheap integer hash of the texel coordinates — no RNG, so the grain is fixed
-/// across runs (golden tests depend on it) and identical on every machine.
+/// Fill an `NOISE_DIM`×`NOISE_DIM` R8 tile with baked, seamlessly-tileable
+/// 2-octave value noise: a coarse mottle plus a finer grain at half amplitude.
+/// Value noise (smoothstep-interpolated lattice) reads as ground glass rather than
+/// the per-pixel static a raw hash gives; the frost sampler is LINEAR so it smooths
+/// further. Deterministic — no RNG — so golden tests are stable and it's identical
+/// on every machine. Mean is ~0.5 so the shader's `n - 0.5` grain is zero-mean.
 fn noise_tile() -> Vec<u8> {
-    let mut data = vec![0u8; (NOISE_DIM * NOISE_DIM) as usize];
-    for (i, texel) in data.iter_mut().enumerate() {
-        let x = (i as u32) % NOISE_DIM;
-        let y = (i as u32) / NOISE_DIM;
-        // A small mix (a la Wang/xxHash finalizer) so adjacent texels don't
-        // correlate — enough decorrelation for a visual grain.
+    // Value in [0, 1] at a lattice point — an xxHash-style finalizer of its coords.
+    fn hash01(x: u32, y: u32) -> f32 {
         let mut h = x
             .wrapping_mul(374_761_393)
             .wrapping_add(y.wrapping_mul(668_265_263));
         h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
         h ^= h >> 16;
-        *texel = (h & 0xff) as u8;
+        (h & 0xffff) as f32 / 65_535.0
+    }
+    // One tileable value-noise octave: `cells` lattice points wrap across the tile,
+    // so opposite edges share values and the result tiles seamlessly.
+    fn octave(px: u32, py: u32, cells: u32) -> f32 {
+        let step = NOISE_DIM as f32 / cells as f32;
+        let (fx, fy) = (px as f32 / step, py as f32 / step);
+        let (cx, cy) = (fx.floor() as u32, fy.floor() as u32);
+        let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+        let (tx, ty) = (smooth(fx - cx as f32), smooth(fy - cy as f32));
+        let (x0, y0) = (cx % cells, cy % cells);
+        let (x1, y1) = ((cx + 1) % cells, (cy + 1) % cells);
+        let (v00, v10) = (hash01(x0, y0), hash01(x1, y0));
+        let (v01, v11) = (hash01(x0, y1), hash01(x1, y1));
+        let top = v00 + (v10 - v00) * tx;
+        let bot = v01 + (v11 - v01) * tx;
+        top + (bot - top) * ty
+    }
+    let mut data = vec![0u8; (NOISE_DIM * NOISE_DIM) as usize];
+    for (i, texel) in data.iter_mut().enumerate() {
+        let x = (i as u32) % NOISE_DIM;
+        let y = (i as u32) / NOISE_DIM;
+        // Coarse ~32px cells (8 across) at double amplitude + fine ~4px cells (64
+        // across), normalized so the mean stays ~0.5.
+        let n = (2.0 * octave(x, y, 8) + octave(x, y, 64)) / 3.0;
+        *texel = (n * 255.0).round().clamp(0.0, 255.0) as u8;
     }
     data
 }
@@ -1239,6 +1291,10 @@ pub struct Renderer {
     frost_pipeline: wgpu::RenderPipeline,
     frost_bind_group: wgpu::BindGroup,
     frost_uniform_buf: wgpu::Buffer,
+    /// Display scale factor (physical pixels per logical pixel), so the frost grain
+    /// keeps a fixed logical size on HiDPI. Set by [`Renderer::set_scale_factor`];
+    /// defaults to 1.0 (also what the headless golden path uses).
+    scale_factor: f32,
     theme: Theme,
     /// The app-set default bg (OSC 11) of the frame last passed to `prepare`,
     /// so `encode`'s pass clear matches the frame it draws (the frame path has
@@ -1747,8 +1803,10 @@ impl Renderer {
             label: Some("frost sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            // LINEAR so the baked low-frequency value noise reads as soft ground
+            // glass rather than blocky lattice cells.
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let frost_uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1919,7 +1977,19 @@ impl Renderer {
             linear_sampler,
             snapshot: None,
             snapshot_instances: None,
+            scale_factor: 1.0,
         }
+    }
+
+    /// Set the display scale factor (physical pixels per logical pixel) so the
+    /// frost grain keeps a fixed logical size on HiDPI. Cheap; the app calls it on
+    /// window creation and when the scale factor changes.
+    pub fn set_scale_factor(&mut self, scale: f32) {
+        self.scale_factor = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
     }
 
     /// Set (or clear) the text selection to highlight on subsequent frames.
@@ -4102,10 +4172,14 @@ impl Renderer {
         if self.theme.frost <= 0.0 || self.theme.bg_alpha >= 1.0 {
             return;
         }
-        // Draw the grain in a fixed milk-white ([`FROST_TINT`]), scaled to 0..1 and
-        // premultiplied by intensity in the shader. Clamp defensively so a stray
-        // out-of-range frost can't over-drive the blend.
-        let tint = FROST_TINT;
+        // Glass tint: the config override, else derived from the theme background
+        // (dark theme -> dark glass). Scaled to 0..1; the shader premultiplies by
+        // the fill density. Clamp defensively so a stray out-of-range frost can't
+        // over-drive the blend.
+        let tint = self
+            .theme
+            .frost_tint
+            .unwrap_or_else(|| derive_frost_tint(self.theme.bg));
         let uniforms = FrostUniforms {
             tint: [
                 f32::from(tint[0]) / 255.0,
@@ -4113,6 +4187,9 @@ impl Renderer {
                 f32::from(tint[2]) / 255.0,
             ],
             frost: self.theme.frost.clamp(0.0, 1.0),
+            grain: FROST_GRAIN,
+            scale: self.scale_factor,
+            _pad: [0.0; 2],
         };
         self.gpu
             .queue

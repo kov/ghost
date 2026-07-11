@@ -1336,6 +1336,8 @@ impl Graphics {
         // Draw characters outside the configured family (symbols, box-drawing, arrows)
         // from a covering system font instead of the tofu box.
         renderer.set_fallback(Box::new(font::SystemFallback::new()));
+        // Keep the frost grain a fixed logical size on HiDPI.
+        renderer.set_scale_factor(window.scale_factor() as f32);
 
         Graphics {
             window,
@@ -3215,6 +3217,8 @@ impl App {
             // A headless window has no surface to resize; the model still re-grids
             // below via the dispatched `Resize`.
             if let Some(gfx) = w.gfx.as_mut() {
+                // A ScaleFactorChanged also routes here — keep the frost grain sized.
+                gfx.renderer.set_scale_factor(scale as f32);
                 match step {
                     // Isolated resize (maximize / snap / un-maximize / a drag's first
                     // grab): drop any snapshot and resize the surface now; the real

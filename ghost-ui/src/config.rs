@@ -171,11 +171,16 @@ struct Window {
     /// compositors) and macOS; a no-op elsewhere. Only meaningful when `opacity`
     /// is below 1.0. Off by default.
     blur: bool,
-    /// Frosted-glass grain intensity, 0.0..=1.0 (clamped on apply). Above 0, a
-    /// fixed noise grain is rendered into the see-through default-background areas
-    /// — a self-drawn frosting that shows even where the compositor can't `blur`.
-    /// Only meaningful when `opacity` is below 1.0. Off (0.0) by default.
+    /// Frosted-glass density, 0.0..=1.0 (clamped on apply). Above 0, a smooth
+    /// tinted glass fill is rendered into the see-through default-background areas
+    /// — a self-drawn frosting that shows even where the compositor can't `blur`,
+    /// dimming what's behind so it reads as glass. Only meaningful when `opacity`
+    /// is below 1.0. Off (0.0) by default.
     frost: f32,
+    /// Frost glass colour as a hex string (`"#rrggbb"`). Overrides the default,
+    /// which derives the tint from the scheme background (dark scheme → dark glass).
+    /// Only meaningful when `frost` is above 0. Unset by default.
+    frost_tint: Option<String>,
     /// Initial window grid in character cells (clamped on apply). The window opens
     /// sized to hold this many columns/rows at the base font; it can be resized after.
     columns: u16,
@@ -191,6 +196,7 @@ impl Default for Window {
             opacity: 1.0,
             blur: false,
             frost: 0.0,
+            frost_tint: None,
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
             padding: DEFAULT_PADDING,
@@ -254,6 +260,11 @@ impl UiConfig {
         toml::from_str(text)
     }
 
+    #[cfg(test)]
+    fn frost_tint(&self) -> Option<[u8; 3]> {
+        self.window.frost_tint.as_deref().and_then(parse_hex_rgb)
+    }
+
     /// The renderer theme this config selects. An absent or unknown scheme keeps
     /// the renderer's default theme; `[window] opacity` rides on top of either.
     pub fn theme(&self) -> Theme {
@@ -286,6 +297,9 @@ impl UiConfig {
         } else {
             0.0
         };
+        // An explicit tint overrides the theme-derived default; a malformed hex is
+        // ignored (`None` → the renderer derives the tint from the background).
+        theme.frost_tint = self.window.frost_tint.as_deref().and_then(parse_hex_rgb);
         theme
     }
 
@@ -343,6 +357,17 @@ impl UiConfig {
             DEFAULT_PADDING
         }
     }
+}
+
+/// Parse an `#rrggbb` (or bare `rrggbb`) hex colour into RGB bytes. `None` on any
+/// malformed input, so a bad `frost_tint` silently falls back to the derived tint.
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
 #[cfg(test)]
@@ -565,6 +590,29 @@ mod tests {
         assert_eq!(all.theme().bg_alpha, 0.8);
         assert!(all.blur());
         assert_eq!(all.theme().frost, 0.2);
+    }
+
+    #[test]
+    fn window_frost_tint_parses_and_defaults_to_derived() {
+        // Unset by default → None, so the renderer derives the tint from the theme.
+        assert_eq!(UiConfig::default().frost_tint(), None);
+        assert_eq!(UiConfig::parse("[window]\n").unwrap().frost_tint(), None);
+        assert_eq!(UiConfig::default().theme().frost_tint, None);
+        // A hex string (with or without '#') parses to RGB and reaches the theme.
+        let c = UiConfig::parse("[window]\nfrost_tint = \"#1a2b3c\"\n").unwrap();
+        assert_eq!(c.frost_tint(), Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(c.theme().frost_tint, Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(
+            UiConfig::parse("[window]\nfrost_tint = \"aabbcc\"\n")
+                .unwrap()
+                .frost_tint(),
+            Some([0xaa, 0xbb, 0xcc])
+        );
+        // Malformed strings are ignored (fall back to the derived tint), never panic.
+        for bad in ["#fff", "#12345g", "not-a-color", "#1234567"] {
+            let cfg = UiConfig::parse(&format!("[window]\nfrost_tint = \"{bad}\"\n")).unwrap();
+            assert_eq!(cfg.theme().frost_tint, None, "{bad:?} should not parse");
+        }
     }
 
     #[test]

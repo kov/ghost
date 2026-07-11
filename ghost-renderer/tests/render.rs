@@ -514,19 +514,12 @@ fn a_translucent_lone_terminal_composites_see_through() {
     );
 }
 
-#[test]
-fn frost_grains_only_the_translucent_background() {
-    // Frost composites a fixed noise grain UNDER the frame in the see-through
-    // default-background areas, so those pixels vary per-pixel (grain) and grow a
-    // touch more opaque (milkiness), while opaque SGR cells stay byte-identical.
-    // It acts only through the live composite path (`present_scene`), so drive it
-    // via `present_offscreen` like the translucency test above.
-    let mut vt = Vt::new(40, 1);
-    vt.feed_str("\x1b[?25l\x1b[44mA"); // hide cursor; "A" on a blue bg in col 0
-    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
-    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-    let (w, h) = (40 * 9, 18);
-    let scene = Scene {
+/// The blank default-background strip on row 9 (x past the col-0 glyph/blue cell)
+/// used to probe the frost fill. Shared by the frost tests below.
+const FROST_STRIP: std::ops::Range<u32> = 20..350;
+
+fn frost_scene(frame: &std::rc::Rc<ghost_render::Frame>, w: u32, h: u32) -> Scene {
+    Scene {
         size_px: (w, h),
         layers: vec![Layer::new(
             0,
@@ -545,18 +538,42 @@ fn frost_grains_only_the_translucent_background() {
                 damage: TermDamage::All,
             }],
         )],
-    };
-    // Alpha range across a blank default-background strip (x >= 9 is past the
-    // col-0 glyph/blue cell), on the row's mid-line.
-    let alpha_range = |img: &Rendered| -> u32 {
-        let (mut lo, mut hi) = (255u32, 0u32);
-        for x in 20..350 {
-            let a = px(img, x, 9)[3] as u32;
-            lo = lo.min(a);
-            hi = hi.max(a);
-        }
-        hi - lo
-    };
+    }
+}
+
+fn strip_mean(img: &Rendered, chan: usize) -> f32 {
+    let (mut sum, mut n) = (0u32, 0u32);
+    for x in FROST_STRIP {
+        sum += px(img, x, 9)[chan] as u32;
+        n += 1;
+    }
+    sum as f32 / n as f32
+}
+
+fn strip_alpha_range(img: &Rendered) -> u32 {
+    let (mut lo, mut hi) = (255u32, 0u32);
+    for x in FROST_STRIP {
+        let a = px(img, x, 9)[3] as u32;
+        lo = lo.min(a);
+        hi = hi.max(a);
+    }
+    hi - lo
+}
+
+#[test]
+fn frost_glazes_the_translucent_background_as_smooth_tinted_glass() {
+    // Frost v2 is a smooth flat glass FILL (density) — it raises the see-through
+    // default background toward opaque UNIFORMLY, tinted by the theme (dark scheme
+    // -> dark glass), with only a subtle grain riding on top. That's the opposite
+    // of the old per-pixel static, and it's what lets a compositor-less frost read
+    // as glass: it dims/obscures the sharp backdrop instead of just speckling it.
+    // Opaque SGR cells stay byte-identical (dest-over, strictly under the frame).
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA"); // hide cursor; "A" on a blue bg in col 0
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18);
+    let scene = frost_scene(&frame, w, h);
 
     let translucent = Theme {
         bg_alpha: 0.5,
@@ -564,24 +581,36 @@ fn frost_grains_only_the_translucent_background() {
     };
     let frosted = Theme {
         bg_alpha: 0.5,
-        frost: 1.0,
+        frost: 0.55,
         ..Theme::default()
     };
     let plain_img = Renderer::headless(translucent).present_offscreen(&scene, font, 15.0);
     let frost_img = Renderer::headless(frosted).present_offscreen(&scene, font, 15.0);
     write_png("frost.png", &frost_img);
 
-    // Without frost the see-through background is a flat clear: constant alpha.
+    // Density: the flat glass fill raises the background well toward opaque. At
+    // bg_alpha 0.5 + frost 0.55 the effective alpha is ~0.5 + 0.55*0.5 ≈ 0.78.
+    let plain_a = strip_mean(&plain_img, 3); // ~128
+    let frost_a = strip_mean(&frost_img, 3); // ~198
     assert!(
-        alpha_range(&plain_img) <= 1,
-        "a plain translucent background should be flat, got alpha range {}",
-        alpha_range(&plain_img)
+        frost_a > plain_a + 50.0,
+        "frost should fill the background toward opaque (plain {plain_a:.0} -> frost {frost_a:.0})"
     );
-    // With frost it grains: the blank background's alpha varies widely per pixel.
+
+    // Smooth, not static: unlike the old grain (range > 40), the fill is nearly
+    // flat — a subtle grain rides on it but doesn't dominate.
+    let range = strip_alpha_range(&frost_img);
     assert!(
-        alpha_range(&frost_img) > 40,
-        "frost should grain the translucent background, got alpha range {}",
-        alpha_range(&frost_img)
+        (2..25).contains(&range),
+        "frost v2 is a smooth fill with only a subtle grain, got alpha range {range}"
+    );
+
+    // Tint tracks the (dark) theme: the glass is dark, NOT the old milky-white
+    // (which would push mean red well above 100 over this dark background).
+    let frost_r = strip_mean(&frost_img, 0);
+    assert!(
+        frost_r < 80.0,
+        "a dark theme should give dark glass, got mean red {frost_r:.0}"
     );
 
     // An opaque SGR cell (col 0, blue bg) is byte-identical with and without frost —
@@ -592,7 +621,7 @@ fn frost_grains_only_the_translucent_background() {
         "frost must not touch an opaque SGR background"
     );
 
-    // The grain is a fixed seed: two renders of the same frosted theme are identical.
+    // The noise is a fixed seed: two renders of the same frosted theme are identical.
     let frost_img2 = Renderer::headless(frosted).present_offscreen(&scene, font, 15.0);
     assert_eq!(
         frost_img.rgba, frost_img2.rgba,
@@ -603,7 +632,7 @@ fn frost_grains_only_the_translucent_background() {
     // frost): an opaque theme renders identically whether frost is set or not.
     let opaque = Theme::default();
     let opaque_frost = Theme {
-        frost: 1.0,
+        frost: 0.55,
         ..Theme::default()
     };
     let opaque_img = Renderer::headless(opaque).present_offscreen(&scene, font, 15.0);
@@ -611,6 +640,46 @@ fn frost_grains_only_the_translucent_background() {
     assert_eq!(
         opaque_img.rgba, opaque_frost_img.rgba,
         "frost behind an opaque background must be a no-op"
+    );
+}
+
+#[test]
+fn frost_tint_follows_the_theme_background() {
+    // v2's default tint is the theme background nudged toward white, so a dark
+    // scheme gets dark glass and a light scheme gets light glass — the opposite of
+    // the old fixed milk-white, which lightened every scheme the same way.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l "); // hide cursor; a blank cell (default bg)
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18);
+    let scene = frost_scene(&frame, w, h);
+
+    // Default (dark) bg vs a light bg; frost_tint left None so the renderer derives
+    // each from its own theme background.
+    let dark = Theme {
+        bg_alpha: 0.5,
+        frost: 0.6,
+        ..Theme::default()
+    };
+    let light = Theme {
+        bg: [0xf0, 0xf0, 0xf2],
+        bg_alpha: 0.5,
+        frost: 0.6,
+        ..Theme::default()
+    };
+    let dark_img = Renderer::headless(dark).present_offscreen(&scene, font, 15.0);
+    let light_img = Renderer::headless(light).present_offscreen(&scene, font, 15.0);
+
+    let dark_r = strip_mean(&dark_img, 0);
+    let light_r = strip_mean(&light_img, 0);
+    assert!(
+        dark_r < 80.0,
+        "dark scheme -> dark glass, got mean red {dark_r:.0}"
+    );
+    assert!(
+        light_r > 180.0,
+        "light scheme -> light glass, got mean red {light_r:.0}"
     );
 }
 
@@ -646,30 +715,31 @@ fn frost_survives_the_resize_snapshot_blit() {
             }],
         )],
     };
-    let alpha_range = |img: &Rendered| -> u32 {
-        let (mut lo, mut hi) = (255u32, 0u32);
-        for x in 20..350 {
-            let a = px(img, x, 9)[3] as u32;
-            lo = lo.min(a);
-            hi = hi.max(a);
-        }
-        hi - lo
+    let plain = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
     };
     let frosted = Theme {
         bg_alpha: 0.5,
-        frost: 1.0,
+        frost: 0.55,
         ..Theme::default()
     };
+
+    let mut pr = Renderer::headless(plain);
+    pr.capture_snapshot(&scene, font, 15.0);
+    let plain_img = pr.blit_snapshot_offscreen(w, h);
 
     let mut r = Renderer::headless(frosted);
     r.capture_snapshot(&scene, font, 15.0);
     // Blit the snapshot 1:1 (the resize path also stretches, but the frost is
     // applied at the blit target's resolution either way).
     let img = r.blit_snapshot_offscreen(w, h);
+    // The glass fill reaches the snapshot-blitted background too: it's raised well
+    // toward opaque, not left at the plain translucent alpha.
+    let (plain_a, frost_a) = (strip_mean(&plain_img, 3), strip_mean(&img, 3));
     assert!(
-        alpha_range(&img) > 40,
-        "frost should grain the snapshot-blitted background too, got alpha range {}",
-        alpha_range(&img)
+        frost_a > plain_a + 50.0,
+        "frost should fill the snapshot-blitted background too (plain {plain_a:.0} -> frost {frost_a:.0})"
     );
 }
 
