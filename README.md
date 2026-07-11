@@ -101,8 +101,9 @@ scheme = "tango-dark"   # gnome-dark|light, tango-dark|light, solarized-dark|lig
 
 [window]
 opacity = 0.95          # 0.0..=1.0; only the default background goes translucent
-blur    = true          # frost the desktop behind the window (KDE/KWin & macOS; ignored elsewhere)
-frost   = 0.2           # 0.0..=1.0; self-drawn milky grain over the see-through background
+blur    = true          # blur the desktop behind the window (KDE/KWin & macOS; ignored elsewhere)
+frost   = 0.2           # 0.0..=1.0; self-drawn glass density for compositors without blur
+frost_tint = "#202024"  # optional glass colour; default derives from the scheme background
 columns = 100
 rows    = 30
 padding = 6.0
@@ -117,6 +118,13 @@ option_as_meta = true   # macOS: treat Option as Meta
 [zoom]
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
 ```
+
+`blur` and `frost` are two different things. `blur` asks the compositor to blur
+the desktop *behind* the window — the real frosted-glass look — but only KDE/KWin
+and macOS support it. `frost` is a self-drawn tinted-glass fill that works
+everywhere: it can't blur the backdrop (no client can), so instead it dims and
+obscures it to read as glass. Use `blur` where you can; reach for `frost` on
+GNOME/sway. They stack.
 
 Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
 blur, frost, and padding to every open window without a restart. Font and the
