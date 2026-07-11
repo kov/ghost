@@ -250,7 +250,7 @@ impl UiConfig {
         }
     }
 
-    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+    pub(crate) fn parse(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
 

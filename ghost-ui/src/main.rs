@@ -618,6 +618,34 @@ fn session_set_watcher(
     Some(w)
 }
 
+/// Watch the config dir and raise `flag` when `ui.toml` may have changed — the
+/// trigger for a live config reload. Watches the DIRECTORY, not the file:
+/// editors replace-on-save (write a temp, rename over), which would drop an
+/// inode watch bound to the file. Filtered to the config filename so an
+/// unrelated write in the dir doesn't reload (an event with no path — some
+/// backends — falls through as a change, since a reload is cheap and
+/// idempotent). `None` (no dir, no backend) leaves the config launch-only.
+fn config_watcher(flag: Arc<std::sync::atomic::AtomicBool>) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    let dir = ghost_vt::paths::config_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut w = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            let touches_config = ev.paths.is_empty()
+                || ev
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(std::ffi::OsStr::new("ui.toml")));
+            if touches_config {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
+    .ok()?;
+    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
+    Some(w)
+}
+
 /// The theme reported to session hosts at attach; fixed at startup, so read
 /// from the config once.
 fn session_theme() -> ghost_ui_core::ThemeColors {
@@ -1098,6 +1126,7 @@ fn interactive(fresh: bool) {
     }
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let config_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
         windows: HashMap::new(),
@@ -1119,6 +1148,8 @@ fn interactive(fresh: bool) {
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
         sessions_changed,
+        _config_watcher: config_watcher(config_changed.clone()),
+        config_changed,
         // Seed the write-on-change baseline with what's already persisted, so the
         // first save only rewrites the file once the live windows diverge from it.
         last_workspace: workspace,
@@ -1509,6 +1540,8 @@ impl App {
             groups: Vec::new(),
             _watcher: None,
             sessions_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            _config_watcher: None,
+            config_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_workspace: Vec::new(),
             workspace_dirty: false,
         }
@@ -1761,6 +1794,12 @@ struct App {
     /// The watch itself; dropping it stops event delivery. `None` when the
     /// runtime dir cannot be watched — the floor tick still reconciles.
     _watcher: Option<notify::RecommendedWatcher>,
+    /// Set by the config-dir watcher when `ui.toml` may have changed; drained on
+    /// the loop to hot-reload the live-reloadable settings (see [`reload_config`]).
+    config_changed: Arc<std::sync::atomic::AtomicBool>,
+    /// The config watch itself; dropping it stops delivery. `None` when the
+    /// config dir cannot be watched — the config then only applies at launch.
+    _config_watcher: Option<notify::RecommendedWatcher>,
     /// The workspace snapshot last written to disk, so a rebuild that matches it
     /// skips the write. Kept current as windows change so a crash or reboot still
     /// restores what was open (see [`App::save_workspace`]).
@@ -1925,6 +1964,62 @@ impl App {
                 self.dispatch(*wid, UiEvent::SessionsChanged, event_loop);
             }
         }
+    }
+
+    /// Re-read `ui.toml` and re-apply the live-reloadable settings to every open
+    /// window: color scheme / opacity / frost (the renderer theme), compositor
+    /// blur, inner padding, and the model's default colors. Font and initial grid
+    /// are deliberately NOT reloaded — font setup is process-global, and
+    /// columns/rows are open-time only (re-gridding would fight the user's manual
+    /// resize). Triggered by the config watcher; takes `cfg` explicitly so tests
+    /// drive it directly.
+    fn reload_config(&mut self, cfg: &config::UiConfig, event_loop: &dyn Frontend) {
+        let theme = cfg.theme();
+        let colors = theme_colors(&theme);
+        let pad = cfg.padding();
+        let blur = want_blur(theme.bg_alpha < 1.0, cfg.blur());
+        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            let cmds = {
+                let Some(w) = self.windows.get_mut(&wid) else {
+                    continue;
+                };
+                // Model side (headless-observable): the default colors and padding.
+                let cmds = w.root.set_theme(colors);
+                w.root.set_padding(pad);
+                // Gfx side (no model representation; absent under a headless
+                // frontend): the renderer theme — opacity/frost/scheme colours bake
+                // into cached surfaces, so `set_theme` drops them — the compositor
+                // blur, and a forced repaint. The `Scene` is theme-independent, so
+                // without invalidating the scene cache AND requesting a redraw an
+                // identical scene would be skipped as unchanged and nothing would
+                // repaint.
+                if let Some(gfx) = w.gfx.as_mut() {
+                    gfx.renderer.set_theme(theme);
+                    gfx.scene_cache.invalidate();
+                    gfx.window.set_blur(blur);
+                    gfx.window.request_redraw();
+                }
+                cmds
+            };
+            self.exec(wid, cmds, event_loop);
+            // Padding feeds the grid geometry, which only recomputes on a resize:
+            // re-drive the window's current size so a padding change takes effect
+            // now rather than on the next manual resize. Headless windows have no
+            // surface/size, so they skip this (their model padding is already set).
+            if let Some((w_px, h_px, scale)) = self
+                .windows
+                .get(&wid)
+                .and_then(|w| w.gfx.as_ref())
+                .map(|g| {
+                    let (w_px, h_px) = g.size();
+                    (w_px, h_px, g.window.scale_factor())
+                })
+            {
+                self.dispatch(wid, UiEvent::Resize { w_px, h_px, scale }, event_loop);
+            }
+        }
+        self.workspace_dirty = true;
     }
 
     /// Feed an event to window `wid`'s model and execute the effects it returns.
@@ -3840,6 +3935,15 @@ impl ApplicationHandler<UserEvent> for App {
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.
         self.pump_subscriptions(&fe);
+        // A changed `ui.toml` (config-dir watch) hot-reloads the live-reloadable
+        // settings into every window — the compositor blur, opacity, frost, color
+        // scheme, and padding.
+        if self
+            .config_changed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.reload_config(&config::UiConfig::load(), &fe);
+        }
         // Fire any per-window ticks that are now due.
         let now = Instant::now();
         let due: Vec<WindowId> = self
@@ -4283,9 +4387,10 @@ mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
         App, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice, auth_error_message,
-        choose_alpha_mode, choose_surface_format, connect_outcome_wanted, home_launch_dir,
+        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, home_launch_dir,
         inherited_connection, namespace_remote_infos, new_window_choice, password_prompt,
-        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice, want_blur,
+        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
+        theme_colors, want_blur,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -4330,6 +4435,50 @@ mod tests {
             assert!(win.gfx.is_none(), "a headless window carries no surface");
             assert!(win.root.is_fleet(), "it opened in the fleet overview");
             assert!(!fe.exited.get(), "opening a window does not quit the app");
+        });
+    }
+
+    #[test]
+    fn reload_config_reapplies_theme_and_padding_to_every_window() {
+        // A config hot-reload fans the new model-side settings out to EVERY open
+        // window. (The gfx-side keys — opacity/frost/blur — have no headless seam;
+        // this covers the plumbing and the multi-window fan-out, which is the logic
+        // worth guarding. Surface/composite behaviour is a ghost-renderer golden.)
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let g1 = app.mint_group();
+            let w1 = app.open_fleet_window(&fe, g1, None);
+            let g2 = app.mint_group();
+            let w2 = app.open_fleet_window(&fe, g2, None);
+
+            // They open at the built-in defaults (no ui.toml under the isolated XDG).
+            let default_pad = app.windows[&w1].root.padding();
+            let default_theme = app.windows[&w1].root.theme();
+
+            // Reload a config that changes both padding and the color scheme.
+            let cfg = config::UiConfig::parse(
+                "[window]\npadding = 21.0\n\n[colors]\nscheme = \"tango-dark\"\n",
+            )
+            .expect("parse");
+            assert_ne!(cfg.padding(), default_pad, "precondition: config differs");
+            assert_ne!(
+                theme_colors(&cfg.theme()),
+                default_theme,
+                "precondition: scheme differs"
+            );
+
+            app.reload_config(&cfg, &fe);
+
+            for wid in [w1, w2] {
+                let root = &app.windows[&wid].root;
+                assert_eq!(root.padding(), 21.0, "reload updates padding on {wid:?}");
+                assert_eq!(
+                    root.theme(),
+                    theme_colors(&cfg.theme()),
+                    "reload updates theme colors on {wid:?}"
+                );
+            }
         });
     }
 

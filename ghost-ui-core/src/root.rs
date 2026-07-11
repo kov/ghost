@@ -708,6 +708,19 @@ impl RootModel {
         }
     }
 
+    /// The current inner padding (logical px per side) — the value last handed to
+    /// [`set_padding`](Self::set_padding). Lets the shell (and tests) read back a
+    /// config hot-reload.
+    pub fn padding(&self) -> f32 {
+        self.pad
+    }
+
+    /// The current default colors (fg/bg/cursor) — the value last handed to
+    /// [`set_theme`](Self::set_theme).
+    pub fn theme(&self) -> ThemeColors {
+        self.theme
+    }
+
     /// Override the animation duration (ms) — e.g. the shell wiring `GHOST_ANIM_MS`
     /// to slow the animations right down for visual validation. Affects dives and
     /// slides started after this call.
