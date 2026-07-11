@@ -92,15 +92,17 @@ dissolves the group, `Esc` leaves.
 
 The window reads a small, hand-edited TOML at `$XDG_CONFIG_HOME/ghost/ui.toml`
 (unknown keys are ignored, so a file survives version skew). It selects a color
-scheme, background opacity, initial grid size and padding, base font size + family,
-and the macOS Option-key behavior:
+scheme, background opacity and frosting, initial grid size and padding, base font
+size + family, and the macOS Option-key behavior:
 
 ```toml
 [colors]
 scheme = "tango-dark"   # gnome-dark|light, tango-dark|light, solarized-dark|light, linux-console
 
 [window]
-opacity = 0.95          # 0.0..=1.0; only over the default scheme
+opacity = 0.95          # 0.0..=1.0; only the default background goes translucent
+blur    = true          # frost the desktop behind the window (KDE/KWin & macOS; ignored elsewhere)
+frost   = 0.2           # 0.0..=1.0; self-drawn milky grain over the see-through background
 columns = 100
 rows    = 30
 padding = 6.0

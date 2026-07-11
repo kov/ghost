@@ -1,8 +1,9 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), the background opacity, initial grid size, and
-//! inner padding (`[window]`), the base font size + family (`[font]`), and how the macOS Option
-//! key behaves (`[input] option_as_meta`).
+//! a persisted font zoom (`[zoom]`), the background opacity, compositor blur and
+//! self-drawn frost, initial grid size, and inner padding (`[window]`), the base
+//! font size + family (`[font]`), and how the macOS Option key behaves
+//! (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
 //! is pure and unit-tested. Scheme ids are inherited from the retired ghost-gtk
