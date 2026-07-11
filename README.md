@@ -118,6 +118,10 @@ option_as_meta = true   # macOS: treat Option as Meta
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
 ```
 
+Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
+blur, frost, and padding to every open window without a restart. Font and the
+initial grid size (`columns`/`rows`) apply only to newly opened windows.
+
 ## The CLI
 
 ```sh
