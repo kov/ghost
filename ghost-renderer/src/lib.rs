@@ -4391,6 +4391,16 @@ impl Renderer {
     }
 
     /// Whether a resize snapshot is currently held.
+    /// Force the next foreground present to fully re-raster this session's window-res
+    /// Surface instead of a banded update — dropping the assumption that the cached
+    /// texture matches the glass. The shell's self-heal calls this (with a
+    /// `SceneCache::invalidate` + repaint request) to recover a stale-frame freeze: a
+    /// present we recorded that never actually composited. Cheap — one bool — and the
+    /// per-session tile Surfaces survive, so it is not the sledgehammer of `set_theme`.
+    pub fn invalidate_foreground(&mut self) {
+        self.foreground_valid = false;
+    }
+
     pub fn has_snapshot(&self) -> bool {
         self.snapshot.is_some()
     }

@@ -13,20 +13,24 @@
 //! Clean loop with feeds still ongoing classifies [`StallClass::StaleNoPresent`]
 //! (an idle window is kept quiet by the gate's "feeds still ongoing" test instead).
 //!
-//! [`RenderTrace`] is a per-window watchdog + kick oracle. The shell timestamps the
-//! foreground repaint pipeline (redraw commands, release ticks, present outcomes,
-//! input) and, once per event-loop pass, folds in the core's [`TermTrace`] counters
-//! and asks [`RenderTrace::verdict`] whether the foreground is stalled. The insight:
-//! when stalled, the core keeps feeding (`feeds_seen` advances) while `last_present`
-//! freezes — and the classified verdict plus the raw field dump say WHICH gate is
-//! stuck. When a present finally lands after a stall (the user's recovering scroll),
-//! [`RenderTrace::saw_outcome`] reports it: the diff between what was stuck and what
-//! unstuck it is the diagnosis, self-reported at the moment of recovery.
+//! [`RenderTrace`] is a per-window watchdog + kick oracle + self-heal trigger. The
+//! shell timestamps the foreground repaint pipeline (redraw commands, release ticks,
+//! present outcomes, input) and, once per event-loop pass, folds in the core's
+//! [`TermTrace`] counters and asks [`RenderTrace::verdict`] whether the foreground is
+//! stalled. The insight: when stalled, the core keeps feeding (`feeds_seen` advances)
+//! while `last_present` freezes — and the classified verdict plus the raw field dump
+//! say WHICH gate is stuck. When a present finally lands after a stall (the user's
+//! recovering scroll), [`RenderTrace::saw_outcome`] reports it: the diff between what
+//! was stuck and what unstuck it is the diagnosis, self-reported at the moment of
+//! recovery.
+//!
+//! The fold/verdict runs every pass in a normal run (a few subtractions), so a
+//! stale-frame freeze self-heals in the wild: [`RenderTrace::self_heal_due`] asks the
+//! shell to force one corrective re-present when a `StaleNoPresent` stall is armed. The
+//! verbose per-line diagnostic dump is still gated to `RUST_LOG=ghost::render=trace`.
 //!
 //! Everything here is pure (an external millisecond clock), so the classifier is
-//! unit-tested without a window or GPU — the same shape as [`crate::pacer`]. The
-//! shell only runs it under `RUST_LOG=ghost::render=trace`, so a normal run pays
-//! nothing.
+//! unit-tested without a window or GPU — the same shape as [`crate::pacer`].
 
 use ghost_ui_core::TermTrace;
 
@@ -44,6 +48,11 @@ const FEEDS_NOT_VISIBLE_MIN: u64 = 20;
 /// A continuing stall re-emits at most this often, so a persistent freeze leaves a
 /// periodic breadcrumb without flooding the log.
 const EMIT_EVERY_MS: u64 = 5_000;
+/// The self-heal fires at most this often while a stale-no-present stall persists —
+/// well past the frame budget so one corrective re-present lands and clears the stall
+/// before the next would fire, turning any residual freeze into a one-frame glitch
+/// rather than a repaint storm.
+const HEAL_COOLDOWN_MS: u64 = 2_000;
 
 /// The present pipeline's verdict for a foreground frame, mirrored from
 /// `ghost_renderer::FrameOutcome` so this module stays renderer-free.
@@ -199,6 +208,7 @@ pub struct RenderTrace {
     // Oracle + rate limiting.
     stalled: Option<(StallClass, u64)>,
     last_emit_ms: Option<u64>,
+    last_heal_ms: Option<u64>,
 }
 
 impl RenderTrace {
@@ -313,6 +323,7 @@ impl RenderTrace {
             Some(c) if visible => c,
             _ => {
                 self.stalled = None;
+                self.last_heal_ms = None;
                 self.last_core = TermTrace::default();
                 self.feeds_at_last_visible = 0;
                 self.visible_at_last_present = 0;
@@ -428,6 +439,28 @@ impl RenderTrace {
             });
         }
         None
+    }
+
+    /// While a stale-no-present stall is armed, ask the shell to force one corrective
+    /// re-present — at most once per [`HEAL_COOLDOWN_MS`], so a persistent freeze heals
+    /// promptly without a repaint storm. Returns `true` on the pass the shell should
+    /// invalidate its foreground cache and re-request a paint. Scoped to
+    /// [`StallClass::StaleNoPresent`]: a synchronized-output hold releases on its own
+    /// tick (a forced repaint wouldn't help), and a `SurfaceLost` window is the platform
+    /// withholding the drawable (nothing to heal). Healing a true stale-frame freeze
+    /// repaints the burst; a false trigger (idempotent-active content) just re-renders
+    /// identical pixels — no flicker, since it re-renders rather than reconfiguring.
+    pub fn self_heal_due(&mut self, now_ms: u64) -> bool {
+        if !matches!(self.stalled, Some((StallClass::StaleNoPresent, _))) {
+            return false;
+        }
+        let due = self
+            .last_heal_ms
+            .is_none_or(|h| now_ms.saturating_sub(h) >= HEAL_COOLDOWN_MS);
+        if due {
+            self.last_heal_ms = Some(now_ms);
+        }
+        due
     }
 
     fn build_report(
@@ -553,6 +586,36 @@ mod tests {
             .poll(2_600, Some(core(5, 5, false)), true, false, true)
             .expect("visible output with no present is a stall");
         assert_eq!(r.class, StallClass::StaleNoPresent);
+    }
+
+    #[test]
+    fn a_stale_no_present_stall_asks_for_one_self_heal_per_cooldown() {
+        let mut t = RenderTrace::new();
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        // A clean, un-stalled view never asks to heal.
+        assert!(!t.self_heal_due(500), "no stall, no heal");
+        // Drive into a stale-no-present stall: visible feeds, no real present.
+        t.poll(2_600, Some(core(5, 5, false)), true, false, true)
+            .expect("stalled");
+        // The first ask heals; a second within the cooldown does not (no repaint storm).
+        assert!(
+            t.self_heal_due(2_600),
+            "an armed stale-no-present asks for a heal"
+        );
+        assert!(!t.self_heal_due(2_700), "not again within the cooldown");
+        // Still stalled past the cooldown: ask again.
+        t.poll(4_700, Some(core(8, 8, false)), true, false, true);
+        assert!(
+            t.self_heal_due(4_700),
+            "a persistent stall asks again after the cooldown"
+        );
+        // A recovering present clears the stall, so it stops asking to heal.
+        t.saw_outcome(Outcome::Presented, 4_800, Some(core(8, 8, false)), false);
+        assert!(
+            !t.self_heal_due(7_000),
+            "a recovered view does not ask to heal"
+        );
     }
 
     #[test]

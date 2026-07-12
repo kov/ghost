@@ -1458,6 +1458,17 @@ impl Graphics {
         self.scene_cache.invalidate();
     }
 
+    /// Force the next present to fully re-render and re-raster the foreground, dropping
+    /// both the scene-equality skip and the "cached texture is current" assumption. The
+    /// self-heal calls this when the watchdog detects a stale-frame freeze (a present we
+    /// recorded that never reached the glass): the next paint is a full one, so the
+    /// stale texture is replaced. Re-renders rather than reconfiguring the swapchain, so
+    /// a false trigger just redraws identical pixels — no flicker.
+    fn force_foreground_repaint(&mut self) {
+        self.scene_cache.invalidate();
+        self.renderer.invalidate_foreground();
+    }
+
     /// Stretch-blit the renderer's held resize snapshot to the surface — immediate
     /// feedback during an interactive resize, without the relayout/re-raster of a
     /// full scene render. Returns whether a frame actually landed (`false` if there is
@@ -4325,7 +4336,6 @@ impl ApplicationHandler<UserEvent> for App {
         // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
-        let trace_on = tracing::enabled!(target: "ghost::render", tracing::Level::TRACE);
         for (id, w) in self.windows.iter_mut() {
             if !w.presented_ok {
                 // The opening frame hasn't landed yet: a window created mid-run can drop
@@ -4338,20 +4348,37 @@ impl ApplicationHandler<UserEvent> for App {
                 w.render_trace.saw_release(now_ms);
                 w.request_redraw();
             }
-            // Once per pass, classify a foreground stall from the folded gate state and
-            // leave a breadcrumb. Gated so a normal run does no fold/verdict work. The
-            // window id separates concurrent windows' tracks in a multi-window log.
-            if trace_on {
-                let core = w.root.foreground_trace();
-                let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
-                let pending = w.pacer.pending();
-                let visible = !w.occluded;
-                if let Some(report) =
-                    w.render_trace
-                        .poll(now_ms, core, pending, has_snapshot, visible)
-                {
-                    tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
+            // Once per pass, fold the foreground gate state and classify. Runs always
+            // (not just under the trace flag) so a stale-frame freeze can self-heal in
+            // the wild — the fold/verdict is a few subtractions, and the diagnostic dump
+            // self-filters through the `trace!` level. The window id separates concurrent
+            // windows' tracks in a multi-window log.
+            let core = w.root.foreground_trace();
+            let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
+            let pending = w.pacer.pending();
+            let visible = !w.occluded;
+            if let Some(report) = w
+                .render_trace
+                .poll(now_ms, core, pending, has_snapshot, visible)
+            {
+                tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
+            }
+            // Self-heal: when the watchdog sees a stale-no-present freeze (visible output
+            // streaming, but no real present reached the glass — the Clean-over-stale
+            // texture staleness), force one full foreground re-present. Rate-limited to
+            // one per HEAL_COOLDOWN_MS, so a persistent freeze becomes a one-frame glitch
+            // and a false trigger just redraws identical pixels (no flicker). Warn so a
+            // recovery leaves a breadcrumb even without the trace flag.
+            if w.render_trace.self_heal_due(now_ms) {
+                if let Some(gfx) = w.gfx.as_mut() {
+                    gfx.force_foreground_repaint();
                 }
+                w.pacer.request();
+                tracing::warn!(
+                    target: "ghost::render",
+                    window = ?id,
+                    "forced a foreground re-present (watchdog: suspected stale frame)"
+                );
             }
         }
         fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
@@ -4464,25 +4491,27 @@ impl ApplicationHandler<UserEvent> for App {
                                 // Model-side cache line (fleet preview frames) under
                                 // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
                                 win.root.emit_cache_trace();
-                                // The kick oracle: a present that ends an armed stall
-                                // reports the frozen state it just recovered (warn — the
-                                // self-reported bug report at the moment of the scroll).
-                                if trace_on {
-                                    let core = win.root.foreground_trace();
-                                    let pending = win.pacer.pending();
-                                    if let Some(report) = win.render_trace.saw_outcome(
-                                        rendertrace::Outcome::Presented,
-                                        now_ms,
-                                        core,
-                                        pending,
-                                    ) {
-                                        tracing::warn!(
-                                            target: "ghost::render",
-                                            window = ?id,
-                                            %report,
-                                            "foreground render stall recovered"
-                                        );
-                                    }
+                                // Advance the watchdog's real-present baseline (always, so
+                                // the self-heal in `about_to_wait` has an accurate view even
+                                // without the trace flag). The kick oracle: a present that
+                                // ends an armed stall reports the frozen state it just
+                                // recovered — logged only under the trace flag to keep a
+                                // normal run quiet.
+                                let core = win.root.foreground_trace();
+                                let pending = win.pacer.pending();
+                                if let Some(report) = win.render_trace.saw_outcome(
+                                    rendertrace::Outcome::Presented,
+                                    now_ms,
+                                    core,
+                                    pending,
+                                ) && trace_on
+                                {
+                                    tracing::warn!(
+                                        target: "ghost::render",
+                                        window = ?id,
+                                        %report,
+                                        "foreground render stall recovered"
+                                    );
                                 }
                                 // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
                                 // this frame and print a summary when a dive ends.
@@ -4507,18 +4536,19 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             FrameOutcome::Clean => {
                                 // Nothing to draw: what's on screen already matches the
-                                // scene, so the pending repaint is satisfied.
+                                // scene, so the pending repaint is satisfied. Record the
+                                // Clean (always): it does NOT advance the real-present
+                                // baseline, so a Clean loop over a stale frame stays visible
+                                // to the self-heal.
                                 win.pacer.painted(now_ms);
-                                if trace_on {
-                                    let core = win.root.foreground_trace();
-                                    let pending = win.pacer.pending();
-                                    win.render_trace.saw_outcome(
-                                        rendertrace::Outcome::Clean,
-                                        now_ms,
-                                        core,
-                                        pending,
-                                    );
-                                }
+                                let core = win.root.foreground_trace();
+                                let pending = win.pacer.pending();
+                                win.render_trace.saw_outcome(
+                                    rendertrace::Outcome::Clean,
+                                    now_ms,
+                                    core,
+                                    pending,
+                                );
                             }
                             FrameOutcome::Lost => {
                                 // The surface wasn't acquirable, so nothing was presented.
@@ -4526,16 +4556,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 // frame lands — this is what recovers a window whose
                                 // redraws the platform dropped while it was occluded.
                                 win.pacer.request();
-                                if trace_on {
-                                    let core = win.root.foreground_trace();
-                                    let pending = win.pacer.pending();
-                                    win.render_trace.saw_outcome(
-                                        rendertrace::Outcome::Lost,
-                                        now_ms,
-                                        core,
-                                        pending,
-                                    );
-                                }
+                                let core = win.root.foreground_trace();
+                                let pending = win.pacer.pending();
+                                win.render_trace.saw_outcome(
+                                    rendertrace::Outcome::Lost,
+                                    now_ms,
+                                    core,
+                                    pending,
+                                );
                             }
                         }
                         // Warm ONE deferred surface off the just-finished frame's slack, so
