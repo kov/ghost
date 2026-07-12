@@ -1039,13 +1039,19 @@ impl RootModel {
         };
         let (name, ended) = (name.clone(), *ended);
         let cmds = match self.warm.get_mut(&name) {
-            // A background mirror still tracks its own title internally (so a later
-            // Ctrl-Tab restores it), but must not drive the window title — only the
-            // foreground session does. Same guard the fleet overview applies to tiles.
+            // A background mirror still tracks its own title and screen internally (so a
+            // later Ctrl-Tab restores it), but it is NOT visible, so two of its commands
+            // must not reach the shell: `SetTitle` (only the foreground drives the window
+            // title, same guard the fleet applies to tiles) and `Redraw` (its content
+            // changed, but the foreground's did not — a repaint here is a full deep
+            // scene-compare ending in a Clean skip, up to 60x/s under a chatty background
+            // session). Everything else flows: replies to a program querying the terminal
+            // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
+            // that backstops a mirror's synchronized-output hold for when it's promoted.
             Some(m) => m
                 .update(ev)
                 .into_iter()
-                .filter(|c| !matches!(c, Cmd::SetTitle(_)))
+                .filter(|c| !matches!(c, Cmd::SetTitle(_) | Cmd::Redraw))
                 .collect(),
             None => Vec::new(), // not a session this window mirrors
         };
@@ -4243,6 +4249,32 @@ mod tests {
         // The shell fires that tick — into the foreground (alpha), the only tick
         // recipient. Beta's hold is now latched with nothing pending to release it.
         r.update(UiEvent::Tick { now_ms: 150 });
+    }
+
+    #[test]
+    fn a_background_mirror_replies_but_does_not_repaint_the_foreground() {
+        let mut r = root();
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        r.update(UiEvent::AdoptSession("alpha".into())); // alpha foreground, beta warm
+        // Beta (backgrounded) transmits an image: a program querying the terminal while
+        // backgrounded is still answered (the reply must flow), but beta is NOT visible
+        // — the foreground is alpha — so its content change must not repaint the window.
+        // That churn is a full deep scene-compare ending in a Clean skip, up to 60x/s
+        // under a chatty background session; the foreground's own feeds and the
+        // self-heal drive its repaints.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "a backgrounded program's query is still answered: {cmds:?}"
+        );
+        assert!(
+            !cmds.contains(&Cmd::Redraw),
+            "a background mirror's content change must not repaint the foreground: {cmds:?}"
+        );
     }
 
     /// The foreground render-stall freeze: a warm mirror latched mid-2026-frame is
