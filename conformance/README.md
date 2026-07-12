@@ -160,10 +160,22 @@ inflated pass counts — don't repeat that.)
        `DCS 1 $ r Pl;Pr s ST` — a `left_right_margins` field threaded through
        `ReplyCtx` (attached model + detached host), fed by
        `ghost_term::Vt::left_right_margins`. `DECRQSS_DECSLRM` passes.
-     - ⬜ 6b: DECSCL conformance levels (gate DECLRMM off below VT level 4, report
-       the level via DECRQSS) and the DECCOLM/DECNCSM column-mode machinery the
-       `DECSCL_Level4` test also needs — a separate feature. Other DECRQSS
-       selectors (DECSTBM, SGR, DECSCA, …) are likewise still unreported.
+     - ✅ 6b: DECSCL conformance levels (`CSI Pl " p`) — a hard reset that then
+       applies the VT level (1–5), which gates version-specific features: ANSI-mode
+       DECRQM (`CSI Ps $ p`, new) answers only at level ≥ 3 (silent below, how a
+       host probes the level), DECLRMM (`?69`) needs ≥ 4, DECNCSM (`?95`) needs ≥ 5.
+       Level defaults to 5 so nothing regresses; RIS resets it; a non-default level
+       leads a state dump (DECSCL hard-resets). `DECSCL` Level2/Level3 pass.
+     - ✅ 6c: DECCOLM (`?3`) 80↔132 column mode, gated by Allow80To132 (`?40`,
+       xterm's `c132`) — resizes the grid, resets the full scroll region, homes the
+       cursor and clears (unless DECNCSM). The self-resize is surfaced bottom-up:
+       `Screen::feed` reconciles its size from `Vt::size` after each feed, so
+       `CSI 18 t` and any recording follow it. `DECSCL_Level4`, `DECSET_DECCOLM`,
+       `DECSET_Allow80To132` pass. (`DECSET_DECNCSM` needs `--xterm-winops` and is
+       skipped. The GUI frontend does not yet follow a DECCOLM resize with a window
+       resize, so `?40`-enabled apps see it only until the next window event.)
+     - ⬜ 6d: other DECRQSS selectors (DECSTBM, SGR, DECSCA, …) remain unreported;
+       DECRQM for modes ghost doesn't track (DECBKM, DECNKM, …) reports "unrecognized".
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

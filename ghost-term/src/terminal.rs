@@ -84,6 +84,10 @@ pub struct Terminal {
     /// DECNCSM (`CSI ?95h`): keep the screen when DECCOLM changes the column
     /// count (default clears it). Only settable at conformance level ≥ 5.
     no_clear_on_column_change: bool,
+    /// Allow80To132 (`CSI ?40h`): whether DECCOLM (`?3`) may switch between 80
+    /// and 132 columns. With it off, DECCOLM is inert — matching xterm's
+    /// `c132` resource gate.
+    allow_80_to_132: bool,
     /// Deferred autowrap: set after printing into the right-edge column so the
     /// cursor stays *on* that column (not past it) until the next print, which
     /// wraps first. Cleared by any cursor movement. This makes the wrap column
@@ -230,6 +234,7 @@ impl Terminal {
             left_right_margin_mode: false,
             conformance_level: 5,
             no_clear_on_column_change: false,
+            allow_80_to_132: false,
             pending_wrap: false,
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
@@ -1262,6 +1267,7 @@ impl Terminal {
         self.reverse_wrap_mode = false;
         self.conformance_level = 5;
         self.no_clear_on_column_change = false;
+        self.allow_80_to_132 = false;
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
         self.modify_other_keys = 0;
@@ -1376,6 +1382,9 @@ impl Terminal {
             // DECLRMM lives in its own field, not the tracked-modes set.
             LeftRightMargin => self.left_right_margin_mode,
             NoClearOnColumnChange => self.no_clear_on_column_change,
+            Allow80To132 => self.allow_80_to_132,
+            // DECCOLM state is reflected in the column count.
+            Columns132 => self.cols == 132,
             // 1048 is a save/restore action, not a queryable state.
             SaveCursor => return None,
             m => self.tracked_modes.contains(&m),
@@ -1468,6 +1477,7 @@ impl Terminal {
             self.no_clear_on_column_change,
             other.no_clear_on_column_change
         );
+        assert_eq!(self.allow_80_to_132, other.allow_80_to_132);
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
         assert_eq!(self.modify_other_keys, other.modify_other_keys);
@@ -2168,6 +2178,38 @@ impl Terminal {
         self.conformance_level = level;
     }
 
+    /// DECCOLM — switch between 80- and 132-column mode. Inert unless
+    /// Allow80To132 (`?40`) is on (xterm's `c132` gate). When it fires it resizes
+    /// the grid, resets the scroll margins to full, homes the cursor, and — unless
+    /// DECNCSM (`?95`) is set — clears the screen. The resize is surfaced to the
+    /// `Screen` (and any recording) after the feed, via [`Vt::size`].
+    fn set_column_mode(&mut self, want_132: bool) {
+        if !self.allow_80_to_132 {
+            return;
+        }
+        let new_cols = if want_132 { 132 } else { 80 };
+        // resize() reflows and, on a column change, resets the left/right margins;
+        // but DECCOLM also clears the top/bottom region, which resize() only
+        // touches on a row change — so reset the full scroll region explicitly.
+        self.resize(new_cols, self.rows);
+        self.top_margin = 0;
+        self.bottom_margin = self.rows - 1;
+        self.left_margin = 0;
+        self.right_margin = self.cols - 1;
+        self.left_right_margin_mode = false;
+        if !self.no_clear_on_column_change {
+            self.buffer.erase(
+                (self.cursor.col, self.cursor.row),
+                EraseMode::WholeView,
+                &self.pen,
+            );
+        }
+        self.cursor.col = 0;
+        self.cursor.row = 0;
+        self.pending_wrap = false;
+        self.dirty_lines.extend(0..self.rows);
+    }
+
     fn decstbm(&mut self, top: u16, bottom: u16) {
         let top = as_usize(top, 1) - 1;
         let bottom = as_usize(bottom, self.rows) - 1;
@@ -2239,6 +2281,14 @@ impl Terminal {
                     }
                 }
 
+                Allow80To132 => {
+                    self.allow_80_to_132 = true;
+                }
+
+                Columns132 => {
+                    self.set_column_mode(true);
+                }
+
                 AutoWrap => {
                     self.auto_wrap_mode = true;
                 }
@@ -2298,6 +2348,14 @@ impl Terminal {
 
                 NoClearOnColumnChange => {
                     self.no_clear_on_column_change = false;
+                }
+
+                Allow80To132 => {
+                    self.allow_80_to_132 = false;
+                }
+
+                Columns132 => {
+                    self.set_column_mode(false);
                 }
 
                 AutoWrap => {
@@ -2663,6 +2721,14 @@ impl Terminal {
             funs.push(Function::Decset(DecModes::one(
                 DecMode::NoClearOnColumnChange,
             )));
+        }
+
+        // 12d. setup Allow80To132 (off by default). The column count is already
+        // carried by the restored buffer width, so DECCOLM (`?3`) itself is not
+        // re-emitted — that would clear the screen we just rebuilt.
+
+        if self.allow_80_to_132 {
+            funs.push(Function::Decset(DecModes::one(DecMode::Allow80To132)));
         }
 
         // 13. setup new line mode

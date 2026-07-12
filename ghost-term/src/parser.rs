@@ -175,9 +175,11 @@ pub enum CtcOp {
 #[repr(u16)]
 pub enum DecMode {
     CursorKeys = 1,             // DECCKM
+    Columns132 = 3,             // DECCOLM — 80↔132 column mode (needs ?40)
     Origin = 6,                 // DECOM
     AutoWrap = 7,               // DECAWM
     TextCursorEnable = 25,      // DECTCEM
+    Allow80To132 = 40,          // enable the DECCOLM 80↔132 switch
     ReverseWrap = 45,           // reverse-wraparound (xterm ?45; needs DECAWM)
     LeftRightMargin = 69,       // DECLRMM — enables DECSLRM left/right margins
     NoClearOnColumnChange = 95, // DECNCSM — keep screen on DECCOLM (VT500)
@@ -1383,9 +1385,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
                 .iter()
                 .map(|mode| match mode {
                     CursorKeys => 1,
+                    Columns132 => 3,
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    Allow80To132 => 40,
                     ReverseWrap => 45,
                     LeftRightMargin => 69,
                     NoClearOnColumnChange => 95,
@@ -1415,9 +1419,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
                 .iter()
                 .map(|mode| match mode {
                     CursorKeys => 1,
+                    Columns132 => 3,
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    Allow80To132 => 40,
                     ReverseWrap => 45,
                     LeftRightMargin => 69,
                     NoClearOnColumnChange => 95,
@@ -2000,9 +2006,11 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
 
     match param {
         1 => Some(CursorKeys),
+        3 => Some(Columns132),
         6 => Some(Origin),
         7 => Some(AutoWrap),
         25 => Some(TextCursorEnable),
+        40 => Some(Allow80To132),
         45 => Some(ReverseWrap),
         69 => Some(LeftRightMargin),
         95 => Some(NoClearOnColumnChange),

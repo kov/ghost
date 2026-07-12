@@ -878,6 +878,52 @@ mod tests {
     }
 
     #[test]
+    fn deccolm_resizes_clears_and_homes_when_allowed() {
+        // esctest test_DECSET_DECCOLM: with Allow80To132 on, DECCOLM switches to
+        // 132 columns, clears the screen, and homes the cursor.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?40h"); // Allow80To132
+        vt.feed_str("\x1b[5;5Hxyz"); // 'xyz' at row 4
+        vt.feed_str("\x1b[6;11r\x1b[?69h\x1b[3;10s"); // top/bottom + L/R margins
+        vt.feed_str("\x1b[?3h"); // DECCOLM -> 132
+        assert_eq!(vt.size().0, 132, "resized to 132 columns");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (0, 0), "cursor homed");
+        assert_eq!(row_cells(&vt, 4, 8).trim(), "", "screen cleared");
+        assert_eq!(vt.dec_mode_state(69), Some(false), "DECLRMM reset");
+        // The top/bottom region must reset too (it survived a col-only resize),
+        // so line feeds walk down the full screen rather than scrolling a stale
+        // 2-row DECSTBM box.
+        vt.feed_str("\r\nHello\r\nWorld");
+        assert_eq!(&row_cells(&vt, 1, 5), "Hello", "second row after home");
+        assert_eq!(&row_cells(&vt, 2, 5), "World", "third row, not scrolled");
+    }
+
+    #[test]
+    fn deccolm_is_inert_without_allow_80_to_132() {
+        // esctest test_DECSET_Allow80To132: DECCOLM only has an effect while ?40
+        // is on; toggling ?3 without it leaves the width unchanged.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?3h"); // no ?40
+        assert_eq!(vt.size().0, 80, "inert without Allow80To132");
+        vt.feed_str("\x1b[?40h\x1b[?3h"); // allow, then enter 132
+        assert_eq!(vt.size().0, 132);
+        vt.feed_str("\x1b[?40l\x1b[?3l"); // disallow, then try to leave — inert
+        assert_eq!(vt.size().0, 132, "132->80 also needs ?40");
+    }
+
+    #[test]
+    fn deccolm_preserves_the_screen_under_decncsm() {
+        // With DECNCSM (?95, level 5) set, a column change keeps the screen.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[65\"p"); // DECSCL level 5 (so ?95 is settable)
+        vt.feed_str("\x1b[?40h\x1b[?95h"); // Allow80To132 + DECNCSM
+        vt.feed_str("\x1b[1;1H1"); // '1' at the origin
+        vt.feed_str("\x1b[?3h"); // DECCOLM -> 132, but no clear
+        assert_eq!(vt.size().0, 132);
+        assert_eq!(&row_cells(&vt, 0, 1), "1", "DECNCSM kept the content");
+    }
+
+    #[test]
     fn left_right_margins_drive_origin_relative_cursor() {
         let mut vt = Vt::new(80, 25);
         vt.feed_str("\x1b[6;11r"); // DECSTBM: top row 6, bottom 11

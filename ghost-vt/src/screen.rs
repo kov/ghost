@@ -156,6 +156,14 @@ impl Screen {
         }
         self.dirty_rows.sort_unstable();
         self.dirty_rows.dedup();
+        // The emulator can resize itself from within the feed (DECCOLM 80↔132),
+        // an unusual bottom-up change: keep our own size in step so `dimensions()`
+        // (and the CSI 18t reply built from it) and the cursor-damage clamp below
+        // reflect it. The change is deterministic from these bytes, so a recording
+        // replays it without a separate resize item.
+        let (vc, vr) = self.vt.size();
+        self.cols = vc as u16;
+        self.rows = vr as u16;
         // The drawn cursor is part of the frame but moving it writes no cell, so
         // this feed's content hint above misses it. Diff the cursor (position +
         // visibility + shape) against the last feed and report the row it left
