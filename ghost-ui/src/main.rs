@@ -1460,16 +1460,20 @@ impl Graphics {
 
     /// Stretch-blit the renderer's held resize snapshot to the surface — immediate
     /// feedback during an interactive resize, without the relayout/re-raster of a
-    /// full scene render. No-op if the renderer holds no snapshot.
-    fn blit_snapshot(&mut self) {
+    /// full scene render. Returns whether a frame actually landed (`false` if there is
+    /// no snapshot or the surface acquire failed), so the caller paces honestly rather
+    /// than marking a dropped blit as painted.
+    fn blit_snapshot(&mut self) -> bool {
         let Target::Surface(s) = &mut self.target else {
-            return;
+            return false;
         };
-        if s.blit_snapshot(&mut self.renderer, || self.window.pre_present_notify()) {
+        let landed = s.blit_snapshot(&mut self.renderer, || self.window.pre_present_notify());
+        if landed {
             // What's on screen is the stretched snapshot, not a model scene; keep the
             // scene cache invalid so the eventual crisp commit always redraws.
             self.scene_cache.invalidate();
         }
+        landed
     }
 
     /// Draw a scene to the window. `scene.size_px` must equal the surface size, and
@@ -4419,10 +4423,13 @@ impl ApplicationHandler<UserEvent> for App {
                         // A resize is in flight: blit the snapshot to the current
                         // surface rather than render a scene whose size no longer
                         // matches it (the model resize is deferred until settle).
-                        gfx.blit_snapshot();
+                        let landed = gfx.blit_snapshot();
                         // Keep the blits paced during the drag; the commit at settle
                         // dispatches the real resize, whose Redraw re-arms the pacer.
-                        win.pacer.painted(now_ms);
+                        // A blit whose acquire failed did NOT land — stay pending and
+                        // retry, rather than marking a dropped frame painted (which
+                        // would freeze the window on a stale blit until the next event).
+                        win.pacer.settle(landed, now_ms);
                     } else {
                         let t_model = Instant::now();
                         let scene = win.root.view();

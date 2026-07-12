@@ -83,6 +83,19 @@ impl FramePacer {
         self.pending = false;
     }
 
+    /// Resolve a repaint attempt by whether a frame actually landed: `painted` if it
+    /// did, `request` (keep pending, retry) if it did not. The one call every paint
+    /// path should end with, so a failed present — a blit whose surface acquire failed,
+    /// a `FrameOutcome::Lost` — can never be mistaken for a landed frame and strand the
+    /// window on stale content. See [`painted`](Self::painted).
+    pub fn settle(&mut self, landed: bool, now_ms: u64) {
+        if landed {
+            self.painted(now_ms);
+        } else {
+            self.request();
+        }
+    }
+
     /// Whether a repaint is pending — requested but not yet confirmed painted.
     /// The render trace reads it to tell a stuck pacer from a stuck platform.
     pub fn pending(&self) -> bool {
@@ -179,6 +192,25 @@ mod tests {
         // Only a frame that actually landed clears the pending repaint.
         p.painted(16);
         assert!(!p.release(32), "a painted frame is no longer pending");
+    }
+
+    #[test]
+    fn settle_keeps_an_unpresented_frame_pending_but_clears_a_landed_one() {
+        // The blit/resize path and the scene path both end by telling the pacer
+        // whether a frame actually reached the glass. A frame that did NOT land (a
+        // failed surface acquire) must stay pending so `release` retries it — the same
+        // contract as a dropped redraw; marking it painted would strand the window on
+        // a stale frame.
+        let mut p = FramePacer::new(16);
+        p.request();
+        assert!(p.release(0), "a pending repaint releases");
+        p.settle(false, 0); // the acquire failed: nothing was presented
+        assert!(
+            p.pending(),
+            "a frame that did not land must stay pending for retry"
+        );
+        p.settle(true, 16); // a later attempt landed
+        assert!(!p.pending(), "a landed frame clears the pending repaint");
     }
 
     #[test]
