@@ -929,15 +929,24 @@ impl Terminal {
         }
     }
 
+    /// The columns a scroll/insert/delete acts on: the left/right-margin box,
+    /// which is the full width `0..cols` whenever DECLRMM is off (margins reset
+    /// to full then), so the buffer takes its fast whole-row path.
+    fn scroll_cols(&self) -> std::ops::Range<usize> {
+        self.left_margin..self.right_margin + 1
+    }
+
     fn scroll_up_in_region(&mut self, n: usize) {
         let range = self.top_margin..self.bottom_margin + 1;
-        self.buffer.scroll_up(range.clone(), n, &self.pen);
+        self.buffer
+            .scroll_up_within(range.clone(), self.scroll_cols(), n, &self.pen);
         self.dirty_lines.extend(range);
     }
 
     fn scroll_down_in_region(&mut self, n: usize) {
         let range = self.top_margin..self.bottom_margin + 1;
-        self.buffer.scroll_down(range.clone(), n, &self.pen);
+        self.buffer
+            .scroll_down_within(range.clone(), self.scroll_cols(), n, &self.pen);
         self.dirty_lines.extend(range);
     }
 
@@ -1375,10 +1384,12 @@ impl Terminal {
         self.in_placeholder_run = ch == PLACEHOLDER;
 
         // A glyph filling the right edge parks the cursor there with a deferred
-        // wrap (the DEC "last column flag"); the next *printing* glyph performs
-        // it. Zero-width combining marks attach to the parked cell and neither
-        // consume nor trigger the wrap.
-        if self.pending_wrap && ch.width().unwrap_or(0) > 0 {
+        // wrap (the DEC "last column flag"); the next glyph performs it. ghost has
+        // no combining-mark support — `Line::print` gives even a zero-width mark
+        // its own cell — so such a mark consumes the wrap like any other glyph.
+        // (ghost's own dump relies on this to round-trip a full wrapped row: it
+        // emits the filled row immediately followed by the next row's first cell.)
+        if self.pending_wrap {
             if self.auto_wrap_mode {
                 self.wrap_line();
             }

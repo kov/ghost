@@ -482,6 +482,74 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_width_glyph_consumes_a_pending_wrap() {
+        // ghost prints even zero-width marks as their own cell (no combining
+        // support), so one arriving with a wrap pending must wrap to the next
+        // line rather than overwrite the last column. ghost's own dump relies on
+        // this to round-trip a full wrapped row (regression from the slice-2
+        // pending_wrap change; shrunk from prop_dump).
+        let mut vt = Vt::new(10, 5);
+        vt.feed_str("     ⺀⺀ "); // fills the row: cursor parks on col 9, wrap pending
+        vt.feed_str("\u{fe00}"); // VS-15, width 0 — must wrap to row 1, col 0
+        assert_eq!(
+            vt.line(0).cells()[9].char(),
+            ' ',
+            "row 0's last column is intact"
+        );
+        assert_eq!(
+            vt.line(1).cells()[0].char(),
+            '\u{fe00}',
+            "the mark wrapped down"
+        );
+        assert_eq!((vt.cursor().col, vt.cursor().row), (1, 1));
+    }
+
+    #[test]
+    fn su_scrolls_only_the_left_right_margin_box() {
+        // esctest test_SU_RespectsLeftRightScrollRegion on a 5x5 grid: SU scrolls
+        // only the boxed columns, leaving cells outside [left,right] in place.
+        let mut vt = Vt::new(5, 5);
+        for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            vt.feed_str(&format!("\x1b[{};1H{s}", r + 1));
+        }
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[2;4s"); // DECSLRM: left col 2, right col 4
+        vt.feed_str("\x1b[3;2H"); // cursor inside the box
+        vt.feed_str("\x1b[2S"); // SU 2
+
+        assert_eq!(row_cells(&vt, 0, 5), "almne");
+        assert_eq!(row_cells(&vt, 1, 5), "fqrsj");
+        assert_eq!(row_cells(&vt, 2, 5), "kvwxo");
+        assert_eq!(row_cells(&vt, 3, 5), "p   t");
+        assert_eq!(row_cells(&vt, 4, 5), "u   y");
+    }
+
+    #[test]
+    fn sd_scrolls_only_the_left_right_margin_box() {
+        // SU's counterpart: SD moves the boxed columns down, outside columns stay.
+        let mut vt = Vt::new(5, 5);
+        for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            vt.feed_str(&format!("\x1b[{};1H{s}", r + 1));
+        }
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[2;4s"); // DECSLRM: left col 2, right col 4
+        vt.feed_str("\x1b[3;2H"); // cursor inside the box
+        vt.feed_str("\x1b[2T"); // SD 2
+
+        assert_eq!(row_cells(&vt, 0, 5), "a   e");
+        assert_eq!(row_cells(&vt, 1, 5), "f   j");
+        assert_eq!(row_cells(&vt, 2, 5), "kbcdo");
+        assert_eq!(row_cells(&vt, 3, 5), "pghit");
+        assert_eq!(row_cells(&vt, 4, 5), "ulmny");
+    }
+
+    #[test]
     fn decrqm_reports_left_right_margin_mode_state() {
         // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
         // in its own field rather than the tracked-modes set.

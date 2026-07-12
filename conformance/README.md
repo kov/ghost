@@ -111,9 +111,16 @@ inflated pass counts — don't repeat that.)
      `right_margin + 1`); the cursor now parks *on* the last usable column with
      the wrap deferred. Also lands: HT stops at the right margin, and DECRQM
      reports DECLRMM's real state. `DECAWM`/`DECLRMM` families 15/0.
-  3. ⬜ scroll box — LF/IND/RI/SU/SD scroll only `[left..=right]×[top..=bottom]`;
-     the biggest change (ghost's scroll rotates whole `Line`s; needs column-range
-     ops in `buffer.rs`/`line.rs`).
+  3. scroll box — LF/IND/RI/SU/SD scroll only `[left..=right]×[top..=bottom]`,
+     landed in two steps:
+     - ✅ 3a: the boxed-scroll primitive + SU/SD. `Buffer::scroll_{up,down}_within`
+       dispatch on a full-width predicate — the fast whole-`Line` path (scrollback
+       + `wrapped` flags intact) when columns span the width, else a per-row
+       cell-copy core (`Line::split_wide_at`/`write_cols`) that touches only
+       `[cols]`, never scrollback, at O(box area). `SU`/`SD` families 18/0.
+     - ⬜ 3b: cursor-motion scrolls — LF/IND/NEL/RI freeze when the cursor is
+       outside the box (`*_MovesDoesNotScrollOutsideLeftRight`), and autowrap must
+       not set `wrapped` inside a box.
   4. ⬜ insert/delete within margins — ICH/DCH bounded by the right margin,
      IL/DL/DECIC/DECDC within the box.
   - Also still open (independent of the slices): CUF/CUB stopping at the

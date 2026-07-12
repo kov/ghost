@@ -188,6 +188,32 @@ impl Line {
         self.cells[fill_start..].fill(Cell::blank(*pen));
     }
 
+    /// Blank both halves of a wide glyph straddling the boundary just before
+    /// `col` — i.e. a `WideTail` at `col` whose `WideHead` sits at `col - 1`, so
+    /// the split line runs between them. No-op at column 0, at/beyond the end, or
+    /// when `col` isn't a wide tail. Used to mend a box edge before moving cells
+    /// so no partial wide pair is ever copied across it.
+    pub(crate) fn split_wide_at(&mut self, col: usize, pen: &Pen) {
+        if col == 0 || col >= self.len() {
+            return;
+        }
+
+        if self.cells[col].occupancy() == Occupancy::WideTail {
+            self.cells[col - 1].set(' ', Occupancy::Single, *pen);
+            self.cells[col].set(' ', Occupancy::Single, *pen);
+        }
+    }
+
+    /// Overwrite the cells in `cols` with `src` (which must be `cols.len()`
+    /// wide), leaving cells outside `cols` untouched. Pairs with [`cells`] for a
+    /// boxed scroll's read side; callers pre-[`split_wide_at`] both endpoints so
+    /// no partial wide pair is written.
+    ///
+    /// [`cells`]: Self::cells
+    pub(crate) fn write_cols(&mut self, cols: Range<usize>, src: &[Cell]) {
+        self.cells[cols].copy_from_slice(src);
+    }
+
     pub(crate) fn extend(&mut self, mut other: Line, len: usize) -> (bool, Option<Line>) {
         let mut needed = len - self.len();
 

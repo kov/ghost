@@ -30,6 +30,12 @@ pub(crate) enum EraseMode {
     WholeLine,
 }
 
+/// Direction for the boxed (left/right-margin) scroll core.
+enum ScrollDir {
+    Up,
+    Down,
+}
+
 type LogicalPosition = (usize, usize);
 type RelativePosition = (usize, isize);
 type VisualPosition = (usize, usize);
@@ -201,6 +207,99 @@ impl Buffer {
         }
 
         self[end - 1].wrapped = false;
+    }
+
+    /// Scroll `rows` up by `n` within the columns `cols`. When `cols` spans the
+    /// full width this is the legacy whole-row [`scroll_up`] (scrollback-feeding,
+    /// wrapped-flag-moving); a narrower `cols` takes the boxed path — per-row cell
+    /// copies confined to `[cols]`, nothing outside it moves, no scrollback, and
+    /// `wrapped` flags left untouched. `terminal.rs` always passes the left/right
+    /// margins, which are full-width whenever DECLRMM is off, so the common case
+    /// keeps the fast path.
+    pub fn scroll_up_within(
+        &mut self,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        n: usize,
+        pen: &Pen,
+    ) {
+        if cols.start == 0 && cols.end == self.cols {
+            self.scroll_up(rows, n, pen);
+        } else {
+            self.scroll_boxed(rows, cols, n, pen, ScrollDir::Up);
+        }
+    }
+
+    /// [`scroll_up_within`]'s counterpart: scroll `rows` down by `n` within `cols`.
+    pub fn scroll_down_within(
+        &mut self,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        n: usize,
+        pen: &Pen,
+    ) {
+        if cols.start == 0 && cols.end == self.cols {
+            self.scroll_down(rows, n, pen);
+        } else {
+            self.scroll_boxed(rows, cols, n, pen, ScrollDir::Down);
+        }
+    }
+
+    /// The boxed scroll core: move each row's `[cols]` cells up/down by `n`, blank
+    /// the vacated ones, and touch nothing else. Wide glyphs straddling either box
+    /// edge are mended first so only whole pairs move.
+    ///
+    /// Rows index the deque directly (viewport-relative, like [`scroll_up`]) via a
+    /// small reused scratch buffer, rather than borrowing a contiguous `&mut
+    /// [Line]` slice — the boxed path costs O(box area), not O(deque length via
+    /// `make_contiguous`), so a deep primary-screen scrollback doesn't slow it.
+    fn scroll_boxed(
+        &mut self,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        n: usize,
+        pen: &Pen,
+        dir: ScrollDir,
+    ) {
+        // Viewport row -> absolute deque index (scrollback sits ahead of it).
+        let base = self.lines.len() - self.rows;
+        let height = rows.end - rows.start;
+        let n = n.min(height);
+
+        for row in rows.clone() {
+            let line = &mut self.lines[base + row];
+            line.split_wide_at(cols.start, pen);
+            line.split_wide_at(cols.end, pen);
+        }
+
+        let mut scratch: Vec<Cell> = Vec::with_capacity(cols.end - cols.start);
+        // Iterate dest rows so each source is read before it is overwritten:
+        // top-down for an up-scroll (dest reads from below), bottom-up for down.
+        let dest_rows: Vec<usize> = match dir {
+            ScrollDir::Up => rows.clone().collect(),
+            ScrollDir::Down => rows.clone().rev().collect(),
+        };
+
+        for row in dest_rows {
+            let src = match dir {
+                // `then` (not `then_some`) so `row - n` isn't evaluated — and
+                // underflow — when the row is one of the vacated ones.
+                ScrollDir::Up => (row + n < rows.end).then(|| row + n),
+                ScrollDir::Down => (row >= rows.start + n).then(|| row - n),
+            };
+
+            match src {
+                Some(src) => {
+                    scratch.clear();
+                    scratch.extend_from_slice(&self.lines[base + src].cells()[cols.clone()]);
+                    self.lines[base + row].write_cols(cols.clone(), &scratch);
+                }
+                None => self.lines[base + row].clear(cols.clone(), pen),
+            }
+        }
+
+        // No line-count change and nothing added to scrollback, so `trim_needed`
+        // stays as it was — the boxed scroll only rewrites cells in place.
     }
 
     pub fn resize(
