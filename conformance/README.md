@@ -84,15 +84,29 @@ directly). Three touch points: compute in `ghost_term::Vt::rect_checksum`,
 recognise in `ghost-vt/src/query.rs::classify_csi`, format in
 `ghost_vt::query::Query::reply` via a `ReplyCtx::checksum` closure wired in both
 the attached model (`ghost-ui-core`) and the detached host (`ghost-vt/server`).
-This unlocked the bulk of content assertions: **DECSTR 13/13, ED 28/0, ICH 6/0,
-DCH 6/0, ECH 7/0, EL clean, DECALN 3/0**.
+The algorithm is validated directly by known-vector unit tests in
+`ghost-term/src/vt.rs`; end-to-end, the content families that pass (ED, EL, ICH,
+…) confirm the wiring reads real cells.
 
-**Known findings (real gaps, scheduled separately):**
-- **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`): the
-  two `*_RespectsOriginMode` cursor failures need a margin-relative origin, a
-  VT420 feature ghost lacks. Reproduces in isolation — a genuine gap, not a leak.
-- **CIE Lab/Luv OSC color specs**: `ChangeColor`/`ChangeSpecialColor_CIE*` — ghost
-  doesn't parse those color-space forms. Niche.
+**⚠️ Never pass `--force`.** In esctest2, `--force` makes `Raise()` a no-op —
+*every assertion is skipped*, so tests "pass" without checking anything (only a
+timed-out query still fails). `run.sh` deliberately omits it; the suite still
+runs past failures because `RunTest` catches each test's exception and tallies
+pass/fail. (An early version of this harness used `--force` and reported wildly
+inflated pass counts — don't repeat that.)
+
+**Honest baseline (no `--force`):** a broad cursor+content sweep runs roughly
+**64 pass / 42 fail**. The failures cluster into real, tracked feature gaps:
+
+- **Selective erase / ISO protection** (`DECSCA` `CSI " q`, `DECSED`, `DECSEL`,
+  `*_respectsISOProtection`) — the biggest cluster (~26 tests). ghost's `Pen`
+  has no protected-cell attribute, so selective erase can't spare protected
+  cells. A distinct feature.
+- **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`) — the
+  `*_RespectsOriginMode` cursor tests, the `DCH`/`ICH` `*Margins` cases, and the
+  scroll-region cursor-stop tests. A VT420 feature ghost lacks. **(in progress)**
+- **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
+  ghost doesn't parse those color-space forms. Niche.
 
 **Note on `--include`:** the regex is `re.search` over `Class.test_name`, so
 `EL` also matches `CIELab`/`CIELuv`. Anchor when you mean a family — `^EL` /

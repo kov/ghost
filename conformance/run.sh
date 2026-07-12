@@ -25,12 +25,12 @@ repo="$(cd "$here/.." && pwd)"
 esctest="$here/esctest2/esctest/esctest.py"
 
 GHOST_BIN="${GHOST_BIN:-$repo/target/debug/ghost}"
-# Default: a curated set that currently passes clean, so a bare run is a
-# regression gate (exit 0). Class-anchored (`re.search` over `Class.test_name`,
-# so a loose `EL` would also match `CIELab`). Widen as coverage grows; the two
-# known gaps (left/right margins, CIE color specs) are excluded on purpose —
-# see README "Known findings".
-INCLUDE="${INCLUDE:-EDTests|ELTests|ICHTests|DCHTests|ECHTests|DECALNTests|DECSTRTests|CUUTests|CUDTests|CNLTests|CPLTests|VPATests|DECRQCRATests}"
+# Default: a small SMOKE set of families that currently pass clean (measured
+# without --force, so the assertions really run), giving a bare `run.sh` a
+# green exit. Class-anchored (`re.search` over `Class.test_name`, so a loose
+# `EL` would also match `CIELab`). The broader suite has many tracked real
+# failures — see README "Known findings"; widen this set as they're fixed.
+INCLUDE="${INCLUDE:-CUUTests|CUDTests|CBTTests|HPATests}"
 MAX_VT_LEVEL="${MAX_VT_LEVEL:-4}"
 TIMEOUT_SECS="${GHOST_ESCTEST_TIMEOUT_SECS:-120}"
 
@@ -65,10 +65,13 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 log="$work/esctest.log"
 
-# The esctest invocation. --force keeps running past assertions (full report);
+# The esctest invocation. NOTE: do NOT pass --force — in esctest2 that turns
+# every assertion into a no-op (`Raise()` only raises when force is off), so
+# tests "pass" without checking anything. Failures still don't stop the suite:
+# RunTest catches each test's exception and moves on, tallying pass/fail.
 # --no-print-logs keeps esctest from dumping the whole log back into the PTY on
 # exit (we read $log directly). Single-quote paths for the host's `sh -c`.
-esctest_cmd="python3 '$esctest' --expected-terminal xterm --max-vt-level $MAX_VT_LEVEL --include '$INCLUDE' --logfile '$log' --force --no-print-logs"
+esctest_cmd="python3 '$esctest' --expected-terminal xterm --max-vt-level $MAX_VT_LEVEL --include '$INCLUDE' --logfile '$log' --no-print-logs"
 
 echo "ghost:   $GHOST_BIN"
 echo "include: $INCLUDE   (max-vt-level $MAX_VT_LEVEL)"
