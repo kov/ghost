@@ -4633,15 +4633,21 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Occluded(occluded) => {
                 // While a window is occluded (another Space/virtual desktop, the lock
                 // screen) the platform may drop our redraw requests, and macOS App Nap
-                // can throttle the poll loop on top. Becoming visible again therefore
-                // re-arms a repaint: if content really did change while hidden it
-                // paints, and an unchanged scene is a cheap `Clean` skip.
+                // can throttle the poll loop on top. Becoming visible again re-arms a
+                // repaint — but the backing store macOS held may have been discarded
+                // while we were hidden, so a plain repaint could come back `Clean`
+                // against a stale texture and leave the window showing old content.
+                // Force a full re-render (not a Clean skip) so the first visible frame
+                // is provably fresh.
                 if let Some(w) = self.windows.get_mut(&id) {
                     // Record it so the render-stall watchdog skips a window that can't
                     // present (its Lost-looping surface is the platform withholding the
                     // drawable, not our repaint bug).
                     w.occluded = occluded;
                     if !occluded {
+                        if let Some(gfx) = w.gfx.as_mut() {
+                            gfx.force_foreground_repaint();
+                        }
                         w.pacer.request();
                     }
                 }
@@ -4652,8 +4658,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if focused {
                     self.focused = Some(id);
                     // Belt and braces for platforms/WMs that don't report occlusion
-                    // (see `Occluded` above): regaining focus re-arms a repaint too.
+                    // (see `Occluded` above): regaining focus forces a fresh full frame
+                    // too, in case the backing store was discarded while unfocused.
                     if let Some(w) = self.windows.get_mut(&id) {
+                        if let Some(gfx) = w.gfx.as_mut() {
+                            gfx.force_foreground_repaint();
+                        }
                         w.pacer.request();
                     }
                 }
