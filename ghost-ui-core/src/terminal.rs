@@ -238,6 +238,11 @@ pub struct TerminalModel {
     /// feed hint can't localize — and otherwise reports just `feed_dirty`. `None` until
     /// the first present, so the first frame is always `All`.
     presented: Option<Presented>,
+    /// The visible window slid under a scroll offset pinned at the scrollback cap
+    /// (eviction moved every row but the offset couldn't grow to follow it) since the
+    /// last present. Like a scroll, this is whole-view damage the per-row feed hint
+    /// can't localize, so [`Self::damage`] reports `All` until the next present clears it.
+    view_slid: bool,
     /// A repaint is being held back because the app is mid synchronized-output
     /// frame (DEC mode 2026). Released by the mode resetting, or by the tick
     /// scheduled when the hold began (so a stuck app can't freeze the window).
@@ -308,6 +313,11 @@ struct Presented {
     colors: [Option<[u8; 3]>; 3],
 }
 
+/// A cheap identity of one direct graphics placement — image id, placement id, cell
+/// position, footprint, and z — for detecting a feed that changed the placed images
+/// without writing a cell (see [`TerminalModel::placement_signature`]).
+type PlacementSig = (u32, u32, usize, usize, u32, u32, i32);
+
 impl TerminalModel {
     pub fn new(session: SessionId, cols: u16, rows: u16, metrics: CellMetrics) -> Self {
         let size_px = (
@@ -342,6 +352,7 @@ impl TerminalModel {
             reconnecting: false,
             feed_dirty: None,
             presented: None,
+            view_slid: false,
             sync_held: false,
             theme: ThemeColors::default(),
             hovered_link: None,
@@ -369,22 +380,41 @@ impl TerminalModel {
     /// selection, resize, zoom, scale), otherwise the feed-dirtied rows (`None` if a
     /// present was requested but nothing on screen changed). See [`Self::presented`].
     fn damage(&self) -> TermDamage {
-        let moved = match &self.presented {
-            None => true,
-            Some(p) => {
-                p.scroll != self.scroll_offset
-                    || p.selection != self.selection
-                    || p.size != self.size_px
-                    || p.zoom != self.zoom
-                    || p.scale != self.scale
-                    || p.colors != self.render_colors()
-            }
-        };
+        let moved = self.view_slid
+            || match &self.presented {
+                None => true,
+                Some(p) => {
+                    p.scroll != self.scroll_offset
+                        || p.selection != self.selection
+                        || p.size != self.size_px
+                        || p.zoom != self.zoom
+                        || p.scale != self.scale
+                        || p.colors != self.render_colors()
+                }
+            };
         if moved {
             TermDamage::All
         } else {
             match self.feed_dirty {
-                Some((lo, hi)) => TermDamage::Rows { lo, hi },
+                // `feed_dirty` rows are live-viewport rows, but the renderer bands
+                // `TermDamage::Rows` in frame space. While scrolled back a stable offset
+                // (a scroll *change* is already `All` via `moved`), live row L is drawn at
+                // frame row L + offset, so shift the claim into frame space and clip to the
+                // visible window; a range entirely below the fold changed nothing on
+                // screen. Omitting this left the banded foreground texture stale on an
+                // in-place rewrite while scrolled — the recurring foreground-stall bug.
+                Some((lo, hi)) => {
+                    let rows = self.rows as usize;
+                    let lo = lo + self.scroll_offset;
+                    if lo >= rows {
+                        TermDamage::None
+                    } else {
+                        TermDamage::Rows {
+                            lo,
+                            hi: (hi + self.scroll_offset).min(rows - 1),
+                        }
+                    }
+                }
                 None => TermDamage::None,
             }
         }
@@ -404,6 +434,7 @@ impl TerminalModel {
             colors: self.render_colors(),
         });
         self.feed_dirty = None;
+        self.view_slid = false;
         self.trace.presents_marked += 1;
     }
 
@@ -1053,6 +1084,7 @@ impl TerminalModel {
             self.trace.feeds_seen += 1;
             let before = self.screen.vt().lines_scrolled_off();
             let colors_before = self.render_colors();
+            let placements_before = self.placement_signature();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
             // slice means nothing on screen moved (a mode set, a query that only
             // produced a reply, an incomplete UTF-8 tail). That is the "backing
@@ -1073,7 +1105,17 @@ impl TerminalModel {
             // At the bottom (offset 0) we just follow the live output.
             if self.scroll_offset > 0 {
                 let pushed = self.screen.vt().lines_scrolled_off().saturating_sub(before);
-                self.scroll_offset = (self.scroll_offset + pushed).min(self.max_scroll());
+                let desired = self.scroll_offset + pushed;
+                let capped = desired.min(self.max_scroll());
+                // At the scrollback cap the offset can't grow to keep the view pinned to
+                // its content, so the evicted lines slide the whole visible window while
+                // the offset stays put. The per-row feed hint names only the live rows
+                // that changed, not the slid history above them — force a full repaint the
+                // way a scroll does (see [`Self::damage`]).
+                if capped < desired {
+                    self.view_slid = true;
+                }
+                self.scroll_offset = capped;
             }
             let screen = &self.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
@@ -1144,6 +1186,15 @@ impl TerminalModel {
             if images_added {
                 self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
             }
+            // A direct placement changed WITHOUT a new upload — a delete (`a=d`), a move,
+            // or a re-place of an already-uploaded image — alters the drawn frame but
+            // writes no cell and sends no blob, so nothing above dirtied its rows. Damage
+            // the whole viewport (a placement's footprint sits outside any row hint), the
+            // same as a fresh upload does.
+            let placements_changed = placements_before != self.placement_signature();
+            if placements_changed && !images_added {
+                self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
+            }
             // App-set dynamic colors (OSC 10/11/12) dirty no rows, but they
             // recolor everything; `damage` reports All via the `Presented`
             // snapshot — this only makes sure a repaint is actually requested.
@@ -1170,8 +1221,10 @@ impl TerminalModel {
             let want_redraw = viewport_changed
                 || selection_dropped
                 || images_added
+                || placements_changed
                 || colors_changed
-                || cursor_redrawn;
+                || cursor_redrawn
+                || self.view_slid;
             if want_redraw {
                 self.trace.visible_feeds += 1;
             }
@@ -1215,6 +1268,28 @@ impl TerminalModel {
     /// direct placement or by a Unicode-placeholder cell in the viewport — whose
     /// pixels we have not yet sent the renderer. The blob travels out of band (not
     /// through the `Scene`) and once per image.
+    /// The on-screen direct graphics placements as cheap identity tuples, so a feed that
+    /// deletes (`a=d`), moves, or re-places an already-uploaded image — none of which
+    /// writes a cell or uploads a blob — can be detected as a frame change. Placeholder
+    /// cells aren't placements; they change a cell and are covered by the row-damage hint.
+    fn placement_signature(&self) -> Vec<PlacementSig> {
+        self.screen
+            .vt()
+            .graphics_placements()
+            .map(|p| {
+                (
+                    p.image_id,
+                    p.placement_id,
+                    p.row,
+                    p.col,
+                    p.cols,
+                    p.rows,
+                    p.z,
+                )
+            })
+            .collect()
+    }
+
     fn upload_new_images(&mut self, cmds: &mut Vec<Cmd>) {
         let mut fresh: Vec<u32> = Vec::new();
         for p in self.screen.vt().graphics_placements() {
@@ -3273,6 +3348,14 @@ mod tests {
         }
     }
 
+    /// The number of kitty-graphics images the view's frame carries.
+    fn frame_image_count(m: &TerminalModel) -> usize {
+        match m.view().terminals().next().expect("a single terminal item") {
+            SceneItem::Terminal { frame, .. } => frame.images.len(),
+            other => panic!("the single view is one terminal item, got {other:?}"),
+        }
+    }
+
     #[test]
     fn feed_damage_localizes_and_accumulates_until_presented() {
         let mut m = model();
@@ -3329,6 +3412,124 @@ mod tests {
             "a scroll is a full repaint, got {:?}",
             view_damage(&m)
         );
+    }
+
+    #[test]
+    fn deleting_a_graphics_placement_repaints_and_damages_the_view() {
+        let mut m = model();
+        // a=T transmits AND places a 2x1-cell image. The upload is its own
+        // repaint trigger, damaging the whole view (its footprint sits outside
+        // the row hint), so the baseline present below starts clean.
+        feed(&mut m, b"\x1b_Ga=T,i=7,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        assert_eq!(frame_image_count(&m), 1, "the placement is in the frame");
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // Deleting every placement (a=d,d=a) removes the image from the frame:
+        // the rows it covered now render without it. No cell was written and no
+        // image was *uploaded*, so nothing else will trigger the repaint.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Ga=d,d=a\x1b\\".to_vec(),
+            ended: false,
+        });
+        assert_eq!(frame_image_count(&m), 0, "the placement left the frame");
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "removing an on-screen image must repaint, got {cmds:?}"
+        );
+        assert!(
+            !matches!(view_damage(&m), TermDamage::None),
+            "the rows the image uncovered must be damaged"
+        );
+    }
+
+    /// The rows of the *visible* (scroll-adjusted) frame, as text — the ground
+    /// truth a damage claim is checked against, in the same row space
+    /// [`TermDamage::Rows`] is consumed in (see `rows_differ_outside`).
+    fn visible_rows(m: &TerminalModel) -> Vec<String> {
+        m.screen
+            .vt()
+            .view_at(m.scroll_offset)
+            .map(|l| l.text())
+            .collect()
+    }
+
+    /// Assert the view's damage claim covers every frame row whose text differs
+    /// between `before` and `after` — the `rows_differ_outside` contract the
+    /// renderer's band re-raster trusts.
+    #[track_caller]
+    fn assert_damage_covers(m: &TerminalModel, before: &[String], after: &[String]) {
+        let damage = view_damage(m);
+        let covered = |row: usize| match damage {
+            TermDamage::All => true,
+            TermDamage::Rows { lo, hi } => lo <= row && row <= hi,
+            TermDamage::None => false,
+        };
+        let missed: Vec<usize> = before
+            .iter()
+            .zip(after)
+            .enumerate()
+            .filter(|(row, (b, a))| b != a && !covered(*row))
+            .map(|(row, _)| row)
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "TermDamage under-report: frame rows {missed:?} changed outside the claim {damage:?}"
+        );
+    }
+
+    #[test]
+    fn in_place_update_while_scrolled_back_damages_the_visible_frame_row() {
+        let mut m = model();
+        feed_lines(&mut m, 100); // history to scroll into
+        m.set_scroll(3); // live row L is visible at frame row L+3
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // The app rewrites live row 0 in place (CUP home + text) — the way a
+        // spinner or status line redraws between pushes. Nothing scrolled, so
+        // stay-put pinning leaves the offset alone and `moved` stays false.
+        let before = visible_rows(&m);
+        feed(&mut m, b"\x1b[1;1HREWRITTEN");
+        assert_eq!(m.scroll_offset, 3, "no lines pushed; the view stays put");
+        let after = visible_rows(&m);
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter(|(_, (b, a))| b != a)
+            .map(|(row, _)| row)
+            .collect();
+        assert_eq!(changed, vec![3], "live row 0 is visible at frame row 3");
+
+        // The claim must cover frame row 3 — the row that actually changed on
+        // screen — not (only) live row 0.
+        assert_damage_covers(&m, &before, &after);
+    }
+
+    #[test]
+    fn history_sliding_under_a_view_pinned_at_the_scrollback_cap_is_covered() {
+        let mut m = model();
+        // Fill scrollback past its cap (DEFAULT_SCROLLBACK) so trimming is
+        // live, then pin the view at the very top of retained history.
+        feed_lines(&mut m, screen::DEFAULT_SCROLLBACK + 100);
+        m.set_scroll(m.max_scroll());
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // A scroll region pinned to the top (DECSTBM 1;5) scrolling pushes its
+        // top line into scrollback while dirtying only live rows 0..5. At the
+        // cap the eviction slides the whole pinned window, but the offset is
+        // clamped (max_scroll is unchanged), so stay-put pinning cannot absorb
+        // it and `moved` stays false.
+        let before = visible_rows(&m);
+        feed(&mut m, b"\x1b[1;5r\x1b[5;1H\ntail-a\ntail-b\x1b[r");
+        assert_eq!(m.scroll_offset, m.max_scroll(), "still pinned at the cap");
+        let after = visible_rows(&m);
+        assert_ne!(before, after, "the capped history window slides");
+
+        assert_damage_covers(&m, &before, &after);
     }
 
     #[test]
