@@ -101,16 +101,23 @@ impl Buffer {
         self[row].wrapped = true;
     }
 
-    pub fn shift_right(&mut self, (col, row): VisualPosition, mut n: usize, pen: Pen) {
-        n = n.min(self.cols - col);
-        self[row].shift_right(col, n, pen);
+    /// Insert `n` blank cells at `(col, row)`, shifting cells right up to `end`
+    /// (exclusive) — the right margin + 1, or the full width for a plain
+    /// insert/ICH. Cells at/after `end` are untouched.
+    pub fn insert_within(&mut self, (col, row): VisualPosition, n: usize, end: usize, pen: &Pen) {
+        self[row].insert_within(col, n, end, pen);
     }
 
-    pub fn delete(&mut self, (col, row): VisualPosition, mut n: usize, pen: &Pen) {
-        n = n.min(self.cols - col);
+    /// Delete `n` cells at `(col, row)`, pulling cells left up to `end`
+    /// (exclusive). Only a full-width delete (`end == cols`) moves the true line
+    /// end, so only then is the `wrapped` flag cleared.
+    pub fn delete_within(&mut self, (col, row): VisualPosition, n: usize, end: usize, pen: &Pen) {
+        let clear_wrap = end >= self.cols;
         let line = &mut self[row];
-        line.delete(col, n, pen);
-        line.wrapped = false;
+        line.delete_within(col, n, end, pen);
+        if clear_wrap {
+            line.wrapped = false;
+        }
     }
 
     pub fn erase(&mut self, (col, row): VisualPosition, mode: EraseMode, pen: &Pen) {

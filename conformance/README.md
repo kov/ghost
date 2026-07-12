@@ -123,8 +123,13 @@ inflated pass counts — don't repeat that.)
        (no scroll, no move) outside them; an in-box autowrap no longer sets the
        `wrapped` flag. `IND`/`LF`/`NEL`/`RI` families 0 fail
        (`*_MovesDoesNotScrollOutsideLeftRight`).
-  4. ⬜ insert/delete within margins — ICH/DCH bounded by the right margin,
-     IL/DL/DECIC/DECDC within the box.
+  4. insert/delete within margins:
+     - ✅ 4a: ICH/DCH bounded by the right margin — no-op outside the L/R box,
+       else insert/delete within `[cursor..=right]` (`Line::{insert,delete}_within`
+       via `copy_within` + edge mending; `shift_right`/`delete`/insert-mode fold
+       onto them at full width). `ICH`/`DCH` families 12/0.
+     - ⬜ 4b: IL/DL bounded to the box + no-op outside the DECSTBM×L/R region.
+     - ⬜ 4c: DECIC/DECDC (insert/delete columns) — needs new parser arms.
   - Also still open (independent of the slices): CUF/CUB stopping at the
      left/right margin, and reverse-wraparound (`DECSET ?45`, `ReverseWrapInline`)
      for BS/CUB across wrapped lines.

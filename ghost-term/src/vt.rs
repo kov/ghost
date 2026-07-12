@@ -618,6 +618,53 @@ mod tests {
     }
 
     #[test]
+    fn ich_inserts_within_the_right_margin() {
+        // esctest test_ICH_ScrollOffRightMarginInScrollRegion: ICH shifts right
+        // only up to the right margin, dropping the cell there; cells outside the
+        // box are untouched.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("abcdefg");
+        vt.feed_str("\x1b[?69h\x1b[2;5s"); // box cols 2..5 (left 1, right 4)
+        vt.feed_str("\x1b[1;3H"); // cursor at col 2 (inside the box)
+        vt.feed_str("\x1b[1@"); // ICH 1
+        assert_eq!(row_cells(&vt, 0, 7), "ab cdfg");
+    }
+
+    #[test]
+    fn ich_outside_the_box_is_a_no_op() {
+        // esctest test_ICH_IsNoOpWhenCursorBeginsOutsideScrollRegion.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("abcdefg");
+        vt.feed_str("\x1b[?69h\x1b[2;5s"); // box cols 2..5
+        vt.feed_str("\x1b[1;1H"); // cursor left of the box
+        vt.feed_str("\x1b[10@"); // ICH 10
+        assert_eq!(row_cells(&vt, 0, 7), "abcdefg");
+    }
+
+    #[test]
+    fn dch_deletes_within_the_right_margin() {
+        // esctest test_DCH_RespectsMargins: DCH pulls left only within the box,
+        // blank-filling at the right margin; cells outside the box are untouched.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("abcde");
+        vt.feed_str("\x1b[?69h\x1b[2;4s"); // box cols 2..4 (left 1, right 3)
+        vt.feed_str("\x1b[1;3H"); // cursor at col 2 (inside the box)
+        vt.feed_str("\x1b[1P"); // DCH 1
+        assert_eq!(row_cells(&vt, 0, 5), "abd e");
+    }
+
+    #[test]
+    fn dch_outside_the_box_is_a_no_op() {
+        // esctest test_DCH_DoesNothingOutsideLeftRightMargin.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("abcde");
+        vt.feed_str("\x1b[?69h\x1b[2;4s"); // box cols 2..4
+        vt.feed_str("\x1b[1;1H"); // cursor left of the box
+        vt.feed_str("\x1b[99P"); // DCH 99
+        assert_eq!(row_cells(&vt, 0, 5), "abcde");
+    }
+
+    #[test]
     fn decrqm_reports_left_right_margin_mode_state() {
         // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
         // in its own field rather than the tracked-modes set.

@@ -1436,8 +1436,11 @@ impl Terminal {
         }
 
         if self.insert_mode {
+            // Insert-mode (IRM) shift is bounded by the right edge of the print
+            // area, so it doesn't push a cell across a right margin.
+            let end = self.print_right_edge() + 1;
             self.buffer
-                .shift_right((self.cursor.col, self.cursor.row), 1, self.pen);
+                .insert_within((self.cursor.col, self.cursor.row), 1, end, &self.pen);
         }
 
         match self
@@ -1616,16 +1619,19 @@ impl Terminal {
     }
 
     fn ich(&mut self, n: u16) {
+        // ICH is a no-op outside the left/right margins; inside, it inserts blanks
+        // up to the right margin (cells past it drop, those outside the box stay).
+        if !self.cursor_within_lr_margins() {
+            return;
+        }
         self.pending_wrap = false;
 
-        let n = as_usize(n, 1).min(self.cols - self.cursor.col);
-
-        self.buffer
-            .shift_right((self.cursor.col, self.cursor.row), n, self.pen);
-
-        for col in self.cursor.col..self.cursor.col + n {
-            self.buffer.print((col, self.cursor.row), ' ', self.pen);
-        }
+        self.buffer.insert_within(
+            (self.cursor.col, self.cursor.row),
+            as_usize(n, 1),
+            self.right_margin + 1,
+            &self.pen,
+        );
 
         self.dirty_lines.add(self.cursor.row);
     }
@@ -1768,11 +1774,17 @@ impl Terminal {
     }
 
     fn dch(&mut self, n: u16) {
+        // DCH is a no-op outside the left/right margins (but works outside the
+        // top/bottom region); inside, it deletes up to the right margin.
+        if !self.cursor_within_lr_margins() {
+            return;
+        }
         self.pending_wrap = false;
 
-        self.buffer.delete(
+        self.buffer.delete_within(
             (self.cursor.col, self.cursor.row),
             as_usize(n, 1),
+            self.right_margin + 1,
             &self.pen,
         );
 

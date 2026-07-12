@@ -149,43 +149,51 @@ impl Line {
         Some(char_width.as_usize())
     }
 
-    pub(crate) fn shift_right(&mut self, col: usize, n: usize, pen: Pen) {
-        let col = col.min(self.len() - 1);
-        let cur_cell = &mut self.cells[col];
-
-        if cur_cell.occupancy() == Occupancy::WideTail {
-            cur_cell.set(' ', Occupancy::Single, pen);
-            self.cells[col - 1].set(' ', Occupancy::Single, pen);
+    /// Insert `n` blank cells at `col`, shifting `[col..end)` right by `n` and
+    /// dropping the cells pushed past `end - 1`; cells at/after `end` stay put.
+    /// `end` is clamped to the line length and `n` to the window width. A full
+    /// window (`end == len`) is a plain right-shift-and-blank (ICH / insert mode).
+    pub(crate) fn insert_within(&mut self, col: usize, n: usize, end: usize, pen: &Pen) {
+        let end = end.min(self.len());
+        if col >= end {
+            return;
         }
+        let n = n.min(end - col);
 
-        self.cells[col..].rotate_right(n);
+        // Mend wide glyphs straddling either window edge so only whole pairs move.
+        self.split_wide_at(col, pen);
+        self.split_wide_at(end, pen);
 
-        let cur_cell = &mut self.cells[col];
+        self.cells.copy_within(col..end - n, col + n);
+        self.cells[col..col + n].fill(Cell::blank(*pen));
 
-        if cur_cell.occupancy() == Occupancy::WideTail {
-            cur_cell.set(' ', Occupancy::Single, pen);
-            self.cells
-                .last_mut()
-                .unwrap()
-                .set(' ', Occupancy::Single, pen);
+        // A wide head shifted into the last column lost its tail past `end`.
+        if self.cells[end - 1].occupancy() == Occupancy::WideHead {
+            self.cells[end - 1].set(' ', Occupancy::Single, *pen);
         }
     }
 
-    pub(crate) fn delete(&mut self, col: usize, n: usize, pen: &Pen) {
+    /// Delete `n` cells at `col`, pulling `[col + n..end)` left and blank-filling
+    /// the `n` cells before `end`; cells at/after `end` stay put. `end` is clamped
+    /// to the line length and `n` to the window width. A full window
+    /// (`end == len`) is a plain left-shift-and-blank (DCH).
+    pub(crate) fn delete_within(&mut self, col: usize, n: usize, end: usize, pen: &Pen) {
+        let end = end.min(self.len());
+        if col >= end {
+            return;
+        }
+        let n = n.min(end - col);
+
+        self.split_wide_at(col, pen);
+        self.split_wide_at(end, pen);
+
+        self.cells.copy_within(col + n..end, col);
+        self.cells[end - n..end].fill(Cell::blank(*pen));
+
+        // A wide tail pulled to `col` lost its head.
         if self.cells[col].occupancy() == Occupancy::WideTail {
-            self.cells[col - 1].set(' ', Occupancy::Single, *pen);
+            self.cells[col].set(' ', Occupancy::Single, *pen);
         }
-
-        self.cells[col..].rotate_left(n);
-
-        let cur_cell = &mut self.cells[col];
-
-        if cur_cell.occupancy() == Occupancy::WideTail {
-            cur_cell.set(' ', Occupancy::Single, *pen);
-        }
-
-        let fill_start = self.cells.len() - n;
-        self.cells[fill_start..].fill(Cell::blank(*pen));
     }
 
     /// Blank both halves of a wide glyph straddling the boundary just before
