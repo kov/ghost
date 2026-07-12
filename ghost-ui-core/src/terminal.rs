@@ -20,7 +20,7 @@ use ghost_term::{ClipboardSelection, Line, MouseProtocol};
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 use crate::{
@@ -215,8 +215,11 @@ pub struct TerminalModel {
     /// Last window title pushed to the shell, to emit `SetTitle` only on change.
     last_title: String,
     /// kitty-graphics image ids whose pixels have been uploaded to the renderer,
-    /// so the (potentially large) blob is sent once rather than every feed.
-    uploaded_images: HashSet<u32>,
+    /// mapped to the [`generation`](ghost_term::graphics::Image::generation) sent, so
+    /// the (potentially large) blob is sent once per transmit — but a re-transmit
+    /// under an existing id (a higher generation) re-uploads the replaced pixels
+    /// rather than leaving the stale image on screen.
+    uploaded_images: HashMap<u32, u64>,
     /// Count of stored graphics images at the last feed. When it grows, a newly
     /// stored image may be referenced by a placeholder that has already scrolled
     /// out of the live viewport, so we rescan all retained lines (not just the
@@ -346,7 +349,7 @@ impl TerminalModel {
             scroll_offset: 0,
             preedit: String::new(),
             last_title: String::new(),
-            uploaded_images: HashSet::new(),
+            uploaded_images: HashMap::new(),
             last_image_count: 0,
             ended: false,
             reconnecting: false,
@@ -1300,17 +1303,17 @@ impl TerminalModel {
     }
 
     fn upload_new_images(&mut self, cmds: &mut Vec<Cmd>) {
-        let mut fresh: Vec<u32> = Vec::new();
+        // Every image id referenced on screen: direct placements first...
+        let mut referenced: Vec<u32> = Vec::new();
         for p in self.screen.vt().graphics_placements() {
-            let id = p.image_id;
-            if !self.uploaded_images.contains(&id) && !fresh.contains(&id) {
-                fresh.push(id);
+            if !referenced.contains(&p.image_id) {
+                referenced.push(p.image_id);
             }
         }
-        // Placeholder cells reference an image by id without a direct placement.
-        // Normally scan just the live viewport; but when a new image was just
-        // stored, also scan the retained scrollback, since the image may belong to
-        // a placeholder that already scrolled out of view (otherwise it would never
+        // ...then Unicode-placeholder cells, which reference an image by id without a
+        // direct placement. Normally scan just the live viewport; but when a new image
+        // was just stored, also scan the retained scrollback, since the image may belong
+        // to a placeholder that already scrolled out of view (otherwise it would never
         // upload and would render blank when scrolled back to).
         let count = self.screen.vt().graphics_image_count();
         let scan_all = count != self.last_image_count;
@@ -1331,20 +1334,28 @@ impl TerminalModel {
                 .collect()
         };
         for id in placeholder_ids {
-            if !self.uploaded_images.contains(&id) && !fresh.contains(&id) {
-                fresh.push(id);
+            if !referenced.contains(&id) {
+                referenced.push(id);
             }
         }
-        for id in fresh {
-            if let Some(image) = self.screen.vt().graphics_image(id) {
-                cmds.push(Cmd::UploadImage {
-                    id,
-                    width: image.width,
-                    height: image.height,
-                    rgba: image.pixels.clone(),
-                });
-                self.uploaded_images.insert(id);
+        // Upload any whose current store generation differs from what we last sent — a
+        // first transmit (no entry yet) or a re-transmit that replaced the pixels under
+        // an existing id. Keying on the id alone would leave a re-transmit stale.
+        for id in referenced {
+            let Some(image) = self.screen.vt().graphics_image(id) else {
+                continue;
+            };
+            if self.uploaded_images.get(&id) == Some(&image.generation) {
+                continue;
             }
+            let generation = image.generation;
+            cmds.push(Cmd::UploadImage {
+                id,
+                width: image.width,
+                height: image.height,
+                rgba: image.pixels.clone(),
+            });
+            self.uploaded_images.insert(id, generation);
         }
     }
 
@@ -3691,6 +3702,41 @@ mod tests {
             ended: false,
         });
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
+    }
+
+    #[test]
+    fn re_transmitting_an_image_under_the_same_id_re_uploads_the_new_pixels() {
+        let mut m = model();
+        // a=T: transmit a 2x1 RGB image (id 5, red|green) and display it.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::UploadImage {
+            id: 5,
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+        }));
+        // Re-transmit id 5 with DIFFERENT pixels (blue|green). kitty lets a client
+        // replace an image under an existing id (an animation frame, a reused id); the
+        // renderer still holds the OLD pixels, so the model must send the new ones.
+        // Keying uploads on the id alone leaves the image stale on screen forever.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;AAD/AP8A\x1b\\".to_vec(),
+            ended: false,
+        });
+        let uploaded = cmds.iter().find_map(|c| match c {
+            Cmd::UploadImage { id: 5, rgba, .. } => Some(rgba.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            uploaded,
+            Some(vec![0, 0, 255, 255, 0, 255, 0, 255]),
+            "a re-transmit under an existing id must re-upload the replaced pixels: {cmds:?}"
+        );
     }
 
     #[test]

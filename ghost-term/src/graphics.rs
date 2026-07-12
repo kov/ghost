@@ -62,6 +62,11 @@ pub struct Image {
     pub height: u32,
     /// `4 * width * height` bytes, RGBA, sRGB, top-left origin.
     pub pixels: Vec<u8>,
+    /// Monotonic store generation, bumped every time an id is (re)transmitted. kitty
+    /// lets a client replace the pixels under an existing id (animation frames, id
+    /// reuse); consumers that cache uploads per id must re-send when this changes, or
+    /// the old pixels stay on screen. See `GraphicsState::next_generation`.
+    pub generation: u64,
 }
 
 impl std::fmt::Debug for Image {
@@ -71,6 +76,7 @@ impl std::fmt::Debug for Image {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("bytes", &self.pixels.len())
+            .field("generation", &self.generation)
             .finish()
     }
 }
@@ -145,6 +151,10 @@ pub struct GraphicsState {
     /// Next candidate id when the terminal must allocate one (image-number `I=`
     /// transfers, or a transfer with neither `i` nor `I`).
     next_id: u32,
+    /// Monotonic generation stamp, bumped on every stored transmit and copied into
+    /// the image's [`Image::generation`], so a consumer can tell a re-transmit (new
+    /// pixels under an old id) from an unchanged image and refresh its upload.
+    next_generation: u64,
     /// Running sum of stored `pixels.len()`, kept in step with `images` so the
     /// storage budget (`MAX_STORED_BYTES`) is an O(1) check.
     stored_bytes: usize,
@@ -390,6 +400,9 @@ impl GraphicsState {
         }
         let freed = self.images.get(&id).map_or(0, |old| old.pixels.len());
         self.stored_bytes = self.stored_bytes.saturating_sub(freed) + new_bytes;
+        // A fresh generation for every transmit, so a re-transmit under an existing id
+        // (kitty animation / id reuse) is distinguishable from the pixels already sent.
+        self.next_generation += 1;
         self.images.insert(
             id,
             Image {
@@ -397,6 +410,7 @@ impl GraphicsState {
                 width: image.0,
                 height: image.1,
                 pixels: image.2,
+                generation: self.next_generation,
             },
         );
         self.touch(id);
@@ -855,6 +869,23 @@ mod tests {
         g.reset();
         assert_eq!(g.image_count(), 0);
         assert_eq!(g.stored_bytes, 0);
+    }
+
+    #[test]
+    fn re_transmitting_an_id_bumps_the_image_generation() {
+        let mut g = GraphicsState::default();
+        feed(&mut g, &transmit_rgb(1, 1, 1, &[1, 2, 3]));
+        let first = g.image(1).expect("stored").generation;
+        // A distinct image gets its own, later generation (the stamp is store-wide).
+        feed(&mut g, &transmit_rgb(2, 1, 1, &[4, 5, 6]));
+        assert!(g.image(2).unwrap().generation > first);
+        // Re-transmitting id 1 replaces its pixels and must advance ITS generation, so a
+        // consumer caching uploads per id can tell the pixels changed and re-send them.
+        feed(&mut g, &transmit_rgb(1, 1, 1, &[7, 8, 9]));
+        assert!(
+            g.image(1).unwrap().generation > first,
+            "a re-transmit under an existing id must bump its generation"
+        );
     }
 
     #[test]
