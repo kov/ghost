@@ -245,6 +245,18 @@ impl Screen {
         )
     }
 
+    /// Cursor position for a cursor-position report (CPR) as 1-based
+    /// `(col, row)`, reported relative to the active margins in origin mode —
+    /// what a program querying its cursor reads back. Distinct from
+    /// [`Self::cursor`], which is the absolute position for rendering/IME.
+    pub fn cursor_report(&self) -> (u16, u16) {
+        let (col, row) = self.vt.cursor_report();
+        (
+            (col as u16).saturating_add(1),
+            (row as u16).saturating_add(1),
+        )
+    }
+
     /// The emulator state as an extended dump (scrollback + viewport + modes).
     /// Feeding these bytes to a fresh terminal reconstructs the state; this is
     /// what a reattach resync replays.

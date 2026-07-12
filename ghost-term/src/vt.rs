@@ -214,6 +214,12 @@ impl Vt {
         self.terminal.bell_count()
     }
 
+    /// The cursor position for a cursor-position report, 0-based `(col, row)`,
+    /// origin-relative in origin mode. See [`Terminal::cursor_report`].
+    pub fn cursor_report(&self) -> (usize, usize) {
+        self.terminal.cursor_report()
+    }
+
     pub fn cursor(&self) -> Cursor {
         self.terminal.cursor()
     }
@@ -399,6 +405,54 @@ mod tests {
     use proptest::prelude::*;
     use std::env;
     use std::fs;
+
+    #[test]
+    fn left_right_margins_drive_origin_relative_cursor() {
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[6;11r"); // DECSTBM: top row 6, bottom 11
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[5;10s"); // DECSLRM: left col 5, right col 10
+        vt.feed_str("\x1b[?6h"); // origin mode on
+        vt.feed_str("\x1b[1;1H"); // CUP(1,1) -> origin corner (col5,row6)
+
+        // Absolute landing: 0-based (col4, row5).
+        let c = vt.cursor();
+        assert_eq!(
+            (c.col, c.row),
+            (4, 5),
+            "origin CUP lands at the margin corner"
+        );
+        // CPR reports origin-relative (1,1).
+        assert_eq!(
+            vt.cursor_report(),
+            (0, 0),
+            "CPR is origin-relative (0-based)"
+        );
+
+        // The write lands at the corner; DECRQCRA reads 'X' there, blank elsewhere.
+        vt.feed_str("X");
+        let neg_x = 0u16.wrapping_sub(u16::from(b'X'));
+        assert_eq!(
+            vt.rect_checksum(5, 4, 5, 4),
+            neg_x,
+            "X at absolute (col5,row6)"
+        );
+        assert_eq!(
+            vt.rect_checksum(5, 0, 5, 0),
+            0xFFE0,
+            "col1 of that row is blank"
+        );
+
+        // `CSI s` with the mode on resets margins to full; disabling ?69 too.
+        vt.feed_str("\x1b[?6l"); // origin off so addressing is absolute again
+        vt.feed_str("\x1b[?69l"); // DECLRMM off -> margins reset to full
+        vt.feed_str("\x1b[1;1H\x1b[?6h\x1b[1;1H"); // origin on, home
+        assert_eq!(
+            vt.cursor().col,
+            0,
+            "no left margin after ?69l, home is col 1"
+        );
+    }
 
     #[test]
     fn rect_checksum_matches_xterm_decrqcra() {

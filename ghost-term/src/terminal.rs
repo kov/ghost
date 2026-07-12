@@ -61,6 +61,17 @@ pub struct Terminal {
     alternate_kitty_kbd_stack: Vec<u8>,
     top_margin: usize,
     bottom_margin: usize,
+    /// Left/right scroll margins (DECSLRM), 0-based inclusive column bounds.
+    /// Default to the full width `0..=cols-1`; only narrowed while
+    /// `left_right_margin_mode` (DECLRMM, private mode ?69) is enabled. When set,
+    /// they bound autowrap, scrolling, insert/delete, and (in origin mode) cursor
+    /// addressing to the `[left..=right]` × `[top..=bottom]` box.
+    left_margin: usize,
+    right_margin: usize,
+    /// DECLRMM (`CSI ?69h`): whether left/right margins are honored. DECSLRM
+    /// (`CSI Pl;Pr s`) only sets margins while this is on; with it off, `CSI s`
+    /// is SCOSC (save cursor) instead.
+    left_right_margin_mode: bool,
     saved_ctx: SavedCtx,
     alternate_saved_ctx: SavedCtx,
     dirty_lines: DirtyLines,
@@ -194,6 +205,9 @@ impl Terminal {
             alternate_kitty_kbd_stack: Vec::new(),
             top_margin: 0,
             bottom_margin: (rows - 1),
+            left_margin: 0,
+            right_margin: (cols - 1),
+            left_right_margin_mode: false,
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
             dirty_lines,
@@ -456,6 +470,16 @@ impl Terminal {
                 self.decstbm(top, bottom);
             }
 
+            Decslrm(left, right) => {
+                // `CSI Pl;Pr s` is DECSLRM only while DECLRMM (?69) is on;
+                // otherwise the sequence is SCOSC (save cursor).
+                if self.left_right_margin_mode {
+                    self.decslrm(left, right);
+                } else {
+                    self.sc();
+                }
+            }
+
             Decstr => {
                 self.decstr();
             }
@@ -713,6 +737,18 @@ impl Terminal {
         self.cursor
     }
 
+    /// The cursor position for a cursor-position report (CPR/DECXCPR): 0-based
+    /// `(col, row)`, made relative to the active margins in origin mode (xterm
+    /// reports origin-relative there). Clamped at 0 if the cursor sits outside
+    /// the box. Unlike [`Self::cursor`] (absolute, for rendering/IME), this is
+    /// what a program querying its own cursor should read back.
+    pub fn cursor_report(&self) -> (usize, usize) {
+        (
+            self.cursor.col.saturating_sub(self.actual_left_margin()),
+            self.cursor.row.saturating_sub(self.actual_top_margin()),
+        )
+    }
+
     pub fn gc(&mut self) -> Box<dyn Iterator<Item = Line> + '_> {
         let lines = self.buffer.gc();
 
@@ -752,11 +788,19 @@ impl Terminal {
     }
 
     fn move_cursor_to_col(&mut self, col: usize) {
-        if col >= self.cols {
-            self.cursor.col = self.cols - 1;
-        } else {
-            self.cursor.col = col;
-        }
+        // Origin-aware absolute column (CUP/CHA/HPA): in origin mode with
+        // left/right margins the column is relative to the left margin and
+        // clamped to the margin box; otherwise it is an absolute screen column.
+        // Mirrors [`Self::move_cursor_to_row`].
+        let left = self.actual_left_margin();
+        let right = self.actual_right_margin();
+        self.cursor.col = (left + col).clamp(left, right);
+    }
+
+    /// Set the cursor column with no origin/margin translation, clamped to the
+    /// screen — for tab stops and absolute edge moves.
+    fn do_move_cursor_to_col(&mut self, col: usize) {
+        self.cursor.col = col.min(self.cols - 1);
     }
 
     fn move_cursor_to_row(&mut self, mut row: usize) {
@@ -784,18 +828,18 @@ impl Terminal {
     }
 
     fn move_cursor_home(&mut self) {
-        self.cursor.col = 0;
+        self.cursor.col = self.actual_left_margin();
         self.do_move_cursor_to_row(self.actual_top_margin());
     }
 
     fn move_cursor_to_next_tab(&mut self, n: usize) {
         let next_tab = self.tabs.after(self.cursor.col, n).unwrap_or(self.cols - 1);
-        self.move_cursor_to_col(next_tab);
+        self.do_move_cursor_to_col(next_tab);
     }
 
     fn move_cursor_to_prev_tab(&mut self, n: usize) {
         let prev_tab = self.tabs.before(self.cursor.col, n).unwrap_or(0);
-        self.move_cursor_to_col(prev_tab);
+        self.do_move_cursor_to_col(prev_tab);
     }
 
     fn move_cursor_down_with_scroll(&mut self) {
@@ -841,6 +885,27 @@ impl Terminal {
         match self.origin_mode {
             false => self.rows - 1,
             true => self.bottom_margin,
+        }
+    }
+
+    /// The left margin as it constrains cursor *addressing* (CUP/CHA/home): the
+    /// left margin only in origin mode with DECLRMM on, else column 0. (Autowrap
+    /// and scrolling use the raw `left_margin`, gated on DECLRMM alone.)
+    fn actual_left_margin(&self) -> usize {
+        if self.origin_mode && self.left_right_margin_mode {
+            self.left_margin
+        } else {
+            0
+        }
+    }
+
+    /// The right margin as it constrains cursor addressing; the counterpart of
+    /// [`Self::actual_left_margin`].
+    fn actual_right_margin(&self) -> usize {
+        if self.origin_mode && self.left_right_margin_mode {
+            self.right_margin
+        } else {
+            self.cols - 1
         }
     }
 
@@ -916,6 +981,10 @@ impl Terminal {
         match cols.cmp(&self.cols) {
             std::cmp::Ordering::Less => {
                 self.tabs.contract(cols);
+                // A column change invalidates left/right margins; reset to the
+                // full width (as a row change does for top/bottom).
+                self.left_margin = 0;
+                self.right_margin = cols - 1;
                 resized = true;
             }
 
@@ -923,6 +992,8 @@ impl Terminal {
 
             std::cmp::Ordering::Greater => {
                 self.tabs.expand(self.cols, cols);
+                self.left_margin = 0;
+                self.right_margin = cols - 1;
                 resized = true;
             }
         }
@@ -973,6 +1044,11 @@ impl Terminal {
         self.cursor.visible = true;
         self.top_margin = 0;
         self.bottom_margin = self.rows - 1;
+        // DEC STD 070: DECSTR resets left/right margins to full width and turns
+        // off left/right margin mode.
+        self.left_margin = 0;
+        self.right_margin = self.cols - 1;
+        self.left_right_margin_mode = false;
         self.insert_mode = false;
         self.origin_mode = false;
         self.pen = Pen::default();
@@ -1006,6 +1082,9 @@ impl Terminal {
         self.alternate_kitty_kbd_stack.clear();
         self.top_margin = 0;
         self.bottom_margin = self.rows - 1;
+        self.left_margin = 0;
+        self.right_margin = self.cols - 1;
+        self.left_right_margin_mode = false;
         self.saved_ctx = SavedCtx::default();
         self.alternate_saved_ctx = SavedCtx::default();
         self.dirty_lines = DirtyLines::new(self.rows);
@@ -1197,6 +1276,9 @@ impl Terminal {
         assert_eq!(self.kitty_kbd, other.kitty_kbd);
         assert_eq!(self.top_margin, other.top_margin);
         assert_eq!(self.bottom_margin, other.bottom_margin);
+        assert_eq!(self.left_margin, other.left_margin);
+        assert_eq!(self.right_margin, other.right_margin);
+        assert_eq!(self.left_right_margin_mode, other.left_right_margin_mode);
         assert_eq!(self.saved_ctx, other.saved_ctx);
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
         assert_eq!(self.tracked_modes, other.tracked_modes);
@@ -1537,7 +1619,7 @@ impl Terminal {
 
     fn dch(&mut self, n: u16) {
         if self.cursor.col >= self.cols {
-            self.move_cursor_to_col(self.cols - 1);
+            self.do_move_cursor_to_col(self.cols - 1);
         }
 
         self.buffer.delete(
@@ -1751,6 +1833,21 @@ impl Terminal {
         self.move_cursor_home();
     }
 
+    /// DECSLRM — set the left/right margins (only reached while DECLRMM is on).
+    /// Omitted params default to the full width, so `CSI s` resets the margins.
+    /// Like DECSTBM, an invalid pair is ignored and the cursor homes afterward.
+    fn decslrm(&mut self, left: u16, right: u16) {
+        let left = as_usize(left, 1) - 1;
+        let right = as_usize(right, self.cols) - 1;
+
+        if left < right && right < self.cols {
+            self.left_margin = left;
+            self.right_margin = right;
+        }
+
+        self.move_cursor_home();
+    }
+
     fn xtwinops(&mut self, op: XtwinopsOp) {
         if self.xtwinops {
             let XtwinopsOp::Resize(cols, rows) = op;
@@ -1777,6 +1874,12 @@ impl Terminal {
                 Origin => {
                     self.origin_mode = true;
                     self.move_cursor_home();
+                }
+
+                LeftRightMargin => {
+                    // Enable DECLRMM; margins stay at their default (full width)
+                    // until a DECSLRM sets them.
+                    self.left_right_margin_mode = true;
                 }
 
                 AutoWrap => {
@@ -1823,6 +1926,13 @@ impl Terminal {
                 Origin => {
                     self.origin_mode = false;
                     self.move_cursor_home();
+                }
+
+                LeftRightMargin => {
+                    // Disabling DECLRMM resets the margins to the full width.
+                    self.left_right_margin_mode = false;
+                    self.left_margin = 0;
+                    self.right_margin = self.cols - 1;
                 }
 
                 AutoWrap => {
@@ -2022,6 +2132,19 @@ impl Terminal {
             ));
         }
 
+        // 8b. setup left/right margins: enable DECLRMM, then set them (DECSLRM
+        // only takes effect while the mode is on). Like DECSTBM this homes the
+        // cursor, so it must precede the cursor fixup below.
+        if self.left_right_margin_mode {
+            funs.push(Function::Decset(DecModes::one(DecMode::LeftRightMargin)));
+            if self.left_margin > 0 || self.right_margin < self.cols - 1 {
+                funs.push(Function::Decslrm(
+                    as_u16(self.left_margin + 1),
+                    as_u16(self.right_margin + 1),
+                ));
+            }
+        }
+
         // 9. setup cursor
 
         let col = self.cursor.col;
@@ -2063,6 +2186,13 @@ impl Terminal {
                 }
             } else {
                 row -= self.top_margin;
+                // In origin mode with left/right margins, CUP columns are also
+                // margin-relative, so shift the target back by the left margin.
+                let col = if self.left_right_margin_mode {
+                    col.saturating_sub(self.left_margin)
+                } else {
+                    col
+                };
                 funs.push(Function::Cup(as_u16(row + 1), as_u16(col + 1)));
             }
         } else {

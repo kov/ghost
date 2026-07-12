@@ -1133,7 +1133,7 @@ impl TerminalModel {
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
             let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
             let ctx = ReplyCtx {
-                cursor: screen.cursor(),
+                cursor: screen.cursor_report(),
                 size: screen.dimensions(),
                 kitty_flags: screen.kitty_keyboard_flags(),
                 cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),

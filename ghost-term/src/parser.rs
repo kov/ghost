@@ -76,6 +76,10 @@ pub enum Function {
     Decsc,
     Decset(DecModes),
     Decstbm(u16, u16),
+    /// DECSLRM `CSI Pl ; Pr s` — set left/right margins. Shares its final byte
+    /// with SCOSC (`CSI s`): the terminal treats it as DECSLRM only while
+    /// DECLRMM (`?69`) is on, otherwise as SCOSC (save cursor).
+    Decslrm(u16, u16),
     Decstr,
     Dl(u16),
     Ech(u16),
@@ -165,6 +169,7 @@ pub enum DecMode {
     Origin = 6,            // DECOM
     AutoWrap = 7,          // DECAWM
     TextCursorEnable = 25, // DECTCEM
+    LeftRightMargin = 69,  // DECLRMM — enables DECSLRM left/right margins
     // Non-display modes: tracked but not rendered, so a state dump can restore
     // them on reattach. They affect what the terminal *sends*, not the grid.
     MouseReportX11 = 1000,            // button press/release
@@ -972,7 +977,7 @@ impl Parser {
 
             (None, 'r') => Some(Decstbm(ps[0].as_u16(), ps[1].as_u16())),
 
-            (None, 's') => Some(Scosc),
+            (None, 's') => Some(Decslrm(ps[0].as_u16(), ps[1].as_u16())),
 
             (None, 't') => {
                 if ps[0].as_u16() == 8 {
@@ -1362,6 +1367,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    LeftRightMargin => 69,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
                     MouseReportAny => 1003,
@@ -1391,6 +1397,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    LeftRightMargin => 69,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
                     MouseReportAny => 1003,
@@ -1411,6 +1418,10 @@ fn dump_function(seq: &mut String, fun: &Function) {
 
         Decstbm(top, bottom) => {
             push_csi(seq, None, &[top.to_string(), bottom.to_string()], 'r');
+        }
+
+        Decslrm(left, right) => {
+            push_csi(seq, None, &[left.to_string(), right.to_string()], 's');
         }
 
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
@@ -1945,6 +1956,7 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         6 => Some(Origin),
         7 => Some(AutoWrap),
         25 => Some(TextCursorEnable),
+        69 => Some(LeftRightMargin),
         47 => Some(AltScreenBuffer), // legacy variant of 1047
         1000 => Some(MouseReportX11),
         1002 => Some(MouseReportButton),
@@ -2324,7 +2336,10 @@ mod tests {
             parse("\x1b[8;24;80t"),
             [Xtwinops(XtwinopsOp::Resize(80, 24))]
         );
-        assert_eq!(parse("\x1b[s"), [Scosc]);
+        // `CSI s` parses to DECSLRM(0,0); the terminal treats it as SCOSC when
+        // DECLRMM is off, or as a reset-to-full-margins when it is on.
+        assert_eq!(parse("\x1b[s"), [Decslrm(0, 0)]);
+        assert_eq!(parse("\x1b[5;10s"), [Decslrm(5, 10)]);
         assert_eq!(parse("\x1b[u"), [Scorc]);
         assert_eq!(parse("\x1b[!p"), [Decstr]);
 
@@ -2803,6 +2818,7 @@ mod tests {
                 DecMode::SaveCursor,
                 DecMode::SaveCursorAltScreenBuffer,
             ])),
+            Decslrm(5, 10),
             Decstbm(2, 5),
             Decstr,
             Dl(17),
@@ -2841,7 +2857,6 @@ mod tests {
             Rm(ansi_modes([])),
             Rm(ansi_modes([AnsiMode::Insert, AnsiMode::NewLine])),
             Scorc,
-            Scosc,
             Sd(20),
             SetCursorStyle(0),
             SetCursorStyle(4),
