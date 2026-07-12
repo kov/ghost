@@ -955,6 +955,14 @@ impl Terminal {
         self.left_margin > 0 || self.right_margin < self.cols - 1
     }
 
+    /// Whether the cursor is inside the scroll region on both axes (within the
+    /// top/bottom margins and the left/right margins). IL/DL are no-ops outside
+    /// it — including above or below the DECSTBM region.
+    fn cursor_in_scroll_region(&self) -> bool {
+        (self.top_margin..=self.bottom_margin).contains(&self.cursor.row)
+            && self.cursor_within_lr_margins()
+    }
+
     fn scroll_up_in_region(&mut self, n: usize) {
         let range = self.top_margin..self.bottom_margin + 1;
         self.buffer
@@ -1748,28 +1756,29 @@ impl Terminal {
     }
 
     fn il(&mut self, n: u16) {
-        let range = if self.cursor.row <= self.bottom_margin {
-            self.cursor.row..self.bottom_margin + 1
-        } else {
-            self.cursor.row..self.rows
-        };
-
-        self.buffer
-            .scroll_down(range.clone(), as_usize(n, 1), &self.pen);
-
+        // IL inserts blank lines (scrolls the region down) only when the cursor
+        // is inside the scroll region, bounded to the left/right-margin box.
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        let range = self.cursor.row..self.bottom_margin + 1;
+        self.buffer.scroll_down_within(
+            range.clone(),
+            self.scroll_cols(),
+            as_usize(n, 1),
+            &self.pen,
+        );
         self.dirty_lines.extend(range);
     }
 
     fn dl(&mut self, n: u16) {
-        let range = if self.cursor.row <= self.bottom_margin {
-            self.cursor.row..self.bottom_margin + 1
-        } else {
-            self.cursor.row..self.rows
-        };
-
+        // DL deletes lines (scrolls the region up), same gating and box bound.
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        let range = self.cursor.row..self.bottom_margin + 1;
         self.buffer
-            .scroll_up(range.clone(), as_usize(n, 1), &self.pen);
-
+            .scroll_up_within(range.clone(), self.scroll_cols(), as_usize(n, 1), &self.pen);
         self.dirty_lines.extend(range);
     }
 
@@ -3403,8 +3412,10 @@ mod tests {
         term.execute(Cup(4, 1));
         term.execute(Dl(0));
 
-        assert_eq!(text(&term), "abcd\nefgh\nijkl\n|");
-        assert_eq!(wrapped(&term), vec![true, true, false, false]);
+        // The cursor (row 4) is below the scroll region (rows 1-2), so DL is a
+        // no-op — it must not scroll `cursor.row..rows` as it once did.
+        assert_eq!(text(&term), "abcd\nefgh\nijkl\n|mn");
+        assert_eq!(wrapped(&term), vec![true, true, true, false]);
     }
 
     #[test]

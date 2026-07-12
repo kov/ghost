@@ -412,6 +412,16 @@ mod tests {
         vt.line(row).cells()[..n].iter().map(|c| c.char()).collect()
     }
 
+    /// Fill a 5×5 vt with the esctest region grid (abcde / fghij / …).
+    fn grid5(vt: &mut Vt) {
+        for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            vt.feed_str(&format!("\x1b[{};1H{s}", r + 1));
+        }
+    }
+
     #[test]
     fn autowrap_respects_the_right_margin() {
         let mut vt = Vt::new(10, 5);
@@ -662,6 +672,70 @@ mod tests {
         vt.feed_str("\x1b[1;1H"); // cursor left of the box
         vt.feed_str("\x1b[99P"); // DCH 99
         assert_eq!(row_cells(&vt, 0, 5), "abcde");
+    }
+
+    #[test]
+    fn dl_deletes_lines_within_the_box() {
+        // esctest test_DL_InLeftRightScrollRegion: DL pulls lines up only within
+        // the boxed columns, leaving cells outside the box in place.
+        let mut vt = Vt::new(5, 5);
+        grid5(&mut vt);
+        vt.feed_str("\x1b[?69h\x1b[2;4s"); // box cols 2..4 (left 1, right 3)
+        vt.feed_str("\x1b[2;3H"); // cursor row 1, col 2 (inside the box)
+        vt.feed_str("\x1b[1M"); // DL 1
+        assert_eq!(row_cells(&vt, 0, 5), "abcde");
+        assert_eq!(row_cells(&vt, 1, 5), "flmnj");
+        assert_eq!(row_cells(&vt, 2, 5), "kqrso");
+        assert_eq!(row_cells(&vt, 3, 5), "pvwxt");
+        assert_eq!(row_cells(&vt, 4, 5), "u   y");
+    }
+
+    #[test]
+    fn il_inserts_lines_within_the_box() {
+        // DL's counterpart: IL pushes boxed lines down, outside columns stay.
+        let mut vt = Vt::new(5, 5);
+        grid5(&mut vt);
+        vt.feed_str("\x1b[?69h\x1b[2;4s"); // box cols 2..4
+        vt.feed_str("\x1b[2;3H"); // cursor row 1, col 2 (inside the box)
+        vt.feed_str("\x1b[1L"); // IL 1
+        assert_eq!(row_cells(&vt, 0, 5), "abcde");
+        assert_eq!(row_cells(&vt, 1, 5), "f   j");
+        assert_eq!(row_cells(&vt, 2, 5), "kghio");
+        assert_eq!(row_cells(&vt, 3, 5), "plmnt");
+        assert_eq!(row_cells(&vt, 4, 5), "uqrsy");
+    }
+
+    #[test]
+    fn dl_outside_the_box_is_a_no_op() {
+        // esctest test_DL_OutsideLeftRightScrollRegion.
+        let mut vt = Vt::new(5, 5);
+        grid5(&mut vt);
+        vt.feed_str("\x1b[?69h\x1b[2;4s"); // box cols 2..4
+        vt.feed_str("\x1b[2;1H"); // cursor left of the box
+        vt.feed_str("\x1b[1M"); // DL
+        for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(row_cells(&vt, r, 5), *s);
+        }
+    }
+
+    #[test]
+    fn dl_above_the_scroll_region_is_a_no_op() {
+        // esctest test_DL_OutsideScrollRegion: DL is inert when the cursor is
+        // outside the DECSTBM region (previously it scrolled anyway).
+        let mut vt = Vt::new(5, 5);
+        grid5(&mut vt);
+        vt.feed_str("\x1b[2;4r"); // DECSTBM rows 2..4 (top_margin = row 1)
+        vt.feed_str("\x1b[1;3H"); // cursor at row 0, above the top margin
+        vt.feed_str("\x1b[1M"); // DL
+        for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(row_cells(&vt, r, 5), *s);
+        }
     }
 
     #[test]

@@ -128,7 +128,11 @@ inflated pass counts — don't repeat that.)
        else insert/delete within `[cursor..=right]` (`Line::{insert,delete}_within`
        via `copy_within` + edge mending; `shift_right`/`delete`/insert-mode fold
        onto them at full width). `ICH`/`DCH` families 12/0.
-     - ⬜ 4b: IL/DL bounded to the box + no-op outside the DECSTBM×L/R region.
+     - ✅ 4b: IL/DL scroll the box (via `scroll_{down,up}_within`) and are a
+       no-op unless the cursor is in the scroll region on both axes
+       (`cursor_in_scroll_region()`) — which also fixed a pre-existing bug where
+       they scrolled `cursor.row..rows` above/below the DECSTBM region.
+       `IL`/`DL` families 16/0.
      - ⬜ 4c: DECIC/DECDC (insert/delete columns) — needs new parser arms.
   - Also still open (independent of the slices): CUF/CUB stopping at the
      left/right margin, and reverse-wraparound (`DECSET ?45`, `ReverseWrapInline`)
