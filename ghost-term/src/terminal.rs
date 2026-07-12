@@ -76,6 +76,14 @@ pub struct Terminal {
     /// (`CSI Pl;Pr s`) only sets margins while this is on; with it off, `CSI s`
     /// is SCOSC (save cursor) instead.
     left_right_margin_mode: bool,
+    /// DECSCL conformance level, 1–5 (VT100–VT500). Gates version-specific
+    /// features: DECRQM needs ≥3, DECLRMM (`?69`) needs ≥4, DECNCSM (`?95`)
+    /// needs ≥5. Defaults to 5 (all features on); a `CSI Pl " p` hard-resets and
+    /// sets it.
+    conformance_level: u8,
+    /// DECNCSM (`CSI ?95h`): keep the screen when DECCOLM changes the column
+    /// count (default clears it). Only settable at conformance level ≥ 5.
+    no_clear_on_column_change: bool,
     /// Deferred autowrap: set after printing into the right-edge column so the
     /// cursor stays *on* that column (not past it) until the next print, which
     /// wraps first. Cleared by any cursor movement. This makes the wrap column
@@ -220,6 +228,8 @@ impl Terminal {
             left_margin: 0,
             right_margin: (cols - 1),
             left_right_margin_mode: false,
+            conformance_level: 5,
+            no_clear_on_column_change: false,
             pending_wrap: false,
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
@@ -501,6 +511,10 @@ impl Terminal {
                 self.decdc(n);
             }
 
+            Decscl(level, controls) => {
+                self.decscl(level, controls);
+            }
+
             Decstr => {
                 self.decstr();
             }
@@ -775,6 +789,23 @@ impl Terminal {
     /// `(1, cols)`, which is what the raw margins collapse to.
     pub fn left_right_margins(&self) -> (usize, usize) {
         (self.left_margin + 1, self.right_margin + 1)
+    }
+
+    /// The DECSCL conformance level (1–5). DECRQM is a VT300+ feature, so the
+    /// query layer withholds its reply below level 3.
+    pub fn conformance_level(&self) -> u8 {
+        self.conformance_level
+    }
+
+    /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p`: `Some(true)`
+    /// set, `Some(false)` reset, `None` unrecognized. Only IRM (4) and LNM (20)
+    /// are tracked.
+    pub fn ansi_mode_state(&self, mode: u16) -> Option<bool> {
+        match mode {
+            4 => Some(self.insert_mode),
+            20 => Some(self.new_line_mode),
+            _ => None,
+        }
     }
 
     pub fn gc(&mut self) -> Box<dyn Iterator<Item = Line> + '_> {
@@ -1229,6 +1260,8 @@ impl Terminal {
         self.origin_mode = false;
         self.auto_wrap_mode = true;
         self.reverse_wrap_mode = false;
+        self.conformance_level = 5;
+        self.no_clear_on_column_change = false;
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
         self.modify_other_keys = 0;
@@ -1342,6 +1375,7 @@ impl Terminal {
             }
             // DECLRMM lives in its own field, not the tracked-modes set.
             LeftRightMargin => self.left_right_margin_mode,
+            NoClearOnColumnChange => self.no_clear_on_column_change,
             // 1048 is a save/restore action, not a queryable state.
             SaveCursor => return None,
             m => self.tracked_modes.contains(&m),
@@ -1429,6 +1463,11 @@ impl Terminal {
         assert_eq!(self.origin_mode, other.origin_mode);
         assert_eq!(self.auto_wrap_mode, other.auto_wrap_mode);
         assert_eq!(self.reverse_wrap_mode, other.reverse_wrap_mode);
+        assert_eq!(self.conformance_level, other.conformance_level);
+        assert_eq!(
+            self.no_clear_on_column_change,
+            other.no_clear_on_column_change
+        );
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
         assert_eq!(self.modify_other_keys, other.modify_other_keys);
@@ -2115,6 +2154,20 @@ impl Terminal {
         }
     }
 
+    /// DECSCL — select conformance level. `Pl` is 61–65 (VT100–VT500). Per the
+    /// VT300/420/520 manuals DECSCL performs a hard reset, so we do that and then
+    /// apply the new level, which gates version-specific features. `Ps` (7- vs
+    /// 8-bit controls) is accepted but not acted on — ghost's replies are already
+    /// the 7-bit ESC forms an 8-bit-unaware host understands.
+    fn decscl(&mut self, level: u16, _controls: u16) {
+        // `CSI " p` with no level is out of range; ignore it rather than reset.
+        let Some(level) = (61..=65).contains(&level).then(|| (level - 60) as u8) else {
+            return;
+        };
+        self.hard_reset();
+        self.conformance_level = level;
+    }
+
     fn decstbm(&mut self, top: u16, bottom: u16) {
         let top = as_usize(top, 1) - 1;
         let bottom = as_usize(bottom, self.rows) - 1;
@@ -2172,8 +2225,18 @@ impl Terminal {
 
                 LeftRightMargin => {
                     // Enable DECLRMM; margins stay at their default (full width)
-                    // until a DECSLRM sets them.
-                    self.left_right_margin_mode = true;
+                    // until a DECSLRM sets them. A VT400 feature: ignored below
+                    // conformance level 4.
+                    if self.conformance_level >= 4 {
+                        self.left_right_margin_mode = true;
+                    }
+                }
+
+                NoClearOnColumnChange => {
+                    // DECNCSM is a VT500 feature: ignored below level 5.
+                    if self.conformance_level >= 5 {
+                        self.no_clear_on_column_change = true;
+                    }
                 }
 
                 AutoWrap => {
@@ -2233,6 +2296,10 @@ impl Terminal {
                     self.right_margin = self.cols - 1;
                 }
 
+                NoClearOnColumnChange => {
+                    self.no_clear_on_column_change = false;
+                }
+
                 AutoWrap => {
                     self.auto_wrap_mode = false;
                 }
@@ -2289,6 +2356,12 @@ impl Terminal {
         // 1. dump primary screen buffer
 
         let mut funs = Vec::new();
+        // A non-default conformance level goes first: DECSCL hard-resets, so it
+        // must precede every other rebuilt piece of state. `Ps 1` = 8-bit
+        // controls (ghost's default control encoding).
+        if self.conformance_level != 5 {
+            funs.push(Function::Decscl(60 + u16::from(self.conformance_level), 1));
+        }
         // Prompt marks re-emitted as buffer-relative line indices so the
         // replaying terminal re-records them at matching depths.
         let base =
@@ -2581,6 +2654,15 @@ impl Terminal {
 
         if self.reverse_wrap_mode {
             funs.push(Function::Decset(DecModes::one(DecMode::ReverseWrap)));
+        }
+
+        // 12c. setup DECNCSM (off by default; the DECSCL above already set a
+        // level ≥ 5 if it was on, since ?95 is only settable there)
+
+        if self.no_clear_on_column_change {
+            funs.push(Function::Decset(DecModes::one(
+                DecMode::NoClearOnColumnChange,
+            )));
         }
 
         // 13. setup new line mode

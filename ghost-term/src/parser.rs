@@ -84,6 +84,11 @@ pub enum Function {
     Decic(u16),
     /// DECDC `CSI Pn ' ~` — delete `Pn` columns at the cursor column.
     Decdc(u16),
+    /// DECSCL `CSI Pl ; Ps " p` — select conformance level. `Pl` is 61–65
+    /// (VT100–VT500 → level 1–5); `Ps` picks 7- vs 8-bit controls. Performs a
+    /// hard reset, then applies the level (which gates VT400+ features like
+    /// DECLRMM).
+    Decscl(u16, u16),
     Decstr,
     Dl(u16),
     Ech(u16),
@@ -169,12 +174,13 @@ pub enum CtcOp {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub enum DecMode {
-    CursorKeys = 1,        // DECCKM
-    Origin = 6,            // DECOM
-    AutoWrap = 7,          // DECAWM
-    TextCursorEnable = 25, // DECTCEM
-    ReverseWrap = 45,      // reverse-wraparound (xterm ?45; needs DECAWM)
-    LeftRightMargin = 69,  // DECLRMM — enables DECSLRM left/right margins
+    CursorKeys = 1,             // DECCKM
+    Origin = 6,                 // DECOM
+    AutoWrap = 7,               // DECAWM
+    TextCursorEnable = 25,      // DECTCEM
+    ReverseWrap = 45,           // reverse-wraparound (xterm ?45; needs DECAWM)
+    LeftRightMargin = 69,       // DECLRMM — enables DECSLRM left/right margins
+    NoClearOnColumnChange = 95, // DECNCSM — keep screen on DECCOLM (VT500)
     // Non-display modes: tracked but not rendered, so a state dump can restore
     // them on reattach. They affect what the terminal *sends*, not the grid.
     MouseReportX11 = 1000,            // button press/release
@@ -999,6 +1005,9 @@ impl Parser {
 
             (Some('!'), 'p') => Some(Decstr),
 
+            // DECSCL: `CSI Pl ; Ps " p` (intermediate `"`) — select conformance level.
+            (Some('"'), 'p') => Some(Decscl(ps[0].as_u16(), ps[1].as_u16())),
+
             // DECIC / DECDC: `CSI Pn ' }` / `CSI Pn ' ~` (intermediate `'`).
             (Some('\''), '}') => Some(Decic(ps[0].as_u16())),
 
@@ -1379,6 +1388,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     TextCursorEnable => 25,
                     ReverseWrap => 45,
                     LeftRightMargin => 69,
+                    NoClearOnColumnChange => 95,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
                     MouseReportAny => 1003,
@@ -1410,6 +1420,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     TextCursorEnable => 25,
                     ReverseWrap => 45,
                     LeftRightMargin => 69,
+                    NoClearOnColumnChange => 95,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
                     MouseReportAny => 1003,
@@ -1438,6 +1449,15 @@ fn dump_function(seq: &mut String, fun: &Function) {
 
         Decic(n) => push_csi(seq, Some('\''), &[n.to_string()], '}'),
         Decdc(n) => push_csi(seq, Some('\''), &[n.to_string()], '~'),
+
+        Decscl(level, controls) => {
+            push_csi(
+                seq,
+                Some('"'),
+                &[level.to_string(), controls.to_string()],
+                'p',
+            );
+        }
 
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
         Dl(n) => push_csi(seq, None, &[n.to_string()], 'M'),
@@ -1985,6 +2005,7 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         25 => Some(TextCursorEnable),
         45 => Some(ReverseWrap),
         69 => Some(LeftRightMargin),
+        95 => Some(NoClearOnColumnChange),
         47 => Some(AltScreenBuffer), // legacy variant of 1047
         1000 => Some(MouseReportX11),
         1002 => Some(MouseReportButton),
@@ -2373,6 +2394,8 @@ mod tests {
         assert_eq!(parse("\x1b[3'}"), [Decic(3)]);
         assert_eq!(parse("\x1b['~"), [Decdc(0)]);
         assert_eq!(parse("\x1b[3'~"), [Decdc(3)]);
+        assert_eq!(parse("\x1b[64;1\"p"), [Decscl(64, 1)]);
+        assert_eq!(parse("\x1b[61\"p"), [Decscl(61, 0)]);
         assert_eq!(parse("\x1b[!p"), [Decstr]);
 
         // DEC private modes.
@@ -2861,6 +2884,7 @@ mod tests {
             Decslrm(5, 10),
             Decic(3),
             Decdc(7),
+            Decscl(64, 1),
             Decstbm(2, 5),
             Decstr,
             Dl(17),

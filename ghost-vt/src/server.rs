@@ -646,6 +646,7 @@ fn host_main(
                     let asked = queries.scan(&ptybuf[..n]);
                     if client.is_none() && !asked.is_empty() {
                         let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+                        let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
                         let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
                         let (lm, rm) = screen.vt().left_right_margins();
                         let ctx = crate::query::ReplyCtx {
@@ -654,6 +655,8 @@ fn host_main(
                             kitty_flags: screen.kitty_keyboard_flags(),
                             cursor_style: crate::query::decscusr_digit(screen.vt().cursor().shape),
                             left_right_margins: (lm as u16, rm as u16),
+                            conformance_level: screen.vt().conformance_level(),
+                            ansi_mode_state: &ansi_mode_state,
                             // Detached, nobody sees the live scheme; answer
                             // with the last-attached client's colors (ghost's
                             // default if none ever attached), under any

@@ -230,6 +230,17 @@ impl Vt {
         self.terminal.left_right_margins()
     }
 
+    /// The DECSCL conformance level (1–5). See [`Terminal::conformance_level`].
+    pub fn conformance_level(&self) -> u8 {
+        self.terminal.conformance_level()
+    }
+
+    /// An ANSI mode's state for DECRQM `CSI Ps $ p`. See
+    /// [`Terminal::ansi_mode_state`].
+    pub fn ansi_mode_state(&self, mode: u16) -> Option<bool> {
+        self.terminal.ansi_mode_state(mode)
+    }
+
     pub fn cursor_key_app_mode(&self) -> bool {
         self.terminal.cursor_keys_app_mode()
     }
@@ -808,6 +819,62 @@ mod tests {
             Some(false),
             "DECLRMM reported reset again"
         );
+    }
+
+    #[test]
+    fn decscl_gates_declrmm_below_conformance_level_4() {
+        // esctest test_DSCSCL_Level3: at level 3 DECLRMM (?69) is inert, so DECSLRM
+        // sets no margins and text past the intended right margin does not wrap.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[63\"p"); // DECSCL level 3
+        vt.feed_str("\x1b[?69h"); // DECLRMM — ignored at level 3
+        assert_eq!(
+            vt.dec_mode_state(69),
+            Some(false),
+            "?69 stays off at level 3"
+        );
+        vt.feed_str("\x1b[5;6s"); // DECSLRM — treated as SCOSC, no margins
+        vt.feed_str("\x1b[1;5Habc"); // write from col 4
+        assert_eq!(
+            vt.cursor().col,
+            7,
+            "no right margin, cursor advances to col 7"
+        );
+
+        // At level 4 the same sequence enables the margins and stops the wrap.
+        vt.feed_str("\x1b[64\"p"); // DECSCL level 4 (hard reset)
+        vt.feed_str("\x1b[?69h");
+        assert_eq!(vt.dec_mode_state(69), Some(true), "?69 works at level 4");
+    }
+
+    #[test]
+    fn decscl_gates_decncsm_below_conformance_level_5() {
+        // DECNCSM (?95) is a VT500 feature: settable only at level 5.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[64\"p\x1b[?95h"); // level 4 — ?95 ignored
+        assert_eq!(
+            vt.dec_mode_state(95),
+            Some(false),
+            "?95 stays off at level 4"
+        );
+        vt.feed_str("\x1b[65\"p\x1b[?95h"); // level 5 — ?95 settable
+        assert_eq!(vt.dec_mode_state(95), Some(true), "?95 works at level 5");
+    }
+
+    #[test]
+    fn decscl_hard_resets_and_reports_ansi_mode_by_level() {
+        // DECSCL performs a hard reset (insert mode cleared) and drives the
+        // conformance level the query layer reads for ANSI-mode DECRQM.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[4h"); // IRM (insert mode) on
+        assert_eq!(vt.ansi_mode_state(4), Some(true));
+        vt.feed_str("\x1b[62\"p"); // DECSCL level 2 — hard reset
+        assert_eq!(
+            vt.ansi_mode_state(4),
+            Some(false),
+            "hard reset cleared insert mode"
+        );
+        assert_eq!(vt.conformance_level(), 2);
     }
 
     #[test]

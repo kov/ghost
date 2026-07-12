@@ -41,6 +41,10 @@ pub enum Query {
     /// `CSI > q` / `CSI > 0 q` — XTVERSION, report terminal name and version.
     /// Reply: `DCS > | ghost <version> ST`. Claude Code sends it at startup.
     TerminalVersion,
+    /// `CSI Ps $ p` — ANSI-mode DECRQM (no `?`). A VT300+ feature: answered
+    /// `CSI Ps ; Pm $ y` only at conformance level ≥ 3, silent below (which is
+    /// how a program probes the level). `Pm` mirrors [`Query::ReportMode`].
+    ReportAnsiMode(u16),
     /// `CSI ? Ps $ p` — DECRQM, request a DEC private mode's state. Reply is
     /// DECRPM `CSI ? Ps ; Pm $ y` with Pm 0 = unrecognized, 1 = set, 2 = reset.
     /// Apps probe synchronized output (2026) this way before using it.
@@ -133,6 +137,11 @@ pub struct ReplyCtx<'a> {
     /// The current left/right scroll margins, 1-based inclusive, for DECRQSS
     /// DECSLRM (selector `s`). Full width `(1, cols)` when DECLRMM is off.
     pub left_right_margins: (u16, u16),
+    /// The DECSCL conformance level (1–5); ANSI-mode DECRQM is silent below 3.
+    pub conformance_level: u8,
+    /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p` — `Some(true)`
+    /// set, `Some(false)` reset, `None` unrecognized (IRM/LNM only).
+    pub ansi_mode_state: &'a dyn Fn(u16) -> Option<bool>,
     /// Default fg/bg for the OSC color queries.
     pub colors: ThemeColors,
     /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
@@ -219,6 +228,19 @@ impl Query {
                     None => 0,
                 };
                 format!("\x1b[?{mode};{pm}$y").into_bytes()
+            }
+            Query::ReportAnsiMode(mode) => {
+                // A VT300+ feature: silent below conformance level 3, which is
+                // how a host distinguishes a level-2 terminal.
+                if ctx.conformance_level < 3 {
+                    return Vec::new();
+                }
+                let pm = match (ctx.ansi_mode_state)(*mode) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 0,
+                };
+                format!("\x1b[{mode};{pm}$y").into_bytes()
             }
             Query::ForegroundColor => {
                 format!("\x1b]10;{}\x1b\\", xterm_rgb(ctx.colors.fg)).into_bytes()
@@ -527,12 +549,22 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
         // single mode number. `CSI ! p` (DECSTR) and the ANSI-mode form (no `?`)
         // fall through.
         b'p' => {
-            let mode = params.strip_prefix(b"?")?.strip_suffix(b"$")?;
-            std::str::from_utf8(mode)
-                .ok()?
-                .parse()
-                .ok()
-                .map(Query::ReportMode)
+            let body = params.strip_suffix(b"$")?;
+            match body.strip_prefix(b"?") {
+                // `CSI ? Ps $ p` — DEC-private DECRQM.
+                Some(mode) => std::str::from_utf8(mode)
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(Query::ReportMode),
+                // `CSI Ps $ p` — ANSI-mode DECRQM (`CSI ! p` DECSTR has no `$`
+                // and never reaches here).
+                None => std::str::from_utf8(body)
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(Query::ReportAnsiMode),
+            }
         }
         // DECRQCRA: `CSI Pid ; Pp ; Pt ; Pl ; Pb ; Pr * y`. The `*` intermediate
         // is appended to the params (as `$` is for DECRQM). `Pid` leads; the
@@ -620,7 +652,8 @@ mod tests {
         assert!(scan_all(b"\x1b[u").is_empty()); // bare CSI u is SCO restore-cursor
         assert!(scan_all(b"\x1b[0 q").is_empty()); // DECSCUSR shares `q`, not a query
         assert!(scan_all(b"\x1b[!p").is_empty()); // DECSTR shares `p`, not a query
-        assert!(scan_all(b"\x1b[2026$p").is_empty()); // ANSI-mode DECRQM (no `?`)
+        // ANSI-mode DECRQM `CSI Ps $ p` (no `?`) IS a query now (level-gated reply).
+        assert_eq!(scan_all(b"\x1b[2026$p"), [Query::ReportAnsiMode(2026)]);
     }
 
     #[test]
@@ -672,6 +705,8 @@ mod tests {
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),
+            conformance_level: 5,
+            ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
             mode_state: &no_modes,
             checksum: &echo_rect,
@@ -866,5 +901,32 @@ mod tests {
         assert_eq!(Query::ReportMode(2026).reply(&modal), b"\x1b[?2026;1$y");
         assert_eq!(Query::ReportMode(2004).reply(&modal), b"\x1b[?2004;2$y");
         assert_eq!(Query::ReportMode(12345).reply(&modal), b"\x1b[?12345;0$y");
+    }
+
+    #[test]
+    fn ansi_decrqm_is_gated_by_conformance_level() {
+        // ANSI-mode DECRQM `CSI Ps $ p` (no `?`) is a VT300+ feature: answered
+        // only at conformance level >= 3, silent below.
+        assert_eq!(scan_all(b"\x1b[4$p"), [Query::ReportAnsiMode(4)]);
+        let ansi = |m: u16| match m {
+            4 => Some(true),
+            _ => None,
+        };
+        let l4 = ReplyCtx {
+            conformance_level: 4,
+            ansi_mode_state: &ansi,
+            ..ctx()
+        };
+        assert_eq!(Query::ReportAnsiMode(4).reply(&l4), b"\x1b[4;1$y");
+        assert_eq!(Query::ReportAnsiMode(20).reply(&l4), b"\x1b[20;0$y");
+        let l2 = ReplyCtx {
+            conformance_level: 2,
+            ansi_mode_state: &ansi,
+            ..ctx()
+        };
+        assert!(
+            Query::ReportAnsiMode(4).reply(&l2).is_empty(),
+            "silent below level 3"
+        );
     }
 }
