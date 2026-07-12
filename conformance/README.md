@@ -102,9 +102,17 @@ inflated pass counts — don't repeat that.)
   `*_respectsISOProtection`) — the biggest cluster (~26 tests). ghost's `Pen`
   has no protected-cell attribute, so selective erase can't spare protected
   cells. A distinct feature.
-- **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`) — the
-  `*_RespectsOriginMode` cursor tests, the `DCH`/`ICH` `*Margins` cases, and the
-  scroll-region cursor-stop tests. A VT420 feature ghost lacks. **(in progress)**
+- **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`) — a
+  VT420 feature, **in progress**, being landed in slices:
+  1. ✅ state + parsing + margin-relative cursor addressing + origin-relative CPR
+     (`*_RespectsOriginMode` 3/3, CUP/CHA 6/0).
+  2. ⬜ autowrap at the right margin — needs an explicit `pending_wrap` flag
+     (ghost's implicit `col == cols` sentinel can't represent `right_margin+1`).
+  3. ⬜ scroll box — LF/IND/RI/SU/SD scroll only `[left..=right]×[top..=bottom]`;
+     the biggest change (ghost's scroll rotates whole `Line`s; needs column-range
+     ops in `buffer.rs`/`line.rs`).
+  4. ⬜ insert/delete within margins — ICH/DCH bounded by the right margin,
+     IL/DL/DECIC/DECDC within the box.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 
