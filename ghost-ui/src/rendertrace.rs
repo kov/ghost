@@ -5,10 +5,13 @@
 //! and a scroll (or any input) unsticks it. It has been "fixed" many times, each
 //! closing one repaint-suppression path (a synchronized-output hold that never
 //! releases, a dropped `request_redraw`, a feed dirty-hint that missed a row, a
-//! scene-equality skip). We still can't SEE which gate is stuck when it recurs.
-//! (A recurrence of the scene-equality class is the one gate this watchdog cannot
-//! flag: it reports `Clean`, which re-baselines by design — see
-//! [`StallClass::StaleNoPresent`].)
+//! scene-equality skip). The subtlest recurrence is the "Clean-over-stale" freeze:
+//! a present is discarded by the platform, the screen goes stale, yet every rebuilt
+//! scene still compares byte-identical to the last scene we RECORDED as presented, so
+//! the renderer reports `Clean` while the app keeps streaming. This watchdog now
+//! catches that too: [`Outcome::Clean`] no longer advances the present baseline, so a
+//! Clean loop with feeds still ongoing classifies [`StallClass::StaleNoPresent`]
+//! (an idle window is kept quiet by the gate's "feeds still ongoing" test instead).
 //!
 //! [`RenderTrace`] is a per-window watchdog + kick oracle. The shell timestamps the
 //! foreground repaint pipeline (redraw commands, release ticks, present outcomes,
@@ -64,15 +67,18 @@ pub enum StallClass {
     /// Feeds keep arriving but none change anything visible — the core's per-feed
     /// dirty-row hint is dropping updates, so no repaint is even requested.
     FeedsNotVisible,
-    /// The core produced visible changes and the surface DID acquire, but the window
-    /// still hasn't presented in a while — a redraw request the platform dropped or a
-    /// stuck pacer. This is the recurring foreground bug. The report's
-    /// `pacer_pending`, `last_release`, `last_redraw_event` and `last_outcome`
-    /// discriminate among them. Note the one blind spot: a repaint that DID run but
-    /// skipped on scene equality reports `Clean`, which re-baselines and disarms —
-    /// the compare is exact (`SceneCache::damage` is `PartialEq`, never a hash), so
-    /// a Clean loop hiding a stale *scene build* is invisible here by design (the
-    /// alternative false-alarms on every redundant-content feed, e.g. a spinner).
+    /// The core produced visible changes but no REAL present has landed in a while —
+    /// a redraw request the platform dropped, a stuck pacer, or a Clean loop over a
+    /// stale screen (a discarded present the exact scene-compare then keeps confirming
+    /// against the recorded frame rather than the glass). The report's `pacer_pending`,
+    /// `last_release`, `last_redraw_event`, `last_outcome` and `cleans_since_present`
+    /// discriminate among them — a high `cleans_since_present` with a stale
+    /// `present_ago` is the Clean-over-stale shape. Baselines advance only on a real
+    /// `Presented`, so a `Clean` can no longer hide this; a genuinely idle window
+    /// (feeds stopped) is excluded by the gate's "feeds still ongoing" test, not by
+    /// trusting Clean. The residual false positive — a truly idempotent-active region
+    /// (identical writes every feed, always Clean, screen genuinely current) — is rare
+    /// and benign (a warn under the trace flag, never a heal).
     StaleNoPresent,
     /// The core produced visible changes but every present attempt comes back `Lost`
     /// — the surface isn't acquirable, so the platform (not our repaint pipeline) is
@@ -120,6 +126,9 @@ pub struct RenderReport {
     pub released_by_reset: u64,
     pub pending_tick: bool,
     pub presents: u64,
+    /// Clean presents since the last real `Presented` — a high count with a stale
+    /// `present_ago` is the Clean-over-stale freeze signature.
+    pub cleans_since_present: u64,
 }
 
 impl std::fmt::Display for RenderReport {
@@ -131,7 +140,7 @@ impl std::fmt::Display for RenderReport {
              redraw_cmd_ago={} release_ago={} redraw_event_ago={} present_ago={} \
              input_ago={} last_outcome={:?} pacer_pending={} pending_tick={} \
              feeds_seen={} visible={} while_held={} holds={} rel_tick={} rel_reset={} \
-             presents={}",
+             presents={} cleans_since_present={}",
             self.class,
             self.stalled_for_ms,
             ago(self.held_for_ms),
@@ -152,6 +161,7 @@ impl std::fmt::Display for RenderReport {
             self.released_by_tick,
             self.released_by_reset,
             self.presents,
+            self.cleans_since_present,
         )
     }
 }
@@ -164,7 +174,6 @@ pub struct RenderTrace {
     last_redraw_cmd_ms: Option<u64>,
     last_release_ms: Option<u64>,
     last_redraw_event_ms: Option<u64>,
-    last_present_ms: Option<u64>,
     last_tick_scheduled_ms: Option<u64>,
     last_tick_fired_ms: Option<u64>,
     last_input_ms: Option<u64>,
@@ -174,7 +183,18 @@ pub struct RenderTrace {
     last_visible_feed_ms: Option<u64>,
     held_since_ms: Option<u64>,
     feeds_at_last_visible: u64,
+    // Baselines advanced ONLY by a real `Presented` (never `Clean`): the last time a
+    // frame provably reached the glass, and the visible-feed count then. A Clean loop
+    // over a stale screen leaves these frozen while `visible_feeds` climbs — that gap,
+    // with feeds still ongoing, is what the stale-no-present gate keys on. (`Clean`
+    // used to advance them, which is exactly what blinded the gate to the freeze.)
+    last_present_ms: Option<u64>,
     visible_at_last_present: u64,
+    // Cleans observed since the last real present, and when the last one landed — the
+    // Clean-over-stale signature (a high count with a frozen `last_present_ms`), carried
+    // into the report so a human can see the loop.
+    cleans_since_present: u64,
+    last_clean_ms: Option<u64>,
     last_core: TermTrace,
     // Oracle + rate limiting.
     stalled: Option<(StallClass, u64)>,
@@ -229,11 +249,13 @@ impl RenderTrace {
     ) -> Option<RenderReport> {
         self.last_outcome = Some(outcome);
         match outcome {
-            // A frame was drawn: the surface now shows this scene. Advance the present
-            // baseline, and a present that ends an armed stall is the kick oracle —
-            // report the frozen state it just recovered (the user's scroll).
+            // A frame was drawn: the surface now provably shows this scene. Advance the
+            // real-present baseline, clear the Clean streak, and — as the kick oracle —
+            // report any armed stall this present just recovered (the user's scroll, a
+            // slide, or the self-heal when the scene finally differs).
             Outcome::Presented => {
                 self.last_present_ms = Some(now_ms);
+                self.cleans_since_present = 0;
                 if let Some(c) = core {
                     self.visible_at_last_present = c.visible_feeds;
                 }
@@ -247,18 +269,18 @@ impl RenderTrace {
                     )
                 })
             }
-            // Nothing to draw: the renderer compared the scene byte-for-byte and it
-            // already matches what's on screen, so the display is provably up to date
-            // as of now. Advance the baseline too (else an idle window that settles
-            // into Clean frames looks permanently stale — the pending-visible gap is a
-            // fossil), and silently disarm any false alarm: a Clean confirms the screen
-            // is correct, it is not a recovery worth a "recovered" line.
+            // Nothing to draw: the renderer compared the scene byte-for-byte to the last
+            // one it RECORDED as presented and they match. That confirms the screen only
+            // if that recording is true — and it is a LIE when an earlier present was
+            // discarded by the platform (the Clean-over-stale freeze): the scene equals
+            // the recorded frame, not the glass. So a Clean must NOT advance the
+            // real-present baseline and must NOT disarm — otherwise a Clean loop hides the
+            // very freeze this watchdog exists to catch. It only tallies the streak (an
+            // idle window is kept quiet instead by the gate's "feeds still ongoing" test,
+            // not by trusting Clean). A real `Presented` is the only thing that recovers.
             Outcome::Clean => {
-                self.last_present_ms = Some(now_ms);
-                if let Some(c) = core {
-                    self.visible_at_last_present = c.visible_feeds;
-                }
-                self.stalled = None;
+                self.cleans_since_present += 1;
+                self.last_clean_ms = Some(now_ms);
                 None
             }
             // The surface wasn't acquirable: nothing landed and the baseline is
@@ -294,6 +316,8 @@ impl RenderTrace {
                 self.last_core = TermTrace::default();
                 self.feeds_at_last_visible = 0;
                 self.visible_at_last_present = 0;
+                self.cleans_since_present = 0;
+                self.last_clean_ms = None;
                 self.last_feed_ms = None;
                 self.last_visible_feed_ms = None;
                 self.last_present_ms = None;
@@ -369,15 +393,24 @@ impl RenderTrace {
         {
             return Some(StallClass::FeedsNotVisible);
         }
-        // Visible changes produced but not presented for a while: a dropped redraw
-        // or a stuck pacer (a scene-equality skip lands as Clean, which re-baselines
-        // — see `StallClass::StaleNoPresent`). Suppressed mid-resize (the
-        // stretch-blit snapshot is intentionally holding the last frame).
+        // Visible changes produced but not really presented for a while: a dropped
+        // redraw, a stuck pacer, or a Clean loop over a stale screen (`Clean` no longer
+        // advances `last_present_ms`/`visible_at_last_present`, so it can no longer hide
+        // this). Two guards keep it honest: `visible_pending` measures against the last
+        // REAL present, and `feeds_ongoing` requires a visible feed within the quiet
+        // window — an idle window that settled into Clean frames stops feeding, so it
+        // ages out here rather than false-alarming (the job the Clean re-baseline used
+        // to do, minus the blind spot). Suppressed mid-resize (the stretch-blit snapshot
+        // is intentionally holding the last frame).
         let visible_pending = core
             .visible_feeds
             .saturating_sub(self.visible_at_last_present);
+        let feeds_ongoing = self
+            .last_visible_feed_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < STALL_QUIET_MS);
         if !has_snapshot
             && visible_pending > 0
+            && feeds_ongoing
             && self
                 .last_present_ms
                 .is_some_and(|p| now_ms.saturating_sub(p) >= STALL_QUIET_MS)
@@ -428,6 +461,7 @@ impl RenderTrace {
             released_by_reset: c.sync_released_by_reset,
             pending_tick: self.last_tick_scheduled_ms > self.last_tick_fired_ms,
             presents: c.presents_marked,
+            cleans_since_present: self.cleans_since_present,
         }
     }
 }
@@ -646,6 +680,38 @@ mod tests {
             t.poll(5_000, Some(core(3, 3, false)), false, false, true),
             None,
             "a Clean present confirms the screen is current — an idle window is not stalled"
+        );
+    }
+
+    #[test]
+    fn a_clean_loop_over_a_stale_screen_is_flagged_while_feeds_keep_coming() {
+        let mut t = RenderTrace::new();
+        // Baseline: the first visible feed is really presented.
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        // The freeze: a present was discarded by the platform, so the screen is stale —
+        // but every rebuilt scene compares byte-identical to the last RECORDED scene, so
+        // each present comes back Clean while the app (Claude's spinner) keeps streaming
+        // visible feeds. Unlike the idle case above, feeds never stop, so this is NOT the
+        // screen being provably current — it is the Clean-over-stale foreground freeze.
+        let mut fired = false;
+        let mut seq = 1;
+        for step in 1..=40 {
+            let now = step * 100;
+            seq += 1;
+            // A visible feed folds in...
+            if let Some(r) = t.poll(now, Some(core(seq, seq, false)), false, false, true) {
+                assert_eq!(r.class, StallClass::StaleNoPresent);
+                fired = true;
+                break;
+            }
+            // ...and its present comes back Clean (scene == the stale recorded scene).
+            t.saw_outcome(Outcome::Clean, now, Some(core(seq, seq, false)), false);
+        }
+        assert!(
+            fired,
+            "a Clean loop over a stale screen, with feeds still streaming, must be \
+             flagged — a Clean re-baseline must not hide it"
         );
     }
 
