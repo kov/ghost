@@ -155,6 +155,14 @@ fn main() {
         return;
     }
 
+    // `GHOST_ESCTEST` runs the terminal-conformance harness headlessly: spawn
+    // the esctest child, drive the model over the PTY, and exit. See
+    // [`esctest_host`] and `conformance/run.sh`.
+    if std::env::var_os("GHOST_ESCTEST").is_some() {
+        esctest_host();
+        return;
+    }
+
     if let Some(path) = std::env::var_os("GHOST_CAPTURE") {
         capture(PathBuf::from(path));
     } else {
@@ -877,6 +885,93 @@ fn capture(path: PathBuf) {
         img.height,
         path.display()
     );
+
+    let _ = session::kill_session(&name);
+}
+
+// ---- esctest conformance host (headless) -------------------------------
+
+/// Drive the terminal-conformance suite (`conformance/esctest2`, GPLv2, run as a
+/// separate child — it links into nothing; see `conformance/README.md`).
+///
+/// `conformance/run.sh` sets `GHOST_ESCTEST` to the esctest invocation (a
+/// `python3 …` command) and redirects the XDG dirs to a tempdir, then runs
+/// `ghost`. Here we spawn that command as a real ghost session's child and drive
+/// the SAME [`TerminalModel`] the GUI uses over the PTY: esctest writes control
+/// sequences to its stdout (the model feeds on them) and reads our replies (CPR,
+/// text-area size, later DECRQCRA) from its stdin — the model's `SendInput`
+/// effects, written back here by [`exec_headless`]. esctest checks each reply
+/// against xterm and writes a pass/fail report to its `--logfile`, which
+/// `run.sh` greps. No renderer: esctest only observes what a program can.
+fn esctest_host() {
+    // The child command comes from run.sh (the esctest invocation), mirroring
+    // `GHOST_CMD`. `1` is the bare on-marker used by the env gate below.
+    let command = match std::env::var("GHOST_ESCTEST") {
+        Ok(c) if !c.is_empty() && c != "1" => vec!["sh".to_string(), "-c".to_string(), c],
+        _ => {
+            eprintln!("GHOST_ESCTEST must hold the esctest command to run");
+            std::process::exit(2);
+        }
+    };
+    // esctest normalises the terminal to 25 rows x 80 cols and reads the size
+    // back with `CSI 18 t`; spawn at that size so our truthful reply matches.
+    const ECOLS: u16 = 80;
+    const EROWS: u16 = 25;
+    // Keep the name short: it becomes a path component of the control socket,
+    // which must fit `sockaddr_un` (~104 bytes). The XDG runtime dir is a
+    // private tempdir (run.sh), so `esct-<pid>` is already collision-free.
+    let name = format!("esct-{}", std::process::id());
+    server::spawn(SpawnOpts {
+        name: name.clone(),
+        command,
+        size: (ECOLS, EROWS),
+        cwd: None,
+        record: None,
+        seed_from: None,
+        scrollback: screen::DEFAULT_SCROLLBACK,
+        max_recording_bytes: None,
+        start_on_attach: true,
+        connection: None,
+    })
+    .expect("spawn esctest session");
+
+    let mut session = attach_retry(&name, ECOLS, EROWS);
+    let mut model = TerminalModel::new(name.clone(), ECOLS, EROWS, metrics());
+    // The harness "window" is focused, so focus-reporting queries answer
+    // consistently (and a DEC ?1004 enable reports focused).
+    exec_headless(&mut session, &model.update(UiEvent::Focus(true)));
+
+    // Ping-pong until esctest exits: feed each control-sequence burst into the
+    // model and write every reply back. Unlike `capture`, never break on an
+    // output lull — esctest pauses between hundreds of tests. A generous
+    // wall-clock cap is the only backstop against a wedged child.
+    let start = Instant::now();
+    let deadline = Duration::from_secs(
+        std::env::var("GHOST_ESCTEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
+    loop {
+        let (bytes, end) = pump(&mut session, 256);
+        let ended = end.is_end();
+        if !bytes.is_empty() || ended {
+            let cmds = model.update(UiEvent::SessionData {
+                name: name.clone(),
+                bytes,
+                ended,
+            });
+            exec_headless(&mut session, &cmds);
+        }
+        if model.ended() || ended {
+            break;
+        }
+        if start.elapsed() > deadline {
+            eprintln!("esctest host timed out after {}s", deadline.as_secs());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     let _ = session::kill_session(&name);
 }
