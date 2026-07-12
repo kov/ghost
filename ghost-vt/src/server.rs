@@ -646,6 +646,7 @@ fn host_main(
                     let asked = queries.scan(&ptybuf[..n]);
                     if client.is_none() && !asked.is_empty() {
                         let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+                        let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
                         let ctx = crate::query::ReplyCtx {
                             cursor: screen.cursor(),
                             size: screen.dimensions(),
@@ -657,6 +658,7 @@ fn host_main(
                             // app-set dynamic overrides.
                             colors: screen.effective_colors(last_theme),
                             mode_state: &mode_state,
+                            checksum: &checksum,
                         };
                         let mut reply = Vec::new();
                         for q in asked {

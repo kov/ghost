@@ -25,9 +25,12 @@ repo="$(cd "$here/.." && pwd)"
 esctest="$here/esctest2/esctest/esctest.py"
 
 GHOST_BIN="${GHOST_BIN:-$repo/target/debug/ghost}"
-# P0a de-risking default: cursor-motion tests, which assert via CPR (already
-# answered) and need no DECRQCRA. Widen as emulator coverage grows.
-INCLUDE="${INCLUDE:-CUP|CUU|CUD|CHA|VPA|CNL|CPL}"
+# Default: a curated set that currently passes clean, so a bare run is a
+# regression gate (exit 0). Class-anchored (`re.search` over `Class.test_name`,
+# so a loose `EL` would also match `CIELab`). Widen as coverage grows; the two
+# known gaps (left/right margins, CIE color specs) are excluded on purpose —
+# see README "Known findings".
+INCLUDE="${INCLUDE:-EDTests|ELTests|ICHTests|DCHTests|ECHTests|DECALNTests|DECSTRTests|CUUTests|CUDTests|CNLTests|CPLTests|VPATests|DECRQCRATests}"
 MAX_VT_LEVEL="${MAX_VT_LEVEL:-4}"
 TIMEOUT_SECS="${GHOST_ESCTEST_TIMEOUT_SECS:-120}"
 

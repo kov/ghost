@@ -70,24 +70,33 @@ a curated include-set.
 
 **P0a (done):** the harness runs end-to-end on cursor-motion tests, which assert
 via CPR (`CSI 6 n`) and text-area size (`CSI 18 t`) — both already answered by
-ghost, so this needed no emulator change. Current default set: **34 pass, 2
-fail**, both `*_RespectsOriginMode`. That first finding is real (it reproduces in
-isolation, so it is not a cross-test state leak): those tests set a
-**left/right margin region** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`)
-and expect origin mode (`DECOM`) to make `CUP` relative to it. ghost has no
-left/right margins, so the margin-relative origin is wrong — a genuine VT420
-feature gap to schedule, not a quick fix.
+ghost, so this needed no emulator change.
 
-**P0b (next):** DECSTR (`CSI ! p`) soft-reset. esctest's per-test `reset()` sends
-it before every test; ghost ignores it today, so mode state leaks across tests.
-It doesn't cause the origin-mode failures above, but it will cause *spurious*
-failures as the include-set widens (a mode left set by test N breaks test N+1).
-Fix test-first in `ghost-term`, then re-run.
+**P0b (already present):** DECSTR (`CSI ! p`) soft-reset. esctest's per-test
+`reset()` sends it before every test; ghost already handles it
+(`Decstr → soft_reset`), so mode state does not leak across tests. Confirmed by
+the DECSTR family passing 13/13 once DECRQCRA (below) let its assertions read the
+screen.
 
-**P0c:** DECRQCRA (`CSI … * y`) rectangle-checksum replies, esctest's primary
-screen-read primitive — unlocks the bulk of content assertions (ED/EL/ICH/DCH/
-IRM/tabs/…). Three touch points: compute in `ghost-term`, recognise in
-`ghost-vt/src/query.rs`, format in `ghost_vt::query::Query::reply`.
+**P0c (done):** DECRQCRA (`CSI Pid;Pp;Pt;Pl;Pb;Pr * y`) rectangle-checksum
+replies — esctest's primary screen-read primitive (a program can't see a cell
+directly). Three touch points: compute in `ghost_term::Vt::rect_checksum`,
+recognise in `ghost-vt/src/query.rs::classify_csi`, format in
+`ghost_vt::query::Query::reply` via a `ReplyCtx::checksum` closure wired in both
+the attached model (`ghost-ui-core`) and the detached host (`ghost-vt/server`).
+This unlocked the bulk of content assertions: **DECSTR 13/13, ED 28/0, ICH 6/0,
+DCH 6/0, ECH 7/0, EL clean, DECALN 3/0**.
+
+**Known findings (real gaps, scheduled separately):**
+- **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`): the
+  two `*_RespectsOriginMode` cursor failures need a margin-relative origin, a
+  VT420 feature ghost lacks. Reproduces in isolation — a genuine gap, not a leak.
+- **CIE Lab/Luv OSC color specs**: `ChangeColor`/`ChangeSpecialColor_CIE*` — ghost
+  doesn't parse those color-space forms. Niche.
+
+**Note on `--include`:** the regex is `re.search` over `Class.test_name`, so
+`EL` also matches `CIELab`/`CIELuv`. Anchor when you mean a family — `^EL` /
+`ELTests`.
 
 **Blind spot:** esctest cannot test focus reporting, mouse encoding, or paste —
 it can't drive those windowed-only inputs. Those stay covered by the

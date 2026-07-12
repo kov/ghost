@@ -100,6 +100,61 @@ impl Vt {
         self.terminal.text()
     }
 
+    /// The DECRQCRA rectangle checksum for the visible-screen rectangle with
+    /// 0-based inclusive bounds `[top..=bottom] x [left..=right]`, ready to
+    /// place verbatim in the `DCS Pid ! ~ HHHH ST` reply.
+    ///
+    /// This follows xterm's algorithm (what esctest and other conformance tools
+    /// expect): each cell contributes its character code plus attribute bits
+    /// (bold `+0x80`, blink `+0x40`, inverse `+0x20`, underline `+0x10`; ghost
+    /// has no invisible/protected bits), a plain unattributed space (`0x20`) is
+    /// trimmed unless it is the rectangle's first cell, and the 16-bit sum is
+    /// negated — `(0x10000 - sum) & 0xFFFF` — because the default xterm checksum
+    /// esctest reads is the negated form (it recovers the sum as
+    /// `0x10000 - reply`). A blank cell therefore checksums to `0x20`, which
+    /// esctest's empty-cell assertions rely on. Coordinates are clamped to the
+    /// screen so an out-of-range request can't panic.
+    pub fn rect_checksum(&self, top: usize, left: usize, bottom: usize, right: usize) -> u16 {
+        let (cols, rows) = self.terminal.size();
+        if cols == 0 || rows == 0 || top >= rows || left >= cols {
+            return 0;
+        }
+        let bottom = bottom.min(rows - 1);
+        let right = right.min(cols - 1);
+        let mut sum: u32 = 0;
+        let mut first = true;
+        for r in top..=bottom {
+            let cells = self.terminal.line(r).cells();
+            for c in left..=right {
+                let Some(cell) = cells.get(c) else { continue };
+                let ch = cell.char();
+                // ghost stores blanks as ' ', but treat a NUL base char as a
+                // space too (belt-and-braces with xterm's undrawn-cell handling).
+                let mut v = if ch == '\0' { 0x20 } else { ch as u32 };
+                let pen = cell.pen();
+                if pen.is_bold() {
+                    v += 0x80;
+                }
+                if pen.is_blink() {
+                    v += 0x40;
+                }
+                if pen.is_inverse() {
+                    v += 0x20;
+                }
+                if pen.is_underline() {
+                    v += 0x10;
+                }
+                // A plain unattributed space contributes only as the first cell;
+                // interior and trailing blanks are trimmed (as DEC terminals do).
+                if first || v != 0x20 {
+                    sum = sum.wrapping_add(v);
+                }
+                first = false;
+            }
+        }
+        (0x10000u32.wrapping_sub(sum) & 0xFFFF) as u16
+    }
+
     /// The URI behind an interned OSC 8 hyperlink id — the id a linked cell
     /// carries in `Pen::link_id`.
     pub fn hyperlink(&self, id: u16) -> Option<&str> {
@@ -344,6 +399,43 @@ mod tests {
     use proptest::prelude::*;
     use std::env;
     use std::fs;
+
+    #[test]
+    fn rect_checksum_matches_xterm_decrqcra() {
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("A B"); // row 0: 'A', ' ', 'B', then blanks
+
+        // Single cells: character code, negated 16-bit (xterm's default form,
+        // which esctest un-negates as 0x10000 - reply).
+        assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFFBF); // 'A' = 65
+        assert_eq!(vt.rect_checksum(0, 2, 0, 2), 0xFFBE); // 'B' = 66
+                                                          // A lone blank still counts (it is the rect's first cell): 0x20 = 32.
+        assert_eq!(vt.rect_checksum(0, 1, 0, 1), 0xFFE0);
+
+        // Multi-cell: interior/trailing plain spaces are trimmed, but a leading
+        // one (the first cell) is not.
+        assert_eq!(vt.rect_checksum(0, 0, 0, 2), 0xFF7D); // 'A' + 'B' = 131
+        assert_eq!(vt.rect_checksum(0, 0, 0, 1), 0xFFBF); // 'A' + trimmed space
+        assert_eq!(vt.rect_checksum(0, 3, 0, 4), 0xFFE0); // space + trimmed space
+
+        // Out-of-range coordinates clamp to the screen rather than panicking.
+        assert_eq!(vt.rect_checksum(0, 0, 99, 0), vt.rect_checksum(0, 0, 1, 0));
+    }
+
+    #[test]
+    fn rect_checksum_adds_attribute_bits_like_xterm() {
+        let mut vt = Vt::new(10, 1);
+        vt.feed_str("\x1b[1mA\x1b[0m"); // bold 'A' = 65 + 0x80 = 193
+        assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFF3F);
+
+        let mut vt = Vt::new(10, 1);
+        vt.feed_str("\x1b[7mA\x1b[0m"); // inverse 'A' = 65 + 0x20 = 97
+        assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFF9F);
+
+        let mut vt = Vt::new(10, 1);
+        vt.feed_str("\x1b[4mA\x1b[0m"); // underline 'A' = 65 + 0x10 = 81
+        assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFFAF);
+    }
 
     #[test]
     fn feed_str_returns_changed_lines() {

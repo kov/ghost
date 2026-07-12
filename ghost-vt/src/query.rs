@@ -69,6 +69,19 @@ pub enum Query {
     /// reported; everything else gets the well-formed invalid reply
     /// `DCS 0 $ r ST`.
     Setting(String),
+    /// DECRQCRA `CSI Pid ; Pp ; Pt ; Pl ; Pb ; Pr * y` — request the checksum of
+    /// a screen rectangle. `Pid` is echoed back; `Pt`/`Pl`/`Pb`/`Pr` are the
+    /// 1-based inclusive top/left/bottom/right (the page `Pp` is ignored — ghost
+    /// has one page). Reply: DECCKSR `DCS Pid ! ~ HHHH ST`, `HHHH` the negated
+    /// 16-bit checksum from [`ghost_term::Vt::rect_checksum`]. Conformance tools
+    /// (esctest) read cells this way, since a program can't see a cell directly.
+    RectChecksum {
+        pid: u16,
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+    },
 }
 
 /// The default fg/bg an OSC 10/11 color query is answered with. The attached
@@ -122,6 +135,10 @@ pub struct ReplyCtx<'a> {
     /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
     /// reset, `None` unrecognized.
     pub mode_state: &'a dyn Fn(u16) -> Option<bool>,
+    /// The DECRQCRA rectangle checksum over 0-based inclusive `(top, left,
+    /// bottom, right)` screen coordinates — [`ghost_term::Vt::rect_checksum`],
+    /// threaded in so the pure query layer can read cells without owning a grid.
+    pub checksum: &'a dyn Fn(usize, usize, usize, usize) -> u16,
 }
 
 /// The 16-bit-per-channel `rgb:rrrr/gggg/bbbb` form xterm reports colors in
@@ -227,6 +244,20 @@ impl Query {
                 " q" => format!("\x1bP1$r{} q\x1b\\", ctx.cursor_style).into_bytes(),
                 _ => b"\x1bP0$r\x1b\\".to_vec(),
             },
+            Query::RectChecksum {
+                pid,
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                // esctest coordinates are 1-based inclusive; `rect_checksum`
+                // wants 0-based. Reply DECCKSR even for a degenerate rect —
+                // silence would just stall the querying program for a timeout.
+                let z = |v: u16| v.saturating_sub(1) as usize;
+                let sum = (ctx.checksum)(z(*top), z(*left), z(*bottom), z(*right));
+                format!("\x1bP{pid}!~{sum:04X}\x1b\\").into_bytes()
+            }
         }
     }
 }
@@ -496,6 +527,24 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
                 .ok()
                 .map(Query::ReportMode)
         }
+        // DECRQCRA: `CSI Pid ; Pp ; Pt ; Pl ; Pb ; Pr * y`. The `*` intermediate
+        // is appended to the params (as `$` is for DECRQM). `Pid` leads; the
+        // rectangle is the last four fields (so an omitted page still parses).
+        b'y' => {
+            let body = std::str::from_utf8(params.strip_suffix(b"*")?).ok()?;
+            let fields: Vec<&str> = body.split(';').collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            let n = fields.len();
+            Some(Query::RectChecksum {
+                pid: fields[0].parse().ok()?,
+                top: fields[n - 4].parse().ok()?,
+                left: fields[n - 3].parse().ok()?,
+                bottom: fields[n - 2].parse().ok()?,
+                right: fields[n - 1].parse().ok()?,
+            })
+        }
         _ => None,
     }
 }
@@ -524,6 +573,35 @@ mod tests {
         assert_eq!(scan_all(b"\x1b[>0q"), [Query::TerminalVersion]);
         assert_eq!(scan_all(b"\x1b[?2026$p"), [Query::ReportMode(2026)]);
         assert_eq!(scan_all(b"\x1b[?25$p"), [Query::ReportMode(25)]);
+        // DECRQCRA: pid ; page ; top ; left ; bottom ; right * y.
+        assert_eq!(
+            scan_all(b"\x1b[1;0;1;1;25;80*y"),
+            [Query::RectChecksum {
+                pid: 1,
+                top: 1,
+                left: 1,
+                bottom: 25,
+                right: 80,
+            }]
+        );
+        // A bare `CSI ... y` without the `*` intermediate is not DECRQCRA.
+        assert!(scan_all(b"\x1b[1;1;1;1y").is_empty());
+    }
+
+    #[test]
+    fn rect_checksum_reply_is_deccksr() {
+        // esctest coords are 1-based; the closure receives 0-based (here echoed
+        // as 1;2;1;2 -> 1212 = 0x04BC). Pid echoes back, 4 uppercase hex in a
+        // DCS ! ~ ... ST envelope.
+        let reply = Query::RectChecksum {
+            pid: 7,
+            top: 2,
+            left: 3,
+            bottom: 2,
+            right: 3,
+        }
+        .reply(&ctx());
+        assert_eq!(reply, b"\x1bP7!~04BC\x1b\\");
     }
 
     #[test]
@@ -573,6 +651,12 @@ mod tests {
         None
     }
 
+    /// A `checksum` for tests: encodes the requested rect so assertions can see
+    /// the coordinates the reply was built from.
+    fn echo_rect(top: usize, left: usize, bottom: usize, right: usize) -> u16 {
+        (top * 1000 + left * 100 + bottom * 10 + right) as u16
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -582,6 +666,7 @@ mod tests {
             cursor_style: 2,
             colors: ThemeColors::default(),
             mode_state: &no_modes,
+            checksum: &echo_rect,
         }
     }
 

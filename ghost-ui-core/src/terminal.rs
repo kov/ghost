@@ -1131,6 +1131,7 @@ impl TerminalModel {
             }
             let screen = &self.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+            let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
             let ctx = ReplyCtx {
                 cursor: screen.cursor(),
                 size: screen.dimensions(),
@@ -1138,6 +1139,7 @@ impl TerminalModel {
                 cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
                 colors: screen.effective_colors(self.theme),
                 mode_state: &mode_state,
+                checksum: &checksum,
             };
             let replies = query_replies(&mut self.scanner, bytes, &ctx);
             if !replies.is_empty() {
@@ -4199,6 +4201,11 @@ mod tests {
         None
     }
 
+    /// A `checksum` for tests: the query tests here don't exercise DECRQCRA.
+    fn no_checksum(_: usize, _: usize, _: usize, _: usize) -> u16 {
+        0
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn reply_ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -4208,6 +4215,7 @@ mod tests {
             cursor_style: 2,
             colors: ThemeColors::default(),
             mode_state: &no_modes,
+            checksum: &no_checksum,
         }
     }
 
