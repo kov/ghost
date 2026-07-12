@@ -836,15 +836,23 @@ impl Terminal {
     }
 
     fn move_cursor_to_rel_col(&mut self, rel_col: isize) {
-        let new_col = self.cursor.col as isize + rel_col;
-
-        if new_col < 0 {
-            self.cursor.col = 0;
-        } else if new_col as usize >= self.cols {
-            self.cursor.col = self.cols - 1;
+        // Relative moves (CUF/CUB/BS) stop at the left/right margin when the cursor
+        // starts on the inside of it, but run to the screen edge when it starts
+        // outside — a cursor left of the left margin backs up to column 0, one right
+        // of the right margin advances to the last column. When DECLRMM is off the
+        // margins are the full width, so this collapses to a plain screen clamp.
+        let lower = if self.cursor.col >= self.left_margin {
+            self.left_margin
         } else {
-            self.cursor.col = new_col as usize;
-        }
+            0
+        };
+        let upper = if self.cursor.col <= self.right_margin {
+            self.right_margin
+        } else {
+            self.cols - 1
+        };
+        let new_col = (self.cursor.col as isize + rel_col).clamp(lower as isize, upper as isize);
+        self.cursor.col = new_col as usize;
         self.pending_wrap = false;
     }
 

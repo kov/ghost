@@ -853,6 +853,48 @@ mod tests {
     }
 
     #[test]
+    fn cuf_stops_at_the_right_margin_inside_the_box() {
+        // esctest test_CUF_StopsAtRightMarginInScrollRegion: a cursor at or left of
+        // the right margin can't be moved past it, even without origin mode.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?69h\x1b[5;10s"); // box cols 4..=9 (0-based)
+        vt.feed_str("\x1b[3;7H"); // absolute col 6, inside the box
+        vt.feed_str("\x1b[80C"); // CUF by a lot
+        assert_eq!(vt.cursor().col, 9, "stops at the right margin");
+    }
+
+    #[test]
+    fn cuf_stops_at_the_screen_edge_when_right_of_the_box() {
+        // test_CUF_StopsAtRightEdgeWhenBegunRightOfScrollRegion: begun right of the
+        // margin, CUF runs to the screen edge, not the margin.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?69h\x1b[5;10s");
+        vt.feed_str("\x1b[3;12H"); // absolute col 11, right of the box
+        vt.feed_str("\x1b[80C");
+        assert_eq!(vt.cursor().col, 79, "stops at the screen edge");
+    }
+
+    #[test]
+    fn cub_stops_at_the_left_margin_inside_the_box() {
+        // esctest test_CUB_StopsAtLeftMarginInScrollRegion.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?69h\x1b[5;10s");
+        vt.feed_str("\x1b[3;7H"); // absolute col 6, inside the box
+        vt.feed_str("\x1b[99D"); // CUB by a lot
+        assert_eq!(vt.cursor().col, 4, "stops at the left margin");
+    }
+
+    #[test]
+    fn cub_stops_at_the_screen_edge_when_left_of_the_box() {
+        // test_CUB_StopsAtLeftEdgeWhenBegunLeftOfScrollRegion.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?69h\x1b[5;10s");
+        vt.feed_str("\x1b[3;4H"); // absolute col 3, left of the box
+        vt.feed_str("\x1b[99D");
+        assert_eq!(vt.cursor().col, 0, "stops at the screen edge");
+    }
+
+    #[test]
     fn rect_checksum_matches_xterm_decrqcra() {
         let mut vt = Vt::new(10, 2);
         vt.feed_str("A B"); // row 0: 'A', ' ', 'B', then blanks
