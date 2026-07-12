@@ -1064,6 +1064,21 @@ impl RootModel {
         cmds
     }
 
+    /// Re-forward the window's OS focus onto the freshly-promoted foreground
+    /// model. A session brought forward by a Ctrl-Tab switch, a dive-out, or the
+    /// previous foreground exiting receives no focus event of its own, yet the
+    /// window's focus did not change — so the new foreground is focused exactly
+    /// when the window is. Forwarding keeps its `focused` flag truthful (a later
+    /// DEC ?1004 enable then reports the right state) and hands a focus-reporting
+    /// app the ESC[I / ESC[O a real terminal sends as its view comes forward.
+    fn reassert_foreground_focus(&mut self) -> Vec<Cmd> {
+        let focused = self.focused_win;
+        match &mut self.mode {
+            Mode::Single(m) => m.update(UiEvent::Focus(focused)),
+            Mode::Fleet(_) => Vec::new(),
+        }
+    }
+
     /// Switch to the single view of `id` (the shell has just attached it) and
     /// take ownership. From the fleet, the existing tile's screen is preserved;
     /// otherwise (or from another single session) a fresh terminal is created.
@@ -1151,6 +1166,9 @@ impl RootModel {
         self.primary = Some(id);
         cmds.push(Cmd::SetTitle(title));
         cmds.push(Cmd::Redraw);
+        // The promoted session inherited no focus event; tell it whether the
+        // window is focused so its DEC ?1004 reports stay correct.
+        cmds.extend(self.reassert_foreground_focus());
         if let Some(anim) = anim {
             self.anim = Some(anim);
             cmds.push(Cmd::ScheduleTick { after_ms: 0 });
@@ -1203,6 +1221,9 @@ impl RootModel {
             self.mode = Mode::Single(Box::new(model));
             self.primary = Some(next);
             cmds.push(Cmd::SetTitle(title));
+            // The successor inherited no focus event; reassert the window's focus
+            // so its DEC ?1004 reports stay correct.
+            cmds.extend(self.reassert_foreground_focus());
             // Slide the next session in (forward, like a Ctrl-Tab) over the dead
             // session's frozen stand-in.
             let incoming = self.live_scene();
@@ -1863,6 +1884,10 @@ impl RootModel {
             }
         };
         self.mode = next;
+        // A dive that lands on a single session promotes it with no focus event
+        // of its own; reassert the window's focus so its ?1004 reports stay
+        // correct (a no-op when the dive stays in the fleet).
+        cmds.extend(self.reassert_foreground_focus());
         // Kick the (purely visual) dive: the first scheduled tick stamps its start.
         if let Some(anim) = anim {
             self.anim = Some(anim);
@@ -3951,6 +3976,52 @@ mod tests {
             !ctrl_tab(&mut r, false)
                 .iter()
                 .any(|c| matches!(c, Cmd::SendInput { .. })),
+        );
+    }
+
+    #[test]
+    fn a_freshly_promoted_session_learns_it_is_focused_for_1004_reports() {
+        let mut r = root(); // foreground alpha
+        r.update(UiEvent::Focus(true)); // the window holds OS focus
+        // Adopt a new session; it becomes the foreground with no OS focus event
+        // of its own (the window's focus didn't change).
+        r.update(UiEvent::AdoptSession("beta".into()));
+        // beta's app enables focus reporting. The window is focused, so beta
+        // must be told it HAS focus (ESC[I) — not that it lost it (ESC[O), which
+        // is what a stale `focused` flag inherited from a fresh model sends.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"\x1b[?1004h".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::SendInput {
+                session: "beta".into(),
+                bytes: b"\x1b[I".to_vec(),
+            }),
+            "a promoted, focused session reports ESC[I on ?1004h enable, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn switching_away_and_back_keeps_focus_reporting_correct() {
+        let mut r = root();
+        r.update(UiEvent::Focus(true));
+        with_three(&mut r); // foreground gamma; alpha, beta warm
+        ctrl_tab(&mut r, false); // gamma wraps forward to alpha
+        // alpha is the focused foreground again; an app that only now enables
+        // focus reporting still learns it is focused.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "alpha".into(),
+            bytes: b"\x1b[?1004h".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::SendInput {
+                session: "alpha".into(),
+                bytes: b"\x1b[I".to_vec(),
+            }),
+            "a switched-back focused session reports ESC[I on ?1004h, got {cmds:?}"
         );
     }
 

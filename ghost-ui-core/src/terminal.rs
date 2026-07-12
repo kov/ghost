@@ -250,6 +250,12 @@ pub struct TerminalModel {
     /// frame (DEC mode 2026). Released by the mode resetting, or by the tick
     /// scheduled when the hold began (so a stuck app can't freeze the window).
     sync_held: bool,
+    /// Whether this session's window currently holds keyboard focus. Tracked so
+    /// that when an app first enables focus reporting (DEC ?1004) we can report
+    /// the *current* focus state immediately, not only on the next change (see
+    /// [`Self::session_data`]). Warm background mirrors never receive a focus
+    /// event, so they correctly stay `false`.
+    focused: bool,
     /// The scheme's default fg/bg, for answering OSC 10/11 color queries (vim
     /// and fzf theme detection). Defaults to ghost's default scheme; the shell
     /// overrides it when a scheme is configured (see `set_theme`).
@@ -357,6 +363,7 @@ impl TerminalModel {
             presented: None,
             view_slid: false,
             sync_held: false,
+            focused: false,
             theme: ThemeColors::default(),
             hovered_link: None,
             display_name: String::new(),
@@ -1024,6 +1031,7 @@ impl TerminalModel {
     }
 
     fn focus(&mut self, focused: bool) -> Vec<Cmd> {
+        self.focused = focused;
         if !focused {
             // Losing focus aborts any IME composition; clear it so we don't get
             // stuck swallowing input should the platform omit `Ime::Disabled`.
@@ -1087,6 +1095,7 @@ impl TerminalModel {
             self.trace.feeds_seen += 1;
             let before = self.screen.vt().lines_scrolled_off();
             let colors_before = self.render_colors();
+            let focus_report_before = self.screen.vt().focus_report();
             let placements_before = self.placement_signature();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
             // slice means nothing on screen moved (a mode set, a query that only
@@ -1135,6 +1144,24 @@ impl TerminalModel {
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
                     bytes: replies,
+                });
+            }
+            // Report the current focus state when an app first subscribes to
+            // focus events (DEC ?1004 rising edge). xterm reports only on the
+            // next *change*, so an app that enables focus reporting while the
+            // window already holds focus never learns it does — Claude Code's
+            // prompt does exactly this and then swallows input until a focus
+            // change happens to arrive. Emit the current state on enable so a
+            // newly-subscribed app is never left guessing (a deliberate,
+            // documented divergence from xterm).
+            if self.screen.vt().focus_report() && !focus_report_before {
+                cmds.push(Cmd::SendInput {
+                    session: self.session.clone(),
+                    bytes: if self.focused {
+                        b"\x1b[I".to_vec()
+                    } else {
+                        b"\x1b[O".to_vec()
+                    },
                 });
             }
             // kitty-graphics acknowledgements are stateful, so (unlike the scanner
@@ -2779,6 +2806,58 @@ mod tests {
         assert_eq!(
             m.update(UiEvent::Focus(false)),
             vec![sent("alpha", b"\x1b[O")]
+        );
+    }
+
+    #[test]
+    fn focus_report_enable_reports_current_state_when_focused() {
+        let mut m = model();
+        // The window already holds focus when the app subscribes (the common
+        // case: an app enables ?1004h after it is already in the foreground).
+        m.update(UiEvent::Focus(true));
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?1004h".to_vec(),
+            ended: false,
+        });
+        // Enabling focus reporting reports the current state (focused) at once,
+        // so the app doesn't block waiting for a change that never comes.
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[I")),
+            "enable-while-focused should report ESC[I, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn focus_report_enable_reports_current_state_when_unfocused() {
+        let mut m = model();
+        m.update(UiEvent::Focus(false));
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?1004h".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&sent("alpha", b"\x1b[O")),
+            "enable-while-unfocused should report ESC[O, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn focus_report_reports_only_on_the_enable_edge() {
+        let mut m = model();
+        m.update(UiEvent::Focus(true));
+        feed(&mut m, b"\x1b[?1004h");
+        // A second feed that does not touch ?1004 must not re-report focus —
+        // only the rising edge of the mode does.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"x".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !cmds.contains(&sent("alpha", b"\x1b[I")),
+            "no ?1004 edge, so no focus report, got {cmds:?}"
         );
     }
 
