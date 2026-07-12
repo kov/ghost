@@ -133,10 +133,18 @@ inflated pass counts — don't repeat that.)
        (`cursor_in_scroll_region()`) — which also fixed a pre-existing bug where
        they scrolled `cursor.row..rows` above/below the DECSTBM region.
        `IL`/`DL` families 16/0.
-     - ⬜ 4c: DECIC/DECDC (insert/delete columns) — needs new parser arms.
+     - ✅ 4c: DECIC/DECDC (insert/delete columns) — new parser arms `CSI Pn ' }`
+       / `CSI Pn ' ~`; they rewrite the same `[cursor..=right]` column band across
+       every row of the scroll region (`Buffer::{insert,delete}_columns`) and are a
+       no-op unless the cursor is in the scroll region on both axes. A `push_csi`
+       fix rides along: a true intermediate (`'`, 0x20–0x2F) now serialises *after*
+       the params (ECMA-48 order), where a private-marker prefix (`<=>?`) still
+       leads — the old order emitted `CSI ' Pn }`, which re-parses to nothing.
+       `DECIC`/`DECDC` families 14/0.
   - Also still open (independent of the slices): CUF/CUB stopping at the
      left/right margin, and reverse-wraparound (`DECSET ?45`, `ReverseWrapInline`)
-     for BS/CUB across wrapped lines.
+     for BS/CUB across wrapped lines. DECRQSS/DECSCL reporting of DECSLRM (the
+     status-string and conformance-level replies) is a separate, still-open gap.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

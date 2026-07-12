@@ -80,6 +80,10 @@ pub enum Function {
     /// with SCOSC (`CSI s`): the terminal treats it as DECSLRM only while
     /// DECLRMM (`?69`) is on, otherwise as SCOSC (save cursor).
     Decslrm(u16, u16),
+    /// DECIC `CSI Pn ' }` — insert `Pn` blank columns at the cursor column.
+    Decic(u16),
+    /// DECDC `CSI Pn ' ~` — delete `Pn` columns at the cursor column.
+    Decdc(u16),
     Decstr,
     Dl(u16),
     Ech(u16),
@@ -994,6 +998,11 @@ impl Parser {
 
             (Some('!'), 'p') => Some(Decstr),
 
+            // DECIC / DECDC: `CSI Pn ' }` / `CSI Pn ' ~` (intermediate `'`).
+            (Some('\''), '}') => Some(Decic(ps[0].as_u16())),
+
+            (Some('\''), '~') => Some(Decdc(ps[0].as_u16())),
+
             (Some('?'), 'h') => Some(Decset(DecModes::collect(
                 ps[..=self.cur_param].iter().filter_map(dec_mode),
             ))),
@@ -1424,6 +1433,9 @@ fn dump_function(seq: &mut String, fun: &Function) {
             push_csi(seq, None, &[left.to_string(), right.to_string()], 's');
         }
 
+        Decic(n) => push_csi(seq, Some('\''), &[n.to_string()], '}'),
+        Decdc(n) => push_csi(seq, Some('\''), &[n.to_string()], '~'),
+
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
         Dl(n) => push_csi(seq, None, &[n.to_string()], 'M'),
         Ech(n) => push_csi(seq, None, &[n.to_string()], 'X'),
@@ -1672,8 +1684,16 @@ fn push_csi(seq: &mut String, intermediate: Option<char>, params: &[String], fin
     seq.push('\u{1b}');
     seq.push('[');
 
-    if let Some(intermediate) = intermediate {
-        seq.push(intermediate);
+    // ECMA-48 byte order is: private-marker prefix (`<=>?`, 0x3C–0x3F), then
+    // parameter bytes, then intermediate bytes (0x20–0x2F), then the final byte.
+    // Callers pass both kinds through `intermediate`; a marker sits before the
+    // params, a true intermediate after (a param byte following an intermediate
+    // is malformed and the parser would drop the whole sequence).
+    let marker = intermediate.filter(|c| ('<'..='?').contains(c));
+    let trailing = intermediate.filter(|c| !('<'..='?').contains(c));
+
+    if let Some(marker) = marker {
+        seq.push(marker);
     }
 
     if let Some((first, rest)) = params.split_first() {
@@ -1683,6 +1703,10 @@ fn push_csi(seq: &mut String, intermediate: Option<char>, params: &[String], fin
             seq.push(';');
             seq.push_str(param);
         }
+    }
+
+    if let Some(trailing) = trailing {
+        seq.push(trailing);
     }
 
     seq.push(final_char);
@@ -2341,6 +2365,10 @@ mod tests {
         assert_eq!(parse("\x1b[s"), [Decslrm(0, 0)]);
         assert_eq!(parse("\x1b[5;10s"), [Decslrm(5, 10)]);
         assert_eq!(parse("\x1b[u"), [Scorc]);
+        assert_eq!(parse("\x1b['}"), [Decic(0)]);
+        assert_eq!(parse("\x1b[3'}"), [Decic(3)]);
+        assert_eq!(parse("\x1b['~"), [Decdc(0)]);
+        assert_eq!(parse("\x1b[3'~"), [Decdc(3)]);
         assert_eq!(parse("\x1b[!p"), [Decstr]);
 
         // DEC private modes.
@@ -2819,6 +2847,8 @@ mod tests {
                 DecMode::SaveCursorAltScreenBuffer,
             ])),
             Decslrm(5, 10),
+            Decic(3),
+            Decdc(7),
             Decstbm(2, 5),
             Decstr,
             Dl(17),

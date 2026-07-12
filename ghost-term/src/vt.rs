@@ -739,6 +739,56 @@ mod tests {
     }
 
     #[test]
+    fn decic_inserts_columns_across_the_region() {
+        // esctest test_DECIC_ExplicitParam: DECIC inserts blank columns at the
+        // cursor column across every row of the vertical region.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("\x1b[1;1Habcdefg\x1b[2;1HABCDEFG\x1b[3;1Hzyxwvut");
+        vt.feed_str("\x1b[2;2H"); // cursor row 1, col 1
+        vt.feed_str("\x1b['}"); // DECIC 1
+        assert_eq!(row_cells(&vt, 0, 8), "a bcdefg");
+        assert_eq!(row_cells(&vt, 1, 8), "A BCDEFG");
+        assert_eq!(row_cells(&vt, 2, 8), "z yxwvut");
+    }
+
+    #[test]
+    fn decdc_deletes_columns_across_the_region() {
+        // DECIC's counterpart.
+        let mut vt = Vt::new(10, 3);
+        vt.feed_str("\x1b[1;1Habcdefg\x1b[2;1HABCDEFG");
+        vt.feed_str("\x1b[2;2H"); // cursor row 1, col 1
+        vt.feed_str("\x1b['~"); // DECDC 1
+        assert_eq!(row_cells(&vt, 0, 7), "acdefg ");
+        assert_eq!(row_cells(&vt, 1, 7), "ACDEFG ");
+    }
+
+    #[test]
+    fn decic_only_affects_the_scroll_region() {
+        // esctest test_DECIC_CursorWithinTopBottom: rows outside DECSTBM untouched.
+        let mut vt = Vt::new(10, 4);
+        vt.feed_str("\x1b[1;1Habcdefg\x1b[2;1HABCDEFG");
+        vt.feed_str("\x1b[3;1Hzyxwvut\x1b[4;1HZYXWVUT");
+        vt.feed_str("\x1b[2;3r"); // DECSTBM rows 2..3 (region rows 1-2)
+        vt.feed_str("\x1b[2;2H"); // cursor row 1, col 1 (inside)
+        vt.feed_str("\x1b[2'}"); // DECIC 2
+        assert_eq!(row_cells(&vt, 0, 7), "abcdefg"); // above: untouched
+        assert_eq!(row_cells(&vt, 1, 9), "A  BCDEFG");
+        assert_eq!(row_cells(&vt, 2, 9), "z  yxwvut");
+        assert_eq!(row_cells(&vt, 3, 7), "ZYXWVUT"); // below: untouched
+    }
+
+    #[test]
+    fn decic_outside_the_box_is_a_no_op() {
+        // esctest test_DECIC_IsNoOpWhenCursorBeginsOutsideScrollRegion.
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("\x1b[1;1Habcdefg");
+        vt.feed_str("\x1b[?69h\x1b[2;5s"); // box cols 2..5
+        vt.feed_str("\x1b[1;1H"); // cursor col 0, outside the box
+        vt.feed_str("\x1b[10'}"); // DECIC 10
+        assert_eq!(row_cells(&vt, 0, 7), "abcdefg");
+    }
+
+    #[test]
     fn decrqm_reports_left_right_margin_mode_state() {
         // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
         // in its own field rather than the tracked-modes set.

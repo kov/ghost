@@ -120,6 +120,38 @@ impl Buffer {
         }
     }
 
+    /// DECIC — insert `n` blank columns at `col` in every row of `rows`, shifting
+    /// each row's `[col..end]` cells right. A whole-rectangle column op: unlike
+    /// [`insert_within`] (one row), it rewrites the same column band across the
+    /// scroll region, so `wrapped` flags stay put.
+    pub fn insert_columns(
+        &mut self,
+        rows: Range<usize>,
+        col: usize,
+        n: usize,
+        end: usize,
+        pen: &Pen,
+    ) {
+        for row in rows {
+            self[row].insert_within(col, n, end, pen);
+        }
+    }
+
+    /// DECDC — delete `n` columns at `col` in every row of `rows`, pulling each
+    /// row's `[col..end]` cells left. The counterpart to [`insert_columns`].
+    pub fn delete_columns(
+        &mut self,
+        rows: Range<usize>,
+        col: usize,
+        n: usize,
+        end: usize,
+        pen: &Pen,
+    ) {
+        for row in rows {
+            self[row].delete_within(col, n, end, pen);
+        }
+    }
+
     pub fn erase(&mut self, (col, row): VisualPosition, mode: EraseMode, pen: &Pen) {
         use EraseMode::*;
 

@@ -488,6 +488,14 @@ impl Terminal {
                 }
             }
 
+            Decic(n) => {
+                self.decic(n);
+            }
+
+            Decdc(n) => {
+                self.decdc(n);
+            }
+
             Decstr => {
                 self.decstr();
             }
@@ -1798,6 +1806,43 @@ impl Terminal {
         );
 
         self.dirty_lines.add(self.cursor.row);
+    }
+
+    fn decic(&mut self, n: u16) {
+        // DECIC inserts blank columns at the cursor column across every row of the
+        // scroll region, shifting each row's cells right up to the right margin.
+        // No-op unless the cursor is inside the scroll region on both axes.
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        self.pending_wrap = false;
+        let range = self.top_margin..self.bottom_margin + 1;
+        self.buffer.insert_columns(
+            range.clone(),
+            self.cursor.col,
+            as_usize(n, 1),
+            self.right_margin + 1,
+            &self.pen,
+        );
+        self.dirty_lines.extend(range);
+    }
+
+    fn decdc(&mut self, n: u16) {
+        // DECDC deletes columns at the cursor column across the scroll region,
+        // pulling each row's cells left up to the right margin. Same gating.
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        self.pending_wrap = false;
+        let range = self.top_margin..self.bottom_margin + 1;
+        self.buffer.delete_columns(
+            range.clone(),
+            self.cursor.col,
+            as_usize(n, 1),
+            self.right_margin + 1,
+            &self.pen,
+        );
+        self.dirty_lines.extend(range);
     }
 
     fn su(&mut self, n: u16) {
