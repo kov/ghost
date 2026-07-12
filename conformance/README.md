@@ -155,8 +155,15 @@ inflated pass counts — don't repeat that.)
        (both start at column 0 of a non-wrapped row, one must wrap and one must not);
        we pass the latter (and the multi-row counting tests), leaving the NEL nuance
        as the one known gap.
-  - Still open: DECRQSS/DECSCL reporting of DECSLRM (the status-string and
-     conformance-level replies) is a separate gap.
+  6. reporting/query follow-ups:
+     - ✅ 6a: DECRQSS DECSLRM (`DCS $ q s ST`) reports the current margins as
+       `DCS 1 $ r Pl;Pr s ST` — a `left_right_margins` field threaded through
+       `ReplyCtx` (attached model + detached host), fed by
+       `ghost_term::Vt::left_right_margins`. `DECRQSS_DECSLRM` passes.
+     - ⬜ 6b: DECSCL conformance levels (gate DECLRMM off below VT level 4, report
+       the level via DECRQSS) and the DECCOLM/DECNCSM column-mode machinery the
+       `DECSCL_Level4` test also needs — a separate feature. Other DECRQSS
+       selectors (DECSTBM, SGR, DECSCA, …) are likewise still unreported.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

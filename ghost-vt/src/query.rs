@@ -130,6 +130,9 @@ pub struct ReplyCtx<'a> {
     /// The cursor style as a steady DECSCUSR digit (2 block, 4 underline,
     /// 6 bar — see [`decscusr_digit`]), for DECRQSS `" q"`.
     pub cursor_style: u8,
+    /// The current left/right scroll margins, 1-based inclusive, for DECRQSS
+    /// DECSLRM (selector `s`). Full width `(1, cols)` when DECLRMM is off.
+    pub left_right_margins: (u16, u16),
     /// Default fg/bg for the OSC color queries.
     pub colors: ThemeColors,
     /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
@@ -242,6 +245,10 @@ impl Query {
             }
             Query::Setting(selector) => match selector.as_str() {
                 " q" => format!("\x1bP1$r{} q\x1b\\", ctx.cursor_style).into_bytes(),
+                "s" => {
+                    let (l, r) = ctx.left_right_margins;
+                    format!("\x1bP1$r{l};{r}s\x1b\\").into_bytes()
+                }
                 _ => b"\x1bP0$r\x1b\\".to_vec(),
             },
             Query::RectChecksum {
@@ -664,6 +671,7 @@ mod tests {
             size: (80, 24),
             kitty_flags: 0,
             cursor_style: 2,
+            left_right_margins: (1, 80),
             colors: ThemeColors::default(),
             mode_state: &no_modes,
             checksum: &echo_rect,
@@ -829,6 +837,18 @@ mod tests {
         // (validity 0), not silence — the prober can move on immediately.
         let qs = scan_all(b"\x1bP$qm\x1b\\");
         assert_eq!(qs[0].reply(&ctx()), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_reports_the_left_right_margins() {
+        // DECRQSS for DECSLRM (selector "s") answers the current margins, 1-based.
+        let qs = scan_all(b"\x1bP$qs\x1b\\");
+        assert_eq!(qs.len(), 1);
+        let margined = ReplyCtx {
+            left_right_margins: (3, 4),
+            ..ctx()
+        };
+        assert_eq!(qs[0].reply(&margined), b"\x1bP1$r3;4s\x1b\\");
     }
 
     #[test]

@@ -224,6 +224,12 @@ impl Vt {
         self.terminal.cursor()
     }
 
+    /// The current left/right margins as 1-based inclusive columns (DECRQSS
+    /// DECSLRM report). See [`Terminal::left_right_margins`].
+    pub fn left_right_margins(&self) -> (usize, usize) {
+        self.terminal.left_right_margins()
+    }
+
     pub fn cursor_key_app_mode(&self) -> bool {
         self.terminal.cursor_keys_app_mode()
     }

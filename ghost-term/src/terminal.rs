@@ -770,6 +770,13 @@ impl Terminal {
         )
     }
 
+    /// The current left/right scroll margins as 1-based inclusive columns, for a
+    /// DECRQSS DECSLRM report. When DECLRMM is off these are the full width
+    /// `(1, cols)`, which is what the raw margins collapse to.
+    pub fn left_right_margins(&self) -> (usize, usize) {
+        (self.left_margin + 1, self.right_margin + 1)
+    }
+
     pub fn gc(&mut self) -> Box<dyn Iterator<Item = Line> + '_> {
         let lines = self.buffer.gc();
 

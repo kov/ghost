@@ -1132,11 +1132,13 @@ impl TerminalModel {
             let screen = &self.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
             let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
+            let (lm, rm) = screen.vt().left_right_margins();
             let ctx = ReplyCtx {
                 cursor: screen.cursor_report(),
                 size: screen.dimensions(),
                 kitty_flags: screen.kitty_keyboard_flags(),
                 cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
+                left_right_margins: (lm as u16, rm as u16),
                 colors: screen.effective_colors(self.theme),
                 mode_state: &mode_state,
                 checksum: &checksum,
@@ -4213,6 +4215,7 @@ mod tests {
             size: (80, 24),
             kitty_flags: 0,
             cursor_style: 2,
+            left_right_margins: (1, 80),
             colors: ThemeColors::default(),
             mode_state: &no_modes,
             checksum: &no_checksum,
