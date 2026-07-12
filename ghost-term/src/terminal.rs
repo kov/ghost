@@ -864,7 +864,12 @@ impl Terminal {
 
     fn move_cursor_down_with_scroll(&mut self) {
         if self.cursor.row == self.bottom_margin {
-            self.scroll_up_in_region(1);
+            // At the bottom margin a line feed scrolls the box, but only while the
+            // cursor is within the left/right margins; outside them it is inert
+            // (no scroll, no move) — DEC's LF/IND behaviour with L/R margins.
+            if self.cursor_within_lr_margins() {
+                self.scroll_up_in_region(1);
+            }
         } else if self.cursor.row < self.rows - 1 {
             self.do_move_cursor_to_row(self.cursor.row + 1);
         }
@@ -934,6 +939,20 @@ impl Terminal {
     /// to full then), so the buffer takes its fast whole-row path.
     fn scroll_cols(&self) -> std::ops::Range<usize> {
         self.left_margin..self.right_margin + 1
+    }
+
+    /// Whether the cursor column sits within the left/right margins. A line
+    /// feed/reverse index scrolls the box only from inside it; a wide glyph's
+    /// head counts (the cursor never rests on a tail).
+    fn cursor_within_lr_margins(&self) -> bool {
+        (self.left_margin..=self.right_margin).contains(&self.cursor.col)
+    }
+
+    /// Whether a real left/right-margin box is set (narrower than the full
+    /// width). Gates behaviour that only differs inside a box, like not marking
+    /// an in-box autowrap as a soft line continuation.
+    fn lr_margins_narrowed(&self) -> bool {
+        self.left_margin > 0 || self.right_margin < self.cols - 1
     }
 
     fn scroll_up_in_region(&mut self, n: usize) {
@@ -1447,12 +1466,20 @@ impl Terminal {
     /// wrap, else column 0.
     fn wrap_line(&mut self) {
         let left = self.wrap_left_edge();
+        // Inside a left/right-margin box the wrap point isn't the true line end,
+        // so it's not a logical-line continuation — don't flag it `wrapped` (that
+        // would fuse the rows in text()/reflow).
+        let soft_wrap = !self.lr_margins_narrowed();
 
         if self.cursor.row == self.bottom_margin {
-            self.buffer.wrap(self.cursor.row);
+            if soft_wrap {
+                self.buffer.wrap(self.cursor.row);
+            }
             self.scroll_up_in_region(1);
         } else if self.cursor.row < self.rows - 1 {
-            self.buffer.wrap(self.cursor.row);
+            if soft_wrap {
+                self.buffer.wrap(self.cursor.row);
+            }
             self.cursor.row += 1;
         }
 
@@ -1548,7 +1575,11 @@ impl Terminal {
     fn ri(&mut self) {
         self.pending_wrap = false;
         if self.cursor.row == self.top_margin {
-            self.scroll_down_in_region(1);
+            // Like a line feed at the bottom margin, RI scrolls the box only from
+            // within the left/right margins; outside them it is inert.
+            if self.cursor_within_lr_margins() {
+                self.scroll_down_in_region(1);
+            }
         } else if self.cursor.row > 0 {
             self.move_cursor_to_row(self.cursor.row - 1);
         }

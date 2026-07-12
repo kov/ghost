@@ -550,6 +550,74 @@ mod tests {
     }
 
     #[test]
+    fn a_line_feed_outside_the_box_is_inert_at_the_bottom_margin() {
+        // esctest test_LF_MovesDoesNotScrollOutsideLeftRight: at the bottom margin
+        // but outside the L/R box a line feed neither scrolls nor moves down.
+        let mut vt = Vt::new(10, 8);
+        vt.feed_str("\x1b[2;5r"); // DECSTBM rows 2..5 (bottom_margin = row 4)
+        vt.feed_str("\x1b[?69h");
+        vt.feed_str("\x1b[2;5s"); // DECSLRM cols 2..5 (box cols 1..=4)
+        vt.feed_str("\x1b[5;3Hx"); // 'x' at row 4, col 2 (inside the box)
+
+        vt.feed_str("\x1b[5;6H\n"); // cursor right of the box, at the bottom margin
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (5, 4),
+            "frozen right of box"
+        );
+        assert_eq!(vt.line(4).cells()[2].char(), 'x', "no scroll");
+
+        vt.feed_str("\x1b[5;1H\n"); // cursor left of the box, at the bottom margin
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (0, 4),
+            "frozen left of box"
+        );
+        assert_eq!(vt.line(4).cells()[2].char(), 'x', "still no scroll");
+
+        vt.feed_str("\x1b[4;6H\n"); // above the bottom margin: may still move down
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (5, 4),
+            "moves down, no scroll"
+        );
+    }
+
+    #[test]
+    fn a_reverse_index_outside_the_box_is_inert_at_the_top_margin() {
+        // esctest test_RI_MovesDoesNotScrollOutsideLeftRight.
+        let mut vt = Vt::new(10, 8);
+        vt.feed_str("\x1b[2;5r"); // DECSTBM rows 2..5 (top_margin = row 1)
+        vt.feed_str("\x1b[?69h");
+        vt.feed_str("\x1b[2;5s"); // DECSLRM cols 2..5 (box cols 1..=4)
+        vt.feed_str("\x1b[5;3Hx"); // 'x' at row 4, col 2 (inside the box)
+
+        vt.feed_str("\x1b[2;6H\x1bM"); // RI right of the box, at the top margin
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (5, 1),
+            "frozen right of box"
+        );
+        assert_eq!(vt.line(4).cells()[2].char(), 'x', "no scroll");
+    }
+
+    #[test]
+    fn autowrap_inside_a_box_does_not_mark_the_row_wrapped() {
+        // A soft wrap at the right margin isn't a logical-line continuation, so
+        // the row must not get the `wrapped` flag (which would fuse it with the
+        // next row in text()/reflow).
+        let mut vt = Vt::new(10, 5);
+        vt.feed_str("\x1b[?69h");
+        vt.feed_str("\x1b[2;4s"); // box cols 2..4 (left_margin 1, right_margin 3)
+        vt.feed_str("\x1b[1;2H"); // cursor at the left margin, row 0
+        vt.feed_str("abcdef"); // wraps within the box
+        assert!(
+            !vt.line(0).wrapped,
+            "an in-box wrap must not set the wrapped flag"
+        );
+    }
+
+    #[test]
     fn decrqm_reports_left_right_margin_mode_state() {
         // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
         // in its own field rather than the tracked-modes set.

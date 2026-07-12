@@ -118,9 +118,11 @@ inflated pass counts — don't repeat that.)
        + `wrapped` flags intact) when columns span the width, else a per-row
        cell-copy core (`Line::split_wide_at`/`write_cols`) that touches only
        `[cols]`, never scrollback, at O(box area). `SU`/`SD` families 18/0.
-     - ⬜ 3b: cursor-motion scrolls — LF/IND/NEL/RI freeze when the cursor is
-       outside the box (`*_MovesDoesNotScrollOutsideLeftRight`), and autowrap must
-       not set `wrapped` inside a box.
+     - ✅ 3b: cursor-motion scrolls — LF/IND/NEL/RI at the bottom/top margin
+       scroll the box only from within the left/right margins, and are inert
+       (no scroll, no move) outside them; an in-box autowrap no longer sets the
+       `wrapped` flag. `IND`/`LF`/`NEL`/`RI` families 0 fail
+       (`*_MovesDoesNotScrollOutsideLeftRight`).
   4. ⬜ insert/delete within margins — ICH/DCH bounded by the right margin,
      IL/DL/DECIC/DECDC within the box.
   - Also still open (independent of the slices): CUF/CUB stopping at the
