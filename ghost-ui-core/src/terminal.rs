@@ -1234,17 +1234,26 @@ impl TerminalModel {
             // Any tick releases the hold — an early animation tick just means
             // one mid-frame paint, the status quo without the mode.
             let sync = self.screen.vt().synchronized_output();
-            if sync && want_redraw && !self.sync_held {
-                self.sync_held = true;
-                self.trace.sync_holds += 1;
-                cmds.push(Cmd::ScheduleTick {
-                    after_ms: SYNC_RELEASE_MS,
-                });
-            }
             if sync && want_redraw {
+                // Re-arm the release backstop on EVERY swallowed feed, not just
+                // the rising edge. A hold can be latched into a warm background
+                // mirror whose one rising-edge tick is then spent on the wrong
+                // (foreground) model; a later non-animated promotion carries the
+                // still-held mirror to the foreground with nothing pending, and
+                // it freezes until output happens to pause outside a frame.
+                // Re-scheduling every feed closes that race for free: the shell
+                // coalesces deadlines and a tick to an unlatched model is a
+                // no-op. `sync_holds` still counts the rising edge only.
+                if !self.sync_held {
+                    self.sync_held = true;
+                    self.trace.sync_holds += 1;
+                }
                 // The repaint is deferred by the open hold — counted so the render
                 // trace can see feeds piling up behind a latched 2026 frame.
                 self.trace.feeds_while_held += 1;
+                cmds.push(Cmd::ScheduleTick {
+                    after_ms: SYNC_RELEASE_MS,
+                });
             }
             if !sync {
                 let released = std::mem::take(&mut self.sync_held);
@@ -2912,6 +2921,48 @@ mod tests {
         );
     }
 
+    /// The foreground render-stall latch (the recurring "Claude Code freezes, its
+    /// fleet preview stays live" bug): a synchronized-output hold schedules its
+    /// release backstop ONLY on the rising edge (`!sync_held` in `session_data`),
+    /// but the shell delivers ticks to the window's *foreground* model only — so a
+    /// hold latched while this model was a warm background mirror (or a fleet tile)
+    /// has its one backstop spent on the wrong recipient. Promoted to the
+    /// foreground by a non-animated adopt, the model then swallows every feed whose
+    /// pump batch ends inside the still-open 2026 frame — no `Cmd::Redraw`, and
+    /// (the bug) no new `Cmd::ScheduleTick` — until the app happens to end a batch
+    /// outside the frame: a stale window over a live screen, self-healing only when
+    /// output pauses. Every swallowed feed must therefore re-arm the backstop; the
+    /// shell coalesces duplicate deadlines and a tick reaching an unlatched model
+    /// is a no-op, so re-scheduling is free.
+    #[test]
+    fn a_feed_swallowed_by_an_open_hold_re_arms_the_release_backstop() {
+        let mut m = model();
+        // The hold opens mid-frame: the backstop tick is scheduled once.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026hhello".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "opening a hold schedules the release backstop"
+        );
+        // The backstop was spent elsewhere (it fired into the then-foreground
+        // model): no tick ever reaches this one. The next batch also ends inside
+        // the open frame — swallowed, and it must leave a release pending.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"world".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "a feed swallowed by an already-open hold must re-arm the backstop, \
+             or a hold latched while this model was not the tick recipient never \
+             releases: {cmds:?}"
+        );
+    }
+
     /// A left press at 0-based cell `(row, col)` carrying `mods`.
     fn press_at_cell(row: usize, col: usize, mods: Mods) -> UiEvent {
         UiEvent::Pointer {
@@ -3129,7 +3180,12 @@ mod tests {
             "no release timeout scheduled: {cmds:?}"
         );
 
-        // More held content: still no redraw, and the timeout is not re-armed.
+        // More held content: still no redraw, but the release backstop IS
+        // re-armed. A hold can be latched into a warm mirror whose single
+        // rising-edge tick is spent on the wrong model, then promoted to the
+        // foreground with nothing pending; re-arming every held feed keeps a
+        // release always in flight (see
+        // `a_feed_swallowed_by_an_open_hold_re_arms_the_release_backstop`).
         let cmds = m.update(UiEvent::SessionData {
             name: "alpha".to_string(),
             bytes: b" world".to_vec(),
@@ -3137,8 +3193,8 @@ mod tests {
         });
         assert!(!cmds.contains(&Cmd::Redraw), "redraw leaked: {cmds:?}");
         assert!(
-            !cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
-            "timeout re-armed mid-hold: {cmds:?}"
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "a held feed must re-arm the release backstop: {cmds:?}"
         );
 
         // The frame closes: one redraw presents the accumulated content, even

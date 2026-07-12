@@ -4219,4 +4219,120 @@ mod tests {
             );
         }
     }
+
+    /// Foreground alpha with beta warm, beta's mirror latched mid synchronized-
+    /// output frame, and its one backstop tick already spent on alpha — ticks reach
+    /// only the window's foreground model (`RootModel::update` routes `Tick` to
+    /// `self.mode`), so a warm mirror's hold has no release pending anywhere. This
+    /// is the state a pump-batch boundary inside an open DEC-2026 frame leaves a
+    /// streaming background session in.
+    fn latch_beta_warm(r: &mut RootModel) {
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        r.update(UiEvent::AdoptSession("alpha".into())); // back: beta warm
+        // Beta streams and the batch ends INSIDE the frame it opened: the warm
+        // mirror latches its hold and schedules the release backstop.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"\x1b[?2026hstreaming".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
+            "the warm mirror's hold schedules its backstop: {cmds:?}"
+        );
+        // The shell fires that tick — into the foreground (alpha), the only tick
+        // recipient. Beta's hold is now latched with nothing pending to release it.
+        r.update(UiEvent::Tick { now_ms: 150 });
+    }
+
+    /// The foreground render-stall freeze: a warm mirror latched mid-2026-frame is
+    /// promoted by a PLAIN adopt (no slide, no dive — `Cmd::TakeOver` on an
+    /// already-held session and the remote-restore round-trip take exactly this
+    /// path). `TerminalModel::session_data` schedules the release backstop only on
+    /// the hold's rising edge, so the promoted foreground swallows every feed whose
+    /// batch ends inside the still-open frame — no repaint, no backstop — while the
+    /// screen keeps advancing: a stale window over a live model, invisible to
+    /// GHOST_RENDER_TRACE=verify (no redraw ever runs). Self-heals only when a
+    /// batch ends outside the frame (the companion test below).
+    #[test]
+    fn a_plain_adopt_of_a_mirror_latched_mid_sync_frame_keeps_repainting_held_feeds() {
+        let mut r = root();
+        latch_beta_warm(&mut r);
+        // The plain adopt promotes the latched mirror; the switch itself paints once.
+        let cmds = r.update(UiEvent::AdoptSession("beta".into()));
+        assert!(cmds.contains(&Cmd::Redraw), "the switch paints once");
+        assert!(
+            r.foreground_trace().expect("single view").sync_held,
+            "the promoted foreground carries the hold latched while warm"
+        );
+        // Under saturation every batch keeps ending inside an open frame (the
+        // stream is nearly all frame bytes); each such feed must still leave a
+        // repaint or a pending backstop, or the window freezes on the adopt frame.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"more streamed output".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Redraw | Cmd::ScheduleTick { .. })),
+            "a held feed after promotion must repaint or re-arm the release \
+             backstop, else the foreground stays stale while the screen advances: \
+             {cmds:?}"
+        );
+    }
+
+    /// The observed self-heal of the freeze above: the latch is released by the
+    /// first pump batch that ends OUTSIDE the synchronized frame (the app pausing
+    /// between frames / finishing its response), which repaints without any input.
+    #[test]
+    fn a_batch_ending_outside_the_sync_frame_self_heals_a_promoted_latched_hold() {
+        let mut r = root();
+        latch_beta_warm(&mut r);
+        r.update(UiEvent::AdoptSession("beta".into()));
+        // Output pauses: this batch ends after the frame's 2026l reset.
+        let cmds = r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"done\x1b[?2026l".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "the mode reset releases the latched hold and repaints: {cmds:?}"
+        );
+        assert!(
+            !r.foreground_trace().expect("single view").sync_held,
+            "the hold is gone once a batch ends outside the frame"
+        );
+    }
+
+    /// Why Ctrl-Tab "fixes" the freeze: an ANIMATED switch into the latched session
+    /// ends with `tick_anim` handing the settling tick to the new foreground, which
+    /// releases the hold — every animated path self-corrects, which is exactly why
+    /// only the non-animated promotions (the red test above) can freeze.
+    #[test]
+    fn a_ctrl_tab_slide_releases_a_hold_latched_while_warm() {
+        let mut r = root();
+        latch_beta_warm(&mut r);
+        // Ctrl-Tab from alpha to beta: the warm swap plus a slide.
+        ctrl_tab(&mut r, false);
+        assert!(
+            r.foreground_trace().expect("single view").sync_held,
+            "the promoted foreground still carries the latched hold mid-slide"
+        );
+        // Drive the slide to completion: the first tick stamps its start, one past
+        // the duration finishes it and hands the settling tick to the foreground.
+        r.update(UiEvent::Tick { now_ms: 1_000 });
+        let cmds = r.update(UiEvent::Tick {
+            now_ms: 1_000 + ANIM_MS,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "the settling tick repaints: {cmds:?}"
+        );
+        assert!(
+            !r.foreground_trace().expect("single view").sync_held,
+            "the slide's completion tick released the hold latched while warm"
+        );
+    }
 }
