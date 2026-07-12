@@ -106,13 +106,19 @@ inflated pass counts — don't repeat that.)
   VT420 feature, **in progress**, being landed in slices:
   1. ✅ state + parsing + margin-relative cursor addressing + origin-relative CPR
      (`*_RespectsOriginMode` 3/3, CUP/CHA 6/0).
-  2. ⬜ autowrap at the right margin — needs an explicit `pending_wrap` flag
-     (ghost's implicit `col == cols` sentinel can't represent `right_margin+1`).
+  2. ✅ autowrap at the right margin — an explicit `pending_wrap` flag replaces
+     the old implicit `col == cols` sentinel (which couldn't represent
+     `right_margin + 1`); the cursor now parks *on* the last usable column with
+     the wrap deferred. Also lands: HT stops at the right margin, and DECRQM
+     reports DECLRMM's real state. `DECAWM`/`DECLRMM` families 15/0.
   3. ⬜ scroll box — LF/IND/RI/SU/SD scroll only `[left..=right]×[top..=bottom]`;
      the biggest change (ghost's scroll rotates whole `Line`s; needs column-range
      ops in `buffer.rs`/`line.rs`).
   4. ⬜ insert/delete within margins — ICH/DCH bounded by the right margin,
      IL/DL/DECIC/DECDC within the box.
+  - Also still open (independent of the slices): CUF/CUB stopping at the
+     left/right margin, and reverse-wraparound (`DECSET ?45`, `ReverseWrapInline`)
+     for BS/CUB across wrapped lines.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

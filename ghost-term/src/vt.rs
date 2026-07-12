@@ -406,6 +406,97 @@ mod tests {
     use std::env;
     use std::fs;
 
+    /// The first `n` cells of a physical grid row as a string (unlike `text()`,
+    /// which joins wrapped rows into logical lines).
+    fn row_cells(vt: &Vt, row: usize, n: usize) -> String {
+        vt.line(row).cells()[..n].iter().map(|c| c.char()).collect()
+    }
+
+    #[test]
+    fn autowrap_respects_the_right_margin() {
+        let mut vt = Vt::new(10, 5);
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[2;4s"); // DECSLRM: left col 2, right col 4
+        vt.feed_str("\x1b[1;1H"); // CUP(1,1) — absolute top-left
+        vt.feed_str("abcdefgh");
+
+        // Text flows to the right margin (col 4), then wraps to the left margin
+        // (col 2) on the next line — exactly esctest's test_DECSET_DECLRMM.
+        assert_eq!(
+            row_cells(&vt, 0, 4),
+            "abcd",
+            "row 1 fills to the right margin"
+        );
+        assert_eq!(
+            row_cells(&vt, 1, 4),
+            " efg",
+            "row 2 resumes at the left margin"
+        );
+        assert_eq!(
+            row_cells(&vt, 2, 3),
+            " h ",
+            "row 3 continues at the left margin"
+        );
+    }
+
+    #[test]
+    fn autowrap_at_the_screen_edge_is_unchanged() {
+        let mut vt = Vt::new(4, 3);
+        vt.feed_str("abcdef"); // no margins: wrap at the screen edge
+        assert_eq!(row_cells(&vt, 0, 4), "abcd");
+        assert_eq!(row_cells(&vt, 1, 4), "ef  ");
+    }
+
+    #[test]
+    fn a_cursor_move_cancels_a_pending_wrap() {
+        let mut vt = Vt::new(4, 2);
+        vt.feed_str("abcd"); // cursor now pending-wrap at the last column
+        vt.feed_str("\x1b[1;1H"); // move home cancels the pending wrap
+        vt.feed_str("X"); // must overwrite at col 1, not wrap to row 2
+        assert_eq!(row_cells(&vt, 0, 4), "Xbcd");
+        assert_eq!(row_cells(&vt, 1, 4), "    ");
+    }
+
+    #[test]
+    fn a_tab_stops_at_the_right_margin() {
+        // esctest test_DECSET_DECAWM_NoLineWrapOnTabWithLeftRightMargin: inside a
+        // left/right-margin box a tab stops at the right margin rather than
+        // jumping to the next tab stop beyond it.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[10;20s"); // DECSLRM: left col 10, right col 20
+        vt.feed_str("\x1b[1;1H"); // home (absolute col 0)
+
+        vt.feed_str("\t");
+        assert_eq!(vt.cursor().col, 8, "first tab -> next stop");
+        vt.feed_str("\t");
+        assert_eq!(vt.cursor().col, 16, "second tab -> next stop");
+        vt.feed_str("\t");
+        assert_eq!(
+            vt.cursor().col,
+            19,
+            "tab clamps to the right margin (col 20)"
+        );
+        vt.feed_str("\t");
+        assert_eq!(vt.cursor().col, 19, "further tabs stay at the right margin");
+    }
+
+    #[test]
+    fn decrqm_reports_left_right_margin_mode_state() {
+        // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
+        // in its own field rather than the tracked-modes set.
+        let mut vt = Vt::new(80, 24);
+        assert_eq!(vt.dec_mode_state(69), Some(false), "DECLRMM starts reset");
+        vt.feed_str("\x1b[?69h");
+        assert_eq!(vt.dec_mode_state(69), Some(true), "DECLRMM reported set");
+        vt.feed_str("\x1b[?69l");
+        assert_eq!(
+            vt.dec_mode_state(69),
+            Some(false),
+            "DECLRMM reported reset again"
+        );
+    }
+
     #[test]
     fn left_right_margins_drive_origin_relative_cursor() {
         let mut vt = Vt::new(80, 25);
@@ -520,7 +611,9 @@ mod tests {
         vt.feed_str("aa\r\nbb\r\ncc");
 
         assert_eq!(vt.size(), (2, 2));
-        assert_eq!(vt.cursor(), (2, 1));
+        // "cc" fills the 2-col bottom line; the cursor parks on the last column
+        // with the wrap deferred rather than sitting past the edge.
+        assert_eq!(vt.cursor(), (1, 1));
 
         assert_eq!(
             vt.text(),

@@ -72,6 +72,13 @@ pub struct Terminal {
     /// (`CSI Pl;Pr s`) only sets margins while this is on; with it off, `CSI s`
     /// is SCOSC (save cursor) instead.
     left_right_margin_mode: bool,
+    /// Deferred autowrap: set after printing into the right-edge column so the
+    /// cursor stays *on* that column (not past it) until the next print, which
+    /// wraps first. Cleared by any cursor movement. This makes the wrap column
+    /// explicit so it can be the right margin, not just the screen edge — the
+    /// implicit `col == cols` sentinel it replaces couldn't represent
+    /// `right_margin + 1` (a legitimate column).
+    pending_wrap: bool,
     saved_ctx: SavedCtx,
     alternate_saved_ctx: SavedCtx,
     dirty_lines: DirtyLines,
@@ -208,6 +215,7 @@ impl Terminal {
             left_margin: 0,
             right_margin: (cols - 1),
             left_right_margin_mode: false,
+            pending_wrap: false,
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
             dirty_lines,
@@ -785,6 +793,7 @@ impl Terminal {
         self.pen = self.saved_ctx.pen;
         self.origin_mode = self.saved_ctx.origin_mode;
         self.auto_wrap_mode = self.saved_ctx.auto_wrap_mode;
+        self.pending_wrap = false;
     }
 
     fn move_cursor_to_col(&mut self, col: usize) {
@@ -795,12 +804,14 @@ impl Terminal {
         let left = self.actual_left_margin();
         let right = self.actual_right_margin();
         self.cursor.col = (left + col).clamp(left, right);
+        self.pending_wrap = false;
     }
 
     /// Set the cursor column with no origin/margin translation, clamped to the
     /// screen — for tab stops and absolute edge moves.
     fn do_move_cursor_to_col(&mut self, col: usize) {
         self.cursor.col = col.min(self.cols - 1);
+        self.pending_wrap = false;
     }
 
     fn move_cursor_to_row(&mut self, mut row: usize) {
@@ -813,6 +824,7 @@ impl Terminal {
     fn do_move_cursor_to_row(&mut self, row: usize) {
         self.cursor.col = self.cursor.col.min(self.cols - 1);
         self.cursor.row = row;
+        self.pending_wrap = false;
     }
 
     fn move_cursor_to_rel_col(&mut self, rel_col: isize) {
@@ -825,6 +837,7 @@ impl Terminal {
         } else {
             self.cursor.col = new_col as usize;
         }
+        self.pending_wrap = false;
     }
 
     fn move_cursor_home(&mut self) {
@@ -833,7 +846,14 @@ impl Terminal {
     }
 
     fn move_cursor_to_next_tab(&mut self, n: usize) {
-        let next_tab = self.tabs.after(self.cursor.col, n).unwrap_or(self.cols - 1);
+        // A tab stops at the right edge of the print area (the right margin inside
+        // a left/right-margin box, else the screen edge) rather than crossing it.
+        let limit = self.print_right_edge();
+        let next_tab = self
+            .tabs
+            .after(self.cursor.col, n)
+            .unwrap_or(limit)
+            .min(limit);
         self.do_move_cursor_to_col(next_tab);
     }
 
@@ -1022,9 +1042,22 @@ impl Terminal {
     }
 
     fn reflow(&mut self) {
-        (self.cursor.col, self.cursor.row) =
+        // A pending wrap keeps the cursor parked on the last column while it
+        // logically belongs one past it. Hand the buffer that logical column so
+        // reflow maps it exactly as the old `col == cols` sentinel did (it
+        // matters when a wrapped-line boundary precedes the cursor); the
+        // reflowed cursor is always clamped back inside the grid, and the
+        // deferred wrap is dropped.
+        let logical_col = self.cursor.col + usize::from(self.pending_wrap);
+        self.pending_wrap = false;
+        let (new_col, new_row) =
             self.buffer
-                .resize(self.cols, self.rows, (self.cursor.col, self.cursor.row));
+                .resize(self.cols, self.rows, (logical_col, self.cursor.row));
+        // A dimensions-unchanged reflow (e.g. a buffer switch) returns the column
+        // verbatim, so clamp the logical `col + 1` back onto the grid; real
+        // reflows are already clamped by `relative_position`.
+        self.cursor.col = new_col.min(self.cols - 1);
+        self.cursor.row = new_row;
 
         self.dirty_lines.resize(self.rows);
         self.dirty_lines.extend(0..self.rows);
@@ -1049,6 +1082,7 @@ impl Terminal {
         self.left_margin = 0;
         self.right_margin = self.cols - 1;
         self.left_right_margin_mode = false;
+        self.pending_wrap = false;
         self.insert_mode = false;
         self.origin_mode = false;
         self.pen = Pen::default();
@@ -1085,6 +1119,7 @@ impl Terminal {
         self.left_margin = 0;
         self.right_margin = self.cols - 1;
         self.left_right_margin_mode = false;
+        self.pending_wrap = false;
         self.saved_ctx = SavedCtx::default();
         self.alternate_saved_ctx = SavedCtx::default();
         self.dirty_lines = DirtyLines::new(self.rows);
@@ -1182,6 +1217,8 @@ impl Terminal {
             AltScreenBuffer | SaveCursorAltScreenBuffer => {
                 self.active_buffer_type == BufferType::Alternate
             }
+            // DECLRMM lives in its own field, not the tracked-modes set.
+            LeftRightMargin => self.left_right_margin_mode,
             // 1048 is a save/restore action, not a queryable state.
             SaveCursor => return None,
             m => self.tracked_modes.contains(&m),
@@ -1279,6 +1316,7 @@ impl Terminal {
         assert_eq!(self.left_margin, other.left_margin);
         assert_eq!(self.right_margin, other.right_margin);
         assert_eq!(self.left_right_margin_mode, other.left_right_margin_mode);
+        assert_eq!(self.pending_wrap, other.pending_wrap);
         assert_eq!(self.saved_ctx, other.saved_ctx);
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
         assert_eq!(self.tracked_modes, other.tracked_modes);
@@ -1297,6 +1335,31 @@ impl Terminal {
         }
     }
 
+    /// The rightmost column a printed glyph may occupy before autowrap fires.
+    /// Inside a left/right-margin box (DECLRMM) text wraps at the right margin,
+    /// but only while the cursor is within the box; outside it (or with no
+    /// margins) it wraps at the last screen column. Gated on DECLRMM alone, not
+    /// origin mode — mirrors the raw-`left_margin` autowrap note on
+    /// [`Self::actual_left_margin`].
+    fn print_right_edge(&self) -> usize {
+        if self.left_right_margin_mode && self.cursor.col <= self.right_margin {
+            self.right_margin
+        } else {
+            self.cols - 1
+        }
+    }
+
+    /// The column a wrapped line restarts at: the left margin when the cursor is
+    /// parked at the right margin (an in-box wrap), otherwise column 0. Paired
+    /// with [`Self::print_right_edge`].
+    fn wrap_left_edge(&self) -> usize {
+        if self.left_right_margin_mode && self.cursor.col == self.right_margin {
+            self.left_margin
+        } else {
+            0
+        }
+    }
+
     fn print(&mut self, mut ch: char) {
         ch = self.charsets[self.active_charset].translate(ch);
 
@@ -1311,6 +1374,17 @@ impl Terminal {
         }
         self.in_placeholder_run = ch == PLACEHOLDER;
 
+        // A glyph filling the right edge parks the cursor there with a deferred
+        // wrap (the DEC "last column flag"); the next *printing* glyph performs
+        // it. Zero-width combining marks attach to the parked cell and neither
+        // consume nor trigger the wrap.
+        if self.pending_wrap && ch.width().unwrap_or(0) > 0 {
+            if self.auto_wrap_mode {
+                self.wrap_line();
+            }
+            self.pending_wrap = false;
+        }
+
         match self.try_print(ch) {
             PrintResult::Printed(width) => self.advance_cursor_after_print(width),
             PrintResult::NeedsRelocation if self.auto_wrap_mode => {
@@ -1323,7 +1397,11 @@ impl Terminal {
     }
 
     fn try_print(&mut self, ch: char) -> PrintResult {
-        if self.cursor.col >= self.cols {
+        // A glyph that would spill past the right edge of the print area (a wide
+        // glyph at the last usable column) must relocate rather than cross a
+        // right margin or the screen edge. Zero-width marks never relocate.
+        let width = ch.width().unwrap_or(0);
+        if width > 0 && self.cursor.col + width > self.print_right_edge() + 1 {
             return PrintResult::NeedsRelocation;
         }
 
@@ -1342,14 +1420,23 @@ impl Terminal {
     }
 
     fn advance_cursor_after_print(&mut self, width: usize) {
+        let edge = self.print_right_edge();
         self.cursor.col += width;
 
-        if self.cursor.col == self.cols && !self.auto_wrap_mode {
-            self.cursor.col = self.cols - 1;
+        if self.cursor.col > edge {
+            // Filled the edge column: park there and defer the wrap. With
+            // autowrap off we stay put and the next glyph overprints the edge.
+            self.cursor.col = edge;
+            self.pending_wrap = self.auto_wrap_mode;
         }
     }
 
-    fn wrap_and_print_at_line_start(&mut self, ch: char) {
+    /// Move to the start of the next line for an autowrap, scrolling the region
+    /// if parked on the bottom margin. Lands at the left margin for an in-box
+    /// wrap, else column 0.
+    fn wrap_line(&mut self) {
+        let left = self.wrap_left_edge();
+
         if self.cursor.row == self.bottom_margin {
             self.buffer.wrap(self.cursor.row);
             self.scroll_up_in_region(1);
@@ -1358,18 +1445,34 @@ impl Terminal {
             self.cursor.row += 1;
         }
 
-        if let Some(width) = self.buffer.print((0, self.cursor.row), ch, self.pen) {
-            self.cursor.col = width;
-        } else {
-            self.cursor.col = 0;
+        self.cursor.col = left;
+    }
+
+    fn wrap_and_print_at_line_start(&mut self, ch: char) {
+        self.wrap_line();
+
+        let col = self.cursor.col;
+        if let Some(width) = self.buffer.print((col, self.cursor.row), ch, self.pen) {
+            self.cursor.col = col + width;
+
+            let edge = self.print_right_edge();
+            if self.cursor.col > edge {
+                self.cursor.col = edge;
+                self.pending_wrap = self.auto_wrap_mode;
+            }
         }
+        // Otherwise the glyph won't fit even at the line start (a box narrower
+        // than the glyph); drop it and leave the cursor at the left edge.
     }
 
     fn print_at_line_end(&mut self, ch: char) {
         let row = self.cursor.row;
+        let edge = self.print_right_edge();
 
-        if self.cursor.col > 0 {
-            let col = self.cursor.col - 1;
+        // Autowrap is off and the (wide) glyph can't cross the edge: overprint it
+        // at the edge, backing up one more cell if it needs two.
+        if edge > 0 {
+            let col = edge - 1;
             let printed = self.buffer.print((col, row), ch, self.pen).is_some();
 
             if !printed && col > 0 {
@@ -1377,15 +1480,14 @@ impl Terminal {
             }
         }
 
-        self.cursor.col = self.cols - 1;
+        self.cursor.col = edge;
+        self.pending_wrap = false;
     }
 
     fn bs(&mut self) {
-        if self.cursor.col == self.cols {
-            self.move_cursor_to_rel_col(-2);
-        } else {
-            self.move_cursor_to_rel_col(-1);
-        }
+        // The cursor is parked at the edge (never past it), so a single step back
+        // is always right; `move_cursor_to_rel_col` clears any pending wrap.
+        self.move_cursor_to_rel_col(-1);
     }
 
     fn ht(&mut self) {
@@ -1393,15 +1495,24 @@ impl Terminal {
     }
 
     fn lf(&mut self) {
+        self.pending_wrap = false;
         self.move_cursor_down_with_scroll();
 
         if self.new_line_mode {
-            self.cursor.col = 0;
+            // LNM: a line feed also returns to the line start (left-margin aware).
+            self.cr();
         }
     }
 
     fn cr(&mut self) {
-        self.cursor.col = 0;
+        // Carriage return goes to the left margin when the cursor is at or right
+        // of it (keeping text inside the box), otherwise to column 0.
+        self.cursor.col = if self.left_right_margin_mode && self.cursor.col >= self.left_margin {
+            self.left_margin
+        } else {
+            0
+        };
+        self.pending_wrap = false;
     }
 
     fn so(&mut self) {
@@ -1414,7 +1525,9 @@ impl Terminal {
 
     fn nel(&mut self) {
         self.move_cursor_down_with_scroll();
-        self.cursor.col = 0;
+        // NEL is index + carriage return; reuse the left-margin-aware CR (which
+        // also clears any pending wrap).
+        self.cr();
     }
 
     fn hts(&mut self) {
@@ -1422,6 +1535,7 @@ impl Terminal {
     }
 
     fn ri(&mut self) {
+        self.pending_wrap = false;
         if self.cursor.row == self.top_margin {
             self.scroll_down_in_region(1);
         } else if self.cursor.row > 0 {
@@ -1460,9 +1574,7 @@ impl Terminal {
     }
 
     fn ich(&mut self, n: u16) {
-        if self.cursor.col == self.cols {
-            self.cursor.col = self.cols - 1;
-        }
+        self.pending_wrap = false;
 
         let n = as_usize(n, 1).min(self.cols - self.cursor.col);
 
@@ -1489,13 +1601,9 @@ impl Terminal {
     }
 
     fn cub(&mut self, n: u16) {
-        let mut rel_col = -(as_usize(n, 1) as isize);
-
-        if self.cursor.col == self.cols {
-            rel_col -= 1;
-        }
-
-        self.move_cursor_to_rel_col(rel_col);
+        // The cursor is parked at the edge (never past it), so no extra step is
+        // needed; `move_cursor_to_rel_col` clears any pending wrap.
+        self.move_cursor_to_rel_col(-(as_usize(n, 1) as isize));
     }
 
     fn cnl(&mut self, n: u16) {
@@ -1618,9 +1726,7 @@ impl Terminal {
     }
 
     fn dch(&mut self, n: u16) {
-        if self.cursor.col >= self.cols {
-            self.do_move_cursor_to_col(self.cols - 1);
-        }
+        self.pending_wrap = false;
 
         self.buffer.delete(
             (self.cursor.col, self.cursor.row),
@@ -2199,17 +2305,19 @@ impl Terminal {
             funs.push(Function::Cup(as_u16(row + 1), as_u16(col + 1)));
         }
 
-        if self.cursor.col >= self.cols {
-            // move cursor past the right border by re-printing the character in
-            // the last column
-            let last_cell = self.buffer[(self.cols - 1, self.cursor.row)];
+        if self.pending_wrap {
+            // Re-arm the deferred right-edge wrap: re-print the glyph in the edge
+            // column, which parks the cursor back at the edge with the wrap
+            // pending. The cursor is parked exactly at that edge column.
+            let edge = self.cursor.col;
+            let last_cell = self.buffer[(edge, self.cursor.row)];
             let occupancy = last_cell.occupancy();
 
             if occupancy == Occupancy::Single {
                 funs.push(to_sgr(last_cell.pen()));
                 funs.push(Function::Print(last_cell.char()));
-            } else if occupancy == Occupancy::WideTail {
-                let prev_cell = self.buffer[(self.cols - 2, self.cursor.row)];
+            } else if occupancy == Occupancy::WideTail && edge > 0 {
+                let prev_cell = self.buffer[(edge - 1, self.cursor.row)];
 
                 funs.push(Function::Cub(1));
                 funs.push(to_sgr(prev_cell.pen()));
@@ -2941,7 +3049,9 @@ mod tests {
 
         term.execute(Print('a'));
 
-        assert_eq!(text(&term), "   a|");
+        // Filling the last column parks the cursor on it (wrap pending), so the
+        // cursor marker sits on the 'a' rather than past it.
+        assert_eq!(text(&term), "   |a");
 
         term.execute(Cuf(5));
 
@@ -3545,8 +3655,10 @@ mod tests {
         term.execute(Cub(1));
         term.execute(Print('界'));
 
-        assert_eq!(term.cursor(), (4, 0));
-        assert_eq!(text(&term), "A 界|\n");
+        // 界 fills the last two columns and parks the cursor on the last one with
+        // the wrap deferred (rather than advancing past the edge).
+        assert_eq!(term.cursor(), (3, 0));
+        assert_eq!(text(&term), "A |界\n");
         assert_eq!(wrapped(&term), vec![false, false]);
 
         let row0 = term.view().next().unwrap();
@@ -3862,7 +3974,9 @@ mod tests {
 
         feed(&mut term, "BBBBB");
 
-        assert_eq!(term.cursor(), (8, 3));
+        // "AAABBBBB" fills the 8-col row; the cursor parks on the last column
+        // (wrap deferred) rather than one past the edge.
+        assert_eq!(term.cursor(), (7, 3));
 
         term.resize(4, 5);
 
@@ -4127,12 +4241,15 @@ mod tests {
         assert_eq!(text(&term), "\n  |\n");
 
         feed(&mut term, "xy");
-        assert_eq!(text(&term), "\n  xy|\n");
+        // "xy" fills the 4-col line; the cursor parks on the last column with a
+        // pending wrap, so the marker sits on the 'y'.
+        assert_eq!(text(&term), "\n  x|y\n");
 
         term.execute(Decrst(dec_modes([DecMode::AltScreenBuffer])));
 
         assert_eq!(term.active_buffer_type(), BufferType::Primary);
-        assert_eq!(text(&term), "ab\ncd  |\n");
+        // The shared cursor carries back parked at column 3 (not past the edge).
+        assert_eq!(text(&term), "ab\ncd |\n");
     }
 
     #[test]
