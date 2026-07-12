@@ -1110,6 +1110,16 @@ impl TerminalModel {
                     d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
                 )
             };
+            // A program can resize the emulator from within the feed (DECCOLM
+            // 80↔132). In the GUI the window owns the grid size, so snap the screen
+            // back to it: DECCOLM's clear/home/margin-reset still land, but the
+            // column count follows the window rather than the program (following it
+            // with a real window resize is a possible future enhancement). Force a
+            // full repaint since the reflow invalidates every cell coordinate.
+            if self.screen.dimensions() != (self.cols, self.rows) {
+                self.screen.resize(self.cols, self.rows);
+                self.view_slid = true;
+            }
             // Keep a scrolled-up view pinned to its content: advance the offset by
             // the GROSS lines that scrolled off the top this feed. That count
             // survives scrollback trimming (unlike the net scrollback_len delta,
@@ -2169,6 +2179,26 @@ mod tests {
         });
         let a = m.ime_cursor_area().unwrap();
         assert_eq!((a.w, a.h), (18.0, 36.0));
+    }
+
+    #[test]
+    fn deccolm_in_the_gui_snaps_the_grid_back_to_the_window_size() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        let before = m.cols;
+        // An app enables 80↔132 switching and requests 132-column mode. In the GUI
+        // the window owns the grid size, so the screen must snap back to it.
+        feed(&mut m, b"\x1b[?40h\x1b[?3h");
+        assert_eq!(
+            m.screen.dimensions(),
+            (m.cols, m.rows),
+            "screen stays synced to the window grid"
+        );
+        assert_eq!(m.cols, before, "DECCOLM did not change the GUI grid width");
     }
 
     #[test]
