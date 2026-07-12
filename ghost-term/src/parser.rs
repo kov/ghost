@@ -173,6 +173,7 @@ pub enum DecMode {
     Origin = 6,            // DECOM
     AutoWrap = 7,          // DECAWM
     TextCursorEnable = 25, // DECTCEM
+    ReverseWrap = 45,      // reverse-wraparound (xterm ?45; needs DECAWM)
     LeftRightMargin = 69,  // DECLRMM — enables DECSLRM left/right margins
     // Non-display modes: tracked but not rendered, so a state dump can restore
     // them on reattach. They affect what the terminal *sends*, not the grid.
@@ -1376,6 +1377,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    ReverseWrap => 45,
                     LeftRightMargin => 69,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
@@ -1406,6 +1408,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                     Origin => 6,
                     AutoWrap => 7,
                     TextCursorEnable => 25,
+                    ReverseWrap => 45,
                     LeftRightMargin => 69,
                     MouseReportX11 => 1000,
                     MouseReportButton => 1002,
@@ -1980,6 +1983,7 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         6 => Some(Origin),
         7 => Some(AutoWrap),
         25 => Some(TextCursorEnable),
+        45 => Some(ReverseWrap),
         69 => Some(LeftRightMargin),
         47 => Some(AltScreenBuffer), // legacy variant of 1047
         1000 => Some(MouseReportX11),
@@ -2374,6 +2378,14 @@ mod tests {
         // DEC private modes.
         assert_eq!(parse("\x1b[?7h"), [Decset(dec_modes([DecMode::AutoWrap]))]);
         assert_eq!(parse("\u{9b}?7h"), [Decset(dec_modes([DecMode::AutoWrap]))]);
+        assert_eq!(
+            parse("\x1b[?45h"),
+            [Decset(dec_modes([DecMode::ReverseWrap]))]
+        );
+        assert_eq!(
+            parse("\x1b[?45l"),
+            [Decrst(dec_modes([DecMode::ReverseWrap]))]
+        );
         assert_eq!(
             parse("\x1b[?6;1047h"),
             [Decset(dec_modes([

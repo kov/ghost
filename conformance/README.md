@@ -141,10 +141,22 @@ inflated pass counts — don't repeat that.)
        the params (ECMA-48 order), where a private-marker prefix (`<=>?`) still
        leads — the old order emitted `CSI ' Pn }`, which re-parses to nothing.
        `DECIC`/`DECDC` families 14/0.
-  - Also still open (independent of the slices): CUF/CUB stopping at the
-     left/right margin, and reverse-wraparound (`DECSET ?45`, `ReverseWrapInline`)
-     for BS/CUB across wrapped lines. DECRQSS/DECSCL reporting of DECSLRM (the
-     status-string and conformance-level replies) is a separate, still-open gap.
+  5. margin-aware cursor moves (independent follow-ups to the box slices):
+     - ✅ 5a: CUF/CUB (and BS) stop at the left/right margin when the cursor starts
+       on the inside of it, but run to the screen edge when it starts outside
+       (folded into the shared `move_cursor_to_rel_col`). `CUF`/`CUB` families 10/0.
+     - ✅ 5b: reverse-wraparound (`DECSET ?45`, needs DECAWM) — a leftward BS/CUB at
+       the left edge wraps up to the right margin of the row above, wrapping around
+       from the top of the scroll region to its bottom (`move_cursor_back_wrapping`);
+       a pending wrap is consumed in place. DECSTR clears `?45` (esctest relies on
+       that). `BS`/`CUB`/`CUF` 26/1 — the one fail, `test_BS_InitialReverseWraparound`,
+       wants BS *not* to wrap after a NEL onto a non-continuation line, which on a
+       blank screen is provably mutually exclusive with `test_BS_WrapsInWraparoundMode`
+       (both start at column 0 of a non-wrapped row, one must wrap and one must not);
+       we pass the latter (and the multi-row counting tests), leaving the NEL nuance
+       as the one known gap.
+  - Still open: DECRQSS/DECSCL reporting of DECSLRM (the status-string and
+     conformance-level replies) is a separate gap.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

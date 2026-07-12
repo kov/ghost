@@ -895,6 +895,115 @@ mod tests {
     }
 
     #[test]
+    fn reverse_wrap_wraps_to_the_previous_rows_right_edge() {
+        // esctest test_BS_WrapsInWraparoundMode: with ?7 + ?45, a backspace at the
+        // left edge wraps up to the last column of the row above.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h"); // DECAWM + reverse-wrap
+        vt.feed_str("\x1b[3;1H"); // row 2, col 0
+        vt.feed_str("\x08"); // BS
+        assert_eq!((vt.cursor().col, vt.cursor().row), (79, 1));
+    }
+
+    #[test]
+    fn reverse_wrap_requires_both_decawm_and_mode_45() {
+        // test_BS_ReverseWrapRequiresDECAWM / test_BS_NoWrapByDefault: neither mode
+        // alone wraps.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7l\x1b[?45h"); // reverse-wrap on, DECAWM off
+        vt.feed_str("\x1b[3;1H\x08");
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (0, 2),
+            "no wrap without DECAWM"
+        );
+
+        vt.feed_str("\x1b[?7h\x1b[?45l"); // DECAWM on, reverse-wrap off
+        vt.feed_str("\x1b[3;1H\x08");
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (0, 2),
+            "no wrap without ?45"
+        );
+    }
+
+    #[test]
+    fn reverse_wrap_lands_on_the_right_margin_inside_a_box() {
+        // test_BS_ReverseWrapWithLeftRight: from the left margin, wrap to the right
+        // margin of the row above.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h\x1b[?69h\x1b[5;10s"); // box cols 4..=9
+        vt.feed_str("\x1b[3;5H"); // absolute col 4 (the left margin), row 2
+        vt.feed_str("\x08");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (9, 1));
+    }
+
+    #[test]
+    fn reverse_wrap_from_left_of_the_box_lands_on_the_right_margin() {
+        // test_BS_ReversewrapFromLeftEdgeToRightMargin: begun at the screen's left
+        // edge (left of the left margin), a backspace still wraps to the right
+        // margin of the row above.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h\x1b[?69h\x1b[5;10s");
+        vt.feed_str("\x1b[3;1H"); // absolute col 0, left of the box
+        vt.feed_str("\x08");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (9, 1));
+    }
+
+    #[test]
+    fn reverse_wrap_wraps_around_the_top_of_the_scroll_region() {
+        // test_BS_ReverseWrapGoesToBottom: at the top margin, a reverse wrap lands
+        // on the bottom margin, staying inside the vertical region.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h\x1b[2;5r"); // DECSTBM rows 1..=4 (0-based)
+        vt.feed_str("\x1b[2;1H"); // row 1 (top margin), col 0
+        vt.feed_str("\x08");
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (79, 4),
+            "top margin wraps to bottom"
+        );
+    }
+
+    #[test]
+    fn reverse_wrap_counts_across_several_rows() {
+        // esctest test_CUB_AfterNoWrappedInlines geometry: 160 backspaces from
+        // (col4,row4) on an 80-wide screen walk back two full rows to (col4,row2).
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h");
+        vt.feed_str("\x1b[5;5H"); // row 4, col 4
+        vt.feed_str("\x1b[160D"); // CUB 160
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 2));
+    }
+
+    #[test]
+    fn reverse_wrap_from_a_pending_wrap_stays_on_the_edge_column() {
+        // esctest test_BS_ReverseWrapStartingInDoWrapPosition: after filling the
+        // last column the cursor is in a pending wrap; under reverse-wrap the next
+        // backspace cancels the pending wrap in place (lands on the last column)
+        // rather than stepping left, so the following glyph overwrites the last one.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h");
+        vt.feed_str("\x1b[1;79H"); // col 78, row 0
+        vt.feed_str("ab"); // 'a'@78, 'b'@79, then pending wrap
+        vt.feed_str("\x08"); // BS: cancels the pending wrap, stays on col 79
+        assert_eq!((vt.cursor().col, vt.cursor().row), (79, 0));
+        vt.feed_str("X"); // overwrites 'b'
+        let row = row_cells(&vt, 0, 80);
+        assert_eq!(&row[78..80], "aX", "'a' kept, 'X' overwrote 'b'");
+    }
+
+    #[test]
+    fn decrqm_reports_reverse_wrap_mode_state() {
+        let mut vt = Vt::new(80, 25);
+        assert_eq!(vt.dec_mode_state(45), Some(false), "?45 starts reset");
+        vt.feed_str("\x1b[?45h");
+        assert_eq!(vt.dec_mode_state(45), Some(true), "?45 reported set");
+        vt.feed_str("\x1b[?45l");
+        assert_eq!(vt.dec_mode_state(45), Some(false), "?45 reported reset");
+    }
+
+    #[test]
     fn rect_checksum_matches_xterm_decrqcra() {
         let mut vt = Vt::new(10, 2);
         vt.feed_str("A B"); // row 0: 'A', ' ', 'B', then blanks

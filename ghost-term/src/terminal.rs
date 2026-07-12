@@ -45,6 +45,10 @@ pub struct Terminal {
     insert_mode: bool,
     origin_mode: bool,
     auto_wrap_mode: bool,
+    /// Reverse-wraparound (xterm `?45`): a backspace/CUB at the left edge wraps up
+    /// to the right margin of the previous row instead of stopping. Only active
+    /// together with `auto_wrap_mode` (DECAWM).
+    reverse_wrap_mode: bool,
     new_line_mode: bool,
     cursor_keys_mode: CursorKeysMode,
     /// xterm modifyOtherKeys level (XTMODKEYS resource 4): 0 off, 1, 2. Drives
@@ -203,6 +207,7 @@ impl Terminal {
             insert_mode: false,
             origin_mode: false,
             auto_wrap_mode: true,
+            reverse_wrap_mode: false,
             new_line_mode: false,
             cursor_keys_mode: CursorKeysMode::Normal,
             modify_other_keys: 0,
@@ -836,6 +841,13 @@ impl Terminal {
     }
 
     fn move_cursor_to_rel_col(&mut self, rel_col: isize) {
+        // A leftward move with reverse-wraparound (?45 + DECAWM) doesn't stop at the
+        // left edge — it wraps up to the right margin of the previous row.
+        if rel_col < 0 && self.reverse_wrap_mode && self.auto_wrap_mode {
+            self.move_cursor_back_wrapping((-rel_col) as usize);
+            return;
+        }
+
         // Relative moves (CUF/CUB/BS) stop at the left/right margin when the cursor
         // starts on the inside of it, but run to the screen edge when it starts
         // outside — a cursor left of the left margin backs up to column 0, one right
@@ -854,6 +866,53 @@ impl Terminal {
         let new_col = (self.cursor.col as isize + rel_col).clamp(lower as isize, upper as isize);
         self.cursor.col = new_col as usize;
         self.pending_wrap = false;
+    }
+
+    /// Move the cursor left by `n` with reverse-wraparound: within a row it steps
+    /// toward the left margin, and a step from the left margin wraps to the right
+    /// margin of the row above — wrapping around from the top of the scroll region
+    /// to its bottom. The traversed band is `[left_margin..=right_margin]`; columns
+    /// left of the left margin (when the cursor starts there) are stepped through
+    /// down to column 0 before the first wrap.
+    fn move_cursor_back_wrapping(&mut self, mut n: usize) {
+        // A pending wrap means the cursor sits half a step right of its column (at
+        // the right edge, about to wrap forward). Under reverse-wrap the first step
+        // back just cancels that, landing on the edge column without moving — unlike
+        // a plain backspace, which clears the pending wrap and still steps left.
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            n -= 1;
+        }
+        let left = self.left_margin;
+        let right = self.right_margin;
+        let top = self.top_margin;
+        let bottom = self.bottom_margin;
+
+        while n > 0 {
+            // The near-left bound is the left margin when the cursor is inside the
+            // box, else column 0 (when it started left of the left margin).
+            let near_left = if self.cursor.col >= left { left } else { 0 };
+
+            if self.cursor.col > near_left {
+                let step = n.min(self.cursor.col - near_left);
+                self.cursor.col -= step;
+                n -= step;
+                continue;
+            }
+
+            // At the left edge: wrap up one row (top of region wraps to bottom) and
+            // land on the right margin. This one move consumes a single step.
+            self.cursor.row = if self.cursor.row == top {
+                bottom
+            } else if self.cursor.row > 0 {
+                self.cursor.row - 1
+            } else {
+                // Above the top margin with nowhere higher to go: stop.
+                break;
+            };
+            self.cursor.col = right;
+            n -= 1;
+        }
     }
 
     fn move_cursor_home(&mut self) {
@@ -1137,6 +1196,9 @@ impl Terminal {
         self.pending_wrap = false;
         self.insert_mode = false;
         self.origin_mode = false;
+        // DECSTR clears reverse-wraparound (?45); xterm relies on this, so
+        // esctest's per-test reset does too.
+        self.reverse_wrap_mode = false;
         self.pen = Pen::default();
         self.charsets = [Charset::Ascii, Charset::Ascii];
         self.active_charset = 0;
@@ -1159,6 +1221,7 @@ impl Terminal {
         self.insert_mode = false;
         self.origin_mode = false;
         self.auto_wrap_mode = true;
+        self.reverse_wrap_mode = false;
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
         self.modify_other_keys = 0;
@@ -1265,6 +1328,7 @@ impl Terminal {
             CursorKeys => self.cursor_keys_mode == CursorKeysMode::Application,
             Origin => self.origin_mode,
             AutoWrap => self.auto_wrap_mode,
+            ReverseWrap => self.reverse_wrap_mode,
             TextCursorEnable => self.cursor.visible,
             AltScreenBuffer | SaveCursorAltScreenBuffer => {
                 self.active_buffer_type == BufferType::Alternate
@@ -1357,6 +1421,7 @@ impl Terminal {
         assert_eq!(self.insert_mode, other.insert_mode);
         assert_eq!(self.origin_mode, other.origin_mode);
         assert_eq!(self.auto_wrap_mode, other.auto_wrap_mode);
+        assert_eq!(self.reverse_wrap_mode, other.reverse_wrap_mode);
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
         assert_eq!(self.modify_other_keys, other.modify_other_keys);
@@ -2108,6 +2173,10 @@ impl Terminal {
                     self.auto_wrap_mode = true;
                 }
 
+                ReverseWrap => {
+                    self.reverse_wrap_mode = true;
+                }
+
                 TextCursorEnable => {
                     self.cursor.visible = true;
                 }
@@ -2159,6 +2228,10 @@ impl Terminal {
 
                 AutoWrap => {
                     self.auto_wrap_mode = false;
+                }
+
+                ReverseWrap => {
+                    self.reverse_wrap_mode = false;
                 }
 
                 TextCursorEnable => {
@@ -2495,6 +2568,12 @@ impl Terminal {
         if !self.auto_wrap_mode {
             // disable auto-wrap mode
             funs.push(Function::Decrst(DecModes::one(DecMode::AutoWrap)));
+        }
+
+        // 12b. setup reverse-wraparound mode (off by default, so emit when on)
+
+        if self.reverse_wrap_mode {
+            funs.push(Function::Decset(DecModes::one(DecMode::ReverseWrap)));
         }
 
         // 13. setup new line mode
