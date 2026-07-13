@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::{Index, IndexMut, Range};
 
-use crate::cell::Cell;
+use crate::cell::{Cell, Occupancy};
 use crate::line::Line;
 use crate::pen::{Pen, Protection};
 
@@ -179,6 +179,68 @@ impl Buffer {
     ) {
         for row in rows {
             self[row].delete_within(col, n, end, pen);
+        }
+    }
+
+    /// DECFRA — write `ch` (under `pen`) into every cell of the `rows` × `cols`
+    /// rectangle, sparing what `guard` protects. `ch` is always narrow (DEC limits
+    /// the fill character to Latin-1), so no wide pair is ever created; wide glyphs
+    /// already straddling an edge are mended by [`Line::fill`].
+    pub fn fill_rect(
+        &mut self,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        ch: char,
+        pen: &Pen,
+        guard: EraseGuard,
+    ) {
+        let cell = Cell::new(ch, Occupancy::Single, pen.without_link());
+        for row in rows {
+            self[row].fill(cols.clone(), cell, pen, guard);
+        }
+    }
+
+    /// DECCRA — copy the `height` × `width` rectangle at `src` to `dest`. The two
+    /// may overlap: every source row is snapshotted before any destination row is
+    /// written, so the copy always reads the rectangle as it was.
+    ///
+    /// A wide glyph the source rectangle cuts in half travels as a blank (its
+    /// other half stays behind), and one the destination cuts is mended there —
+    /// the same edge discipline as the boxed scroll.
+    pub fn copy_rect(
+        &mut self,
+        src: VisualPosition,
+        dest: VisualPosition,
+        (width, height): (usize, usize),
+        pen: &Pen,
+    ) {
+        let (src_col, src_row) = src;
+        let (dest_col, dest_row) = dest;
+
+        let mut rect: Vec<Vec<Cell>> = Vec::with_capacity(height);
+        for row in src_row..src_row + height {
+            let mut cells = self[row].cells()[src_col..src_col + width].to_vec();
+            // A wide pair split by the rectangle's edge can't travel whole: blank
+            // the half that's inside it. (The half left behind is untouched — the
+            // source is read-only.)
+            if let Some(first) = cells.first_mut() {
+                if first.occupancy() == Occupancy::WideTail {
+                    first.set(' ', Occupancy::Single, *pen);
+                }
+            }
+            if let Some(last) = cells.last_mut() {
+                if last.occupancy() == Occupancy::WideHead {
+                    last.set(' ', Occupancy::Single, *pen);
+                }
+            }
+            rect.push(cells);
+        }
+
+        for (i, cells) in rect.into_iter().enumerate() {
+            let line = &mut self[dest_row + i];
+            line.split_wide_at(dest_col, pen);
+            line.split_wide_at(dest_col + width, pen);
+            line.write_cols(dest_col..dest_col + width, &cells);
         }
     }
 

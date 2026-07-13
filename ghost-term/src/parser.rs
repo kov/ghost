@@ -97,6 +97,18 @@ pub enum Function {
     /// sparing DEC-protected cells. Coordinates are 1-based inclusive
     /// (origin-mode relative), and the erase ignores the scroll margins.
     Decsera(u16, u16, u16, u16),
+    /// DECERA `CSI Pt ; Pl ; Pb ; Pr $ z` — erase a rectangle. The non-selective
+    /// twin of [`Decsera`]: it clears DEC-protected cells too. Same coordinates.
+    Decera(u16, u16, u16, u16),
+    /// DECFRA `CSI Pch ; Pt ; Pl ; Pb ; Pr $ x` — fill a rectangle with the
+    /// character whose code is `Pch` (32..126 or 160..255; anything else is
+    /// ignored), under the current pen. Same coordinates as [`Decera`].
+    Decfra(u16, u16, u16, u16, u16),
+    /// DECCRA `CSI Pts;Pls;Pbs;Prs;Pps;Ptd;Pld;Ppd $ v` — copy the source
+    /// rectangle to the destination's top-left corner, source and destination
+    /// free to overlap. Coordinates as [`Decera`]; the two page params are
+    /// ignored (ghost has a single page).
+    Deccra([u16; 8]),
     Decstr,
     Dl(u16),
     Ech(u16),
@@ -1077,6 +1089,36 @@ impl Parser {
                 ps[3].as_u16(),
             )),
 
+            // DECERA: `CSI Pt;Pl;Pb;Pr $ z` — erase rectangle.
+            (Some('$'), 'z') => Some(Decera(
+                ps[0].as_u16(),
+                ps[1].as_u16(),
+                ps[2].as_u16(),
+                ps[3].as_u16(),
+            )),
+
+            // DECFRA: `CSI Pch;Pt;Pl;Pb;Pr $ x` — fill rectangle with `Pch`.
+            (Some('$'), 'x') => Some(Decfra(
+                ps[0].as_u16(),
+                ps[1].as_u16(),
+                ps[2].as_u16(),
+                ps[3].as_u16(),
+                ps[4].as_u16(),
+            )),
+
+            // DECCRA: `CSI Pts;Pls;Pbs;Prs;Pps;Ptd;Pld;Ppd $ v` — copy rectangle.
+            // The page params are parsed and ignored: ghost has a single page.
+            (Some('$'), 'v') => Some(Deccra([
+                ps[0].as_u16(),
+                ps[1].as_u16(),
+                ps[2].as_u16(),
+                ps[3].as_u16(),
+                ps[4].as_u16(),
+                ps[5].as_u16(),
+                ps[6].as_u16(),
+                ps[7].as_u16(),
+            ])),
+
             // DECIC / DECDC: `CSI Pn ' }` / `CSI Pn ' ~` (intermediate `'`).
             (Some('\''), '}') => Some(Decic(ps[0].as_u16())),
 
@@ -1525,6 +1567,33 @@ fn dump_function(seq: &mut String, fun: &Function) {
             ],
             '{',
         ),
+
+        Decera(pt, pl, pb, pr) => push_csi(
+            seq,
+            Some('$'),
+            &[
+                pt.to_string(),
+                pl.to_string(),
+                pb.to_string(),
+                pr.to_string(),
+            ],
+            'z',
+        ),
+
+        Decfra(pch, pt, pl, pb, pr) => push_csi(
+            seq,
+            Some('$'),
+            &[
+                pch.to_string(),
+                pt.to_string(),
+                pl.to_string(),
+                pb.to_string(),
+                pr.to_string(),
+            ],
+            'x',
+        ),
+
+        Deccra(ps) => push_csi(seq, Some('$'), &ps.map(|p| p.to_string()), 'v'),
 
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
         Dl(n) => push_csi(seq, None, &[n.to_string()], 'M'),
@@ -2482,6 +2551,12 @@ mod tests {
         assert_eq!(parse("\x1b[\"q"), [Decsca(0)]);
         assert_eq!(parse("\x1b[1\"q"), [Decsca(1)]);
         assert_eq!(parse("\x1b[2;3;5;7${"), [Decsera(2, 3, 5, 7)]);
+        assert_eq!(parse("\x1b[2;3;5;7$z"), [Decera(2, 3, 5, 7)]);
+        assert_eq!(parse("\x1b[37;2;3;5;7$x"), [Decfra(37, 2, 3, 5, 7)]);
+        assert_eq!(
+            parse("\x1b[2;3;5;7;1;9;9;1$v"),
+            [Deccra([2, 3, 5, 7, 1, 9, 9, 1])]
+        );
         assert_eq!(parse("\x1bV"), [Spa]);
         assert_eq!(parse("\x1bW"), [Epa]);
         assert_eq!(parse("\u{96}"), [Spa]);
@@ -2977,6 +3052,9 @@ mod tests {
             Decsca(0),
             Decsca(1),
             Decsera(2, 3, 5, 7),
+            Decera(2, 3, 5, 7),
+            Decfra(37, 2, 3, 5, 7),
+            Deccra([2, 3, 5, 7, 1, 9, 9, 1]),
             Decstbm(2, 5),
             Decstr,
             Dl(17),

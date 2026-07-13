@@ -157,6 +157,17 @@ pub struct Terminal {
 /// first to leave retained scrollback).
 const MAX_PROMPT_MARKS: usize = 1024;
 
+/// A resolved rectangle for the VT420 rect ops (DECERA/DECFRA/DECSERA/DECCRA):
+/// absolute 0-based bounds, inclusive on all four sides. See
+/// [`Terminal::rect_bounds`], which is the only thing that builds one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct Rect {
+    top: usize,
+    left: usize,
+    bottom: usize,
+    right: usize,
+}
+
 /// The selection an OSC 52 write targets (xterm's `Pc`: `c` = clipboard,
 /// `p` = primary; `s` is treated as the clipboard).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -607,8 +618,22 @@ impl Terminal {
             Spa => self.pen.set_protection(Protection::Iso),
             Epa => self.pen.set_protection(Protection::None),
 
+            // The three rectangle erases differ only in what they spare (see
+            // `EraseGuard`): DECSERA keeps DEC-protected cells, DECERA doesn't.
             Decsera(pt, pl, pb, pr) => {
-                self.decsera(pt, pl, pb, pr);
+                self.erase_rect(pt, pl, pb, pr, EraseGuard::SpareDec);
+            }
+
+            Decera(pt, pl, pb, pr) => {
+                self.erase_rect(pt, pl, pb, pr, EraseGuard::SpareIso);
+            }
+
+            Decfra(pch, pt, pl, pb, pr) => {
+                self.decfra(pch, pt, pl, pb, pr);
+            }
+
+            Deccra(ps) => {
+                self.deccra(ps);
             }
 
             G1d4(charset) => {
@@ -2147,37 +2172,110 @@ impl Terminal {
         }
     }
 
-    /// DECSERA — selectively erase a rectangle, sparing DEC-protected cells.
-    /// Coordinates are origin-mode relative (like CUP) and clamped to the
-    /// addressable region; the scroll margins otherwise don't constrain it. An
-    /// empty/inverted rectangle is a no-op, and the cursor does not move.
-    fn decsera(&mut self, pt: u16, pl: u16, pb: u16, pr: u16) {
+    /// The rectangle a rect op (DECERA/DECFRA/DECSERA/DECCRA) addresses, as
+    /// absolute 0-based `(top, left, bottom, right)`, or `None` if it is empty or
+    /// inverted (which makes the op a no-op).
+    ///
+    /// The 1-based params are origin-mode relative, exactly like CUP's — so they
+    /// hang off the margins only when DECOM is on, and are clamped to the
+    /// addressable region either way. With DECOM off the margins do *not* confine
+    /// the rectangle, which is what esctest's `*_ignoresMargins` pins: a rect op
+    /// with margins set still reaches through them. An omitted bottom/right
+    /// defaults to the region's far edge.
+    fn rect_bounds(&self, pt: u16, pl: u16, pb: u16, pr: u16) -> Option<Rect> {
         let atop = self.actual_top_margin();
         let abot = self.actual_bottom_margin();
         let aleft = self.actual_left_margin();
         let aright = self.actual_right_margin();
 
-        // 1-based params → absolute 0-based; omitted bottom/right default to the
-        // region's far edge.
         let top = (atop + as_usize(pt, 1) - 1).clamp(atop, abot);
         let left = (aleft + as_usize(pl, 1) - 1).clamp(aleft, aright);
         let bottom = (atop + as_usize(pb, abot - atop + 1) - 1).clamp(atop, abot);
         let right = (aleft + as_usize(pr, aright - aleft + 1) - 1).clamp(aleft, aright);
 
-        if top > bottom || left > right {
+        (top <= bottom && left <= right).then_some(Rect {
+            top,
+            left,
+            bottom,
+            right,
+        })
+    }
+
+    /// DECERA / DECSERA — erase a rectangle. The guard is what tells the two
+    /// apart: DECERA clears everything in its way (well, everything but the ISO
+    /// guarded area, like plain ED/EL do), DECSERA spares DEC-protected cells.
+    /// The cursor does not move.
+    fn erase_rect(&mut self, pt: u16, pl: u16, pb: u16, pr: u16, guard: EraseGuard) {
+        let Some(r) = self.rect_bounds(pt, pl, pb, pr) else {
             return;
-        }
+        };
 
         let pen = self.pen;
-        for row in top..=bottom {
+        for row in r.top..=r.bottom {
             self.buffer.erase(
-                (left, row),
-                EraseMode::NextChars(right - left + 1),
+                (r.left, row),
+                EraseMode::NextChars(r.right - r.left + 1),
                 &pen,
-                EraseGuard::SpareDec,
+                guard,
             );
         }
-        self.dirty_lines.extend(top..bottom + 1);
+        self.dirty_lines.extend(r.top..r.bottom + 1);
+    }
+
+    /// DECFRA — fill a rectangle with `pch` under the current pen. DEC restricts
+    /// the fill character to the printable Latin-1 ranges; anything else (a
+    /// control, DEL, a C1) is ignored rather than printed. Like DECERA it spares
+    /// the ISO guarded area and leaves the cursor alone.
+    fn decfra(&mut self, pch: u16, pt: u16, pl: u16, pb: u16, pr: u16) {
+        let Some(ch) = (match pch {
+            32..=126 | 160..=255 => char::from_u32(u32::from(pch)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(r) = self.rect_bounds(pt, pl, pb, pr) else {
+            return;
+        };
+
+        let pen = self.pen;
+        self.buffer.fill_rect(
+            r.top..r.bottom + 1,
+            r.left..r.right + 1,
+            ch,
+            &pen,
+            EraseGuard::SpareIso,
+        );
+        self.dirty_lines.extend(r.top..r.bottom + 1);
+    }
+
+    /// DECCRA — copy the source rectangle to the destination's top-left corner.
+    /// The destination is a corner, not a rectangle: the copy carries the source's
+    /// full size, clipped to what fits inside the addressable region (so a
+    /// destination near the edge takes only part of it). Source and destination may
+    /// overlap. The page params are ignored — ghost has a single page — and the
+    /// cursor does not move.
+    fn deccra(&mut self, ps: [u16; 8]) {
+        let [pts, pls, pbs, prs, _pps, ptd, pld, _ppd] = ps;
+        let Some(src) = self.rect_bounds(pts, pls, pbs, prs) else {
+            return;
+        };
+
+        let abot = self.actual_bottom_margin();
+        let aright = self.actual_right_margin();
+        let dest_row = (self.actual_top_margin() + as_usize(ptd, 1) - 1).clamp(0, abot);
+        let dest_col = (self.actual_left_margin() + as_usize(pld, 1) - 1).clamp(0, aright);
+
+        let width = (src.right - src.left + 1).min(aright - dest_col + 1);
+        let height = (src.bottom - src.top + 1).min(abot - dest_row + 1);
+
+        let pen = self.pen;
+        self.buffer.copy_rect(
+            (src.left, src.top),
+            (dest_col, dest_row),
+            (width, height),
+            &pen,
+        );
+        self.dirty_lines.extend(dest_row..dest_row + height);
     }
 
     fn ech(&mut self, n: u16) {

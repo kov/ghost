@@ -447,6 +447,25 @@ mod tests {
         vt.line(row).cells()[..n].iter().map(|c| c.char()).collect()
     }
 
+    /// The 8×8 block esctest's rectangle tests prepare (`abcdefgh` / `ijklmnop` /
+    /// …), on a 10-row grid so the last line feed doesn't scroll it.
+    fn rect_vt() -> Vt {
+        let mut vt = Vt::new(8, 10);
+        for line in [
+            "abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "ABCDEFGH", "IJKLMNOP", "QRSTUVWX",
+            "YZ6789!@",
+        ] {
+            vt.feed_str(line);
+            vt.feed_str("\r\n");
+        }
+        vt
+    }
+
+    /// The eight rows [`rect_vt`] wrote, as strings.
+    fn rect_rows(vt: &Vt) -> Vec<String> {
+        (0..8).map(|r| row_cells(vt, r, 8)).collect()
+    }
+
     /// Fill a 5×5 vt with the esctest region grid (abcde / fghij / …).
     fn grid5(vt: &mut Vt) {
         for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
@@ -907,6 +926,119 @@ mod tests {
             row_cells(&vt, 0, 2),
             "  ",
             "ISO guard does not stop DECSERA"
+        );
+    }
+
+    #[test]
+    fn decera_erases_a_rectangle_and_ignores_the_margins() {
+        let mut vt = rect_vt();
+        // Margins on both axes, origin mode off: the rectangle's coordinates are
+        // absolute, so the erase reaches straight through them (esctest
+        // test_DECERA_ignoresMargins).
+        vt.feed_str("\x1b[?69h\x1b[3;6s\x1b[3;6r");
+        vt.feed_str("\x1b[4;4H"); // park the cursor
+        vt.feed_str("\x1b[5;5;7;7$z");
+        assert_eq!(
+            rect_rows(&vt),
+            [
+                "abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "ABCD   H", "IJKL   P", "QRST   X",
+                "YZ6789!@"
+            ]
+        );
+        let c = vt.cursor();
+        assert_eq!((c.col, c.row), (3, 3), "DECERA does not move the cursor");
+
+        // An inverted rectangle does nothing, and an oversized one clips.
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[5;5;4;4$z");
+        assert_eq!(
+            rect_rows(&vt)[4],
+            "ABCDEFGH",
+            "inverted rectangle is a no-op"
+        );
+        vt.feed_str("\x1b[8;8;99;99$z");
+        assert_eq!(rect_rows(&vt)[7], "YZ6789! ", "clipped to the screen");
+    }
+
+    #[test]
+    fn decfra_fills_a_rectangle_with_a_character() {
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[37;5;5;7;7$x"); // 37 = '%'
+        assert_eq!(
+            rect_rows(&vt),
+            [
+                "abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "ABCD%%%H", "IJKL%%%P", "QRST%%%X",
+                "YZ6789!@"
+            ]
+        );
+        // A fill character outside the printable ranges (here BEL) is ignored, not
+        // printed — DEC restricts Pch to 32..126 and 160..255.
+        vt.feed_str("\x1b[7;1;1;1;1$x");
+        assert_eq!(rect_rows(&vt)[0], "abcdefgh");
+        // Omitted bounds default to the whole addressable region.
+        vt.feed_str("\x1b[46$x"); // '.'
+        assert_eq!(rect_rows(&vt)[0], "........");
+        assert_eq!(rect_rows(&vt)[7], "........");
+    }
+
+    #[test]
+    fn deccra_copies_a_rectangle_source_and_destination_may_overlap() {
+        // Non-overlapping: rows 2-4 x cols 2-4 land at (5,5).
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[4;4H");
+        vt.feed_str("\x1b[2;2;4;4;1;5;5;1$v");
+        assert_eq!(
+            rect_rows(&vt),
+            [
+                "abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "ABCDjklH", "IJKLrstP", "QRSTz01X",
+                "YZ6789!@"
+            ]
+        );
+        let c = vt.cursor();
+        assert_eq!((c.col, c.row), (3, 3), "DECCRA does not move the cursor");
+
+        // Overlapping: the source is read as it was, not as the copy rewrites it.
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[2;2;4;4;1;3;3;1$v");
+        assert_eq!(
+            rect_rows(&vt),
+            [
+                "abcdefgh", "ijklmnop", "qrjklvwx", "yzrst345", "ABz01FGH", "IJKLMNOP", "QRSTUVWX",
+                "YZ6789!@"
+            ]
+        );
+    }
+
+    #[test]
+    fn deccra_defaults_the_destination_to_the_origin_and_clips_it() {
+        // Omitted destination = the region's top-left corner.
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[2;2;4;4$v");
+        assert_eq!(rect_rows(&vt)[..3], ["jkldefgh", "rstlmnop", "z01tuvwx"]);
+
+        // A destination near the edge takes only the part of the rectangle that
+        // fits (esctest test_DECCRA_destinationPartiallyOffscreen): the 3×3 block
+        // lands as a 2×2 in the bottom-right corner of the 8×10 grid.
+        let mut vt = rect_vt();
+        vt.feed_str("\x1b[2;2;4;4;1;9;7;1$v");
+        assert_eq!(row_cells(&vt, 8, 8), "      jk");
+        assert_eq!(row_cells(&vt, 9, 8), "      rs");
+    }
+
+    #[test]
+    fn deccra_coordinates_are_origin_relative() {
+        let mut vt = rect_vt();
+        // Margins on both axes + origin mode: source 1,1-3,3 is really 2,2-4,4 and
+        // the destination 4,4 is really 5,5 — the same copy as the absolute case.
+        vt.feed_str("\x1b[?69h\x1b[2;8s\x1b[2;8r\x1b[?6h");
+        vt.feed_str("\x1b[1;1;3;3;1;4;4;1$v");
+        vt.feed_str("\x1b[?6l\x1b[?69l\x1b[r");
+        assert_eq!(
+            rect_rows(&vt),
+            [
+                "abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "ABCDjklH", "IJKLrstP", "QRSTz01X",
+                "YZ6789!@"
+            ]
         );
     }
 

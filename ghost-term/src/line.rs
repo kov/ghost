@@ -41,6 +41,13 @@ impl Line {
     }
 
     pub(crate) fn clear(&mut self, range: Range<usize>, pen: &Pen, guard: EraseGuard) {
+        self.fill(range, Cell::blank(*pen), pen, guard);
+    }
+
+    /// Overwrite every cell in `range` with `cell`, sparing the ones `guard`
+    /// protects. [`clear`](Self::clear) is this with a blank; DECFRA fills with a
+    /// real character. `pen` is what a mended wide-glyph half is blanked under.
+    pub(crate) fn fill(&mut self, range: Range<usize>, cell: Cell, pen: &Pen, guard: EraseGuard) {
         if range.start == self.len() {
             return;
         }
@@ -49,7 +56,7 @@ impl Line {
         let end_col = range.end;
 
         // Mend a wide glyph straddling the leading edge, but only if its tail
-        // (the first cell of the range) is actually being erased — a spared
+        // (the first cell of the range) is actually being overwritten — a spared
         // protected tail keeps its head intact.
         if self.cells[start_col].occupancy() == Occupancy::WideTail
             && !guard.spares(self.cells[start_col].protection())
@@ -59,13 +66,12 @@ impl Line {
 
         match guard {
             // Nothing to spare: the fast slice fill.
-            EraseGuard::None => self.cells[range].fill(Cell::blank(*pen)),
-            // Selective: blank each cell unless its protection spares it.
+            EraseGuard::None => self.cells[range].fill(cell),
+            // Selective: overwrite each cell unless its protection spares it.
             _ => {
-                let blank = Cell::blank(*pen);
-                for cell in &mut self.cells[range] {
-                    if !guard.spares(cell.protection()) {
-                        *cell = blank;
+                for c in &mut self.cells[range] {
+                    if !guard.spares(c.protection()) {
+                        *c = cell;
                     }
                 }
             }
