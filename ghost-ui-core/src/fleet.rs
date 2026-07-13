@@ -1871,12 +1871,11 @@ impl FleetModel {
         // a redraw — but the card header shows it, so a change repaints here.
         let progress = tile.model.screen().vt().progress();
         let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
-        // The overview doesn't drive the window title; a tile changing its OSC
-        // title must not retitle the window out from under the single view.
-        let mut cmds: Vec<Cmd> = cmds
-            .into_iter()
-            .filter(|c| !matches!(c, Cmd::SetTitle(_)))
-            .collect();
+        // A tile drives nothing about the window it is previewed in: not the title
+        // (that would retitle the window out from under the single view), and not
+        // its state or size — a tile may be a session attached elsewhere, even on
+        // a remote host, and it does not get to minimize the overview.
+        let mut cmds: Vec<Cmd> = cmds.into_iter().filter(|c| !c.drives_window()).collect();
         if progress_changed && !cmds.contains(&Cmd::Redraw) {
             cmds.push(Cmd::Redraw);
         }
@@ -6584,6 +6583,21 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
             "the fleet overview does not retitle the window for a tile"
+        );
+    }
+
+    #[test]
+    fn a_tile_does_not_drive_the_overview_window() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // Tiles are previews — including of sessions attached elsewhere, on hosts
+        // we don't control. A program in one asking to minimize / maximize /
+        // fullscreen / resize must not reach out of its tile and do it to the
+        // overview window.
+        let cmds = data(&mut m, "a", b"\x1b[2t\x1b[9;1t\x1b[10;1t\x1b[8;40;100t");
+        assert!(
+            !cmds.iter().any(|c| c.drives_window()),
+            "a tile does not drive the overview window: {cmds:?}"
         );
     }
 

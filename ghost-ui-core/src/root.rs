@@ -1039,19 +1039,21 @@ impl RootModel {
         };
         let (name, ended) = (name.clone(), *ended);
         let cmds = match self.warm.get_mut(&name) {
-            // A background mirror still tracks its own title and screen internally (so a
-            // later Ctrl-Tab restores it), but it is NOT visible, so two of its commands
-            // must not reach the shell: `SetTitle` (only the foreground drives the window
-            // title, same guard the fleet applies to tiles) and `Redraw` (its content
-            // changed, but the foreground's did not — a repaint here is a full deep
-            // scene-compare ending in a Clean skip, up to 60x/s under a chatty background
-            // session). Everything else flows: replies to a program querying the terminal
-            // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
-            // that backstops a mirror's synchronized-output hold for when it's promoted.
+            // A background mirror still tracks its own title, screen and window state
+            // internally (so a later Ctrl-Tab restores them), but it is NOT visible, so
+            // two kinds of command must not reach the shell: anything that drives the
+            // window (`Cmd::drives_window` — title, iconify/maximize/fullscreen, resize;
+            // only the foreground may, same guard the fleet applies to tiles) and
+            // `Redraw` (its content changed, but the foreground's did not — a repaint
+            // here is a full deep scene-compare ending in a Clean skip, up to 60x/s under
+            // a chatty background session). Everything else flows: replies to a program
+            // querying the terminal (`SendInput`), image pre-uploads, and — load-bearing
+            // — the `ScheduleTick` that backstops a mirror's synchronized-output hold for
+            // when it's promoted.
             Some(m) => m
                 .update(ev)
                 .into_iter()
-                .filter(|c| !matches!(c, Cmd::SetTitle(_) | Cmd::Redraw))
+                .filter(|c| !c.drives_window() && !matches!(c, Cmd::Redraw))
                 .collect(),
             None => Vec::new(), // not a session this window mirrors
         };
@@ -3824,6 +3826,30 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
             "a background session must not retitle the window: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_foreground_session_drives_the_windows_state() {
+        let mut r = root(); // foreground alpha
+        let cmds = feed(&mut r, "alpha", b"\x1b[2t"); // iconify
+        assert!(
+            cmds.contains(&Cmd::SetIconified(true)),
+            "the foreground session drives the window state: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_background_session_does_not_drive_the_windows_state() {
+        let mut r = root(); // foreground alpha
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        // alpha is a warm background mirror. A program in it asking to minimize,
+        // maximize, go fullscreen or resize the window must not reach through and
+        // do it to the window the user is actually typing in.
+        let cmds = feed(&mut r, "alpha", b"\x1b[2t\x1b[9;1t\x1b[10;1t\x1b[8;40;100t");
+        assert!(
+            !cmds.iter().any(|c| c.drives_window()),
+            "a background session must not drive the window: {cmds:?}"
         );
     }
 

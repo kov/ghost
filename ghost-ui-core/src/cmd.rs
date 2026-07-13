@@ -171,6 +171,28 @@ pub enum Cmd {
     Quit,
 }
 
+impl Cmd {
+    /// Does this command reach out of its session and act on *the window*?
+    ///
+    /// A session is one of possibly many in a window, and — in the fleet — may
+    /// not even be one the window owns: tiles preview sessions attached
+    /// elsewhere, on hosts we don't control. So the window ops a program can ask
+    /// for (XTWINOPS, and the grid-driven resize behind DECCOLM) are only the
+    /// *visible, foreground* session's to drive. Everything else is fed with
+    /// these filtered out, or four bytes of output from a background session
+    /// would minimize the window the user is typing in.
+    pub fn drives_window(&self) -> bool {
+        matches!(
+            self,
+            Cmd::SetTitle(_)
+                | Cmd::ResizeWindow { .. }
+                | Cmd::SetIconified(_)
+                | Cmd::SetMaximized(_)
+                | Cmd::SetFullscreen(_)
+        )
+    }
+}
+
 /// The pointer shape a [`Cmd::PointerIcon`] asks the window to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerIcon {
