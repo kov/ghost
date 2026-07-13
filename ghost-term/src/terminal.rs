@@ -3,7 +3,7 @@ mod dirty_lines;
 
 pub use self::cursor::{Cursor, CursorShape};
 use self::dirty_lines::DirtyLines;
-use crate::buffer::{Buffer, EraseMode};
+use crate::buffer::{Buffer, EraseGuard, EraseMode};
 use crate::cell::{Cell, Occupancy, PLACEHOLDER};
 use crate::charset::Charset;
 use crate::graphics::{GraphicsState, Image, Placement};
@@ -13,7 +13,7 @@ use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function,
     Progress, SgrOp, SgrOps, TbcScope, XtwinopsOp,
 };
-use crate::pen::{Intensity, Pen};
+use crate::pen::{Intensity, Pen, Protection};
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -576,12 +576,35 @@ impl Terminal {
             }
 
             Ed(mode) => {
-                self.ed(mode);
+                // A plain ED spares only ISO-guarded (SPA/EPA) cells, not
+                // DECSCA-protected ones.
+                self.ed(mode, EraseGuard::SpareIso);
+            }
+
+            Decsed(mode) => {
+                self.ed(mode, EraseGuard::SpareProtected);
             }
 
             El(mode) => {
-                self.el(mode);
+                self.el(mode, EraseGuard::SpareIso);
             }
+
+            Decsel(mode) => {
+                self.el(mode, EraseGuard::SpareProtected);
+            }
+
+            Decsca(ps) => {
+                // DECSCA 1 protects, 0/2 unprotect (DEC protection).
+                let protection = if ps == 1 {
+                    Protection::Dec
+                } else {
+                    Protection::None
+                };
+                self.pen.set_protection(protection);
+            }
+
+            Spa => self.pen.set_protection(Protection::Iso),
+            Epa => self.pen.set_protection(Protection::None),
 
             G1d4(charset) => {
                 self.g1d4(charset);
@@ -1923,13 +1946,14 @@ impl Terminal {
         self.move_cursor_to_next_tab(as_usize(n, 1));
     }
 
-    fn ed(&mut self, scope: EdScope) {
+    fn ed(&mut self, scope: EdScope, guard: EraseGuard) {
         match scope {
             EdScope::Below => {
                 self.buffer.erase(
                     (self.cursor.col, self.cursor.row),
                     EraseMode::FromCursorToEndOfView,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.extend(self.cursor.row..self.rows);
@@ -1940,6 +1964,7 @@ impl Terminal {
                     (self.cursor.col, self.cursor.row),
                     EraseMode::FromStartOfViewToCursor,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.extend(0..self.cursor.row + 1);
@@ -1950,6 +1975,7 @@ impl Terminal {
                     (self.cursor.col, self.cursor.row),
                     EraseMode::WholeView,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.extend(0..self.rows);
@@ -1959,13 +1985,14 @@ impl Terminal {
         }
     }
 
-    fn el(&mut self, scope: ElScope) {
+    fn el(&mut self, scope: ElScope, guard: EraseGuard) {
         match scope {
             ElScope::ToRight => {
                 self.buffer.erase(
                     (self.cursor.col, self.cursor.row),
                     EraseMode::FromCursorToEndOfLine,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.add(self.cursor.row);
@@ -1976,6 +2003,7 @@ impl Terminal {
                     (self.cursor.col, self.cursor.row),
                     EraseMode::FromStartOfLineToCursor,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.add(self.cursor.row);
@@ -1986,6 +2014,7 @@ impl Terminal {
                     (self.cursor.col, self.cursor.row),
                     EraseMode::WholeLine,
                     &self.pen,
+                    guard,
                 );
 
                 self.dirty_lines.add(self.cursor.row);
@@ -2106,6 +2135,8 @@ impl Terminal {
             (self.cursor.col, self.cursor.row),
             EraseMode::NextChars(n),
             &self.pen,
+            // ECH spares ISO-guarded cells but erases DECSCA-protected ones.
+            EraseGuard::SpareIso,
         );
 
         self.dirty_lines.add(self.cursor.row);
@@ -2308,10 +2339,12 @@ impl Terminal {
         self.right_margin = self.cols - 1;
         self.left_right_margin_mode = false;
         if !self.no_clear_on_column_change {
+            // The DECCOLM clear is unconditional — protection does not spare it.
             self.buffer.erase(
                 (self.cursor.col, self.cursor.row),
                 EraseMode::WholeView,
                 &self.pen,
+                EraseGuard::None,
             );
         }
         self.cursor.col = 0;
@@ -2579,11 +2612,17 @@ impl Terminal {
                 as_u16(primary_ctx.cursor_col + 1),
             ));
 
-            // configure pen
+            // configure pen (style plus any character protection, which is not SGR)
             funs.push(to_sgr(&primary_ctx.pen));
+            push_protection(&mut funs, primary_ctx.pen.protection());
 
             // save cursor
             funs.push(Function::Decsc);
+
+            // clear the protection back off so it does not bleed into later writes
+            if primary_ctx.pen.protection() != Protection::None {
+                funs.push(Function::Decsca(0));
+            }
 
             if !primary_ctx.auto_wrap_mode {
                 // re-enable auto-wrap mode
@@ -2633,11 +2672,17 @@ impl Terminal {
                 as_u16(alternate_ctx.cursor_col + 1),
             ));
 
-            // configure pen
+            // configure pen (style plus any character protection, which is not SGR)
             funs.push(to_sgr(&alternate_ctx.pen));
+            push_protection(&mut funs, alternate_ctx.pen.protection());
 
             // save cursor
             funs.push(Function::Decsc);
+
+            // clear the protection back off so it does not bleed into later writes
+            if alternate_ctx.pen.protection() != Protection::None {
+                funs.push(Function::Decsca(0));
+            }
 
             if !alternate_ctx.auto_wrap_mode {
                 // re-enable auto-wrap mode
@@ -2769,6 +2814,13 @@ impl Terminal {
         funs.push(to_sgr(&self.pen));
         if let Some(uri) = self.pen.link.and_then(|id| self.links.get(id.get())) {
             funs.push(Function::Hyperlink(Some(uri.to_string())));
+        }
+        // Re-arm the current write protection (DECSCA/SPA state) so writes after
+        // a reattach stay guarded as the app left them.
+        match self.pen.protection() {
+            Protection::None => {}
+            Protection::Dec => funs.push(Function::Decsca(1)),
+            Protection::Iso => funs.push(Function::Spa),
         }
 
         if !self.cursor.visible {
@@ -2980,6 +3032,17 @@ fn dump_buffer_lines(
                         .map(str::to_string);
                     funs.push(Function::Hyperlink(uri));
                 }
+                // Character protection is not SGR: re-set it with its own control
+                // so a protected run replays guarded (DECSCA 1 for DEC, SPA for
+                // ISO, DECSCA 0 back to unprotected).
+                let protection = cells[0].pen().protection();
+                if protection != pen.protection() {
+                    funs.push(match protection {
+                        Protection::None => Function::Decsca(0),
+                        Protection::Dec => Function::Decsca(1),
+                        Protection::Iso => Function::Spa,
+                    });
+                }
 
                 pen = *cells[0].pen();
             }
@@ -2995,6 +3058,9 @@ fn dump_buffer_lines(
 
     if pen.link.is_some() {
         funs.push(Function::Hyperlink(None));
+    }
+    if pen.protection() != Protection::None {
+        funs.push(Function::Decsca(0));
     }
 }
 
@@ -3111,6 +3177,16 @@ fn dump_cells(cells: &[Cell], funs: &mut Vec<Function>) {
 
 fn to_sgr(pen: &Pen) -> Function {
     Function::Sgr(to_sgr_ops(pen))
+}
+
+/// Emit the control that turns *on* a non-`None` protection (DECSCA 1 for DEC,
+/// SPA for ISO); a no-op for `None` since a dump starts unprotected.
+fn push_protection(funs: &mut Vec<Function>, protection: Protection) {
+    match protection {
+        Protection::None => {}
+        Protection::Dec => funs.push(Function::Decsca(1)),
+        Protection::Iso => funs.push(Function::Spa),
+    }
 }
 
 fn to_sgr_ops(pen: &Pen) -> SgrOps {

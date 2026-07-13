@@ -845,6 +845,56 @@ mod tests {
     }
 
     #[test]
+    fn plain_ed_spares_iso_protection_but_not_dec() {
+        // A plain ED spares SPA/EPA (ISO) guarded cells but erases DECSCA (DEC)
+        // protected ones — matching xterm's ED_respectsISOProtection and
+        // ED_should_not_respect_DECSCA.
+        let mut vt = Vt::new(10, 2);
+        // "ab", then an ISO-guarded "c" (ESC V = SPA, ESC W = EPA).
+        vt.feed_str("ab\x1bVc\x1bW");
+        vt.feed_str("\x1b[1;1H\x1b[0J"); // home, ED below
+        assert_eq!(row_cells(&vt, 0, 3), "  c", "ISO-guarded c is spared");
+
+        // Now with DEC protection (DECSCA), a plain ED erases everything.
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("\x1b[1\"qabc\x1b[0\"q"); // DECSCA 1, "abc", DECSCA 0
+        vt.feed_str("\x1b[1;1H\x1b[0J");
+        assert_eq!(
+            row_cells(&vt, 0, 3),
+            "   ",
+            "DEC-protected cells still erased"
+        );
+    }
+
+    #[test]
+    fn selective_erase_spares_dec_protection() {
+        // DECSED / DECSEL spare DECSCA-protected cells and erase the rest.
+        let mut vt = Vt::new(10, 2);
+        // Protected "ab", then unprotected "cd".
+        vt.feed_str("\x1b[1\"qab\x1b[0\"qcd");
+        vt.feed_str("\x1b[1;1H\x1b[?0K"); // home, DECSEL to end of line
+        assert_eq!(row_cells(&vt, 0, 4), "ab  ", "DECSEL spares protected a,b");
+
+        // DECSED (display) likewise spares protected cells.
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("\x1b[1\"qab\x1b[0\"qcd");
+        vt.feed_str("\x1b[1;1H\x1b[?2J"); // DECSED whole display
+        assert_eq!(row_cells(&vt, 0, 4), "ab  ", "DECSED spares protected a,b");
+    }
+
+    #[test]
+    fn decsca_survives_a_dump() {
+        // A DECSCA-protected run replays guarded after a dump/reload.
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("\x1b[1\"qab\x1b[0\"qcd");
+        let mut reloaded = Vt::new(10, 2);
+        reloaded.feed_str(&vt.dump());
+        // In the reloaded terminal, a DECSEL still spares the protected a,b.
+        reloaded.feed_str("\x1b[1;1H\x1b[?0K");
+        assert_eq!(row_cells(&reloaded, 0, 4), "ab  ");
+    }
+
+    #[test]
     fn decrqm_tracks_inert_dec_modes() {
         // Modes ghost does not act on (DECBKM, DECNKM, DECSCLM, …) still round-trip
         // their DECRQM set/reset bit rather than reporting 0/unrecognized.

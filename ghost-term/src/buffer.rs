@@ -4,7 +4,7 @@ use std::ops::{Index, IndexMut, Range};
 
 use crate::cell::Cell;
 use crate::line::Line;
-use crate::pen::Pen;
+use crate::pen::{Pen, Protection};
 
 #[derive(Debug)]
 pub(crate) struct Buffer {
@@ -28,6 +28,28 @@ pub(crate) enum EraseMode {
     FromCursorToEndOfLine,
     FromStartOfLineToCursor,
     WholeLine,
+}
+
+/// Which protected cells an erase spares (see [`crate::pen::Protection`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum EraseGuard {
+    /// Spare nothing — the unconditional erase (fills, resets, DECCOLM clear).
+    None,
+    /// Spare ISO-guarded cells (SPA/EPA) — a plain ED/EL/ECH.
+    SpareIso,
+    /// Spare every protected cell — a selective DECSED/DECSEL/DECSERA.
+    SpareProtected,
+}
+
+impl EraseGuard {
+    /// Whether a cell with this protection is spared from the erase.
+    pub(crate) fn spares(self, protection: Protection) -> bool {
+        match self {
+            EraseGuard::None => false,
+            EraseGuard::SpareIso => protection == Protection::Iso,
+            EraseGuard::SpareProtected => protection != Protection::None,
+        }
+    }
 }
 
 /// Direction for the boxed (left/right-margin) scroll core.
@@ -152,7 +174,13 @@ impl Buffer {
         }
     }
 
-    pub fn erase(&mut self, (col, row): VisualPosition, mode: EraseMode, pen: &Pen) {
+    pub fn erase(
+        &mut self,
+        (col, row): VisualPosition,
+        mode: EraseMode,
+        pen: &Pen,
+        guard: EraseGuard,
+    ) {
         use EraseMode::*;
 
         match mode {
@@ -161,7 +189,7 @@ impl Buffer {
                 let end = col + n;
                 let clear_wrap = end == self.cols;
                 let line = &mut self[row];
-                line.clear(col..end, pen);
+                line.clear(col..end, pen, guard);
 
                 if clear_wrap {
                     line.wrapped = false;
@@ -172,36 +200,36 @@ impl Buffer {
                 let range = col..self.cols;
                 let line = &mut self[row];
                 line.wrapped = false;
-                line.clear(range, pen);
-                self.clear((row + 1)..self.rows, pen);
+                line.clear(range, pen, guard);
+                self.clear((row + 1)..self.rows, pen, guard);
             }
 
             FromStartOfViewToCursor => {
                 let range = 0..(col + 1).min(self.cols);
-                self[row].clear(range, pen);
-                self.clear(0..row, pen);
+                self[row].clear(range, pen, guard);
+                self.clear(0..row, pen, guard);
             }
 
             WholeView => {
-                self.clear(0..self.rows, pen);
+                self.clear(0..self.rows, pen, guard);
             }
 
             FromCursorToEndOfLine => {
                 let range = col..self.cols;
                 let line = &mut self[row];
-                line.clear(range, pen);
+                line.clear(range, pen, guard);
                 line.wrapped = false;
             }
 
             FromStartOfLineToCursor => {
                 let range = 0..(col + 1).min(self.cols);
-                self[row].clear(range, pen);
+                self[row].clear(range, pen, guard);
             }
 
             WholeLine => {
                 let range = 0..self.cols;
                 let line = &mut self[row];
-                line.clear(range, pen);
+                line.clear(range, pen, guard);
                 line.wrapped = false;
             }
         }
@@ -229,7 +257,7 @@ impl Buffer {
             self[range.start - 1].wrapped = false;
             let end = range.end;
             self[range].rotate_left(n);
-            self.clear((end - n)..end, pen);
+            self.clear((end - n)..end, pen, EraseGuard::None);
         }
 
         self.trim_needed = true;
@@ -239,7 +267,7 @@ impl Buffer {
         let (start, end) = (range.start, range.end);
         n = n.min(end - start);
         self[range].rotate_right(n);
-        self.clear(start..start + n, pen);
+        self.clear(start..start + n, pen, EraseGuard::None);
 
         if start > 0 {
             self[start - 1].wrapped = false;
@@ -333,7 +361,7 @@ impl Buffer {
                     scratch.extend_from_slice(&self.lines[base + src].cells()[cols.clone()]);
                     self.lines[base + row].write_cols(cols.clone(), &scratch);
                 }
-                None => self.lines[base + row].clear(cols.clone(), pen),
+                None => self.lines[base + row].clear(cols.clone(), pen, EraseGuard::None),
             }
         }
 
@@ -510,7 +538,7 @@ impl Buffer {
         }
     }
 
-    fn clear(&mut self, range: Range<usize>, pen: &Pen) {
+    fn clear(&mut self, range: Range<usize>, pen: &Pen, guard: EraseGuard) {
         let cols = self.cols;
         let offset = self.view_offset();
 
@@ -518,7 +546,16 @@ impl Buffer {
             .lines
             .range_mut(offset + range.start..offset + range.end)
         {
-            line.reset(cols, *pen);
+            match guard {
+                // Fast whole-line reset when nothing can be spared.
+                EraseGuard::None => line.reset(cols, *pen),
+                // A selective erase must inspect each cell for protection;
+                // `reset`'s wrap-flag clear is done by hand since `clear` leaves it.
+                _ => {
+                    line.clear(0..cols, pen, guard);
+                    line.wrapped = false;
+                }
+            }
         }
     }
 

@@ -89,11 +89,25 @@ pub enum Function {
     /// hard reset, then applies the level (which gates VT400+ features like
     /// DECLRMM).
     Decscl(u16, u16),
+    /// DECSCA `CSI Ps " q` — select character protection attribute. `Ps` 1 marks
+    /// subsequent writes as DEC-protected (spared by DECSED/DECSEL/DECSERA);
+    /// `Ps` 0 or 2 clears it.
+    Decsca(u16),
     Decstr,
     Dl(u16),
     Ech(u16),
     Ed(EdScope),
+    /// DECSED `CSI ? Ps J` — selective erase in display: like ED, but spares
+    /// protected cells.
+    Decsed(EdScope),
     El(ElScope),
+    /// DECSEL `CSI ? Ps K` — selective erase in line: like EL, but spares
+    /// protected cells.
+    Decsel(ElScope),
+    /// SPA (`ESC V`) / EPA (`ESC W`) — start/end an ISO 6429 guarded area. Cells
+    /// written between them are ISO-protected (spared by plain ED/EL/ECH too).
+    Spa,
+    Epa,
     G1d4(Charset),
     Gzd4(Charset),
     Ht,
@@ -857,6 +871,8 @@ impl Parser {
             '\u{85}' => Some(Nel),
             '\u{88}' => Some(Hts),
             '\u{8d}' => Some(Ri),
+            '\u{96}' => Some(Spa),
+            '\u{97}' => Some(Epa),
             _ => None,
         }
     }
@@ -951,10 +967,25 @@ impl Parser {
                 _ => None,
             },
 
+            (Some('?'), 'J') => match ps[0].as_u16() {
+                0 => Some(Decsed(EdScope::Below)),
+                1 => Some(Decsed(EdScope::Above)),
+                2 => Some(Decsed(EdScope::All)),
+                3 => Some(Decsed(EdScope::SavedLines)),
+                _ => None,
+            },
+
             (None, 'K') => match ps[0].as_u16() {
                 0 => Some(El(ElScope::ToRight)),
                 1 => Some(El(ElScope::ToLeft)),
                 2 => Some(El(ElScope::All)),
+                _ => None,
+            },
+
+            (Some('?'), 'K') => match ps[0].as_u16() {
+                0 => Some(Decsel(ElScope::ToRight)),
+                1 => Some(Decsel(ElScope::ToLeft)),
+                2 => Some(Decsel(ElScope::All)),
                 _ => None,
             },
 
@@ -1030,6 +1061,9 @@ impl Parser {
 
             // DECSCL: `CSI Pl ; Ps " p` (intermediate `"`) — select conformance level.
             (Some('"'), 'p') => Some(Decscl(ps[0].as_u16(), ps[1].as_u16())),
+
+            // DECSCA: `CSI Ps " q` (intermediate `"`) — select character protection.
+            (Some('"'), 'q') => Some(Decsca(ps[0].as_u16())),
 
             // DECIC / DECDC: `CSI Pn ' }` / `CSI Pn ' ~` (intermediate `'`).
             (Some('\''), '}') => Some(Decic(ps[0].as_u16())),
@@ -1466,6 +1500,8 @@ fn dump_function(seq: &mut String, fun: &Function) {
             );
         }
 
+        Decsca(ps) => push_csi(seq, Some('"'), &[ps.to_string()], 'q'),
+
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
         Dl(n) => push_csi(seq, None, &[n.to_string()], 'M'),
         Ech(n) => push_csi(seq, None, &[n.to_string()], 'X'),
@@ -1481,6 +1517,17 @@ fn dump_function(seq: &mut String, fun: &Function) {
             push_csi(seq, None, &[param.to_string()], 'J');
         }
 
+        Decsed(scope) => {
+            let param = match scope {
+                Below => 0,
+                Above => 1,
+                EdScope::All => 2,
+                SavedLines => 3,
+            };
+
+            push_csi(seq, Some('?'), &[param.to_string()], 'J');
+        }
+
         El(scope) => {
             let param = match scope {
                 ToRight => 0,
@@ -1489,6 +1536,16 @@ fn dump_function(seq: &mut String, fun: &Function) {
             };
 
             push_csi(seq, None, &[param.to_string()], 'K');
+        }
+
+        Decsel(scope) => {
+            let param = match scope {
+                ToRight => 0,
+                ToLeft => 1,
+                ElScope::All => 2,
+            };
+
+            push_csi(seq, Some('?'), &[param.to_string()], 'K');
         }
 
         G1d4(charset) => push_esc(
@@ -1530,6 +1587,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Rep(n) => push_csi(seq, None, &[n.to_string()], 'b'),
         Ri => push_esc(seq, None, 'M'),
         Ris => push_esc(seq, None, 'c'),
+
+        // SPA/EPA as their 7-bit `ESC V` / `ESC W` forms (reparsed as C1 via the
+        // generic `ESC @..._` rule).
+        Spa => push_esc(seq, None, 'V'),
+        Epa => push_esc(seq, None, 'W'),
 
         Rm(modes) => {
             // Every `AnsiMode` discriminant is its ANSI mode number (`#[repr(u16)]`).
@@ -2342,10 +2404,16 @@ mod tests {
         assert_eq!(parse("\x1b[2J"), [Ed(EdScope::All)]);
         assert_eq!(parse("\u{9b}2J"), [Ed(EdScope::All)]);
         assert_eq!(parse("\x1b[3J"), [Ed(EdScope::SavedLines)]);
+        assert_eq!(parse("\x1b[?J"), [Decsed(EdScope::Below)]);
+        assert_eq!(parse("\x1b[?1J"), [Decsed(EdScope::Above)]);
+        assert_eq!(parse("\x1b[?2J"), [Decsed(EdScope::All)]);
         assert_eq!(parse("\x1b[K"), [El(ElScope::ToRight)]);
         assert_eq!(parse("\x1b[0K"), [El(ElScope::ToRight)]);
         assert_eq!(parse("\x1b[1K"), [El(ElScope::ToLeft)]);
         assert_eq!(parse("\x1b[2K"), [El(ElScope::All)]);
+        assert_eq!(parse("\x1b[?K"), [Decsel(ElScope::ToRight)]);
+        assert_eq!(parse("\x1b[?1K"), [Decsel(ElScope::ToLeft)]);
+        assert_eq!(parse("\x1b[?2K"), [Decsel(ElScope::All)]);
         assert_eq!(parse("\x1b[16L"), [Il(16)]);
         assert_eq!(parse("\x1b[17M"), [Dl(17)]);
         assert_eq!(parse("\x1b[18P"), [Dch(18)]);
@@ -2385,6 +2453,14 @@ mod tests {
         assert_eq!(parse("\x1b[64;1\"p"), [Decscl(64, 1)]);
         assert_eq!(parse("\x1b[61\"p"), [Decscl(61, 0)]);
         assert_eq!(parse("\x1b[!p"), [Decstr]);
+
+        // DECSCA and the SPA/EPA guarded-area controls (7-bit ESC V / ESC W).
+        assert_eq!(parse("\x1b[\"q"), [Decsca(0)]);
+        assert_eq!(parse("\x1b[1\"q"), [Decsca(1)]);
+        assert_eq!(parse("\x1bV"), [Spa]);
+        assert_eq!(parse("\x1bW"), [Epa]);
+        assert_eq!(parse("\u{96}"), [Spa]);
+        assert_eq!(parse("\u{97}"), [Epa]);
 
         // DEC private modes.
         assert_eq!(parse("\x1b[?7h"), [Decset(dec_modes([DecMode::AutoWrap]))]);
@@ -2873,6 +2949,8 @@ mod tests {
             Decic(3),
             Decdc(7),
             Decscl(64, 1),
+            Decsca(0),
+            Decsca(1),
             Decstbm(2, 5),
             Decstr,
             Dl(17),
@@ -2881,9 +2959,18 @@ mod tests {
             Ed(EdScope::Above),
             Ed(EdScope::All),
             Ed(EdScope::SavedLines),
+            Decsed(EdScope::Below),
+            Decsed(EdScope::Above),
+            Decsed(EdScope::All),
+            Decsed(EdScope::SavedLines),
             El(ElScope::ToRight),
             El(ElScope::ToLeft),
             El(ElScope::All),
+            Decsel(ElScope::ToRight),
+            Decsel(ElScope::ToLeft),
+            Decsel(ElScope::All),
+            Spa,
+            Epa,
             G1d4(Charset::Drawing),
             G1d4(Charset::Ascii),
             Gzd4(Charset::Drawing),

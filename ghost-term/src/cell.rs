@@ -79,6 +79,10 @@ impl Cell {
         &self.2
     }
 
+    pub(crate) fn protection(&self) -> crate::pen::Protection {
+        self.2.protection()
+    }
+
     pub(crate) fn set(&mut self, ch: char, occupancy: Occupancy, pen: Pen) {
         self.0 = ch;
         self.1 = occupancy;

@@ -11,6 +11,10 @@ pub struct Pen {
     /// terminal (resolve with `Vt::hyperlink`). Not an SGR attribute: SGR 0
     /// does not clear it, only OSC 8 with an empty URI (or a full reset) does.
     pub(crate) link: Option<NonZeroU16>,
+    /// Character protection guarding cells written under this pen from erasure.
+    /// Not an SGR attribute (set by DECSCA / SPA-EPA); no visual effect — it only
+    /// governs which erases spare the cell. See [`Protection`].
+    pub(crate) protection: Protection,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -18,6 +22,21 @@ pub enum Intensity {
     Normal,
     Bold,
     Faint,
+}
+
+/// A cell's erase protection. Two independent mechanisms set it, and the two
+/// erase families honor them differently (matching xterm):
+///
+/// - [`Protection::Dec`] — DECSCA (`CSI Ps " q`). Spared only by the *selective*
+///   erases (DECSED / DECSEL / DECSERA); a plain ED/EL/ECH erases it.
+/// - [`Protection::Iso`] — the ISO 6429 guarded area (SPA / EPA). Spared by the
+///   *plain* erases (ED / EL / ECH) as well as the selective ones.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum Protection {
+    #[default]
+    None,
+    Dec,
+    Iso,
 }
 
 const ITALIC_MASK: u8 = 1;
@@ -109,11 +128,23 @@ impl Pen {
         self.link.map(NonZeroU16::get)
     }
 
-    /// This pen minus its hyperlink — what erase/fill operations use, so blank
-    /// cells never read as clickable.
+    /// The erase protection cells written under this pen carry.
+    pub(crate) fn protection(&self) -> Protection {
+        self.protection
+    }
+
+    /// Set the erase protection for subsequent writes (DECSCA / SPA-EPA).
+    pub(crate) fn set_protection(&mut self, protection: Protection) {
+        self.protection = protection;
+    }
+
+    /// This pen minus its hyperlink and protection — what erase/fill operations
+    /// use, so blank cells never read as clickable and are never guarded, and
+    /// what style comparison uses, since neither is an SGR-visible attribute.
     pub(crate) fn without_link(&self) -> Pen {
         Pen {
             link: None,
+            protection: Protection::None,
             ..*self
         }
     }
@@ -134,6 +165,7 @@ impl Pen {
             && !self.is_blink()
             && !self.is_inverse()
             && self.link.is_none()
+            && self.protection == Protection::None
     }
 }
 
@@ -145,6 +177,7 @@ impl Default for Pen {
             intensity: Intensity::Normal,
             attrs: 0,
             link: None,
+            protection: Protection::None,
         }
     }
 }
