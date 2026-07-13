@@ -16,7 +16,9 @@
 use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
-use ghost_term::{ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp};
+use ghost_term::{
+    ActionPolicy, ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp,
+};
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
 
@@ -186,6 +188,12 @@ pub struct TerminalModel {
     /// `CSI 11 t`. What the window manager did with the request is its own
     /// business — this is what the program asked for and what it reads back.
     iconified: bool,
+    /// What this session may do *outside* its own screen — put text on the system
+    /// clipboard, minimize the window (see [`ghost_term::policy`]). Enforced here,
+    /// at the point the queued side effect would be carried out, rather than in the
+    /// emulator: only this layer knows whether the session is even on screen, and a
+    /// policy that later wants to *ask* the user needs the payload to still exist.
+    action_policy: ActionPolicy,
     /// Whether the window is maximized or full-screen at a program's asking, and
     /// the grid it had before each — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts
     /// that grid back rather than guessing a size. The two keep *separate* slots:
@@ -364,6 +372,7 @@ impl TerminalModel {
             iconified: false,
             maximized: false,
             fullscreen: false,
+            action_policy: ActionPolicy::default(),
             maximize_restore: None,
             fullscreen_restore: None,
             pad: 0.0,
@@ -497,6 +506,22 @@ impl TerminalModel {
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// What this session may do outside its own screen — the clipboard, the window
+    /// (see [`ghost_term::policy`]). Safe to change while the session runs: nothing
+    /// here is screen state, so the session host needn't agree with us about it.
+    pub fn set_action_policy(&mut self, policy: ActionPolicy) {
+        self.action_policy = policy;
+    }
+
+    /// What the program may change about the terminal itself (see
+    /// [`ghost_term::policy`]). Set this when the session is created and leave it:
+    /// the session host runs its own emulator over the same bytes and re-seeds ours
+    /// on every attach, so a policy the two disagree about is state that appears and
+    /// vanishes depending on who was looking.
+    pub fn set_terminal_policy(&mut self, policy: ghost_term::TerminalPolicy) {
+        self.screen.set_policy(policy);
     }
 
     /// The session id these effects target.
@@ -763,6 +788,23 @@ impl TerminalModel {
     fn apply_window_ops(&mut self) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         for op in self.screen.take_window_ops() {
+            // Minimizing, maximizing and going full-screen are the window's, not the
+            // screen's — the emulator only queued them, and this is where they would
+            // actually happen, so this is where the policy gets a say. Drained either
+            // way, so a refusal doesn't leave them piling up. (The resizes below are
+            // *grid* ops that reach the window as a consequence; the emulator gates
+            // those, since the grid is screen state it must agree with the host on.)
+            if !self.action_policy.window_control
+                && matches!(
+                    op,
+                    XtwinopsOp::Iconify
+                        | XtwinopsOp::Deiconify
+                        | XtwinopsOp::Maximize(_)
+                        | XtwinopsOp::Fullscreen(_)
+                )
+            {
+                continue;
+            }
             // The screen's own size, not `self.cols`/`self.rows` — those are
             // reconciled once, after this loop, so within a burst they are the grid
             // we *started* with. Two ops in one write (`\e[9;2t\e[9;3t`: grow one
@@ -1438,6 +1480,11 @@ impl TerminalModel {
             // set-clipboard). The emulator already decoded, size-capped, and
             // refused the read form; route each write to its selection.
             for (target, text) in self.screen.take_clipboard_writes() {
+                // Drained whatever the policy says — a refused write is dropped
+                // here, not left to pile up in the emulator.
+                if !self.action_policy.clipboard_write {
+                    continue;
+                }
                 cmds.push(match target {
                     ClipboardSelection::Clipboard => Cmd::WriteClipboard(text),
                     ClipboardSelection::Primary => Cmd::WritePrimary(text),
@@ -2191,6 +2238,42 @@ mod tests {
         // Vertically: the columns it had, the display's height.
         feed(&mut m, b"\x1b[9;2t");
         assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;80t");
+    }
+
+    #[test]
+    fn a_policy_can_refuse_the_clipboard_and_the_window_without_touching_the_screen() {
+        let mut m = model();
+        m.set_action_policy(ActionPolicy::deny_all());
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            // A clipboard write, a minimize — and a plain print, which is the
+            // session's own screen and never a policy matter.
+            bytes: b"\x1b]52;c;aGVsbG8=\x07\x1b[2thello".to_vec(),
+            ended: false,
+        });
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Cmd::WriteClipboard(_) | Cmd::WritePrimary(_) | Cmd::SetIconified(_)
+            )),
+            "the policy refused both: {cmds:?}"
+        );
+        assert!(
+            m.screen().vt().text()[0].starts_with("hello"),
+            "the program still owns its own screen"
+        );
+    }
+
+    #[test]
+    fn the_default_policy_still_carries_out_the_clipboard_and_the_window() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]52;c;aGVsbG8=\x07\x1b[2t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::WriteClipboard("hello".to_string())));
+        assert!(cmds.contains(&Cmd::SetIconified(true)));
     }
 
     #[test]

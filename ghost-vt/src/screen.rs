@@ -206,6 +206,13 @@ impl Screen {
     /// Borrow the underlying emulator core for read-only consumers such as a
     /// renderer's layout pass (`ghost_render::layout_frame`), which needs the
     /// live styled grid and cursor rather than a text/CPR snapshot.
+    /// What a program on this session's tty may change about the terminal (see
+    /// [`ghost_term::policy`]). The session host and an attached frontend each run
+    /// one of these over the same bytes: give them the same policy.
+    pub fn set_policy(&mut self, policy: ghost_term::TerminalPolicy) {
+        self.vt.set_policy(policy);
+    }
+
     pub fn vt(&self) -> &Vt {
         &self.vt
     }
