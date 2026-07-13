@@ -62,7 +62,16 @@ pub enum Query {
     /// (`4;0;?;1;?`), and each is answered by its own `OSC 4 ; c ;
     /// rgb:rrrr/gggg/bbbb ST`, in the order asked. The color reported is what the
     /// screen shows: the app's OSC 4 override if it set one, else the theme's.
-    PaletteColors(Vec<u8>),
+    ///
+    /// An index at or past [`ghost_term::SPECIAL_COLOR_BASE`] names a special
+    /// color (see [`Query::SpecialColors`]) — xterm's other way of addressing
+    /// them, answered in the form it was asked in.
+    PaletteColors(Vec<u16>),
+    /// `OSC 5 ; c ; ? ST` — a special color (bold, underline, blink, reverse,
+    /// italic), answered as `OSC 5 ; c ; rgb:rrrr/gggg/bbbb ST`. An app that has
+    /// not set one reads back the theme foreground, which is what its text is
+    /// painted with.
+    SpecialColors(Vec<u16>),
     /// `CSI ? 996 n` — one-shot color-scheme request (contour's dark/light
     /// extension, mode 2031's query form). Reply: `CSI ? 997 ; Ps n` with
     /// Ps 1 = dark, 2 = light.
@@ -179,6 +188,9 @@ pub struct ReplyCtx<'a> {
     /// query must report, since it is what the screen shows. `None` falls back to
     /// the theme (see [`ThemeColors::ansi`]). Fed by [`ghost_term::Vt::palette_color`].
     pub palette: &'a dyn Fn(u8) -> Option<[u8; 3]>,
+    /// The app's OSC 5 override for a special color, if it set one. `None` falls
+    /// back to the theme foreground. Fed by [`ghost_term::Vt::special_color`].
+    pub special: &'a dyn Fn(ghost_term::SpecialColor) -> Option<[u8; 3]>,
     /// A DEC private mode's DECRQM report for `CSI ? Ps $ p`.
     pub mode_state: &'a dyn Fn(u16) -> ghost_term::ModeReport,
     /// The DECRQCRA rectangle checksum over 0-based inclusive `(top, left,
@@ -191,6 +203,45 @@ pub struct ReplyCtx<'a> {
 /// (each 8-bit channel doubled into 16 bits).
 fn xterm_rgb([r, g, b]: [u8; 3]) -> String {
     format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+/// The color numbers an OSC 4/OSC 5 body asks about: the `c` of every `c ; ?`
+/// pair, in the order asked, keeping only those `exists` names (the sets and
+/// the colors ghost doesn't have are not replied to). One reply per ask keeps
+/// an app's reads in step with its questions.
+fn asked_colors(body: &str, exists: impl Fn(u16) -> bool) -> Vec<u16> {
+    let mut fields = body.split(';');
+    let mut asked = Vec::new();
+    while let (Some(number), Some(spec)) = (fields.next(), fields.next()) {
+        // A color we don't have is dropped on its own — the asks beside it are
+        // still answered, as the set path leaves its neighbours alone. Dropping
+        // the whole OSC instead would leave an app blocking on a reply it asked
+        // for and could have had.
+        if spec == "?"
+            && let Ok(c) = number.parse::<u16>()
+            && exists(c)
+        {
+            asked.push(c);
+        }
+    }
+    asked
+}
+
+/// Whether an OSC 4 index names a color ghost has: one of the 256 indexed
+/// colors, or one of the five special colors past them.
+fn palette_index_exists(i: u16) -> bool {
+    i < ghost_term::SPECIAL_COLOR_BASE
+        || ghost_term::SpecialColor::from_code(i - ghost_term::SPECIAL_COLOR_BASE).is_some()
+}
+
+/// What a special color (OSC 5's `c`) reports: the app's override, else the
+/// theme foreground — ghost paints bold/underline/… text in the pen's own
+/// color, so that is the color the screen shows. An unknown code (xterm has
+/// five) reads as the foreground too; the scanner does not produce one.
+fn special_rgb(ctx: &ReplyCtx, code: u16) -> [u8; 3] {
+    ghost_term::SpecialColor::from_code(code)
+        .and_then(ctx.special)
+        .unwrap_or(ctx.colors.fg)
 }
 
 /// The DECRPM `Pm` value for a mode report: 0 unrecognized, 1 set, 2 reset,
@@ -293,10 +344,24 @@ impl Query {
             Query::PaletteColors(indices) => {
                 let mut out = String::new();
                 for &i in indices {
-                    // What the screen shows: the app's override, else the theme's.
-                    let rgb = (ctx.palette)(i)
-                        .unwrap_or_else(|| ghost_term::index_rgb(i, &ctx.colors.ansi));
+                    let rgb = match u8::try_from(i) {
+                        // What the screen shows: the app's override, else the theme's.
+                        Ok(i) => (ctx.palette)(i)
+                            .unwrap_or_else(|| ghost_term::index_rgb(i, &ctx.colors.ansi)),
+                        // Past the palette: a special color, asked for the long way.
+                        Err(_) => special_rgb(ctx, i - ghost_term::SPECIAL_COLOR_BASE),
+                    };
                     out.push_str(&format!("\x1b]4;{i};{}\x1b\\", xterm_rgb(rgb)));
+                }
+                out.into_bytes()
+            }
+            Query::SpecialColors(codes) => {
+                let mut out = String::new();
+                for &c in codes {
+                    out.push_str(&format!(
+                        "\x1b]5;{c};{}\x1b\\",
+                        xterm_rgb(special_rgb(ctx, c))
+                    ));
                 }
                 out.into_bytes()
             }
@@ -462,23 +527,17 @@ impl QueryScanner {
             // OSC 4 ; c ; spec [; c ; spec]… — only the `?` pairs are queries; the
             // rest are sets the emulator applies (and are skipped here). One reply
             // per index asked, so they stay in step with the app's reads.
-            "4" => {
-                let mut fields = rest.split(';');
-                let mut asked = Vec::new();
-                while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
-                    if spec == "?" {
-                        match index.parse::<u8>() {
-                            Ok(i) => asked.push(i),
-                            Err(_) => return Vec::new(),
-                        }
-                    }
-                }
-                if asked.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Query::PaletteColors(asked)]
-                }
-            }
+            // An index past the palette names a special color, which is answered in
+            // the OSC 4 form it was asked in (`Query::PaletteColors`).
+            "4" => match asked_colors(rest, palette_index_exists) {
+                asked if asked.is_empty() => Vec::new(),
+                asked => vec![Query::PaletteColors(asked)],
+            },
+            // OSC 5 ; c ; spec … — the same colors named from 0, answered as OSC 5.
+            "5" => match asked_colors(rest, |c| ghost_term::SpecialColor::from_code(c).is_some()) {
+                asked if asked.is_empty() => Vec::new(),
+                asked => vec![Query::SpecialColors(asked)],
+            },
             _ => Vec::new(),
         }
     }
@@ -800,6 +859,11 @@ mod tests {
         None
     }
 
+    /// A `special` for tests: the app has overridden nothing.
+    fn no_special(_: ghost_term::SpecialColor) -> Option<[u8; 3]> {
+        None
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -815,6 +879,7 @@ mod tests {
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
             palette: &no_palette,
+            special: &no_special,
             mode_state: &no_modes,
             checksum: &echo_rect,
         }
@@ -963,6 +1028,72 @@ mod tests {
         assert_eq!(
             Query::PaletteColors(vec![2, 1]).reply(&cx),
             b"\x1b]4;2;rgb:0000/1111/2222\x1b\\\x1b]4;1;rgb:ffff/0000/0000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn recognizes_special_color_queries_in_both_forms() {
+        // OSC 5 names the special colors from 0; OSC 4 names the same ones past
+        // the 256 indexed colors, and answers in the form it was asked in.
+        assert_eq!(
+            scan_all(b"\x1b]5;0;?\x07"),
+            [Query::SpecialColors(vec![0])],
+            "OSC 5, bold"
+        );
+        assert_eq!(
+            scan_all(b"\x1b]5;0;?;1;?\x1b\\"),
+            [Query::SpecialColors(vec![0, 1])],
+            "one OSC may ask for several"
+        );
+        assert_eq!(
+            scan_all(b"\x1b]4;256;?\x07"),
+            [Query::PaletteColors(vec![256])],
+            "the OSC 4 form of the same color"
+        );
+        // Sets and resets are not queries.
+        assert!(scan_all(b"\x1b]5;0;#ff0000\x07").is_empty());
+        assert!(scan_all(b"\x1b]105;0\x07").is_empty());
+    }
+
+    #[test]
+    fn an_ask_for_a_color_we_do_not_have_does_not_swallow_the_asks_beside_it() {
+        // The app is blocked on one reply per `?` it sent; dropping the whole OSC
+        // over an index we can't answer would hang it on the ones we can.
+        assert_eq!(
+            scan_all(b"\x1b]4;1;?;9999;?;2;?\x07"),
+            [Query::PaletteColors(vec![1, 2])]
+        );
+        assert_eq!(
+            scan_all(b"\x1b]5;0;?;7;?\x07"),
+            [Query::SpecialColors(vec![0])]
+        );
+        // An OSC that asks only for colors we don't have is answered by silence.
+        assert!(scan_all(b"\x1b]5;7;?\x07").is_empty());
+    }
+
+    #[test]
+    fn special_color_replies_report_the_override_then_the_theme() {
+        let bold_is_red = |t: ghost_term::SpecialColor| {
+            (t == ghost_term::SpecialColor::Bold).then_some([0xff, 0x00, 0x00])
+        };
+        let cx = ReplyCtx {
+            special: &bold_is_red,
+            ..ctx()
+        };
+        // Asked as OSC 5, answered as OSC 5 — and an unset one falls back to the
+        // theme foreground, which is what ghost paints the text with.
+        assert_eq!(
+            Query::SpecialColors(vec![0]).reply(&cx),
+            b"\x1b]5;0;rgb:ffff/0000/0000\x1b\\"
+        );
+        assert_eq!(
+            Query::SpecialColors(vec![4]).reply(&cx),
+            b"\x1b]5;4;rgb:d8d8/dbdb/e0e0\x1b\\"
+        );
+        // Asked as OSC 4, answered as OSC 4 — same color, the index it was asked by.
+        assert_eq!(
+            Query::PaletteColors(vec![256]).reply(&cx),
+            b"\x1b]4;256;rgb:ffff/0000/0000\x1b\\"
         );
     }
 

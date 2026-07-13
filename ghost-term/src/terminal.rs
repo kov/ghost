@@ -11,7 +11,7 @@ use crate::line::Line;
 use crate::links::Links;
 use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function,
-    Progress, SgrOp, SgrOps, TbcScope, XtwinopsOp,
+    Progress, SgrOp, SgrOps, SpecialColor, TbcScope, XtwinopsOp, SPECIAL_COLOR_BASE,
 };
 use crate::pen::{Intensity, Pen, Protection};
 use crate::tabs::Tabs;
@@ -153,6 +153,10 @@ pub struct Terminal {
     /// an untouched palette costs the renderer nothing. Boxed: 1 KiB of mostly-
     /// `None` has no business inflating every `Terminal` by value.
     palette: Box<[Option<[u8; 3]>; 256]>,
+    /// OSC 5 special-color overrides, indexed by [`SpecialColor`] (bold,
+    /// underline, blink, reverse, italic). Tracked so a program's set/query
+    /// round-trips; nothing paints with them (see [`SpecialColor`]).
+    special_colors: [Option<[u8; 3]>; 5],
     /// OSC 9;4 taskbar progress, the running task's own report. Dumped, so a
     /// long task's progress survives detach/reattach.
     progress: Option<Progress>,
@@ -302,6 +306,7 @@ impl Terminal {
             last_exit: None,
             dynamic_colors: [None; 3],
             palette: Box::new([None; 256]),
+            special_colors: [None; 5],
             progress: None,
             bell_count: 0,
             graphics: GraphicsState::default(),
@@ -814,19 +819,29 @@ impl Terminal {
                 }
             }
 
+            // An index past the palette names a special color (OSC 5's, which the
+            // parser folds onto this form) — the parser has already dropped the
+            // indices that name neither.
             SetPalette(entries) => {
                 for (index, rgb) in entries {
-                    self.palette[index as usize] = Some(rgb);
+                    match self.color_slot(index) {
+                        Some(slot) => *slot = Some(rgb),
+                        None => debug_assert!(false, "parser passed OSC 4 index {index}"),
+                    }
                 }
             }
 
-            // No indices = the whole palette (xterm's `OSC 104 ST`).
+            // No indices = the whole palette (xterm's `OSC 104 ST`), special
+            // colors aside — OSC 105 resets those, and reaches here as its five
+            // indices spelled out.
             ResetPalette(indices) => {
                 if indices.is_empty() {
                     *self.palette = [None; 256];
                 } else {
                     for index in indices {
-                        self.palette[index as usize] = None;
+                        if let Some(slot) = self.color_slot(index) {
+                            *slot = None;
+                        }
                     }
                 }
             }
@@ -1479,6 +1494,7 @@ impl Terminal {
         self.last_exit = None;
         self.dynamic_colors = [None; 3];
         *self.palette = [None; 256];
+        self.special_colors = [None; 5];
         self.progress = None;
     }
 
@@ -1624,6 +1640,24 @@ impl Terminal {
         &self.palette
     }
 
+    /// The OSC 5 override for a special color, if an app set one.
+    pub fn special_color(&self, target: SpecialColor) -> Option<[u8; 3]> {
+        self.special_colors[target as usize]
+    }
+
+    /// The override slot an OSC 4 index addresses: the indexed palette below
+    /// [`SPECIAL_COLOR_BASE`], a special color above it (`None` for an index
+    /// naming neither, which the parser already filters out).
+    fn color_slot(&mut self, index: u16) -> Option<&mut Option<[u8; 3]>> {
+        match index.checked_sub(SPECIAL_COLOR_BASE) {
+            None => Some(&mut self.palette[index as usize]),
+            Some(code) => {
+                let target = SpecialColor::from_code(code)?;
+                Some(&mut self.special_colors[target as usize])
+            }
+        }
+    }
+
     /// Whether the app has left the palette alone (the common case): the renderer
     /// then needs no override table at all.
     pub fn palette_is_default(&self) -> bool {
@@ -1714,6 +1748,7 @@ impl Terminal {
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
         assert_eq!(self.tracked_modes, other.tracked_modes);
         assert_eq!(self.palette, other.palette);
+        assert_eq!(self.special_colors, other.special_colors);
         assert_eq!(self.title, other.title);
 
         assert_eq!(
@@ -3214,14 +3249,21 @@ impl Terminal {
             funs.push(Function::SetProgress(self.progress));
         }
 
-        // 18. restore the indexed-palette overrides (OSC 4) — one sequence for
-        // all of them, since a dump replays into a terminal whose palette is the
-        // theme's (nothing to reset first).
-        let entries: Vec<(u8, [u8; 3])> = self
+        // 18. restore the indexed-palette overrides (OSC 4) and the special colors
+        // (which ride the same sequence, at `SPECIAL_COLOR_BASE + c`) — one
+        // sequence for all of them, since a dump replays into a terminal whose
+        // colors are the theme's (nothing to reset first).
+        let entries: Vec<(u16, [u8; 3])> = self
             .palette
             .iter()
             .enumerate()
-            .filter_map(|(i, rgb)| rgb.map(|rgb| (i as u8, rgb)))
+            .filter_map(|(i, rgb)| rgb.map(|rgb| (i as u16, rgb)))
+            .chain(
+                self.special_colors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, rgb)| rgb.map(|rgb| (SPECIAL_COLOR_BASE + c as u16, rgb))),
+            )
             .collect();
         if !entries.is_empty() {
             funs.push(Function::SetPalette(entries));

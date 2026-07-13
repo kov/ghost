@@ -1,6 +1,6 @@
 use crate::graphics::{Image, Placement};
 use crate::line::Line;
-use crate::parser::{self, DecMode, DynamicColor, Parser, Progress};
+use crate::parser::{self, DecMode, DynamicColor, Parser, Progress, SpecialColor};
 use crate::terminal::{ClipboardSelection, Cursor, Terminal};
 
 /// The active mouse-reporting protocol (DEC private modes 1000/1002/1003),
@@ -195,6 +195,12 @@ impl Vt {
     /// Whether the app has left the palette untouched (the common case).
     pub fn palette_is_default(&self) -> bool {
         self.terminal.palette_is_default()
+    }
+
+    /// The app-set special color (OSC 5, or OSC 4 past the palette), if any —
+    /// tracked so a query round-trips; ghost paints with the pen's own color.
+    pub fn special_color(&self, target: SpecialColor) -> Option<[u8; 3]> {
+        self.terminal.special_color(target)
     }
 
     /// The task progress the app last reported (OSC 9;4), if any.
@@ -452,7 +458,7 @@ pub struct Changes<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::Vt;
+    use super::{SpecialColor, Vt};
     use proptest::prelude::*;
     use std::env;
     use std::fs;
@@ -2231,6 +2237,96 @@ mod tests {
         // RIS takes the palette back to the theme's.
         vt.feed_str("\x1bc");
         assert!(vt.palette_is_default());
+    }
+
+    #[test]
+    fn osc_5_sets_the_special_colors_and_osc_105_resets_them() {
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.special_color(SpecialColor::Bold), None);
+
+        vt.feed_str("\x1b]5;0;rgb:f0f0/0000/0000\x07");
+        assert_eq!(
+            vt.special_color(SpecialColor::Bold),
+            Some([0xf0, 0x00, 0x00])
+        );
+
+        // Several pairs in one OSC, as OSC 4 takes.
+        vt.feed_str("\x1b]5;1;#00ff00;4;#0000ff\x1b\\");
+        assert_eq!(
+            vt.special_color(SpecialColor::Underline),
+            Some([0x00, 0xff, 0x00])
+        );
+        assert_eq!(
+            vt.special_color(SpecialColor::Italic),
+            Some([0x00, 0x00, 0xff])
+        );
+
+        // xterm addresses the same five through OSC 4, offset past the 256
+        // indexed colors: 256 is bold, so 258 is blink.
+        vt.feed_str("\x1b]4;258;#ffffff\x07");
+        assert_eq!(
+            vt.special_color(SpecialColor::Blink),
+            Some([0xff, 0xff, 0xff])
+        );
+        assert!(vt.palette_is_default(), "the indexed palette is untouched");
+
+        // OSC 105 resets the named ones — and OSC 104 the offset form — while
+        // OSC 105 with no index resets all five.
+        vt.feed_str("\x1b]105;0\x07");
+        assert_eq!(vt.special_color(SpecialColor::Bold), None);
+        vt.feed_str("\x1b]104;257\x07");
+        assert_eq!(vt.special_color(SpecialColor::Underline), None);
+        vt.feed_str("\x1b]105\x07");
+        assert_eq!(vt.special_color(SpecialColor::Blink), None);
+        assert_eq!(vt.special_color(SpecialColor::Italic), None);
+    }
+
+    #[test]
+    fn a_reset_that_names_only_colors_we_do_not_have_resets_nothing() {
+        // "Reset every color" is the *empty* index list (`OSC 104`/`OSC 105` with
+        // no argument). A reset that names colors and happens to name none we have
+        // must not collapse into it and wipe the lot.
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]4;1;#ff0000\x07\x1b]5;0;#00ff00\x07");
+
+        vt.feed_str("\x1b]105;99\x07");
+        assert_eq!(
+            vt.special_color(SpecialColor::Bold),
+            Some([0x00, 0xff, 0x00])
+        );
+        assert_eq!(vt.palette_color(1), Some([0xff, 0x00, 0x00]));
+
+        vt.feed_str("\x1b]104;999\x07");
+        assert_eq!(vt.palette_color(1), Some([0xff, 0x00, 0x00]));
+        assert_eq!(
+            vt.special_color(SpecialColor::Bold),
+            Some([0x00, 0xff, 0x00])
+        );
+
+        // A reset that names a real color alongside a bogus one still does its job.
+        vt.feed_str("\x1b]104;1;999\x07");
+        assert_eq!(vt.palette_color(1), None);
+    }
+
+    #[test]
+    fn a_special_color_survives_a_dump_and_a_hard_reset_clears_it() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]5;0;#ff0000;3;#00ff00\x07");
+
+        let mut reloaded = Vt::new(20, 5);
+        reloaded.feed_str(&vt.dump());
+        assert_eq!(
+            reloaded.special_color(SpecialColor::Bold),
+            Some([0xff, 0x00, 0x00])
+        );
+        assert_eq!(
+            reloaded.special_color(SpecialColor::Reverse),
+            Some([0x00, 0xff, 0x00])
+        );
+
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.special_color(SpecialColor::Bold), None);
+        assert_eq!(vt.special_color(SpecialColor::Reverse), None);
     }
 
     #[test]

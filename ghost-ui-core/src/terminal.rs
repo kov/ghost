@@ -1171,6 +1171,7 @@ impl TerminalModel {
             let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
             let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
             let palette = |i: u8| screen.vt().palette_color(i);
+            let special = |t| screen.vt().special_color(t);
             let (lm, rm) = screen.vt().left_right_margins();
             let (tm, bm) = screen.vt().top_bottom_margins();
             let ctx = ReplyCtx {
@@ -1186,6 +1187,7 @@ impl TerminalModel {
                 ansi_mode_state: &ansi_mode_state,
                 colors: screen.effective_colors(self.theme),
                 palette: &palette,
+                special: &special,
                 mode_state: &mode_state,
                 checksum: &checksum,
             };
@@ -4352,6 +4354,11 @@ mod tests {
         None
     }
 
+    /// A `special` for tests: the app has overridden no special color.
+    fn no_special(_: ghost_term::SpecialColor) -> Option<[u8; 3]> {
+        None
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn reply_ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -4367,6 +4374,7 @@ mod tests {
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
             palette: &no_palette,
+            special: &no_special,
             mode_state: &no_modes,
             checksum: &no_checksum,
         }

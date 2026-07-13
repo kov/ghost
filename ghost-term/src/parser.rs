@@ -181,10 +181,15 @@ pub enum Function {
     /// OSC 4 indexed-palette set: `(index, rgb)` for every pair the sequence
     /// carried (one OSC may set several). Query (`?`) pairs are not here — the
     /// host answers those from the live palette.
-    SetPalette(Vec<(u8, [u8; 3])>),
+    ///
+    /// The index is 16-bit because xterm addresses the five special colors
+    /// (bold, underline, …) past the end of the 256 indexed ones — `256 + c`,
+    /// the same colors OSC 5 names directly. [`SPECIAL_COLOR_BASE`] splits them.
+    SetPalette(Vec<(u16, [u8; 3])>),
     /// OSC 104 palette reset: the indices to take back to the theme's colors, or
-    /// an empty list for "all of them".
-    ResetPalette(Vec<u8>),
+    /// an empty list for "all of them" (which, as in xterm, leaves the special
+    /// colors alone — OSC 105 resets those).
+    ResetPalette(Vec<u16>),
     /// OSC 9;4 taskbar progress; `None` (state 0) removes it.
     SetProgress(Option<Progress>),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
@@ -305,6 +310,42 @@ pub enum DynamicColor {
     Foreground,
     Background,
     Cursor,
+}
+
+/// The five xterm "special colors" an application can override with OSC 5 (and
+/// reset with OSC 105): the color to paint text carrying an attribute with,
+/// instead of the pen's own. Ghost tracks them so a program's set/query
+/// round-trips, but — like xterm with its `colorBDMode` and friends off — does
+/// not paint with them.
+///
+/// xterm also addresses them through OSC 4, at [`SPECIAL_COLOR_BASE`] `+ c`,
+/// past the end of the 256 indexed colors.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SpecialColor {
+    Bold = 0,
+    Underline = 1,
+    Blink = 2,
+    Reverse = 3,
+    Italic = 4,
+}
+
+/// The OSC 4 index the special colors start at: `OSC 4 ; 256` is OSC 5's color
+/// 0 (bold). The 256 indexed colors come below it.
+pub const SPECIAL_COLOR_BASE: u16 = 256;
+
+impl SpecialColor {
+    /// The special color OSC 5 names `c` (and OSC 4 names `SPECIAL_COLOR_BASE +
+    /// c`), or `None` for one xterm has and ghost does not.
+    pub fn from_code(c: u16) -> Option<Self> {
+        match c {
+            0 => Some(SpecialColor::Bold),
+            1 => Some(SpecialColor::Underline),
+            2 => Some(SpecialColor::Blink),
+            3 => Some(SpecialColor::Reverse),
+            4 => Some(SpecialColor::Italic),
+            _ => None,
+        }
+    }
 }
 
 /// The OSC 133 semantic marks (FinalTerm shell integration): where a prompt
@@ -1279,24 +1320,55 @@ impl Parser {
             // live palette (see `ghost_vt::query`), so it sets nothing here;
             // unparseable specs (named X11 colors) and out-of-range indices are
             // skipped, leaving their neighbours in the same OSC untouched.
+            // Indices past the palette (`SPECIAL_COLOR_BASE + c`) name the special
+            // colors OSC 5 names directly; the terminal routes them.
             "4" => {
                 let mut fields = rest.split(';');
                 let mut set = Vec::new();
                 while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
-                    if let (Ok(i), Some(rgb)) = (index.parse::<u8>(), parse_color_spec(spec)) {
-                        set.push((i, rgb));
+                    if let (Ok(i), Some(rgb)) = (index.parse::<u16>(), parse_color_spec(spec)) {
+                        if palette_index_exists(i) {
+                            set.push((i, rgb));
+                        }
+                    }
+                }
+                (!set.is_empty()).then_some(Function::SetPalette(set))
+            }
+            // OSC 5 ; c ; spec [; c ; spec]… — the same as OSC 4, addressing the
+            // special colors from 0 rather than past the palette. It folds onto
+            // the OSC 4 form, so both reach the terminal as one function.
+            "5" => {
+                let mut fields = rest.split(';');
+                let mut set = Vec::new();
+                while let (Some(code), Some(spec)) = (fields.next(), fields.next()) {
+                    if let (Ok(c), Some(rgb)) = (code.parse::<u16>(), parse_color_spec(spec)) {
+                        if SpecialColor::from_code(c).is_some() {
+                            set.push((SPECIAL_COLOR_BASE + c, rgb));
+                        }
                     }
                 }
                 (!set.is_empty()).then_some(Function::SetPalette(set))
             }
             // OSC 104 [; index]… — reset palette colors to the theme's; with no
-            // index, the whole palette. (`OSC 104 ;` — xterm's reset-all — has an
-            // empty `rest`, hence the filter.)
-            "104" => Some(Function::ResetPalette(
-                rest.split(';')
-                    .filter_map(|i| i.parse::<u8>().ok())
-                    .collect(),
-            )),
+            // index, the whole palette (`OSC 104` and `OSC 104 ;`, xterm's
+            // reset-all, both arrive with an empty `rest`).
+            "104" => Some(Function::ResetPalette(reset_indices(
+                rest,
+                |i| i,
+                palette_index_exists,
+            )?)),
+            // OSC 105 [; c]… — reset special colors; with no code, all five. The
+            // "all" case is spelled out rather than left empty, which OSC 104
+            // already means (the whole indexed palette, special colors aside).
+            "105" => Some(Function::ResetPalette(if rest.is_empty() {
+                (0..5).map(|c| SPECIAL_COLOR_BASE + c).collect()
+            } else {
+                reset_indices(
+                    rest,
+                    |c| SPECIAL_COLOR_BASE + c,
+                    |c| SpecialColor::from_code(c).is_some(),
+                )?
+            })),
             // OSC 10/11/12 — set a dynamic color. xterm's consecutive-code form
             // gives one OSC several specs, each setting the *next* color (`OSC 10 ;
             // fg ; bg`); codes past the cursor (12) name colors ghost doesn't have
@@ -2248,6 +2320,37 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
         2031 => Some(ColorSchemeReport),
         _ => None,
     }
+}
+
+/// Whether an OSC 4 index names a color ghost has: one of the 256 indexed
+/// colors, or one of the five special colors past them. Anything else (xterm's
+/// mouse/Tek/highlight colors, or nonsense) is skipped, leaving its neighbours
+/// in the same OSC untouched.
+fn palette_index_exists(i: u16) -> bool {
+    i < SPECIAL_COLOR_BASE || SpecialColor::from_code(i - SPECIAL_COLOR_BASE).is_some()
+}
+
+/// The colors an OSC 104/105 reset names, mapped into palette indices by `slot`
+/// — dropping the ones that name a color ghost doesn't have, the way a set does.
+///
+/// `None` if the sequence named colors but none of them survived. An *empty*
+/// list is how "reset all of them" reaches the terminal, so a reset that named
+/// only colors we don't have must not collapse into it and wipe the palette.
+fn reset_indices(
+    rest: &str,
+    slot: impl Fn(u16) -> u16,
+    exists: impl Fn(u16) -> bool,
+) -> Option<Vec<u16>> {
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    let indices: Vec<u16> = rest
+        .split(';')
+        .filter_map(|i| i.parse::<u16>().ok())
+        .filter(|i| exists(*i))
+        .map(slot)
+        .collect();
+    (!indices.is_empty()).then_some(indices)
 }
 
 /// Parse an XParseColor-style color spec to 8-bit RGB. `rgb:R/G/B` takes 1–4
