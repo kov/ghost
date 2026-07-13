@@ -12,7 +12,8 @@
 #   conformance/run.sh                 # default cursor/CPR include-set
 #   INCLUDE='CUP|CUU' conformance/run.sh
 #   MAX_VT_LEVEL=3 INCLUDE='CHA' conformance/run.sh
-#   GHOST_BIN=target/release/ghost conformance/run.sh
+#   GHOST_BIN=target/release/ghost conformance/run.sh   # your binary, never built
+#   GHOST_BUILD=0 conformance/run.sh                    # skip the rebuild
 #
 # Exit status: 0 if the suite ran and nothing failed; 1 if any test FAILED or
 # the harness could not produce a report; 0 with a SKIP note if python3 is
@@ -24,7 +25,20 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 esctest="$here/esctest2/esctest/esctest.py"
 
-GHOST_BIN="${GHOST_BIN:-$repo/target/debug/ghost}"
+# The binary under test. An explicit GHOST_BIN is the caller's own artifact (a
+# release build, a CI download) — run it as given, never rebuild it. The default
+# debug binary we *do* build ourselves: this is a dev loop, and a stale
+# target/debug/ghost silently tests code you no longer have (an easy hour to
+# lose chasing a phantom pass or fail). GHOST_BUILD=0 opts out; a missing cargo
+# just falls through to the not-found check below.
+GHOST_BIN="${GHOST_BIN:-}"
+if [ -z "$GHOST_BIN" ]; then
+  GHOST_BIN="$repo/target/debug/ghost"
+  if [ "${GHOST_BUILD:-1}" != "0" ] && command -v cargo >/dev/null 2>&1; then
+    echo "building ghost…"
+    (cd "$repo" && cargo build -p ghost-ui) || exit 1
+  fi
+fi
 # Default: a small SMOKE set of families that currently pass clean (measured
 # without --force, so the assertions really run), giving a bare `run.sh` a
 # green exit. Class-anchored (`re.search` over `Class.test_name`, so a loose
@@ -40,7 +54,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [ ! -x "$GHOST_BIN" ]; then
   echo "ERROR: ghost binary not found at $GHOST_BIN"
-  echo "       build it first:  cargo build -p ghost-ui"
+  echo "       build it:  cargo build -p ghost-ui"
   exit 1
 fi
 if [ ! -f "$esctest" ]; then
