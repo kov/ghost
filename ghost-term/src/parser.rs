@@ -173,9 +173,11 @@ pub enum Function {
     /// OSC 52 clipboard write: the raw `Pc` selection list and the base64
     /// `Pd` payload, decoded and dispatched by the terminal.
     SetClipboard(String, String),
-    /// OSC 10/11/12 dynamic-color set (spec already parsed to 8-bit RGB) or
-    /// the matching OSC 110/111/112 reset (`None`) back to the theme default.
-    SetDynamicColor(DynamicColor, Option<[u8; 3]>),
+    /// OSC 10/11/12 dynamic-color set (specs already parsed to 8-bit RGB) or the
+    /// matching OSC 110/111/112 reset (`None`) back to the theme default. A list
+    /// because xterm's consecutive-code form lets one OSC set several: `OSC 10 ;
+    /// fg ; bg` sets the foreground *and* the background.
+    SetDynamicColor(Vec<(DynamicColor, Option<[u8; 3]>)>),
     /// OSC 4 indexed-palette set: `(index, rgb)` for every pair the sequence
     /// carried (one OSC may set several). Query (`?`) pairs are not here — the
     /// host answers those from the live palette.
@@ -1295,24 +1297,45 @@ impl Parser {
                     .filter_map(|i| i.parse::<u8>().ok())
                     .collect(),
             )),
-            // OSC 10/11/12 — set a dynamic color. Only the first spec is
-            // taken (xterm's consecutive-code form is rare); the "?" query
-            // form is the host's to answer, and specs we can't parse
-            // (named colors) are dropped whole.
+            // OSC 10/11/12 — set a dynamic color. xterm's consecutive-code form
+            // gives one OSC several specs, each setting the *next* color (`OSC 10 ;
+            // fg ; bg`); codes past the cursor (12) name colors ghost doesn't have
+            // (mouse fg/bg, highlight, …) and are dropped. The "?" query form is the
+            // host's to answer, and specs we can't parse (named colors) are skipped
+            // — without disturbing the ones beside them.
             "10" | "11" | "12" => {
-                let target = match ps {
-                    "10" => DynamicColor::Foreground,
-                    "11" => DynamicColor::Background,
-                    _ => DynamicColor::Cursor,
+                let first = match ps {
+                    "10" => 0,
+                    "11" => 1,
+                    _ => 2,
                 };
-                let spec = rest.split(';').next().unwrap_or("");
-                let rgb = parse_color_spec(spec)?;
-                Some(Function::SetDynamicColor(target, Some(rgb)))
+                let mut set = Vec::new();
+                for (i, spec) in rest.split(';').enumerate() {
+                    let target = match first + i {
+                        0 => DynamicColor::Foreground,
+                        1 => DynamicColor::Background,
+                        2 => DynamicColor::Cursor,
+                        _ => break,
+                    };
+                    if let Some(rgb) = parse_color_spec(spec) {
+                        set.push((target, Some(rgb)));
+                    }
+                }
+                (!set.is_empty()).then_some(Function::SetDynamicColor(set))
             }
             // OSC 110/111/112 — reset a dynamic color to the theme default.
-            "110" => Some(Function::SetDynamicColor(DynamicColor::Foreground, None)),
-            "111" => Some(Function::SetDynamicColor(DynamicColor::Background, None)),
-            "112" => Some(Function::SetDynamicColor(DynamicColor::Cursor, None)),
+            "110" => Some(Function::SetDynamicColor(vec![(
+                DynamicColor::Foreground,
+                None,
+            )])),
+            "111" => Some(Function::SetDynamicColor(vec![(
+                DynamicColor::Background,
+                None,
+            )])),
+            "112" => Some(Function::SetDynamicColor(vec![(
+                DynamicColor::Cursor,
+                None,
+            )])),
             // OSC 133 — FinalTerm shell integration. The letter picks the
             // mark; anything after a `;` is extension parameters (kitty's
             // `k=s` and friends), accepted and dropped — except D's first
@@ -1787,18 +1810,23 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push_str(&format!("\u{1b}]9;4;{st};{pct}\u{7}"));
         }
 
-        SetDynamicColor(target, rgb) => {
-            let code = match target {
-                DynamicColor::Foreground => 10,
-                DynamicColor::Background => 11,
-                DynamicColor::Cursor => 12,
-            };
-            match rgb {
-                Some([r, g, b]) => {
-                    seq.push_str(&format!("\u{1b}]{code};rgb:{r:02x}/{g:02x}/{b:02x}\u{7}"));
+        // One OSC per color rather than the consecutive-code form: a dump is read
+        // by our own parser, and per-color is what a partial (fg-only) state needs
+        // anyway.
+        SetDynamicColor(entries) => {
+            for (target, rgb) in entries {
+                let code = match target {
+                    DynamicColor::Foreground => 10,
+                    DynamicColor::Background => 11,
+                    DynamicColor::Cursor => 12,
+                };
+                match rgb {
+                    Some([r, g, b]) => {
+                        seq.push_str(&format!("\u{1b}]{code};rgb:{r:02x}/{g:02x}/{b:02x}\u{7}"));
+                    }
+                    // Resets are OSC 110/111/112.
+                    None => seq.push_str(&format!("\u{1b}]1{code}\u{7}")),
                 }
-                // Resets are OSC 110/111/112.
-                None => seq.push_str(&format!("\u{1b}]1{code}\u{7}")),
             }
         }
 

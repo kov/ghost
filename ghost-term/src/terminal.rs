@@ -808,8 +808,10 @@ impl Terminal {
                 }
             }
 
-            SetDynamicColor(target, rgb) => {
-                self.dynamic_colors[target as usize] = rgb;
+            SetDynamicColor(entries) => {
+                for (target, rgb) in entries {
+                    self.dynamic_colors[target as usize] = rgb;
+                }
             }
 
             SetPalette(entries) => {
@@ -3235,7 +3237,7 @@ impl Terminal {
         .enumerate()
         {
             if let Some(rgb) = self.dynamic_colors[i] {
-                funs.push(Function::SetDynamicColor(target, Some(rgb)));
+                funs.push(Function::SetDynamicColor(vec![(target, Some(rgb))]));
             }
         }
 

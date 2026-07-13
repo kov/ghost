@@ -426,29 +426,60 @@ impl QueryScanner {
 
     /// Classify the just-terminated OSC, if it stayed small enough to be one
     /// of the queries we answer.
-    fn osc_query(&self) -> Option<Query> {
+    fn osc_query(&self) -> Vec<Query> {
         if self.osc_overflow {
-            return None;
+            return Vec::new();
         }
-        match self.osc.as_slice() {
-            b"10;?" => Some(Query::ForegroundColor),
-            b"11;?" => Some(Query::BackgroundColor),
-            b"12;?" => Some(Query::CursorColor),
+        let Ok(osc) = std::str::from_utf8(&self.osc) else {
+            return Vec::new();
+        };
+        let Some((ps, rest)) = osc.split_once(';') else {
+            return Vec::new();
+        };
+        match ps {
+            // OSC 10/11/12, including xterm's consecutive-code form: each spec
+            // after the first asks about the *next* color, so `10;?;?` reports the
+            // foreground and the background. A spec that isn't `?` is a set, which
+            // the emulator applies — but it still advances the code.
+            "10" | "11" | "12" => {
+                let first = match ps {
+                    "10" => 0,
+                    "11" => 1,
+                    _ => 2,
+                };
+                rest.split(';')
+                    .enumerate()
+                    .filter(|(_, spec)| *spec == "?")
+                    .map_while(|(i, _)| match first + i {
+                        0 => Some(Query::ForegroundColor),
+                        1 => Some(Query::BackgroundColor),
+                        2 => Some(Query::CursorColor),
+                        // Codes past the cursor name colors ghost doesn't have.
+                        _ => None,
+                    })
+                    .collect()
+            }
             // OSC 4 ; c ; spec [; c ; spec]… — only the `?` pairs are queries; the
-            // rest are sets the emulator applies (and are skipped here). An OSC
-            // that asks for nothing produces no reply.
-            osc if osc.starts_with(b"4;") => {
-                let s = std::str::from_utf8(osc).ok()?;
-                let mut fields = s[2..].split(';');
+            // rest are sets the emulator applies (and are skipped here). One reply
+            // per index asked, so they stay in step with the app's reads.
+            "4" => {
+                let mut fields = rest.split(';');
                 let mut asked = Vec::new();
                 while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
                     if spec == "?" {
-                        asked.push(index.parse::<u8>().ok()?);
+                        match index.parse::<u8>() {
+                            Ok(i) => asked.push(i),
+                            Err(_) => return Vec::new(),
+                        }
                     }
                 }
-                (!asked.is_empty()).then_some(Query::PaletteColors(asked))
+                if asked.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Query::PaletteColors(asked)]
+                }
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 
@@ -521,9 +552,7 @@ impl QueryScanner {
                 State::Osc => match b {
                     // BEL terminates: classify what was collected.
                     0x07 => {
-                        if let Some(q) = self.osc_query() {
-                            out.push(q);
-                        }
+                        out.extend(self.osc_query());
                         self.state = State::Ground;
                     }
                     0x1b => self.state = State::OscEsc,
@@ -534,9 +563,7 @@ impl QueryScanner {
                     // `ESC \` is ST; any other byte is still OSC payload (and
                     // an embedded escape disqualifies it as a query).
                     if b == b'\\' {
-                        if let Some(q) = self.osc_query() {
-                            out.push(q);
-                        }
+                        out.extend(self.osc_query());
                         self.state = State::Ground;
                     } else {
                         self.osc_overflow = true;
@@ -798,6 +825,16 @@ mod tests {
         assert_eq!(scan_all(b"\x1b]10;?\x07"), [Query::ForegroundColor]);
         assert_eq!(scan_all(b"\x1b]11;?\x1b\\"), [Query::BackgroundColor]);
         assert_eq!(scan_all(b"\x1b]12;?\x07"), [Query::CursorColor]);
+        // xterm's consecutive-code form: each further spec asks about the next
+        // color, so one OSC can ask for two — and gets two replies.
+        assert_eq!(
+            scan_all(b"\x1b]10;?;?\x07"),
+            [Query::ForegroundColor, Query::BackgroundColor]
+        );
+        assert_eq!(
+            scan_all(b"\x1b]11;?;?\x07"),
+            [Query::BackgroundColor, Query::CursorColor]
+        );
         // Set/reset forms and unrelated OSCs are not queries.
         assert!(scan_all(b"\x1b]11;#101012\x07").is_empty());
         assert!(scan_all(b"\x1b]112\x07").is_empty());

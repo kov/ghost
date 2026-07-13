@@ -2259,6 +2259,14 @@ mod tests {
         vt.feed_str("\x1b]11;bogus\x07");
         assert_eq!(vt.dynamic_background(), Some([0x10, 0x20, 0x30]));
 
+        // xterm's consecutive-code form: each further spec sets the next color
+        // (OSC 10 ; fg ; bg). Codes past the cursor (12) have no ghost color and
+        // are dropped.
+        vt.feed_str("\x1b]10;#010203;#040506;#070809;#0a0b0c\x07");
+        assert_eq!(vt.dynamic_foreground(), Some([0x01, 0x02, 0x03]));
+        assert_eq!(vt.dynamic_background(), Some([0x04, 0x05, 0x06]));
+        assert_eq!(vt.dynamic_cursor_color(), Some([0x07, 0x08, 0x09]));
+
         // OSC 110/111/112 reset each override to the theme default.
         vt.feed_str("\x1b]110\x07\x1b]111\x07\x1b]112\x07");
         assert_eq!(vt.dynamic_foreground(), None);
