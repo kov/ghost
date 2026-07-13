@@ -77,10 +77,12 @@ pub enum Query {
     /// Ps 1 = dark, 2 = light.
     ColorScheme,
     /// XTGETTCAP `DCS + q Pt ST` — termcap/terminfo capability query; `Pt` is
-    /// a `;`-separated list of hex-encoded capability names (decoded here).
+    /// a `;`-separated list of hex-encoded capability names, **kept as asked**.
     /// Answered per cap, kitty-style: `DCS 1 + r <hexname>[=<hexvalue>] ST`
     /// for a known cap (no `=value` for a true boolean), `DCS 0 + r <hexname>
-    /// ST` for an unknown one.
+    /// ST` for an unknown one — echoing the name hex for hex, since a client
+    /// matches the reply against the name it sent (esctest asks for `Co` as
+    /// `436F` and drops a reply that comes back as `436f`).
     Termcap(Vec<String>),
     /// DECRQSS `DCS $ q <selector> ST` — request a control-function setting.
     /// Only DECSCUSR (`" q"`, the cursor style — vim's t_RS probe) is
@@ -368,13 +370,14 @@ impl Query {
             Query::ColorScheme => color_scheme_report(&ctx.colors),
             Query::Termcap(names) => {
                 let mut out = String::new();
-                for name in names {
-                    match termcap_value(name) {
+                for asked in names {
+                    // The name goes back exactly as it came (see `Query::Termcap`).
+                    match unhex(asked).as_deref().and_then(termcap_value) {
                         Some(Some(value)) => {
-                            out.push_str(&format!("\x1bP1+r{}={}\x1b\\", hex(name), hex(&value)));
+                            out.push_str(&format!("\x1bP1+r{asked}={}\x1b\\", hex(&value)));
                         }
-                        Some(None) => out.push_str(&format!("\x1bP1+r{}\x1b\\", hex(name))),
-                        None => out.push_str(&format!("\x1bP0+r{}\x1b\\", hex(name))),
+                        Some(None) => out.push_str(&format!("\x1bP1+r{asked}\x1b\\")),
+                        None => out.push_str(&format!("\x1bP0+r{asked}\x1b\\")),
                     }
                 }
                 out.into_bytes()
@@ -550,7 +553,12 @@ impl QueryScanner {
         }
         let s = std::str::from_utf8(&self.dcs).ok()?;
         if let Some(names) = s.strip_prefix("+q") {
-            let names: Vec<String> = names.split(';').filter_map(unhex).collect();
+            // Kept hex-encoded, as asked — `unhex` only vets that it *is* a name.
+            let names: Vec<String> = names
+                .split(';')
+                .filter(|name| unhex(name).is_some())
+                .map(str::to_string)
+                .collect();
             return (!names.is_empty()).then_some(Query::Termcap(names));
         }
         s.strip_prefix("$q")
@@ -1094,6 +1102,21 @@ mod tests {
         assert_eq!(
             Query::PaletteColors(vec![256]).reply(&cx),
             b"\x1b]4;256;rgb:ffff/0000/0000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn xtgettcap_echoes_the_name_as_it_was_asked() {
+        // xterm answers with the name the client sent, hex for hex — esctest asks
+        // for `Co` as uppercase "436F" and string-matches the echo, so lowercasing
+        // it loses the reply.
+        assert_eq!(
+            Query::Termcap(vec!["436F".into()]).reply(&ctx()),
+            b"\x1bP1+r436F=323536\x1b\\"
+        );
+        assert_eq!(
+            Query::Termcap(vec!["436f".into()]).reply(&ctx()),
+            b"\x1bP1+r436f=323536\x1b\\"
         );
     }
 
