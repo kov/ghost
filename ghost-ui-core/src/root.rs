@@ -3932,6 +3932,34 @@ mod tests {
     }
 
     #[test]
+    fn a_view_minted_after_the_theme_is_set_answers_queries_with_it() {
+        // The theme is the *window's* to author, but a session has to remember the
+        // last-applied one so it can still answer OSC 10/11 (vim/fzf theme detection)
+        // — including from a view the window mints *after* the theme was set, and even
+        // once detached. This is the theme twin of
+        // `the_policy_reaches_every_emulator_this_window_runs`: it guards that a
+        // per-session fact set once on the root reaches a view that did not yet exist,
+        // which is exactly the single-owner invariant the model/view redesign keeps.
+        let mut r = root(); // foreground alpha
+        r.set_theme(ThemeColors {
+            fg: [0x01, 0x02, 0x03],
+            bg: [0x0a, 0x0b, 0x0c],
+            ..ThemeColors::default()
+        });
+        // A fresh foreground built after the theme was set (no warm mirror to inherit
+        // it from) — the hard case, mirroring the policy test.
+        r.update(UiEvent::AdoptSession("gamma".into()));
+        let cmds = feed(&mut r, "gamma", b"\x1b]11;?\x07");
+        assert!(
+            cmds.contains(&Cmd::SendInput {
+                session: "gamma".into(),
+                bytes: b"\x1b]11;rgb:0a0a/0b0b/0c0c\x1b\\".to_vec(),
+            }),
+            "a view minted after the theme was set answers with it: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn a_background_session_does_not_write_the_clipboard() {
         let mut r = root(); // foreground alpha
         r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
