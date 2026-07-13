@@ -23,6 +23,9 @@ base64 = "0.22.1"
 miniz_oxide = "0.9.1"
 png = "0.18.1"
 rgb = "0.8.33"
+# Only `policy` is serialized: the attaching terminal reports its policy to the
+# session host, so both emulators enforce the same one (see `policy`'s docs).
+serde = { version = "1.0.228", features = ["derive"] }
 unicode-width = "0.1.13"
 
 [dev-dependencies]

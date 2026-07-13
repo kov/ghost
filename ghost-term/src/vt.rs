@@ -2443,6 +2443,33 @@ mod tests {
     }
 
     #[test]
+    fn adopting_a_stricter_policy_takes_back_what_the_looser_one_allowed() {
+        // A policy is negotiated when a terminal attaches, so a session can be
+        // handed a stricter one than the state it has already accumulated under.
+        // Tightening has to take that state back, not just stop new ops: the host's
+        // resync dump would otherwise hand the client a title and a palette its own
+        // policy forbids, and the two would disagree about what's on screen.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b]2;a title\x07\x1b]4;1;rgb:ff/00/00\x07\x1b[?1000h\x1b[5 q");
+        assert_eq!(vt.title(), "a title");
+
+        vt.set_policy(crate::TerminalPolicy::deny_all());
+        assert_eq!(vt.title(), "", "the title it may no longer have");
+        assert_eq!(vt.palette_color(1), None, "the colors it may no longer set");
+        assert_eq!(
+            vt.mouse_protocol(),
+            super::MouseProtocol::Off,
+            "the mouse it may no longer hold"
+        );
+        // And the dump can't smuggle any of it back to a client.
+        let dump = vt.dump();
+        assert!(
+            !dump.contains("a title"),
+            "not in the dump either: {dump:?}"
+        );
+    }
+
+    #[test]
     fn an_allowed_program_still_does_all_of_it() {
         // The default policy is what ghost has always done — the seam changes
         // nothing until someone sets a policy.

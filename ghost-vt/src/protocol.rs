@@ -39,6 +39,19 @@ pub enum ClientMsg {
     /// built-in defaults. Clients that know their scheme (the GUI) send it
     /// right after attaching.
     Theme(crate::query::ThemeColors),
+    /// The policy the attaching terminal enforces — what a program on this
+    /// session's tty may change about the terminal (see [`ghost_term::policy`]).
+    ///
+    /// The host adopts it: it runs its own emulator over the same bytes, and its
+    /// dump re-seeds the client on every attach, so the two must agree or state
+    /// would appear and vanish depending on who was looking. It also *keeps* it, and
+    /// goes on enforcing it while detached — the session has no terminal of its own,
+    /// so the last one to attach speaks for it, exactly as with [`ClientMsg::Theme`].
+    ///
+    /// Sent by a display client right after attaching. An observer never sends one:
+    /// the terminal the user is actually driving owns the policy; the rest are
+    /// watching.
+    Policy(ghost_term::TerminalPolicy),
     /// Identify this connection: an opaque self-chosen id (e.g. one GUI
     /// window). A display client sends it right after attaching — like
     /// [`ClientMsg::Theme`] — so the host can say *who* holds the display in
@@ -139,7 +152,7 @@ pub enum ServerMsg {
 /// level 0. Bump this when appending a message clients send unprompted — or
 /// when an existing message's *semantics* change in a way clients must gate on
 /// — and add a `PROTO_*` constant for it.
-pub const PROTO_LEVEL: u32 = 4;
+pub const PROTO_LEVEL: u32 = 5;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
@@ -164,6 +177,15 @@ pub const PROTO_OBSERVE: u32 = 4;
 
 const _: () = assert!(PROTO_OBSERVE > PROTO_SUBSCRIBE);
 const _: () = assert!(PROTO_LEVEL >= PROTO_OBSERVE);
+
+/// Feature level at which the host understands [`ClientMsg::Policy`]. A host below
+/// it enforces the policy it was spawned with (today: everything), and a client
+/// must not send one — an unknown message is a decode error the host treats as a
+/// broken connection, and it would drop the client rather than ignore the message.
+pub const PROTO_POLICY: u32 = 5;
+
+const _: () = assert!(PROTO_POLICY > PROTO_OBSERVE);
+const _: () = assert!(PROTO_LEVEL >= PROTO_POLICY);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.

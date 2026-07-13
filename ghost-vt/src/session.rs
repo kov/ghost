@@ -370,6 +370,7 @@ mod tests {
                 title: String::new(),
                 display_name: "build box".into(),
                 size: (120, 60),
+                policy: ghost_term::TerminalPolicy::default(),
                 connection: None,
             },
         )

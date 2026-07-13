@@ -108,6 +108,61 @@ fn theme_is_not_sent_to_a_host_that_predates_it() {
 }
 
 #[test]
+fn policy_is_not_sent_to_a_host_that_predates_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "old-host-policy";
+    let _guard = KillOnDrop { xdg, name };
+
+    // An old host would treat `ClientMsg::Policy` as a corrupt frame and drop us on
+    // the spot — so the client must not send one, and the session simply runs under
+    // the policy that host was built with. It keeps working; it just isn't governed.
+    let marker = xdg.join("detach-done");
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; printf '\\033]2;still here\\007'; exec sleep 60",
+        marker.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "`ghost new -d` failed");
+
+    let dir = xdg.join("run/ghost").join(name);
+    let sock = dir.join("sock");
+    assert!(
+        wait_until(Duration::from_secs(5), || sock.exists()),
+        "session socket never appeared"
+    );
+    // An old host's session dir has no `proto` file.
+    let _ = std::fs::remove_file(dir.join("proto"));
+
+    {
+        let mut s =
+            ghost_vt::client::Session::attach_path(&sock, name, 80, 24).expect("attach failed");
+        // Denied — but it must never reach this host, so it must not take effect.
+        s.report_policy(ghost_term::TerminalPolicy::deny_all())
+            .expect("report_policy failed");
+    }
+    std::fs::write(&marker, b"").unwrap();
+
+    // The title still lands: the report was skipped, not delivered-and-obeyed. (And
+    // the host is still alive to have set it — which is the other half of the point:
+    // an unknown frame would have killed the connection.)
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read(dir.join("meta"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|m| m.get("title").and_then(|t| t.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("still here")
+        }),
+        "policy was delivered to a host that never declared support for it"
+    );
+}
+
+#[test]
 fn input_flows_after_a_gui_style_attach_to_an_undeclared_host() {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();

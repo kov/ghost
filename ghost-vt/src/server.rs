@@ -417,6 +417,12 @@ fn host_main(
     // command are fixed; the title is refreshed below whenever it changes.
     // Built before the child can spawn: the spawn also writes the durable
     // descriptor, which carries these facts.
+    // A session that ran before under this name (a recreate, a resurrect) already
+    // has a policy the user's terminal negotiated for it; going back to permissive
+    // just because the process restarted would be a silent downgrade.
+    let inherited_policy = crate::meta::read(&paths::meta_path(current_name))
+        .map(|m| m.policy)
+        .unwrap_or_default();
     let mut meta = crate::meta::Meta {
         // Milliseconds, not seconds: this is the fleet's spatial sort key, so
         // sub-second resolution keeps sessions spawned in the same second in their
@@ -430,6 +436,7 @@ fn host_main(
         display_name: String::new(),
         size: opts.size,
         connection: opts.connection.clone(),
+        policy: inherited_policy,
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
@@ -469,6 +476,10 @@ fn host_main(
         }
         None => Screen::new(cols, rows, opts.scrollback),
     };
+    // Detached, the host *is* the terminal: it filters the child's output and
+    // answers its queries alone, so it enforces the policy the last terminal to
+    // attach reported (see `ClientMsg::Policy`).
+    screen.set_policy(inherited_policy);
 
     // Optional durable recording. Best-effort: if it cannot be created, the
     // session still runs (just unrecorded).
@@ -1159,6 +1170,25 @@ fn handle_client_messages(
             ClientMsg::Theme(colors) => {
                 *last_theme = colors;
             }
+            // The terminal the user is driving owns the policy; the rest are only
+            // watching. So an observer's report is ignored — it has no window and no
+            // clipboard at stake here, and letting a fleet preview tighten (or
+            // loosen) the session someone else is typing in would be absurd.
+            //
+            // Adopting scrubs whatever a stricter policy now forbids, so the resync
+            // below can't hand the client state its own policy would refuse — and
+            // the *whole* screen is re-sent, because a scrub can change any cell's
+            // color and drop images anywhere on it.
+            ClientMsg::Policy(policy) if !c.subscribed && !c.observing => {
+                if policy != screen.vt().policy() {
+                    screen.set_policy(policy);
+                    meta.policy = policy;
+                    if c.resynced {
+                        c.queue_output(screen.resync());
+                    }
+                }
+            }
+            ClientMsg::Policy(_) => {}
             ClientMsg::Hello { client } => {
                 c.hello = Some(client);
             }

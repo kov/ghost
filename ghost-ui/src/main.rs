@@ -266,6 +266,7 @@ fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Sessio
     s.set_nonblocking(true)?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
+    s.report_policy(session_policy())?;
     s.hello(identity)?;
     Ok(s)
 }
@@ -288,6 +289,7 @@ fn attach_over_ssh(
     s.set_nonblocking(true)?;
     s.resize(cols, rows)?;
     s.report_theme(session_theme())?;
+    s.report_policy(session_policy())?;
     s.hello(identity)?;
     Ok(s)
 }
@@ -721,6 +723,17 @@ fn config_watcher(flag: Arc<std::sync::atomic::AtomicBool>) -> Option<notify::Re
 fn session_theme() -> ghost_ui_core::ThemeColors {
     static THEME: std::sync::OnceLock<ghost_ui_core::ThemeColors> = std::sync::OnceLock::new();
     *THEME.get_or_init(|| theme_colors(&config::UiConfig::load().theme()))
+}
+
+/// The policy reported to session hosts at attach — what a program on the tty may
+/// change about the terminal (see `ghost_term::policy`).
+///
+/// Every field is on today: the seam is wired end to end, but nothing has decided
+/// yet that a stranger's tty may not, say, retitle your window, and that decision
+/// is the user's to make in config, not one to smuggle in here. When it lands, it
+/// lands in this function.
+fn session_policy() -> ghost_term::TerminalPolicy {
+    ghost_term::TerminalPolicy::default()
 }
 
 fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {

@@ -1067,6 +1067,7 @@ dependencies = [
  "proptest",
  "rand 0.7.3",
  "rgb",
+ "serde",
  "tempfile",
  "unicode-width",
 ]

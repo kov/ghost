@@ -40,6 +40,16 @@ pub struct Meta {
     /// for a local session, defaulted so pre-connection metadata still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<crate::connection::ConnectionSpec>,
+    /// What a program on this session's tty may change about the terminal (see
+    /// [`ghost_term::policy`]) — the policy the last terminal to attach reported.
+    ///
+    /// Kept here because a session outlives every terminal that shows it: detached,
+    /// there is nobody to ask, so the host goes on enforcing what it was last told,
+    /// and a recreate or a resurrect gets it back rather than silently reverting to
+    /// permissive. Defaulted, so metadata written before the field existed still
+    /// parses — as the old behavior, which is what those sessions were running.
+    #[serde(default)]
+    pub policy: ghost_term::TerminalPolicy,
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -71,6 +81,7 @@ mod tests {
             display_name: "build box".into(),
             size: (120, 60),
             connection: None,
+            policy: ghost_term::TerminalPolicy::default(),
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));
@@ -86,6 +97,11 @@ mod tests {
         let meta = read(&path).expect("legacy meta parses");
         assert_eq!(meta.display_name, "");
         assert_eq!(meta.size, (0, 0), "pre-size metadata reads as unknown");
+        assert_eq!(
+            meta.policy,
+            ghost_term::TerminalPolicy::allow_all(),
+            "a session from before the policy existed keeps the behavior it had"
+        );
     }
 
     #[test]

@@ -954,11 +954,49 @@ impl Terminal {
         self.prev_op_was_line_feed = is_line_feed;
     }
 
-    /// Replace the policy (see [`crate::policy`]). Meant to be set when the session
-    /// is created: the GUI's emulator and the session host's must agree, or state
-    /// one of them allowed would vanish from the other's resync dump.
+    /// Adopt a policy (see [`crate::policy`]), taking back any state it forbids.
+    ///
+    /// A policy is negotiated when a terminal attaches, so a running session can be
+    /// handed a stricter one than the state it has already accumulated under —
+    /// tightening therefore has to *scrub*, not merely start refusing. Otherwise the
+    /// host's resync dump would hand the attaching client a title and a palette its
+    /// own policy forbids, the client would filter them back out on replay, and the
+    /// two would quietly disagree about what is on screen (and the fleet card would
+    /// go on showing a title the terminal refuses to display).
+    ///
+    /// The grid is deliberately *not* scrubbed: a size a program asked for is a size
+    /// the window already is, and there is no honest "before" to go back to.
     pub fn set_policy(&mut self, policy: TerminalPolicy) {
         self.policy = policy;
+        if !policy.title {
+            self.title.clear();
+            self.icon_title.clear();
+            self.title_stack.clear();
+        }
+        if !policy.colors {
+            self.dynamic_colors = [None; 3];
+            *self.palette = [None; 256];
+            self.special_colors = [None; 5];
+        }
+        if !policy.cursor_style {
+            self.cursor.shape = Cursor::default().shape;
+        }
+        if !policy.graphics {
+            self.graphics.reset();
+        }
+        if !policy.progress {
+            self.progress = None;
+        }
+        if !policy.mouse_report {
+            for m in [
+                DecMode::MouseReportX11,
+                DecMode::MouseReportButton,
+                DecMode::MouseReportAny,
+                DecMode::MouseSgr,
+            ] {
+                self.tracked_modes.remove(&m);
+            }
+        }
     }
 
     pub fn policy(&self) -> TerminalPolicy {

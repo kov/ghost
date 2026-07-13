@@ -64,7 +64,7 @@
 /// Enforced inside the emulator (see [`Terminal::execute`](crate::Terminal)), so
 /// the GUI and the session host must be given the *same* one — see the module
 /// docs. [`Default`] is what ghost has always done: all of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalPolicy {
     /// Set the window/icon title (OSC 0/1/2) and push/pop the title stack
     /// (XTWINOPS `CSI 22/23 t`).

@@ -388,6 +388,25 @@ impl Session {
         self.client.send(&ClientMsg::Theme(colors))
     }
 
+    /// Report the policy this terminal enforces — what a program on the session's
+    /// tty may change about the terminal (see [`ghost_term::policy`]). The host
+    /// adopts it for its own emulator and keeps enforcing it while detached, so the
+    /// session and the terminal showing it never disagree about what a program got
+    /// away with.
+    ///
+    /// Sent right after attaching, like [`report_theme`](Session::report_theme), and
+    /// silently skipped when the host predates [`ClientMsg::Policy`] (it never
+    /// declared [`PROTO_POLICY`](crate::protocol::PROTO_POLICY)) — an old host would
+    /// treat the unknown message as a connection error and drop us. Such a session
+    /// keeps running under the policy its host was spawned with; there is nothing
+    /// this client can do about that from out here.
+    pub fn report_policy(&mut self, policy: ghost_term::TerminalPolicy) -> io::Result<()> {
+        if self.client.proto < crate::protocol::PROTO_POLICY {
+            return Ok(());
+        }
+        self.client.send(&ClientMsg::Policy(policy))
+    }
+
     /// Identify this display client to the host ([`ClientMsg::Hello`]) so
     /// state subscribers can see *who* holds the display ([`AttachInfo`]
     /// (crate::protocol::AttachInfo)). Advisory, sent right after attaching
