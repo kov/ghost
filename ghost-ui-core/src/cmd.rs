@@ -172,16 +172,21 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Does this command reach out of its session and act on *the window*?
+    /// Does this command reach *out* of its session, onto state the whole desktop
+    /// shares — the window it happens to be in, or the system clipboard?
     ///
-    /// A session is one of possibly many in a window, and — in the fleet — may
-    /// not even be one the window owns: tiles preview sessions attached
-    /// elsewhere, on hosts we don't control. So the window ops a program can ask
-    /// for (XTWINOPS, and the grid-driven resize behind DECCOLM) are only the
-    /// *visible, foreground* session's to drive. Everything else is fed with
-    /// these filtered out, or four bytes of output from a background session
-    /// would minimize the window the user is typing in.
-    pub fn drives_window(&self) -> bool {
+    /// A session is one of possibly many in a window, and — in the fleet — may not
+    /// even be one the window owns: tiles preview sessions attached elsewhere, on
+    /// hosts we don't control. So the things a program can ask for that land
+    /// outside its own screen (XTWINOPS and the grid-driven resize behind DECCOLM;
+    /// the title; an OSC 52 clipboard write) are only the *visible, foreground*
+    /// session's to ask for. The non-foreground feed paths filter these out, or
+    /// four bytes from a session the user isn't even looking at would minimize
+    /// their window or replace what they last copied.
+    ///
+    /// This is about *who* may do it, not whether it's allowed at all — a program
+    /// in the foreground still does all of this.
+    pub fn reaches_the_desktop(&self) -> bool {
         matches!(
             self,
             Cmd::SetTitle(_)
@@ -189,6 +194,8 @@ impl Cmd {
                 | Cmd::SetIconified(_)
                 | Cmd::SetMaximized(_)
                 | Cmd::SetFullscreen(_)
+                | Cmd::WriteClipboard(_)
+                | Cmd::WritePrimary(_)
         )
     }
 }

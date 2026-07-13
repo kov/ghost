@@ -1871,11 +1871,15 @@ impl FleetModel {
         // a redraw — but the card header shows it, so a change repaints here.
         let progress = tile.model.screen().vt().progress();
         let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
-        // A tile drives nothing about the window it is previewed in: not the title
-        // (that would retitle the window out from under the single view), and not
-        // its state or size — a tile may be a session attached elsewhere, even on
-        // a remote host, and it does not get to minimize the overview.
-        let mut cmds: Vec<Cmd> = cmds.into_iter().filter(|c| !c.drives_window()).collect();
+        // A tile reaches nothing outside itself: not the window title (that would
+        // retitle the window out from under the single view), not the window's state
+        // or size, and not the clipboard — a tile may be a session attached
+        // elsewhere, even on a remote host, and it does not get to minimize the
+        // machine previewing it or replace what its user last copied.
+        let mut cmds: Vec<Cmd> = cmds
+            .into_iter()
+            .filter(|c| !c.reaches_the_desktop())
+            .collect();
         if progress_changed && !cmds.contains(&Cmd::Redraw) {
             cmds.push(Cmd::Redraw);
         }
@@ -6587,6 +6591,22 @@ mod tests {
     }
 
     #[test]
+    fn a_tile_does_not_write_the_clipboard() {
+        let mut m = fleet();
+        list(&mut m, &["a", "b"]);
+        // A tile is a preview of a session that may be attached elsewhere, even on
+        // another machine. It does not get to reach into the clipboard of the
+        // machine previewing it.
+        let cmds = data(&mut m, "a", b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::WriteClipboard(_) | Cmd::WritePrimary(_))),
+            "a tile does not write the clipboard: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn a_tile_does_not_drive_the_overview_window() {
         let mut m = fleet();
         list(&mut m, &["a", "b"]);
@@ -6596,7 +6616,13 @@ mod tests {
         // overview window.
         let cmds = data(&mut m, "a", b"\x1b[2t\x1b[9;1t\x1b[10;1t\x1b[8;40;100t");
         assert!(
-            !cmds.iter().any(|c| c.drives_window()),
+            !cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SetIconified(_)
+                    | Cmd::SetMaximized(_)
+                    | Cmd::SetFullscreen(_)
+                    | Cmd::ResizeWindow { .. }
+            )),
             "a tile does not drive the overview window: {cmds:?}"
         );
     }

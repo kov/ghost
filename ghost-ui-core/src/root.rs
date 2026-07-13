@@ -1041,19 +1041,19 @@ impl RootModel {
         let cmds = match self.warm.get_mut(&name) {
             // A background mirror still tracks its own title, screen and window state
             // internally (so a later Ctrl-Tab restores them), but it is NOT visible, so
-            // two kinds of command must not reach the shell: anything that drives the
-            // window (`Cmd::drives_window` — title, iconify/maximize/fullscreen, resize;
-            // only the foreground may, same guard the fleet applies to tiles) and
-            // `Redraw` (its content changed, but the foreground's did not — a repaint
-            // here is a full deep scene-compare ending in a Clean skip, up to 60x/s under
-            // a chatty background session). Everything else flows: replies to a program
-            // querying the terminal (`SendInput`), image pre-uploads, and — load-bearing
-            // — the `ScheduleTick` that backstops a mirror's synchronized-output hold for
-            // when it's promoted.
+            // two kinds of command must not reach the shell: anything that reaches out
+            // of the session onto the desktop (`Cmd::reaches_the_desktop` — the window,
+            // the title, the clipboard; only the foreground may, the same guard the
+            // fleet applies to tiles) and `Redraw` (its content changed, but the
+            // foreground's did not — a repaint here is a full deep scene-compare ending
+            // in a Clean skip, up to 60x/s under a chatty background session).
+            // Everything else flows: replies to a program querying the terminal
+            // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
+            // that backstops a mirror's synchronized-output hold for when it's promoted.
             Some(m) => m
                 .update(ev)
                 .into_iter()
-                .filter(|c| !c.drives_window() && !matches!(c, Cmd::Redraw))
+                .filter(|c| !c.reaches_the_desktop() && !matches!(c, Cmd::Redraw))
                 .collect(),
             None => Vec::new(), // not a session this window mirrors
         };
@@ -3840,6 +3840,32 @@ mod tests {
     }
 
     #[test]
+    fn a_background_session_does_not_write_the_clipboard() {
+        let mut r = root(); // foreground alpha
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        // OSC 52 from a session the user isn't looking at: the system clipboard is
+        // the desktop's, not the session's, and silently replacing what the user
+        // last copied is the same reach-out as minimizing their window.
+        let cmds = feed(&mut r, "alpha", b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::WriteClipboard(_) | Cmd::WritePrimary(_))),
+            "a background session must not write the clipboard: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_foreground_session_writes_the_clipboard() {
+        let mut r = root(); // foreground alpha
+        let cmds = feed(&mut r, "alpha", b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(
+            cmds.contains(&Cmd::WriteClipboard("hello".to_string())),
+            "the session on screen still gets its OSC 52: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn a_background_session_does_not_drive_the_windows_state() {
         let mut r = root(); // foreground alpha
         r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
@@ -3848,7 +3874,13 @@ mod tests {
         // do it to the window the user is actually typing in.
         let cmds = feed(&mut r, "alpha", b"\x1b[2t\x1b[9;1t\x1b[10;1t\x1b[8;40;100t");
         assert!(
-            !cmds.iter().any(|c| c.drives_window()),
+            !cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SetIconified(_)
+                    | Cmd::SetMaximized(_)
+                    | Cmd::SetFullscreen(_)
+                    | Cmd::ResizeWindow { .. }
+            )),
             "a background session must not drive the window: {cmds:?}"
         );
     }
