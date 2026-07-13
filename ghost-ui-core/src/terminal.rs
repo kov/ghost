@@ -187,11 +187,15 @@ pub struct TerminalModel {
     /// business — this is what the program asked for and what it reads back.
     iconified: bool,
     /// Whether the window is maximized or full-screen at a program's asking, and
-    /// the grid it had before — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts the
-    /// grid back rather than guessing a size.
+    /// the grid it had before each — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts
+    /// that grid back rather than guessing a size. The two keep *separate* slots:
+    /// they nest (a program may full-screen a maximized window and expect leaving
+    /// full-screen to land back on the maximize), and one shared slot let a restore
+    /// of a state we were never in steal the other's.
     maximized: bool,
     fullscreen: bool,
-    restore_grid: Option<(u16, u16)>,
+    maximize_restore: Option<(u16, u16)>,
+    fullscreen_restore: Option<(u16, u16)>,
     /// Inner padding in *logical* px per side between the grid and the window edges.
     /// Scaled by the device factor (not zoom — it's a fixed window-space border) into
     /// [`Self::pad_px`], which insets the grid, the scene item rect, pointer
@@ -360,7 +364,8 @@ impl TerminalModel {
             iconified: false,
             maximized: false,
             fullscreen: false,
-            restore_grid: None,
+            maximize_restore: None,
+            fullscreen_restore: None,
             pad: 0.0,
             screen,
             scanner: QueryScanner::new(),
@@ -758,7 +763,11 @@ impl TerminalModel {
     fn apply_window_ops(&mut self) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         for op in self.screen.take_window_ops() {
-            let (cols, rows) = (self.cols, self.rows);
+            // The screen's own size, not `self.cols`/`self.rows` — those are
+            // reconciled once, after this loop, so within a burst they are the grid
+            // we *started* with. Two ops in one write (`\e[9;2t\e[9;3t`: grow one
+            // axis, then the other) have to each see what the one before it left.
+            let (cols, rows) = self.screen.dimensions();
             let (display_cols, display_rows) = self.display_grid();
             match op {
                 XtwinopsOp::Iconify => {
@@ -770,15 +779,19 @@ impl TerminalModel {
                     cmds.push(Cmd::SetIconified(false));
                 }
                 XtwinopsOp::Maximize(op) => {
+                    let leaving = op == MaximizeOp::Restore;
                     let grid = match op {
                         MaximizeOp::Both => Some((display_cols, display_rows)),
                         MaximizeOp::Horizontally => Some((display_cols, rows)),
                         MaximizeOp::Vertically => Some((cols, display_rows)),
-                        MaximizeOp::Restore => self.restore_grid.take(),
+                        // Only a maximize we made has anything to come back to.
+                        MaximizeOp::Restore => self.maximize_restore.take(),
                     };
-                    let leaving = op == MaximizeOp::Restore;
-                    if !leaving {
-                        self.restore_grid.get_or_insert((cols, rows));
+                    if !leaving && !self.maximized {
+                        // Save on the way in only: growing the second axis (or
+                        // maximizing twice) must not overwrite the grid from before
+                        // the first with an already-grown one.
+                        self.maximize_restore = Some((cols, rows));
                     }
                     self.maximized = !leaving;
                     // Only a both-axes maximize is a state a window manager has;
@@ -796,10 +809,20 @@ impl TerminalModel {
                         FullscreenOp::Leave => false,
                         FullscreenOp::Toggle => !self.fullscreen,
                     };
-                    if entering {
-                        self.restore_grid.get_or_insert((cols, rows));
+                    // Full-screen keeps its *own* saved grid, and only touches it on
+                    // a real transition. Sharing one slot with the maximize let a
+                    // leave-full-screen we were never in (a no-op in xterm, and one
+                    // programs send defensively) walk off with the grid the maximize
+                    // saved. Keeping them apart also nests the two the way xterm
+                    // does: full-screen over a maximize comes back to the maximized
+                    // grid, and the maximize still restores what preceded it.
+                    if entering && !self.fullscreen {
+                        self.fullscreen_restore = Some((cols, rows));
                         self.resize_grid(display_cols, display_rows);
-                    } else if let Some((cols, rows)) = self.restore_grid.take() {
+                    } else if !entering
+                        && self.fullscreen
+                        && let Some((cols, rows)) = self.fullscreen_restore.take()
+                    {
                         self.resize_grid(cols, rows);
                     }
                     self.fullscreen = entering;
@@ -2168,6 +2191,58 @@ mod tests {
         // Vertically: the columns it had, the display's height.
         feed(&mut m, b"\x1b[9;2t");
         assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;80t");
+    }
+
+    #[test]
+    fn window_ops_in_one_burst_compose_instead_of_clobbering_each_other() {
+        let mut m = model();
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        // Grow one axis and then the other in a *single* write. Each op has to see
+        // the grid the one before it left, or the second silently undoes the first.
+        feed(&mut m, b"\x1b[9;2t\x1b[9;3t");
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;200t");
+    }
+
+    #[test]
+    fn maximize_and_fullscreen_each_restore_their_own_grid() {
+        let mut m = model();
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        // A leave-fullscreen while not full-screen is a no-op in xterm — and a
+        // program that sends one defensively at startup is common. It must not
+        // walk off with the grid a maximize saved to come back to.
+        feed(&mut m, b"\x1b[9;1t"); // maximize: 200x50, remembering 80x24
+        feed(&mut m, b"\x1b[10;0t"); // leave a full-screen we were never in
+        assert_eq!(
+            reply_to(&mut m, b"\x1b[18t"),
+            "\x1b[8;50;200t",
+            "the no-op left the maximized grid alone"
+        );
+        feed(&mut m, b"\x1b[9;0t"); // and the maximize still has 80x24 to restore
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;80t");
+
+        // Full-screen *over* a maximize comes back to the maximized grid, not to
+        // the grid from before the maximize: the two states nest.
+        feed(&mut m, b"\x1b[8;30;90t"); // a plain 90x30
+        feed(&mut m, b"\x1b[9;1t"); // maximize: 200x50, remembering 90x30
+        feed(&mut m, b"\x1b[10;1t"); // full-screen
+        feed(&mut m, b"\x1b[10;0t"); // leave it
+        assert_eq!(
+            reply_to(&mut m, b"\x1b[18t"),
+            "\x1b[8;50;200t",
+            "leaving full-screen lands back on the maximize"
+        );
+        feed(&mut m, b"\x1b[9;0t");
+        assert_eq!(
+            reply_to(&mut m, b"\x1b[18t"),
+            "\x1b[8;30;90t",
+            "and the maximize still restores what it saved"
+        );
     }
 
     #[test]
