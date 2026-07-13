@@ -2607,7 +2607,15 @@ impl Display for Param {
         // zero either way for most controls, but the window ops tell them apart
         // (see `Param::given`), and a dump of a half-parsed CSI must resume into
         // the parser state it left.
+        //
+        // "Left out" means no digit was typed into it — but a colon still may have
+        // been (`ESC [ 1 ; :`), and that sub-part boundary is not nothing: SGR
+        // reads `0:4` (an underline style) very differently from `4` (underline
+        // on). So the separators go out even when the value didn't.
         if !self.given {
+            for _ in 0..self.cur_part {
+                write!(f, ":")?;
+            }
             return Ok(());
         }
         match self.parts() {
@@ -3560,6 +3568,33 @@ mod tests {
         ];
 
         assert_eq!(parse(&super::dump(&functions)), functions);
+    }
+
+    #[test]
+    fn a_dump_mid_csi_keeps_a_parameters_colon_parts() {
+        // `ESC [ 1 ; :` — the second parameter is nothing but a sub-part separator.
+        // No digit was typed into it, so it is not *given*; but neither is it
+        // absent, and the difference shows: SGR reads `1;0:4` (an underline
+        // *style*, none) very differently from `1;4` (underline on). Dropping the
+        // colon resumes into a parser that renders the next bytes differently from
+        // the live screen — and this is the checkpoint-resync path, the one a
+        // client takes every time it attaches.
+        let mut live = Parser::new();
+        let _ = emit(&mut live, &"\x1b[1;:".chars().collect::<Vec<_>>());
+
+        let mut resumed = Parser::new();
+        let dumped = live.dump();
+        for ch in dumped.chars() {
+            assert!(resumed.feed(ch).is_none(), "the dump is mid-sequence");
+        }
+        live.assert_eq(&resumed);
+
+        let finish: Vec<char> = "4m".chars().collect();
+        assert_eq!(
+            emit(&mut live, &finish),
+            emit(&mut resumed, &finish),
+            "the resumed parser must finish the sequence the way the live one does"
+        );
     }
 
     proptest! {
