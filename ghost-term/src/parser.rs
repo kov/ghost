@@ -93,6 +93,10 @@ pub enum Function {
     /// subsequent writes as DEC-protected (spared by DECSED/DECSEL/DECSERA);
     /// `Ps` 0 or 2 clears it.
     Decsca(u16),
+    /// DECSERA `CSI Pt ; Pl ; Pb ; Pr $ {` — selectively erase a rectangle,
+    /// sparing DEC-protected cells. Coordinates are 1-based inclusive
+    /// (origin-mode relative), and the erase ignores the scroll margins.
+    Decsera(u16, u16, u16, u16),
     Decstr,
     Dl(u16),
     Ech(u16),
@@ -1065,6 +1069,14 @@ impl Parser {
             // DECSCA: `CSI Ps " q` (intermediate `"`) — select character protection.
             (Some('"'), 'q') => Some(Decsca(ps[0].as_u16())),
 
+            // DECSERA: `CSI Pt;Pl;Pb;Pr $ {` (intermediate `$`) — selective erase rect.
+            (Some('$'), '{') => Some(Decsera(
+                ps[0].as_u16(),
+                ps[1].as_u16(),
+                ps[2].as_u16(),
+                ps[3].as_u16(),
+            )),
+
             // DECIC / DECDC: `CSI Pn ' }` / `CSI Pn ' ~` (intermediate `'`).
             (Some('\''), '}') => Some(Decic(ps[0].as_u16())),
 
@@ -1501,6 +1513,18 @@ fn dump_function(seq: &mut String, fun: &Function) {
         }
 
         Decsca(ps) => push_csi(seq, Some('"'), &[ps.to_string()], 'q'),
+
+        Decsera(pt, pl, pb, pr) => push_csi(
+            seq,
+            Some('$'),
+            &[
+                pt.to_string(),
+                pl.to_string(),
+                pb.to_string(),
+                pr.to_string(),
+            ],
+            '{',
+        ),
 
         Decstr => push_csi(seq, Some('!'), &[], 'p'),
         Dl(n) => push_csi(seq, None, &[n.to_string()], 'M'),
@@ -2457,6 +2481,7 @@ mod tests {
         // DECSCA and the SPA/EPA guarded-area controls (7-bit ESC V / ESC W).
         assert_eq!(parse("\x1b[\"q"), [Decsca(0)]);
         assert_eq!(parse("\x1b[1\"q"), [Decsca(1)]);
+        assert_eq!(parse("\x1b[2;3;5;7${"), [Decsera(2, 3, 5, 7)]);
         assert_eq!(parse("\x1bV"), [Spa]);
         assert_eq!(parse("\x1bW"), [Epa]);
         assert_eq!(parse("\u{96}"), [Spa]);
@@ -2951,6 +2976,7 @@ mod tests {
             Decscl(64, 1),
             Decsca(0),
             Decsca(1),
+            Decsera(2, 3, 5, 7),
             Decstbm(2, 5),
             Decstr,
             Dl(17),

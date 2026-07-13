@@ -582,6 +582,7 @@ impl Terminal {
             }
 
             Decsed(mode) => {
+                // xterm's DECSED spares both DEC and ISO protection.
                 self.ed(mode, EraseGuard::SpareProtected);
             }
 
@@ -605,6 +606,10 @@ impl Terminal {
 
             Spa => self.pen.set_protection(Protection::Iso),
             Epa => self.pen.set_protection(Protection::None),
+
+            Decsera(pt, pl, pb, pr) => {
+                self.decsera(pt, pl, pb, pr);
+            }
 
             G1d4(charset) => {
                 self.g1d4(charset);
@@ -2128,6 +2133,39 @@ impl Terminal {
         }
     }
 
+    /// DECSERA — selectively erase a rectangle, sparing DEC-protected cells.
+    /// Coordinates are origin-mode relative (like CUP) and clamped to the
+    /// addressable region; the scroll margins otherwise don't constrain it. An
+    /// empty/inverted rectangle is a no-op, and the cursor does not move.
+    fn decsera(&mut self, pt: u16, pl: u16, pb: u16, pr: u16) {
+        let atop = self.actual_top_margin();
+        let abot = self.actual_bottom_margin();
+        let aleft = self.actual_left_margin();
+        let aright = self.actual_right_margin();
+
+        // 1-based params → absolute 0-based; omitted bottom/right default to the
+        // region's far edge.
+        let top = (atop + as_usize(pt, 1) - 1).clamp(atop, abot);
+        let left = (aleft + as_usize(pl, 1) - 1).clamp(aleft, aright);
+        let bottom = (atop + as_usize(pb, abot - atop + 1) - 1).clamp(atop, abot);
+        let right = (aleft + as_usize(pr, aright - aleft + 1) - 1).clamp(aleft, aright);
+
+        if top > bottom || left > right {
+            return;
+        }
+
+        let pen = self.pen;
+        for row in top..=bottom {
+            self.buffer.erase(
+                (left, row),
+                EraseMode::NextChars(right - left + 1),
+                &pen,
+                EraseGuard::SpareDec,
+            );
+        }
+        self.dirty_lines.extend(top..bottom + 1);
+    }
+
     fn ech(&mut self, n: u16) {
         let n = as_usize(n, 1);
 
@@ -2797,12 +2835,14 @@ impl Terminal {
 
             if occupancy == Occupancy::Single {
                 funs.push(to_sgr(last_cell.pen()));
+                push_protection(&mut funs, last_cell.pen().protection());
                 funs.push(Function::Print(last_cell.char()));
             } else if occupancy == Occupancy::WideTail && edge > 0 {
                 let prev_cell = self.buffer[(edge - 1, self.cursor.row)];
 
                 funs.push(Function::Cub(1));
                 funs.push(to_sgr(prev_cell.pen()));
+                push_protection(&mut funs, prev_cell.pen().protection());
                 funs.push(Function::Print(prev_cell.char()));
             }
         }

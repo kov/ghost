@@ -31,14 +31,21 @@ pub(crate) enum EraseMode {
 }
 
 /// Which protected cells an erase spares (see [`crate::pen::Protection`]).
+/// The three erase families guard differently, matching xterm:
+/// plain ED/EL/ECH spare the ISO guarded area; DECSED/DECSEL spare *both*
+/// protections (xterm respects ISO here for backward compatibility); DECSERA
+/// spares only DEC protection.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum EraseGuard {
     /// Spare nothing — the unconditional erase (fills, resets, DECCOLM clear).
     None,
     /// Spare ISO-guarded cells (SPA/EPA) — a plain ED/EL/ECH.
     SpareIso,
-    /// Spare every protected cell — a selective DECSED/DECSEL/DECSERA.
+    /// Spare every protected cell — DECSED/DECSEL.
     SpareProtected,
+    /// Spare only DECSCA (DEC) protection — DECSERA, which erases ISO-guarded
+    /// cells.
+    SpareDec,
 }
 
 impl EraseGuard {
@@ -48,6 +55,7 @@ impl EraseGuard {
             EraseGuard::None => false,
             EraseGuard::SpareIso => protection == Protection::Iso,
             EraseGuard::SpareProtected => protection != Protection::None,
+            EraseGuard::SpareDec => protection == Protection::Dec,
         }
     }
 }

@@ -883,6 +883,28 @@ mod tests {
     }
 
     #[test]
+    fn decsera_erases_a_rectangle_sparing_only_dec_protection() {
+        let mut vt = Vt::new(10, 4);
+        // Row 1: DEC-protected "AB"; row 2: unprotected "cd"; both at col 1.
+        vt.feed_str("\x1b[1\"qAB\x1b[0\"q");
+        vt.feed_str("\x1b[2;1Hcd");
+        // Erase the 2x2 rect covering both rows, cols 1-2.
+        vt.feed_str("\x1b[1;1;2;2$\x7b"); // 0x7b = '{'
+        assert_eq!(row_cells(&vt, 0, 2), "AB", "DEC-protected row spared");
+        assert_eq!(row_cells(&vt, 1, 2), "  ", "unprotected row erased");
+
+        // DECSERA erases ISO-guarded cells (unlike DECSED/DECSEL).
+        let mut vt = Vt::new(10, 2);
+        vt.feed_str("a\x1bVb\x1bW"); // "a", ISO-guarded "b"
+        vt.feed_str("\x1b[1;1;1;2$\x7b");
+        assert_eq!(
+            row_cells(&vt, 0, 2),
+            "  ",
+            "ISO guard does not stop DECSERA"
+        );
+    }
+
+    #[test]
     fn decsca_survives_a_dump() {
         // A DECSCA-protected run replays guarded after a dump/reload.
         let mut vt = Vt::new(10, 2);
