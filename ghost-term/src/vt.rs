@@ -995,6 +995,25 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_reset_leaves_132_column_mode_but_keeps_a_window_sized_grid() {
+        // esctest test_RIS_ResetDECCOLM. The grid normally belongs to the window,
+        // so a hard reset must not resize it...
+        let mut vt = Vt::new(100, 24);
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.size(), (100, 24), "RIS left the window's grid alone");
+        // ...but 132-column mode is a width the *program* asked for (DECCOLM, gated
+        // on Allow80To132), so a hard reset takes it back to 80.
+        vt.feed_str("\x1b[?40h\x1b[?3h");
+        assert_eq!(vt.size(), (132, 24));
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.size(), (80, 24), "RIS left 132-column mode");
+        assert_eq!(vt.dec_mode_state(3), crate::ModeReport::Reset);
+        // And the restored 80 columns are a plain grid again: another RIS keeps it.
+        vt.feed_str("\x1bc");
+        assert_eq!(vt.size(), (80, 24));
+    }
+
+    #[test]
     fn decscl_gates_declrmm_below_conformance_level_4() {
         // esctest test_DSCSCL_Level3: at level 3 DECLRMM (?69) is inert, so DECSLRM
         // sets no margins and text past the intended right margin does not wrap.

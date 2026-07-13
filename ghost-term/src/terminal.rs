@@ -1364,6 +1364,14 @@ impl Terminal {
     }
 
     fn hard_reset(&mut self) {
+        // The grid belongs to whoever owns the window, so a hard reset leaves its
+        // size alone — with one exception: 132-column mode is a width the *program*
+        // asked for (DECCOLM, gated on Allow80To132), so leaving it means going back
+        // to 80 columns. xterm makes exactly this pair of checks; without it a
+        // DECCOLM'd terminal would keep its 132 columns across a reset forever.
+        if self.column_mode_132 {
+            self.cols = 80;
+        }
         let primary_buffer = Buffer::new(self.cols, self.rows, self.scrollback_limit, None);
         let alternate_buffer = Buffer::new(self.cols, self.rows, Some(0), None);
 
