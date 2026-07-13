@@ -1182,6 +1182,7 @@ impl RootModel {
                     let model = self.warm.remove(&id).unwrap_or_else(|| {
                         let mut m = TerminalModel::new(id.clone(), 1, 1, self.metrics);
                         m.set_theme(self.theme);
+                        m.set_policy(self.policy);
                         m
                     });
                     (model, Vec::new())
@@ -1246,6 +1247,7 @@ impl RootModel {
             let mut model = self.warm.remove(&next).unwrap_or_else(|| {
                 let mut m = TerminalModel::new(next.clone(), 1, 1, self.metrics);
                 m.set_theme(self.theme);
+                m.set_policy(self.policy);
                 m
             });
             let mut cmds = resize_model(&mut model, self.size_px, self.scale, self.pad);
@@ -1268,6 +1270,7 @@ impl RootModel {
         // Nothing left to show: drop to the fleet overview.
         let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
         fleet.set_theme(self.theme);
+        fleet.set_policy(self.policy);
         fleet.set_groups(self.groups.clone());
         fleet.set_my_group(self.my_group.clone());
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
@@ -1864,6 +1867,7 @@ impl RootModel {
                     self.mine.clone(),
                 );
                 fleet.set_theme(self.theme);
+                fleet.set_policy(self.policy);
                 fleet.set_groups(self.groups.clone());
                 fleet.set_my_group(self.my_group.clone());
                 cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
@@ -3902,6 +3906,28 @@ mod tests {
                 .title(),
             "",
             "a warm background mirror honours it too"
+        );
+
+        // The hard case: a model the root mints *after* the policy was set. Set the
+        // policy, then adopt a session with no warm mirror — a fresh foreground is
+        // built at that moment — and it must be born governed, not permissive.
+        let mut r = root(); // foreground alpha
+        r.set_policy(ghost_term::SessionPolicy::deny_all());
+        r.update(UiEvent::AdoptSession("gamma".into())); // freshly minted
+        feed(&mut r, "gamma", b"\x1b]2;pwned\x07");
+        let foreground = match &r.mode {
+            Mode::Single(m) => m,
+            Mode::Fleet(_) => panic!("single view"),
+        };
+        assert_eq!(
+            foreground.session(),
+            "gamma",
+            "gamma is the freshly-minted foreground"
+        );
+        assert_eq!(
+            foreground.screen().vt().title(),
+            "",
+            "a model minted after the policy was set is born governed"
         );
     }
 

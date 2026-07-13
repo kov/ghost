@@ -1476,7 +1476,6 @@ impl FleetModel {
                     let mut model = TerminalModel::new(tile.id.clone(), cols, rows, self.metrics);
                     model.set_theme(self.theme);
                     model.set_policy(self.policy);
-                    model.set_policy(self.policy);
                     model.set_display_name(tile.model.display_name().to_string());
                     tile.model = model;
                     tile.fed = false; // placeholder until the resync lands

@@ -264,9 +264,14 @@ fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Sessio
     // latency gain. Mirror the observer pool, which is non-blocking for the same
     // reason (a whole pool's idle reads would otherwise add up on the loop).
     s.set_nonblocking(true)?;
-    s.resize(cols, rows)?;
+    // Report the theme and policy *before* the resize: the resize completes the
+    // attach handshake and triggers the host's resync (and spawns a deferred child),
+    // so reporting the policy first means that resync already carries scrubbed state
+    // and the child's first queries are answered under this terminal's policy rather
+    // than the host's previous one being applied and then walked back.
     s.report_theme(session_theme())?;
     s.report_policy(session_policy())?;
+    s.resize(cols, rows)?;
     s.hello(identity)?;
     Ok(s)
 }
@@ -287,9 +292,14 @@ fn attach_over_ssh(
     // no latency. (On the ssh transport `set_read_timeout(Some(_))` already maps to
     // non-blocking; spell it the same way as `attach` so the two don't drift.)
     s.set_nonblocking(true)?;
-    s.resize(cols, rows)?;
+    // Report the theme and policy *before* the resize: the resize completes the
+    // attach handshake and triggers the host's resync (and spawns a deferred child),
+    // so reporting the policy first means that resync already carries scrubbed state
+    // and the child's first queries are answered under this terminal's policy rather
+    // than the host's previous one being applied and then walked back.
     s.report_theme(session_theme())?;
     s.report_policy(session_policy())?;
+    s.resize(cols, rows)?;
     s.hello(identity)?;
     Ok(s)
 }

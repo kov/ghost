@@ -1009,6 +1009,15 @@ impl Terminal {
                 self.tracked_modes.remove(&m);
             }
         }
+        if !policy.program_resize {
+            // `?40` arms the DECCOLM switch; the filter refuses to *set* it, but one
+            // armed before the policy tightened must be disarmed here to match — or
+            // the dump carries it (a DECRQM would answer differently detached vs
+            // attached) and a later terminal that re-allows resize would find the
+            // switch still live. The 132-column *grid* itself is not touched: it is
+            // a size the window already is, like any other program resize.
+            self.allow_80_to_132 = false;
+        }
     }
 
     pub fn policy(&self) -> TerminalPolicy {

@@ -161,9 +161,6 @@ impl Vt {
         self.terminal.hyperlink(id)
     }
 
-    /// Drain the window ops (XTWINOPS) a program asked for that only the window
-    /// can grant — iconify, maximize, full-screen. The grid-only ones (`CSI 8 t`,
-    /// DECSLPP) the emulator has already done itself.
     /// Replace the policy — what a program on this tty may change about the
     /// terminal (see [`crate::policy`]).
     pub fn set_policy(&mut self, policy: crate::TerminalPolicy) {
@@ -174,6 +171,9 @@ impl Vt {
         self.terminal.policy()
     }
 
+    /// Drain the window ops (XTWINOPS) a program asked for that only the window
+    /// can grant — iconify, maximize, full-screen. The grid-only ones (`CSI 8 t`,
+    /// DECSLPP) the emulator has already done itself.
     pub fn take_window_ops(&mut self) -> Vec<parser::XtwinopsOp> {
         self.terminal.take_window_ops()
     }
@@ -1970,14 +1970,14 @@ mod tests {
     fn exposes_input_relevant_modes() {
         use super::MouseProtocol;
         let mut vt = Vt::new(20, 5);
-        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Off);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
 
         // An app turns on X11 mouse, SGR coords, focus, and bracketed paste.
         vt.feed_str("\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
-        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Press);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
         assert!(vt.mouse_sgr());
         assert!(vt.focus_report());
         assert!(vt.bracketed_paste());
@@ -1986,13 +1986,13 @@ mod tests {
         vt.feed_str("\x1b[?1003h");
         assert_eq!(vt.mouse_protocol(), MouseProtocol::AnyMotion);
         vt.feed_str("\x1b[?1003l");
-        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Press);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
         vt.feed_str("\x1b[?1002h");
         assert_eq!(vt.mouse_protocol(), MouseProtocol::ButtonDrag);
 
         // Everything off again.
         vt.feed_str("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l");
-        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Off);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
@@ -2404,10 +2404,43 @@ mod tests {
         let mut vt = denied();
         vt.feed_str("\x1b[8;40;100t"); // XTWINOPS resize
         assert_eq!(vt.size(), (80, 24));
-        // DECCOLM, and the `?40` that arms it: denying the resize must strip the
-        // arming mode too, or the program just switches it back on itself.
-        vt.feed_str("\x1b[?40h\x1b[?3h");
-        assert_eq!(vt.size(), (80, 24), "?40 did not re-arm DECCOLM");
+        // DECCOLM itself.
+        vt.feed_str("\x1b[?3h");
+        assert_eq!(vt.size(), (80, 24), "DECCOLM was denied");
+        // And `?40`, the mode that arms it, must be filtered too — not because ?3
+        // could get through (it can't, above), but so a denied session never carries
+        // the armed switch into its dump, where it would diverge from an attached
+        // client's identical policy. Assert on the dumpable state directly, so this
+        // can't pass just because ?3 happens to be denied as well.
+        vt.feed_str("\x1b[?40h");
+        assert!(
+            !vt.dump().contains("\u{9b}?40h"),
+            "the denied ?40 never reached dumpable state: {:?}",
+            vt.dump()
+        );
+    }
+
+    #[test]
+    fn the_rest_of_the_gated_ops_are_actually_gated() {
+        // One check per gate the earlier tests missed — each fails if its arm is
+        // removed from `policy_allows` (verified by reverting). (The title-stack
+        // push/pop gate is deliberately not here: it rides `title`, so with the
+        // title denied there is never anything for a push to save or a pop to
+        // restore — it is defense-in-depth, not independently observable.)
+        let mut vt = denied();
+
+        // Cursor style (DECSCUSR): stays the default shape.
+        let default_shape = Vt::new(1, 1).cursor().shape;
+        vt.feed_str("\x1b[4 q"); // steady underline
+        assert_eq!(vt.cursor().shape, default_shape, "cursor style denied");
+
+        // Progress (OSC 9;4): never set.
+        vt.feed_str("\x1b]9;4;1;50\x07");
+        assert_eq!(vt.progress(), None, "progress denied");
+
+        // Kitty graphics: the transmit is dropped, so no image is stored.
+        vt.feed_str("\x1b_Ga=t,f=24,s=1,v=1;AAAA\x1b\\");
+        assert_eq!(vt.graphics_image_count(), 0, "graphics denied");
     }
 
     #[test]
@@ -2467,6 +2500,32 @@ mod tests {
             !dump.contains("a title"),
             "not in the dump either: {dump:?}"
         );
+    }
+
+    #[test]
+    fn denying_the_resize_disarms_a_mode_that_was_already_armed() {
+        // `?40` (Allow80To132) arms the DECCOLM switch. The filter strips it going
+        // forward — but if it was armed *before* the policy tightened, the scrub has
+        // to disarm it too, or two things break: the host's dump still emits `?40h`
+        // (so a DECRQM answers differently detached vs attached — the exact
+        // divergence to avoid), and a later terminal that re-allows resize finds the
+        // switch still armed and a bare `?3h` jumps to 132 columns the program never
+        // asked for.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b[?40h"); // arm DECCOLM while still allowed
+        vt.set_policy(crate::TerminalPolicy {
+            program_resize: false,
+            ..crate::TerminalPolicy::allow_all()
+        });
+        assert!(
+            !vt.dump().contains("\u{9b}?40h"),
+            "the dump no longer carries the armed switch: {:?}",
+            vt.dump()
+        );
+        // And a program cannot exploit the leftover arming to resize.
+        vt.set_policy(crate::TerminalPolicy::allow_all());
+        vt.feed_str("\x1b[?3h");
+        assert_eq!(vt.size(), (80, 24), "the switch stayed disarmed");
     }
 
     #[test]
