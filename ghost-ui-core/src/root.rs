@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
+use crate::terminal::{SessionState, TerminalView};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::text_input::TextInput;
 use crate::{
@@ -23,8 +24,95 @@ use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::query::ThemeColors;
 
 enum Mode {
-    Single(Box<TerminalModel>),
+    /// The single-terminal view of the session named `id`. The [`SessionState`]
+    /// itself lives in [`RootModel::sessions`], not here — this holds only the view
+    /// onto it, so switching which session is foreground (or previewing it in the
+    /// fleet) moves a lightweight [`TerminalView`], never the emulator.
+    Single {
+        id: SessionId,
+        view: Box<TerminalView>,
+    },
     Fleet(Box<FleetModel>),
+}
+
+/// The window's session states, keyed by session id — the *single* owner of every
+/// [`SessionState`] this window holds. A per-session fact (the emulator, the theme
+/// it answers OSC 10/11 with, the policy) is stamped once, when the session is
+/// minted here, and lives in exactly one place; the foreground view, the warm
+/// background mirrors, and (from B1b) the fleet tiles all borrow a state from here
+/// by id. A view moving between foreground/warm/fleet never moves the state, so the
+/// per-session facts stop being re-stamped at every transition.
+struct Sessions {
+    map: HashMap<SessionId, SessionState>,
+    /// The scheme default fg/bg every state is minted with and answers OSC 10/11 by
+    /// (the window authors it via [`RootModel::set_theme`]; remembered here so a
+    /// backgrounded session still answers with its last-shown colors).
+    theme: ThemeColors,
+    /// The policy every state is minted with — what a program on the session's tty
+    /// may do (see [`ghost_term::policy`]).
+    policy: SessionPolicy,
+}
+
+impl Sessions {
+    fn new() -> Self {
+        Sessions {
+            map: HashMap::new(),
+            theme: ThemeColors::default(),
+            policy: SessionPolicy::default(),
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<&SessionState> {
+        self.map.get(id)
+    }
+
+    fn get_mut(&mut self, id: &str) -> Option<&mut SessionState> {
+        self.map.get_mut(id)
+    }
+
+    fn insert(&mut self, id: SessionId, state: SessionState) {
+        self.map.insert(id, state);
+    }
+
+    fn remove(&mut self, id: &str) -> Option<SessionState> {
+        self.map.remove(id)
+    }
+
+    /// Borrow the state for `id`, minting it (stamped with the current theme and
+    /// policy) if this window doesn't hold it yet. A dead entry of the same name is
+    /// replaced by a fresh one first — a reused session name must never resurrect
+    /// the ended session's stale screen.
+    fn get_or_mint(&mut self, id: &str, cols: u16, rows: u16) -> &mut SessionState {
+        if self.map.get(id).is_some_and(SessionState::ended) {
+            self.map.remove(id);
+        }
+        let (theme, policy) = (self.theme, self.policy);
+        self.map.entry(id.to_string()).or_insert_with(|| {
+            let mut state = SessionState::new(id.to_string(), cols, rows);
+            let _ = state.set_theme(theme); // a fresh state has no 2031 subscriber
+            state.set_policy(policy);
+            state
+        })
+    }
+
+    /// Restamp the theme on every held state, broadcasting the mode-2031 dark/light
+    /// notification a real change owes each subscribed session.
+    fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
+        self.theme = theme;
+        self.map
+            .values_mut()
+            .flat_map(|s| s.set_theme(theme))
+            .collect()
+    }
+
+    /// Restamp the policy on every held state — applying it live *scrubs* whatever
+    /// it now forbids (the emulator does that).
+    fn set_policy(&mut self, policy: SessionPolicy) {
+        self.policy = policy;
+        for s in self.map.values_mut() {
+            s.set_policy(policy);
+        }
+    }
 }
 
 /// Default duration of the UI animations (the fleet zoom and the session slide),
@@ -232,16 +320,12 @@ fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
 pub struct RootModel {
     mode: Mode,
     metrics: CellMetrics,
-    /// The scheme's default fg/bg (OSC 10/11 color-query replies), stamped on
-    /// every model this root creates or holds. Set once by the shell after
-    /// construction (the theme is fixed at startup today).
-    theme: ThemeColors,
-    /// What a program on a session's tty may do — to the terminal, and to the
-    /// desktop (see [`ghost_term::policy`]). Stamped on every model this root
-    /// creates or holds, exactly like the theme: the shell hands down one policy
-    /// and it must reach every emulator we run, or an attached window would honour
-    /// what the session host is refusing.
-    policy: SessionPolicy,
+    /// The single owner of this window's session states — the emulator, theme, and
+    /// policy for each session, held once and borrowed by whichever view (foreground,
+    /// warm mirror, fleet tile) is looking at it. Carries the scheme default fg/bg
+    /// and the policy that every session it mints is stamped with; the shell sets
+    /// both once after construction ([`Self::set_theme`]/[`Self::set_policy`]).
+    sessions: Sessions,
     size_px: (u32, u32),
     /// Device scale factor, tracked so a fleet toggle preserves HiDPI sizing.
     scale: f32,
@@ -254,8 +338,10 @@ pub struct RootModel {
     /// view (the foreground lives in `mode`). They are fed and resized exactly
     /// like the foreground, so their previews stay live and Ctrl-Tab switches are
     /// instant and correctly sized. In the fleet, the models live in its tiles, so
-    /// this is empty.
-    warm: HashMap<SessionId, TerminalModel>,
+    /// this is empty. Holds only the *view* of each background session; the session
+    /// state itself lives in [`Self::sessions`], so a Ctrl-Tab that promotes one of
+    /// these moves a lightweight view, not the emulator.
+    warm: HashMap<SessionId, TerminalView>,
     /// A dive-out (single → fleet) waiting for the host's session list before it
     /// animates. F9 swaps to the fleet instantly for input, but the grid it builds
     /// only knows *this* window's sessions; the real fleet (foreign/detached tiles,
@@ -395,15 +481,25 @@ impl ConnectPrompt {
     }
 }
 
-/// Resize a model to the window (physical px + scale), first stamping the inner
-/// `pad` (logical px) so the model insets its grid, returning its commands.
-fn resize_model(m: &mut TerminalModel, size_px: (u32, u32), scale: f32, pad: f32) -> Vec<Cmd> {
-    m.set_padding(pad);
-    m.update(UiEvent::Resize {
-        w_px: size_px.0.max(1),
-        h_px: size_px.1.max(1),
-        scale: scale as f64,
-    })
+/// Resize a view to the window (physical px + scale), first stamping the inner
+/// `pad` (logical px) so it insets its grid, returning its commands. Threads the
+/// session state the resize re-grids.
+fn resize_model(
+    view: &mut TerminalView,
+    state: &mut SessionState,
+    size_px: (u32, u32),
+    scale: f32,
+    pad: f32,
+) -> Vec<Cmd> {
+    view.set_padding(pad);
+    view.update(
+        state,
+        UiEvent::Resize {
+            w_px: size_px.0.max(1),
+            h_px: size_px.1.max(1),
+            scale: scale as f64,
+        },
+    )
 }
 
 /// F9 toggles the fleet overview.
@@ -424,12 +520,17 @@ fn cycle_dir(key: &Key, mods: Mods) -> Option<bool> {
 impl RootModel {
     /// Start in the single-terminal view around `model`.
     pub fn single(model: TerminalModel, metrics: CellMetrics, size_px: (u32, u32)) -> Self {
-        let id = model.session().to_string();
+        let (state, view) = model.into_parts();
+        let id = state.session().to_string();
+        let mut sessions = Sessions::new();
+        sessions.insert(id.clone(), state);
         RootModel {
-            mode: Mode::Single(Box::new(model)),
+            mode: Mode::Single {
+                id: id.clone(),
+                view: Box::new(view),
+            },
             metrics,
-            theme: ThemeColors::default(),
-            policy: SessionPolicy::default(),
+            sessions,
             size_px,
             scale: 1.0,
             mine: HashSet::from([id.clone()]),
@@ -454,8 +555,7 @@ impl RootModel {
         let root = RootModel {
             mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px, HashSet::new()))),
             metrics,
-            theme: ThemeColors::default(),
-            policy: SessionPolicy::default(),
+            sessions: Sessions::new(),
             size_px,
             scale,
             mine: HashSet::new(),
@@ -482,13 +582,13 @@ impl RootModel {
     /// model this root holds now or creates later. Returns the mode-2031
     /// dark/light notifications a real change owes subscribed sessions.
     pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
-        self.theme = theme;
-        let mut cmds = match &mut self.mode {
-            Mode::Single(m) => m.set_theme(theme),
-            Mode::Fleet(f) => f.set_theme(theme),
-        };
-        for m in self.warm.values_mut() {
-            cmds.extend(m.set_theme(theme));
+        // The foreground and warm states live in `sessions`, so one broadcast
+        // covers them both. A fleet owns its tiles' states itself (until B1b), so it
+        // is stamped separately — the mode is Single XOR Fleet, so nothing is
+        // double-stamped.
+        let mut cmds = self.sessions.set_theme(theme);
+        if let Mode::Fleet(f) = &mut self.mode {
+            cmds.extend(f.set_theme(theme));
         }
         cmds
     }
@@ -500,19 +600,51 @@ impl RootModel {
     /// agree. Applying it to a live model *scrubs* whatever it forbids (the emulator
     /// does that), so tightening takes effect on what is already on screen.
     pub fn set_policy(&mut self, policy: SessionPolicy) {
-        self.policy = policy;
-        match &mut self.mode {
-            Mode::Single(m) => m.set_policy(policy),
-            Mode::Fleet(f) => f.set_policy(policy),
-        }
-        for m in self.warm.values_mut() {
-            m.set_policy(policy);
+        // As with `set_theme`: one broadcast over `sessions` covers the foreground
+        // and warm states; a fleet (XOR with single) is stamped separately.
+        self.sessions.set_policy(policy);
+        if let Mode::Fleet(f) = &mut self.mode {
+            f.set_policy(policy);
         }
     }
 
-    /// The policy this root stamps on its models.
+    /// The policy this root stamps on its sessions.
     pub fn policy(&self) -> SessionPolicy {
-        self.policy
+        self.sessions.policy
+    }
+
+    /// The foreground session's view paired with its state, or `None` in the fleet.
+    /// The two borrows are disjoint (`mode` vs `sessions`), so the caller can drive
+    /// the view against its state.
+    fn foreground_mut(&mut self) -> Option<(&mut TerminalView, &mut SessionState)> {
+        match &mut self.mode {
+            Mode::Single { id, view } => Some((view, self.sessions.get_mut(id)?)),
+            Mode::Fleet(_) => None,
+        }
+    }
+
+    /// The foreground session's view paired with its state (read-only).
+    fn foreground_view(&self) -> Option<(&TerminalView, &SessionState)> {
+        match &self.mode {
+            Mode::Single { id, view } => Some((view, self.sessions.get(id)?)),
+            Mode::Fleet(_) => None,
+        }
+    }
+
+    /// Apply `ev` to the active view — the foreground view against its state, or the
+    /// fleet — returning its commands. The single-view arm borrows the state from
+    /// `sessions` disjointly from the view in `mode`.
+    fn drive(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        match &mut self.mode {
+            Mode::Single { id, view } => {
+                let state = self
+                    .sessions
+                    .get_mut(id)
+                    .expect("foreground session state present");
+                view.update(state, ev)
+            }
+            Mode::Fleet(f) => f.update(ev),
+        }
     }
 
     /// Adopt this window's group identity (minted by the shell at window
@@ -579,7 +711,7 @@ impl RootModel {
     pub fn fleet_frame_cache(&self) -> Option<ghost_render::CacheCounters> {
         match &self.mode {
             Mode::Fleet(f) => Some(f.frame_cache()),
-            Mode::Single(_) => None,
+            Mode::Single { .. } => None,
         }
     }
 
@@ -731,11 +863,12 @@ impl RootModel {
     /// takes effect on the next resize (the shell always sizes a fresh window).
     pub fn set_padding(&mut self, pad: f32) {
         self.pad = pad.max(0.0);
-        if let Mode::Single(m) = &mut self.mode {
-            m.set_padding(self.pad);
+        // Padding is a per-view geometry, not session state — set it on the views.
+        if let Mode::Single { view, .. } = &mut self.mode {
+            view.set_padding(self.pad);
         }
-        for m in self.warm.values_mut() {
-            m.set_padding(self.pad);
+        for view in self.warm.values_mut() {
+            view.set_padding(self.pad);
         }
     }
 
@@ -749,7 +882,7 @@ impl RootModel {
     /// The current default colors (fg/bg/cursor) — the value last handed to
     /// [`set_theme`](Self::set_theme).
     pub fn theme(&self) -> ThemeColors {
-        self.theme
+        self.sessions.theme
     }
 
     /// Override the animation duration (ms) — e.g. the shell wiring `GHOST_ANIM_MS`
@@ -832,7 +965,7 @@ impl RootModel {
             self.groups = groups.clone();
             return match &mut self.mode {
                 Mode::Fleet(f) => f.update(UiEvent::GroupsLoaded(groups)),
-                Mode::Single(_) => Vec::new(),
+                Mode::Single { .. } => Vec::new(),
             };
         }
         // A set-change hint (a session appeared/vanished, a subscription ended):
@@ -841,7 +974,7 @@ impl RootModel {
         if let UiEvent::SessionsChanged = &ev {
             return match &self.mode {
                 Mode::Fleet(_) => vec![Cmd::ListSessions],
-                Mode::Single(_) => Vec::new(),
+                Mode::Single { .. } => Vec::new(),
             };
         }
         // A driven session's transport dropped (or came back): put it — or its
@@ -857,13 +990,19 @@ impl RootModel {
                 }
                 _ => unreachable!(),
             };
-            if let Mode::Single(m) = &mut self.mode
-                && m.session() == name
+            if let Mode::Single { id, view } = &mut self.mode
+                && *id == name
             {
-                return m.update(ev);
+                let state = self
+                    .sessions
+                    .get_mut(id)
+                    .expect("foreground session state present");
+                return view.update(state, ev);
             }
-            if let Some(m) = self.warm.get_mut(&name) {
-                return m.update(ev);
+            if let Some(view) = self.warm.get_mut(&name)
+                && let Some(state) = self.sessions.get_mut(&name)
+            {
+                return view.update(state, ev);
             }
             return Vec::new();
         }
@@ -873,16 +1012,16 @@ impl RootModel {
         if let UiEvent::SessionData {
             name, ended: true, ..
         } = &ev
-            && let Mode::Single(m) = &self.mode
-            && m.session() == name
+            && let Mode::Single { id, .. } = &self.mode
+            && id == name
         {
             return self.foreground_ended();
         }
         // Output for a background session keeps its warm mirror live (the fleet
         // owns every model, so this only matters in the single view).
         if let UiEvent::SessionData { name, .. } = &ev
-            && let Mode::Single(m) = &self.mode
-            && m.session() != name
+            && let Mode::Single { id, .. } = &self.mode
+            && id != name
         {
             return self.feed_warm(ev);
         }
@@ -896,7 +1035,7 @@ impl RootModel {
             let name = name.clone();
             let mut cmds = match &mut self.mode {
                 Mode::Fleet(f) => f.update(ev),
-                Mode::Single(_) => unreachable!(),
+                Mode::Single { .. } => unreachable!(),
             };
             if self.pending_dive_in.as_deref() == Some(name.as_str())
                 && matches!(&self.mode, Mode::Fleet(f) if f.tile_fed(&name))
@@ -919,11 +1058,25 @@ impl RootModel {
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
             let mut cmds = match &mut self.mode {
-                Mode::Single(m) => resize_model(m, self.size_px, self.scale, self.pad),
+                Mode::Single { id, view } => {
+                    let state = self
+                        .sessions
+                        .get_mut(id)
+                        .expect("foreground session state present");
+                    resize_model(view, state, self.size_px, self.scale, self.pad)
+                }
                 Mode::Fleet(f) => return f.update(UiEvent::Resize { w_px, h_px, scale }),
             };
-            for m in self.warm.values_mut() {
-                cmds.extend(resize_model(m, self.size_px, self.scale, self.pad));
+            for (id, view) in self.warm.iter_mut() {
+                if let Some(state) = self.sessions.get_mut(id) {
+                    cmds.extend(resize_model(
+                        view,
+                        state,
+                        self.size_px,
+                        self.scale,
+                        self.pad,
+                    ));
+                }
             }
             return cmds;
         }
@@ -937,24 +1090,26 @@ impl RootModel {
             // title, so a label change there retitles.
             let mut cmds = Vec::new();
             for info in infos {
-                if let Some(m) = self.warm.get_mut(&info.name) {
-                    m.set_display_name(info.display_name.clone());
+                if self.warm.contains_key(&info.name)
+                    && let Some(state) = self.sessions.get_mut(&info.name)
+                {
+                    state.set_display_name(info.display_name.clone());
                 }
             }
-            if let Mode::Single(m) = &mut self.mode
-                && let Some(info) = infos.iter().find(|i| i.name == m.session())
-            {
-                let before = m.title();
-                m.set_display_name(info.display_name.clone());
-                let after = m.title();
-                if after != before {
-                    cmds.push(Cmd::SetTitle(after));
+            if let Mode::Single { id, .. } = &self.mode {
+                let id = id.clone();
+                if let Some(info) = infos.iter().find(|i| i.name == id)
+                    && let Some(state) = self.sessions.get_mut(&id)
+                {
+                    let before = state.title();
+                    state.set_display_name(info.display_name.clone());
+                    let after = state.title();
+                    if after != before {
+                        cmds.push(Cmd::SetTitle(after));
+                    }
                 }
             }
-            cmds.extend(match &mut self.mode {
-                Mode::Single(m) => m.update(ev),
-                Mode::Fleet(f) => f.update(ev),
-            });
+            cmds.extend(self.drive(ev));
             self.mirror_fleet_identity();
             self.release_detached(&cmds);
             if let Some(p) = self.pending_dive.take() {
@@ -976,10 +1131,7 @@ impl RootModel {
                 name,
                 push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
             } if !self.focused_win && self.mine.contains(name.as_str()));
-        let mut cmds = match &mut self.mode {
-            Mode::Single(m) => m.update(ev),
-            Mode::Fleet(f) => f.update(ev),
-        };
+        let mut cmds = self.drive(ev);
         self.mirror_fleet_identity();
         self.release_detached(&cmds);
         if bell_attention {
@@ -1037,7 +1189,12 @@ impl RootModel {
         for c in cmds {
             if let Cmd::Detach(id) = c {
                 self.mine.remove(id);
-                self.warm.remove(id);
+                // Its only view in this window is the warm mirror; dropping that
+                // drops the last viewer, so the session state goes too. (In the
+                // fleet the tile owns the state, warm is empty, and this no-ops.)
+                if self.warm.remove(id).is_some() {
+                    self.sessions.remove(id);
+                }
             }
         }
     }
@@ -1069,7 +1226,7 @@ impl RootModel {
             return Vec::new();
         };
         let (name, ended) = (name.clone(), *ended);
-        let cmds = match self.warm.get_mut(&name) {
+        let cmds = match (self.warm.get_mut(&name), self.sessions.get_mut(&name)) {
             // A background mirror still tracks its own title, screen and window state
             // internally (so a later Ctrl-Tab restores them), but it is NOT visible, so
             // two kinds of command must not reach the shell: anything that reaches out
@@ -1081,17 +1238,18 @@ impl RootModel {
             // Everything else flows: replies to a program querying the terminal
             // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
             // that backstops a mirror's synchronized-output hold for when it's promoted.
-            Some(m) => m
-                .update(ev)
+            (Some(view), Some(state)) => view
+                .update(state, ev)
                 .into_iter()
                 .filter(|c| !c.reaches_the_desktop() && !matches!(c, Cmd::Redraw))
                 .collect(),
-            None => Vec::new(), // not a session this window mirrors
+            _ => Vec::new(), // not a session this window mirrors
         };
         if ended {
-            // A dead background session is no longer ours: drop its mirror and
-            // ownership so Ctrl-Tab and the fleet never land on it.
+            // A dead background session is no longer ours: drop its mirror, its
+            // state, and our ownership so Ctrl-Tab and the fleet never land on it.
             self.warm.remove(&name);
+            self.sessions.remove(&name);
             self.mine.remove(&name);
         }
         cmds
@@ -1106,9 +1264,9 @@ impl RootModel {
     /// app the ESC[I / ESC[O a real terminal sends as its view comes forward.
     fn reassert_foreground_focus(&mut self) -> Vec<Cmd> {
         let focused = self.focused_win;
-        match &mut self.mode {
-            Mode::Single(m) => m.update(UiEvent::Focus(focused)),
-            Mode::Fleet(_) => Vec::new(),
+        match self.foreground_mut() {
+            Some((view, state)) => view.update(state, UiEvent::Focus(focused)),
+            None => Vec::new(),
         }
     }
 
@@ -1137,16 +1295,14 @@ impl RootModel {
             cmds.push(Cmd::Redraw);
             return cmds;
         }
-        let placeholder = Mode::Single(Box::new(TerminalModel::new(
-            String::new(),
-            1,
-            1,
-            self.metrics,
-        )));
+        let placeholder = Mode::Single {
+            id: String::new(),
+            view: Box::new(TerminalView::new(self.metrics, 1, 1)),
+        };
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let mut anim = None;
-        let (mut model, mut cmds) = match current {
+        let (mut view, mut cmds) = match current {
             Mode::Fleet(f) => {
                 // Carry the fleet's (possibly edited) groups — and identity,
                 // in case it adopted a closed group — out of the closing
@@ -1161,40 +1317,59 @@ impl RootModel {
                     .map(|to| Anim::dive(f.view(), Transform::IDENTITY, to, dur));
                 let (kept, warm, cmds) =
                     f.into_single_adopting(id.clone(), self.size_px, self.scale);
-                // The window's other driven sessions stay warm in the background.
-                // Own them too: a group-open claims sessions fleet-side, and this
-                // is where the window learns about them (no-op for ones we knew).
+                // Unpack the fleet's models into (state → registry, view → warm): the
+                // window's other driven sessions stay warm in the background. Own them
+                // too: a group-open claims sessions fleet-side, and this is where the
+                // window learns about them (no-op for ones we knew).
                 for m in warm {
-                    self.mine.insert(m.session().to_string());
-                    self.warm.insert(m.session().to_string(), m);
+                    let sid = m.session().to_string();
+                    let (state, view) = m.into_parts();
+                    self.mine.insert(sid.clone());
+                    self.sessions.insert(sid.clone(), state);
+                    self.warm.insert(sid, view);
                 }
-                (kept, cmds)
+                let (state, view) = kept.into_parts();
+                self.sessions.insert(state.session().to_string(), state);
+                (Box::new(view), cmds)
             }
-            Mode::Single(m) => {
-                let old = m.session().to_string();
+            Mode::Single { id: old, view } => {
                 if old == id {
-                    (*m, Vec::new())
+                    (view, Vec::new())
                 } else {
-                    // Stow the outgoing foreground as a warm mirror; restore the
-                    // target's mirror if we have one (instant, no re-attach), else
-                    // build a fresh model.
-                    self.warm.insert(old, *m);
-                    let model = self.warm.remove(&id).unwrap_or_else(|| {
-                        let mut m = TerminalModel::new(id.clone(), 1, 1, self.metrics);
-                        m.set_theme(self.theme);
-                        m.set_policy(self.policy);
-                        m
-                    });
-                    (model, Vec::new())
+                    // Stow the outgoing foreground's view as a warm mirror (its state
+                    // stays put in the registry); restore the target's view if we have
+                    // one (instant, no re-attach), else mint a fresh state + view.
+                    self.warm.insert(old, *view);
+                    let view = match self.warm.remove(&id) {
+                        Some(v) => Box::new(v),
+                        None => {
+                            self.sessions.get_or_mint(&id, 1, 1);
+                            Box::new(TerminalView::new(self.metrics, 1, 1))
+                        }
+                    };
+                    (view, Vec::new())
                 }
             }
         };
         // Size the (possibly restored or fresh) foreground to the window.
-        cmds.extend(resize_model(&mut model, self.size_px, self.scale, self.pad));
+        let state = self
+            .sessions
+            .get_mut(&id)
+            .expect("adopted session state present");
+        cmds.extend(resize_model(
+            &mut view,
+            state,
+            self.size_px,
+            self.scale,
+            self.pad,
+        ));
         // The window title follows the foreground: reassert this session's remembered
         // title on the switch, since it changed no title of its own to trigger one.
-        let title = model.title();
-        self.mode = Mode::Single(Box::new(model));
+        let title = state.title();
+        self.mode = Mode::Single {
+            id: id.clone(),
+            view,
+        };
         self.mine.insert(id.clone());
         cmds.extend(self.claim_member(&id));
         self.primary = Some(id);
@@ -1216,17 +1391,18 @@ impl RootModel {
     /// warm mirror — or, when the window has none left, fall back to the fleet
     /// overview (which lists whatever sessions still exist, empty if none).
     fn foreground_ended(&mut self) -> Vec<Cmd> {
-        let Mode::Single(m) = &self.mode else {
+        let Mode::Single { id: gone, .. } = &self.mode else {
             return Vec::new();
         };
-        let gone = m.session().to_string();
+        let gone = gone.clone();
         // Freeze the dead session's last frame now, before we discard it — it's the
         // rendered stand-in that slides out under the switch.
         let outgoing = self.live_scene();
-        // The session is dead: drop our ownership and any warm mirror of it, and
-        // cancel any in-flight dive/slide so a stale camera/snapshot can't linger.
+        // The session is dead: drop our ownership, its state, and any warm mirror of
+        // it, and cancel any in-flight dive/slide so a stale camera can't linger.
         self.mine.remove(&gone);
         self.warm.remove(&gone);
+        self.sessions.remove(&gone);
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
@@ -1244,16 +1420,24 @@ impl RootModel {
         if let Some(next) = next {
             // Promote its warm mirror to the foreground (already attached and kept
             // resized); the dead model is discarded, never stowed as a mirror.
-            let mut model = self.warm.remove(&next).unwrap_or_else(|| {
-                let mut m = TerminalModel::new(next.clone(), 1, 1, self.metrics);
-                m.set_theme(self.theme);
-                m.set_policy(self.policy);
-                m
-            });
-            let mut cmds = resize_model(&mut model, self.size_px, self.scale, self.pad);
+            let mut view = match self.warm.remove(&next) {
+                Some(v) => v,
+                None => {
+                    self.sessions.get_or_mint(&next, 1, 1);
+                    TerminalView::new(self.metrics, 1, 1)
+                }
+            };
+            let state = self
+                .sessions
+                .get_mut(&next)
+                .expect("promoted session state present");
+            let mut cmds = resize_model(&mut view, state, self.size_px, self.scale, self.pad);
             // The window title follows the new foreground, not the exited session.
-            let title = model.title();
-            self.mode = Mode::Single(Box::new(model));
+            let title = state.title();
+            self.mode = Mode::Single {
+                id: next.clone(),
+                view: Box::new(view),
+            };
             self.primary = Some(next);
             cmds.push(Cmd::SetTitle(title));
             // The successor inherited no focus event; reassert the window's focus
@@ -1269,8 +1453,8 @@ impl RootModel {
 
         // Nothing left to show: drop to the fleet overview.
         let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
-        fleet.set_theme(self.theme);
-        fleet.set_policy(self.policy);
+        fleet.set_theme(self.sessions.theme);
+        fleet.set_policy(self.sessions.policy);
         fleet.set_groups(self.groups.clone());
         fleet.set_my_group(self.my_group.clone());
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
@@ -1323,7 +1507,11 @@ impl RootModel {
     /// endpoints a slide is built from.
     fn live_scene(&self) -> Scene {
         match &self.mode {
-            Mode::Single(m) => m.view(),
+            Mode::Single { id, view } => view.view(
+                self.sessions
+                    .get(id)
+                    .expect("foreground session state present"),
+            ),
             Mode::Fleet(f) => f.view(),
         }
     }
@@ -1802,8 +1990,8 @@ impl RootModel {
         if self.anim.is_some() {
             return;
         }
-        if let Mode::Single(m) = &mut self.mode {
-            m.mark_presented();
+        if let Some((view, state)) = self.foreground_mut() {
+            view.mark_presented(state);
         }
     }
 
@@ -1813,7 +2001,7 @@ impl RootModel {
     /// never calls `view`, so reading it can't perturb the timing it measures.
     pub fn foreground_trace(&self) -> Option<crate::TermTrace> {
         match &self.mode {
-            Mode::Single(m) => Some(m.trace()),
+            Mode::Single { view, .. } => Some(view.trace()),
             Mode::Fleet(_) => None,
         }
     }
@@ -1822,7 +2010,7 @@ impl RootModel {
     /// rasterizes glyphs at the size the current scene was laid out for.
     pub fn render_scale(&self) -> f32 {
         match &self.mode {
-            Mode::Single(m) => m.render_scale(),
+            Mode::Single { view, .. } => view.render_scale(),
             Mode::Fleet(f) => f.render_scale(),
         }
     }
@@ -1830,21 +2018,19 @@ impl RootModel {
     /// Physical-pixel rect of the text cursor for the IME candidate window. Only
     /// the single view has a well-defined caret; the fleet overview returns None.
     pub fn ime_cursor_area(&self) -> Option<ghost_render::RectPx> {
-        match &self.mode {
-            Mode::Single(m) => m.ime_cursor_area(),
-            Mode::Fleet(_) => None,
+        match self.foreground_view() {
+            Some((view, state)) => view.ime_cursor_area(state),
+            None => None,
         }
     }
 
     fn toggle(&mut self) -> Vec<Cmd> {
         // Swap the mode out behind a cheap placeholder so we can move the owned
         // model/fleet into the conversion.
-        let placeholder = Mode::Single(Box::new(TerminalModel::new(
-            String::new(),
-            1,
-            1,
-            self.metrics,
-        )));
+        let placeholder = Mode::Single {
+            id: String::new(),
+            view: Box::new(TerminalView::new(self.metrics, 1, 1)),
+        };
         // A new transition cancels any in-flight dive or slide (a still-waiting
         // dive-out, an animation that hasn't settled, or a take-over awaiting its
         // preview) so a stale camera/snapshot can't linger.
@@ -1854,20 +2040,37 @@ impl RootModel {
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let (next, mut cmds, anim) = match current {
-            Mode::Single(m) => {
-                // Hand the foreground and every warm background mirror to the
-                // fleet, so all of this window's previews are live, not cold.
-                let warm: Vec<TerminalModel> = self.warm.drain().map(|(_, m)| m).collect();
+            Mode::Single { id, view } => {
+                // Hand the foreground and every warm background mirror to the fleet,
+                // so all of this window's previews are live, not cold. The fleet still
+                // owns whole models (until B1b), so re-pair each view with its state
+                // pulled out of the registry — entering the fleet, the tiles own them.
+                let fg_state = self
+                    .sessions
+                    .remove(&id)
+                    .expect("foreground session state present");
+                let primary = TerminalModel::from_parts(fg_state, *view);
+                let warm_views: Vec<(SessionId, TerminalView)> = self.warm.drain().collect();
+                let warm: Vec<TerminalModel> = warm_views
+                    .into_iter()
+                    .map(|(sid, v)| {
+                        let st = self
+                            .sessions
+                            .remove(&sid)
+                            .expect("warm session state present");
+                        TerminalModel::from_parts(st, v)
+                    })
+                    .collect();
                 let (mut fleet, mut cmds) = FleetModel::adopting(
-                    *m,
+                    primary,
                     warm,
                     self.metrics,
                     self.size_px,
                     self.scale,
                     self.mine.clone(),
                 );
-                fleet.set_theme(self.theme);
-                fleet.set_policy(self.policy);
+                fleet.set_theme(self.sessions.theme);
+                fleet.set_policy(self.sessions.policy);
                 fleet.set_groups(self.groups.clone());
                 fleet.set_my_group(self.my_group.clone());
                 cmds.insert(0, Cmd::ListSessions); // fetch the complete grid
@@ -1902,22 +2105,36 @@ impl RootModel {
                 let anim = to.map(|to| Anim::dive(f.view(), Transform::IDENTITY, to, dur));
                 let (model, warm, mut cmds) =
                     f.into_single_adopting(target.clone(), self.size_px, self.scale);
+                // Unpack the fleet's models into (state → registry, view → warm/mode).
                 // The extracted session becomes the foreground; the rest of the
                 // window's driven sessions stay warm in the background. Own them
                 // too: a group-open claims sessions fleet-side, and this is where
                 // the window learns about them (no-op for ones we knew).
                 for m in warm {
-                    self.mine.insert(m.session().to_string());
-                    self.warm.insert(m.session().to_string(), m);
+                    let sid = m.session().to_string();
+                    let (st, v) = m.into_parts();
+                    self.mine.insert(sid.clone());
+                    self.sessions.insert(sid.clone(), st);
+                    self.warm.insert(sid, v);
                 }
                 cmds.push(Cmd::Redraw);
-                let id = model.session().to_string();
+                let (st, v) = model.into_parts();
+                let id = st.session().to_string();
+                let title = st.title();
                 self.mine.insert(id.clone());
-                self.primary = Some(id);
+                self.sessions.insert(id.clone(), st);
+                self.primary = Some(id.clone());
                 // Follow the foreground: diving in reasserts this session's remembered
                 // title, since the fleet filtered any title changes while overviewing.
-                cmds.push(Cmd::SetTitle(model.title()));
-                (Mode::Single(Box::new(model)), cmds, anim)
+                cmds.push(Cmd::SetTitle(title));
+                (
+                    Mode::Single {
+                        id,
+                        view: Box::new(v),
+                    },
+                    cmds,
+                    anim,
+                )
             }
         };
         self.mode = next;
@@ -1950,10 +2167,7 @@ impl RootModel {
             // its release tick — forward one now, or the hold latches and the
             // view stays frozen on the pre-frame content until some input forces
             // a repaint. The fleet needs it too, to resume its periodic refresh.
-            cmds.extend(match &mut self.mode {
-                Mode::Fleet(f) => f.update(UiEvent::Tick { now_ms }),
-                Mode::Single(m) => m.update(UiEvent::Tick { now_ms }),
-            });
+            cmds.extend(self.drive(UiEvent::Tick { now_ms }));
         } else {
             cmds.push(Cmd::ScheduleTick {
                 after_ms: ANIM_TICK_MS,
@@ -2311,7 +2525,7 @@ mod tests {
         settle(&mut r);
         let fleet_has = |r: &RootModel, gid: &str| match &r.mode {
             Mode::Fleet(f) => f.groups().iter().any(|g| g.id == gid),
-            Mode::Single(_) => false,
+            Mode::Single { .. } => false,
         };
         assert!(fleet_has(&r, "g-infra"), "startup groups seed the fleet");
         // Re-broadcast while open (another window saved): applies live.
@@ -3889,7 +4103,7 @@ mod tests {
         feed(&mut r, "alpha", b"\x1b]2;pwned\x07");
 
         let foreground = match &r.mode {
-            Mode::Single(m) => m,
+            Mode::Single { id, .. } => r.sessions.get(id).expect("foreground state"),
             Mode::Fleet(_) => panic!("single view"),
         };
         assert_eq!(
@@ -3897,10 +4111,11 @@ mod tests {
             "",
             "the foreground honours the window's policy"
         );
+        assert!(r.warm.contains_key("alpha"), "alpha is warm");
         assert_eq!(
-            r.warm
+            r.sessions
                 .get("alpha")
-                .expect("alpha is warm")
+                .expect("alpha's state")
                 .screen()
                 .vt()
                 .title(),
@@ -3916,7 +4131,7 @@ mod tests {
         r.update(UiEvent::AdoptSession("gamma".into())); // freshly minted
         feed(&mut r, "gamma", b"\x1b]2;pwned\x07");
         let foreground = match &r.mode {
-            Mode::Single(m) => m,
+            Mode::Single { id, .. } => r.sessions.get(id).expect("foreground state"),
             Mode::Fleet(_) => panic!("single view"),
         };
         assert_eq!(

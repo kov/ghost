@@ -173,7 +173,7 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
 /// recreate the model and re-stamp its per-session facts (theme, policy, …). Every
 /// field here answers "what is true of the session," never "how is this window
 /// looking at it" — that is [`TerminalModel`]'s.
-struct SessionState {
+pub(crate) struct SessionState {
     session: SessionId,
     screen: Screen,
     scanner: QueryScanner,
@@ -387,7 +387,7 @@ struct Presented {
 type PlacementSig = (u32, u32, usize, usize, u32, u32, i32);
 
 impl SessionState {
-    fn new(session: SessionId, cols: u16, rows: u16) -> Self {
+    pub(crate) fn new(session: SessionId, cols: u16, rows: u16) -> Self {
         SessionState {
             session,
             screen: Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK),
@@ -485,7 +485,7 @@ impl SessionState {
     /// the id does — so the titlebar always shows something meaningful. Lives
     /// on the screen state and the label, so it is remembered across
     /// background/foreground switches.
-    fn title(&self) -> String {
+    pub(crate) fn title(&self) -> String {
         let title = self.screen.title();
         let label = (!self.display_name.is_empty() && self.display_name != self.session)
             .then_some(self.display_name.as_str());
@@ -498,8 +498,58 @@ impl SessionState {
     }
 
     /// The session id these effects target.
-    fn session(&self) -> &str {
+    pub(crate) fn session(&self) -> &str {
         &self.session
+    }
+
+    /// Whether the child exited / the session closed. Read by the window's
+    /// session registry to mint a fresh state over a dead one of the same name.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// The session's emulator screen (tests read it directly off the registry).
+    #[cfg(test)]
+    pub(crate) fn screen(&self) -> &Screen {
+        &self.screen
+    }
+
+    /// Set the session's user-chosen display name (empty = unlabeled).
+    pub(crate) fn set_display_name(&mut self, name: String) {
+        self.display_name = name;
+    }
+
+    /// Set the scheme's default fg/bg reported to apps that query them
+    /// (OSC 10/11). Called once per session right after it is minted; on a real
+    /// theme *change*, sessions subscribed to mode 2031 get the unsolicited
+    /// `CSI ? 997 ; Ps n` dark/light notification.
+    pub(crate) fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
+        let changed = theme != self.theme;
+        self.theme = theme;
+        if changed && self.screen.vt().dec_mode_state(2031) == ghost_term::ModeReport::Set {
+            let colors = self.screen.effective_colors(self.theme);
+            return self.send(ghost_vt::query::color_scheme_report(&colors));
+        }
+        Vec::new()
+    }
+
+    /// What this session may do outside its own screen — the clipboard, the window
+    /// (see [`ghost_term::policy`]). Safe to change while the session runs.
+    pub(crate) fn set_action_policy(&mut self, policy: ActionPolicy) {
+        self.action_policy = policy;
+    }
+
+    /// What the program may change about the terminal itself (see
+    /// [`ghost_term::policy`]). Set this when the session is created and leave it.
+    pub(crate) fn set_terminal_policy(&mut self, policy: ghost_term::TerminalPolicy) {
+        self.screen.set_policy(policy);
+    }
+
+    /// Both halves at once — what the shell hands down, and the same value it
+    /// reports to the session host so the two emulators agree.
+    pub(crate) fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
+        self.set_terminal_policy(policy.terminal);
+        self.set_action_policy(policy.action);
     }
 }
 
@@ -511,53 +561,51 @@ impl TerminalModel {
         }
     }
 
-    /// Set the scheme's default fg/bg reported to apps that query them
-    /// (OSC 10/11). Called once per model right after construction; on a real
-    /// theme *change*, sessions subscribed to mode 2031 get the unsolicited
-    /// `CSI ? 997 ; Ps n` dark/light notification.
+    /// Split this shell into its two halves so the window can own the session and
+    /// the view separately (the "one model, many views" hoist): the session state
+    /// goes into the window's session registry, the view into its mode/warm slot.
+    pub(crate) fn into_parts(self) -> (SessionState, TerminalView) {
+        (self.state, self.view)
+    }
+
+    /// Re-pair a session state with a view into a single owner — the inverse of
+    /// [`Self::into_parts`], for handing a `(state, view)` back across an API that
+    /// still takes a whole model (e.g. the fleet, until it borrows the registry).
+    pub(crate) fn from_parts(state: SessionState, view: TerminalView) -> Self {
+        TerminalModel { state, view }
+    }
+
+    /// Set the scheme's default fg/bg reported to apps that query them (OSC 10/11)
+    /// — see [`SessionState::set_theme`].
     pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
-        let changed = theme != self.state.theme;
-        self.state.theme = theme;
-        if changed && self.state.screen.vt().dec_mode_state(2031) == ghost_term::ModeReport::Set {
-            let colors = self.state.screen.effective_colors(self.state.theme);
-            return self
-                .state
-                .send(ghost_vt::query::color_scheme_report(&colors));
-        }
-        Vec::new()
+        self.state.set_theme(theme)
     }
 
     pub fn screen(&self) -> &Screen {
         &self.state.screen
     }
 
-    /// What this session may do outside its own screen — the clipboard, the window
-    /// (see [`ghost_term::policy`]). Safe to change while the session runs: nothing
-    /// here is screen state, so the session host needn't agree with us about it.
+    /// What this session may do outside its own screen (see
+    /// [`SessionState::set_action_policy`]).
     pub fn set_action_policy(&mut self, policy: ActionPolicy) {
-        self.state.action_policy = policy;
+        self.state.set_action_policy(policy)
     }
 
-    /// Both halves at once — what the shell hands down, and the same value it
-    /// reports to the session host so the two emulators agree.
+    /// Both halves at once (see [`SessionState::set_policy`]).
     pub fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
-        self.set_terminal_policy(policy.terminal);
-        self.set_action_policy(policy.action);
+        self.state.set_policy(policy)
     }
 
     /// What the program may change about the terminal itself (see
-    /// [`ghost_term::policy`]). Set this when the session is created and leave it:
-    /// the session host runs its own emulator over the same bytes and re-seeds ours
-    /// on every attach, so a policy the two disagree about is state that appears and
-    /// vanishes depending on who was looking.
+    /// [`SessionState::set_terminal_policy`]).
     pub fn set_terminal_policy(&mut self, policy: ghost_term::TerminalPolicy) {
-        self.state.screen.set_policy(policy);
+        self.state.set_terminal_policy(policy)
     }
 
-    /// Set the session's user-chosen display name (empty = unlabeled). A label
-    /// for humans only — routing stays on the immutable [`Self::session`] id.
+    /// Set the session's user-chosen display name (see
+    /// [`SessionState::set_display_name`]).
     pub fn set_display_name(&mut self, name: String) {
-        self.state.display_name = name;
+        self.state.set_display_name(name)
     }
 
     /// The session's user-chosen display name, empty if unlabeled.
@@ -649,7 +697,7 @@ impl TerminalModel {
 }
 
 impl TerminalView {
-    fn new(metrics: CellMetrics, cols: u16, rows: u16) -> Self {
+    pub(crate) fn new(metrics: CellMetrics, cols: u16, rows: u16) -> Self {
         let size_px = (
             (f32::from(cols) * metrics.advance) as u32,
             (f32::from(rows) * metrics.line_height) as u32,
@@ -732,7 +780,7 @@ impl TerminalView {
     /// and drop the accumulated feed damage, so the next [`Self::damage`] measures from
     /// here. Driven by the shell after a successful present (never from `view`, which is
     /// called more than once per frame), so damage is never cleared before it is applied.
-    fn mark_presented(&mut self, state: &SessionState) {
+    pub(crate) fn mark_presented(&mut self, state: &SessionState) {
         self.presented = Some(Presented {
             scroll: self.scroll_offset,
             selection: self.selection,
@@ -748,7 +796,7 @@ impl TerminalView {
 
     /// A snapshot of this session's render-gate counters, with the live
     /// `sync_held`/`feed_dirty` folded in (see [`TermTrace`]).
-    fn trace(&self) -> TermTrace {
+    pub(crate) fn trace(&self) -> TermTrace {
         TermTrace {
             sync_held: self.sync_held,
             feed_dirty: self.feed_dirty,
@@ -760,7 +808,7 @@ impl TerminalView {
     /// at the window edges. The model keeps the full range in absolute line
     /// space (it survives scrolling and can span beyond the window); `None`
     /// when there is no selection or it lies entirely off-screen.
-    fn selection(&self, state: &SessionState) -> Option<Selection> {
+    pub(crate) fn selection(&self, state: &SessionState) -> Option<Selection> {
         let s = self.selection?;
         let top = self.abs_top(state);
         let rows = state.rows as usize;
@@ -800,7 +848,7 @@ impl TerminalView {
     }
 
     /// Apply an event, returning the effects to perform.
-    fn update(&mut self, state: &mut SessionState, ev: UiEvent) -> Vec<Cmd> {
+    pub(crate) fn update(&mut self, state: &mut SessionState, ev: UiEvent) -> Vec<Cmd> {
         match ev {
             UiEvent::Key {
                 key,
@@ -858,13 +906,13 @@ impl TerminalView {
     /// Combined render scale: device scale × user zoom. The shell multiplies the
     /// base font size by this to rasterize glyphs at the same size the grid is
     /// laid out for, keeping the two in lockstep.
-    fn render_scale(&self) -> f32 {
+    pub(crate) fn render_scale(&self) -> f32 {
         self.scale * self.zoom
     }
 
     /// Set the inner padding (logical px per side). The caller re-grids by resizing
     /// afterwards; storing it here is enough for [`Self::view`] and hit-testing.
-    fn set_padding(&mut self, pad_logical: f32) {
+    pub(crate) fn set_padding(&mut self, pad_logical: f32) {
         self.pad = pad_logical.max(0.0);
     }
 
@@ -1060,7 +1108,7 @@ impl TerminalView {
 
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
     /// window. `None` while scrolled into history (no live cursor is shown).
-    fn ime_cursor_area(&self, state: &SessionState) -> Option<RectPx> {
+    pub(crate) fn ime_cursor_area(&self, state: &SessionState) -> Option<RectPx> {
         if self.scroll_offset != 0 {
             return None;
         }
@@ -1089,7 +1137,7 @@ impl TerminalView {
     /// Render the current state to a single terminal scene. The canvas is the whole
     /// window; the terminal item is inset by the padding, leaving a background-filled
     /// border (see [`Self::pad`]).
-    fn view(&self, state: &SessionState) -> Scene {
+    pub(crate) fn view(&self, state: &SessionState) -> Scene {
         let frame = std::rc::Rc::new(layout_frame_at(
             state.screen.vt(),
             self.effective_metrics(),
