@@ -1,1 +1,9 @@
 /target
+
+# Scratch crates and spikes kept beside the workspace, not part of it.
+/experiments
+
+# Screen captures, recordings and logs dropped at the root while working.
+/*.png
+/*.log
+/*.cast

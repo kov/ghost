@@ -19,7 +19,7 @@ or kill as a unit.
 
 ![Two ghost windows: a single terminal, and a fleet view of a remote SSH group
 with live session previews, per-tile and per-group actions, and an
-"attached elsewhere" row](ghost.png)
+"attached elsewhere" row](docs/ghost.png)
 
 [dtach]: https://github.com/crigler/dtach
 [asciinema]: https://asciinema.org/
