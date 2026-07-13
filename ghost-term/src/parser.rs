@@ -71,6 +71,12 @@ pub enum Function {
     Cuu(u16),
     Dch(u16),
     Decaln,
+    /// DECBI `ESC 6` — back index. Steps the cursor left; at the left margin it
+    /// scrolls the margin box right instead, opening a blank column.
+    Decbi,
+    /// DECFI `ESC 9` — forward index. The mirror of [`Decbi`]: at the right margin
+    /// it scrolls the box left.
+    Decfi,
     Decrc,
     Decrst(DecModes),
     Decsc,
@@ -926,9 +932,13 @@ impl Parser {
         match (self.intermediate, input) {
             (None, c) if ('@'..='_').contains(&c) => self.execute(((input as u8) + 0x40) as char),
 
+            (None, '6') => Some(Decbi),
+
             (None, '7') => Some(Decsc),
 
             (None, '8') => Some(Decrc),
+
+            (None, '9') => Some(Decfi),
 
             (None, 'c') => {
                 self.state = State::Ground;
@@ -1509,6 +1519,10 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Cuu(n) => push_csi(seq, None, &[n.to_string()], 'A'),
         Dch(n) => push_csi(seq, None, &[n.to_string()], 'P'),
         Decaln => push_esc(seq, Some('#'), '8'),
+        Decbi => push_esc(seq, None, '6'),
+
+        Decfi => push_esc(seq, None, '9'),
+
         Decrc => push_esc(seq, None, '8'),
 
         Decrst(modes) => {
@@ -2455,6 +2469,8 @@ mod tests {
         assert_eq!(parse("\x1bc"), [Ris]);
         assert_eq!(parse("\x1bM"), [Ri]);
         assert_eq!(parse("\x1b#8"), [Decaln]);
+        assert_eq!(parse("\x1b6"), [Decbi]);
+        assert_eq!(parse("\x1b9"), [Decfi]);
         assert_eq!(parse("\x1b(0"), [Gzd4(Charset::Drawing)]);
         assert_eq!(parse("\x1b(B"), [Gzd4(Charset::Ascii)]);
         assert_eq!(parse("\x1b)0"), [G1d4(Charset::Drawing)]);
@@ -3023,6 +3039,8 @@ mod tests {
             Cuu(1),
             Dch(18),
             Decaln,
+            Decbi,
+            Decfi,
             Decrc,
             Decrst(dec_modes([])),
             Decrst(dec_modes([

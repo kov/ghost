@@ -466,6 +466,17 @@ mod tests {
         (0..8).map(|r| row_cells(vt, r, 8)).collect()
     }
 
+    /// Write the esctest region grid (abcde / fghij / …) with its top-left corner
+    /// at 1-based `(col, row)` — how the DECFI/DECBI tests lay out their screen.
+    fn grid5_at(vt: &mut Vt, col: usize, row: usize) {
+        for (i, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
+            .iter()
+            .enumerate()
+        {
+            vt.feed_str(&format!("\x1b[{};{col}H{s}", row + i));
+        }
+    }
+
     /// Fill a 5×5 vt with the esctest region grid (abcde / fghij / …).
     fn grid5(vt: &mut Vt) {
         for (r, s) in ["abcde", "fghij", "klmno", "pqrst", "uvwxy"]
@@ -1040,6 +1051,95 @@ mod tests {
                 "YZ6789!@"
             ]
         );
+    }
+
+    #[test]
+    fn decfi_moves_forward_and_scrolls_the_box_at_the_right_margin() {
+        let mut vt = Vt::new(10, 8);
+        grid5_at(&mut vt, 2, 3); // the esctest grid at col 2, row 3
+
+        // Inside the box, short of the right margin: just a step right.
+        vt.feed_str("\x1b[?69h\x1b[3;5s\x1b[4;6r"); // L/R 3-5, T/B 4-6
+        vt.feed_str("\x1b[5;4H\x1b9");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 4));
+
+        // At the right margin: the box scrolls left, a blank column arrives at the
+        // right margin, and the cursor stays put (esctest test_DECFI_Scrolls).
+        vt.feed_str("\x1b[5;5H\x1b9");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 4), "cursor held");
+        assert_eq!(
+            (2..7).map(|r| row_cells(&vt, r, 7)).collect::<Vec<_>>(),
+            [" abcde ", " fhi j ", " kmn o ", " prs t ", " uvwxy "]
+        );
+
+        // Right of the margin the cursor moves on, unconfined — but at the screen's
+        // right edge the control is ignored.
+        vt.feed_str("\x1b[1;6H\x1b9");
+        assert_eq!(vt.cursor().col, 6, "outside the box it just steps right");
+        vt.feed_str("\x1b[1;10H\x1b9");
+        assert_eq!(vt.cursor().col, 9, "ignored at the screen's right edge");
+    }
+
+    #[test]
+    fn decbi_moves_back_and_scrolls_the_box_at_the_left_margin() {
+        let mut vt = Vt::new(10, 8);
+        grid5_at(&mut vt, 2, 3);
+
+        vt.feed_str("\x1b[?69h\x1b[3;5s\x1b[4;6r"); // L/R 3-5, T/B 4-6
+
+        // At the left margin the box scrolls right, blanking the left column; the
+        // cursor stays (esctest test_DECBI_Scrolls).
+        vt.feed_str("\x1b[5;3H\x1b6");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (2, 4), "cursor held");
+        assert_eq!(
+            (2..7).map(|r| row_cells(&vt, r, 7)).collect::<Vec<_>>(),
+            [" abcde ", " f ghj ", " k lmo ", " p qrt ", " uvwxy "]
+        );
+
+        // Left of the margin the cursor steps back, and is ignored at column 1.
+        vt.feed_str("\x1b[1;2H\x1b6");
+        assert_eq!(vt.cursor().col, 0, "outside the box it just steps left");
+        vt.feed_str("\x1b[1;1H\x1b6");
+        assert_eq!(vt.cursor().col, 0, "ignored at the screen's left edge");
+    }
+
+    #[test]
+    fn cnl_and_cpl_return_to_the_left_margin() {
+        let mut vt = Vt::new(20, 10);
+        vt.feed_str("\x1b[2;4r\x1b[?69h\x1b[5;10s"); // T/B 2-4, L/R 5-10
+
+        // Begun inside the region, CNL stops at the bottom margin and lands on the
+        // left margin — not column 1 (esctest test_CNL_StopsAtBottomMarginInScrollRegion).
+        vt.feed_str("\x1b[3;7H\x1b[99E");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 3));
+
+        // Begun below it, CNL runs to the last line, still landing on the margin.
+        vt.feed_str("\x1b[6;7H\x1b[99E");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 9));
+
+        // CPL is the mirror: up to the top margin, onto the left margin.
+        vt.feed_str("\x1b[3;7H\x1b[99F");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (4, 1));
+    }
+
+    #[test]
+    fn decaln_homes_the_cursor_and_clears_the_margins() {
+        let mut vt = Vt::new(10, 6);
+        vt.feed_str("\x1b[?69h\x1b[2;3s\x1b[4;5r"); // margins on both axes
+        vt.feed_str("\x1b[5;5H");
+        vt.feed_str("\x1b#8");
+
+        assert_eq!((vt.cursor().col, vt.cursor().row), (0, 0), "cursor homed");
+        assert_eq!(row_cells(&vt, 0, 10), "EEEEEEEEEE");
+        assert_eq!(row_cells(&vt, 5, 10), "EEEEEEEEEE");
+
+        // The margins are gone, so the cursor can cross where they were.
+        vt.feed_str("\x1b[4;2H\x1b[A"); // CUU from the old top margin
+        assert_eq!(vt.cursor().row, 2, "passed the old top margin");
+        vt.feed_str("\x1b[5;2H\x1b[B"); // CUD from the old bottom margin
+        assert_eq!(vt.cursor().row, 5, "passed the old bottom margin");
+        vt.feed_str("\x1b[1;2H\x1b[D"); // CUB from the old left margin
+        assert_eq!(vt.cursor().col, 0, "passed the old left margin");
     }
 
     #[test]

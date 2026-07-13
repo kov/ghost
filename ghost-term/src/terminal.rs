@@ -532,6 +532,14 @@ impl Terminal {
                 self.decaln();
             }
 
+            Decbi => {
+                self.decbi();
+            }
+
+            Decfi => {
+                self.decfi();
+            }
+
             Decrc => {
                 self.rc();
             }
@@ -1913,10 +1921,21 @@ impl Terminal {
         self.hard_reset();
     }
 
+    /// DECALN (`ESC # 8`) — the screen-alignment pattern: fill every cell with `E`.
+    /// It is a whole-screen test pattern, so nothing may be left confining it: the
+    /// margins are reset on both axes and the cursor goes home.
     fn decaln(&mut self) {
+        self.top_margin = 0;
+        self.bottom_margin = self.rows - 1;
+        self.left_margin = 0;
+        self.right_margin = self.cols - 1;
+        self.cursor.col = 0;
+        self.cursor.row = 0;
+        self.pending_wrap = false;
+
         for row in 0..self.rows {
             for col in 0..self.cols {
-                self.buffer.print((col, row), '\u{45}', Pen::default());
+                self.buffer.print((col, row), 'E', Pen::default());
             }
 
             self.dirty_lines.add(row);
@@ -1967,14 +1986,61 @@ impl Terminal {
         self.move_cursor_to_rel_col(-(as_usize(n, 1) as isize));
     }
 
+    // CNL/CPL are a vertical move plus a carriage return — and a CR goes to the
+    // *left margin*, not to column 1, when the cursor is at or right of it. (The
+    // old `cursor.col = 0` also left a pending wrap armed; `cr` clears it.)
     fn cnl(&mut self, n: u16) {
         self.cursor_down(as_usize(n, 1));
-        self.cursor.col = 0;
+        self.cr();
     }
 
     fn cpl(&mut self, n: u16) {
         self.cursor_up(as_usize(n, 1));
-        self.cursor.col = 0;
+        self.cr();
+    }
+
+    /// DECFI (`ESC 9`) — forward index. At the right margin of the scroll box the
+    /// box's contents shift left one column (the column past the left margin is
+    /// dropped, a blank one opens at the right margin) and the cursor holds still.
+    /// Anywhere else the cursor simply steps right — DEC STD 070 lets it move
+    /// outside the margins — and at the screen's right edge there is nowhere to go,
+    /// so the control is ignored.
+    fn decfi(&mut self) {
+        if self.cursor_in_scroll_region() && self.cursor.col == self.right_margin {
+            let rows = self.top_margin..self.bottom_margin + 1;
+            let pen = self.pen;
+            self.buffer.delete_columns(
+                rows.clone(),
+                self.left_margin,
+                1,
+                self.right_margin + 1,
+                &pen,
+            );
+            self.dirty_lines.extend(rows);
+        } else if self.cursor.col + 1 < self.cols {
+            self.cursor.col += 1;
+        }
+        self.pending_wrap = false;
+    }
+
+    /// DECBI (`ESC 6`) — back index, the mirror of [`Self::decfi`]: at the left
+    /// margin the box shifts right, opening a blank column there.
+    fn decbi(&mut self) {
+        if self.cursor_in_scroll_region() && self.cursor.col == self.left_margin {
+            let rows = self.top_margin..self.bottom_margin + 1;
+            let pen = self.pen;
+            self.buffer.insert_columns(
+                rows.clone(),
+                self.left_margin,
+                1,
+                self.right_margin + 1,
+                &pen,
+            );
+            self.dirty_lines.extend(rows);
+        } else if self.cursor.col > 0 {
+            self.cursor.col -= 1;
+        }
+        self.pending_wrap = false;
     }
 
     fn cha(&mut self, n: u16) {
@@ -4569,8 +4635,9 @@ mod tests {
         term.execute(Cup(2, 3));
         term.execute(Decaln);
 
-        assert_eq!(term.cursor(), (2, 1));
-        assert_eq!(text(&term), "EEEE\nEE|EE");
+        // DECALN homes the cursor (esctest test_DECALN_MovesCursorHome).
+        assert_eq!(term.cursor(), (0, 0));
+        assert_eq!(text(&term), "|EEEE\nEEEE");
     }
 
     #[test]
