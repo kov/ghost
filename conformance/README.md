@@ -178,9 +178,8 @@ inflated pass counts — don't repeat that.)
        cursor and clears (unless DECNCSM). The self-resize is surfaced bottom-up:
        `Screen::feed` reconciles its size from `Vt::size` after each feed, so
        `CSI 18 t` and any recording follow it. `DECSCL_Level4`, `DECSET_DECCOLM`,
-       `DECSET_Allow80To132` pass. (`DECSET_DECNCSM` needs `--xterm-winops` and is
-       skipped. The GUI frontend does not yet follow a DECCOLM resize with a window
-       resize, so `?40`-enabled apps see it only until the next window event.)
+       `DECSET_Allow80To132` pass (the GUI follows the resize — slice 8).
+       (`DECSET_DECNCSM` needs `--xterm-winops` and is skipped.)
      - ✅ 6d: the reporting cluster — DECRQSS DECSTBM (`r` → `1$r Pt;Pb r`) and SGR
        (`m` → `1$r <pen> m`, the pen's op list led by a `0` reset, sharing
        `parser::sgr_op_param` with the `Sgr` dump); plus DECRQM for the legacy
@@ -191,10 +190,24 @@ inflated pass counts — don't repeat that.)
        round-trip their 1/2 bit (the DEC ones via the non-display `tracked_modes`
        set, KAM/SRM via dedicated fields); the legacy graphic/format modes (ANSI
        GATM/…/EBM, DEC DECHCCM) report 4 permanently-reset. DECCOLM's `?3` bit is
-       tracked apart from the physical column count (`column_mode_132`) so the
-       attached GUI's grid snap-back can't defeat it. `DECRQM` **33/0**;
+       tracked apart from the physical column count (`column_mode_132`) so a grid
+       the window later reconciles to some other width can't defeat it — and it is
+       what tells RIS whether the width is the program's (slice 8). `DECRQM` **33/0**;
        `DECRQSS_DECSTBM`/`DECRQSS_SGR` pass. Still unreported: DECRQSS DECSCA (part
        of selective erase) and the niche selectors (DECSCL/DECSLPP/DECSNLS/…).
+- **GUI DECCOLM window resize** — ✅ **DONE** (slice 8). The grid used to be the
+  window's alone: `TerminalModel` snapped the screen back after every feed, so a
+  DECCOLM self-resize survived only until the next window event. Now the model
+  *follows* the program — it adopts the new grid, emits `Cmd::ResizeWindow` (the
+  shell calls winit's `request_inner_size` at the pixel size that grid needs) and
+  `Cmd::Resize` (the child gets its SIGWINCH, as after xterm's DECCOLM). The
+  window may clamp or refuse the request; whatever size it reports next arrives as
+  a `UiEvent::Resize` and wins, which is the fallback the old snap-back used to be.
+  Removing the snap-back exposed a real bug it had been hiding: RIS must leave
+  132-column mode. `Terminal::hard_reset` now takes the grid back to 80 columns
+  when — and only when — `column_mode_132` is set, so a `reset` in a 200-column
+  window doesn't shrink it (xterm makes the same pair of checks).
+  `DECSET_DECCOLM`, `DECSET_Allow80To132`, `RIS_ResetDECCOLM` pass.
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 

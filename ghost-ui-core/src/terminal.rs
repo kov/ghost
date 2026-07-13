@@ -668,6 +668,19 @@ impl TerminalModel {
         }
     }
 
+    /// Physical inner-window size that fits a `cols` × `rows` grid at the current
+    /// metrics — the inverse of the grid math in [`Self::resize`], padding included.
+    /// Rounded *up* so the floor there gives back exactly this grid.
+    fn window_px_for_grid(&self, cols: u16, rows: u16) -> (u32, u32) {
+        let m = self.effective_metrics();
+        let pad = self.pad_px();
+        let w = (f32::from(cols) * m.advance + 2.0 * pad).ceil().max(1.0);
+        let h = (f32::from(rows) * m.line_height + 2.0 * pad)
+            .ceil()
+            .max(1.0);
+        (w as u32, h as u32)
+    }
+
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
     /// window. `None` while scrolled into history (no live cursor is shown).
     pub fn ime_cursor_area(&self) -> Option<RectPx> {
@@ -1111,14 +1124,28 @@ impl TerminalModel {
                 )
             };
             // A program can resize the emulator from within the feed (DECCOLM
-            // 80↔132). In the GUI the window owns the grid size, so snap the screen
-            // back to it: DECCOLM's clear/home/margin-reset still land, but the
-            // column count follows the window rather than the program (following it
-            // with a real window resize is a possible future enhancement). Force a
-            // full repaint since the reflow invalidates every cell coordinate.
+            // 80↔132) — the one change that comes bottom-up, from the child rather
+            // than from the window. Follow it: adopt the new grid, ask the window to
+            // resize to fit, and tell the child its new size (xterm SIGWINCHes after
+            // DECCOLM too). The reply context below is built from the adopted grid,
+            // so a `CSI 18 t` in the same burst answers with the size the program
+            // just asked for. The window may refuse or clamp the request; its next
+            // `UiEvent::Resize` re-grids us to what it actually is, which is the
+            // fallback. Force a full repaint — the reflow invalidates every cell
+            // coordinate — and drop the (now meaningless) selection and scroll.
             if self.screen.dimensions() != (self.cols, self.rows) {
-                self.screen.resize(self.cols, self.rows);
+                (self.cols, self.rows) = self.screen.dimensions();
+                self.selection = None;
+                self.sel_anchor = None;
+                self.scroll_offset = 0;
                 self.view_slid = true;
+                let (w_px, h_px) = self.window_px_for_grid(self.cols, self.rows);
+                cmds.push(Cmd::ResizeWindow { w_px, h_px });
+                cmds.push(Cmd::Resize {
+                    session: self.session.clone(),
+                    cols: self.cols,
+                    rows: self.rows,
+                });
             }
             // Keep a scrolled-up view pinned to its content: advance the offset by
             // the GROSS lines that scrolled off the top this feed. That count
@@ -2186,23 +2213,96 @@ mod tests {
     }
 
     #[test]
-    fn deccolm_in_the_gui_snaps_the_grid_back_to_the_window_size() {
+    fn deccolm_asks_the_shell_to_resize_the_window_to_the_new_grid() {
         let mut m = model();
         m.update(UiEvent::Resize {
             w_px: 720,
             h_px: 432,
             scale: 1.0,
         });
-        let before = m.cols;
-        // An app enables 80↔132 switching and requests 132-column mode. In the GUI
-        // the window owns the grid size, so the screen must snap back to it.
-        feed(&mut m, b"\x1b[?40h\x1b[?3h");
-        assert_eq!(
-            m.screen.dimensions(),
-            (m.cols, m.rows),
-            "screen stays synced to the window grid"
+        // An app enables 80↔132 switching and requests 132-column mode: the grid
+        // follows the program, and the window is asked to grow to fit it (80 * 9 =
+        // 720 px wide becomes 132 * 9 = 1188; the height is unchanged).
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?40h\x1b[?3h".to_vec(),
+            ended: false,
+        });
+        assert_eq!(m.screen.dimensions(), (132, 24));
+        assert_eq!((m.cols, m.rows), (132, 24));
+        assert!(
+            cmds.contains(&Cmd::ResizeWindow {
+                w_px: 1188,
+                h_px: 432,
+            }),
+            "DECCOLM asks the window to fit the new grid: {cmds:?}"
         );
-        assert_eq!(m.cols, before, "DECCOLM did not change the GUI grid width");
+        // The child learns its new width too (xterm SIGWINCHes after DECCOLM).
+        assert!(
+            cmds.contains(&Cmd::Resize {
+                session: "alpha".to_string(),
+                cols: 132,
+                rows: 24,
+            }),
+            "DECCOLM re-sizes the pty: {cmds:?}"
+        );
+
+        // Back to 80 columns: the window is asked to shrink again.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?3l".to_vec(),
+            ended: false,
+        });
+        assert_eq!(m.screen.dimensions(), (80, 24));
+        assert!(cmds.contains(&Cmd::ResizeWindow {
+            w_px: 720,
+            h_px: 432,
+        }));
+    }
+
+    #[test]
+    fn a_denied_deccolm_window_resize_is_reconciled_by_the_next_window_size() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        feed(&mut m, b"\x1b[?40h\x1b[?3h");
+        assert_eq!(m.cols, 132);
+        // The window manager granted nothing (tiled, fullscreen, clamped): whatever
+        // size the window does report next wins, and the grid snaps to it.
+        let cmds = m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        assert_eq!(m.screen.dimensions(), (80, 24));
+        assert_eq!((m.cols, m.rows), (80, 24));
+        assert!(cmds.contains(&Cmd::Resize {
+            session: "alpha".to_string(),
+            cols: 80,
+            rows: 24,
+        }));
+    }
+
+    #[test]
+    fn deccolm_without_allow_80_to_132_neither_regrids_nor_resizes_the_window() {
+        let mut m = model();
+        m.update(UiEvent::Resize {
+            w_px: 720,
+            h_px: 432,
+            scale: 1.0,
+        });
+        // DECCOLM is gated on ?40 (off by default): the sequence is inert, so the
+        // window must not be jostled.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?3h".to_vec(),
+            ended: false,
+        });
+        assert_eq!(m.screen.dimensions(), (80, 24));
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::ResizeWindow { .. })));
     }
 
     #[test]

@@ -22,6 +22,15 @@ pub enum Cmd {
         cols: u16,
         rows: u16,
     },
+    /// Ask the window manager to resize *the window* to this inner size (physical
+    /// px) — a program resized the grid from within its output (DECCOLM 80↔132),
+    /// and the window has to follow the grid rather than the other way round. The
+    /// request may be clamped or refused; whatever size the window ends up
+    /// reporting comes back as a `UiEvent::Resize` and wins.
+    ResizeWindow {
+        w_px: u32,
+        h_px: u32,
+    },
     /// Read the system clipboard; the shell replies `UiEvent::ClipboardText`.
     ReadClipboard,
     /// Write text to the system clipboard.

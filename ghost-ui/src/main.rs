@@ -2264,6 +2264,27 @@ impl App {
                         let _ = s.resize(cols, rows);
                     }
                 }
+                Cmd::ResizeWindow { w_px, h_px } => {
+                    // A program re-gridded itself (DECCOLM): ask the window manager to
+                    // resize the window to fit. `request_inner_size` answers `Some` when
+                    // the platform applied it synchronously — no `Resized` event will
+                    // follow, so re-grid against the granted (possibly clamped) size
+                    // ourselves; `None` means the request is in flight and the event
+                    // will arrive. A refused request simply produces neither, and the
+                    // model stays on the program's grid until the window next resizes.
+                    let granted = self
+                        .windows
+                        .get(&wid)
+                        .and_then(|w| w.gfx.as_ref())
+                        .and_then(|g| {
+                            g.window
+                                .request_inner_size(PhysicalSize::new(w_px, h_px))
+                                .map(|s| (s, g.window.scale_factor()))
+                        });
+                    if let Some((s, scale)) = granted {
+                        self.resize_step(wid, s.width.max(1), s.height.max(1), scale, event_loop);
+                    }
+                }
                 Cmd::ReadClipboard => {
                     let text = self.read_clipboard();
                     self.dispatch(wid, UiEvent::ClipboardText(text), event_loop);
