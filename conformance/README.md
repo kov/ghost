@@ -173,8 +173,20 @@ inflated pass counts — don't repeat that.)
        `DECSET_Allow80To132` pass. (`DECSET_DECNCSM` needs `--xterm-winops` and is
        skipped. The GUI frontend does not yet follow a DECCOLM resize with a window
        resize, so `?40`-enabled apps see it only until the next window event.)
-     - ⬜ 6d: other DECRQSS selectors (DECSTBM, SGR, DECSCA, …) remain unreported;
-       DECRQM for modes ghost doesn't track (DECBKM, DECNKM, …) reports "unrecognized".
+     - ✅ 6d: the reporting cluster — DECRQSS DECSTBM (`r` → `1$r Pt;Pb r`) and SGR
+       (`m` → `1$r <pen> m`, the pen's op list led by a `0` reset, sharing
+       `parser::sgr_op_param` with the `Sgr` dump); plus DECRQM for the legacy
+       modes ghost doesn't act on. A new `ModeReport` enum
+       (Set/Reset/PermanentlySet/PermanentlyReset/Unrecognized) replaces the
+       `Option<bool>` mode reports so DECRPM can answer 3/4: inert DEC modes
+       (DECSCLM/DECSCNM/DECPFF/DECPEX/DECNRCM/DECNKM/DECBKM) and ANSI KAM/SRM
+       round-trip their 1/2 bit (the DEC ones via the non-display `tracked_modes`
+       set, KAM/SRM via dedicated fields); the legacy graphic/format modes (ANSI
+       GATM/…/EBM, DEC DECHCCM) report 4 permanently-reset. DECCOLM's `?3` bit is
+       tracked apart from the physical column count (`column_mode_132`) so the
+       attached GUI's grid snap-back can't defeat it. `DECRQM` **33/0**;
+       `DECRQSS_DECSTBM`/`DECRQSS_SGR` pass. Still unreported: DECRQSS DECSCA (part
+       of selective erase) and the niche selectors (DECSCL/DECSLPP/DECSNLS/…).
 - **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
   ghost doesn't parse those color-space forms. Niche.
 
