@@ -811,6 +811,12 @@ impl Terminal {
         (self.left_margin + 1, self.right_margin + 1)
     }
 
+    /// The current top/bottom scroll margins (DECSTBM) as 1-based inclusive rows,
+    /// for a DECRQSS DECSTBM report. Full height `(1, rows)` when unset.
+    pub fn top_bottom_margins(&self) -> (usize, usize) {
+        (self.top_margin + 1, self.bottom_margin + 1)
+    }
+
     /// The DECSCL conformance level (1–5). DECRQM is a VT300+ feature, so the
     /// query layer withholds its reply below level 3.
     pub fn conformance_level(&self) -> u8 {

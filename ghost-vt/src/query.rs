@@ -137,6 +137,9 @@ pub struct ReplyCtx<'a> {
     /// The current left/right scroll margins, 1-based inclusive, for DECRQSS
     /// DECSLRM (selector `s`). Full width `(1, cols)` when DECLRMM is off.
     pub left_right_margins: (u16, u16),
+    /// The current top/bottom scroll margins, 1-based inclusive, for DECRQSS
+    /// DECSTBM (selector `r`). Full height `(1, rows)` when unset.
+    pub top_bottom_margins: (u16, u16),
     /// The DECSCL conformance level (1–5); ANSI-mode DECRQM is silent below 3.
     pub conformance_level: u8,
     /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p` — `Some(true)`
@@ -270,6 +273,10 @@ impl Query {
                 "s" => {
                     let (l, r) = ctx.left_right_margins;
                     format!("\x1bP1$r{l};{r}s\x1b\\").into_bytes()
+                }
+                "r" => {
+                    let (t, b) = ctx.top_bottom_margins;
+                    format!("\x1bP1$r{t};{b}r\x1b\\").into_bytes()
                 }
                 _ => b"\x1bP0$r\x1b\\".to_vec(),
             },
@@ -705,6 +712,7 @@ mod tests {
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),
+            top_bottom_margins: (1, 24),
             conformance_level: 5,
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
@@ -884,6 +892,18 @@ mod tests {
             ..ctx()
         };
         assert_eq!(qs[0].reply(&margined), b"\x1bP1$r3;4s\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_reports_the_top_bottom_margins() {
+        // DECRQSS for DECSTBM (selector "r") answers the current margins, 1-based.
+        let qs = scan_all(b"\x1bP$qr\x1b\\");
+        assert_eq!(qs.len(), 1);
+        let margined = ReplyCtx {
+            top_bottom_margins: (5, 6),
+            ..ctx()
+        };
+        assert_eq!(qs[0].reply(&margined), b"\x1bP1$r5;6r\x1b\\");
     }
 
     #[test]

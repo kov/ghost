@@ -1,0 +1,1539 @@
+ghost-ui: font family "Fira Code" -> /Users/kov/Library/Fonts/FiraCode-Regular.ttf (bold synth, italic synth, bold-italic synth)
+ghost-ui: no premultiplied alpha mode; window will stay opaque
+[ghost-diag] WindowId(51046498944) created (fleet), surface 1608x1608 scale 1
+[ghost-diag] WindowId(51046498944) RedrawRequested sync=true presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046498944) render -> dropped
+[ghost-diag] WindowId(51046498944) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046498944) render -> presented
+[ghost-diag] WindowId(51046498944) RedrawRequested sync=false presented_ok=true snapshot=false
+[ghost-diag] WindowId(51046498944) render -> dropped
+ghost-ui: no premultiplied alpha mode; window will stay opaque
+[ghost-diag] WindowId(51041075200) created (fleet), surface 1608x1608 scale 1
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=true presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51041075200) render -> presented
+[ghost-diag] WindowId(51041075200) RedrawRequested sync=false presented_ok=true snapshot=false
+[ghost-diag] WindowId(51041075200) render -> dropped
+ghost-ui: no premultiplied alpha mode; window will stay opaque
+[ghost-diag] WindowId(51032727680) created (fleet), surface 1608x1608 scale 1
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=true presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51032727680) render -> presented
+[ghost-diag] WindowId(51032727680) RedrawRequested sync=false presented_ok=true snapshot=false
+[ghost-diag] WindowId(51032727680) render -> dropped
+ghost-ui: no premultiplied alpha mode; window will stay opaque
+[ghost-diag] WindowId(51046505984) created (fleet), surface 1608x1608 scale 1
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=true presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51046505984) render -> presented
+[ghost-diag] WindowId(51046505984) RedrawRequested sync=false presented_ok=true snapshot=false
+[ghost-diag] WindowId(51046505984) render -> dropped
+ghost-ui: no premultiplied alpha mode; window will stay opaque
+[ghost-diag] WindowId(51033755392) created (fleet), surface 1608x1608 scale 1
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=true presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=false snapshot=false
+[ghost-diag] WindowId(51033755392) render -> presented
+[ghost-diag] WindowId(51033755392) RedrawRequested sync=false presented_ok=true snapshot=false
+[ghost-diag] WindowId(51033755392) render -> dropped

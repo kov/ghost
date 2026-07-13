@@ -230,6 +230,12 @@ impl Vt {
         self.terminal.left_right_margins()
     }
 
+    /// The current top/bottom margins as 1-based inclusive rows (DECRQSS DECSTBM
+    /// report). See [`Terminal::top_bottom_margins`].
+    pub fn top_bottom_margins(&self) -> (usize, usize) {
+        self.terminal.top_bottom_margins()
+    }
+
     /// The DECSCL conformance level (1–5). See [`Terminal::conformance_level`].
     pub fn conformance_level(&self) -> u8 {
         self.terminal.conformance_level()
