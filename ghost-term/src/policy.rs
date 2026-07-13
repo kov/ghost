@@ -102,12 +102,15 @@ pub struct TerminalPolicy {
     /// Read the title *back* (XTWINOPS `CSI 20/21 t`).
     ///
     /// Separate from [`Self::title`] because the two hazards are opposite ends of
-    /// the same sequence: setting a title is cosmetic, but *reading* one is how a
-    /// program gets text it chose onto the shell's stdin — it sets a title with a
-    /// command in it and asks for it back, and the answer is indistinguishable from
-    /// typing. xterm disables the report by default and keeps the set. A denial is
-    /// still answered, just with an empty title: a query that goes unanswered hangs
-    /// the program that asked.
+    /// the same sequence: setting a title is cosmetic, but *reading* one puts text
+    /// the program chose onto the shell's stdin — it sets a title and asks for it
+    /// back. Ghost's OSC parser drops C0 controls from a title, so the reflected
+    /// text cannot carry a newline and so cannot execute on its own; it lands in the
+    /// shell's line-edit buffer and runs only if the user then presses Enter. Real,
+    /// but narrower than xterm's classic version — xterm disables the report by
+    /// default all the same, and keeps the set. A denial is still answered, just
+    /// with an empty title: a query that goes unanswered hangs the program that
+    /// asked.
     pub report_title: bool,
     /// Ask to be sent mouse events (`?1000`/`?1002`/`?1003`/`?1006` and friends).
     ///
