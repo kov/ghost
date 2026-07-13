@@ -27,5 +27,7 @@ pub use parser::{
     FullscreenOp, MaximizeOp, Progress, SpecialColor, TitleTarget, XtwinopsOp, SPECIAL_COLOR_BASE,
 };
 pub use pen::Pen;
-pub use terminal::{ClipboardSelection, CursorShape, ModeReport};
+pub use terminal::{
+    ClipboardSelection, CursorShape, ModeReport, MAX_PROGRAM_COLS, MAX_PROGRAM_ROWS,
+};
 pub use vt::{MouseProtocol, Vt};

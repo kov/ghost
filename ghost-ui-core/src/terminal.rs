@@ -706,6 +706,16 @@ impl TerminalModel {
         (w as u32, h as u32)
     }
 
+    /// Re-grid the screen at a program's asking. Child output is untrusted, so the
+    /// ask is bounded by what a terminal could be (`ghost_term::MAX_PROGRAM_*`) —
+    /// a `CSI 4 ; 65535 ; 65535 t` names a grid no display has and no host should
+    /// try to allocate. The emulator bounds the resizes *it* performs the same way.
+    fn resize_grid(&mut self, cols: u16, rows: u16) {
+        let cols = cols.clamp(1, ghost_term::MAX_PROGRAM_COLS as u16);
+        let rows = rows.clamp(1, ghost_term::MAX_PROGRAM_ROWS as u16);
+        self.screen.resize(cols, rows);
+    }
+
     /// One dimension of an XTWINOPS resize: omitted keeps what it has, zero is
     /// xterm's "as much as the display fits", anything else is itself.
     fn fit_dimension(asked: Option<u16>, current: u16, display: u16) -> u16 {
@@ -777,7 +787,7 @@ impl TerminalModel {
                         cmds.push(Cmd::SetMaximized(!leaving));
                     }
                     if let Some((cols, rows)) = grid {
-                        self.screen.resize(cols, rows);
+                        self.resize_grid(cols, rows);
                     }
                 }
                 XtwinopsOp::Fullscreen(op) => {
@@ -788,9 +798,9 @@ impl TerminalModel {
                     };
                     if entering {
                         self.restore_grid.get_or_insert((cols, rows));
-                        self.screen.resize(display_cols, display_rows);
+                        self.resize_grid(display_cols, display_rows);
                     } else if let Some((cols, rows)) = self.restore_grid.take() {
-                        self.screen.resize(cols, rows);
+                        self.resize_grid(cols, rows);
                     }
                     self.fullscreen = entering;
                     cmds.push(Cmd::SetFullscreen(entering));
@@ -801,7 +811,7 @@ impl TerminalModel {
                 XtwinopsOp::Resize(w, h) => {
                     let cols = Self::fit_dimension(w, cols, display_cols);
                     let rows = Self::fit_dimension(h, rows, display_rows);
-                    self.screen.resize(cols, rows);
+                    self.resize_grid(cols, rows);
                 }
                 // The same, in pixels: only we know how many a cell is.
                 XtwinopsOp::ResizePixels(w_px, h_px) => {
@@ -820,7 +830,7 @@ impl TerminalModel {
                         Some(px) => cells(px, m.line_height),
                         None => rows,
                     };
-                    self.screen.resize(cols, rows);
+                    self.resize_grid(cols, rows);
                 }
                 // The emulator does these itself: a fully-given grid, the page
                 // height, and the title stack (it holds the titles).
@@ -2198,6 +2208,25 @@ mod tests {
         });
         assert!(cmds.contains(&Cmd::SetFullscreen(false)), "2 toggles");
         assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn a_pixel_resize_from_hostile_output_cannot_blow_the_grid_up() {
+        let mut m = model();
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        // 65535 x 65535 px at a 9x18 cell is a 7281 x 3640 grid — 26 million cells
+        // the session host would try to allocate. It is bounded to a grid a
+        // terminal could actually have.
+        feed(&mut m, b"\x1b[4;65535;65535t");
+        let (cols, rows) = (m.cols, m.rows);
+        assert!(
+            cols as usize <= ghost_term::MAX_PROGRAM_COLS
+                && rows as usize <= ghost_term::MAX_PROGRAM_ROWS,
+            "hostile output re-gridded us to {cols}x{rows}"
+        );
     }
 
     #[test]

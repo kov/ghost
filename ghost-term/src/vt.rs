@@ -2286,6 +2286,24 @@ mod tests {
     }
 
     #[test]
+    fn a_program_cannot_resize_the_grid_past_what_a_terminal_could_be() {
+        // Output is untrusted: `cat` of a hostile file can ask for any grid it
+        // likes. A 60000x60000 one is 3.6 billion cells — the session host would
+        // die trying. The ask is honoured up to a size a real terminal could have.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b[8;60000;60000t");
+        let (cols, rows) = vt.size();
+        assert!(
+            cols <= crate::MAX_PROGRAM_COLS && rows <= crate::MAX_PROGRAM_ROWS,
+            "a program resized the grid to {cols}x{rows}"
+        );
+
+        // Same for a page height (DECSLPP), which is a resize by another name.
+        vt.feed_str("\x1b[60000t");
+        assert!(vt.size().1 <= crate::MAX_PROGRAM_ROWS);
+    }
+
+    #[test]
     fn the_title_stack_gives_a_program_its_old_title_back() {
         let mut vt = Vt::new(20, 5);
         vt.feed_str("\x1b]1;icon\x07\x1b]2;window\x07");

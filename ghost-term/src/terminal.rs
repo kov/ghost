@@ -2729,11 +2729,14 @@ impl Terminal {
             // "as big as the display" — is the frontend's: the emulator has no
             // display. So is any resize in pixels; a cell's size is not ours either.
             XtwinopsOp::Resize(Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
-                self.resize(cols as usize, rows as usize);
+                self.resize(
+                    (cols as usize).min(MAX_PROGRAM_COLS),
+                    (rows as usize).min(MAX_PROGRAM_ROWS),
+                );
             }
             // DECSLPP: the height alone.
             XtwinopsOp::SetLines(rows) => {
-                let rows = as_usize(rows, self.rows);
+                let rows = as_usize(rows, self.rows).min(MAX_PROGRAM_ROWS);
                 self.resize(self.cols, rows);
             }
             // The title stack is ours: we hold the titles. A push keeps both of
@@ -3650,6 +3653,15 @@ fn as_u16(value: usize) -> u16 {
         .try_into()
         .expect("terminal dump parameter exceeds u16 range")
 }
+
+/// The largest grid a *program* may ask for (XTWINOPS). A window can be as big
+/// as the display makes it, but child output is untrusted — `printf` of a
+/// `CSI 8 ; 60000 ; 60000 t` would ask for 3.6 billion cells and take the session
+/// host down with it. These bounds are past any real display and cost nothing to
+/// keep. A resize driven by the *window* is not clamped: it is already bounded by
+/// a window that exists.
+pub const MAX_PROGRAM_COLS: usize = 1000;
+pub const MAX_PROGRAM_ROWS: usize = 1000;
 
 /// How deep a program may push the title stack. xterm has no limit; ghost keeps
 /// one, so output that pushes in a loop costs bounded memory. Past it the oldest
