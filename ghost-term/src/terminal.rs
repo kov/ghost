@@ -894,6 +894,12 @@ impl Terminal {
         self.conformance_level
     }
 
+    /// The current DECSCA state for a DECRQSS `" q` report: 1 when writes are
+    /// DEC-protected, 0 otherwise (ISO guarding is not DECSCA state).
+    pub fn decsca_report(&self) -> u16 {
+        (self.pen.protection() == Protection::Dec) as u16
+    }
+
     /// How an ANSI (non-private) mode reports to DECRQM `CSI Ps $ p`. IRM (4) and
     /// LNM (20) are the modes ghost acts on; KAM (2) and SRM (12) are tracked but
     /// inert; the legacy graphic/format modes are permanently reset.

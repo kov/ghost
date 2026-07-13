@@ -143,6 +143,9 @@ pub struct ReplyCtx<'a> {
     /// The current pen as a DECRQSS SGR report body (e.g. `"0;1"`, always led by
     /// a `0` reset), for the selector `m`. See [`ghost_term::Vt::sgr_report`].
     pub sgr_report: String,
+    /// The current DECSCA state (0/1) for the DECRQSS `" q` selector. See
+    /// [`ghost_term::Vt::decsca_report`].
+    pub decsca: u16,
     /// The DECSCL conformance level (1–5); ANSI-mode DECRQM is silent below 3.
     pub conformance_level: u8,
     /// An ANSI (non-private) mode's DECRQM report for `CSI Ps $ p`.
@@ -285,6 +288,7 @@ impl Query {
                     format!("\x1bP1$r{t};{b}r\x1b\\").into_bytes()
                 }
                 "m" => format!("\x1bP1$r{}m\x1b\\", ctx.sgr_report).into_bytes(),
+                "\"q" => format!("\x1bP1$r{}\"q\x1b\\", ctx.decsca).into_bytes(),
                 _ => b"\x1bP0$r\x1b\\".to_vec(),
             },
             Query::RectChecksum {
@@ -721,6 +725,7 @@ mod tests {
             left_right_margins: (1, 80),
             top_bottom_margins: (1, 24),
             sgr_report: "0".to_owned(),
+            decsca: 0,
             conformance_level: 5,
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
@@ -889,6 +894,16 @@ mod tests {
         // (`t` is DECSLPP, which ghost does not report.)
         let qs = scan_all(b"\x1bP$qt\x1b\\");
         assert_eq!(qs[0].reply(&ctx()), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_reports_decsca() {
+        // DECRQSS for DECSCA (selector `"q`) reports the current protection bit.
+        let qs = scan_all(b"\x1bP$q\"q\x1b\\");
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].reply(&ctx()), b"\x1bP1$r0\"q\x1b\\");
+        let protected = ReplyCtx { decsca: 1, ..ctx() };
+        assert_eq!(qs[0].reply(&protected), b"\x1bP1$r1\"q\x1b\\");
     }
 
     #[test]

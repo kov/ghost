@@ -247,6 +247,12 @@ impl Vt {
         self.terminal.conformance_level()
     }
 
+    /// The current DECSCA state (0/1) for a DECRQSS `" q` report. See
+    /// [`Terminal::decsca_report`].
+    pub fn decsca_report(&self) -> u16 {
+        self.terminal.decsca_report()
+    }
+
     /// An ANSI mode's state for DECRQM `CSI Ps $ p`. See
     /// [`Terminal::ansi_mode_state`].
     pub fn ansi_mode_state(&self, mode: u16) -> crate::ModeReport {
