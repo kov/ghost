@@ -515,6 +515,13 @@ impl TerminalModel {
         self.action_policy = policy;
     }
 
+    /// Both halves at once — what the shell hands down, and the same value it
+    /// reports to the session host so the two emulators agree.
+    pub fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
+        self.set_terminal_policy(policy.terminal);
+        self.set_action_policy(policy.action);
+    }
+
     /// What the program may change about the terminal itself (see
     /// [`ghost_term::policy`]). Set this when the session is created and leave it:
     /// the session host runs its own emulator over the same bytes and re-seeds ours

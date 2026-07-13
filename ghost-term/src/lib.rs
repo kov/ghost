@@ -28,7 +28,7 @@ pub use parser::{
     FullscreenOp, MaximizeOp, Progress, SpecialColor, TitleTarget, XtwinopsOp, SPECIAL_COLOR_BASE,
 };
 pub use pen::Pen;
-pub use policy::{ActionPolicy, TerminalPolicy};
+pub use policy::{ActionPolicy, SessionPolicy, TerminalPolicy};
 pub use terminal::{
     ClipboardSelection, CursorShape, ModeReport, MAX_PROGRAM_COLS, MAX_PROGRAM_ROWS,
 };

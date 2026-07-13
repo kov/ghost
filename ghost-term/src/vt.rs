@@ -2470,6 +2470,25 @@ mod tests {
     }
 
     #[test]
+    fn a_scrub_repaints_what_it_changed() {
+        // Scrubbing a palette changes the color of every cell that used it, and
+        // dropping images changes the cells they covered — but no *cell* was
+        // written, so nothing would mark those rows dirty. A frontend that repaints
+        // only damaged rows would go on showing the program's colors after the
+        // policy took them away.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b]4;1;rgb:ff/00/00\x07\x1b[31mred text\r\n"); // drains its own damage
+
+        vt.set_policy(crate::TerminalPolicy::deny_all());
+        let after = vt.feed_str(""); // no new bytes — this is the scrub's damage
+        assert_eq!(
+            after.lines.len(),
+            24,
+            "the whole screen is repainted: a scrub can recolor any cell on it"
+        );
+    }
+
+    #[test]
     fn an_allowed_program_still_does_all_of_it() {
         // The default policy is what ghost has always done — the seam changes
         // nothing until someone sets a policy.

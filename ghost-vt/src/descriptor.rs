@@ -30,6 +30,17 @@ pub struct Descriptor {
     /// so descriptors written before connections existed still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<crate::connection::ConnectionSpec>,
+    /// What a program on this session's tty may change about the terminal (see
+    /// [`ghost_term::policy`]) — the policy the last terminal to attach reported.
+    ///
+    /// Here rather than only in the runtime `meta`, because `meta` is pruned with
+    /// the session directory the moment the host exits: a recreate or a resurrect
+    /// reads *this* file, and a policy that died with the process would hand the
+    /// session straight back to a program that had been refused. Defaulted, so
+    /// descriptors written before the field existed still parse — as the old
+    /// behavior, which is what those sessions were running.
+    #[serde(default)]
+    pub policy: ghost_term::TerminalPolicy,
 }
 
 /// Where `name`'s descriptor lives.
@@ -117,6 +128,7 @@ mod tests {
             created_at: 1_700_000_000_000,
             display_name: "build-box".into(),
             connection: None,
+            policy: ghost_term::TerminalPolicy::default(),
         };
         let json = serde_json::to_vec(&d).unwrap();
         let back: Descriptor = serde_json::from_slice(&json).unwrap();
@@ -141,6 +153,7 @@ mod tests {
             created_at: 1,
             display_name: String::new(),
             connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
+            policy: ghost_term::TerminalPolicy::default(),
         };
         let json = serde_json::to_vec(&d).unwrap();
         let back: Descriptor = serde_json::from_slice(&json).unwrap();

@@ -18,6 +18,7 @@ use crate::{
     CellMetrics, Cmd, FleetModel, Layer, PointPx, PointerButton, PointerPhase, RectPx, Run, Scene,
     SceneId, SceneItem, SessionId, Style, TerminalModel, Transform, UiEvent,
 };
+use ghost_term::SessionPolicy;
 use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::query::ThemeColors;
 
@@ -235,6 +236,12 @@ pub struct RootModel {
     /// every model this root creates or holds. Set once by the shell after
     /// construction (the theme is fixed at startup today).
     theme: ThemeColors,
+    /// What a program on a session's tty may do — to the terminal, and to the
+    /// desktop (see [`ghost_term::policy`]). Stamped on every model this root
+    /// creates or holds, exactly like the theme: the shell hands down one policy
+    /// and it must reach every emulator we run, or an attached window would honour
+    /// what the session host is refusing.
+    policy: SessionPolicy,
     size_px: (u32, u32),
     /// Device scale factor, tracked so a fleet toggle preserves HiDPI sizing.
     scale: f32,
@@ -422,6 +429,7 @@ impl RootModel {
             mode: Mode::Single(Box::new(model)),
             metrics,
             theme: ThemeColors::default(),
+            policy: SessionPolicy::default(),
             size_px,
             scale: 1.0,
             mine: HashSet::from([id.clone()]),
@@ -447,6 +455,7 @@ impl RootModel {
             mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px, HashSet::new()))),
             metrics,
             theme: ThemeColors::default(),
+            policy: SessionPolicy::default(),
             size_px,
             scale,
             mine: HashSet::new(),
@@ -482,6 +491,28 @@ impl RootModel {
             cmds.extend(m.set_theme(theme));
         }
         cmds
+    }
+
+    /// Set the policy on every model this root holds now or creates later — see
+    /// [`ghost_term::policy`] and [`SessionPolicy`].
+    ///
+    /// The same value the shell reports to each session host, so the two emulators
+    /// agree. Applying it to a live model *scrubs* whatever it forbids (the emulator
+    /// does that), so tightening takes effect on what is already on screen.
+    pub fn set_policy(&mut self, policy: SessionPolicy) {
+        self.policy = policy;
+        match &mut self.mode {
+            Mode::Single(m) => m.set_policy(policy),
+            Mode::Fleet(f) => f.set_policy(policy),
+        }
+        for m in self.warm.values_mut() {
+            m.set_policy(policy);
+        }
+    }
+
+    /// The policy this root stamps on its models.
+    pub fn policy(&self) -> SessionPolicy {
+        self.policy
     }
 
     /// Adopt this window's group identity (minted by the shell at window
@@ -3836,6 +3867,41 @@ mod tests {
         assert!(
             cmds.contains(&Cmd::SetIconified(true)),
             "the foreground session drives the window state: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_policy_reaches_every_emulator_this_window_runs() {
+        // The shell reports one policy to the session host and hands the same one to
+        // the window. Every emulator the window runs — the foreground, the warm
+        // background mirrors, the fleet's preview tiles — must honour it, or an
+        // attached window would cheerfully do what the host is refusing, which is
+        // the exact divergence the whole design exists to prevent.
+        let mut r = root(); // foreground alpha
+        r.update(UiEvent::AdoptSession("beta".into())); // beta foreground, alpha warm
+        r.set_policy(ghost_term::SessionPolicy::deny_all());
+
+        feed(&mut r, "beta", b"\x1b]2;pwned\x07");
+        feed(&mut r, "alpha", b"\x1b]2;pwned\x07");
+
+        let foreground = match &r.mode {
+            Mode::Single(m) => m,
+            Mode::Fleet(_) => panic!("single view"),
+        };
+        assert_eq!(
+            foreground.screen().vt().title(),
+            "",
+            "the foreground honours the window's policy"
+        );
+        assert_eq!(
+            r.warm
+                .get("alpha")
+                .expect("alpha is warm")
+                .screen()
+                .vt()
+                .title(),
+            "",
+            "a warm background mirror honours it too"
         );
     }
 

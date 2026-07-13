@@ -419,9 +419,12 @@ fn host_main(
     // descriptor, which carries these facts.
     // A session that ran before under this name (a recreate, a resurrect) already
     // has a policy the user's terminal negotiated for it; going back to permissive
-    // just because the process restarted would be a silent downgrade.
-    let inherited_policy = crate::meta::read(&paths::meta_path(current_name))
-        .map(|m| m.policy)
+    // just because the process restarted would be a silent downgrade. The durable
+    // descriptor is what survives a host's death — the runtime `meta` is pruned
+    // with the session directory — so that is what we inherit from.
+    let inherited_policy = crate::descriptor::read(current_name)
+        .map(|d| d.policy)
+        .or_else(|| crate::meta::read(&paths::meta_path(current_name)).map(|m| m.policy))
         .unwrap_or_default();
     let mut meta = crate::meta::Meta {
         // Milliseconds, not seconds: this is the fleet's spatial sort key, so
@@ -1189,6 +1192,16 @@ fn handle_client_messages(
                     // program that had been refused the moment anything restarted.
                     meta.policy = policy;
                     let _ = crate::meta::write(&paths::meta_path(current_name), meta);
+                    // And the *durable* descriptor, which is the one that outlives
+                    // this host: `meta` is pruned with the session directory the
+                    // moment we exit, so a recreate reads the descriptor or nothing
+                    // at all. (A session whose child hasn't started yet has no
+                    // descriptor; it gets written from `meta` when it does, policy
+                    // and all.)
+                    if let Some(mut d) = crate::descriptor::read(current_name) {
+                        d.policy = policy;
+                        let _ = crate::descriptor::write(current_name, &d);
+                    }
                     if c.resynced {
                         c.queue_output(screen.resync());
                     }
@@ -1400,6 +1413,7 @@ fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path:
             created_at: meta.created_at,
             display_name: meta.display_name.clone(),
             connection: meta.connection.clone(),
+            policy: meta.policy,
         },
     );
 }

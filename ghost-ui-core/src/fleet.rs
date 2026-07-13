@@ -461,6 +461,8 @@ pub struct FleetModel {
     /// The scheme's default fg/bg, stamped on every tile model so previews
     /// answer OSC 10/11 color queries like the single view does.
     theme: ThemeColors,
+    /// Stamped on every tile model, like the theme (see `RootModel::set_policy`).
+    policy: ghost_term::SessionPolicy,
     /// Vertical scroll offset in physical pixels (0 = top). The grid lays out at a
     /// readable tile size regardless of session count and scrolls when it overflows
     /// the viewport, rather than shrinking previews to fit.
@@ -648,6 +650,7 @@ impl FleetModel {
             preedit: String::new(),
             scroll_y: 0.0,
             theme: ThemeColors::default(),
+            policy: ghost_term::SessionPolicy::default(),
             observing: HashSet::new(),
             marked: HashSet::new(),
             killed: HashSet::new(),
@@ -670,6 +673,15 @@ impl FleetModel {
             cmds.extend(tile.model.set_theme(theme));
         }
         cmds
+    }
+
+    /// Stamp the policy on every tile model, current and future — a preview runs a
+    /// real emulator over a real session's bytes, so it is governed like any other.
+    pub fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
+        self.policy = policy;
+        for tile in &mut self.tiles {
+            tile.model.set_policy(policy);
+        }
     }
 
     /// The group registry, for [`RootModel`](crate::RootModel) to carry
@@ -1028,6 +1040,7 @@ impl FleetModel {
         let mut model = kept.unwrap_or_else(|| {
             let mut m = TerminalModel::new(fresh, 1, 1, metrics);
             m.set_theme(theme);
+            m.set_policy(self.policy);
             m
         });
         cmds.append(&mut model.update(resize.clone()));
@@ -1247,6 +1260,7 @@ impl FleetModel {
                 let (cols, rows) = info.size.unwrap_or((PREVIEW_COLS, PREVIEW_ROWS));
                 let mut model = TerminalModel::new(info.name.clone(), cols, rows, self.metrics);
                 model.set_theme(self.theme);
+                model.set_policy(self.policy);
                 model.set_display_name(info.display_name.clone());
                 self.push_tile(
                     info.name.clone(),
@@ -1360,6 +1374,7 @@ impl FleetModel {
                 let mut model =
                     TerminalModel::new(d.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
                 model.set_theme(self.theme);
+                model.set_policy(self.policy);
                 model.set_display_name(d.display_name);
                 self.push_tile(
                     d.name.clone(),
@@ -1460,6 +1475,8 @@ impl FleetModel {
                 if (observed || tile.dead) && tile.model.dims() != (cols, rows) {
                     let mut model = TerminalModel::new(tile.id.clone(), cols, rows, self.metrics);
                     model.set_theme(self.theme);
+                    model.set_policy(self.policy);
+                    model.set_policy(self.policy);
                     model.set_display_name(tile.model.display_name().to_string());
                     tile.model = model;
                     tile.fed = false; // placeholder until the resync lands
@@ -6587,6 +6604,24 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
             "the fleet overview does not retitle the window for a tile"
+        );
+    }
+
+    #[test]
+    fn a_tile_minted_after_the_policy_was_set_still_honours_it() {
+        // A tile runs a real emulator over a real session's bytes — including
+        // sessions attached elsewhere, even on another machine. It is governed like
+        // any other, and a tile that appears *later* (a session someone else just
+        // started) must be born governed, not permissive.
+        let mut m = fleet();
+        m.set_policy(ghost_term::SessionPolicy::deny_all());
+        list(&mut m, &["a", "b"]);
+        data(&mut m, "a", b"\x1b]2;pwned\x07");
+        let tile = m.tiles.iter().find(|t| t.id == "a").expect("tile a");
+        assert_eq!(
+            tile.model.screen().vt().title(),
+            "",
+            "the tile inherited the fleet's policy"
         );
     }
 

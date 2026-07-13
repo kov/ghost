@@ -130,6 +130,67 @@ fn the_attached_terminal_tells_the_host_what_a_program_may_do_and_it_sticks() {
     );
 }
 
+/// The policy in the session's *durable* descriptor — the one that outlives the
+/// session, and the only thing a recreate or a resurrect actually reads. (The
+/// runtime `meta` is pruned along with the session directory when the host exits.)
+fn durable_policy(xdg: &Path, name: &str) -> Option<serde_json::Value> {
+    let d: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(xdg.join("data/ghost/sessions").join(format!("{name}.json"))).ok()?,
+    )
+    .ok()?;
+    d.get("policy").cloned()
+}
+
+#[test]
+fn a_negotiated_policy_outlives_the_session_that_negotiated_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "policy-durable";
+    let _guard = KillOnDrop { xdg, name };
+
+    // A session whose host is gone — killed, rebooted, or simply finished — is
+    // recreated from its *durable descriptor*, not from the runtime directory,
+    // which is pruned with it. A policy that lived only in the runtime dir would
+    // hand the resurrected session straight back to a program that had been
+    // refused. So the descriptor has to carry it.
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "60"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "`ghost new -d` failed");
+
+    let sock = xdg.join("run/ghost").join(name).join("sock");
+    assert!(
+        wait_until(Duration::from_secs(5), || sock.exists()),
+        "session socket never appeared"
+    );
+    {
+        let mut s =
+            ghost_vt::client::Session::attach_path(&sock, name, 80, 24).expect("attach failed");
+        s.report_policy(ghost_term::TerminalPolicy {
+            title: false,
+            ..Default::default()
+        })
+        .expect("report_policy failed");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || s
+                .pump()
+                .map(|p| !p.output.is_empty())
+                .unwrap_or(false)),
+            "resync repaint never arrived"
+        );
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(5), || durable_policy(xdg, name)
+            .and_then(|p| p.get("title").and_then(|t| t.as_bool()))
+            == Some(false)),
+        "the descriptor that outlives the session carries the policy, got {:?}",
+        durable_policy(xdg, name)
+    );
+}
+
 #[test]
 fn a_terminal_that_allows_it_still_gets_its_title() {
     let tmp = tempfile::tempdir().unwrap();

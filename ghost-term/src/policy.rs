@@ -205,3 +205,33 @@ impl ActionPolicy {
         }
     }
 }
+
+/// Both policies together — what a program on one session's tty may do, to the
+/// terminal and to the desktop.
+///
+/// They are enforced in different places for good reasons (see the module docs),
+/// but they are chosen together, by the user, in one place. Passing them as a pair
+/// keeps a caller from setting one and forgetting the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionPolicy {
+    pub terminal: TerminalPolicy,
+    pub action: ActionPolicy,
+}
+
+impl SessionPolicy {
+    /// Everything on, whatever the defaults become.
+    pub fn allow_all() -> Self {
+        Self {
+            terminal: TerminalPolicy::allow_all(),
+            action: ActionPolicy::allow_all(),
+        }
+    }
+
+    /// Nothing a program asks for beyond drawing on its own screen.
+    pub fn deny_all() -> Self {
+        Self {
+            terminal: TerminalPolicy::deny_all(),
+            action: ActionPolicy::deny_all(),
+        }
+    }
+}

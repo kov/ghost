@@ -733,7 +733,23 @@ fn session_theme() -> ghost_ui_core::ThemeColors {
 /// is the user's to make in config, not one to smuggle in here. When it lands, it
 /// lands in this function.
 fn session_policy() -> ghost_term::TerminalPolicy {
-    ghost_term::TerminalPolicy::default()
+    session_policy_pair().terminal
+}
+
+/// The policy this terminal enforces: what a program on a session's tty may change
+/// about the terminal, and what it may do outside it (see `ghost_term::policy`).
+///
+/// ONE source for both halves and for both places they have to reach — the session
+/// host (reported at attach, `session_policy`) and this window's own emulators
+/// (`RootModel::set_policy`). They must agree; a window that allowed what the host
+/// refuses would show state that vanishes on the next reattach.
+///
+/// Every field is on today: the seam is wired end to end, but nothing has decided
+/// yet that a stranger's tty may not, say, retitle your window, and that decision is
+/// the user's to make in config, not one to smuggle in here. When it lands, it lands
+/// in this function.
+fn session_policy_pair() -> ghost_term::SessionPolicy {
+    ghost_term::SessionPolicy::default()
 }
 
 fn attach_retry(name: &str, cols: u16, rows: u16) -> Session {
@@ -3741,6 +3757,10 @@ impl App {
         });
         let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         root.set_theme(theme_colors(&cfg.theme()));
+        // The same policy we report to every session host we attach to — the
+        // window's emulators and the hosts' must agree, or an attached window would
+        // honour what the host is refusing (see `ghost_term::policy`).
+        root.set_policy(session_policy_pair());
         root.set_padding(cfg.padding());
         // A fleet window owns nothing yet, so reclaiming a group here just adopts
         // its identity — the members come from the loaded registry below.
@@ -4038,6 +4058,7 @@ impl App {
         }
         let mut root = RootModel::single(model, metrics(), (w, h));
         root.set_theme(theme_colors(&cfg.theme()));
+        root.set_policy(session_policy_pair());
         root.set_padding(cfg.padding());
         // Seed the persisted registry BEFORE the group claim, so the claim's
         // save extends it rather than clobbering it with just this window.

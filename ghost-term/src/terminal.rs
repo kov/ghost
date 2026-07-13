@@ -967,7 +967,19 @@ impl Terminal {
     /// The grid is deliberately *not* scrubbed: a size a program asked for is a size
     /// the window already is, and there is no honest "before" to go back to.
     pub fn set_policy(&mut self, policy: TerminalPolicy) {
+        let was = self.policy;
         self.policy = policy;
+        // A scrub writes no cell, yet it can change what every cell *looks* like —
+        // taking away a palette recolors everything drawn in it, and dropping the
+        // images uncovers whatever they were over. Nothing would mark those rows
+        // dirty, so a frontend that repaints only damaged rows would go on showing
+        // the colors the policy just took away. Repaint the screen.
+        let tightened = (was.colors && !policy.colors)
+            || (was.graphics && !policy.graphics)
+            || (was.cursor_style && !policy.cursor_style);
+        if tightened {
+            self.dirty_lines.extend(0..self.rows);
+        }
         if !policy.title {
             self.title.clear();
             self.icon_title.clear();
