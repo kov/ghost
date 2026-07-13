@@ -714,6 +714,10 @@ fn host_main(
                     // stream); the host just drains its copy so they never
                     // accumulate — detached, there is no clipboard to write.
                     let _ = screen.take_clipboard_writes();
+                    // Same for the window ops (XTWINOPS iconify/maximize/…): the
+                    // attached frontend carries them out from its own emulator,
+                    // and the host has no window to carry them out on.
+                    let _ = screen.take_window_ops();
                     // Refresh the discoverable title when the child changes it
                     // (coalesced — only an actual change rewrites the meta file).
                     if screen.title() != meta.title {

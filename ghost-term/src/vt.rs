@@ -2374,6 +2374,25 @@ mod tests {
     }
 
     #[test]
+    fn un_drained_window_ops_do_not_pile_up_without_bound() {
+        use crate::parser::XtwinopsOp;
+
+        // Nothing obliges an embedder to have a window — the session host is
+        // headless, and it is the process that must survive. So a program that
+        // asks for window ops forever must not grow the queue forever with it.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str(&"\x1b[2t".repeat(10_000));
+        let ops = vt.take_window_ops();
+        assert!(
+            ops.len() <= 32,
+            "the queue is bounded, not one entry per op: {}",
+            ops.len()
+        );
+        // What's kept is the tail: a window op says what the window should be now.
+        assert_eq!(ops.last(), Some(&XtwinopsOp::Iconify));
+    }
+
+    #[test]
     fn osc_5_sets_the_special_colors_and_osc_105_resets_them() {
         let mut vt = Vt::new(20, 5);
         assert_eq!(vt.special_color(SpecialColor::Bold), None);

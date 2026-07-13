@@ -2764,7 +2764,12 @@ impl Terminal {
                     }
                 }
             }
-            op => self.window_ops.push(op),
+            op => {
+                if self.window_ops.len() == MAX_WINDOW_OPS {
+                    self.window_ops.remove(0);
+                }
+                self.window_ops.push(op);
+            }
         }
     }
 
@@ -3668,6 +3673,16 @@ pub const MAX_PROGRAM_ROWS: usize = 1000;
 /// entry falls off the bottom — the pushes a program actually pops are the recent
 /// ones.
 const MAX_TITLE_STACK: usize = 32;
+
+/// How many un-drained window ops the emulator will hold. The ops it cannot carry
+/// out itself (iconify, maximize, full-screen) queue for whoever owns a window to
+/// perform — but nothing *requires* an embedder to have a window, and the session
+/// host (headless, and the process that must outlive everything) has none. So the
+/// queue is bounded rather than trusting every embedder to drain it: a program
+/// spewing `CSI 1 t` forever costs bounded memory even where nobody is listening.
+/// Past the bound the oldest op falls off — a window op is a statement about what
+/// the window should be *now*, so the newest are the ones worth keeping.
+const MAX_WINDOW_OPS: usize = 32;
 
 /// One entry of the XTWINOPS title stack. A push records *both* titles whatever
 /// it names — the `Ps` picks what a **pop** restores, not what is kept (xterm:
