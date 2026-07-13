@@ -95,8 +95,9 @@ runs past failures because `RunTest` catches each test's exception and tallies
 pass/fail. (An early version of this harness used `--force` and reported wildly
 inflated pass counts — don't repeat that.)
 
-**Honest baseline (no `--force`):** a broad cursor+content sweep runs roughly
-**64 pass / 42 fail**. The failures cluster into real, tracked feature gaps:
+**Honest baseline (no `--force`):** the whole suite (`INCLUDE='.'`) runs
+**422 pass / 45 known bugs / 101 fail**. The failures cluster into real, tracked
+feature gaps — what's left is listed under "Still open" at the end:
 
 - **Selective erase / ISO protection** — ✅ **DONE** (slice 7). Cells carry a
   three-state `Protection` (`None`/`Dec`/`Iso`) on the pen: DECSCA (`CSI Ps " q`)
@@ -195,6 +196,30 @@ inflated pass counts — don't repeat that.)
        what tells RIS whether the width is the program's (slice 8). `DECRQM` **33/0**;
        `DECRQSS_DECSTBM`/`DECRQSS_SGR` pass. Still unreported: DECRQSS DECSCA (part
        of selective erase) and the niche selectors (DECSCL/DECSLPP/DECSNLS/…).
+- **Rectangular area operations** — ✅ **DONE** (slice 9). DECSERA already had the
+  shape of it, so `rect_bounds` (origin-relative coordinates, clamped to the
+  addressable region, margins deliberately *not* confining it — that's what the
+  `*_ignoresMargins` tests pin) was pulled out of it and the rest followed:
+  **DECERA** (`$ z`) is DECSERA with a different erase guard (it clears
+  DEC-protected cells; both spare the ISO guarded area, as plain ED/EL do);
+  **DECFRA** (`$ x`) fills with `Pch` — `Line::clear` generalised to `Line::fill`,
+  so the guard and wide-glyph edge-mending carry over, and an out-of-range fill
+  character is ignored rather than printed; **DECCRA** (`$ v`) copies, source and
+  destination free to overlap (`Buffer::copy_rect` snapshots every source row
+  first), the destination a *corner* whose copy is clipped to what fits. Page
+  params are parsed and ignored — one page. None of them moves the cursor.
+  `DECCRA` 10/0, `DECERA` 7/0, `DECFRA` 7/0. (DECSACE/DECCARA/DECRARA have no
+  esctest coverage and are not implemented.)
+- **Margin-aware odds and ends** — ✅ **DONE** (slice 10). **DECFI**/**DECBI**
+  (`ESC 9`/`ESC 6`): at the right/left margin of the box its contents shift by a
+  column (`delete_columns`/`insert_columns`, from DECIC/DECDC) and the cursor
+  holds; elsewhere it just steps, outside the margins included, and is ignored at
+  the screen edge. **CNL/CPL**: a vertical move plus a *carriage return* — which
+  goes to the left margin, not column 1 — so they call `cr()` now (which also
+  clears the pending wrap they used to leave armed). **DECALN**: resets the margins
+  on both axes and homes the cursor before filling; it's a whole-screen pattern,
+  nothing may confine it. `DECFI` 5/0, `DECBI` 5/0, `CNL` 5/0, `CPL` 5/0,
+  `DECALN` 3/0.
 - **GUI DECCOLM window resize** — ✅ **DONE** (slice 8). The grid used to be the
   window's alone: `TerminalModel` snapped the screen back after every feed, so a
   DECCOLM self-resize survived only until the next window event. Now the model
@@ -208,8 +233,21 @@ inflated pass counts — don't repeat that.)
   when — and only when — `column_mode_132` is set, so a `reset` in a 200-column
   window doesn't shrink it (xterm makes the same pair of checks).
   `DECSET_DECCOLM`, `DECSET_Allow80To132`, `RIS_ResetDECCOLM` pass.
-- **CIE Lab/Luv OSC color specs** (`ChangeColor`/`ChangeSpecialColor_CIE*`) —
-  ghost doesn't parse those color-space forms. Niche.
+**Still open** (the 101 failures, biggest first — measured with a full
+`INCLUDE='.'` sweep, so these counts are honest):
+
+- **OSC color** (~42): `ChangeColor` / `ChangeSpecialColor` / `ChangeDynamicColor`
+  / `Reset*Color`. Palette get/set (OSC 4/5/104/105) plus the niche CIE Lab/Luv
+  color-space specs. Reaches into the theme/render side, not just `ghost-term`.
+- **XTWINOPS** (~28): window ops — iconify, position, maximize, the title stack.
+  `Cmd::ResizeWindow` (slice 8) is the plumbing a real `CSI 8;h;w t` would need,
+  but several of these need a window manager the headless harness can't drive.
+- **DECDSR** (~11): the niche device-status reports (printer, keyboard, locator).
+- **DECRQSS** (6): the selectors we don't answer —
+  DECSACE/DECSASD/DECSCL/DECSLPP/DECSNLS/DECSSDT.
+- **DA / DA2 / DECID** (5): device-attribute strings.
+- Odds and ends: `XtermSave`, `SCORC`, `DECRC`, `DECSET_ALTBUF`/`MoreFix`,
+  `RIS_ResetTitleMode`, `DECSET_TiteInhibit`.
 
 **Note on `--include`:** the regex is `re.search` over `Class.test_name`, so
 `EL` also matches `CIELab`/`CIELuv`. Anchor when you mean a family — `^EL` /
