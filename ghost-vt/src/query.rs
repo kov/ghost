@@ -140,6 +140,9 @@ pub struct ReplyCtx<'a> {
     /// The current top/bottom scroll margins, 1-based inclusive, for DECRQSS
     /// DECSTBM (selector `r`). Full height `(1, rows)` when unset.
     pub top_bottom_margins: (u16, u16),
+    /// The current pen as a DECRQSS SGR report body (e.g. `"0;1"`, always led by
+    /// a `0` reset), for the selector `m`. See [`ghost_term::Vt::sgr_report`].
+    pub sgr_report: String,
     /// The DECSCL conformance level (1–5); ANSI-mode DECRQM is silent below 3.
     pub conformance_level: u8,
     /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p` — `Some(true)`
@@ -278,6 +281,7 @@ impl Query {
                     let (t, b) = ctx.top_bottom_margins;
                     format!("\x1bP1$r{t};{b}r\x1b\\").into_bytes()
                 }
+                "m" => format!("\x1bP1$r{}m\x1b\\", ctx.sgr_report).into_bytes(),
                 _ => b"\x1bP0$r\x1b\\".to_vec(),
             },
             Query::RectChecksum {
@@ -713,6 +717,7 @@ mod tests {
             cursor_style: 2,
             left_right_margins: (1, 80),
             top_bottom_margins: (1, 24),
+            sgr_report: "0".to_owned(),
             conformance_level: 5,
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
@@ -878,8 +883,22 @@ mod tests {
         assert_eq!(qs[0].reply(&bar), b"\x1bP1$r6 q\x1b\\");
         // Settings we do not report get the well-formed invalid reply
         // (validity 0), not silence — the prober can move on immediately.
-        let qs = scan_all(b"\x1bP$qm\x1b\\");
+        // (`t` is DECSLPP, which ghost does not report.)
+        let qs = scan_all(b"\x1bP$qt\x1b\\");
         assert_eq!(qs[0].reply(&ctx()), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_reports_the_sgr() {
+        // DECRQSS for SGR (selector "m") echoes the current pen as a param list,
+        // always led by a `0` reset — matching what a `Sgr` dump would emit.
+        let qs = scan_all(b"\x1bP$qm\x1b\\");
+        assert_eq!(qs.len(), 1);
+        let bold = ReplyCtx {
+            sgr_report: "0;1".to_owned(),
+            ..ctx()
+        };
+        assert_eq!(qs[0].reply(&bold), b"\x1bP1$r0;1m\x1b\\");
     }
 
     #[test]

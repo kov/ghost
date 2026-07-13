@@ -1339,6 +1339,32 @@ pub(crate) fn dump_sgr_color(color: Color, base: u8) -> String {
     }
 }
 
+/// The SGR parameter (as a string) that reproduces one [`SgrOp`]. Shared by the
+/// `Sgr` dump and the DECRQSS SGR report so both stay in lockstep.
+pub(crate) fn sgr_op_param(op: &SgrOp) -> String {
+    use SgrOp::*;
+    match op {
+        Reset => "0".to_owned(),
+        SetBoldIntensity => "1".to_owned(),
+        SetFaintIntensity => "2".to_owned(),
+        SetItalic => "3".to_owned(),
+        SetUnderline => "4".to_owned(),
+        SetBlink => "5".to_owned(),
+        SetInverse => "7".to_owned(),
+        SetStrikethrough => "9".to_owned(),
+        ResetIntensity => "22".to_owned(),
+        ResetItalic => "23".to_owned(),
+        ResetUnderline => "24".to_owned(),
+        ResetBlink => "25".to_owned(),
+        ResetInverse => "27".to_owned(),
+        ResetStrikethrough => "29".to_owned(),
+        SetForegroundColor(color) => dump_sgr_color(*color, 30),
+        ResetForegroundColor => "39".to_owned(),
+        SetBackgroundColor(color) => dump_sgr_color(*color, 40),
+        ResetBackgroundColor => "49".to_owned(),
+    }
+}
+
 fn dump_function(seq: &mut String, fun: &Function) {
     use AnsiMode::*;
     use CtcOp::*;
@@ -1346,7 +1372,6 @@ fn dump_function(seq: &mut String, fun: &Function) {
     use EdScope::*;
     use ElScope::*;
     use Function::*;
-    use SgrOp::*;
     use TbcScope::*;
     use XtwinopsOp::*;
 
@@ -1628,30 +1653,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
                 // valid but semantically incomplete SGR sequence for `Sgr([])`.
                 seq.push_str("\x1b[38;2m");
             } else {
-                let params = ops
-                    .as_slice()
-                    .iter()
-                    .map(|op| match op {
-                        Reset => "0".to_owned(),
-                        SetBoldIntensity => "1".to_owned(),
-                        SetFaintIntensity => "2".to_owned(),
-                        SetItalic => "3".to_owned(),
-                        SetUnderline => "4".to_owned(),
-                        SetBlink => "5".to_owned(),
-                        SetInverse => "7".to_owned(),
-                        SetStrikethrough => "9".to_owned(),
-                        ResetIntensity => "22".to_owned(),
-                        ResetItalic => "23".to_owned(),
-                        ResetUnderline => "24".to_owned(),
-                        ResetBlink => "25".to_owned(),
-                        ResetInverse => "27".to_owned(),
-                        ResetStrikethrough => "29".to_owned(),
-                        SetForegroundColor(color) => dump_sgr_color(*color, 30),
-                        ResetForegroundColor => "39".to_owned(),
-                        SetBackgroundColor(color) => dump_sgr_color(*color, 40),
-                        ResetBackgroundColor => "49".to_owned(),
-                    })
-                    .collect::<Vec<_>>();
+                let params = ops.as_slice().iter().map(sgr_op_param).collect::<Vec<_>>();
 
                 push_csi(seq, None, &params, 'm');
             }

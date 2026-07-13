@@ -817,6 +817,19 @@ impl Terminal {
         (self.top_margin + 1, self.bottom_margin + 1)
     }
 
+    /// The current pen serialized as the DECRQSS SGR report body (e.g. `"0;1"`
+    /// for bold on defaults) — the same op list a `Sgr` dump would emit, always
+    /// led by a `0` reset. Reuses [`crate::parser::sgr_op_param`] so the report
+    /// and the dump never drift.
+    pub fn sgr_report(&self) -> String {
+        to_sgr_ops(&self.pen)
+            .as_slice()
+            .iter()
+            .map(crate::parser::sgr_op_param)
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     /// The DECSCL conformance level (1–5). DECRQM is a VT300+ feature, so the
     /// query layer withholds its reply below level 3.
     pub fn conformance_level(&self) -> u8 {

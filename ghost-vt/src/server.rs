@@ -657,6 +657,7 @@ fn host_main(
                             cursor_style: crate::query::decscusr_digit(screen.vt().cursor().shape),
                             left_right_margins: (lm as u16, rm as u16),
                             top_bottom_margins: (tm as u16, bm as u16),
+                            sgr_report: screen.vt().sgr_report(),
                             conformance_level: screen.vt().conformance_level(),
                             ansi_mode_state: &ansi_mode_state,
                             // Detached, nobody sees the live scheme; answer

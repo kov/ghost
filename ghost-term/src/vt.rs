@@ -236,6 +236,12 @@ impl Vt {
         self.terminal.top_bottom_margins()
     }
 
+    /// The current pen as a DECRQSS SGR report body (e.g. `"0;1"`). See
+    /// [`Terminal::sgr_report`].
+    pub fn sgr_report(&self) -> String {
+        self.terminal.sgr_report()
+    }
+
     /// The DECSCL conformance level (1–5). See [`Terminal::conformance_level`].
     pub fn conformance_level(&self) -> u8 {
         self.terminal.conformance_level()
@@ -825,6 +831,20 @@ mod tests {
             Some(false),
             "DECLRMM reported reset again"
         );
+    }
+
+    #[test]
+    fn sgr_report_serializes_the_current_pen() {
+        // The DECRQSS SGR body is the current pen's op list, always led by a `0`
+        // reset — e.g. bold on defaults is `0;1`, and a blank pen is just `0`.
+        let mut vt = Vt::new(80, 24);
+        assert_eq!(vt.sgr_report(), "0", "default pen reports only the reset");
+        vt.feed_str("\x1b[1m");
+        assert_eq!(vt.sgr_report(), "0;1", "bold reports 0;1");
+        vt.feed_str("\x1b[3;4m"); // italic + underline (bold still set)
+        assert_eq!(vt.sgr_report(), "0;1;3;4");
+        vt.feed_str("\x1b[m"); // reset back to defaults
+        assert_eq!(vt.sgr_report(), "0");
     }
 
     #[test]
