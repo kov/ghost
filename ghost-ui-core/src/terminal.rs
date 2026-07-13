@@ -165,9 +165,65 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
     }
 }
 
-/// One terminal view's reducer state.
-pub struct TerminalModel {
+/// The part of a terminal that belongs to the *session*, not to any single view
+/// of it: the emulator and everything a program changes about terminal *state*.
+///
+/// One per session. The foreground and a fleet preview render the same
+/// `SessionState`, and it survives the single↔fleet↔warm transitions that used to
+/// recreate the model and re-stamp its per-session facts (theme, policy, …). Every
+/// field here answers "what is true of the session," never "how is this window
+/// looking at it" — that is [`TerminalModel`]'s.
+struct SessionState {
     session: SessionId,
+    screen: Screen,
+    scanner: QueryScanner,
+    cols: u16,
+    rows: u16,
+    /// What this session may do *outside* its own screen — put text on the system
+    /// clipboard, minimize the window (see [`ghost_term::policy`]). Enforced at the
+    /// point the queued side effect would be carried out, rather than in the
+    /// emulator: only that layer knows whether the session is even on screen, and a
+    /// policy that later wants to *ask* the user needs the payload to still exist.
+    action_policy: ActionPolicy,
+    /// Whether a program has iconified the window (XTWINOPS `CSI 2 t`), for
+    /// `CSI 11 t`. What the window manager did with the request is its own
+    /// business — this is what the program asked for and what it reads back.
+    iconified: bool,
+    /// Whether the window is maximized or full-screen at a program's asking, and
+    /// the grid it had before each — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts
+    /// that grid back rather than guessing a size. The two keep *separate* slots:
+    /// they nest (a program may full-screen a maximized window and expect leaving
+    /// full-screen to land back on the maximize), and one shared slot let a restore
+    /// of a state we were never in steal the other's.
+    maximized: bool,
+    fullscreen: bool,
+    maximize_restore: Option<(u16, u16)>,
+    fullscreen_restore: Option<(u16, u16)>,
+    ended: bool,
+    /// The transport dropped but the session may still be alive on the far side
+    /// (a remote session over ssh): the screen is frozen and dimmed while the shell
+    /// retries the attach. Cleared when it re-attaches ([`UiEvent::SessionReattached`]),
+    /// whose resync repaints the recovered screen. Distinct from `ended` — this
+    /// session is NOT gone, so it must never tear the tile down.
+    reconnecting: bool,
+    /// The session's user-chosen display name (`ghost rename`), empty if
+    /// unlabeled. A human-facing label only: `session` stays the immutable id
+    /// every effect routes by. Feeds the [`TerminalModel::title`] fallback.
+    display_name: String,
+    /// The scheme's default fg/bg, for answering OSC 10/11 color queries (vim and
+    /// fzf theme detection). The *window* authors it (see [`TerminalModel::set_theme`]),
+    /// but it is remembered here so a detached session still answers with the colors
+    /// it was last shown in. Defaults to ghost's default scheme.
+    theme: ThemeColors,
+}
+
+/// One terminal view's reducer state: how one window is looking at a
+/// [`SessionState`] — its viewport, selection, scroll, focus, and the render
+/// bookkeeping that goes with them. Several of these can point at one session.
+pub struct TerminalModel {
+    /// The session this view shows: the emulator and the terminal-state facts that
+    /// belong to the session itself, not to this view of it.
+    state: SessionState,
     /// Base (logical, 1x) cell metrics; physical metrics are these scaled by
     /// [`scale`](Self::scale).
     metrics: CellMetrics,
@@ -184,36 +240,12 @@ pub struct TerminalModel {
     /// never hears): a nominal display then stands in, so a program's arithmetic
     /// still adds up.
     display_px: Option<(u32, u32)>,
-    /// Whether a program has iconified the window (XTWINOPS `CSI 2 t`), for
-    /// `CSI 11 t`. What the window manager did with the request is its own
-    /// business — this is what the program asked for and what it reads back.
-    iconified: bool,
-    /// What this session may do *outside* its own screen — put text on the system
-    /// clipboard, minimize the window (see [`ghost_term::policy`]). Enforced here,
-    /// at the point the queued side effect would be carried out, rather than in the
-    /// emulator: only this layer knows whether the session is even on screen, and a
-    /// policy that later wants to *ask* the user needs the payload to still exist.
-    action_policy: ActionPolicy,
-    /// Whether the window is maximized or full-screen at a program's asking, and
-    /// the grid it had before each — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts
-    /// that grid back rather than guessing a size. The two keep *separate* slots:
-    /// they nest (a program may full-screen a maximized window and expect leaving
-    /// full-screen to land back on the maximize), and one shared slot let a restore
-    /// of a state we were never in steal the other's.
-    maximized: bool,
-    fullscreen: bool,
-    maximize_restore: Option<(u16, u16)>,
-    fullscreen_restore: Option<(u16, u16)>,
     /// Inner padding in *logical* px per side between the grid and the window edges.
     /// Scaled by the device factor (not zoom — it's a fixed window-space border) into
     /// [`Self::pad_px`], which insets the grid, the scene item rect, pointer
     /// hit-testing and the IME caret. The scene canvas stays the full window, so the
     /// border is filled by the terminal background. 0 = flush to the edges.
     pad: f32,
-    screen: Screen,
-    scanner: QueryScanner,
-    cols: u16,
-    rows: u16,
     /// Last 1-based `(col, row)` cell the pointer was over (`None` until moved).
     cursor_cell: Option<(u16, u16)>,
     /// Button currently held (drag vs hover).
@@ -253,13 +285,6 @@ pub struct TerminalModel {
     /// out of the live viewport, so we rescan all retained lines (not just the
     /// viewport) for placeholder ids to upload.
     last_image_count: usize,
-    ended: bool,
-    /// The transport dropped but the session may still be alive on the far side
-    /// (a remote session over ssh): the screen is frozen and dimmed while the shell
-    /// retries the attach. Cleared when it re-attaches ([`UiEvent::SessionReattached`]),
-    /// whose resync repaints the recovered screen. Distinct from `ended` — this
-    /// session is NOT gone, so it must never tear the tile down.
-    reconnecting: bool,
     /// Viewport rows dirtied by feeds since the last present, from the core's per-feed
     /// hint (`Screen::feed`) — the localizable part of the [`TermDamage`] `view` reports.
     /// `None` = no feed changed the viewport; a range accumulates across coalesced feeds.
@@ -284,18 +309,10 @@ pub struct TerminalModel {
     /// [`Self::session_data`]). Warm background mirrors never receive a focus
     /// event, so they correctly stay `false`.
     focused: bool,
-    /// The scheme's default fg/bg, for answering OSC 10/11 color queries (vim
-    /// and fzf theme detection). Defaults to ghost's default scheme; the shell
-    /// overrides it when a scheme is configured (see `set_theme`).
-    theme: ThemeColors,
     /// The interned link id under a Ctrl/Cmd-hover, if any: `view` underlines
     /// every visible run of it and the pointer shows a hand (see
     /// [`Cmd::PointerIcon`]). Updated on pointer motion.
     hovered_link: Option<u16>,
-    /// The session's user-chosen display name (`ghost rename`), empty if
-    /// unlabeled. A human-facing label only: `session` stays the immutable id
-    /// every effect routes by. Feeds the [`Self::title`] fallback.
-    display_name: String,
     /// Render-gate counters (see [`TermTrace`]). Only `feeds_seen`, `visible_feeds`,
     /// `redraws_emitted`, the sync-hold tallies, and `presents_marked` are stored
     /// here; the live `sync_held`/`feed_dirty` are folded in by [`Self::trace`].
@@ -355,31 +372,42 @@ struct Presented {
 /// without writing a cell (see [`TerminalModel::placement_signature`]).
 type PlacementSig = (u32, u32, usize, usize, u32, u32, i32);
 
+impl SessionState {
+    fn new(session: SessionId, cols: u16, rows: u16) -> Self {
+        SessionState {
+            session,
+            screen: Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK),
+            scanner: QueryScanner::new(),
+            cols,
+            rows,
+            action_policy: ActionPolicy::default(),
+            iconified: false,
+            maximized: false,
+            fullscreen: false,
+            maximize_restore: None,
+            fullscreen_restore: None,
+            ended: false,
+            reconnecting: false,
+            display_name: String::new(),
+            theme: ThemeColors::default(),
+        }
+    }
+}
+
 impl TerminalModel {
     pub fn new(session: SessionId, cols: u16, rows: u16, metrics: CellMetrics) -> Self {
         let size_px = (
             (f32::from(cols) * metrics.advance) as u32,
             (f32::from(rows) * metrics.line_height) as u32,
         );
-        let screen = Screen::new(cols, rows, screen::DEFAULT_SCROLLBACK);
         TerminalModel {
-            session,
+            state: SessionState::new(session, cols, rows),
             metrics,
             scale: 1.0,
             zoom: 1.0,
             size_px,
             display_px: None,
-            iconified: false,
-            maximized: false,
-            fullscreen: false,
-            action_policy: ActionPolicy::default(),
-            maximize_restore: None,
-            fullscreen_restore: None,
             pad: 0.0,
-            screen,
-            scanner: QueryScanner::new(),
-            cols,
-            rows,
             cursor_cell: None,
             held: None,
             gesture_report: false,
@@ -392,16 +420,12 @@ impl TerminalModel {
             last_title: String::new(),
             uploaded_images: HashMap::new(),
             last_image_count: 0,
-            ended: false,
-            reconnecting: false,
             feed_dirty: None,
             presented: None,
             view_slid: false,
             sync_held: false,
             focused: false,
-            theme: ThemeColors::default(),
             hovered_link: None,
-            display_name: String::new(),
             trace: TermTrace::default(),
         }
     }
@@ -411,10 +435,10 @@ impl TerminalModel {
     /// theme *change*, sessions subscribed to mode 2031 get the unsolicited
     /// `CSI ? 997 ; Ps n` dark/light notification.
     pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
-        let changed = theme != self.theme;
-        self.theme = theme;
-        if changed && self.screen.vt().dec_mode_state(2031) == ghost_term::ModeReport::Set {
-            let colors = self.screen.effective_colors(self.theme);
+        let changed = theme != self.state.theme;
+        self.state.theme = theme;
+        if changed && self.state.screen.vt().dec_mode_state(2031) == ghost_term::ModeReport::Set {
+            let colors = self.state.screen.effective_colors(self.state.theme);
             return self.send(ghost_vt::query::color_scheme_report(&colors));
         }
         Vec::new()
@@ -449,7 +473,7 @@ impl TerminalModel {
                 // screen. Omitting this left the banded foreground texture stale on an
                 // in-place rewrite while scrolled — the recurring foreground-stall bug.
                 Some((lo, hi)) => {
-                    let rows = self.rows as usize;
+                    let rows = self.state.rows as usize;
                     let lo = lo + self.scroll_offset;
                     if lo >= rows {
                         TermDamage::None
@@ -496,7 +520,7 @@ impl TerminalModel {
     /// The app-set dynamic colors (OSC 10/11/12) the renderer paints with —
     /// the view-shaping color state [`Presented`] snapshots.
     fn render_colors(&self) -> [Option<[u8; 3]>; 3] {
-        let vt = self.screen.vt();
+        let vt = self.state.screen.vt();
         [
             vt.dynamic_foreground(),
             vt.dynamic_background(),
@@ -505,14 +529,14 @@ impl TerminalModel {
     }
 
     pub fn screen(&self) -> &Screen {
-        &self.screen
+        &self.state.screen
     }
 
     /// What this session may do outside its own screen — the clipboard, the window
     /// (see [`ghost_term::policy`]). Safe to change while the session runs: nothing
     /// here is screen state, so the session host needn't agree with us about it.
     pub fn set_action_policy(&mut self, policy: ActionPolicy) {
-        self.action_policy = policy;
+        self.state.action_policy = policy;
     }
 
     /// Both halves at once — what the shell hands down, and the same value it
@@ -528,32 +552,32 @@ impl TerminalModel {
     /// on every attach, so a policy the two disagree about is state that appears and
     /// vanishes depending on who was looking.
     pub fn set_terminal_policy(&mut self, policy: ghost_term::TerminalPolicy) {
-        self.screen.set_policy(policy);
+        self.state.screen.set_policy(policy);
     }
 
     /// The session id these effects target.
     pub fn session(&self) -> &str {
-        &self.session
+        &self.state.session
     }
 
     /// Set the session's user-chosen display name (empty = unlabeled). A label
     /// for humans only — routing stays on the immutable [`Self::session`] id.
     pub fn set_display_name(&mut self, name: String) {
-        self.display_name = name;
+        self.state.display_name = name;
     }
 
     /// The session's user-chosen display name, empty if unlabeled.
     pub fn display_name(&self) -> &str {
-        &self.display_name
+        &self.state.display_name
     }
 
     /// The name a human should see for this session: its display name when
     /// labeled, else its immutable id.
     pub fn display(&self) -> &str {
-        if self.display_name.is_empty() {
-            &self.session
+        if self.state.display_name.is_empty() {
+            &self.state.session
         } else {
-            &self.display_name
+            &self.state.display_name
         }
     }
 
@@ -566,20 +590,21 @@ impl TerminalModel {
     /// on the screen state and the label, so it is remembered across
     /// background/foreground switches.
     pub fn title(&self) -> String {
-        let title = self.screen.title();
-        let label = (!self.display_name.is_empty() && self.display_name != self.session)
-            .then_some(self.display_name.as_str());
+        let title = self.state.screen.title();
+        let label = (!self.state.display_name.is_empty()
+            && self.state.display_name != self.state.session)
+            .then_some(self.state.display_name.as_str());
         match (label, title.is_empty()) {
             (Some(label), false) => format!("{label} — {title}"),
             (Some(label), true) => label.to_string(),
             (None, false) => title.to_string(),
-            (None, true) => self.session.clone(),
+            (None, true) => self.state.session.clone(),
         }
     }
 
     /// The terminal's grid size in cells (cols, rows).
     pub fn dims(&self) -> (u16, u16) {
-        (self.cols, self.rows)
+        (self.state.cols, self.state.rows)
     }
 
     /// The selection projected into the current viewport for painting, clamped
@@ -589,7 +614,7 @@ impl TerminalModel {
     pub fn selection(&self) -> Option<Selection> {
         let s = self.selection?;
         let top = self.abs_top();
-        let rows = self.rows as usize;
+        let rows = self.state.rows as usize;
         if s.end.0 < top || s.start.0 >= top + rows {
             return None;
         }
@@ -599,7 +624,7 @@ impl TerminalModel {
             (s.start.0 - top, s.start.1)
         };
         let end = if s.end.0 >= top + rows {
-            (rows - 1, (self.cols as usize).saturating_sub(1))
+            (rows - 1, (self.state.cols as usize).saturating_sub(1))
         } else {
             (s.end.0 - top, s.end.1)
         };
@@ -609,7 +634,7 @@ impl TerminalModel {
     /// The first viewport row's absolute line index — the monotonic
     /// lines-ever-scrolled-off space selections are anchored in.
     fn abs_top(&self) -> usize {
-        self.screen.vt().lines_scrolled_off() - self.scroll_offset
+        self.state.screen.vt().lines_scrolled_off() - self.scroll_offset
     }
 
     /// Lift a viewport cell into absolute line space.
@@ -627,22 +652,22 @@ impl TerminalModel {
 
     /// Whether the child exited / the session closed.
     pub fn ended(&self) -> bool {
-        self.ended
+        self.state.ended
     }
 
     /// Whether the transport dropped and the shell is retrying (frozen + dimmed).
     pub fn reconnecting(&self) -> bool {
-        self.reconnecting
+        self.state.reconnecting
     }
 
     /// Enter or leave the reconnecting hold for `name` (a no-op for another
     /// session). A redraw repaints the dim; the reconnected resync repaints the
     /// recovered screen. Never sets `ended` — the session isn't gone.
     fn set_reconnecting(&mut self, name: &str, on: bool) -> Vec<Cmd> {
-        if name != self.session || self.reconnecting == on {
+        if name != self.state.session || self.state.reconnecting == on {
             return Vec::new();
         }
-        self.reconnecting = on;
+        self.state.reconnecting = on;
         vec![Cmd::Redraw]
     }
 
@@ -750,7 +775,7 @@ impl TerminalModel {
     fn resize_grid(&mut self, cols: u16, rows: u16) {
         let cols = cols.clamp(1, ghost_term::MAX_PROGRAM_COLS as u16);
         let rows = rows.clamp(1, ghost_term::MAX_PROGRAM_ROWS as u16);
-        self.screen.resize(cols, rows);
+        self.state.screen.resize(cols, rows);
     }
 
     /// One dimension of an XTWINOPS resize: omitted keeps what it has, zero is
@@ -794,14 +819,14 @@ impl TerminalModel {
     /// asked for, which is all xterm promises it.
     fn apply_window_ops(&mut self) -> Vec<Cmd> {
         let mut cmds = Vec::new();
-        for op in self.screen.take_window_ops() {
+        for op in self.state.screen.take_window_ops() {
             // Minimizing, maximizing and going full-screen are the window's, not the
             // screen's — the emulator only queued them, and this is where they would
             // actually happen, so this is where the policy gets a say. Drained either
             // way, so a refusal doesn't leave them piling up. (The resizes below are
             // *grid* ops that reach the window as a consequence; the emulator gates
             // those, since the grid is screen state it must agree with the host on.)
-            if !self.action_policy.window_control
+            if !self.state.action_policy.window_control
                 && matches!(
                     op,
                     XtwinopsOp::Iconify
@@ -812,19 +837,19 @@ impl TerminalModel {
             {
                 continue;
             }
-            // The screen's own size, not `self.cols`/`self.rows` — those are
+            // The screen's own size, not `self.state.cols`/`self.state.rows` — those are
             // reconciled once, after this loop, so within a burst they are the grid
             // we *started* with. Two ops in one write (`\e[9;2t\e[9;3t`: grow one
             // axis, then the other) have to each see what the one before it left.
-            let (cols, rows) = self.screen.dimensions();
+            let (cols, rows) = self.state.screen.dimensions();
             let (display_cols, display_rows) = self.display_grid();
             match op {
                 XtwinopsOp::Iconify => {
-                    self.iconified = true;
+                    self.state.iconified = true;
                     cmds.push(Cmd::SetIconified(true));
                 }
                 XtwinopsOp::Deiconify => {
-                    self.iconified = false;
+                    self.state.iconified = false;
                     cmds.push(Cmd::SetIconified(false));
                 }
                 XtwinopsOp::Maximize(op) => {
@@ -834,15 +859,15 @@ impl TerminalModel {
                         MaximizeOp::Horizontally => Some((display_cols, rows)),
                         MaximizeOp::Vertically => Some((cols, display_rows)),
                         // Only a maximize we made has anything to come back to.
-                        MaximizeOp::Restore => self.maximize_restore.take(),
+                        MaximizeOp::Restore => self.state.maximize_restore.take(),
                     };
-                    if !leaving && !self.maximized {
+                    if !leaving && !self.state.maximized {
                         // Save on the way in only: growing the second axis (or
                         // maximizing twice) must not overwrite the grid from before
                         // the first with an already-grown one.
-                        self.maximize_restore = Some((cols, rows));
+                        self.state.maximize_restore = Some((cols, rows));
                     }
-                    self.maximized = !leaving;
+                    self.state.maximized = !leaving;
                     // Only a both-axes maximize is a state a window manager has;
                     // one axis is just a size, which the re-grid below asks for.
                     if op == MaximizeOp::Both || leaving {
@@ -856,7 +881,7 @@ impl TerminalModel {
                     let entering = match op {
                         FullscreenOp::Enter => true,
                         FullscreenOp::Leave => false,
-                        FullscreenOp::Toggle => !self.fullscreen,
+                        FullscreenOp::Toggle => !self.state.fullscreen,
                     };
                     // Full-screen keeps its *own* saved grid, and only touches it on
                     // a real transition. Sharing one slot with the maximize let a
@@ -865,16 +890,16 @@ impl TerminalModel {
                     // saved. Keeping them apart also nests the two the way xterm
                     // does: full-screen over a maximize comes back to the maximized
                     // grid, and the maximize still restores what preceded it.
-                    if entering && !self.fullscreen {
-                        self.fullscreen_restore = Some((cols, rows));
+                    if entering && !self.state.fullscreen {
+                        self.state.fullscreen_restore = Some((cols, rows));
                         self.resize_grid(display_cols, display_rows);
                     } else if !entering
-                        && self.fullscreen
-                        && let Some((cols, rows)) = self.fullscreen_restore.take()
+                        && self.state.fullscreen
+                        && let Some((cols, rows)) = self.state.fullscreen_restore.take()
                     {
                         self.resize_grid(cols, rows);
                     }
-                    self.fullscreen = entering;
+                    self.state.fullscreen = entering;
                     cmds.push(Cmd::SetFullscreen(entering));
                 }
                 // A resize the emulator left to us: one with a zero dimension, which
@@ -919,7 +944,7 @@ impl TerminalModel {
         if self.scroll_offset != 0 {
             return None;
         }
-        let (col1, row1) = self.screen.cursor();
+        let (col1, row1) = self.state.screen.cursor();
         let m = self.effective_metrics();
         let pad = self.pad_px();
         Some(RectPx {
@@ -946,7 +971,7 @@ impl TerminalModel {
     /// border (see [`Self::pad`]).
     pub fn view(&self) -> Scene {
         let frame = std::rc::Rc::new(layout_frame_at(
-            self.screen.vt(),
+            self.state.screen.vt(),
             self.effective_metrics(),
             self.scroll_offset,
         ));
@@ -964,7 +989,7 @@ impl TerminalModel {
             frame,
             selection: self.selection(),
             // Dim the frozen screen while the connection is being re-established.
-            dim: self.reconnecting,
+            dim: self.state.reconnecting,
             damage: self.damage(),
         }];
         items.extend(self.hover_underlines());
@@ -980,7 +1005,7 @@ impl TerminalModel {
             return Vec::new();
         };
         let m = self.effective_metrics();
-        let [r, g, b] = self.theme.fg;
+        let [r, g, b] = self.state.theme.fg;
         let color = [
             f32::from(r) / 255.0,
             f32::from(g) / 255.0,
@@ -989,11 +1014,12 @@ impl TerminalModel {
         ];
         let mut items = Vec::new();
         for (row, line) in self
+            .state
             .screen
             .vt()
             .view_at(self.scroll_offset)
             .enumerate()
-            .take(self.rows as usize)
+            .take(self.state.rows as usize)
         {
             let cells = line.cells();
             let mut col = 0;
@@ -1032,14 +1058,14 @@ impl TerminalModel {
 
     fn send(&self, bytes: Vec<u8>) -> Vec<Cmd> {
         vec![Cmd::SendInput {
-            session: self.session.clone(),
+            session: self.state.session.clone(),
             bytes,
         }]
     }
 
     /// The maximum scroll-up offset (retained scrollback lines).
     fn max_scroll(&self) -> usize {
-        self.screen.vt().scrollback_len()
+        self.state.screen.vt().scrollback_len()
     }
 
     /// Clamp `offset` to the retained history and apply it; returns whether the
@@ -1076,7 +1102,7 @@ impl TerminalModel {
         if !mods.shift || mods.ctrl || mods.alt || mods.sup {
             return None;
         }
-        let page = i64::from(self.rows.saturating_sub(1)).max(1);
+        let page = i64::from(self.state.rows.saturating_sub(1)).max(1);
         match key {
             Key::Named(NamedKey::PageUp) => Some(Scroll::By(page)),
             Key::Named(NamedKey::PageDown) => Some(Scroll::By(-page)),
@@ -1103,7 +1129,7 @@ impl TerminalModel {
     /// viewport top lands at the top. The chord is always consumed; with no
     /// prompt to jump to the view just stays put.
     fn jump_to_prompt(&mut self, back: bool) -> Vec<Cmd> {
-        let vt = self.screen.vt();
+        let vt = self.state.screen.vt();
         let scrolled_off = vt.lines_scrolled_off();
         let top = scrolled_off - self.scroll_offset;
         let target = if back {
@@ -1144,9 +1170,9 @@ impl TerminalModel {
         // returns nothing for when that flag is off or the key has no escape-code
         // form). Auto-repeat (`Repeat`) otherwise behaves exactly like a press.
         if matches!(kind, KeyEventKind::Release) {
-            let app_cursor = self.screen.vt().cursor_key_app_mode();
-            let modify_other_keys = self.screen.vt().modify_other_keys();
-            let kitty_flags = self.screen.vt().kitty_keyboard_flags();
+            let app_cursor = self.state.screen.vt().cursor_key_app_mode();
+            let modify_other_keys = self.state.screen.vt().modify_other_keys();
+            let kitty_flags = self.state.screen.vt().kitty_keyboard_flags();
             return match encode::encode(
                 key,
                 mods,
@@ -1200,9 +1226,9 @@ impl TerminalModel {
             Some(Shortcut::CloseWindow) => vec![Cmd::CloseWindow],
             Some(Shortcut::NewSession) => vec![Cmd::SpawnSession],
             None => {
-                let app_cursor = self.screen.vt().cursor_key_app_mode();
-                let modify_other_keys = self.screen.vt().modify_other_keys();
-                let kitty_flags = self.screen.vt().kitty_keyboard_flags();
+                let app_cursor = self.state.screen.vt().cursor_key_app_mode();
+                let modify_other_keys = self.state.screen.vt().modify_other_keys();
+                let kitty_flags = self.state.screen.vt().kitty_keyboard_flags();
                 match encode::encode(
                     key,
                     mods,
@@ -1252,7 +1278,7 @@ impl TerminalModel {
     fn paste(&mut self, text: Option<String>) -> Vec<Cmd> {
         match text {
             Some(s) => {
-                let bytes = bracket_paste(s.as_bytes(), self.screen.vt().bracketed_paste());
+                let bytes = bracket_paste(s.as_bytes(), self.state.screen.vt().bracketed_paste());
                 let mut cmds = self.snap_to_bottom();
                 cmds.extend(self.send(bytes));
                 cmds
@@ -1264,7 +1290,7 @@ impl TerminalModel {
     fn copy(&self) -> Vec<Cmd> {
         match self.selection {
             Some(sel) => {
-                let text = selection_text(&self.screen, sel);
+                let text = selection_text(&self.state.screen, sel);
                 if text.is_empty() {
                     Vec::new()
                 } else {
@@ -1282,7 +1308,7 @@ impl TerminalModel {
             // stuck swallowing input should the platform omit `Ime::Disabled`.
             self.preedit.clear();
         }
-        if self.screen.vt().focus_report() {
+        if self.state.screen.vt().focus_report() {
             self.send(if focused {
                 b"\x1b[I".to_vec()
             } else {
@@ -1308,14 +1334,14 @@ impl TerminalModel {
         let content_h = (h_px as f32 - 2.0 * pad).max(0.0);
         let cols = (content_w / m.advance).floor().max(1.0) as u16;
         let rows = (content_h / m.line_height).floor().max(1.0) as u16;
-        if (cols, rows) == (self.cols, self.rows) {
+        if (cols, rows) == (self.state.cols, self.state.rows) {
             // Grid unchanged, but a scale change still needs a repaint at the new
             // (physical) glyph size.
             return vec![Cmd::Redraw];
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.screen.resize(cols, rows);
+        self.state.cols = cols;
+        self.state.rows = rows;
+        self.state.screen.resize(cols, rows);
         // Reflow invalidates cell coordinates and the history view; drop any
         // stale selection and return to the live bottom.
         self.selection = None;
@@ -1323,7 +1349,7 @@ impl TerminalModel {
         self.scroll_offset = 0;
         vec![
             Cmd::Resize {
-                session: self.session.clone(),
+                session: self.state.session.clone(),
                 cols,
                 rows,
             },
@@ -1332,15 +1358,15 @@ impl TerminalModel {
     }
 
     fn session_data(&mut self, name: &str, bytes: &[u8], ended: bool) -> Vec<Cmd> {
-        if name != self.session {
+        if name != self.state.session {
             return Vec::new();
         }
         let mut cmds = Vec::new();
         if !bytes.is_empty() {
             self.trace.feeds_seen += 1;
-            let before = self.screen.vt().lines_scrolled_off();
+            let before = self.state.screen.vt().lines_scrolled_off();
             let colors_before = self.render_colors();
-            let focus_report_before = self.screen.vt().focus_report();
+            let focus_report_before = self.state.screen.vt().focus_report();
             let placements_before = self.placement_signature();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
             // slice means nothing on screen moved (a mode set, a query that only
@@ -1349,7 +1375,7 @@ impl TerminalModel {
             // it so a no-op feed doesn't drive a present, and carry the dirtied row
             // range into `view`'s per-session `TermDamage` (see [`Self::damage`]).
             let (viewport_changed, dirty) = {
-                let d = self.screen.feed(bytes);
+                let d = self.state.screen.feed(bytes);
                 (
                     !d.is_empty(),
                     d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
@@ -1371,13 +1397,13 @@ impl TerminalModel {
             // `UiEvent::Resize` re-grids us to what it actually is, which is the
             // fallback. Force a full repaint — the reflow invalidates every cell
             // coordinate — and drop the (now meaningless) selection and scroll.
-            if self.screen.dimensions() != (self.cols, self.rows) {
-                (self.cols, self.rows) = self.screen.dimensions();
+            if self.state.screen.dimensions() != (self.state.cols, self.state.rows) {
+                (self.state.cols, self.state.rows) = self.state.screen.dimensions();
                 self.selection = None;
                 self.sel_anchor = None;
                 self.scroll_offset = 0;
                 self.view_slid = true;
-                let (w_px, h_px) = self.window_px_for_grid(self.cols, self.rows);
+                let (w_px, h_px) = self.window_px_for_grid(self.state.cols, self.state.rows);
                 // Hold the size we asked the window for, so a `CSI 14 t` in this
                 // burst reports the pixels the program just asked for rather than
                 // the ones it had. The window's next `UiEvent::Resize` — what it
@@ -1385,9 +1411,9 @@ impl TerminalModel {
                 self.size_px = (w_px, h_px);
                 cmds.push(Cmd::ResizeWindow { w_px, h_px });
                 cmds.push(Cmd::Resize {
-                    session: self.session.clone(),
-                    cols: self.cols,
-                    rows: self.rows,
+                    session: self.state.session.clone(),
+                    cols: self.state.cols,
+                    rows: self.state.rows,
                 });
             }
             // Keep a scrolled-up view pinned to its content: advance the offset by
@@ -1396,7 +1422,12 @@ impl TerminalModel {
             // which reads zero once the cap is hit), clamped to retained history.
             // At the bottom (offset 0) we just follow the live output.
             if self.scroll_offset > 0 {
-                let pushed = self.screen.vt().lines_scrolled_off().saturating_sub(before);
+                let pushed = self
+                    .state
+                    .screen
+                    .vt()
+                    .lines_scrolled_off()
+                    .saturating_sub(before);
                 let desired = self.scroll_offset + pushed;
                 let capped = desired.min(self.max_scroll());
                 // At the scrollback cap the offset can't grow to keep the view pinned to
@@ -1410,7 +1441,7 @@ impl TerminalModel {
                 self.scroll_offset = capped;
             }
             let display_size = self.display_grid();
-            let screen = &self.screen;
+            let screen = &self.state.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
             let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
             let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
@@ -1423,7 +1454,7 @@ impl TerminalModel {
                 size: screen.dimensions(),
                 policy: screen.vt().policy(),
                 display_size,
-                iconified: self.iconified,
+                iconified: self.state.iconified,
                 size_px: self.size_px,
                 display_px: self
                     .display_px
@@ -1442,16 +1473,16 @@ impl TerminalModel {
                 decsca: screen.vt().decsca_report(),
                 conformance_level: screen.vt().conformance_level(),
                 ansi_mode_state: &ansi_mode_state,
-                colors: screen.effective_colors(self.theme),
+                colors: screen.effective_colors(self.state.theme),
                 palette: &palette,
                 special: &special,
                 mode_state: &mode_state,
                 checksum: &checksum,
             };
-            let replies = query_replies(&mut self.scanner, bytes, &ctx);
+            let replies = query_replies(&mut self.state.scanner, bytes, &ctx);
             if !replies.is_empty() {
                 cmds.push(Cmd::SendInput {
-                    session: self.session.clone(),
+                    session: self.state.session.clone(),
                     bytes: replies,
                 });
             }
@@ -1463,9 +1494,9 @@ impl TerminalModel {
             // change happens to arrive. Emit the current state on enable so a
             // newly-subscribed app is never left guessing (a deliberate,
             // documented divergence from xterm).
-            if self.screen.vt().focus_report() && !focus_report_before {
+            if self.state.screen.vt().focus_report() && !focus_report_before {
                 cmds.push(Cmd::SendInput {
-                    session: self.session.clone(),
+                    session: self.state.session.clone(),
                     bytes: if self.focused {
                         b"\x1b[I".to_vec()
                     } else {
@@ -1477,20 +1508,20 @@ impl TerminalModel {
             // queries) they come from the emulator. The detached host stays out of
             // the way while a client is attached, so we — the attached frontend —
             // send them back to the child ourselves.
-            let graphics_replies = self.screen.take_graphics_responses();
+            let graphics_replies = self.state.screen.take_graphics_responses();
             if !graphics_replies.is_empty() {
                 cmds.push(Cmd::SendInput {
-                    session: self.session.clone(),
+                    session: self.state.session.clone(),
                     bytes: graphics_replies,
                 });
             }
             // OSC 52: apply the app's clipboard writes (copy-over-ssh, tmux
             // set-clipboard). The emulator already decoded, size-capped, and
             // refused the read form; route each write to its selection.
-            for (target, text) in self.screen.take_clipboard_writes() {
+            for (target, text) in self.state.screen.take_clipboard_writes() {
                 // Drained whatever the policy says — a refused write is dropped
                 // here, not left to pile up in the emulator.
-                if !self.action_policy.clipboard_write {
+                if !self.state.action_policy.clipboard_write {
                     continue;
                 }
                 cmds.push(match target {
@@ -1512,8 +1543,8 @@ impl TerminalModel {
             // Reflect an OSC 0/2 window-title change to the shell, once per change.
             // Emit the fallback (session name when the app cleared its title) so an
             // empty OSC 2 never blanks the titlebar — consistent with switch paths.
-            if self.screen.title() != self.last_title.as_str() {
-                self.last_title = self.screen.title().to_string();
+            if self.state.screen.title() != self.last_title.as_str() {
+                self.last_title = self.state.screen.title().to_string();
                 cmds.push(Cmd::SetTitle(self.title()));
             }
             // A new image may be a direct placement the row-damage hint doesn't
@@ -1528,7 +1559,7 @@ impl TerminalModel {
                 self.accumulate_dirty(lo, hi);
             }
             if images_added {
-                self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
+                self.accumulate_dirty(0, self.state.rows.saturating_sub(1) as usize);
             }
             // A direct placement changed WITHOUT a new upload — a delete (`a=d`), a move,
             // or a re-place of an already-uploaded image — alters the drawn frame but
@@ -1537,7 +1568,7 @@ impl TerminalModel {
             // same as a fresh upload does.
             let placements_changed = placements_before != self.placement_signature();
             if placements_changed && !images_added {
-                self.accumulate_dirty(0, self.rows.saturating_sub(1) as usize);
+                self.accumulate_dirty(0, self.state.rows.saturating_sub(1) as usize);
             }
             // App-set dynamic colors (OSC 10/11/12) dirty no rows, but they
             // recolor everything; `damage` reports All via the `Presented`
@@ -1551,7 +1582,7 @@ impl TerminalModel {
             // cursor isn't drawn (and a scroll is already a full repaint). `Screen`
             // advances its own baseline every feed, so there's nothing to do when scrolled.
             let cursor_redrawn = if self.scroll_offset == 0 {
-                let cursor = self.screen.cursor_damage();
+                let cursor = self.state.screen.cursor_damage();
                 if let Some(r) = cursor.left {
                     self.accumulate_dirty(r, r);
                 }
@@ -1577,7 +1608,7 @@ impl TerminalModel {
             // accumulating above) and schedule a release tick as the backstop.
             // Any tick releases the hold — an early animation tick just means
             // one mid-frame paint, the status quo without the mode.
-            let sync = self.screen.vt().synchronized_output();
+            let sync = self.state.screen.vt().synchronized_output();
             if sync && want_redraw {
                 // Re-arm the release backstop on EVERY swallowed feed, not just
                 // the rising edge. A hold can be latched into a warm background
@@ -1611,7 +1642,7 @@ impl TerminalModel {
             }
         }
         if ended {
-            self.ended = true;
+            self.state.ended = true;
             cmds.push(Cmd::Redraw);
         }
         cmds
@@ -1626,7 +1657,8 @@ impl TerminalModel {
     /// writes a cell or uploads a blob — can be detected as a frame change. Placeholder
     /// cells aren't placements; they change a cell and are covered by the row-damage hint.
     fn placement_signature(&self) -> Vec<PlacementSig> {
-        self.screen
+        self.state
+            .screen
             .vt()
             .graphics_placements()
             .map(|p| {
@@ -1646,7 +1678,7 @@ impl TerminalModel {
     fn upload_new_images(&mut self, cmds: &mut Vec<Cmd>) {
         // Every image id referenced on screen: direct placements first...
         let mut referenced: Vec<u32> = Vec::new();
-        for p in self.screen.vt().graphics_placements() {
+        for p in self.state.screen.vt().graphics_placements() {
             if !referenced.contains(&p.image_id) {
                 referenced.push(p.image_id);
             }
@@ -1656,18 +1688,20 @@ impl TerminalModel {
         // was just stored, also scan the retained scrollback, since the image may belong
         // to a placeholder that already scrolled out of view (otherwise it would never
         // upload and would render blank when scrolled back to).
-        let count = self.screen.vt().graphics_image_count();
+        let count = self.state.screen.vt().graphics_image_count();
         let scan_all = count != self.last_image_count;
         self.last_image_count = count;
         let placeholder_ids: Vec<u32> = if scan_all {
-            self.screen
+            self.state
+                .screen
                 .vt()
                 .lines()
                 .flat_map(|line| line.cells())
                 .filter_map(|cell| cell.placeholder_image_id())
                 .collect()
         } else {
-            self.screen
+            self.state
+                .screen
                 .vt()
                 .view()
                 .flat_map(|line| line.cells())
@@ -1683,7 +1717,7 @@ impl TerminalModel {
         // first transmit (no entry yet) or a re-transmit that replaced the pixels under
         // an existing id. Keying on the id alone would leave a re-transmit stale.
         for id in referenced {
-            let Some(image) = self.screen.vt().graphics_image(id) else {
+            let Some(image) = self.state.screen.vt().graphics_image(id) else {
                 continue;
             };
             if self.uploaded_images.get(&id) == Some(&image.generation) {
@@ -1703,7 +1737,7 @@ impl TerminalModel {
     // ---- pointer / selection state machine ----
 
     fn mouse_active(&self) -> bool {
-        self.screen.vt().mouse_protocol() != MouseProtocol::Off
+        self.state.screen.vt().mouse_protocol() != MouseProtocol::Off
     }
 
     /// Whether a gesture should be forwarded to the child rather than driving
@@ -1729,9 +1763,11 @@ impl TerminalModel {
     /// disallowed schemes.
     fn link_at(&self, pos: PointPx) -> Option<(u16, String)> {
         let (col1, row1) = self.point_to_cell(pos);
-        let row = usize::from(row1.saturating_sub(1)).min((self.rows as usize).saturating_sub(1));
-        let col = usize::from(col1.saturating_sub(1)).min((self.cols as usize).saturating_sub(1));
-        let vt = self.screen.vt();
+        let row =
+            usize::from(row1.saturating_sub(1)).min((self.state.rows as usize).saturating_sub(1));
+        let col =
+            usize::from(col1.saturating_sub(1)).min((self.state.cols as usize).saturating_sub(1));
+        let vt = self.state.screen.vt();
         let line = vt.view_at(self.scroll_offset).nth(row)?;
         let id = line.cells().get(col)?.pen().link_id()?;
         let uri = vt.hyperlink(id)?;
@@ -1775,8 +1811,8 @@ impl TerminalModel {
         let row0 = usize::from(row1.saturating_sub(1));
         let col0 = usize::from(col1.saturating_sub(1));
         (
-            row0.min((self.rows as usize).saturating_sub(1)),
-            col0.min((self.cols as usize).saturating_sub(1)),
+            row0.min((self.state.rows as usize).saturating_sub(1)),
+            col0.min((self.state.cols as usize).saturating_sub(1)),
         )
     }
 
@@ -1820,7 +1856,7 @@ impl TerminalModel {
         let m = self.effective_metrics();
         let pad = f64::from(self.pad_px());
         let lh = f64::from(m.line_height);
-        let bottom = pad + lh * f64::from(self.rows);
+        let bottom = pad + lh * f64::from(self.state.rows);
         let overshoot = if pos.y < pad {
             pad - pos.y
         } else if pos.y > bottom {
@@ -1871,7 +1907,7 @@ impl TerminalModel {
     /// scrolled-back view by cell (not `screen.text()`, whose char indices don't
     /// line up with cell columns once a wide character is present).
     fn word_at(&self, row: usize, col: usize) -> Option<Selection> {
-        let window: Vec<&Line> = self.screen.vt().view_at(self.scroll_offset).collect();
+        let window: Vec<&Line> = self.state.screen.vt().view_at(self.scroll_offset).collect();
         let cells = window.get(row)?.cells();
         // A word cell is one holding a word character, or the (zero-width) tail
         // of a wide character, which continues whatever head precedes it.
@@ -1897,7 +1933,7 @@ impl TerminalModel {
     /// The line at viewport `row`: column 0 through its last non-blank cell (the
     /// whole row when blank), as an inclusive selection.
     fn line_at(&self, row: usize) -> Option<Selection> {
-        let window: Vec<&Line> = self.screen.vt().view_at(self.scroll_offset).collect();
+        let window: Vec<&Line> = self.state.screen.vt().view_at(self.scroll_offset).collect();
         let cells = window.get(row)?.cells();
         let last = cells.iter().rposition(|c| !c.is_default()).unwrap_or(0);
         Some(Selection::new((row, 0), (row, last)))
@@ -1911,8 +1947,8 @@ impl TerminalModel {
         cell: (u16, u16),
         mods: Mods,
     ) -> Vec<Cmd> {
-        let proto = self.screen.vt().mouse_protocol();
-        let sgr = self.screen.vt().mouse_sgr();
+        let proto = self.state.screen.vt().mouse_protocol();
+        let sgr = self.state.screen.vt().mouse_sgr();
         match mouse::encode(proto, sgr, kind, button, held, cell.0, cell.1, mods) {
             Some(bytes) => self.send(bytes),
             None => Vec::new(),
@@ -2041,7 +2077,7 @@ impl TerminalModel {
                 // A finalized local selection becomes the primary selection, so a
                 // middle-click elsewhere pastes it (X11/Wayland convention).
                 if let Some(sel) = self.selection {
-                    let text = selection_text(&self.screen, sel);
+                    let text = selection_text(&self.state.screen, sel);
                     if !text.is_empty() {
                         cmds.push(Cmd::WritePrimary(text));
                     }
@@ -2387,7 +2423,7 @@ mod tests {
         // the session host would try to allocate. It is bounded to a grid a
         // terminal could actually have.
         feed(&mut m, b"\x1b[4;65535;65535t");
-        let (cols, rows) = (m.cols, m.rows);
+        let (cols, rows) = (m.state.cols, m.state.rows);
         assert!(
             cols as usize <= ghost_term::MAX_PROGRAM_COLS
                 && rows as usize <= ghost_term::MAX_PROGRAM_ROWS,
@@ -2726,8 +2762,8 @@ mod tests {
             bytes: b"\x1b[?40h\x1b[?3h".to_vec(),
             ended: false,
         });
-        assert_eq!(m.screen.dimensions(), (132, 24));
-        assert_eq!((m.cols, m.rows), (132, 24));
+        assert_eq!(m.state.screen.dimensions(), (132, 24));
+        assert_eq!((m.state.cols, m.state.rows), (132, 24));
         assert!(
             cmds.contains(&Cmd::ResizeWindow {
                 w_px: 1188,
@@ -2751,7 +2787,7 @@ mod tests {
             bytes: b"\x1b[?3l".to_vec(),
             ended: false,
         });
-        assert_eq!(m.screen.dimensions(), (80, 24));
+        assert_eq!(m.state.screen.dimensions(), (80, 24));
         assert!(cmds.contains(&Cmd::ResizeWindow {
             w_px: 720,
             h_px: 432,
@@ -2767,7 +2803,7 @@ mod tests {
             scale: 1.0,
         });
         feed(&mut m, b"\x1b[?40h\x1b[?3h");
-        assert_eq!(m.cols, 132);
+        assert_eq!(m.state.cols, 132);
         // The window manager granted nothing (tiled, fullscreen, clamped): whatever
         // size the window does report next wins, and the grid snaps to it.
         let cmds = m.update(UiEvent::Resize {
@@ -2775,8 +2811,8 @@ mod tests {
             h_px: 432,
             scale: 1.0,
         });
-        assert_eq!(m.screen.dimensions(), (80, 24));
-        assert_eq!((m.cols, m.rows), (80, 24));
+        assert_eq!(m.state.screen.dimensions(), (80, 24));
+        assert_eq!((m.state.cols, m.state.rows), (80, 24));
         assert!(cmds.contains(&Cmd::Resize {
             session: "alpha".to_string(),
             cols: 80,
@@ -2799,7 +2835,7 @@ mod tests {
             bytes: b"\x1b[?3h".to_vec(),
             ended: false,
         });
-        assert_eq!(m.screen.dimensions(), (80, 24));
+        assert_eq!(m.state.screen.dimensions(), (80, 24));
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::ResizeWindow { .. })));
     }
 
@@ -4233,7 +4269,8 @@ mod tests {
     /// truth a damage claim is checked against, in the same row space
     /// [`TermDamage::Rows`] is consumed in (see `rows_differ_outside`).
     fn visible_rows(m: &TerminalModel) -> Vec<String> {
-        m.screen
+        m.state
+            .screen
             .vt()
             .view_at(m.scroll_offset)
             .map(|l| l.text())
