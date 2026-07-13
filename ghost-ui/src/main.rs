@@ -937,6 +937,13 @@ fn esctest_host() {
 
     let mut session = attach_retry(&name, ECOLS, EROWS);
     let mut model = TerminalModel::new(name.clone(), ECOLS, EROWS, metrics());
+    // esctest is measuring the terminal, not the user's preferences: it drives the
+    // window ops, the title stack, the palette and the rest, and a conformance
+    // number that quietly fell because we decided some of it was unsafe for a
+    // stranger's tty would be a lie about the emulator. So the harness asks for
+    // everything, explicitly, whatever the defaults become (see `ghost_term::policy`).
+    model.set_terminal_policy(ghost_term::TerminalPolicy::allow_all());
+    model.set_action_policy(ghost_term::ActionPolicy::allow_all());
     // The harness "window" is focused, so focus-reporting queries answer
     // consistently (and a DEC ?1004 enable reports focused).
     exec_headless(&mut session, &model.update(UiEvent::Focus(true)));

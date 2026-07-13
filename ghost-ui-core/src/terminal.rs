@@ -1414,6 +1414,7 @@ impl TerminalModel {
             let ctx = ReplyCtx {
                 cursor: screen.cursor_report(),
                 size: screen.dimensions(),
+                policy: screen.vt().policy(),
                 display_size,
                 iconified: self.iconified,
                 size_px: self.size_px,
@@ -4857,6 +4858,7 @@ mod tests {
             cell_px: ghost_vt::query::NOMINAL_CELL_PX,
             title: "",
             icon_title: "",
+            policy: ghost_term::TerminalPolicy::default(),
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),

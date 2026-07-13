@@ -652,9 +652,11 @@ fn host_main(
                         let special = |t| screen.vt().special_color(t);
                         let (lm, rm) = screen.vt().left_right_margins();
                         let (tm, bm) = screen.vt().top_bottom_margins();
+                        let policy = screen.vt().policy();
                         let ctx = crate::query::ReplyCtx {
                             cursor: screen.cursor_report(),
                             size: screen.dimensions(),
+                            policy,
                             // Detached: no window to iconify, and no display to
                             // maximize onto — answer from the nominal one, so a
                             // program's arithmetic stays sane until a client attaches.

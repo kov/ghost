@@ -201,6 +201,15 @@ pub struct ReplyCtx<'a> {
     pub title: &'a str,
     /// The icon label (OSC 0/1), for `CSI 20 t`.
     pub icon_title: &'a str,
+    /// What the program on this tty is allowed to be told (see
+    /// [`ghost_term::policy`]). It lives on the context rather than at the two call
+    /// sites — the GUI's and the session host's — so that the answer a program gets
+    /// cannot depend on which of them happened to be listening.
+    ///
+    /// A denied query is never *silenced*, only shaped: an app blocked on a reply
+    /// that never comes hangs, which is exactly the stall this whole reply path
+    /// exists to prevent.
+    pub policy: ghost_term::TerminalPolicy,
     /// Current kitty-keyboard progressive-enhancement flags.
     pub kitty_flags: u8,
     /// The cursor style as a steady DECSCUSR digit (2 block, 4 underline,
@@ -389,8 +398,22 @@ impl Query {
                 let (w, h) = ctx.cell_px;
                 format!("\x1b[6;{h};{w}t").into_bytes()
             }
-            Query::WindowTitle => format!("\x1b]l{}\x1b\\", ctx.title).into_bytes(),
-            Query::IconLabel => format!("\x1b]L{}\x1b\\", ctx.icon_title).into_bytes(),
+            Query::WindowTitle => {
+                let title = if ctx.policy.report_title {
+                    ctx.title
+                } else {
+                    ""
+                };
+                format!("\x1b]l{title}\x1b\\").into_bytes()
+            }
+            Query::IconLabel => {
+                let icon = if ctx.policy.report_title {
+                    ctx.icon_title
+                } else {
+                    ""
+                };
+                format!("\x1b]L{icon}\x1b\\").into_bytes()
+            }
             Query::KittyKeyboardFlags => format!("\x1b[?{}u", ctx.kitty_flags).into_bytes(),
             Query::TerminalVersion => {
                 format!("\x1bP>|ghost {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
@@ -968,6 +991,7 @@ mod tests {
             cell_px: NOMINAL_CELL_PX,
             title: "",
             icon_title: "",
+            policy: ghost_term::TerminalPolicy::default(),
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),
@@ -1380,6 +1404,34 @@ mod tests {
         assert_eq!(Query::ReportMode(2004).reply(&modal), b"\x1b[?2004;2$y");
         assert_eq!(Query::ReportMode(60).reply(&modal), b"\x1b[?60;4$y");
         assert_eq!(Query::ReportMode(12345).reply(&modal), b"\x1b[?12345;0$y");
+    }
+
+    #[test]
+    fn a_denied_title_report_is_answered_empty_not_left_unanswered() {
+        // Reading the title back is the classic reflection trick: a program sets a
+        // title with a command in it, reads it back, and the answer arrives on the
+        // shell's stdin looking exactly like the user typed it. xterm turns this
+        // off by default. But a *denied* query must still be ANSWERED — an app that
+        // blocks on a reply hangs forever — so the shape is right and the title is
+        // simply nothing.
+        let told = ReplyCtx {
+            title: "rm -rf ~",
+            icon_title: "rm -rf ~",
+            ..ctx()
+        };
+        assert_eq!(Query::WindowTitle.reply(&told), b"\x1b]lrm -rf ~\x1b\\");
+
+        let denied = ReplyCtx {
+            title: "rm -rf ~",
+            icon_title: "rm -rf ~",
+            policy: ghost_term::TerminalPolicy {
+                report_title: false,
+                ..Default::default()
+            },
+            ..ctx()
+        };
+        assert_eq!(Query::WindowTitle.reply(&denied), b"\x1b]l\x1b\\");
+        assert_eq!(Query::IconLabel.reply(&denied), b"\x1b]L\x1b\\");
     }
 
     #[test]

@@ -99,6 +99,16 @@ pub struct TerminalPolicy {
     pub graphics: bool,
     /// Report progress to the desktop's taskbar (OSC 9;4).
     pub progress: bool,
+    /// Read the title *back* (XTWINOPS `CSI 20/21 t`).
+    ///
+    /// Separate from [`Self::title`] because the two hazards are opposite ends of
+    /// the same sequence: setting a title is cosmetic, but *reading* one is how a
+    /// program gets text it chose onto the shell's stdin — it sets a title with a
+    /// command in it and asks for it back, and the answer is indistinguishable from
+    /// typing. xterm disables the report by default and keeps the set. A denial is
+    /// still answered, just with an empty title: a query that goes unanswered hangs
+    /// the program that asked.
+    pub report_title: bool,
     /// Ask to be sent mouse events (`?1000`/`?1002`/`?1003`/`?1006` and friends).
     ///
     /// Not a security matter so much as an expectation one: a program that turns
@@ -132,6 +142,7 @@ impl TerminalPolicy {
             cursor_style: true,
             graphics: true,
             progress: true,
+            report_title: true,
             mouse_report: true,
         }
     }
@@ -145,6 +156,7 @@ impl TerminalPolicy {
             cursor_style: false,
             graphics: false,
             progress: false,
+            report_title: false,
             mouse_report: false,
         }
     }
