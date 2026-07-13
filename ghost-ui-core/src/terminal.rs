@@ -378,7 +378,7 @@ impl TerminalModel {
     pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
         let changed = theme != self.theme;
         self.theme = theme;
-        if changed && self.screen.vt().dec_mode_state(2031) == Some(true) {
+        if changed && self.screen.vt().dec_mode_state(2031) == ghost_term::ModeReport::Set {
             let colors = self.screen.effective_colors(self.theme);
             return self.send(ghost_vt::query::color_scheme_report(&colors));
         }
@@ -4235,8 +4235,8 @@ mod tests {
     // ---- moved pure-helper tests ----
 
     /// A `mode_state` for tests: nothing is recognized.
-    fn no_modes(_: u16) -> Option<bool> {
-        None
+    fn no_modes(_: u16) -> ghost_term::ModeReport {
+        ghost_term::ModeReport::Unrecognized
     }
 
     /// A `checksum` for tests: the query tests here don't exercise DECRQCRA.

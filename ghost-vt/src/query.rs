@@ -145,14 +145,12 @@ pub struct ReplyCtx<'a> {
     pub sgr_report: String,
     /// The DECSCL conformance level (1–5); ANSI-mode DECRQM is silent below 3.
     pub conformance_level: u8,
-    /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p` — `Some(true)`
-    /// set, `Some(false)` reset, `None` unrecognized (IRM/LNM only).
-    pub ansi_mode_state: &'a dyn Fn(u16) -> Option<bool>,
+    /// An ANSI (non-private) mode's DECRQM report for `CSI Ps $ p`.
+    pub ansi_mode_state: &'a dyn Fn(u16) -> ghost_term::ModeReport,
     /// Default fg/bg for the OSC color queries.
     pub colors: ThemeColors,
-    /// A DEC private mode's state for DECRQM: `Some(true)` set, `Some(false)`
-    /// reset, `None` unrecognized.
-    pub mode_state: &'a dyn Fn(u16) -> Option<bool>,
+    /// A DEC private mode's DECRQM report for `CSI ? Ps $ p`.
+    pub mode_state: &'a dyn Fn(u16) -> ghost_term::ModeReport,
     /// The DECRQCRA rectangle checksum over 0-based inclusive `(top, left,
     /// bottom, right)` screen coordinates — [`ghost_term::Vt::rect_checksum`],
     /// threaded in so the pure query layer can read cells without owning a grid.
@@ -163,6 +161,19 @@ pub struct ReplyCtx<'a> {
 /// (each 8-bit channel doubled into 16 bits).
 fn xterm_rgb([r, g, b]: [u8; 3]) -> String {
     format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+/// The DECRPM `Pm` value for a mode report: 0 unrecognized, 1 set, 2 reset,
+/// 3 permanently set, 4 permanently reset.
+fn decrpm_pm(report: ghost_term::ModeReport) -> u8 {
+    use ghost_term::ModeReport::*;
+    match report {
+        Set => 1,
+        Reset => 2,
+        PermanentlySet => 3,
+        PermanentlyReset => 4,
+        Unrecognized => 0,
+    }
 }
 
 /// The steady DECSCUSR digit for a cursor shape (blink is not tracked):
@@ -228,11 +239,7 @@ impl Query {
                 format!("\x1bP>|ghost {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
             }
             Query::ReportMode(mode) => {
-                let pm = match (ctx.mode_state)(*mode) {
-                    Some(true) => 1,
-                    Some(false) => 2,
-                    None => 0,
-                };
+                let pm = decrpm_pm((ctx.mode_state)(*mode));
                 format!("\x1b[?{mode};{pm}$y").into_bytes()
             }
             Query::ReportAnsiMode(mode) => {
@@ -241,11 +248,7 @@ impl Query {
                 if ctx.conformance_level < 3 {
                     return Vec::new();
                 }
-                let pm = match (ctx.ansi_mode_state)(*mode) {
-                    Some(true) => 1,
-                    Some(false) => 2,
-                    None => 0,
-                };
+                let pm = decrpm_pm((ctx.ansi_mode_state)(*mode));
                 format!("\x1b[{mode};{pm}$y").into_bytes()
             }
             Query::ForegroundColor => {
@@ -698,8 +701,8 @@ mod tests {
     }
 
     /// A `mode_state` for tests: nothing is recognized.
-    fn no_modes(_: u16) -> Option<bool> {
-        None
+    fn no_modes(_: u16) -> ghost_term::ModeReport {
+        ghost_term::ModeReport::Unrecognized
     }
 
     /// A `checksum` for tests: encodes the requested rect so assertions can see
@@ -927,11 +930,13 @@ mod tests {
 
     #[test]
     fn decrqm_reply_reports_mode_state() {
-        // DECRPM Pm: 1 = set, 2 = reset, 0 = unrecognized.
+        // DECRPM Pm: 1 = set, 2 = reset, 4 = permanently reset, 0 = unrecognized.
+        use ghost_term::ModeReport::*;
         let state = |m: u16| match m {
-            2026 => Some(true),
-            2004 => Some(false),
-            _ => None,
+            2026 => Set,
+            2004 => Reset,
+            60 => PermanentlyReset,
+            _ => Unrecognized,
         };
         let modal = ReplyCtx {
             mode_state: &state,
@@ -939,6 +944,7 @@ mod tests {
         };
         assert_eq!(Query::ReportMode(2026).reply(&modal), b"\x1b[?2026;1$y");
         assert_eq!(Query::ReportMode(2004).reply(&modal), b"\x1b[?2004;2$y");
+        assert_eq!(Query::ReportMode(60).reply(&modal), b"\x1b[?60;4$y");
         assert_eq!(Query::ReportMode(12345).reply(&modal), b"\x1b[?12345;0$y");
     }
 
@@ -947,9 +953,10 @@ mod tests {
         // ANSI-mode DECRQM `CSI Ps $ p` (no `?`) is a VT300+ feature: answered
         // only at conformance level >= 3, silent below.
         assert_eq!(scan_all(b"\x1b[4$p"), [Query::ReportAnsiMode(4)]);
+        use ghost_term::ModeReport::*;
         let ansi = |m: u16| match m {
-            4 => Some(true),
-            _ => None,
+            4 => Set,
+            _ => Unrecognized,
         };
         let l4 = ReplyCtx {
             conformance_level: 4,

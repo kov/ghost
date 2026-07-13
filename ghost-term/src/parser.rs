@@ -160,8 +160,12 @@ pub enum Function {
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(u16)]
 pub enum AnsiMode {
-    Insert = 4,   // IRM
-    NewLine = 20, // LNM
+    // Recognized-but-inert legacy modes: tracked only so DECRQM round-trips the
+    // set/reset bit; ghost does not implement their effect.
+    KeyboardAction = 2, // KAM
+    Insert = 4,         // IRM
+    SendReceive = 12,   // SRM
+    NewLine = 20,       // LNM
 }
 
 #[derive(Debug, PartialEq)]
@@ -183,6 +187,16 @@ pub enum DecMode {
     ReverseWrap = 45,           // reverse-wraparound (xterm ?45; needs DECAWM)
     LeftRightMargin = 69,       // DECLRMM — enables DECSLRM left/right margins
     NoClearOnColumnChange = 95, // DECNCSM — keep screen on DECCOLM (VT500)
+    // Recognized-but-inert legacy modes: ghost does not implement their effect,
+    // but tracks the set/reset bit so DECRQM round-trips it (`Pm` 1/2 rather than
+    // 0/unrecognized). Treated as non-display, so a dump re-emits them.
+    SmoothScroll = 4,                // DECSCLM
+    ReverseVideo = 5,                // DECSCNM
+    PrintFormFeed = 18,              // DECPFF
+    PrintExtent = 19,                // DECPEX
+    NationalReplacementCharset = 42, // DECNRCM
+    NumericKeypad = 66,              // DECNKM
+    BackarrowKey = 67,               // DECBKM
     // Non-display modes: tracked but not rendered, so a state dump can restore
     // them on reattach. They affect what the terminal *sends*, not the grid.
     MouseReportX11 = 1000,            // button press/release
@@ -205,7 +219,14 @@ impl DecMode {
         use DecMode::*;
         matches!(
             self,
-            MouseReportX11
+            SmoothScroll
+                | ReverseVideo
+                | PrintFormFeed
+                | PrintExtent
+                | NationalReplacementCharset
+                | NumericKeypad
+                | BackarrowKey
+                | MouseReportX11
                 | MouseReportButton
                 | MouseReportAny
                 | FocusReport
@@ -1366,9 +1387,7 @@ pub(crate) fn sgr_op_param(op: &SgrOp) -> String {
 }
 
 fn dump_function(seq: &mut String, fun: &Function) {
-    use AnsiMode::*;
     use CtcOp::*;
-    use DecMode::*;
     use EdScope::*;
     use ElScope::*;
     use Function::*;
@@ -1405,32 +1424,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Decrc => push_esc(seq, None, '8'),
 
         Decrst(modes) => {
+            // Every `DecMode` discriminant is its DEC mode number (`#[repr(u16)]`).
             let params = modes
                 .as_slice()
                 .iter()
-                .map(|mode| match mode {
-                    CursorKeys => 1,
-                    Columns132 => 3,
-                    Origin => 6,
-                    AutoWrap => 7,
-                    TextCursorEnable => 25,
-                    Allow80To132 => 40,
-                    ReverseWrap => 45,
-                    LeftRightMargin => 69,
-                    NoClearOnColumnChange => 95,
-                    MouseReportX11 => 1000,
-                    MouseReportButton => 1002,
-                    MouseReportAny => 1003,
-                    FocusReport => 1004,
-                    MouseSgr => 1006,
-                    AltScreenBuffer => 1047,
-                    SaveCursor => 1048,
-                    SaveCursorAltScreenBuffer => 1049,
-                    BracketedPaste => 2004,
-                    SynchronizedOutput => 2026,
-                    ColorSchemeReport => 2031,
-                })
-                .map(|param| param.to_string())
+                .map(|mode| (*mode as u16).to_string())
                 .collect::<Vec<_>>();
 
             push_csi(seq, Some('?'), &params, 'l');
@@ -1442,29 +1440,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
             let params = modes
                 .as_slice()
                 .iter()
-                .map(|mode| match mode {
-                    CursorKeys => 1,
-                    Columns132 => 3,
-                    Origin => 6,
-                    AutoWrap => 7,
-                    TextCursorEnable => 25,
-                    Allow80To132 => 40,
-                    ReverseWrap => 45,
-                    LeftRightMargin => 69,
-                    NoClearOnColumnChange => 95,
-                    MouseReportX11 => 1000,
-                    MouseReportButton => 1002,
-                    MouseReportAny => 1003,
-                    FocusReport => 1004,
-                    MouseSgr => 1006,
-                    AltScreenBuffer => 1047,
-                    SaveCursor => 1048,
-                    SaveCursorAltScreenBuffer => 1049,
-                    BracketedPaste => 2004,
-                    SynchronizedOutput => 2026,
-                    ColorSchemeReport => 2031,
-                })
-                .map(|param| param.to_string())
+                .map(|mode| (*mode as u16).to_string())
                 .collect::<Vec<_>>();
 
             push_csi(seq, Some('?'), &params, 'h');
@@ -1556,14 +1532,11 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Ris => push_esc(seq, None, 'c'),
 
         Rm(modes) => {
+            // Every `AnsiMode` discriminant is its ANSI mode number (`#[repr(u16)]`).
             let params = modes
                 .as_slice()
                 .iter()
-                .map(|mode| match mode {
-                    Insert => 4,
-                    NewLine => 20,
-                })
-                .map(|param| param.to_string())
+                .map(|mode| (*mode as u16).to_string())
                 .collect::<Vec<_>>();
 
             push_csi(seq, None, &params, 'l');
@@ -1665,11 +1638,7 @@ fn dump_function(seq: &mut String, fun: &Function) {
             let params = modes
                 .as_slice()
                 .iter()
-                .map(|mode| match mode {
-                    Insert => 4,
-                    NewLine => 20,
-                })
-                .map(|param| param.to_string())
+                .map(|mode| (*mode as u16).to_string())
                 .collect::<Vec<_>>();
 
             push_csi(seq, None, &params, 'h');
@@ -1747,7 +1716,9 @@ fn ansi_mode(param: &Param) -> Option<AnsiMode> {
     use AnsiMode::*;
 
     match param.as_u16() {
+        2 => Some(KeyboardAction),
         4 => Some(Insert),
+        12 => Some(SendReceive),
         20 => Some(NewLine),
         _ => None,
     }
@@ -2009,11 +1980,18 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
     match param {
         1 => Some(CursorKeys),
         3 => Some(Columns132),
+        4 => Some(SmoothScroll),
+        5 => Some(ReverseVideo),
         6 => Some(Origin),
         7 => Some(AutoWrap),
+        18 => Some(PrintFormFeed),
+        19 => Some(PrintExtent),
         25 => Some(TextCursorEnable),
         40 => Some(Allow80To132),
+        42 => Some(NationalReplacementCharset),
         45 => Some(ReverseWrap),
+        66 => Some(NumericKeypad),
+        67 => Some(BackarrowKey),
         69 => Some(LeftRightMargin),
         95 => Some(NoClearOnColumnChange),
         47 => Some(AltScreenBuffer), // legacy variant of 1047

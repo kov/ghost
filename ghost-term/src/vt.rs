@@ -249,7 +249,7 @@ impl Vt {
 
     /// An ANSI mode's state for DECRQM `CSI Ps $ p`. See
     /// [`Terminal::ansi_mode_state`].
-    pub fn ansi_mode_state(&self, mode: u16) -> Option<bool> {
+    pub fn ansi_mode_state(&self, mode: u16) -> crate::ModeReport {
         self.terminal.ansi_mode_state(mode)
     }
 
@@ -337,9 +337,9 @@ impl Vt {
         self.terminal.mode_enabled(DecMode::SynchronizedOutput)
     }
 
-    /// The DECRPM state of a DEC private mode by raw number: `Some(true)` set,
-    /// `Some(false)` reset, `None` not a mode with queryable state here.
-    pub fn dec_mode_state(&self, mode: u16) -> Option<bool> {
+    /// The DECRPM report for a DEC private mode by raw number. See
+    /// [`Terminal::mode_state`].
+    pub fn dec_mode_state(&self, mode: u16) -> crate::ModeReport {
         self.terminal.mode_state(mode)
     }
 
@@ -821,16 +821,13 @@ mod tests {
     fn decrqm_reports_left_right_margin_mode_state() {
         // DECRQM (`CSI ? 69 $ p`) must reflect DECLRMM's real state, which lives
         // in its own field rather than the tracked-modes set.
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 24);
-        assert_eq!(vt.dec_mode_state(69), Some(false), "DECLRMM starts reset");
+        assert_eq!(vt.dec_mode_state(69), Reset, "DECLRMM starts reset");
         vt.feed_str("\x1b[?69h");
-        assert_eq!(vt.dec_mode_state(69), Some(true), "DECLRMM reported set");
+        assert_eq!(vt.dec_mode_state(69), Set, "DECLRMM reported set");
         vt.feed_str("\x1b[?69l");
-        assert_eq!(
-            vt.dec_mode_state(69),
-            Some(false),
-            "DECLRMM reported reset again"
-        );
+        assert_eq!(vt.dec_mode_state(69), Reset, "DECLRMM reported reset again");
     }
 
     #[test]
@@ -848,17 +845,86 @@ mod tests {
     }
 
     #[test]
+    fn decrqm_tracks_inert_dec_modes() {
+        // Modes ghost does not act on (DECBKM, DECNKM, DECSCLM, …) still round-trip
+        // their DECRQM set/reset bit rather than reporting 0/unrecognized.
+        use crate::ModeReport::{Reset, Set};
+        let mut vt = Vt::new(80, 24);
+        for mode in [4, 5, 18, 19, 42, 66, 67] {
+            assert_eq!(vt.dec_mode_state(mode), Reset, "?{mode} starts reset");
+            vt.feed_str(&format!("\x1b[?{mode}h"));
+            assert_eq!(vt.dec_mode_state(mode), Set, "?{mode} reported set");
+            vt.feed_str(&format!("\x1b[?{mode}l"));
+            assert_eq!(vt.dec_mode_state(mode), Reset, "?{mode} reported reset");
+        }
+    }
+
+    #[test]
+    fn decrqm_tracks_inert_ansi_modes() {
+        // KAM (2) and SRM (12) are inert but round-trip their set/reset bit.
+        use crate::ModeReport::{Reset, Set};
+        let mut vt = Vt::new(80, 24);
+        for mode in [2, 12] {
+            assert_eq!(vt.ansi_mode_state(mode), Reset, "mode {mode} starts reset");
+            vt.feed_str(&format!("\x1b[{mode}h"));
+            assert_eq!(vt.ansi_mode_state(mode), Set, "mode {mode} reported set");
+            vt.feed_str(&format!("\x1b[{mode}l"));
+            assert_eq!(
+                vt.ansi_mode_state(mode),
+                Reset,
+                "mode {mode} reported reset"
+            );
+        }
+    }
+
+    #[test]
+    fn decrqm_reports_permanently_reset_legacy_modes() {
+        // Legacy modes recognized by name but never implemented report `4`
+        // (permanently reset): DECHCCM (?60), and the ANSI graphic/format modes.
+        use crate::ModeReport::{PermanentlyReset, Unrecognized};
+        let vt = Vt::new(80, 24);
+        assert_eq!(vt.dec_mode_state(60), PermanentlyReset, "DECHCCM");
+        for mode in [1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19] {
+            assert_eq!(
+                vt.ansi_mode_state(mode),
+                PermanentlyReset,
+                "ANSI mode {mode} is permanently reset"
+            );
+        }
+        // A truly unknown mode is still unrecognized.
+        assert_eq!(vt.dec_mode_state(9999), Unrecognized);
+        assert_eq!(vt.ansi_mode_state(99), Unrecognized);
+    }
+
+    #[test]
+    fn decrqm_deccolm_bit_tracks_the_switch_not_the_column_count() {
+        // DECCOLM's DECRQM bit follows the mode switch even if the grid is later
+        // resized back (an attached GUI reconciles to its window size). Gated by
+        // Allow80To132, matching the physical switch.
+        use crate::ModeReport::{Reset, Set};
+        let mut vt = Vt::new(80, 24);
+        assert_eq!(vt.dec_mode_state(3), Reset, "DECCOLM starts reset");
+        // Without ?40 the switch is inert, so the bit stays reset.
+        vt.feed_str("\x1b[?3h");
+        assert_eq!(vt.dec_mode_state(3), Reset, "inert without Allow80To132");
+        // With ?40 on, DECSET 3 sets the bit; a later resize back to 80 leaves it.
+        vt.feed_str("\x1b[?40h\x1b[?3h");
+        assert_eq!(vt.dec_mode_state(3), Set, "set after the real switch");
+        vt.resize(80, 24);
+        assert_eq!(vt.dec_mode_state(3), Set, "bit survives a grid resize");
+        vt.feed_str("\x1b[?3l");
+        assert_eq!(vt.dec_mode_state(3), Reset, "reset by DECRESET 3");
+    }
+
+    #[test]
     fn decscl_gates_declrmm_below_conformance_level_4() {
         // esctest test_DSCSCL_Level3: at level 3 DECLRMM (?69) is inert, so DECSLRM
         // sets no margins and text past the intended right margin does not wrap.
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 25);
         vt.feed_str("\x1b[63\"p"); // DECSCL level 3
         vt.feed_str("\x1b[?69h"); // DECLRMM — ignored at level 3
-        assert_eq!(
-            vt.dec_mode_state(69),
-            Some(false),
-            "?69 stays off at level 3"
-        );
+        assert_eq!(vt.dec_mode_state(69), Reset, "?69 stays off at level 3");
         vt.feed_str("\x1b[5;6s"); // DECSLRM — treated as SCOSC, no margins
         vt.feed_str("\x1b[1;5Habc"); // write from col 4
         assert_eq!(
@@ -870,34 +936,32 @@ mod tests {
         // At level 4 the same sequence enables the margins and stops the wrap.
         vt.feed_str("\x1b[64\"p"); // DECSCL level 4 (hard reset)
         vt.feed_str("\x1b[?69h");
-        assert_eq!(vt.dec_mode_state(69), Some(true), "?69 works at level 4");
+        assert_eq!(vt.dec_mode_state(69), Set, "?69 works at level 4");
     }
 
     #[test]
     fn decscl_gates_decncsm_below_conformance_level_5() {
         // DECNCSM (?95) is a VT500 feature: settable only at level 5.
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 25);
         vt.feed_str("\x1b[64\"p\x1b[?95h"); // level 4 — ?95 ignored
-        assert_eq!(
-            vt.dec_mode_state(95),
-            Some(false),
-            "?95 stays off at level 4"
-        );
+        assert_eq!(vt.dec_mode_state(95), Reset, "?95 stays off at level 4");
         vt.feed_str("\x1b[65\"p\x1b[?95h"); // level 5 — ?95 settable
-        assert_eq!(vt.dec_mode_state(95), Some(true), "?95 works at level 5");
+        assert_eq!(vt.dec_mode_state(95), Set, "?95 works at level 5");
     }
 
     #[test]
     fn decscl_hard_resets_and_reports_ansi_mode_by_level() {
         // DECSCL performs a hard reset (insert mode cleared) and drives the
         // conformance level the query layer reads for ANSI-mode DECRQM.
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 25);
         vt.feed_str("\x1b[4h"); // IRM (insert mode) on
-        assert_eq!(vt.ansi_mode_state(4), Some(true));
+        assert_eq!(vt.ansi_mode_state(4), Set);
         vt.feed_str("\x1b[62\"p"); // DECSCL level 2 — hard reset
         assert_eq!(
             vt.ansi_mode_state(4),
-            Some(false),
+            Reset,
             "hard reset cleared insert mode"
         );
         assert_eq!(vt.conformance_level(), 2);
@@ -915,7 +979,11 @@ mod tests {
         assert_eq!(vt.size().0, 132, "resized to 132 columns");
         assert_eq!((vt.cursor().col, vt.cursor().row), (0, 0), "cursor homed");
         assert_eq!(row_cells(&vt, 4, 8).trim(), "", "screen cleared");
-        assert_eq!(vt.dec_mode_state(69), Some(false), "DECLRMM reset");
+        assert_eq!(
+            vt.dec_mode_state(69),
+            crate::ModeReport::Reset,
+            "DECLRMM reset"
+        );
         // The top/bottom region must reset too (it survived a col-only resize),
         // so line feeds walk down the full screen rather than scrolling a stale
         // 2-row DECSTBM box.
@@ -1170,12 +1238,13 @@ mod tests {
 
     #[test]
     fn decrqm_reports_reverse_wrap_mode_state() {
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 25);
-        assert_eq!(vt.dec_mode_state(45), Some(false), "?45 starts reset");
+        assert_eq!(vt.dec_mode_state(45), Reset, "?45 starts reset");
         vt.feed_str("\x1b[?45h");
-        assert_eq!(vt.dec_mode_state(45), Some(true), "?45 reported set");
+        assert_eq!(vt.dec_mode_state(45), Set, "?45 reported set");
         vt.feed_str("\x1b[?45l");
-        assert_eq!(vt.dec_mode_state(45), Some(false), "?45 reported reset");
+        assert_eq!(vt.dec_mode_state(45), Reset, "?45 reported reset");
     }
 
     #[test]
@@ -1865,16 +1934,17 @@ mod tests {
 
     #[test]
     fn tracks_color_scheme_report_mode_2031() {
+        use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(20, 5);
-        assert_eq!(vt.dec_mode_state(2031), Some(false));
+        assert_eq!(vt.dec_mode_state(2031), Reset);
         vt.feed_str("\x1b[?2031h");
-        assert_eq!(vt.dec_mode_state(2031), Some(true));
+        assert_eq!(vt.dec_mode_state(2031), Set);
         assert!(
             vt.dump().contains("\x1b[?2031h"),
             "the subscription must survive a resync"
         );
         vt.feed_str("\x1b[?2031l");
-        assert_eq!(vt.dec_mode_state(2031), Some(false));
+        assert_eq!(vt.dec_mode_state(2031), Reset);
     }
 
     #[test]

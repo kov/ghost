@@ -43,6 +43,10 @@ pub struct Terminal {
     in_placeholder_run: bool,
     tabs: Tabs,
     insert_mode: bool,
+    /// KAM (`CSI 2 h`) and SRM (`CSI 12 h`): recognized-but-inert legacy ANSI
+    /// modes, tracked only so DECRQM round-trips their set/reset bit.
+    keyboard_action_mode: bool,
+    send_receive_mode: bool,
     origin_mode: bool,
     auto_wrap_mode: bool,
     /// Reverse-wraparound (xterm `?45`): a backspace/CUB at the left edge wraps up
@@ -94,6 +98,12 @@ pub struct Terminal {
     /// and 132 columns. With it off, DECCOLM is inert — matching xterm's
     /// `c132` resource gate.
     allow_80_to_132: bool,
+    /// DECCOLM's mode bit, tracked separately from the physical column count: an
+    /// attached GUI reconciles the grid back to its window size after a DECCOLM
+    /// resize, so `cols == 132` cannot answer DECRQM `?3` on its own. Set only
+    /// when DECCOLM actually switches (i.e. Allow80To132 is on). Query-only: not
+    /// part of the dumped/asserted state, which the column count already carries.
+    column_mode_132: bool,
     /// Deferred autowrap: set after printing into the right-edge column so the
     /// cursor stays *on* that column (not past it) until the next print, which
     /// wraps first. Cleared by any cursor movement. This makes the wrap column
@@ -153,6 +163,23 @@ const MAX_PROMPT_MARKS: usize = 1024;
 pub enum ClipboardSelection {
     Clipboard,
     Primary,
+}
+
+/// How a mode reports itself to DECRQM (`CSI Ps $ p` / `CSI ? Ps $ p`), matching
+/// the DECRPM `Pm` value the terminal replies with.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ModeReport {
+    /// `Pm = 1`: recognized and currently set.
+    Set,
+    /// `Pm = 2`: recognized and currently reset.
+    Reset,
+    /// `Pm = 3`: recognized and permanently set (cannot be reset).
+    PermanentlySet,
+    /// `Pm = 4`: recognized and permanently reset — a legacy mode the terminal
+    /// knows by name but never implements (GATM, HEM, DECHCCM, …).
+    PermanentlyReset,
+    /// `Pm = 0`: not a mode this terminal recognizes.
+    Unrecognized,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -223,6 +250,8 @@ impl Terminal {
             active_charset: 0,
             in_placeholder_run: false,
             insert_mode: false,
+            keyboard_action_mode: false,
+            send_receive_mode: false,
             origin_mode: false,
             auto_wrap_mode: true,
             reverse_wrap_mode: false,
@@ -242,6 +271,7 @@ impl Terminal {
             conformance_level: 5,
             no_clear_on_column_change: false,
             allow_80_to_132: false,
+            column_mode_132: false,
             pending_wrap: false,
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
@@ -836,14 +866,25 @@ impl Terminal {
         self.conformance_level
     }
 
-    /// An ANSI (non-private) mode's state for DECRQM `CSI Ps $ p`: `Some(true)`
-    /// set, `Some(false)` reset, `None` unrecognized. Only IRM (4) and LNM (20)
-    /// are tracked.
-    pub fn ansi_mode_state(&self, mode: u16) -> Option<bool> {
-        match mode {
-            4 => Some(self.insert_mode),
-            20 => Some(self.new_line_mode),
-            _ => None,
+    /// How an ANSI (non-private) mode reports to DECRQM `CSI Ps $ p`. IRM (4) and
+    /// LNM (20) are the modes ghost acts on; KAM (2) and SRM (12) are tracked but
+    /// inert; the legacy graphic/format modes are permanently reset.
+    pub fn ansi_mode_state(&self, mode: u16) -> ModeReport {
+        use ModeReport::*;
+        let set = match mode {
+            2 => self.keyboard_action_mode, // KAM
+            4 => self.insert_mode,          // IRM
+            12 => self.send_receive_mode,   // SRM
+            20 => self.new_line_mode,       // LNM
+            // GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM, TSM, EBM:
+            // legacy modes a modern terminal recognizes but permanently resets.
+            1 | 5 | 7 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 | 19 => return PermanentlyReset,
+            _ => return Unrecognized,
+        };
+        if set {
+            Set
+        } else {
+            Reset
         }
     }
 
@@ -1303,12 +1344,15 @@ impl Terminal {
         self.in_placeholder_run = false;
         self.prev_op_was_line_feed = false;
         self.insert_mode = false;
+        self.keyboard_action_mode = false;
+        self.send_receive_mode = false;
         self.origin_mode = false;
         self.auto_wrap_mode = true;
         self.reverse_wrap_mode = false;
         self.conformance_level = 5;
         self.no_clear_on_column_change = false;
         self.allow_80_to_132 = false;
+        self.column_mode_132 = false;
         self.new_line_mode = false;
         self.cursor_keys_mode = CursorKeysMode::Normal;
         self.modify_other_keys = 0;
@@ -1405,13 +1449,22 @@ impl Terminal {
         self.tracked_modes.contains(&mode)
     }
 
-    /// The set/reset state of a DEC private mode by its raw number, for DECRPM
-    /// (`CSI ? Ps $ p` reports): `Some(true)` = set, `Some(false)` = reset,
-    /// `None` = not a mode this terminal recognizes as queryable state.
-    pub(crate) fn mode_state(&self, param: u16) -> Option<bool> {
+    /// How a DEC private mode reports to DECRQM (`CSI ? Ps $ p`), by raw number.
+    pub(crate) fn mode_state(&self, param: u16) -> ModeReport {
         use DecMode::*;
-        let mode = crate::parser::dec_mode_from(param)?;
-        Some(match mode {
+        use ModeReport::*;
+
+        // DECHCCM (horizontal cursor coupling): recognized by name, but ghost has
+        // no horizontal scrolling, so it is permanently reset. Not in the DecMode
+        // enum, so it must be checked before `dec_mode_from`.
+        if param == 60 {
+            return PermanentlyReset;
+        }
+
+        let Some(mode) = crate::parser::dec_mode_from(param) else {
+            return Unrecognized;
+        };
+        let set = match mode {
             CursorKeys => self.cursor_keys_mode == CursorKeysMode::Application,
             Origin => self.origin_mode,
             AutoWrap => self.auto_wrap_mode,
@@ -1424,12 +1477,17 @@ impl Terminal {
             LeftRightMargin => self.left_right_margin_mode,
             NoClearOnColumnChange => self.no_clear_on_column_change,
             Allow80To132 => self.allow_80_to_132,
-            // DECCOLM state is reflected in the column count.
-            Columns132 => self.cols == 132,
+            // DECCOLM's mode bit, tracked apart from the physical column count.
+            Columns132 => self.column_mode_132,
             // 1048 is a save/restore action, not a queryable state.
-            SaveCursor => return None,
+            SaveCursor => return Unrecognized,
             m => self.tracked_modes.contains(&m),
-        })
+        };
+        if set {
+            Set
+        } else {
+            Reset
+        }
     }
 
     pub fn title(&self) -> &str {
@@ -1510,6 +1568,8 @@ impl Terminal {
         assert_eq!(self.active_charset, other.active_charset);
         assert_eq!(self.tabs, other.tabs);
         assert_eq!(self.insert_mode, other.insert_mode);
+        assert_eq!(self.keyboard_action_mode, other.keyboard_action_mode);
+        assert_eq!(self.send_receive_mode, other.send_receive_mode);
         assert_eq!(self.origin_mode, other.origin_mode);
         assert_eq!(self.auto_wrap_mode, other.auto_wrap_mode);
         assert_eq!(self.reverse_wrap_mode, other.reverse_wrap_mode);
@@ -2105,6 +2165,9 @@ impl Terminal {
                 NewLine => {
                     self.new_line_mode = true;
                 }
+
+                KeyboardAction => self.keyboard_action_mode = true,
+                SendReceive => self.send_receive_mode = true,
             }
         }
     }
@@ -2121,6 +2184,9 @@ impl Terminal {
                 NewLine => {
                     self.new_line_mode = false;
                 }
+
+                KeyboardAction => self.keyboard_action_mode = false,
+                SendReceive => self.send_receive_mode = false,
             }
         }
     }
@@ -2228,6 +2294,9 @@ impl Terminal {
         if !self.allow_80_to_132 {
             return;
         }
+        // Track the mode bit for DECRQM, independent of the physical column count
+        // (an attached GUI may snap the grid back to its window size).
+        self.column_mode_132 = want_132;
         let new_cols = if want_132 { 132 } else { 80 };
         // resize() reflows and, on a column change, resets the left/right margins;
         // but DECCOLM also clears the top/bottom region, which resize() only
@@ -2740,6 +2809,15 @@ impl Terminal {
         if self.insert_mode {
             // enable insert mode
             funs.push(Function::Sm(AnsiModes::one(AnsiMode::Insert)));
+        }
+
+        // 11b. setup the inert legacy ANSI modes (KAM/SRM), off by default
+
+        if self.keyboard_action_mode {
+            funs.push(Function::Sm(AnsiModes::one(AnsiMode::KeyboardAction)));
+        }
+        if self.send_receive_mode {
+            funs.push(Function::Sm(AnsiModes::one(AnsiMode::SendReceive)));
         }
 
         // 12. setup auto-wrap mode

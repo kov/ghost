@@ -25,5 +25,5 @@ pub use graphics::{encode_transmit, Image, Placement};
 pub use line::Line;
 pub use parser::Progress;
 pub use pen::Pen;
-pub use terminal::{ClipboardSelection, CursorShape};
+pub use terminal::{ClipboardSelection, CursorShape, ModeReport};
 pub use vt::{MouseProtocol, Vt};
