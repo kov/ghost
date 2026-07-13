@@ -695,6 +695,20 @@ impl DecModes {
         }
     }
 
+    /// Drop the modes a predicate rejects, keeping the rest.
+    ///
+    /// One `CSI ? … h` can carry several modes at once, and a policy denies them
+    /// one at a time — `CSI ?1000;25l` turns off mouse reporting *and* hides the
+    /// cursor, and denying the first must not take the second with it.
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&DecMode) -> bool) {
+        let kept: Vec<DecMode> = self.as_slice().iter().copied().filter(keep).collect();
+        *self = Self::from(kept);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
     pub(crate) fn push(&mut self, m: DecMode) {
         match &mut self.0 {
             DecModesStorage::Inline { modes, len } => {

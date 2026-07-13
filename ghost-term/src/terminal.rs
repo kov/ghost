@@ -14,6 +14,7 @@ use crate::parser::{
     Progress, SgrOp, SgrOps, SpecialColor, TbcScope, TitleTarget, XtwinopsOp, SPECIAL_COLOR_BASE,
 };
 use crate::pen::{Intensity, Pen, Protection};
+use crate::policy::TerminalPolicy;
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -114,10 +115,11 @@ pub struct Terminal {
     saved_ctx: SavedCtx,
     alternate_saved_ctx: SavedCtx,
     dirty_lines: DirtyLines,
-    /// Whether the window ops (XTWINOPS, `CSI … t`) are honoured at all — xterm's
-    /// `allowWindowOps`. On: a program can resize the grid, and ask the frontend
-    /// to iconify, maximize or go full-screen.
-    xtwinops: bool,
+    /// What this program is allowed to change about the terminal (see
+    /// [`crate::policy`]). Applied in [`Terminal::execute`], before anything is
+    /// honoured. The GUI and the session host run separate emulators over the same
+    /// bytes and must be given the *same* policy — see the module docs.
+    policy: TerminalPolicy,
     /// The window ops the emulator can't perform itself, queued for the frontend
     /// to (see [`Terminal::take_window_ops`]). Transient: what a window is doing
     /// now is the window's state, not the screen's, so it is not dumped.
@@ -313,7 +315,7 @@ impl Terminal {
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
             dirty_lines,
-            xtwinops: true,
+            policy: TerminalPolicy::default(),
             window_ops: Vec::new(),
             tracked_modes: BTreeSet::new(),
             title: String::new(),
@@ -480,7 +482,7 @@ impl Terminal {
         self.active_buffer_type
     }
 
-    pub fn execute(&mut self, fun: Function) {
+    pub fn execute(&mut self, mut fun: Function) {
         use Function::*;
 
         // A Unicode-placeholder run only spans the characters printed immediately
@@ -497,6 +499,14 @@ impl Terminal {
         // (IND folds into `Lf`). Set after the handler runs — the handler for this
         // op still sees the *previous* op's value.
         let is_line_feed = matches!(fun, Lf | Nel);
+
+        // What the policy won't have (see [`crate::policy`]). Denied ops fall
+        // through to the epilogue below rather than returning: the bookkeeping
+        // above and below is about the *stream*, not about what we chose to honour.
+        if !self.policy_allows(&mut fun) {
+            self.prev_op_was_line_feed = is_line_feed;
+            return;
+        }
 
         match fun {
             Bell => {
@@ -942,6 +952,68 @@ impl Terminal {
         }
 
         self.prev_op_was_line_feed = is_line_feed;
+    }
+
+    /// Replace the policy (see [`crate::policy`]). Meant to be set when the session
+    /// is created: the GUI's emulator and the session host's must agree, or state
+    /// one of them allowed would vanish from the other's resync dump.
+    pub fn set_policy(&mut self, policy: TerminalPolicy) {
+        self.policy = policy;
+    }
+
+    pub fn policy(&self) -> TerminalPolicy {
+        self.policy
+    }
+
+    /// Does the policy let this op through — and if only partly, trim it to the
+    /// part it does allow?
+    ///
+    /// `&mut` rather than a plain predicate because a `CSI ? … h` carries a *list*
+    /// of modes: denying mouse reporting in `CSI ?1000;25l` has to take out the
+    /// mouse mode and leave the cursor being hidden alone. Returning false drops
+    /// the op entirely.
+    fn policy_allows(&self, fun: &mut Function) -> bool {
+        let p = &self.policy;
+        match fun {
+            Function::SetTitle(..) => p.title,
+            // The title stack is the title. The rest of the window ops split: the
+            // ones that resize are the emulator's to refuse, and the ones that
+            // iconify/maximize/full-screen only *queue* here — the frontend decides
+            // those, because only it knows whether this session is even on screen
+            // (see `ActionPolicy`).
+            Function::Xtwinops(XtwinopsOp::PushTitle(_) | XtwinopsOp::PopTitle(_)) => p.title,
+            Function::Xtwinops(
+                XtwinopsOp::Resize(..) | XtwinopsOp::ResizePixels(..) | XtwinopsOp::SetLines(_),
+            ) => p.program_resize,
+            Function::SetPalette(_) | Function::SetDynamicColor(_) if !p.colors => {
+                // Sets are refused; *resets* never are. A program giving the colors
+                // back must always be taken up on it, or a denied session could be
+                // left unreadable by a half-applied theme. An OSC 10/11/12 carries
+                // both forms, so keep the resets and drop the op if nothing's left.
+                if let Function::SetDynamicColor(entries) = fun {
+                    entries.retain(|(_, color)| color.is_none());
+                    return !entries.is_empty();
+                }
+                false
+            }
+            Function::SetCursorStyle(_) => p.cursor_style,
+            Function::KittyGraphics(_) => p.graphics,
+            Function::SetProgress(_) => p.progress,
+            Function::Decset(modes) | Function::Decrst(modes) => {
+                modes.retain(|m| match m {
+                    DecMode::MouseReportX11
+                    | DecMode::MouseReportButton
+                    | DecMode::MouseReportAny
+                    | DecMode::MouseSgr => p.mouse_report,
+                    // `?3` is the switch and `?40` arms it: denying the resize has to
+                    // strip both, or a program just re-arms DECCOLM itself.
+                    DecMode::Columns132 | DecMode::Allow80To132 => p.program_resize,
+                    _ => true,
+                });
+                !modes.is_empty()
+            }
+            _ => true,
+        }
     }
 
     pub fn cursor(&self) -> Cursor {
@@ -2721,9 +2793,6 @@ impl Terminal {
     /// re-grids us, but to a size that depends on the display, which the emulator
     /// has no business knowing.
     fn xtwinops(&mut self, op: XtwinopsOp) {
-        if !self.xtwinops {
-            return;
-        }
         match op {
             // A grid given outright is ours to apply. One with a zero — xterm's
             // "as big as the display" — is the frontend's: the emulator has no

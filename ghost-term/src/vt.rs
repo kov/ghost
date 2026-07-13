@@ -164,6 +164,16 @@ impl Vt {
     /// Drain the window ops (XTWINOPS) a program asked for that only the window
     /// can grant — iconify, maximize, full-screen. The grid-only ones (`CSI 8 t`,
     /// DECSLPP) the emulator has already done itself.
+    /// Replace the policy — what a program on this tty may change about the
+    /// terminal (see [`crate::policy`]).
+    pub fn set_policy(&mut self, policy: crate::TerminalPolicy) {
+        self.terminal.set_policy(policy);
+    }
+
+    pub fn policy(&self) -> crate::TerminalPolicy {
+        self.terminal.policy()
+    }
+
     pub fn take_window_ops(&mut self) -> Vec<parser::XtwinopsOp> {
         self.terminal.take_window_ops()
     }
@@ -1960,14 +1970,14 @@ mod tests {
     fn exposes_input_relevant_modes() {
         use super::MouseProtocol;
         let mut vt = Vt::new(20, 5);
-        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
+        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Off);
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
 
         // An app turns on X11 mouse, SGR coords, focus, and bracketed paste.
         vt.feed_str("\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
-        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
+        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Press);
         assert!(vt.mouse_sgr());
         assert!(vt.focus_report());
         assert!(vt.bracketed_paste());
@@ -1976,13 +1986,13 @@ mod tests {
         vt.feed_str("\x1b[?1003h");
         assert_eq!(vt.mouse_protocol(), MouseProtocol::AnyMotion);
         vt.feed_str("\x1b[?1003l");
-        assert_eq!(vt.mouse_protocol(), MouseProtocol::Press);
+        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Press);
         vt.feed_str("\x1b[?1002h");
         assert_eq!(vt.mouse_protocol(), MouseProtocol::ButtonDrag);
 
         // Everything off again.
         vt.feed_str("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l");
-        assert_eq!(vt.mouse_protocol(), MouseProtocol::Off);
+        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Off);
         assert!(!vt.mouse_sgr());
         assert!(!vt.focus_report());
         assert!(!vt.bracketed_paste());
@@ -2371,6 +2381,77 @@ mod tests {
             "draining leaves them behind"
         );
         assert_eq!(vt.size(), (80, 24), "none of them re-grids us by itself");
+    }
+
+    /// A terminal whose policy denies everything a program can ask for beyond
+    /// drawing on its own screen.
+    fn denied() -> Vt {
+        let mut vt = Vt::new(80, 24);
+        vt.set_policy(crate::TerminalPolicy::deny_all());
+        vt
+    }
+
+    #[test]
+    fn a_denied_program_cannot_set_the_title() {
+        let mut vt = denied();
+        vt.feed_str("\x1b]2;a title\x07\x1b]1;an icon\x07");
+        assert_eq!(vt.title(), "");
+        assert_eq!(vt.icon_title(), "");
+    }
+
+    #[test]
+    fn a_denied_program_cannot_resize_the_grid() {
+        let mut vt = denied();
+        vt.feed_str("\x1b[8;40;100t"); // XTWINOPS resize
+        assert_eq!(vt.size(), (80, 24));
+        // DECCOLM, and the `?40` that arms it: denying the resize must strip the
+        // arming mode too, or the program just switches it back on itself.
+        vt.feed_str("\x1b[?40h\x1b[?3h");
+        assert_eq!(vt.size(), (80, 24), "?40 did not re-arm DECCOLM");
+    }
+
+    #[test]
+    fn a_denied_program_cannot_recolor_the_terminal_but_can_give_the_colors_back() {
+        let mut vt = denied();
+        vt.feed_str("\x1b]4;1;rgb:ff/00/00\x07");
+        assert_eq!(vt.palette_color(1), None, "the set was denied");
+        // A reset is always honoured, denied or not: a program handing the colors
+        // back must never be refused, or a session could be left discolored.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b]4;1;rgb:ff/00/00\x07");
+        assert_eq!(vt.palette_color(1), Some([255, 0, 0]));
+        vt.set_policy(crate::TerminalPolicy::deny_all());
+        vt.feed_str("\x1b]104;1\x07");
+        assert_eq!(vt.palette_color(1), None, "the reset went through");
+    }
+
+    #[test]
+    fn a_denied_program_cannot_take_the_mouse_but_keeps_the_modes_beside_it() {
+        let mut vt = denied();
+        vt.feed_str("\x1b[?25l"); // cursor hidden, so showing it again is observable
+        assert!(!vt.cursor().visible);
+        // One CSI, two modes: mouse reporting (denied) rides along with the cursor
+        // being shown (not a policy matter at all). Denying must strip the one mode
+        // out of the list, not drop the whole sequence and take the other with it.
+        vt.feed_str("\x1b[?1000;25h");
+        assert_eq!(
+            vt.mouse_protocol(),
+            super::MouseProtocol::Off,
+            "the mouse mode was denied"
+        );
+        assert!(vt.cursor().visible, "the mode riding along still applied");
+    }
+
+    #[test]
+    fn an_allowed_program_still_does_all_of_it() {
+        // The default policy is what ghost has always done — the seam changes
+        // nothing until someone sets a policy.
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b]2;a title\x07\x1b]4;1;rgb:ff/00/00\x07\x1b[8;40;100t\x1b[?1000h");
+        assert_eq!(vt.title(), "a title");
+        assert_eq!(vt.palette_color(1), Some([255, 0, 0]));
+        assert_eq!(vt.size(), (100, 40));
+        assert_eq!(vt.mouse_protocol(), super::MouseProtocol::Press);
     }
 
     #[test]
