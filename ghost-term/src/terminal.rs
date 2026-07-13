@@ -49,6 +49,12 @@ pub struct Terminal {
     /// to the right margin of the previous row instead of stopping. Only active
     /// together with `auto_wrap_mode` (DECAWM).
     reverse_wrap_mode: bool,
+    /// Whether the immediately preceding operation was a downward line feed
+    /// (LF/IND/NEL). A backspace landing on a fresh line-feed position does not
+    /// reverse-wrap to the row above — xterm suppresses that first step. Any other
+    /// operation (a print, a cursor move) clears it. Transient, like
+    /// [`Self::in_placeholder_run`]: not dumped.
+    prev_op_was_line_feed: bool,
     new_line_mode: bool,
     cursor_keys_mode: CursorKeysMode,
     /// xterm modifyOtherKeys level (XTMODKEYS resource 4): 0 off, 1, 2. Drives
@@ -220,6 +226,7 @@ impl Terminal {
             origin_mode: false,
             auto_wrap_mode: true,
             reverse_wrap_mode: false,
+            prev_op_was_line_feed: false,
             new_line_mode: false,
             cursor_keys_mode: CursorKeysMode::Normal,
             modify_other_keys: 0,
@@ -412,6 +419,12 @@ impl Terminal {
         if !matches!(fun, Print(_)) {
             self.in_placeholder_run = false;
         }
+
+        // Reverse-wrap is suppressed on a backspace that lands on a fresh
+        // line-feed position, so remember whether this op is a downward line feed
+        // (IND folds into `Lf`). Set after the handler runs — the handler for this
+        // op still sees the *previous* op's value.
+        let is_line_feed = matches!(fun, Lf | Nel);
 
         match fun {
             Bell => {
@@ -771,6 +784,8 @@ impl Terminal {
                 self.xtwinops(op);
             }
         }
+
+        self.prev_op_was_line_feed = is_line_feed;
     }
 
     pub fn cursor(&self) -> Cursor {
@@ -885,8 +900,14 @@ impl Terminal {
 
     fn move_cursor_to_rel_col(&mut self, rel_col: isize) {
         // A leftward move with reverse-wraparound (?45 + DECAWM) doesn't stop at the
-        // left edge — it wraps up to the right margin of the previous row.
-        if rel_col < 0 && self.reverse_wrap_mode && self.auto_wrap_mode {
+        // left edge — it wraps up to the right margin of the previous row. Except:
+        // a backspace landing on a fresh line-feed position doesn't take that first
+        // wrap (xterm suppresses it, so `NEL` then `BS` stays put).
+        if rel_col < 0
+            && self.reverse_wrap_mode
+            && self.auto_wrap_mode
+            && !self.prev_op_was_line_feed
+        {
             self.move_cursor_back_wrapping((-rel_col) as usize);
             return;
         }
@@ -1261,6 +1282,7 @@ impl Terminal {
         self.charsets = [Charset::Ascii, Charset::Ascii];
         self.active_charset = 0;
         self.in_placeholder_run = false;
+        self.prev_op_was_line_feed = false;
         self.insert_mode = false;
         self.origin_mode = false;
         self.auto_wrap_mode = true;

@@ -149,12 +149,11 @@ inflated pass counts — don't repeat that.)
        the left edge wraps up to the right margin of the row above, wrapping around
        from the top of the scroll region to its bottom (`move_cursor_back_wrapping`);
        a pending wrap is consumed in place. DECSTR clears `?45` (esctest relies on
-       that). `BS`/`CUB`/`CUF` 26/1 — the one fail, `test_BS_InitialReverseWraparound`,
-       wants BS *not* to wrap after a NEL onto a non-continuation line, which on a
-       blank screen is provably mutually exclusive with `test_BS_WrapsInWraparoundMode`
-       (both start at column 0 of a non-wrapped row, one must wrap and one must not);
-       we pass the latter (and the multi-row counting tests), leaving the NEL nuance
-       as the one known gap.
+       that). A BS that lands on a *fresh line-feed position* skips the first wrap
+       (a `prev_op_was_line_feed` flag set at the end of `execute` for LF/IND/NEL,
+       cleared by any other op) — so `NEL` then `BS` stays put while `CUP` then `BS`
+       wraps; the distinction is the landing op, not the wrapped flag (a
+       wrapped-flag model breaks `AfterNoWrappedInlines`). `BS`/`CUB`/`CUF` **27/0**.
   6. reporting/query follow-ups:
      - ✅ 6a: DECRQSS DECSLRM (`DCS $ q s ST`) reports the current margins as
        `DCS 1 $ r Pl;Pr s ST` — a `left_right_margins` field threaded through

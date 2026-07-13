@@ -1113,6 +1113,36 @@ mod tests {
     }
 
     #[test]
+    fn reverse_wrap_is_suppressed_right_after_a_line_feed() {
+        // esctest test_BS_InitialReverseWraparound: a line feed lands the cursor at
+        // a fresh line start; the very next BS must NOT reverse-wrap to the row
+        // above. Any other operation in between re-enables the wrap.
+        let mut vt = Vt::new(80, 25);
+        vt.feed_str("\x1b[?7h\x1b[?45h"); // DECAWM + reverse-wrap
+        vt.feed_str("\x1b[1;1H\x1bE"); // home, then NEL -> row 1, col 0
+        vt.feed_str("\x08"); // BS right after the line feed: no wrap
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (0, 1),
+            "BS immediately after NEL stays put"
+        );
+        // A BS after a plain LF is likewise suppressed.
+        vt.feed_str("\x1b[1;1H\n\x08");
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (0, 1),
+            "BS after LF stays put"
+        );
+        // But once the cursor is repositioned by anything else, BS wraps again.
+        vt.feed_str("\x1b[3;1H\x08"); // CUP to row 2 col 0, then BS
+        assert_eq!(
+            (vt.cursor().col, vt.cursor().row),
+            (79, 1),
+            "BS after a CUP wraps to the row above"
+        );
+    }
+
+    #[test]
     fn decrqm_reports_reverse_wrap_mode_state() {
         let mut vt = Vt::new(80, 25);
         assert_eq!(vt.dec_mode_state(45), Some(false), "?45 starts reset");
