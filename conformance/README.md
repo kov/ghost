@@ -96,7 +96,7 @@ pass/fail. (An early version of this harness used `--force` and reported wildly
 inflated pass counts — don't repeat that.)
 
 **Honest baseline (no `--force`):** the whole suite (`INCLUDE='.'`) runs
-**422 pass / 45 known bugs / 101 fail**. The failures cluster into real, tracked
+**442 pass / 45 known bugs / 81 fail**. The failures cluster into real, tracked
 feature gaps — what's left is listed under "Still open" at the end:
 
 - **Selective erase / ISO protection** — ✅ **DONE** (slice 7). Cells carry a
@@ -233,12 +233,48 @@ feature gaps — what's left is listed under "Still open" at the end:
   when — and only when — `column_mode_132` is set, so a `reset` in a 200-column
   window doesn't shrink it (xterm makes the same pair of checks).
   `DECSET_DECCOLM`, `DECSET_Allow80To132`, `RIS_ResetDECCOLM` pass.
-**Still open** (the 101 failures, biggest first — measured with a full
+- **OSC color** — ✅ **the protocol half is DONE** (slice 11). The indexed palette
+  (OSC 4/104) and the dynamic colors (OSC 10–12/110–112) were already in; this
+  adds the **special colors** — the color an app asks bold, underline, blink,
+  reverse or italic text to be painted in. OSC 5 names them from 0 and OSC 105
+  resets them; xterm addresses the same five through OSC 4 at `256 + c`, past the
+  indexed palette, so the palette index widened to `u16` and the terminal routes
+  it (`SPECIAL_COLOR_BASE`), with OSC 5 folding onto that one path. Each query is
+  answered in the form it was asked in. Ghost *tracks* them but paints attribute
+  text in the pen's own color — as xterm does with `colorBDMode` and friends off
+  — so an unset one reads back the theme foreground.
+
+  A prerequisite fell out of it: **XTGETTCAP** answered `DCS + q 436F ST` with a
+  lowercased `1+r436f=…`, and esctest string-matches the name it sent. It was
+  falling back to "16 colors" and addressing the special colors at `16 + c` —
+  inside the palette, where the round-trips passed for the wrong reason. The
+  reply now echoes the name hex for hex. `ChangeSpecialColor` 12/0,
+  `ResetSpecialColor` 4/1, `ChangeColor`/`ChangeDynamicColor` clean but for the
+  color-space specs below.
+
+**Still open** (the 81 failures, biggest first — measured with a full
 `INCLUDE='.'` sweep, so these counts are honest):
 
-- **OSC color** (~42): `ChangeColor` / `ChangeSpecialColor` / `ChangeDynamicColor`
-  / `Reset*Color`. Palette get/set (OSC 4/5/104/105) plus the niche CIE Lab/Luv
-  color-space specs. Reaches into the theme/render side, not just `ghost-term`.
+- **X11 color-space specs** (21): the `rgbi:` / `CIEXYZ:` / `CIEuvY:` / `CIExyY:`
+  / `CIELab:` / `CIELuv:` / `TekHVC:` forms of a color spec, across `ChangeColor`,
+  `ChangeSpecialColor` and `ChangeDynamicColor` (the `rgb:` and `#rgb` forms every
+  real program uses all pass). **Deliberately not implemented.** xterm hands these
+  to `XParseColor`, which converts them through Xlib's Xcms using the *screen's*
+  color characterization — and with no `XDCCC_LINEAR_RGB_*` properties on the root
+  window (nobody runs `xcmsdb`), Xlib falls back to a built-in default in
+  `src/xcms/LRGB.c`: the measured gamma tables of a **1990 Tektronix CRT**. That is
+  where esctest's expected values come from — `rgbi:0.5/0.5/0.5` → `c1c1/bbbb/bbbb`
+  is a reverse lookup through three per-channel CRT tables, not a gamma formula.
+  Matching them bit-for-bit means porting those tables plus the TekHVC gamut-clip
+  solver. No modern terminal does (kitty and Ghostty parse `rgbi:` with a naive
+  `round(f * 255)` and would fail the same tests; alacritty, foot and wezterm don't
+  parse it at all). Revisit only if a real program is found to emit one.
+- **`ResetSpecialColor_Dynamic`** (1): asserts that OSC 110 restores the
+  foreground esctest itself set with OSC 10 in its per-test `reset()` (it sets
+  `#000`), i.e. that a reset returns the *last set* color. Ghost takes OSC 110
+  back to the theme's foreground, which is what the user configured and what the
+  other terminals do. The test bakes in an assumption about xterm's startup
+  resources; not a gap we intend to close.
 - **XTWINOPS** (~28): window ops — iconify, position, maximize, the title stack.
   `Cmd::ResizeWindow` (slice 8) is the plumbing a real `CSI 8;h;w t` would need,
   but several of these need a window manager the headless harness can't drive.
