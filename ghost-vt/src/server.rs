@@ -1182,7 +1182,13 @@ fn handle_client_messages(
             ClientMsg::Policy(policy) if !c.subscribed && !c.observing => {
                 if policy != screen.vt().policy() {
                     screen.set_policy(policy);
+                    // Straight to disk (coalesced on an actual change, like the
+                    // title and the grid): the descriptor is what a restarted host,
+                    // a recreate or a resurrect reads, and a policy that lived only
+                    // as long as this process would hand the session back to a
+                    // program that had been refused the moment anything restarted.
                     meta.policy = policy;
+                    let _ = crate::meta::write(&paths::meta_path(current_name), meta);
                     if c.resynced {
                         c.queue_output(screen.resync());
                     }

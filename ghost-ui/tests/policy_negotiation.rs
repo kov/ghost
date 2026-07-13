@@ -44,13 +44,20 @@ impl Drop for KillOnDrop<'_> {
     }
 }
 
+fn host_meta(xdg: &Path, name: &str) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(xdg.join("run/ghost").join(name).join("meta")).ok()?).ok()
+}
+
 /// The host's view of the session's title — what discovery and the fleet's cards
 /// read, and the thing an OSC 2 sets.
 fn host_title(xdg: &Path, name: &str) -> Option<String> {
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(xdg.join("run/ghost").join(name).join("meta")).ok()?)
-            .ok()?;
-    Some(meta.get("title")?.as_str()?.to_string())
+    Some(host_meta(xdg, name)?.get("title")?.as_str()?.to_string())
+}
+
+/// The policy in the session's durable descriptor — what a restarted host, a
+/// recreate or a resurrect reads back.
+fn host_policy(xdg: &Path, name: &str) -> Option<serde_json::Value> {
+    host_meta(xdg, name)?.get("policy").cloned()
 }
 
 #[test]
@@ -110,6 +117,16 @@ fn the_attached_terminal_tells_the_host_what_a_program_may_do_and_it_sticks() {
         host_title(xdg, name).as_deref(),
         Some(""),
         "the host kept enforcing the policy of the terminal that left"
+    );
+
+    // And it is on DISK, not just in the live host's memory: the session's
+    // descriptor is what a recreate or a resurrect reads, and a policy that only
+    // survived as long as the process did would let a restart silently hand the
+    // session back to a program that had been refused.
+    assert_eq!(
+        host_policy(xdg, name).and_then(|p| p.get("title").and_then(|t| t.as_bool())),
+        Some(false),
+        "the negotiated policy was persisted"
     );
 }
 
