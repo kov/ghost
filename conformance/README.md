@@ -98,10 +98,18 @@ inflated pass counts — don't repeat that.)
 **Honest baseline (no `--force`):** a broad cursor+content sweep runs roughly
 **64 pass / 42 fail**. The failures cluster into real, tracked feature gaps:
 
-- **Selective erase / ISO protection** (`DECSCA` `CSI " q`, `DECSED`, `DECSEL`,
-  `*_respectsISOProtection`) — the biggest cluster (~26 tests). ghost's `Pen`
-  has no protected-cell attribute, so selective erase can't spare protected
-  cells. A distinct feature.
+- **Selective erase / ISO protection** — ✅ **DONE** (slice 7). Cells carry a
+  three-state `Protection` (`None`/`Dec`/`Iso`) on the pen: DECSCA (`CSI Ps " q`)
+  sets DEC protection, SPA/EPA (`ESC V`/`ESC W`) the ISO guarded area. An
+  `EraseGuard` threaded through `Buffer::erase`/`Line::clear` makes each erase
+  family spare the right cells, matching xterm: plain ED/EL/ECH spare ISO;
+  DECSED/DECSEL (`CSI ? Ps J`/`K`) spare both (xterm respects ISO here for
+  back-compat — their `doesNotRespectISOProtect` tests are @knownBug on xterm);
+  DECSERA (`CSI Pt;Pl;Pb;Pr $ {`) spares only DEC. Protection survives a dump
+  (protected runs replay wrapped in DECSCA/SPA controls), DECSTR clears it, and
+  DECRQSS `" q` reports the DECSCA bit. `DECSED` 17/0, `DECSEL` 10/0, `DECSERA`
+  8/0, `ECH`/`ED`/`EL` protection tests pass, `DECSTR_DECSCA` + `DECRQSS_DECSCA`
+  pass.
 - **Left/right margins** (`DECLRMM` `CSI ?69h` + `DECSLRM` `CSI Pl;Pr s`) — a
   VT420 feature, **in progress**, being landed in slices:
   1. ✅ state + parsing + margin-relative cursor addressing + origin-relative CPR
