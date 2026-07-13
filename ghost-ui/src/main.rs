@@ -1757,6 +1757,9 @@ fn theme_colors(theme: &ghost_renderer::Theme) -> ghost_ui_core::ThemeColors {
         fg: theme.fg,
         bg: theme.bg,
         cursor: theme.fg,
+        // The scheme's own 16 colors, so an OSC 4 query reports what the screen
+        // actually paints for an index the app hasn't overridden.
+        ansi: theme.palette,
     }
 }
 

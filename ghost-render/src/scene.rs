@@ -416,6 +416,7 @@ mod tests {
                 default_fg: None,
                 default_bg: None,
                 cursor_color: None,
+                palette: None,
             }),
             selection: None,
             dim: false,

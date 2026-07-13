@@ -185,6 +185,7 @@ fn detached_color_replies_use_the_last_attached_theme() {
             fg: [0xd0, 0xd0, 0xd0],
             bg: [0x12, 0x34, 0x56],
             cursor: [0xd0, 0xd0, 0xd0],
+            ..Default::default()
         })
         .expect("report_theme failed");
         // Stay connected until the resync repaint arrives. Dropping straight

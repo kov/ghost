@@ -240,6 +240,9 @@ impl Screen {
             fg: self.vt.dynamic_foreground().unwrap_or(theme.fg),
             bg: self.vt.dynamic_background().unwrap_or(theme.bg),
             cursor: self.vt.dynamic_cursor_color().unwrap_or(theme.cursor),
+            // The app's OSC 4 overrides are answered per index (`ReplyCtx::palette`),
+            // not folded in here — this is the scheme's own palette.
+            ansi: theme.ansi,
         }
     }
 

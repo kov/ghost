@@ -648,6 +648,7 @@ fn host_main(
                         let mode_state = |m: u16| screen.vt().dec_mode_state(m);
                         let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
                         let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
+                        let palette = |i: u8| screen.vt().palette_color(i);
                         let (lm, rm) = screen.vt().left_right_margins();
                         let (tm, bm) = screen.vt().top_bottom_margins();
                         let ctx = crate::query::ReplyCtx {
@@ -666,6 +667,7 @@ fn host_main(
                             // default if none ever attached), under any
                             // app-set dynamic overrides.
                             colors: screen.effective_colors(last_theme),
+                            palette: &palette,
                             mode_state: &mode_state,
                             checksum: &checksum,
                         };

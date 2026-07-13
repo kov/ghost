@@ -20,7 +20,7 @@ pub mod util;
 mod vt;
 pub use cell::Cell;
 pub use charset::Charset;
-pub use color::Color;
+pub use color::{index_rgb, Color, ANSI_16};
 pub use graphics::{encode_transmit, Image, Placement};
 pub use line::Line;
 pub use parser::Progress;

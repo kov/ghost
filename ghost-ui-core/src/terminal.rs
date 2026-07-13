@@ -1170,6 +1170,7 @@ impl TerminalModel {
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
             let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
             let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
+            let palette = |i: u8| screen.vt().palette_color(i);
             let (lm, rm) = screen.vt().left_right_margins();
             let (tm, bm) = screen.vt().top_bottom_margins();
             let ctx = ReplyCtx {
@@ -1184,6 +1185,7 @@ impl TerminalModel {
                 conformance_level: screen.vt().conformance_level(),
                 ansi_mode_state: &ansi_mode_state,
                 colors: screen.effective_colors(self.theme),
+                palette: &palette,
                 mode_state: &mode_state,
                 checksum: &checksum,
             };
@@ -4345,6 +4347,11 @@ mod tests {
         0
     }
 
+    /// A `palette` for tests: the app has overridden no indexed color.
+    fn no_palette(_: u8) -> Option<[u8; 3]> {
+        None
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn reply_ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -4359,6 +4366,7 @@ mod tests {
             conformance_level: 5,
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
+            palette: &no_palette,
             mode_state: &no_modes,
             checksum: &no_checksum,
         }
@@ -4488,6 +4496,7 @@ mod tests {
             fg: [0x10, 0x10, 0x12],
             bg: [0xff, 0xff, 0xff],
             cursor: [0x10, 0x10, 0x12],
+            ansi: ghost_term::ANSI_16,
         };
         let mut m = model();
         // Nobody subscribed: a theme change stays silent.

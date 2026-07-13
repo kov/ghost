@@ -12,6 +12,7 @@
 //! positions are pure arithmetic from it, so even geometry is unit-testable.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 pub use ghost_term::CursorShape;
 use ghost_term::{Color, Line, Pen, Vt};
@@ -199,7 +200,17 @@ pub struct Frame {
     /// App-set cursor color (OSC 12): colors the cursor block/rule instead of
     /// the reverse-video / foreground default.
     pub cursor_color: Option<[u8; 3]>,
+    /// App-set indexed-palette colors (OSC 4): they outrank the renderer theme's
+    /// palette when resolving `Color::Indexed`. `None` — an app that never touched
+    /// the palette, which is nearly always — costs the renderer nothing. Shared by
+    /// `Rc` because a frame is cloned and compared on every present.
+    pub palette: Option<Rc<PaletteOverrides>>,
 }
+
+/// One slot per xterm palette index; `None` leaves the index to the theme (the
+/// scheme's 16 colors, then the standard cube and grey ramp). See
+/// [`Frame::palette`].
+pub type PaletteOverrides = [Option<[u8; 3]>; 256];
 
 /// Lay out a single line into style- and cursor-delimited [`Run`]s.
 ///
@@ -323,6 +334,7 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
         default_fg: vt.dynamic_foreground(),
         default_bg: vt.dynamic_background(),
         cursor_color: vt.dynamic_cursor_color(),
+        palette: (!vt.palette_is_default()).then(|| Rc::new(*vt.palette())),
     }
 }
 
@@ -555,6 +567,31 @@ mod tests {
         assert_eq!(f.default_fg, None);
         assert_eq!(f.default_bg, None);
         assert_eq!(f.cursor_color, None);
+    }
+
+    #[test]
+    fn palette_overrides_are_captured_on_the_frame() {
+        let m = CellMetrics {
+            advance: 9.0,
+            line_height: 18.0,
+        };
+        let mut vt = Vt::new(10, 3);
+        // An untouched palette rides no table at all — the renderer then resolves
+        // every index through the theme, as it always has.
+        assert_eq!(layout_frame(&vt, m).palette, None);
+
+        vt.feed_str("\x1b]4;4;#00ff00\x07");
+        let f = layout_frame(&vt, m);
+        let p = f.palette.expect("the OSC 4 override rides the frame");
+        assert_eq!(p[4], Some([0x00, 0xff, 0x00]));
+        assert_eq!(p[5], None, "the untouched indices stay the theme's");
+
+        vt.feed_str("\x1b]104\x07");
+        assert_eq!(
+            layout_frame(&vt, m).palette,
+            None,
+            "OSC 104 drops the table"
+        );
     }
 
     #[test]

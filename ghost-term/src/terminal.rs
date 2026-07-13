@@ -148,6 +148,11 @@ pub struct Terminal {
     /// default foreground, default background, cursor color. `None` = the
     /// frontend's theme default applies.
     dynamic_colors: [Option<[u8; 3]>; 3],
+    /// OSC 4 indexed-palette overrides. `None` = the frontend's theme color for
+    /// that index (the scheme's 16, then xterm's standard cube and grey ramp), so
+    /// an untouched palette costs the renderer nothing. Boxed: 1 KiB of mostly-
+    /// `None` has no business inflating every `Terminal` by value.
+    palette: Box<[Option<[u8; 3]>; 256]>,
     /// OSC 9;4 taskbar progress, the running task's own report. Dumped, so a
     /// long task's progress survives detach/reattach.
     progress: Option<Progress>,
@@ -296,6 +301,7 @@ impl Terminal {
             command_running: false,
             last_exit: None,
             dynamic_colors: [None; 3],
+            palette: Box::new([None; 256]),
             progress: None,
             bell_count: 0,
             graphics: GraphicsState::default(),
@@ -804,6 +810,23 @@ impl Terminal {
 
             SetDynamicColor(target, rgb) => {
                 self.dynamic_colors[target as usize] = rgb;
+            }
+
+            SetPalette(entries) => {
+                for (index, rgb) in entries {
+                    self.palette[index as usize] = Some(rgb);
+                }
+            }
+
+            // No indices = the whole palette (xterm's `OSC 104 ST`).
+            ResetPalette(indices) => {
+                if indices.is_empty() {
+                    *self.palette = [None; 256];
+                } else {
+                    for index in indices {
+                        self.palette[index as usize] = None;
+                    }
+                }
             }
 
             SetProgress(progress) => {
@@ -1453,6 +1476,7 @@ impl Terminal {
         self.command_running = false;
         self.last_exit = None;
         self.dynamic_colors = [None; 3];
+        *self.palette = [None; 256];
         self.progress = None;
     }
 
@@ -1586,6 +1610,24 @@ impl Terminal {
         self.dynamic_colors[target as usize]
     }
 
+    /// The OSC 4 override for palette index `i`, if an app set one (`None` = the
+    /// frontend's theme color for that index).
+    pub fn palette_color(&self, i: u8) -> Option<[u8; 3]> {
+        self.palette[i as usize]
+    }
+
+    /// The whole OSC 4 override table — what the renderer resolves indexed colors
+    /// through, and what a color query is answered from.
+    pub fn palette(&self) -> &[Option<[u8; 3]>; 256] {
+        &self.palette
+    }
+
+    /// Whether the app has left the palette alone (the common case): the renderer
+    /// then needs no override table at all.
+    pub fn palette_is_default(&self) -> bool {
+        self.palette.iter().all(Option::is_none)
+    }
+
     /// The task progress the app last reported (OSC 9;4), if any.
     pub fn progress(&self) -> Option<Progress> {
         self.progress
@@ -1669,6 +1711,7 @@ impl Terminal {
         assert_eq!(self.saved_ctx, other.saved_ctx);
         assert_eq!(self.alternate_saved_ctx, other.alternate_saved_ctx);
         assert_eq!(self.tracked_modes, other.tracked_modes);
+        assert_eq!(self.palette, other.palette);
         assert_eq!(self.title, other.title);
 
         assert_eq!(
@@ -3169,7 +3212,20 @@ impl Terminal {
             funs.push(Function::SetProgress(self.progress));
         }
 
-        // 18. restore dynamic-color overrides (OSC 10/11/12).
+        // 18. restore the indexed-palette overrides (OSC 4) — one sequence for
+        // all of them, since a dump replays into a terminal whose palette is the
+        // theme's (nothing to reset first).
+        let entries: Vec<(u8, [u8; 3])> = self
+            .palette
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rgb)| rgb.map(|rgb| (i as u8, rgb)))
+            .collect();
+        if !entries.is_empty() {
+            funs.push(Function::SetPalette(entries));
+        }
+
+        // 19. restore dynamic-color overrides (OSC 10/11/12).
         for (i, target) in [
             DynamicColor::Foreground,
             DynamicColor::Background,

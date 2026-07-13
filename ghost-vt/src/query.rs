@@ -58,6 +58,11 @@ pub enum Query {
     /// `OSC 12 ; ? ST` — the cursor color. Reply mirrors
     /// [`Query::ForegroundColor`].
     CursorColor,
+    /// `OSC 4 ; c ; ? ST` — an indexed palette color. One OSC may ask for several
+    /// (`4;0;?;1;?`), and each is answered by its own `OSC 4 ; c ;
+    /// rgb:rrrr/gggg/bbbb ST`, in the order asked. The color reported is what the
+    /// screen shows: the app's OSC 4 override if it set one, else the theme's.
+    PaletteColors(Vec<u8>),
     /// `CSI ? 996 n` — one-shot color-scheme request (contour's dark/light
     /// extension, mode 2031's query form). Reply: `CSI ? 997 ; Ps n` with
     /// Ps 1 = dark, 2 = light.
@@ -100,6 +105,23 @@ pub struct ThemeColors {
     /// Cursor color (OSC 12). Ghost paints the cursor with the theme
     /// foreground, so that is the default.
     pub cursor: [u8; 3],
+    /// The scheme's 16 base ANSI colors — what an OSC 4 query reports for an
+    /// index the app hasn't overridden (above 15, xterm's cube and grey ramp
+    /// apply; see [`ghost_term::index_rgb`]).
+    ///
+    /// Deliberately **not** on the wire: `ThemeColors` is postcard-encoded in the
+    /// client's theme report, and postcard is not self-describing, so a new field
+    /// would make a new client's report undecodable to an older host — the exact
+    /// break `ghost-ui/tests/proto_compat.rs` guards. An attached frontend fills
+    /// this in-process (the palette is exact); a *detached* host, which only ever
+    /// receives fg/bg/cursor, answers OSC 4 from the standard xterm palette.
+    #[serde(skip, default = "default_ansi")]
+    pub ansi: [[u8; 3]; 16],
+}
+
+/// The serde default for [`ThemeColors::ansi`] (which never crosses the wire).
+fn default_ansi() -> [[u8; 3]; 16] {
+    ghost_term::ANSI_16
 }
 
 impl Default for ThemeColors {
@@ -108,6 +130,7 @@ impl Default for ThemeColors {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
             cursor: [0xd8, 0xdb, 0xe0],
+            ansi: ghost_term::ANSI_16,
         }
     }
 }
@@ -152,6 +175,10 @@ pub struct ReplyCtx<'a> {
     pub ansi_mode_state: &'a dyn Fn(u16) -> ghost_term::ModeReport,
     /// Default fg/bg for the OSC color queries.
     pub colors: ThemeColors,
+    /// The app's OSC 4 override for a palette index, if it set one — what an OSC 4
+    /// query must report, since it is what the screen shows. `None` falls back to
+    /// the theme (see [`ThemeColors::ansi`]). Fed by [`ghost_term::Vt::palette_color`].
+    pub palette: &'a dyn Fn(u8) -> Option<[u8; 3]>,
     /// A DEC private mode's DECRQM report for `CSI ? Ps $ p`.
     pub mode_state: &'a dyn Fn(u16) -> ghost_term::ModeReport,
     /// The DECRQCRA rectangle checksum over 0-based inclusive `(top, left,
@@ -263,6 +290,16 @@ impl Query {
             Query::CursorColor => {
                 format!("\x1b]12;{}\x1b\\", xterm_rgb(ctx.colors.cursor)).into_bytes()
             }
+            Query::PaletteColors(indices) => {
+                let mut out = String::new();
+                for &i in indices {
+                    // What the screen shows: the app's override, else the theme's.
+                    let rgb = (ctx.palette)(i)
+                        .unwrap_or_else(|| ghost_term::index_rgb(i, &ctx.colors.ansi));
+                    out.push_str(&format!("\x1b]4;{i};{}\x1b\\", xterm_rgb(rgb)));
+                }
+                out.into_bytes()
+            }
             Query::ColorScheme => color_scheme_report(&ctx.colors),
             Query::Termcap(names) => {
                 let mut out = String::new();
@@ -313,10 +350,12 @@ impl Query {
 /// we recognize, so a pathological run of parameters can't grow the buffer.
 const MAX_CSI_PARAMS: usize = 32;
 
-/// Upper bound on a collected OSC payload. The OSC queries we answer ("10;?",
-/// "11;?") are tiny; anything longer is a title/clipboard/other string, marked
-/// overflowed and never classified — so a truncation can't masquerade as one.
-const MAX_OSC_PAYLOAD: usize = 16;
+/// Upper bound on a collected OSC payload. The OSC queries we answer are small —
+/// "11;?", or a handful of OSC 4 index/spec pairs ("4;0;?;1;?", and a set whose
+/// specs we skip) — so this is generous while still keeping a title / clipboard /
+/// other long string from being collected: it is marked overflowed and never
+/// classified, so a truncation can't masquerade as a query.
+const MAX_OSC_PAYLOAD: usize = 128;
 
 /// Upper bound on a collected DCS payload. XTGETTCAP requests carry a short
 /// hex-encoded cap-name list; anything longer (sixel data, big DECRQSS-style
@@ -395,6 +434,20 @@ impl QueryScanner {
             b"10;?" => Some(Query::ForegroundColor),
             b"11;?" => Some(Query::BackgroundColor),
             b"12;?" => Some(Query::CursorColor),
+            // OSC 4 ; c ; spec [; c ; spec]… — only the `?` pairs are queries; the
+            // rest are sets the emulator applies (and are skipped here). An OSC
+            // that asks for nothing produces no reply.
+            osc if osc.starts_with(b"4;") => {
+                let s = std::str::from_utf8(osc).ok()?;
+                let mut fields = s[2..].split(';');
+                let mut asked = Vec::new();
+                while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
+                    if spec == "?" {
+                        asked.push(index.parse::<u8>().ok()?);
+                    }
+                }
+                (!asked.is_empty()).then_some(Query::PaletteColors(asked))
+            }
             _ => None,
         }
     }
@@ -715,6 +768,11 @@ mod tests {
         (top * 1000 + left * 100 + bottom * 10 + right) as u16
     }
 
+    /// A `palette` for tests: the app has overridden nothing.
+    fn no_palette(_: u8) -> Option<[u8; 3]> {
+        None
+    }
+
     /// A baseline reply context; tests override the fields they exercise.
     fn ctx() -> ReplyCtx<'static> {
         ReplyCtx {
@@ -729,6 +787,7 @@ mod tests {
             conformance_level: 5,
             ansi_mode_state: &no_modes,
             colors: ThemeColors::default(),
+            palette: &no_palette,
             mode_state: &no_modes,
             checksum: &echo_rect,
         }
@@ -746,7 +805,7 @@ mod tests {
         // A long payload overflows the small buffer and is never classified,
         // even if its prefix looks like a query.
         let mut long = b"\x1b]10;?".to_vec();
-        long.extend(std::iter::repeat_n(b'x', 100));
+        long.extend(std::iter::repeat_n(b'x', 2 * MAX_OSC_PAYLOAD));
         long.push(0x07);
         assert!(scan_all(&long).is_empty());
         // Split across feeds still recognized.
@@ -811,6 +870,62 @@ mod tests {
         assert_eq!(
             Query::BackgroundColor.reply(&themed),
             b"\x1b]11;rgb:1010/1010/1212\x1b\\"
+        );
+    }
+
+    #[test]
+    fn recognizes_osc_4_palette_queries() {
+        assert_eq!(
+            scan_all(b"\x1b]4;1;?\x07"),
+            [Query::PaletteColors(vec![1])],
+            "a single index"
+        );
+        assert_eq!(
+            scan_all(b"\x1b]4;0;?;255;?\x1b\\"),
+            [Query::PaletteColors(vec![0, 255])],
+            "one OSC may ask for several"
+        );
+        // A set is not a query, and a mixed OSC asks only for its `?` pairs.
+        assert!(scan_all(b"\x1b]4;1;rgb:ffff/0000/0000\x07").is_empty());
+        assert_eq!(
+            scan_all(b"\x1b]4;1;#ff0000;2;?\x07"),
+            [Query::PaletteColors(vec![2])]
+        );
+        // OSC 104 (reset) is not a query either.
+        assert!(scan_all(b"\x1b]104;1\x07").is_empty());
+    }
+
+    #[test]
+    fn palette_replies_report_the_override_then_the_theme() {
+        // Index 1 is the app's (OSC 4), index 2 the scheme's, and index 196 comes
+        // from xterm's cube — which no scheme carries.
+        let overridden = |i: u8| (i == 1).then_some([0xff, 0x00, 0x00]);
+        let mut ansi = ghost_term::ANSI_16;
+        ansi[2] = [0x00, 0x11, 0x22];
+        let cx = ReplyCtx {
+            colors: ThemeColors {
+                ansi,
+                ..ThemeColors::default()
+            },
+            palette: &overridden,
+            ..ctx()
+        };
+        assert_eq!(
+            Query::PaletteColors(vec![1]).reply(&cx),
+            b"\x1b]4;1;rgb:ffff/0000/0000\x1b\\"
+        );
+        assert_eq!(
+            Query::PaletteColors(vec![2]).reply(&cx),
+            b"\x1b]4;2;rgb:0000/1111/2222\x1b\\"
+        );
+        assert_eq!(
+            Query::PaletteColors(vec![196]).reply(&cx),
+            b"\x1b]4;196;rgb:ffff/0000/0000\x1b\\"
+        );
+        // Several indices in one query get one reply each, in the order asked.
+        assert_eq!(
+            Query::PaletteColors(vec![2, 1]).reply(&cx),
+            b"\x1b]4;2;rgb:0000/1111/2222\x1b\\\x1b]4;1;rgb:ffff/0000/0000\x1b\\"
         );
     }
 

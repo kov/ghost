@@ -17,8 +17,8 @@ pub mod target;
 pub use target::{FrameOutcome, SurfaceTarget, Target};
 
 use ghost_render::{
-    BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, RectPx, Run, Scene,
-    SceneItem, Selection, Style, TermDamage, Transform,
+    BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, PaletteOverrides, RectPx,
+    Run, Scene, SceneItem, Selection, Style, TermDamage, Transform,
 };
 use ghost_shaper::{FontRef, FontSet, ShapedGlyph, Synthesis};
 use ghost_term::Color;
@@ -480,7 +480,7 @@ impl Default for Theme {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
             selection: [0x3a, 0x53, 0x7a],
-            palette: ANSI_16,
+            palette: ghost_term::ANSI_16,
             bg_alpha: 1.0,
             frost: 0.0,
             frost_tint: None,
@@ -492,47 +492,12 @@ impl Theme {
     /// Resolve an xterm 256-color index, honoring this theme's palette for the
     /// 16 base colors (the cube and grayscale ramp are scheme-independent).
     fn ansi(&self, i: u8) -> [u8; 3] {
-        if (i as usize) < 16 {
-            self.palette[i as usize]
-        } else {
-            index_to_rgb(i)
-        }
+        ghost_term::index_rgb(i, &self.palette)
     }
 }
 
 /// Alpha of the selection tint — translucent so text stays readable beneath it.
 const SELECTION_ALPHA: f32 = 0.45;
-
-/// Standard xterm 16-color base palette (indices 0..=15).
-#[rustfmt::skip]
-const ANSI_16: [[u8; 3]; 16] = [
-    [0x00, 0x00, 0x00], [0x80, 0x00, 0x00], [0x00, 0x80, 0x00], [0x80, 0x80, 0x00],
-    [0x00, 0x00, 0x80], [0x80, 0x00, 0x80], [0x00, 0x80, 0x80], [0xc0, 0xc0, 0xc0],
-    [0x80, 0x80, 0x80], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
-    [0x00, 0x00, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
-];
-
-/// The six channel levels of the 6x6x6 color cube (indices 16..=231).
-const CUBE_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-
-/// Resolve an xterm 256-color index to RGB.
-fn index_to_rgb(i: u8) -> [u8; 3] {
-    match i {
-        0..=15 => ANSI_16[i as usize],
-        16..=231 => {
-            let i = i - 16;
-            [
-                CUBE_STEPS[(i / 36) as usize],
-                CUBE_STEPS[((i / 6) % 6) as usize],
-                CUBE_STEPS[(i % 6) as usize],
-            ]
-        }
-        232..=255 => {
-            let v = 8 + 10 * (i - 232);
-            [v, v, v]
-        }
-    }
-}
 
 /// Bold brightens the 8 base ANSI colors to their bright variants (xterm-ish).
 fn maybe_brighten(c: Option<Color>, bold: bool) -> Option<Color> {
@@ -542,10 +507,20 @@ fn maybe_brighten(c: Option<Color>, bold: bool) -> Option<Color> {
     }
 }
 
-fn resolve(c: Option<Color>, default: [u8; 3], theme: &Theme) -> [u8; 3] {
+/// Resolve a pen color to RGB. An indexed color goes through the app's OSC 4
+/// overrides first (a program that repainted the palette means it), then the
+/// theme's.
+fn resolve(
+    c: Option<Color>,
+    default: [u8; 3],
+    theme: &Theme,
+    palette: Option<&PaletteOverrides>,
+) -> [u8; 3] {
     match c {
         None => default,
-        Some(Color::Indexed(i)) => theme.ansi(i),
+        Some(Color::Indexed(i)) => palette
+            .and_then(|p| p[i as usize])
+            .unwrap_or_else(|| theme.ansi(i)),
         Some(Color::RGB(c)) => [c.r, c.g, c.b],
     }
 }
@@ -562,9 +537,18 @@ fn to_rgba(c: [u8; 3]) -> [f32; 4] {
 /// Resolve a run's style to a foreground color and an optional background-rect
 /// color. The background is `Some` only when it differs from the cleared theme
 /// background (an explicit bg, or `inverse`), so default cells paint no rect.
-fn run_colors(style: &Style, theme: Theme) -> ([f32; 4], Option<[f32; 4]>) {
-    let mut fg = resolve(maybe_brighten(style.fg, style.bold), theme.fg, &theme);
-    let mut bg = resolve(style.bg, theme.bg, &theme);
+fn run_colors(
+    style: &Style,
+    theme: Theme,
+    palette: Option<&PaletteOverrides>,
+) -> ([f32; 4], Option<[f32; 4]>) {
+    let mut fg = resolve(
+        maybe_brighten(style.fg, style.bold),
+        theme.fg,
+        &theme,
+        palette,
+    );
+    let mut bg = resolve(style.bg, theme.bg, &theme, palette);
     let paint_bg = style.bg.is_some() || style.inverse;
     if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
@@ -3206,7 +3190,7 @@ impl Renderer {
             let baseline_y = row_y + baseline;
             for run in &layout.runs {
                 let cursor_here = cursor.filter(|c| c.row == row && c.col == run.start_col);
-                let (fg, bg_opt) = run_colors(&run.style, theme);
+                let (fg, bg_opt) = run_colors(&run.style, theme, frame.palette.as_deref());
                 let x = run.start_col as f32 * metrics.advance;
                 let w = run.width_cols as f32 * metrics.advance;
 
@@ -5159,6 +5143,22 @@ mod tests {
     }
 
     #[test]
+    fn an_osc_4_override_recolors_an_ansi_index() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        // The app remaps palette index 4 ("blue") to green with OSC 4, then paints
+        // a background with it. The override outranks the theme's own palette.
+        let f = frame(10, 1, "\x1b]4;4;#00ff00\x07\x1b[44m  X");
+        let mut theme = Theme::default();
+        theme.palette[4] = [0x00, 0x00, 0xff];
+        let img = Renderer::headless(theme).render_offscreen(&f, font, SIZE_PX);
+        let p = px(&img, 2, 9);
+        assert!(
+            p[1] > 0x80 && p[2] < 0x40,
+            "OSC 4 must recolor index 4, got {p:?}"
+        );
+    }
+
+    #[test]
     fn theme_palette_recolors_ansi_indices() {
         let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
         // Leading spaces (kept by the trailing 'X') with ANSI bg index 4 (blue).
@@ -5176,6 +5176,7 @@ mod tests {
 
     #[test]
     fn index_to_rgb_matches_xterm() {
+        let index_to_rgb = |i| ghost_term::index_rgb(i, &ghost_term::ANSI_16);
         assert_eq!(index_to_rgb(1), [0x80, 0x00, 0x00]); // ANSI red
         assert_eq!(index_to_rgb(9), [0xff, 0x00, 0x00]); // bright red
         assert_eq!(index_to_rgb(16), [0, 0, 0]); // cube origin

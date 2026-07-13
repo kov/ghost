@@ -95,6 +95,7 @@ fn theme_is_not_sent_to_a_host_that_predates_it() {
             fg: [0xd0, 0xd0, 0xd0],
             bg: [0x12, 0x34, 0x56],
             cursor: [0xd0, 0xd0, 0xd0],
+            ..Default::default()
         })
         .expect("report_theme failed");
     }
@@ -146,6 +147,7 @@ fn input_flows_after_a_gui_style_attach_to_an_undeclared_host() {
         fg: [0xd0, 0xd0, 0xd0],
         bg: [0x12, 0x34, 0x56],
         cursor: [0xd0, 0xd0, 0xd0],
+        ..Default::default()
     })
     .expect("report_theme");
     s.send_input(b"hello\n").expect("send_input");

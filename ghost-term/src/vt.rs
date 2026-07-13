@@ -181,6 +181,22 @@ impl Vt {
         self.terminal.dynamic_color(DynamicColor::Cursor)
     }
 
+    /// The app-set color for palette index `i` (OSC 4), if any — `None` leaves the
+    /// index to the frontend's theme.
+    pub fn palette_color(&self, i: u8) -> Option<[u8; 3]> {
+        self.terminal.palette_color(i)
+    }
+
+    /// The whole OSC 4 override table, for a renderer resolving indexed colors.
+    pub fn palette(&self) -> &[Option<[u8; 3]>; 256] {
+        self.terminal.palette()
+    }
+
+    /// Whether the app has left the palette untouched (the common case).
+    pub fn palette_is_default(&self) -> bool {
+        self.terminal.palette_is_default()
+    }
+
     /// The task progress the app last reported (OSC 9;4), if any.
     pub fn progress(&self) -> Option<Progress> {
         self.terminal.progress()
@@ -2168,6 +2184,53 @@ mod tests {
         assert!(!vt.dump().contains("2026"), "dump leaked mode 2026");
         vt.feed_str("\x1bc");
         assert!(!vt.synchronized_output());
+    }
+
+    #[test]
+    fn osc_4_sets_the_indexed_palette_and_osc_104_resets_it() {
+        let mut vt = Vt::new(20, 5);
+        assert_eq!(vt.palette_color(1), None, "the palette starts untouched");
+
+        // A single index, then several pairs in one OSC (xterm allows both).
+        vt.feed_str("\x1b]4;1;rgb:f0f0/0000/0000\x07");
+        assert_eq!(vt.palette_color(1), Some([0xf0, 0x00, 0x00]));
+        vt.feed_str("\x1b]4;2;#00ff00;255;rgb:aaaa/bbbb/cccc\x1b\\");
+        assert_eq!(vt.palette_color(2), Some([0x00, 0xff, 0x00]));
+        assert_eq!(vt.palette_color(255), Some([0xaa, 0xbb, 0xcc]));
+
+        // A query pair sets nothing (the host answers it), and neither an
+        // unparseable spec nor an out-of-range index disturbs its neighbours.
+        vt.feed_str("\x1b]4;1;?\x07\x1b]4;1;bogus\x07\x1b]4;999;#fff\x07");
+        assert_eq!(vt.palette_color(1), Some([0xf0, 0x00, 0x00]));
+
+        // A mixed set/query OSC still applies its set.
+        vt.feed_str("\x1b]4;1;?;3;#0000ff\x07");
+        assert_eq!(vt.palette_color(3), Some([0x00, 0x00, 0xff]));
+
+        // OSC 104 with indices resets those; with none, the whole palette.
+        vt.feed_str("\x1b]104;1;2\x07");
+        assert_eq!(vt.palette_color(1), None);
+        assert_eq!(vt.palette_color(2), None);
+        assert_eq!(vt.palette_color(3), Some([0x00, 0x00, 0xff]));
+        vt.feed_str("\x1b]104\x07");
+        assert_eq!(vt.palette_color(3), None);
+        assert_eq!(vt.palette_color(255), None);
+        assert!(vt.palette_is_default());
+    }
+
+    #[test]
+    fn a_palette_override_survives_a_dump_and_a_hard_reset_clears_it() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]4;1;#ff0000;200;#00ff00\x07");
+
+        let mut reloaded = Vt::new(20, 5);
+        reloaded.feed_str(&vt.dump());
+        assert_eq!(reloaded.palette_color(1), Some([0xff, 0x00, 0x00]));
+        assert_eq!(reloaded.palette_color(200), Some([0x00, 0xff, 0x00]));
+
+        // RIS takes the palette back to the theme's.
+        vt.feed_str("\x1bc");
+        assert!(vt.palette_is_default());
     }
 
     #[test]

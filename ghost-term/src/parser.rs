@@ -176,6 +176,13 @@ pub enum Function {
     /// OSC 10/11/12 dynamic-color set (spec already parsed to 8-bit RGB) or
     /// the matching OSC 110/111/112 reset (`None`) back to the theme default.
     SetDynamicColor(DynamicColor, Option<[u8; 3]>),
+    /// OSC 4 indexed-palette set: `(index, rgb)` for every pair the sequence
+    /// carried (one OSC may set several). Query (`?`) pairs are not here — the
+    /// host answers those from the live palette.
+    SetPalette(Vec<(u8, [u8; 3])>),
+    /// OSC 104 palette reset: the indices to take back to the theme's colors, or
+    /// an empty list for "all of them".
+    ResetPalette(Vec<u8>),
     /// OSC 9;4 taskbar progress; `None` (state 0) removes it.
     SetProgress(Option<Progress>),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
@@ -1265,6 +1272,29 @@ impl Parser {
                 };
                 Some(Function::SetProgress(progress))
             }
+            // OSC 4 ; index ; spec [; index ; spec]… — set indexed palette
+            // colors. A `?` spec is a query, which the host answers from the
+            // live palette (see `ghost_vt::query`), so it sets nothing here;
+            // unparseable specs (named X11 colors) and out-of-range indices are
+            // skipped, leaving their neighbours in the same OSC untouched.
+            "4" => {
+                let mut fields = rest.split(';');
+                let mut set = Vec::new();
+                while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
+                    if let (Ok(i), Some(rgb)) = (index.parse::<u8>(), parse_color_spec(spec)) {
+                        set.push((i, rgb));
+                    }
+                }
+                (!set.is_empty()).then_some(Function::SetPalette(set))
+            }
+            // OSC 104 [; index]… — reset palette colors to the theme's; with no
+            // index, the whole palette. (`OSC 104 ;` — xterm's reset-all — has an
+            // empty `rest`, hence the filter.)
+            "104" => Some(Function::ResetPalette(
+                rest.split(';')
+                    .filter_map(|i| i.parse::<u8>().ok())
+                    .collect(),
+            )),
             // OSC 10/11/12 — set a dynamic color. Only the first spec is
             // taken (xterm's consecutive-code form is rare); the "?" query
             // form is the host's to answer, and specs we can't parse
@@ -1770,6 +1800,19 @@ fn dump_function(seq: &mut String, fun: &Function) {
                 // Resets are OSC 110/111/112.
                 None => seq.push_str(&format!("\u{1b}]1{code}\u{7}")),
             }
+        }
+
+        SetPalette(entries) => {
+            let pairs: Vec<String> = entries
+                .iter()
+                .map(|(i, [r, g, b])| format!("{i};rgb:{r:02x}/{g:02x}/{b:02x}"))
+                .collect();
+            seq.push_str(&format!("\u{1b}]4;{}\u{7}", pairs.join(";")));
+        }
+
+        ResetPalette(indices) => {
+            let list: Vec<String> = indices.iter().map(|i| i.to_string()).collect();
+            seq.push_str(&format!("\u{1b}]104;{}\u{7}", list.join(";")));
         }
 
         PromptMark(mark) => {
@@ -2774,9 +2817,28 @@ mod tests {
         assert_eq!(parse("\x1b]2;a;b;c\x07"), [SetTitle("a;b;c".to_string())]);
         // An empty title clears it.
         assert_eq!(parse("\x1b]2;\x07"), [SetTitle(String::new())]);
-        // Other OSC codes (e.g. OSC 1 icon name, OSC 4 palette) are ignored.
+        // Other OSC codes (e.g. OSC 1 icon name) are ignored.
         assert_eq!(parse("\x1b]1;icon\x07"), []);
-        assert_eq!(parse("\x1b]4;1;rgb:00/00/00\x07"), []);
+    }
+
+    #[test]
+    fn parse_osc_palette() {
+        assert_eq!(
+            parse("\x1b]4;1;rgb:ffff/0000/0000\x07"),
+            [SetPalette(vec![(1, [0xff, 0x00, 0x00])])]
+        );
+        // Several pairs in one OSC; a query pair sets nothing, and a bad spec or
+        // an out-of-range index drops that pair alone.
+        assert_eq!(
+            parse("\x1b]4;1;#ff0000;2;?;300;#fff;3;#00ff00\x1b\\"),
+            [SetPalette(vec![(1, [0xff, 0, 0]), (3, [0, 0xff, 0])])]
+        );
+        // An all-query OSC 4 is not a set at all (the host answers it).
+        assert_eq!(parse("\x1b]4;1;?\x07"), []);
+        // OSC 104: named indices, or all of them.
+        assert_eq!(parse("\x1b]104;1;2\x07"), [ResetPalette(vec![1, 2])]);
+        assert_eq!(parse("\x1b]104\x07"), [ResetPalette(vec![])]);
+        assert_eq!(parse("\x1b]104;\x07"), [ResetPalette(vec![])]);
     }
 
     #[test]
@@ -3121,6 +3183,9 @@ mod tests {
             Rm(ansi_modes([AnsiMode::Insert, AnsiMode::NewLine])),
             Scorc,
             Sd(20),
+            SetPalette(vec![(1, [0xff, 0x00, 0x00]), (200, [0x10, 0x20, 0x30])]),
+            ResetPalette(vec![]),
+            ResetPalette(vec![3, 9]),
             SetCursorStyle(0),
             SetCursorStyle(4),
             SetCursorStyle(6),
