@@ -31,6 +31,17 @@ pub enum Cmd {
         w_px: u32,
         h_px: u32,
     },
+    /// Iconify (minimize) the window, or restore it — a program asked, with
+    /// XTWINOPS `CSI 2 t` / `CSI 1 t`. As with [`Cmd::ResizeWindow`], the window
+    /// manager may ignore it.
+    SetIconified(bool),
+    /// Maximize the window, or restore it (XTWINOPS `CSI 9 ; 1 t` / `9 ; 0 t`).
+    /// The single-axis forms (`9 ; 2`, `9 ; 3`) don't come through here — no
+    /// platform maximizes one axis, so the model just re-grids and the window
+    /// follows through [`Cmd::ResizeWindow`].
+    SetMaximized(bool),
+    /// Take the window full-screen, or leave (XTWINOPS `CSI 10 ; Ps t`).
+    SetFullscreen(bool),
     /// Read the system clipboard; the shell replies `UiEvent::ClipboardText`.
     ReadClipboard,
     /// Write text to the system clipboard.

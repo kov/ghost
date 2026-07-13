@@ -53,7 +53,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// The resolved font, base size, and cell metrics for this process, read once from
 /// `ui.toml`. Resolving leaks the font bytes to `'static` (they live the whole run),
@@ -2288,6 +2288,29 @@ impl App {
                         self.resize_step(wid, s.width.max(1), s.height.max(1), scale, event_loop);
                     }
                 }
+                // The other window ops a program asked for (XTWINOPS). Like the
+                // resize above, these are *requests*: a window manager is free to
+                // ignore them, and a tiling one usually does. Whatever it does with
+                // the window, a size change comes back as a `Resized` event and
+                // re-grids the model.
+                Cmd::SetIconified(on) => {
+                    if let Some(w) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        w.window.set_minimized(on);
+                    }
+                }
+                Cmd::SetMaximized(on) => {
+                    if let Some(w) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        w.window.set_maximized(on);
+                    }
+                }
+                Cmd::SetFullscreen(on) => {
+                    if let Some(w) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
+                        // Borderless on the window's current monitor: exclusive
+                        // full-screen would need a video mode, which no terminal wants.
+                        w.window
+                            .set_fullscreen(on.then(|| Fullscreen::Borderless(None)));
+                    }
+                }
                 Cmd::ReadClipboard => {
                     let text = self.read_clipboard();
                     self.dispatch(wid, UiEvent::ClipboardText(text), event_loop);
@@ -3607,7 +3630,7 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let now_ms = self.now_ms();
-        let step = {
+        let (step, display) = {
             let Some(w) = self.windows.get_mut(&wid) else {
                 return;
             };
@@ -3639,9 +3662,27 @@ impl App {
                     }
                 }
             }
-            step
+            // The monitor this window is on — how far a program maximizing it can
+            // grow the grid (`CSI 19 t`). Read here because this is where a window
+            // learns it moved or changed size, monitor hops included.
+            let display = w
+                .gfx
+                .as_ref()
+                .and_then(|g| g.window.current_monitor())
+                .map(|m| m.size());
+            (step, display)
         };
         if let resize::Step::CommitNow((cw, ch, cs)) = step {
+            if let Some(display) = display {
+                self.dispatch(
+                    wid,
+                    UiEvent::DisplaySize {
+                        w_px: display.width,
+                        h_px: display.height,
+                    },
+                    event_loop,
+                );
+            }
             self.dispatch(
                 wid,
                 UiEvent::Resize {

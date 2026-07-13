@@ -11,7 +11,7 @@ use crate::line::Line;
 use crate::links::Links;
 use crate::parser::{
     AnsiMode, AnsiModes, CtcOp, DecMode, DecModes, DynamicColor, EdScope, ElScope, Function,
-    Progress, SgrOp, SgrOps, SpecialColor, TbcScope, XtwinopsOp, SPECIAL_COLOR_BASE,
+    Progress, SgrOp, SgrOps, SpecialColor, TbcScope, TitleTarget, XtwinopsOp, SPECIAL_COLOR_BASE,
 };
 use crate::pen::{Intensity, Pen, Protection};
 use crate::tabs::Tabs;
@@ -114,13 +114,30 @@ pub struct Terminal {
     saved_ctx: SavedCtx,
     alternate_saved_ctx: SavedCtx,
     dirty_lines: DirtyLines,
+    /// Whether the window ops (XTWINOPS, `CSI … t`) are honoured at all — xterm's
+    /// `allowWindowOps`. On: a program can resize the grid, and ask the frontend
+    /// to iconify, maximize or go full-screen.
     xtwinops: bool,
+    /// The window ops the emulator can't perform itself, queued for the frontend
+    /// to (see [`Terminal::take_window_ops`]). Transient: what a window is doing
+    /// now is the window's state, not the screen's, so it is not dumped.
+    window_ops: Vec<XtwinopsOp>,
     /// Enabled non-display modes (mouse/focus/paste). Tracked but not rendered;
     /// re-emitted on dump so they survive a reattach.
     tracked_modes: BTreeSet<DecMode>,
     /// Current window title (OSC 0/2). Tracked but not rendered; re-emitted on
     /// dump so it survives a reattach.
     title: String,
+    /// Current icon label (OSC 0/1) — what `CSI 20 t` reports. Ghost has no icon
+    /// to label, so this is *only* kept and reported back; a program that hides
+    /// its window title behind an icon label still reads back what it set.
+    icon_title: String,
+    /// The XTWINOPS title stack (`CSI 22/23 t`): a program pushes its titles, does
+    /// its worst, and pops them back. **One** stack, as in xterm — an entry holds
+    /// whichever titles were pushed, so pushing both and popping only the icon
+    /// consumes the entry, and a window pop after it finds nothing to restore.
+    /// Bounded, so output that pushes in a loop costs bounded memory.
+    title_stack: Vec<TitleStackEntry>,
     /// Number of BEL (0x07) controls executed. Ephemeral (never dumped); lets a
     /// host detect that the terminal rang the bell.
     bell_count: u64,
@@ -296,9 +313,12 @@ impl Terminal {
             saved_ctx: SavedCtx::default(),
             alternate_saved_ctx: SavedCtx::default(),
             dirty_lines,
-            xtwinops: false,
+            xtwinops: true,
+            window_ops: Vec::new(),
             tracked_modes: BTreeSet::new(),
             title: String::new(),
+            icon_title: String::new(),
+            title_stack: Vec::new(),
             links: Links::default(),
             clipboard_writes: Vec::new(),
             prompt_marks: VecDeque::new(),
@@ -875,8 +895,13 @@ impl Terminal {
                 }
             }
 
-            SetTitle(title) => {
-                self.title = title;
+            SetTitle(target, title) => {
+                if target.icon() {
+                    self.icon_title = title.clone();
+                }
+                if target.window() {
+                    self.title = title;
+                }
             }
 
             Sgr(params) => {
@@ -1486,6 +1511,8 @@ impl Terminal {
         self.dirty_lines = DirtyLines::new(self.rows);
         self.tracked_modes.clear();
         self.title.clear();
+        self.icon_title.clear();
+        self.title_stack.clear();
         self.graphics.reset();
         self.links.clear();
         self.clipboard_writes.clear();
@@ -1620,6 +1647,18 @@ impl Terminal {
     /// The attached frontend applies them; the detached host discards them.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
         mem::take(&mut self.clipboard_writes)
+    }
+
+    /// Drain the window ops (XTWINOPS) a program asked for and the emulator can't
+    /// perform: iconify, maximize, full-screen. The attached frontend carries them
+    /// out; a detached host has no window and discards them.
+    pub fn take_window_ops(&mut self) -> Vec<XtwinopsOp> {
+        mem::take(&mut self.window_ops)
+    }
+
+    /// The icon label a program last set (OSC 0/1) — what `CSI 20 t` reports.
+    pub fn icon_title(&self) -> &str {
+        &self.icon_title
     }
 
     /// The OSC 10/11/12 dynamic-color override for `target`, if an app set
@@ -2676,13 +2715,53 @@ impl Terminal {
         self.move_cursor_home();
     }
 
+    /// A window op: the two that only move the character grid are the emulator's
+    /// to do; the rest ask something of the *window* (iconify, maximize, …), which
+    /// only the frontend can grant, and are queued for it — a maximize also
+    /// re-grids us, but to a size that depends on the display, which the emulator
+    /// has no business knowing.
     fn xtwinops(&mut self, op: XtwinopsOp) {
-        if self.xtwinops {
-            let XtwinopsOp::Resize(cols, rows) = op;
-            let cols = as_usize(cols, self.cols);
-            let rows = as_usize(rows, self.rows);
-
-            self.resize(cols, rows);
+        if !self.xtwinops {
+            return;
+        }
+        match op {
+            // A grid given outright is ours to apply. One with a zero — xterm's
+            // "as big as the display" — is the frontend's: the emulator has no
+            // display. So is any resize in pixels; a cell's size is not ours either.
+            XtwinopsOp::Resize(Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
+                self.resize(cols as usize, rows as usize);
+            }
+            // DECSLPP: the height alone.
+            XtwinopsOp::SetLines(rows) => {
+                let rows = as_usize(rows, self.rows);
+                self.resize(self.cols, rows);
+            }
+            // The title stack is ours: we hold the titles. A push keeps both of
+            // them, whichever it names (see `TitleStackEntry`).
+            XtwinopsOp::PushTitle(_) => {
+                if self.title_stack.len() == MAX_TITLE_STACK {
+                    self.title_stack.remove(0);
+                }
+                self.title_stack.push(TitleStackEntry {
+                    window: self.title.clone(),
+                    icon: self.icon_title.clone(),
+                });
+            }
+            // A pop spends the top entry and restores only the title(s) it names —
+            // so popping the icon out of an entry, then the window, leaves the
+            // window title alone: the second pop finds an empty stack. A pop of
+            // nothing at all is a no-op, as in xterm.
+            XtwinopsOp::PopTitle(target) => {
+                if let Some(entry) = self.title_stack.pop() {
+                    if target.window() {
+                        self.title = entry.window;
+                    }
+                    if target.icon() {
+                        self.icon_title = entry.icon;
+                    }
+                }
+            }
+            op => self.window_ops.push(op),
         }
     }
 
@@ -3239,9 +3318,27 @@ impl Terminal {
             funs.push(Function::Decset(DecModes::one(mode)));
         }
 
-        // 16. restore the window title (OSC 0/2).
-        if !self.title.is_empty() {
-            funs.push(Function::SetTitle(self.title.clone()));
+        // 16. restore the window title (OSC 0/2) and the icon label (OSC 0/1) —
+        // one sequence when they agree, which is the common case (a program that
+        // sets a title usually sets both). The title *stack* is not restored: a
+        // reattach is not the pop a program pushed for, and replaying its pushes
+        // would leave it holding titles it never sees.
+        match (self.title.is_empty(), self.icon_title.is_empty()) {
+            (true, true) => {}
+            _ if self.title == self.icon_title => {
+                funs.push(Function::SetTitle(TitleTarget::Both, self.title.clone()));
+            }
+            (title_empty, icon_empty) => {
+                if !title_empty {
+                    funs.push(Function::SetTitle(TitleTarget::Window, self.title.clone()));
+                }
+                if !icon_empty {
+                    funs.push(Function::SetTitle(
+                        TitleTarget::Icon,
+                        self.icon_title.clone(),
+                    ));
+                }
+            }
         }
 
         // 17. restore the reported task progress (OSC 9;4), if any.
@@ -3552,6 +3649,22 @@ fn as_u16(value: usize) -> u16 {
     value
         .try_into()
         .expect("terminal dump parameter exceeds u16 range")
+}
+
+/// How deep a program may push the title stack. xterm has no limit; ghost keeps
+/// one, so output that pushes in a loop costs bounded memory. Past it the oldest
+/// entry falls off the bottom — the pushes a program actually pops are the recent
+/// ones.
+const MAX_TITLE_STACK: usize = 32;
+
+/// One entry of the XTWINOPS title stack. A push records *both* titles whatever
+/// it names — the `Ps` picks what a **pop** restores, not what is kept (xterm:
+/// push the icon label, then the window title, then pop both, and both come back,
+/// out of the one entry the second push made).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TitleStackEntry {
+    window: String,
+    icon: String,
 }
 
 fn as_usize(value: u16, default: usize) -> usize {

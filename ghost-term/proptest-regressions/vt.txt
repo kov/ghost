@@ -7,3 +7,4 @@
 cc c3bc27a2f071055fa3f9d743c53d4996305f5e3175f988eee3a6b93f2e3c87c5 # shrinks to input = [' ', ' ', ' ', ' ', ' ', '⺀', '⺀', ' ', ' ', '\r', '\u{fe00}']
 cc 49e48206c49c41903e19d5178cdf1a00b44feccd3b890e04e336c5dfafc45954 # shrinks to input = ['\u{1b}', 'V', '\u{1b}', '[', 's']
 cc 91db43923bfe55c45e1d09122732be1c5ce3a9c5ac23bbae9e3304440d98d5e5 # shrinks to input = ['\u{1b}', 'V', 'ﬀ', 'ﬀ', ' ', '⺀', ' ', ' ', '⺀', ' ']
+cc 655c248292898da2bd29259ca53b4a169abc76203dbdcae94b852dc60cdae36e # shrinks to input = ['\u{1b}', '[', '2', '4', 't']

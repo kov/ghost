@@ -96,7 +96,7 @@ pass/fail. (An early version of this harness used `--force` and reported wildly
 inflated pass counts — don't repeat that.)
 
 **Honest baseline (no `--force`):** the whole suite (`INCLUDE='.'`) runs
-**442 pass / 45 known bugs / 81 fail**. The failures cluster into real, tracked
+**471 pass / 43 known bugs / 54 fail**. The failures cluster into real, tracked
 feature gaps — what's left is listed under "Still open" at the end:
 
 - **Selective erase / ISO protection** — ✅ **DONE** (slice 7). Cells carry a
@@ -252,7 +252,45 @@ feature gaps — what's left is listed under "Still open" at the end:
   `ResetSpecialColor` 4/1, `ChangeColor`/`ChangeDynamicColor` clean but for the
   color-space specs below.
 
-**Still open** (the 81 failures, biggest first — measured with a full
+- **XTWINOPS window ops** — ✅ **DONE** (slice 13), but for the two that Wayland
+  forbids. `xtwinops` had been dead code inherited from avt (initialised `false`,
+  never set), so *every* window op was ignored, `CSI 8 t` included. It is on now,
+  and the ops split by who can actually do them:
+  - The **emulator** does what is only the grid: `CSI 8 t` with both dimensions
+    given, and DECSLPP (`CSI Ps t`, `Ps` ≥ 24 — a page height). It also owns the
+    **title stack** (`CSI 22/23 t`), since it holds the titles. One stack, as in
+    xterm: a push records *both* titles whichever it names, and the `Ps` picks what
+    a **pop** restores — so pushing both and popping the icon spends the entry, and
+    the window pop behind it finds nothing (`PushIconAndWindow_PopIcon` pins
+    exactly that). Along with it: **OSC 1** (the icon label), which ghost had been
+    dropping — it is kept, never shown (there is no icon), and reported by
+    `CSI 20 t`.
+  - The **frontend** does what needs a window or a display, over the seam slice 8
+    built (model asks → shell performs → the window's real size comes back as an
+    event and wins): iconify (`CSI 1/2 t`), maximize (`CSI 9 ; Ps t`, one axis or
+    both), full-screen (`CSI 10 ; Ps t`), and any resize that needs measuring —
+    a *zero* dimension (xterm: "as big as the display fits") or one in pixels
+    (`CSI 4 t`). New `Cmd::Set{Iconified,Maximized,Fullscreen}` reach winit; a new
+    `UiEvent::DisplaySize` tells the model which monitor it is on. A window manager
+    is free to refuse any of it — a program reads back what it asked for, which is
+    all xterm promises.
+  - A parser gap fell out of it: an **omitted** parameter and an explicit **zero**
+    were indistinguishable (both read as 0), and the window ops tell them apart
+    (omitted keeps the dimension, zero means "the display's"). `Param` now records
+    whether a digit was ever given — which also makes a dump of a half-parsed CSI
+    resume into the state it left, instead of writing omitted parameters back as
+    `0`.
+  - The reports the ops are checked against: `CSI 11 t` (iconified), `CSI 14 t`
+    (text area px), `CSI 15 t` (display px), `CSI 16 t` (cell px), `CSI 19 t`
+    (display in characters), `CSI 20/21 t` (the titles). Note the request code and
+    the reply code differ — ask with 15, hear back a `5`. A **headless** host has no
+    window to measure, so it answers from a nominal display
+    (`ghost_vt::query::NOMINAL_*`), measured in *its own* cell so that the pixel
+    and the character answers describe the same display.
+
+  `XtermWinops` **34/2**, `RIS_ResetTitleMode` passes.
+
+**Still open** (the 54 failures, biggest first — measured with a full
 `INCLUDE='.'` sweep, so these counts are honest):
 
 - **X11 color-space specs** (21): the `rgbi:` / `CIEXYZ:` / `CIEuvY:` / `CIExyY:`
@@ -275,15 +313,19 @@ feature gaps — what's left is listed under "Still open" at the end:
   back to the theme's foreground, which is what the user configured and what the
   other terminals do. The test bakes in an assumption about xterm's startup
   resources; not a gap we intend to close.
-- **XTWINOPS** (~28): window ops — iconify, position, maximize, the title stack.
-  `Cmd::ResizeWindow` (slice 8) is the plumbing a real `CSI 8;h;w t` would need,
-  but several of these need a window manager the headless harness can't drive.
+- **`XtermWinops_MoveToXY`** (2): move the window to a position, and read the
+  position back (`CSI 3 t`, `CSI 13 t`). **Deliberately not implemented.** A
+  Wayland client cannot position itself or learn where it is — that is the
+  protocol, not a gap in winit — and Wayland is ghost's first target. A terminal
+  that lies about its position is worse than one that says nothing, so these stay
+  unanswered. (Under X11 they would be a few lines; revisit if an X11 backend
+  ever matters.)
 - **DECDSR** (~11): the niche device-status reports (printer, keyboard, locator).
 - **DECRQSS** (6): the selectors we don't answer —
   DECSACE/DECSASD/DECSCL/DECSLPP/DECSNLS/DECSSDT.
 - **DA / DA2 / DECID** (5): device-attribute strings.
 - Odds and ends: `XtermSave`, `SCORC`, `DECRC`, `DECSET_ALTBUF`/`MoreFix`,
-  `RIS_ResetTitleMode`, `DECSET_TiteInhibit`.
+  `DECSET_TiteInhibit`.
 
 **Note on `--include`:** the regex is `re.search` over `Class.test_name`, so
 `EL` also matches `CIELab`/`CIELuv`. Anchor when you mean a family — `^EL` /

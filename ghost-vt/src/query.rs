@@ -34,6 +34,30 @@ pub enum Query {
     TertiaryDeviceAttributes,
     /// `CSI 18 t` — report text-area size in characters. Reply: `CSI 8 ; rows ; cols t`.
     TextAreaSize,
+    /// `CSI 19 t` — report the *display's* size in characters: how big the text
+    /// area could grow. Reply: `CSI 9 ; rows ; cols t`. A program maximizing the
+    /// window reads this to know what it should have got.
+    DisplaySize,
+    /// `CSI 11 t` — report whether the window is iconified. Reply: `CSI 1 t` when
+    /// it is open, `CSI 2 t` when it is iconified.
+    WindowState,
+    /// `CSI 14 t` — report the text area's size in pixels. Reply: `CSI 4 ; height ;
+    /// width t`. `CSI 15 t` reports the display's, as `CSI 5 ; height ; width t`,
+    /// and `CSI 16 t` a single cell's, as `CSI 6 ; height ; width t` — between them
+    /// a program can do the arithmetic a pixel resize needs. (The request code and
+    /// the reply code differ, as xterm has them: ask with 15, hear back a 5.)
+    TextAreaSizePixels,
+    DisplaySizePixels,
+    CellSizePixels,
+    /// `CSI 21 t` / `CSI 20 t` — report the window title, and the icon label.
+    /// Replies `OSC l <title> ST` and `OSC L <label> ST`. Ghost carries one title
+    /// and answers both with it: it has no separate icon label to keep.
+    ///
+    /// Reported verbatim. xterm can hex-encode a title (its `CSI > Ps t` title
+    /// modes), which ghost does not do — no program asks a terminal for a hex
+    /// title, and tracking a mode we would not act on is worse than not having it.
+    WindowTitle,
+    IconLabel,
     /// `CSI ? u` — kitty keyboard protocol flags query. Reply: `CSI ? flags u`
     /// with the terminal's current progressive-enhancement flags. Answering it
     /// (before the DA reply) is how an app detects kitty-keyboard support.
@@ -163,6 +187,20 @@ pub struct ReplyCtx<'a> {
     pub cursor: (u16, u16),
     /// `(cols, rows)` text-area size.
     pub size: (u16, u16),
+    /// `(cols, rows)` the display could hold — the size a maximized window's grid
+    /// takes, for `CSI 19 t`. A host with no window answers from a nominal display.
+    pub display_size: (u16, u16),
+    /// Whether the window is iconified (minimized), for `CSI 11 t`.
+    pub iconified: bool,
+    /// The text area's size in pixels (`CSI 14 t`), the display's (`CSI 5 t`), and
+    /// one cell's (`CSI 6 t`) — the three a program needs to resize in pixels.
+    pub size_px: (u32, u32),
+    pub display_px: (u32, u32),
+    pub cell_px: (u32, u32),
+    /// The window title (OSC 0/2), for `CSI 21 t`.
+    pub title: &'a str,
+    /// The icon label (OSC 0/1), for `CSI 20 t`.
+    pub icon_title: &'a str,
     /// Current kitty-keyboard progressive-enhancement flags.
     pub kitty_flags: u8,
     /// The cursor style as a steady DECSCUSR digit (2 block, 4 underline,
@@ -206,6 +244,20 @@ pub struct ReplyCtx<'a> {
 fn xterm_rgb([r, g, b]: [u8; 3]) -> String {
     format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
 }
+
+/// The display size, in characters, a host with no window answers `CSI 19 t`
+/// with — a 1920×1080 display at ghost's default cell. Nothing can be measured
+/// while detached, and a program that maximizes needs *some* answer to check its
+/// arithmetic against; an attached frontend reports the real monitor.
+pub const NOMINAL_DISPLAY_CHARS: (u16, u16) = (213, 51);
+
+/// The same nominal display, in pixels (`CSI 5 t`).
+pub const NOMINAL_DISPLAY_PX: (u32, u32) = (1920, 1080);
+
+/// The cell a window with no renderer answers `CSI 6 t` with — ghost's default
+/// font at its default size. `NOMINAL_DISPLAY_CHARS` is this cell into that
+/// display, so the two reports agree with each other.
+pub const NOMINAL_CELL_PX: (u32, u32) = (9, 21);
 
 /// The color numbers an OSC 4/OSC 5 body asks about: the `c` of every `c ; ?`
 /// pair, in the order asked, keeping only those `exists` names (the sets and
@@ -317,6 +369,28 @@ impl Query {
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
             Query::TertiaryDeviceAttributes => b"\x1bP!|00000000\x1b\\".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
+            Query::DisplaySize => {
+                let (cols, rows) = ctx.display_size;
+                format!("\x1b[9;{rows};{cols}t").into_bytes()
+            }
+            Query::WindowState => {
+                let ps = if ctx.iconified { 2 } else { 1 };
+                format!("\x1b[{ps}t").into_bytes()
+            }
+            Query::TextAreaSizePixels => {
+                let (w, h) = ctx.size_px;
+                format!("\x1b[4;{h};{w}t").into_bytes()
+            }
+            Query::DisplaySizePixels => {
+                let (w, h) = ctx.display_px;
+                format!("\x1b[5;{h};{w}t").into_bytes()
+            }
+            Query::CellSizePixels => {
+                let (w, h) = ctx.cell_px;
+                format!("\x1b[6;{h};{w}t").into_bytes()
+            }
+            Query::WindowTitle => format!("\x1b]l{}\x1b\\", ctx.title).into_bytes(),
+            Query::IconLabel => format!("\x1b]L{}\x1b\\", ctx.icon_title).into_bytes(),
             Query::KittyKeyboardFlags => format!("\x1b[?{}u", ctx.kitty_flags).into_bytes(),
             Query::TerminalVersion => {
                 format!("\x1bP>|ghost {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
@@ -693,9 +767,19 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
             b"=" | b"=0" => Some(Query::TertiaryDeviceAttributes),
             _ => None,
         },
-        // Window ops — only the text-area-size request (18) is a query we answer.
+        // Window ops: the ones that *ask* something. The ones that change the
+        // window are the emulator's and the frontend's (`ghost_term::XtwinopsOp`).
         b't' => match params {
+            b"11" => Some(Query::WindowState),
+            // `14` is the text area, `14;2` the whole window. Ghost draws no
+            // decorations of its own, so the two are the same pixels.
+            b"14" | b"14;2" => Some(Query::TextAreaSizePixels),
+            b"15" => Some(Query::DisplaySizePixels),
+            b"16" => Some(Query::CellSizePixels),
             b"18" => Some(Query::TextAreaSize),
+            b"19" => Some(Query::DisplaySize),
+            b"20" => Some(Query::IconLabel),
+            b"21" => Some(Query::WindowTitle),
             _ => None,
         },
         // kitty keyboard flags query: `CSI ? u`. A bare `CSI u` (empty params) is
@@ -877,6 +961,13 @@ mod tests {
         ReplyCtx {
             cursor: (1, 1),
             size: (80, 24),
+            display_size: NOMINAL_DISPLAY_CHARS,
+            iconified: false,
+            size_px: (720, 432),
+            display_px: NOMINAL_DISPLAY_PX,
+            cell_px: NOMINAL_CELL_PX,
+            title: "",
+            icon_title: "",
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),
@@ -1061,6 +1152,28 @@ mod tests {
         // Sets and resets are not queries.
         assert!(scan_all(b"\x1b]5;0;#ff0000\x07").is_empty());
         assert!(scan_all(b"\x1b]105;0\x07").is_empty());
+    }
+
+    #[test]
+    fn window_state_and_display_size_answer_the_window_op_reports() {
+        assert_eq!(scan_all(b"\x1b[11t"), [Query::WindowState]);
+        assert_eq!(scan_all(b"\x1b[19t"), [Query::DisplaySize]);
+        // The ops that *change* the window are not queries — the emulator has them.
+        assert!(scan_all(b"\x1b[2t").is_empty());
+        assert!(scan_all(b"\x1b[9;1t").is_empty());
+
+        let open = ReplyCtx {
+            display_size: (200, 60),
+            ..ctx()
+        };
+        assert_eq!(Query::WindowState.reply(&open), b"\x1b[1t");
+        assert_eq!(Query::DisplaySize.reply(&open), b"\x1b[9;60;200t");
+
+        let iconified = ReplyCtx {
+            iconified: true,
+            ..ctx()
+        };
+        assert_eq!(Query::WindowState.reply(&iconified), b"\x1b[2t");
     }
 
     #[test]

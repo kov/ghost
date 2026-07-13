@@ -655,6 +655,25 @@ fn host_main(
                         let ctx = crate::query::ReplyCtx {
                             cursor: screen.cursor_report(),
                             size: screen.dimensions(),
+                            // Detached: no window to iconify, and no display to
+                            // maximize onto — answer from the nominal one, so a
+                            // program's arithmetic stays sane until a client attaches.
+                            display_size: crate::query::NOMINAL_DISPLAY_CHARS,
+                            iconified: false,
+                            // No window, so no true pixel sizes: report the nominal
+                            // display and the cell a client would draw at, so a
+                            // program's pixel arithmetic still adds up.
+                            size_px: {
+                                let (cols, rows) = screen.dimensions();
+                                (
+                                    u32::from(cols) * crate::query::NOMINAL_CELL_PX.0,
+                                    u32::from(rows) * crate::query::NOMINAL_CELL_PX.1,
+                                )
+                            },
+                            display_px: crate::query::NOMINAL_DISPLAY_PX,
+                            cell_px: crate::query::NOMINAL_CELL_PX,
+                            title: screen.title(),
+                            icon_title: screen.icon_title(),
                             kitty_flags: screen.kitty_keyboard_flags(),
                             cursor_style: crate::query::decscusr_digit(screen.vt().cursor().shape),
                             left_right_margins: (lm as u16, rm as u16),

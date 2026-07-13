@@ -161,6 +161,13 @@ impl Vt {
         self.terminal.hyperlink(id)
     }
 
+    /// Drain the window ops (XTWINOPS) a program asked for that only the window
+    /// can grant — iconify, maximize, full-screen. The grid-only ones (`CSI 8 t`,
+    /// DECSLPP) the emulator has already done itself.
+    pub fn take_window_ops(&mut self) -> Vec<parser::XtwinopsOp> {
+        self.terminal.take_window_ops()
+    }
+
     /// Drain the decoded OSC 52 clipboard writes queued while feeding output.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardSelection, String)> {
         self.terminal.take_clipboard_writes()
@@ -224,6 +231,12 @@ impl Vt {
     /// Exit status reported by the most recent OSC 133;D, if it carried one.
     pub fn last_exit_status(&self) -> Option<i32> {
         self.terminal.last_exit_status()
+    }
+
+    /// The icon label a program last set (OSC 0/1) — reported by `CSI 20 t`.
+    /// Ghost has no icon: it is kept so a program reads back what it set.
+    pub fn icon_title(&self) -> &str {
+        self.terminal.icon_title()
     }
 
     pub fn title(&self) -> &str {
@@ -2240,6 +2253,109 @@ mod tests {
     }
 
     #[test]
+    fn the_window_ops_that_only_move_the_grid_are_the_emulators_to_do() {
+        let mut vt = Vt::new(80, 24);
+
+        // `CSI 8 ; rows ; cols t` with both dimensions given re-grids us outright.
+        vt.feed_str("\x1b[8;10;90t");
+        assert_eq!(vt.size(), (90, 10));
+
+        // DECSLPP (a lone Ps ≥ 24) sets the page height, and only the height.
+        vt.feed_str("\x1b[30t");
+        assert_eq!(vt.size(), (90, 30));
+
+        assert!(
+            vt.take_window_ops().is_empty(),
+            "a grid given outright needs nothing of the window"
+        );
+
+        // A zero dimension means "as big as the display fits", and an omitted one
+        // means "keep it" — neither is the emulator's to resolve (it has no
+        // display), so both go to the frontend, grid untouched.
+        vt.feed_str("\x1b[8;0;100t");
+        assert_eq!(
+            vt.take_window_ops(),
+            [crate::parser::XtwinopsOp::Resize(Some(100), Some(0))]
+        );
+        vt.feed_str("\x1b[8;;100t");
+        assert_eq!(
+            vt.take_window_ops(),
+            [crate::parser::XtwinopsOp::Resize(Some(100), None)]
+        );
+        assert_eq!(vt.size(), (90, 30), "and the emulator re-grids for neither");
+    }
+
+    #[test]
+    fn the_title_stack_gives_a_program_its_old_title_back() {
+        let mut vt = Vt::new(20, 5);
+        vt.feed_str("\x1b]1;icon\x07\x1b]2;window\x07");
+        assert_eq!(vt.title(), "window");
+        assert_eq!(vt.icon_title(), "icon");
+
+        // Push both, scribble over them, pop them back.
+        vt.feed_str("\x1b[22;0t\x1b]0;scratch\x07");
+        assert_eq!(vt.title(), "scratch");
+        assert_eq!(vt.icon_title(), "scratch");
+        vt.feed_str("\x1b[23;0t");
+        assert_eq!(vt.title(), "window");
+        assert_eq!(vt.icon_title(), "icon");
+
+        // A push keeps *both* titles whichever it names — the name picks what a pop
+        // restores. So pushing the window title and popping both brings the icon
+        // label back too: it was in the entry all along.
+        vt.feed_str("\x1b[22;2t\x1b]0;scratch\x07\x1b[23;0t");
+        assert_eq!(vt.title(), "window");
+        assert_eq!(vt.icon_title(), "icon");
+
+        // One stack, not one per title: popping the icon out of an entry that
+        // carried both *spends* it, so the window pop behind it finds nothing —
+        // the window title stays as it was, which is what xterm does.
+        vt.feed_str("\x1b]1;i\x07\x1b]2;w\x07\x1b[22;0t\x1b]0;scratch\x07");
+        vt.feed_str("\x1b[23;1t");
+        assert_eq!(vt.icon_title(), "i", "the icon label came back");
+        assert_eq!(
+            vt.title(),
+            "scratch",
+            "the window title is not popped by it"
+        );
+        vt.feed_str("\x1b[23;2t");
+        assert_eq!(
+            vt.title(),
+            "scratch",
+            "and the entry is spent — this pop restores nothing"
+        );
+
+        // Titles and stacks are the program's; RIS takes them all away.
+        vt.feed_str("\x1b]2;t\x07\x1b[22;0t\x1bc");
+        assert_eq!(vt.title(), "");
+        assert_eq!(vt.icon_title(), "");
+        vt.feed_str("\x1b[23;0t");
+        assert_eq!(vt.title(), "", "nothing left on the stack to pop");
+    }
+
+    #[test]
+    fn the_window_ops_the_emulator_cannot_do_are_queued_for_the_frontend() {
+        use crate::parser::{FullscreenOp, MaximizeOp, XtwinopsOp};
+
+        let mut vt = Vt::new(80, 24);
+        vt.feed_str("\x1b[2t\x1b[9;1t\x1b[10;1t\x1b[1t");
+        assert_eq!(
+            vt.take_window_ops(),
+            [
+                XtwinopsOp::Iconify,
+                XtwinopsOp::Maximize(MaximizeOp::Both),
+                XtwinopsOp::Fullscreen(FullscreenOp::Enter),
+                XtwinopsOp::Deiconify,
+            ]
+        );
+        assert!(
+            vt.take_window_ops().is_empty(),
+            "draining leaves them behind"
+        );
+        assert_eq!(vt.size(), (80, 24), "none of them re-grids us by itself");
+    }
+
+    #[test]
     fn osc_5_sets_the_special_colors_and_osc_105_resets_them() {
         let mut vt = Vt::new(20, 5);
         assert_eq!(vt.special_color(SpecialColor::Bold), None);
@@ -2478,10 +2594,11 @@ mod tests {
         vt2.feed_str(&vt.dump());
         assert_vts_eq(&vt, &vt2);
 
-        // A later title replaces the earlier one.
+        // A later title replaces the earlier one — and `OSC 0` set the icon label
+        // with it, so that is the form the dump replays.
         vt.feed_str("\x1b]0;renamed\x07");
         let dump = vt.dump();
-        assert!(dump.contains("\x1b]2;renamed\x07"));
+        assert!(dump.contains("\x1b]0;renamed\x07"));
         assert!(!dump.contains("my session"));
     }
 
@@ -2682,9 +2799,13 @@ mod tests {
         #[test]
         fn prop_dump(input in gen_input(25)) {
             let mut vt1 = Vt::new(10, 5);
-            let mut vt2 = Vt::new(10, 5);
-
             vt1.feed_str(&(input.into_iter().collect::<String>()));
+
+            // A program can re-grid the terminal from its own output (DECCOLM, and
+            // the window ops), so a dump replays into a terminal of the size it
+            // ended at — which is what a host, who knows the session's size, does.
+            let (cols, rows) = vt1.size();
+            let mut vt2 = Vt::new(cols, rows);
             vt2.feed_str(&vt1.dump());
 
             assert_vts_eq(&vt1, &vt2);

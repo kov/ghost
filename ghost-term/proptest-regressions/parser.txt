@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 103682dc384553a3265214e0f5f5aaea16e2f7e4d8c51e539eb115c5af04b43f # shrinks to input = ['\u{1b}', '\u{1b}', '\u{1b}', '\u{1b}', '\u{1b}', '\u{1b}', '\u{9b}', ';'], split = 8

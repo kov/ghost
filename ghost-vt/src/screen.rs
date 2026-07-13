@@ -232,6 +232,13 @@ impl Screen {
         self.vt.take_clipboard_writes()
     }
 
+    /// Drain the window ops (XTWINOPS) a program asked for that the emulator can't
+    /// carry out — iconify, maximize, full-screen. An attached frontend performs
+    /// them; a detached host has no window and drains them into the void.
+    pub fn take_window_ops(&mut self) -> Vec<ghost_term::XtwinopsOp> {
+        self.vt.take_window_ops()
+    }
+
     /// The colors OSC 10/11/12 (and the `?996` color-scheme) queries answer
     /// with: an app-set dynamic override (OSC 10/11/12 set forms) wins over
     /// `theme`, the frontend's configured scheme.
@@ -313,6 +320,11 @@ impl Screen {
     }
 
     /// The terminal's window title (OSC 0/2), empty if none has been set.
+    /// The icon label a program set (OSC 0/1), for the `CSI 20 t` report.
+    pub fn icon_title(&self) -> &str {
+        self.vt.icon_title()
+    }
+
     pub fn title(&self) -> &str {
         self.vt.title()
     }

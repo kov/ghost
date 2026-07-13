@@ -16,7 +16,7 @@
 use ghost_render::{
     Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
-use ghost_term::{ClipboardSelection, Line, MouseProtocol};
+use ghost_term::{ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp};
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
 
@@ -176,6 +176,22 @@ pub struct TerminalModel {
     /// scale, so a HiDPI display and a zoom level compose.
     zoom: f32,
     size_px: (u32, u32),
+    /// Size (physical px) of the display the window is on, from
+    /// [`UiEvent::DisplaySize`] — how far a maximizing program can grow the grid,
+    /// and what `CSI 19 t` reports. `None` until the shell says (a headless model
+    /// never hears): a nominal display then stands in, so a program's arithmetic
+    /// still adds up.
+    display_px: Option<(u32, u32)>,
+    /// Whether a program has iconified the window (XTWINOPS `CSI 2 t`), for
+    /// `CSI 11 t`. What the window manager did with the request is its own
+    /// business — this is what the program asked for and what it reads back.
+    iconified: bool,
+    /// Whether the window is maximized or full-screen at a program's asking, and
+    /// the grid it had before — restoring (`CSI 9 ; 0 t`, `CSI 10 ; 0 t`) puts the
+    /// grid back rather than guessing a size.
+    maximized: bool,
+    fullscreen: bool,
+    restore_grid: Option<(u16, u16)>,
     /// Inner padding in *logical* px per side between the grid and the window edges.
     /// Scaled by the device factor (not zoom — it's a fixed window-space border) into
     /// [`Self::pad_px`], which insets the grid, the scene item rect, pointer
@@ -340,6 +356,11 @@ impl TerminalModel {
             scale: 1.0,
             zoom: 1.0,
             size_px,
+            display_px: None,
+            iconified: false,
+            maximized: false,
+            fullscreen: false,
+            restore_grid: None,
             pad: 0.0,
             screen,
             scanner: QueryScanner::new(),
@@ -610,6 +631,10 @@ impl TerminalModel {
             } => self.pointer(phase, button, pos, mods, wheel_dy, clicks),
             UiEvent::Focus(focused) => self.focus(focused),
             UiEvent::Resize { w_px, h_px, scale } => self.resize(w_px, h_px, scale as f32),
+            UiEvent::DisplaySize { w_px, h_px } => {
+                self.display_px = Some((w_px, h_px));
+                Vec::new()
+            }
             UiEvent::ClipboardText(text) => self.paste(text),
             UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, &bytes, ended),
             UiEvent::SessionDisconnected { name } => self.set_reconnecting(&name, true),
@@ -679,6 +704,131 @@ impl TerminalModel {
             .ceil()
             .max(1.0);
         (w as u32, h as u32)
+    }
+
+    /// One dimension of an XTWINOPS resize: omitted keeps what it has, zero is
+    /// xterm's "as much as the display fits", anything else is itself.
+    fn fit_dimension(asked: Option<u16>, current: u16, display: u16) -> u16 {
+        match asked {
+            None => current,
+            Some(0) => display,
+            Some(n) => n,
+        }
+    }
+
+    /// The grid a window filling the whole display would hold — what a maximized
+    /// or full-screen program gets, and what `CSI 19 t` reports. Until the shell
+    /// says how big the display is (a headless model is never told), the nominal
+    /// one stands in — but measured in *our* cell, so the grid we report and the
+    /// pixels we report are the same display. A program that maximizes and then
+    /// checks its arithmetic finds it adds up.
+    fn display_grid(&self) -> (u16, u16) {
+        let (w_px, h_px) = self
+            .display_px
+            .unwrap_or(ghost_vt::query::NOMINAL_DISPLAY_PX);
+        let m = self.effective_metrics();
+        let pad = self.pad_px();
+        let cols = ((w_px as f32 - 2.0 * pad).max(0.0) / m.advance)
+            .floor()
+            .max(1.0);
+        let rows = ((h_px as f32 - 2.0 * pad).max(0.0) / m.line_height)
+            .floor()
+            .max(1.0);
+        (cols as u16, rows as u16)
+    }
+
+    /// Carry out the window ops the emulator queued for us (see
+    /// [`ghost_term::XtwinopsOp`]). The ones that grow the window re-grid the
+    /// screen here — the emulator can't, since the size depends on the display —
+    /// and the caller's grid reconciliation turns that into the window resize and
+    /// the child's SIGWINCH, exactly as for a DECCOLM.
+    ///
+    /// The window may of course refuse any of it; a program reads back what it
+    /// asked for, which is all xterm promises it.
+    fn apply_window_ops(&mut self) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for op in self.screen.take_window_ops() {
+            let (cols, rows) = (self.cols, self.rows);
+            let (display_cols, display_rows) = self.display_grid();
+            match op {
+                XtwinopsOp::Iconify => {
+                    self.iconified = true;
+                    cmds.push(Cmd::SetIconified(true));
+                }
+                XtwinopsOp::Deiconify => {
+                    self.iconified = false;
+                    cmds.push(Cmd::SetIconified(false));
+                }
+                XtwinopsOp::Maximize(op) => {
+                    let grid = match op {
+                        MaximizeOp::Both => Some((display_cols, display_rows)),
+                        MaximizeOp::Horizontally => Some((display_cols, rows)),
+                        MaximizeOp::Vertically => Some((cols, display_rows)),
+                        MaximizeOp::Restore => self.restore_grid.take(),
+                    };
+                    let leaving = op == MaximizeOp::Restore;
+                    if !leaving {
+                        self.restore_grid.get_or_insert((cols, rows));
+                    }
+                    self.maximized = !leaving;
+                    // Only a both-axes maximize is a state a window manager has;
+                    // one axis is just a size, which the re-grid below asks for.
+                    if op == MaximizeOp::Both || leaving {
+                        cmds.push(Cmd::SetMaximized(!leaving));
+                    }
+                    if let Some((cols, rows)) = grid {
+                        self.screen.resize(cols, rows);
+                    }
+                }
+                XtwinopsOp::Fullscreen(op) => {
+                    let entering = match op {
+                        FullscreenOp::Enter => true,
+                        FullscreenOp::Leave => false,
+                        FullscreenOp::Toggle => !self.fullscreen,
+                    };
+                    if entering {
+                        self.restore_grid.get_or_insert((cols, rows));
+                        self.screen.resize(display_cols, display_rows);
+                    } else if let Some((cols, rows)) = self.restore_grid.take() {
+                        self.screen.resize(cols, rows);
+                    }
+                    self.fullscreen = entering;
+                    cmds.push(Cmd::SetFullscreen(entering));
+                }
+                // A resize the emulator left to us: one with a zero dimension, which
+                // xterm reads as "as big as the display fits" — it has no display.
+                // An omitted dimension keeps the one it has.
+                XtwinopsOp::Resize(w, h) => {
+                    let cols = Self::fit_dimension(w, cols, display_cols);
+                    let rows = Self::fit_dimension(h, rows, display_rows);
+                    self.screen.resize(cols, rows);
+                }
+                // The same, in pixels: only we know how many a cell is.
+                XtwinopsOp::ResizePixels(w_px, h_px) => {
+                    let m = self.effective_metrics();
+                    let pad = self.pad_px();
+                    let cells = |px: u16, per_cell: f32| {
+                        (((f32::from(px) - 2.0 * pad).max(0.0) / per_cell).floor() as u16).max(1)
+                    };
+                    let cols = match w_px {
+                        Some(0) => display_cols,
+                        Some(px) => cells(px, m.advance),
+                        None => cols,
+                    };
+                    let rows = match h_px {
+                        Some(0) => display_rows,
+                        Some(px) => cells(px, m.line_height),
+                        None => rows,
+                    };
+                    self.screen.resize(cols, rows);
+                }
+                // The emulator does these itself: a fully-given grid, the page
+                // height, and the title stack (it holds the titles).
+                XtwinopsOp::SetLines(..) | XtwinopsOp::PushTitle(..) | XtwinopsOp::PopTitle(..) => {
+                }
+            }
+        }
+        cmds
     }
 
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
@@ -1123,6 +1273,12 @@ impl TerminalModel {
                     d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
                 )
             };
+            // The window ops a program asked for that the emulator couldn't do
+            // itself (iconify, maximize, full-screen). Carried out *before* the grid
+            // is reconciled below, so a maximize's new grid rides the same path a
+            // DECCOLM does — and so a `CSI 18 t` in this very burst already answers
+            // with it.
+            cmds.extend(self.apply_window_ops());
             // A program can resize the emulator from within the feed (DECCOLM
             // 80↔132) — the one change that comes bottom-up, from the child rather
             // than from the window. Follow it: adopt the new grid, ask the window to
@@ -1140,6 +1296,11 @@ impl TerminalModel {
                 self.scroll_offset = 0;
                 self.view_slid = true;
                 let (w_px, h_px) = self.window_px_for_grid(self.cols, self.rows);
+                // Hold the size we asked the window for, so a `CSI 14 t` in this
+                // burst reports the pixels the program just asked for rather than
+                // the ones it had. The window's next `UiEvent::Resize` — what it
+                // actually granted — overwrites this, as it does the grid.
+                self.size_px = (w_px, h_px);
                 cmds.push(Cmd::ResizeWindow { w_px, h_px });
                 cmds.push(Cmd::Resize {
                     session: self.session.clone(),
@@ -1166,6 +1327,7 @@ impl TerminalModel {
                 }
                 self.scroll_offset = capped;
             }
+            let display_size = self.display_grid();
             let screen = &self.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
             let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
@@ -1177,6 +1339,18 @@ impl TerminalModel {
             let ctx = ReplyCtx {
                 cursor: screen.cursor_report(),
                 size: screen.dimensions(),
+                display_size,
+                iconified: self.iconified,
+                size_px: self.size_px,
+                display_px: self
+                    .display_px
+                    .unwrap_or(ghost_vt::query::NOMINAL_DISPLAY_PX),
+                cell_px: {
+                    let m = self.effective_metrics();
+                    (m.advance.ceil() as u32, m.line_height.ceil() as u32)
+                },
+                title: screen.title(),
+                icon_title: screen.icon_title(),
                 kitty_flags: screen.kitty_keyboard_flags(),
                 cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
                 left_right_margins: (lm as u16, rm as u16),
@@ -1915,6 +2089,131 @@ mod tests {
 
     fn model() -> TerminalModel {
         TerminalModel::new("alpha".to_string(), 80, 24, METRICS)
+    }
+
+    /// The reply a program reading `bytes` gets back, as text (the `Cmd::SendInput`
+    /// the model answers a query with).
+    fn reply_to(m: &mut TerminalModel, bytes: &[u8]) -> String {
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: bytes.to_vec(),
+            ended: false,
+        });
+        cmds.iter()
+            .filter_map(|c| match c {
+                Cmd::SendInput { bytes, .. } => Some(String::from_utf8_lossy(bytes).into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_program_maximizing_the_window_gets_the_display_sized_grid_it_reads_back() {
+        let mut m = model();
+        // A 1800x900 display at the test's 9x18 cell: 200 x 50 characters.
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        assert_eq!(reply_to(&mut m, b"\x1b[19t"), "\x1b[9;50;200t");
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;80t");
+
+        // Maximizing takes the grid to the display, asks the window to follow, and
+        // tells the child its new size — and `CSI 18 t` now answers with it.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[9;1t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::SetMaximized(true)));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::ResizeWindow { .. })));
+        assert!(cmds.contains(&Cmd::Resize {
+            session: "alpha".to_string(),
+            cols: 200,
+            rows: 50,
+        }));
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;200t");
+
+        // Restoring puts back the grid it had, not a guess.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[9;0t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::SetMaximized(false)));
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn a_single_axis_maximize_grows_only_that_axis() {
+        let mut m = model();
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        // Horizontally: the display's width, the rows it had.
+        feed(&mut m, b"\x1b[9;3t");
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;200t");
+        feed(&mut m, b"\x1b[9;0t");
+        // Vertically: the columns it had, the display's height.
+        feed(&mut m, b"\x1b[9;2t");
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;80t");
+    }
+
+    #[test]
+    fn a_program_reads_back_the_iconified_and_fullscreen_state_it_asked_for() {
+        let mut m = model();
+        m.update(UiEvent::DisplaySize {
+            w_px: 1800,
+            h_px: 900,
+        });
+        assert_eq!(
+            reply_to(&mut m, b"\x1b[11t"),
+            "\x1b[1t",
+            "open to begin with"
+        );
+
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[2t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::SetIconified(true)));
+        assert_eq!(reply_to(&mut m, b"\x1b[11t"), "\x1b[2t", "iconified");
+        feed(&mut m, b"\x1b[1t");
+        assert_eq!(reply_to(&mut m, b"\x1b[11t"), "\x1b[1t", "and open again");
+
+        // Full-screen fills the display and toggles back to the grid it had.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[10;1t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::SetFullscreen(true)));
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;200t");
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[10;2t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::SetFullscreen(false)), "2 toggles");
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn decslpp_sets_the_page_height_and_the_window_follows() {
+        let mut m = model();
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[30t".to_vec(),
+            ended: false,
+        });
+        assert!(cmds.contains(&Cmd::Resize {
+            session: "alpha".to_string(),
+            cols: 80,
+            rows: 30,
+        }));
+        assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;30;80t");
     }
 
     fn key(m: &mut TerminalModel, k: Key, mods: Mods) -> Vec<Cmd> {
@@ -4364,6 +4663,13 @@ mod tests {
         ReplyCtx {
             cursor: (1, 1),
             size: (80, 24),
+            display_size: ghost_vt::query::NOMINAL_DISPLAY_CHARS,
+            iconified: false,
+            size_px: (720, 432),
+            display_px: ghost_vt::query::NOMINAL_DISPLAY_PX,
+            cell_px: ghost_vt::query::NOMINAL_CELL_PX,
+            title: "",
+            icon_title: "",
             kitty_flags: 0,
             cursor_style: 2,
             left_right_margins: (1, 80),

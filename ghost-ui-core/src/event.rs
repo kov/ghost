@@ -93,6 +93,14 @@ pub enum UiEvent {
         h_px: u32,
         scale: f64,
     },
+    /// The size (physical px) of the display the window is on — what a maximized
+    /// window would grow to fill. The shell sends it when the window lands on a
+    /// monitor and whenever that changes; a model that never hears it answers
+    /// `CSI 19 t` from a nominal display (`ghost_vt::query::NOMINAL_DISPLAY_CHARS`).
+    DisplaySize {
+        w_px: u32,
+        h_px: u32,
+    },
     /// Reply to `Cmd::ReadClipboard` (None if the clipboard was empty/unreadable).
     ClipboardText(Option<String>),
     /// Output the shell pumped off a session socket.

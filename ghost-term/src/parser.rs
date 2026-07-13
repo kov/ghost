@@ -195,7 +195,10 @@ pub enum Function {
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
     /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
     SetCursorStyle(u8),
-    SetTitle(String),
+    /// OSC 0/1/2 — set the window title, the icon label, or both. Ghost shows the
+    /// window title and only *keeps* the icon label (nothing here has an icon), so
+    /// a program that sets it reads back what it set (`CSI 20 t`).
+    SetTitle(TitleTarget, String),
     Sgr(SgrOps),
     Si,
     Sm(AnsiModes),
@@ -404,7 +407,81 @@ pub enum TbcScope {
 
 #[derive(Debug, PartialEq)]
 pub enum XtwinopsOp {
-    Resize(u16, u16),
+    /// `CSI 8 ; rows ; cols t` — resize the text area to a character grid.
+    /// `None` is an omitted dimension (keep the one it has); `Some(0)` is xterm's
+    /// "as big as the display fits", which only the frontend can resolve.
+    Resize(Option<u16>, Option<u16>),
+    /// `CSI 4 ; height ; width t` — the same, in *pixels*. Only the frontend knows
+    /// how many pixels a cell is, so it does the arithmetic.
+    ResizePixels(Option<u16>, Option<u16>),
+    /// `CSI Ps t` with `Ps` ≥ 24 — DECSLPP, set the page height in lines. Only
+    /// the height moves; the width stays.
+    SetLines(u16),
+    /// `CSI 2 t` / `CSI 1 t` — iconify (minimize) the window, and restore it.
+    Iconify,
+    Deiconify,
+    /// `CSI 9 ; Ps t` — maximize the window, in one axis or both, or restore it.
+    Maximize(MaximizeOp),
+    /// `CSI 10 ; Ps t` — take the window full-screen, leave, or toggle.
+    Fullscreen(FullscreenOp),
+    /// `CSI 22 ; Ps t` / `CSI 23 ; Ps t` — push a title onto the terminal's title
+    /// stack, and pop it back. The emulator holds the titles, so it does these
+    /// itself; a program that changes a title around a full-screen editor gets its
+    /// old one back this way.
+    PushTitle(TitleTarget),
+    PopTitle(TitleTarget),
+}
+
+/// The axes `CSI 9 ; Ps t` maximizes over (xterm's `Ps`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MaximizeOp {
+    /// `9 ; 0` — restore the window to the size it had before it was maximized.
+    Restore,
+    /// `9 ; 1` — maximize over both axes.
+    Both,
+    /// `9 ; 2` — maximize the height only.
+    Vertically,
+    /// `9 ; 3` — maximize the width only.
+    Horizontally,
+}
+
+/// Which of the two titles a sequence addresses — OSC 0/1/2, and the XTWINOPS
+/// title stack (`CSI 22 ; Ps t` / `CSI 23 ; Ps t`, where `Ps` is 0 for both,
+/// 1 for the icon label and 2 for the window title).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TitleTarget {
+    Both,
+    Icon,
+    Window,
+}
+
+impl TitleTarget {
+    /// The `Ps` of an XTWINOPS title op (0 both, 1 icon, 2 window); anything else
+    /// names no title.
+    fn from_ps(ps: u16) -> Option<Self> {
+        match ps {
+            0 => Some(TitleTarget::Both),
+            1 => Some(TitleTarget::Icon),
+            2 => Some(TitleTarget::Window),
+            _ => None,
+        }
+    }
+
+    pub fn window(self) -> bool {
+        matches!(self, TitleTarget::Window | TitleTarget::Both)
+    }
+
+    pub fn icon(self) -> bool {
+        matches!(self, TitleTarget::Icon | TitleTarget::Both)
+    }
+}
+
+/// What `CSI 10 ; Ps t` asks of full-screen mode (xterm's `Ps`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum FullscreenOp {
+    Leave,
+    Enter,
+    Toggle,
 }
 
 /// Number of SgrOp values that fit inline without heap allocation.
@@ -1120,16 +1197,42 @@ impl Parser {
 
             (None, 's') => Some(Decslrm(ps[0].as_u16(), ps[1].as_u16())),
 
-            (None, 't') => {
-                if ps[0].as_u16() == 8 {
-                    let rows = ps[1].as_u16();
-                    let cols = ps[2].as_u16();
-
-                    Some(Xtwinops(XtwinopsOp::Resize(cols, rows)))
-                } else {
-                    None
-                }
-            }
+            // XTWINOPS. The reporting ops (`CSI 11 t`, `18 t`, `19 t`, …) are
+            // questions, not changes, and are answered by the host's query layer
+            // (`ghost_vt::query`) — the emulator lets them fall through. So does
+            // `CSI 3 t` (move): a Wayland client cannot position itself.
+            (None, 't') => match ps[0].as_u16() {
+                1 => Some(Xtwinops(XtwinopsOp::Deiconify)),
+                2 => Some(Xtwinops(XtwinopsOp::Iconify)),
+                4 => Some(Xtwinops(XtwinopsOp::ResizePixels(
+                    ps[2].given(),
+                    ps[1].given(),
+                ))),
+                8 => Some(Xtwinops(XtwinopsOp::Resize(ps[2].given(), ps[1].given()))),
+                9 => Some(Xtwinops(XtwinopsOp::Maximize(match ps[1].as_u16() {
+                    0 => MaximizeOp::Restore,
+                    1 => MaximizeOp::Both,
+                    2 => MaximizeOp::Vertically,
+                    3 => MaximizeOp::Horizontally,
+                    _ => return None,
+                }))),
+                10 => Some(Xtwinops(XtwinopsOp::Fullscreen(match ps[1].as_u16() {
+                    0 => FullscreenOp::Leave,
+                    1 => FullscreenOp::Enter,
+                    2 => FullscreenOp::Toggle,
+                    _ => return None,
+                }))),
+                22 => Some(Xtwinops(XtwinopsOp::PushTitle(TitleTarget::from_ps(
+                    ps[1].as_u16(),
+                )?))),
+                23 => Some(Xtwinops(XtwinopsOp::PopTitle(TitleTarget::from_ps(
+                    ps[1].as_u16(),
+                )?))),
+                // DECSLPP — xterm reads a lone `Ps` of 24 or more as a page height,
+                // which is why the window ops stop below it.
+                lines if lines >= 24 => Some(Xtwinops(XtwinopsOp::SetLines(lines))),
+                _ => None,
+            },
 
             (None, 'u') => Some(Scorc),
 
@@ -1271,7 +1374,9 @@ impl Parser {
         };
 
         match ps {
-            "0" | "2" => Some(Function::SetTitle(rest.to_string())),
+            "0" => Some(Function::SetTitle(TitleTarget::Both, rest.to_string())),
+            "1" => Some(Function::SetTitle(TitleTarget::Icon, rest.to_string())),
+            "2" => Some(Function::SetTitle(TitleTarget::Window, rest.to_string())),
             // OSC 8 ; params ; URI — a URI may itself contain `;`, so only the
             // params/URI split is taken here; an absent or empty URI closes
             // the link. Absurdly long URIs are dropped (the sequence is still
@@ -1849,8 +1954,15 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push(' ');
             seq.push('q');
         }
-        SetTitle(title) => {
-            seq.push_str("\u{1b}]2;");
+        SetTitle(target, title) => {
+            let ps = match target {
+                TitleTarget::Both => '0',
+                TitleTarget::Icon => '1',
+                TitleTarget::Window => '2',
+            };
+            seq.push_str("\u{1b}]");
+            seq.push(ps);
+            seq.push(';');
             seq.push_str(title);
             seq.push('\u{07}');
         }
@@ -1971,13 +2083,36 @@ fn dump_function(seq: &mut String, fun: &Function) {
         Vpa(n) => push_csi(seq, None, &[n.to_string()], 'd'),
         Vpr(n) => push_csi(seq, None, &[n.to_string()], 'e'),
 
-        Xtwinops(Resize(cols, rows)) => {
-            push_csi(
-                seq,
-                None,
-                &["8".to_owned(), rows.to_string(), cols.to_string()],
-                't',
-            );
+        Xtwinops(op) => {
+            let params: Vec<String> = match op {
+                Resize(cols, rows) => vec!["8".to_owned(), dim_param(*rows), dim_param(*cols)],
+                ResizePixels(w, h) => vec!["4".to_owned(), dim_param(*h), dim_param(*w)],
+                SetLines(rows) => vec![rows.to_string()],
+                Deiconify => vec!["1".to_owned()],
+                Iconify => vec!["2".to_owned()],
+                Maximize(op) => vec![
+                    "9".to_owned(),
+                    match op {
+                        MaximizeOp::Restore => "0",
+                        MaximizeOp::Both => "1",
+                        MaximizeOp::Vertically => "2",
+                        MaximizeOp::Horizontally => "3",
+                    }
+                    .to_owned(),
+                ],
+                Fullscreen(op) => vec![
+                    "10".to_owned(),
+                    match op {
+                        FullscreenOp::Leave => "0",
+                        FullscreenOp::Enter => "1",
+                        FullscreenOp::Toggle => "2",
+                    }
+                    .to_owned(),
+                ],
+                PushTitle(target) => vec!["22".to_owned(), title_ps(*target)],
+                PopTitle(target) => vec!["23".to_owned(), title_ps(*target)],
+            };
+            push_csi(seq, None, &params, 't');
         }
     }
 }
@@ -2322,6 +2457,22 @@ pub(crate) fn dec_mode_from(param: u16) -> Option<DecMode> {
     }
 }
 
+/// A window-op dimension as a parameter: an omitted one is emitted omitted, so
+/// it re-parses to the same `None` (keep this dimension).
+fn dim_param(dim: Option<u16>) -> String {
+    dim.map(|d| d.to_string()).unwrap_or_default()
+}
+
+/// The XTWINOPS `Ps` naming a title (see [`TitleTarget::from_ps`]).
+fn title_ps(target: TitleTarget) -> String {
+    match target {
+        TitleTarget::Both => "0",
+        TitleTarget::Icon => "1",
+        TitleTarget::Window => "2",
+    }
+    .to_owned()
+}
+
 /// Whether an OSC 4 index names a color ghost has: one of the 256 indexed
 /// colors, or one of the five special colors past them. Anything else (xterm's
 /// mouse/Tek/highlight colors, or nonsense) is skipped, leaving its neighbours
@@ -2404,6 +2555,11 @@ const MAX_PARAM_LEN: usize = 6;
 struct Param {
     cur_part: usize,
     pub parts: [u16; MAX_PARAM_LEN],
+    /// Whether the sequence actually carried a digit here. An *omitted* parameter
+    /// and an explicit `0` both read as zero, and for most controls that is the
+    /// same thing — but not for the window ops, where an omitted dimension keeps
+    /// the one it has and a zero means "as big as the display" (`CSI 8 t`).
+    given: bool,
 }
 
 impl Param {
@@ -2411,12 +2567,14 @@ impl Param {
         Self {
             cur_part: 0,
             parts: [number, 0, 0, 0, 0, 0],
+            given: false,
         }
     }
 
     pub fn clear(&mut self) {
         self.parts[..=self.cur_part].fill(0);
         self.cur_part = 0;
+        self.given = false;
     }
 
     pub fn add_part(&mut self) {
@@ -2426,6 +2584,12 @@ impl Param {
     pub fn add_digit(&mut self, input: u8) {
         let number = &mut self.parts[self.cur_part];
         *number = (10 * (*number as u32) + (input as u32)) as u16;
+        self.given = true;
+    }
+
+    /// The value, or `None` if the sequence left this parameter out (see `given`).
+    pub fn given(&self) -> Option<u16> {
+        self.given.then_some(self.parts[0])
     }
 
     pub fn as_u16(&self) -> u16 {
@@ -2439,6 +2603,13 @@ impl Param {
 
 impl Display for Param {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A parameter the sequence left out is written out left out — it reads as
+        // zero either way for most controls, but the window ops tell them apart
+        // (see `Param::given`), and a dump of a half-parsed CSI must resume into
+        // the parser state it left.
+        if !self.given {
+            return Ok(());
+        }
         match self.parts() {
             [] => unreachable!(),
 
@@ -2479,7 +2650,11 @@ impl From<Vec<u16>> for Param {
             parts[i] = *v;
         }
 
-        Self { cur_part, parts }
+        Self {
+            cur_part,
+            parts,
+            given: true,
+        }
     }
 }
 
@@ -2511,7 +2686,7 @@ mod tests {
     use super::SgrOps;
     use super::State;
     use super::TbcScope;
-    use super::XtwinopsOp;
+    use super::{FullscreenOp, MaximizeOp, TitleTarget, XtwinopsOp};
     use crate::charset::Charset;
     use crate::color::Color;
     use proptest::prelude::*;
@@ -2625,7 +2800,10 @@ mod tests {
         assert_eq!(parse("\x07"), [Bell]);
         // A BEL terminating an OSC string is a string terminator, not a bell: it
         // must yield the OSC's function (here a title set) and no Bell.
-        assert_eq!(parse("\x1b]2;hi\x07"), [SetTitle("hi".to_string())]);
+        assert_eq!(
+            parse("\x1b]2;hi\x07"),
+            [SetTitle(TitleTarget::Window, "hi".to_string())]
+        );
     }
 
     #[test]
@@ -2722,8 +2900,24 @@ mod tests {
         assert_eq!(parse("\x1b[2;5r"), [Decstbm(2, 5)]);
         assert_eq!(
             parse("\x1b[8;24;80t"),
-            [Xtwinops(XtwinopsOp::Resize(80, 24))]
+            [Xtwinops(XtwinopsOp::Resize(Some(80), Some(24)))]
         );
+        assert_eq!(parse("\x1b[2t"), [Xtwinops(XtwinopsOp::Iconify)]);
+        assert_eq!(parse("\x1b[1t"), [Xtwinops(XtwinopsOp::Deiconify)]);
+        assert_eq!(
+            parse("\x1b[9;1t"),
+            [Xtwinops(XtwinopsOp::Maximize(MaximizeOp::Both))]
+        );
+        assert_eq!(
+            parse("\x1b[10;2t"),
+            [Xtwinops(XtwinopsOp::Fullscreen(FullscreenOp::Toggle))]
+        );
+        // A lone Ps of 24 or more is DECSLPP, a page height — not a window op.
+        assert_eq!(parse("\x1b[30t"), [Xtwinops(XtwinopsOp::SetLines(30))]);
+        // The reports are the host's to answer, and a move is not ours to make.
+        assert_eq!(parse("\x1b[11t"), []);
+        assert_eq!(parse("\x1b[19t"), []);
+        assert_eq!(parse("\x1b[3;10;20t"), []);
         // `CSI s` parses to DECSLRM(0,0); the terminal treats it as SCOSC when
         // DECLRMM is off, or as a reset-to-full-margins when it is on.
         assert_eq!(parse("\x1b[s"), [Decslrm(0, 0)]);
@@ -2930,26 +3124,36 @@ mod tests {
         // terminated by BEL, C1 ST, or ESC \.
         assert_eq!(
             parse("\x1b]0;my title\x07"),
-            [SetTitle("my title".to_string())]
+            [SetTitle(TitleTarget::Both, "my title".to_string())]
         );
         assert_eq!(
             parse("\x1b]2;my title\x07"),
-            [SetTitle("my title".to_string())]
+            [SetTitle(TitleTarget::Window, "my title".to_string())]
         );
         assert_eq!(
             parse("\x1b]2;via st\x1b\\"),
-            [SetTitle("via st".to_string())]
+            [SetTitle(TitleTarget::Window, "via st".to_string())]
         );
         assert_eq!(
             parse("\u{9d}2;via c1\u{9c}"),
-            [SetTitle("via c1".to_string())]
+            [SetTitle(TitleTarget::Window, "via c1".to_string())]
         );
         // A title may contain ';' — only the first separator is the code.
-        assert_eq!(parse("\x1b]2;a;b;c\x07"), [SetTitle("a;b;c".to_string())]);
+        assert_eq!(
+            parse("\x1b]2;a;b;c\x07"),
+            [SetTitle(TitleTarget::Window, "a;b;c".to_string())]
+        );
         // An empty title clears it.
-        assert_eq!(parse("\x1b]2;\x07"), [SetTitle(String::new())]);
-        // Other OSC codes (e.g. OSC 1 icon name) are ignored.
-        assert_eq!(parse("\x1b]1;icon\x07"), []);
+        assert_eq!(
+            parse("\x1b]2;\x07"),
+            [SetTitle(TitleTarget::Window, String::new())]
+        );
+        // OSC 1 sets the icon label alone — the title ghost keeps but never shows,
+        // and reports back through `CSI 20 t`.
+        assert_eq!(
+            parse("\x1b]1;icon\x07"),
+            [SetTitle(TitleTarget::Icon, "icon".to_string())]
+        );
     }
 
     #[test]
@@ -3209,7 +3413,9 @@ mod tests {
             parser.feed(ch);
         }
 
-        assert_eq!(parser.dump(), "\u{9b}0;1;0;38:2:1:2:3;0");
+        // An omitted parameter dumps omitted, so resuming lands in the state the
+        // dump left — the sequence comes back as it went in.
+        assert_eq!(parser.dump(), "\u{9b};1;;38:2:1:2:3;");
     }
 
     #[test]
@@ -3350,7 +3556,7 @@ mod tests {
             Tbc(TbcScope::All),
             Vpa(12),
             Vpr(13),
-            Xtwinops(XtwinopsOp::Resize(80, 24)),
+            Xtwinops(XtwinopsOp::Resize(Some(80), Some(24))),
         ];
 
         assert_eq!(parse(&super::dump(&functions)), functions);
