@@ -2649,13 +2649,17 @@ impl App {
                     }
                 }
                 Cmd::UploadImage {
+                    session,
                     id,
                     width,
                     height,
                     rgba,
                 } => {
                     if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
-                        gfx.renderer.upload_image(id, width, height, &rgba);
+                        // The same key the scene names this session's terminals by, so
+                        // the image resolves against the session that transmitted it.
+                        let key = ghost_render::scene::session_key(&session);
+                        gfx.renderer.upload_image(key, id, width, height, &rgba);
                     }
                 }
                 Cmd::RequestAttention => {

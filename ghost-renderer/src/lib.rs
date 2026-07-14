@@ -801,11 +801,12 @@ fn noise_tile() -> Vec<u8> {
     data
 }
 
-/// One kitty-graphics image to paint this frame: which uploaded image (by id),
-/// its pixel rect already translated into viewport space, the scissor it clips
-/// to, and its z-index (drawn low to high among images).
+/// One kitty-graphics image to paint this frame: which uploaded image (by the
+/// session that owns it and the id that session knows it by), its pixel rect
+/// already translated into viewport space, the scissor it clips to, and its
+/// z-index (drawn low to high among images).
 struct ImageDraw {
-    image_id: u32,
+    image: (u64, u32),
     rect: [f32; 4],
     /// Source sub-rectangle of the image to sample, `[u0, v0, u1, v1]`.
     uv: [f32; 4],
@@ -1403,9 +1404,15 @@ pub struct Renderer {
     /// full redraw (a slide), so it's only read to defensively force a full re-render if
     /// a band ever arrives for a different session. `None` until a band has been presented.
     foreground_session: Option<u64>,
-    /// Uploaded image bind groups, keyed by image id; the blob is sent once and
-    /// the bind group (which owns its texture) lives until eviction.
-    image_bind_groups: HashMap<u32, wgpu::BindGroup>,
+    /// Uploaded image bind groups, keyed by session and image id; the blob is sent
+    /// once and the bind group (which owns its texture) lives until eviction.
+    ///
+    /// The session is half the key because the id alone is not the program's to
+    /// share: kitty ids are chosen by whatever is running (`i=`), every session
+    /// hands them out from its own space, and a window holds many sessions. Keyed
+    /// by id alone, the first session to upload id 1 would own it, and every other
+    /// session in the window that placed id 1 would draw that session's picture.
+    image_bind_groups: HashMap<(u64, u32), wgpu::BindGroup>,
     /// Per-frame resolved image draws (z-sorted within a terminal) and the
     /// one-quad-per-draw instance buffer they index.
     image_draws: Vec<ImageDraw>,
@@ -2008,11 +2015,13 @@ impl Renderer {
     }
 
     /// Cache a kitty-graphics image's pixels on the GPU as its own RGBA texture,
-    /// keyed by `id`, so the (potentially large) upload happens once. `rgba` is
+    /// keyed by the `session` that transmitted it and the `id` that session knows
+    /// it by, so the (potentially large) upload happens once. `rgba` is
     /// straight-alpha `Rgba8` packed row-major, `width * height * 4` bytes.
-    /// Idempotent per id for now — re-upload of a replaced id lands with LRU
-    /// eviction in a later phase. A zero dimension or short buffer is ignored.
-    pub fn upload_image(&mut self, id: u32, width: u32, height: u32, rgba: &[u8]) {
+    /// Idempotent per session and id for now — re-upload of a replaced id lands
+    /// with LRU eviction in a later phase. A zero dimension or short buffer is
+    /// ignored.
+    pub fn upload_image(&mut self, session: u64, id: u32, width: u32, height: u32, rgba: &[u8]) {
         // A single dimension can exceed the device's max texture size while the
         // image's total bytes stay within ghost-term's budget (e.g. 9000x1 RGBA is
         // ~36 KiB), and create_texture treats that as an unrecoverable validation
@@ -2024,7 +2033,7 @@ impl Renderer {
             || height == 0
             || width > max
             || height > max
-            || self.image_bind_groups.contains_key(&id)
+            || self.image_bind_groups.contains_key(&(session, id))
             || (rgba.len() as u64) < u64::from(width) * u64::from(height) * 4
         {
             return;
@@ -2088,14 +2097,22 @@ impl Renderer {
                     },
                 ],
             });
-        self.image_bind_groups.insert(id, bind_group);
+        self.image_bind_groups.insert((session, id), bind_group);
     }
 
     /// Resolve `frame`'s image placements into pixel-space draws, offset to
-    /// `(ox, oy)` and clipped to `scissor`. Only images already uploaded are
-    /// emitted; an unknown id has no texture to sample yet, so it is skipped.
+    /// `(ox, oy)` and clipped to `scissor`. The placements name images in
+    /// `session`'s own id space, so they resolve against that session's uploads and
+    /// no other's. Only images already uploaded are emitted; an id this session has
+    /// not transmitted has no texture to sample yet, so it is skipped.
+    // Every argument is an irreducible placement input (who owns the images, what to
+    // place, where, at what scale, clipped to what, and where to put the result);
+    // bundling them into a single-use struct would add indirection without clarity,
+    // as on `ensure_surface`.
+    #[allow(clippy::too_many_arguments)]
     fn collect_image_draws(
         &self,
+        session: u64,
         frame: &Frame,
         ox: f32,
         oy: f32,
@@ -2105,11 +2122,12 @@ impl Renderer {
     ) {
         let m = frame.metrics;
         for img in &frame.images {
-            if !self.image_bind_groups.contains_key(&img.image_id) {
+            let key = (session, img.image_id);
+            if !self.image_bind_groups.contains_key(&key) {
                 continue;
             }
             out.push(ImageDraw {
-                image_id: img.image_id,
+                image: key,
                 rect: [
                     ox + img.col as f32 * m.advance * scale,
                     oy + img.row as f32 * m.line_height * scale,
@@ -2168,7 +2186,7 @@ impl Renderer {
             }
             // Defense-in-depth: collect_image_draws already drops un-uploaded ids,
             // so this only fires if that invariant breaks — never in normal use.
-            let Some(bg) = self.image_bind_groups.get(&d.image_id) else {
+            let Some(bg) = self.image_bind_groups.get(&d.image) else {
                 continue;
             };
             pass.set_bind_group(0, bg, &[]);
@@ -2368,7 +2386,8 @@ impl Renderer {
             }
             Plan::Full => {
                 self.stats.surface.miss();
-                let mut surface = self.render_surface(frame, selection, rect, font, size_px);
+                let mut surface =
+                    self.render_surface(session, frame, selection, rect, font, size_px);
                 surface.used_tick = tick;
                 self.stats.surface.insert();
                 self.surfaces.insert(key, surface);
@@ -2618,6 +2637,7 @@ impl Renderer {
     /// size before the main pass, which always runs after every surface sub-pass.
     fn render_surface(
         &mut self,
+        session: u64,
         frame: &Rc<Frame>,
         selection: Option<Selection>,
         rect: RectPx,
@@ -2647,7 +2667,7 @@ impl Renderer {
         // Texture-space origin, clipped to the texture, z-sorted to match the inline
         // painter order.
         let mut img_draws: Vec<ImageDraw> = Vec::new();
-        self.collect_image_draws(frame, 0.0, 0.0, s, [0, 0, tw, th], &mut img_draws);
+        self.collect_image_draws(session, frame, 0.0, 0.0, s, [0, 0, tw, th], &mut img_draws);
         img_draws.sort_by_key(|d| d.z);
         let img_insts: Vec<Instance> = img_draws
             .iter()
@@ -2741,7 +2761,7 @@ impl Renderer {
                 pass.set_pipeline(&self.image_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 for (i, d) in img_draws.iter().enumerate() {
-                    let Some(bg) = self.image_bind_groups.get(&d.image_id) else {
+                    let Some(bg) = self.image_bind_groups.get(&d.image) else {
                         continue;
                     };
                     pass.set_bind_group(0, bg, &[]);
@@ -3377,6 +3397,14 @@ impl Renderer {
 
     /// Prepare GPU state for one frame: pack glyphs, upload instances, set the
     /// viewport uniform.
+    /// The session a frame-only render implies. [`Renderer::render_to_view`],
+    /// [`Renderer::render_offscreen`] and [`render_frame`] paint exactly one
+    /// [`Frame`] — one session, by construction — so its images live under this one
+    /// key. Upload through it (`upload_image(LONE_FRAME_SESSION, …)`) when rendering
+    /// that way. The scene path, which is what the app runs, keys images by the real
+    /// session instead and never touches this.
+    pub const LONE_FRAME_SESSION: u64 = 0;
+
     fn prepare(&mut self, frame: &Frame, font: FontSet, size_px: f32, vw: u32, vh: u32) {
         self.frame_bg = frame.default_bg;
         let instances = self.build_instances(
@@ -3403,7 +3431,15 @@ impl Renderer {
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         let mut imgs = Vec::new();
-        self.collect_image_draws(frame, 0.0, 0.0, 1.0, [0, 0, vw, vh], &mut imgs);
+        self.collect_image_draws(
+            Self::LONE_FRAME_SESSION,
+            frame,
+            0.0,
+            0.0,
+            1.0,
+            [0, 0, vw, vh],
+            &mut imgs,
+        );
         self.image_draws = imgs;
         self.build_image_instances();
     }
@@ -3747,6 +3783,7 @@ impl Renderer {
                             }
                             push_glyphs(&mut all, &mut draws, scissor, insts);
                             self.collect_image_draws(
+                                *session,
                                 frame,
                                 rect.x,
                                 rect.y,
@@ -4551,12 +4588,88 @@ mod tests {
         ]
     }
 
+    /// Two distinct session keys, as `ghost_render::scene::session_key` would hand out.
+    const SESSION_A: u64 = 1;
+    const SESSION_B: u64 = 2;
+
     fn is_red(p: [u8; 4]) -> bool {
         p[0] > 0x60 && p[1] < 0x20 && p[2] < 0x20
     }
 
     fn is_green(p: [u8; 4]) -> bool {
         p[0] < 0x20 && p[1] > 0x60 && p[2] < 0x20
+    }
+
+    fn is_blue(p: [u8; 4]) -> bool {
+        p[0] < 0x20 && p[1] < 0x20 && p[2] > 0x60
+    }
+
+    /// Kitty image ids are the *program's* to choose (`i=`), and every session hands
+    /// them out from its own space — so two sessions in one window routinely use the
+    /// same id for different pictures. A window-global image cache would serve
+    /// whichever got there first to both, drawing one session's picture inside the
+    /// other's.
+    #[test]
+    fn two_sessions_using_one_image_id_each_paint_their_own_picture() {
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+        // Both sessions transmit image id 7. Session A's is red-then-green; session
+        // B's is blue.
+        let mut a = Vt::new(20, 4);
+        a.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        let mut b = Vt::new(20, 4);
+        b.feed_str("\x1b_Gi=7,a=T,f=24,s=2,v=1,c=2,r=1;AAD/AAD/\x1b\\");
+
+        let (fa, fb) = (layout_frame(&a, TM), layout_frame(&b, TM));
+        let (w, h) = Renderer::frame_size(&fa);
+
+        let mut r = Renderer::headless(Theme::default());
+        let ia = a.graphics_image(7).expect("session A's image");
+        r.upload_image(SESSION_A, 7, ia.width, ia.height, &ia.pixels);
+        let ib = b.graphics_image(7).expect("session B's image");
+        r.upload_image(SESSION_B, 7, ib.width, ib.height, &ib.pixels);
+
+        // The two sessions sit side by side in one window, as a split does.
+        let term = |session: u64, frame: &Frame, x: f32| SceneItem::Terminal {
+            id: SceneId::Root,
+            session,
+            rect: RectPx {
+                x,
+                y: 0.0,
+                w: w as f32,
+                h: h as f32,
+            },
+            frame: std::rc::Rc::new(frame.clone()),
+            selection: None,
+            dim: false,
+            damage: TermDamage::All,
+        };
+        let scene = Scene {
+            size_px: (w * 2, h),
+            layers: vec![Layer::new(
+                0,
+                vec![term(SESSION_A, &fa, 0.0), term(SESSION_B, &fb, w as f32)],
+            )],
+        };
+        let out = r.render_offscreen_scene(&scene, font, SIZE_PX);
+
+        // Each session's cells show its own image, not its neighbour's.
+        assert!(
+            is_red(px(&out, 4, 9)),
+            "session A's left cell is its red pixel"
+        );
+        assert!(
+            is_green(px(&out, 13, 9)),
+            "session A's right cell is its green pixel"
+        );
+        assert!(
+            is_blue(px(&out, w + 4, 9)),
+            "session B must paint its OWN blue image, not session A's red one"
+        );
+        assert!(
+            is_blue(px(&out, w + 13, 9)),
+            "session B must paint its OWN blue image, not session A's green one"
+        );
     }
 
     #[test]
@@ -4699,7 +4812,7 @@ mod tests {
         // Upload the decoded pixels out of band, as the core's Cmd::UploadImage would.
         let mut r = Renderer::headless(Theme::default());
         let img = v.graphics_image(7).expect("image stored");
-        r.upload_image(7, img.width, img.height, &img.pixels);
+        r.upload_image(0, 7, img.width, img.height, &img.pixels);
 
         let (w, h) = Renderer::frame_size(&f);
         let scene = Scene {
@@ -4762,7 +4875,8 @@ mod tests {
 
         let mut r = Renderer::headless(Theme::default());
         let img = v.graphics_image(7).expect("image stored");
-        r.upload_image(7, img.width, img.height, &img.pixels);
+        // Uploaded under the session whose surface will draw it.
+        r.upload_image(session_key("image"), 7, img.width, img.height, &img.pixels);
 
         let (w, h) = Renderer::frame_size(&f);
         let full = |x: f32, session| SceneItem::Terminal {
@@ -4818,7 +4932,7 @@ mod tests {
 
         let mut r = Renderer::headless(Theme::default());
         let img = v.graphics_image(7).expect("image stored");
-        r.upload_image(7, img.width, img.height, &img.pixels);
+        r.upload_image(0, 7, img.width, img.height, &img.pixels);
 
         let (w, h) = Renderer::frame_size(&f);
         let scene = Scene {
@@ -4887,9 +5001,9 @@ mod tests {
         let mut r = Renderer::headless(Theme::default());
         let over = r.gpu.device.limits().max_texture_dimension_2d + 1;
         let rgba = vec![0xFFu8; (over as usize) * 4]; // over x 1 RGBA
-        r.upload_image(5, over, 1, &rgba);
+        r.upload_image(0, 5, over, 1, &rgba);
         assert!(
-            !r.image_bind_groups.contains_key(&5),
+            !r.image_bind_groups.contains_key(&(0, 5)),
             "an oversize image is not cached"
         );
         // A placement of that id then draws nothing rather than crashing.

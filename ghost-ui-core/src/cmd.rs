@@ -136,11 +136,17 @@ pub enum Cmd {
     /// (stealing the display if another window held it) and replies
     /// `UiEvent::AdoptSession` so the window switches to its single view.
     TakeOver(SessionId),
-    /// Upload a kitty-graphics image's pixels to the renderer, out of band and
-    /// keyed by `id` (the pixels never travel through the `Scene`/`Frame`, which
-    /// stay cheap to clone and compare). Sent once per image, before the `Redraw`
-    /// that first draws it; the renderer caches it by `id`.
+    /// Upload a kitty-graphics image's pixels to the renderer, out of band (the
+    /// pixels never travel through the `Scene`/`Frame`, which stay cheap to clone
+    /// and compare). Sent once per image, before the `Redraw` that first draws it.
+    ///
+    /// The id is only meaningful next to the `session` that transmitted it: the
+    /// program picks it (`i=`), and every session's ids start at 1. A window holds
+    /// many sessions, so the renderer caches on the pair — otherwise the first
+    /// session to claim an id would hand its picture to every other session that
+    /// drew the same one.
     UploadImage {
+        session: SessionId,
         id: u32,
         width: u32,
         height: u32,

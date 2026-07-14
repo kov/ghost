@@ -1873,6 +1873,7 @@ impl TerminalView {
             }
             let generation = image.generation;
             cmds.push(Cmd::UploadImage {
+                session: state.session().to_string(),
                 id,
                 width: image.width,
                 height: image.height,
@@ -4610,6 +4611,7 @@ mod tests {
         });
         // The pixels are uploaded out of band, RGBA (red, green, opaque).
         assert!(cmds.contains(&Cmd::UploadImage {
+            session: "alpha".to_string(),
             id: 5,
             width: 2,
             height: 1,
@@ -4627,6 +4629,44 @@ mod tests {
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
     }
 
+    /// The id in a kitty transmission is the *program's* (`i=`), and every session's
+    /// ids start at 1 — so two sessions in one window naming the same id mean two
+    /// different pictures. The upload has to say whose it is, or the renderer cannot
+    /// tell them apart.
+    #[test]
+    fn two_sessions_upload_the_same_image_id_as_two_images() {
+        let upload = |m: &mut TerminalModel, session: &str, pixels: &str| {
+            m.update(UiEvent::SessionData {
+                name: session.to_string(),
+                bytes: format!("\x1b_Gi=1,a=T,f=24,s=2,v=1;{pixels}\x1b\\").into_bytes(),
+                ended: false,
+            })
+            .into_iter()
+            .find_map(|c| match c {
+                Cmd::UploadImage {
+                    session, id, rgba, ..
+                } => Some((session, id, rgba)),
+                _ => None,
+            })
+            .expect("the image is uploaded")
+        };
+
+        // Both sessions transmit id 1: "alpha" red-then-green, "beta" blue-then-blue.
+        let mut alpha = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let (a_session, a_id, a_rgba) = upload(&mut alpha, "alpha", "/wAAAP8A");
+        let mut beta = TerminalModel::new("beta".to_string(), 80, 24, METRICS);
+        let (b_session, b_id, b_rgba) = upload(&mut beta, "beta", "AAD/AAD/");
+
+        assert_eq!((a_id, b_id), (1, 1), "both programs chose id 1");
+        assert_ne!(a_rgba, b_rgba, "the two pictures really do differ");
+        assert_eq!(a_session, "alpha");
+        assert_eq!(
+            b_session, "beta",
+            "the upload must name the session that transmitted it, or the renderer \
+             cannot tell one session's id 1 from another's"
+        );
+    }
+
     #[test]
     fn re_transmitting_an_image_under_the_same_id_re_uploads_the_new_pixels() {
         let mut m = model();
@@ -4637,6 +4677,7 @@ mod tests {
             ended: false,
         });
         assert!(cmds.contains(&Cmd::UploadImage {
+            session: "alpha".to_string(),
             id: 5,
             width: 2,
             height: 1,
@@ -4676,6 +4717,7 @@ mod tests {
         });
         // Even with no direct placement, the placeholder reference triggers upload.
         assert!(cmds.contains(&Cmd::UploadImage {
+            session: "alpha".to_string(),
             id: 7,
             width: 2,
             height: 1,
@@ -4717,6 +4759,7 @@ mod tests {
             ended: false,
         });
         assert!(cmds.contains(&Cmd::UploadImage {
+            session: "alpha".to_string(),
             id: 7,
             width: 2,
             height: 1,
