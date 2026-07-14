@@ -29,7 +29,7 @@ pub use fleet::{FleetModel, Locality};
 pub use ghost_vt::query::ThemeColors;
 pub use group::{Group, REMOTE_ID_SEP, is_remote_id};
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
-pub use root::RootModel;
+pub use root::{RootModel, Sessions};
 pub use terminal::{
     Shortcut, TermTrace, TerminalModel, bracket_paste, classify_shortcut, query_replies,
     selection_text,

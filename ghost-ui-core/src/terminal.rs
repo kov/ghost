@@ -508,10 +508,31 @@ impl SessionState {
         self.ended
     }
 
-    /// The session's emulator screen (tests read it directly off the registry).
-    #[cfg(test)]
+    /// The session's emulator screen — read by every view of the session (the
+    /// foreground, a warm mirror, a fleet preview) to lay out its content, and by
+    /// tests directly off the registry.
     pub(crate) fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// The terminal's grid size in cells (cols, rows).
+    pub(crate) fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
+    /// The session's user-chosen display name, empty if unlabeled.
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// The name a human should see for this session: its display name when
+    /// labeled, else its immutable id.
+    pub(crate) fn display(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.session
+        } else {
+            &self.display_name
+        }
     }
 
     /// Set the session's user-chosen display name (empty = unlabeled).
@@ -582,7 +603,7 @@ impl TerminalModel {
     }
 
     pub fn screen(&self) -> &Screen {
-        &self.state.screen
+        self.state.screen()
     }
 
     /// What this session may do outside its own screen (see
@@ -610,22 +631,18 @@ impl TerminalModel {
 
     /// The session's user-chosen display name, empty if unlabeled.
     pub fn display_name(&self) -> &str {
-        &self.state.display_name
+        self.state.display_name()
     }
 
     /// The name a human should see for this session: its display name when
     /// labeled, else its immutable id.
     pub fn display(&self) -> &str {
-        if self.state.display_name.is_empty() {
-            &self.state.session
-        } else {
-            &self.state.display_name
-        }
+        self.state.display()
     }
 
     /// The terminal's grid size in cells (cols, rows).
     pub fn dims(&self) -> (u16, u16) {
-        (self.state.cols, self.state.rows)
+        self.state.dims()
     }
 
     /// Whether the child exited / the session closed.

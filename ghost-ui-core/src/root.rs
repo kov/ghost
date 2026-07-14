@@ -42,7 +42,7 @@ enum Mode {
 /// background mirrors, and (from B1b) the fleet tiles all borrow a state from here
 /// by id. A view moving between foreground/warm/fleet never moves the state, so the
 /// per-session facts stop being re-stamped at every transition.
-struct Sessions {
+pub struct Sessions {
     map: HashMap<SessionId, SessionState>,
     /// The scheme default fg/bg every state is minted with and answers OSC 10/11 by
     /// (the window authors it via [`RootModel::set_theme`]; remembered here so a
@@ -53,13 +53,30 @@ struct Sessions {
     policy: SessionPolicy,
 }
 
+impl Default for Sessions {
+    fn default() -> Self {
+        Sessions::new()
+    }
+}
+
 impl Sessions {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Sessions {
             map: HashMap::new(),
             theme: ThemeColors::default(),
             policy: SessionPolicy::default(),
         }
+    }
+
+    /// Take ownership of a whole [`TerminalModel`]'s session state, returning its
+    /// view for the caller to place in a mode/warm slot or a fleet tile. The single
+    /// entry point for code that still constructs whole models (the shell handing a
+    /// session to a window, `ghost-shot` building a fleet) to move into the
+    /// one-owner world without reaching for the crate-private `into_parts`.
+    pub fn adopt(&mut self, model: TerminalModel) -> TerminalView {
+        let (state, view) = model.into_parts();
+        self.insert(state.session().to_string(), state);
+        view
     }
 
     fn get(&self, id: &str) -> Option<&SessionState> {
