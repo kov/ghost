@@ -2136,6 +2136,72 @@ mod tests {
         assert_eq!(vt.prompt_rows().count(), 0);
     }
 
+    // A resize that lands while an app holds the alternate screen still has to
+    // reach the primary buffer sitting behind it: a dump can only describe
+    // buffers that are at the terminal's current size, so a primary left on the
+    // old grid is state no resync can carry.
+    #[test]
+    fn a_resize_taken_on_the_alt_screen_reaches_the_primary_buffer() {
+        let mut vt = Vt::new(10, 5);
+        vt.feed_str("\x1b[?47h\x1b[30t");
+
+        let (cols, rows) = vt.size();
+        let mut resynced = Vt::new(cols, rows);
+        resynced.feed_str(&vt.dump());
+
+        assert_vts_eq(&vt, &resynced);
+    }
+
+    #[test]
+    fn the_primary_cursor_survives_a_resize_taken_on_the_alt_screen() {
+        // Enough lines to push "one".."three" into scrollback, so growing the
+        // primary pulls them back and shifts the cursor down with them.
+        let mut vt = Vt::builder().size(10, 5).scrollback_limit(50).build();
+        vt.feed_str("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight");
+        vt.feed_str("\x1b[?1049h");
+        vt.feed_str("VIM");
+        vt.resize(10, 8);
+
+        let mut resynced = Vt::builder().size(10, 8).scrollback_limit(50).build();
+        resynced.feed_str(&vt.dump_with_scrollback());
+
+        // The app gives the screen back on both sides.
+        vt.feed_str("\x1b[?1049l");
+        resynced.feed_str("\x1b[?1049l");
+
+        let text = |vt: &Vt| vt.view().map(|l| l.text()).collect::<Vec<_>>();
+        assert_eq!(text(&vt), text(&resynced));
+        assert_eq!(vt.cursor(), resynced.cursor());
+    }
+
+    #[test]
+    fn a_shrink_taken_on_the_alt_screen_keeps_the_primary_saved_cursor_in_grid() {
+        let mut vt = Vt::new(10, 5);
+        // Park the primary's cursor on row 4 and save it, take the alt screen,
+        // then shrink under the saved row.
+        vt.feed_str("\x1b[4;1H\x1b7\x1b[?47h\x1b[8;3;10t");
+
+        let (cols, rows) = vt.size();
+        let mut resynced = Vt::new(cols, rows);
+        resynced.feed_str(&vt.dump());
+
+        assert_vts_eq(&vt, &resynced);
+    }
+
+    #[test]
+    fn a_shrink_keeps_the_alt_screens_saved_cursor_in_grid() {
+        let mut vt = Vt::new(10, 5);
+        // Save a cursor on the alt screen, hand the screen back, then shrink
+        // under the row that save is parked on.
+        vt.feed_str("\x1b[?1049h\x1b[4;1H\x1b7\x1b[?1049l");
+        vt.resize(10, 3);
+
+        let mut resynced = Vt::new(10, 3);
+        resynced.feed_str(&vt.dump());
+
+        assert_vts_eq(&vt, &resynced);
+    }
+
     #[test]
     fn osc52_queues_clipboard_writes() {
         use super::ClipboardSelection::{Clipboard, Primary};

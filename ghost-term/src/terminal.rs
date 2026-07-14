@@ -1534,9 +1534,66 @@ impl Terminal {
 
         self.cols = cols;
         self.rows = rows;
+        // Anchor the primary's reflow before `reflow` moves the live cursor: the
+        // anchor has to be a position on the grid the primary is still on, which
+        // is the one we are resizing away from.
+        let primary_anchor = self.inactive_primary_anchor();
         self.reflow();
+        self.reflow_inactive_primary(primary_anchor);
 
         resized
+    }
+
+    /// Where the primary buffer's cursor sits while the alternate screen is up —
+    /// the anchor its reflow needs, in the primary's current (pre-resize) grid.
+    /// `None` while the primary *is* the active buffer.
+    ///
+    /// The alternate screen is thrown away and rebuilt at the terminal's size on
+    /// every entry ([`Terminal::switch_to_alternate_buffer`]), so it is never the
+    /// stale one; the primary, which survives behind it, is.
+    fn inactive_primary_anchor(&self) -> Option<(usize, usize)> {
+        if self.active_buffer_type != BufferType::Alternate {
+            return None;
+        }
+
+        // While the alternate screen is active the two save slots are swapped, so
+        // `alternate_saved_ctx` is the *primary's*. A non-default one means the
+        // primary's cursor was saved on the way in (DECSC, or the ?1049 that does
+        // it for the app) and is what the app gets back on the way out — the same
+        // condition the dump gates that slot's replay on. With no save to go by,
+        // the primary's cursor is the live one it shares with the alternate
+        // screen, which is precisely what a switch-back reflow would anchor on.
+        if self.alternate_saved_ctx.is_default() {
+            Some((self.cursor.col, self.cursor.row))
+        } else {
+            Some((
+                self.alternate_saved_ctx.cursor_col,
+                self.alternate_saved_ctx.cursor_row,
+            ))
+        }
+    }
+
+    /// Bring the primary buffer along to the new grid while the alternate screen
+    /// holds the foreground. Deferring this until the app hands the screen back
+    /// would leave the primary on a grid the terminal no longer has — and a dump
+    /// speaks only in the current size, so such a primary cannot survive a
+    /// resync: whoever replays it would reflow it from the wrong grid, pulling a
+    /// different amount of scrollback back into view and landing the restored
+    /// cursor on the wrong row.
+    fn reflow_inactive_primary(&mut self, anchor: Option<(usize, usize)>) {
+        let Some(anchor) = anchor else { return };
+
+        let (col, row) = self.other_buffer.resize(self.cols, self.rows, anchor);
+
+        // Follow the anchor to where the reflow put it, so the app's saved cursor
+        // still means the same line and the next resize anchors from there.
+        if !self.alternate_saved_ctx.is_default() {
+            self.alternate_saved_ctx.cursor_col = col.min(self.cols - 1);
+            self.alternate_saved_ctx.cursor_row = row.min(self.rows - 1);
+        }
+
+        // The buffer wants a trim, but `gc` only ever services the active one —
+        // it will get it when the primary comes back to the foreground.
     }
 
     fn reflow(&mut self) {
@@ -1560,12 +1617,14 @@ impl Terminal {
         self.dirty_lines.resize(self.rows);
         self.dirty_lines.extend(0..self.rows);
 
-        if self.saved_ctx.cursor_col >= self.cols {
-            self.saved_ctx.cursor_col = self.cols - 1;
-        }
-
-        if self.saved_ctx.cursor_row >= self.rows {
-            self.saved_ctx.cursor_row = self.rows - 1;
+        // Both save slots, not just the active screen's: a dump replays the other
+        // one through CUP, which the replaying terminal clamps to its grid. A
+        // saved cursor left off the grid here is one that cannot survive a
+        // resync.
+        let (cols, rows) = (self.cols, self.rows);
+        for ctx in [&mut self.saved_ctx, &mut self.alternate_saved_ctx] {
+            ctx.cursor_col = ctx.cursor_col.min(cols - 1);
+            ctx.cursor_row = ctx.cursor_row.min(rows - 1);
         }
     }
 
