@@ -589,13 +589,6 @@ impl TerminalModel {
         (self.state, self.view)
     }
 
-    /// Re-pair a session state with a view into a single owner — the inverse of
-    /// [`Self::into_parts`], for handing a `(state, view)` back across an API that
-    /// still takes a whole model (e.g. the fleet, until it borrows the registry).
-    pub(crate) fn from_parts(state: SessionState, view: TerminalView) -> Self {
-        TerminalModel { state, view }
-    }
-
     /// Set the scheme's default fg/bg reported to apps that query them (OSC 10/11)
     /// — see [`SessionState::set_theme`].
     pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {

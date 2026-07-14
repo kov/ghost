@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use ghost_render::CellMetrics;
 use ghost_renderer::{Damage, Rendered, Renderer, SceneCache, Theme};
 use ghost_ui_core::{
-    FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, TerminalModel, UiEvent,
+    FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, Sessions, TerminalModel, UiEvent,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -743,19 +743,31 @@ fn calibration_screen(cols: u16, rows: u16) -> String {
 fn calib_scene(size: (u32, u32), count: usize) -> ghost_render::Scene {
     let names: Vec<String> = (0..count.max(1)).map(|i| format!("calib-{i:02}")).collect();
     let mine: HashSet<String> = names.iter().cloned().collect();
+    let mut sessions = Sessions::new();
     let primary = TerminalModel::new(names[0].clone(), 80, 24, METRICS);
-    let (mut fleet, _) = FleetModel::adopting(primary, Vec::new(), METRICS, size, 1.0, mine);
+    let primary_id = names[0].clone();
+    let primary_view = sessions.adopt(primary);
+    let (mut fleet, _) = FleetModel::adopting(
+        &sessions,
+        primary_id,
+        primary_view,
+        Vec::new(),
+        METRICS,
+        size,
+        1.0,
+        mine,
+    );
     let infos: Vec<_> = names
         .iter()
         .enumerate()
         .map(|(i, n)| info(n, true, &[], i as i32 + 1))
         .collect();
-    fleet.update(UiEvent::SessionList(infos));
+    fleet.update(&mut sessions, UiEvent::SessionList(infos));
     let cal = calibration_screen(80, 24);
     for n in &names {
-        feed(&mut fleet, n, &cal);
+        feed(&mut fleet, &mut sessions, n, &cal);
     }
-    fleet.view()
+    fleet.view(&sessions)
 }
 
 /// Take over the real terminal: draw the calibration pattern at the terminal's
@@ -787,34 +799,52 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     let mine: HashSet<String> = ["edit", "build"].into_iter().map(String::from).collect();
 
     // The focused/primary tile carries real content via `adopting`.
+    let mut sessions = Sessions::new();
     let primary = TerminalModel::new("edit".to_string(), 80, 24, METRICS);
-    let (mut fleet, _) = FleetModel::adopting(primary, Vec::new(), METRICS, size, 1.0, mine);
+    let primary_view = sessions.adopt(primary);
+    let (mut fleet, _) = FleetModel::adopting(
+        &sessions,
+        "edit".to_string(),
+        primary_view,
+        Vec::new(),
+        METRICS,
+        size,
+        1.0,
+        mine,
+    );
     fleet.set_my_group(ghost_ui_core::Group::auto("win-shot-0".to_string(), 0));
 
-    fleet.update(UiEvent::SessionList(vec![
-        info("edit", true, &["nvim", "src/fleet.rs"], 4011),
-        info("build", true, &[], 4012),
-        info("logs", true, &["journalctl", "-f"], 4099), // attached elsewhere
-        info("prod", false, &["ssh", "prod-web-1"], 3777), // detached
-        info("batch", false, &["make", "-j8"], 3120),    // a closed group's member
-    ]));
+    fleet.update(
+        &mut sessions,
+        UiEvent::SessionList(vec![
+            info("edit", true, &["nvim", "src/fleet.rs"], 4011),
+            info("build", true, &[], 4012),
+            info("logs", true, &["journalctl", "-f"], 4099), // attached elsewhere
+            info("prod", false, &["ssh", "prod-web-1"], 3777), // detached
+            info("batch", false, &["make", "-j8"], 3120),    // a closed group's member
+        ]),
+    );
 
     // Live previews for the sessions this window drives.
-    feed(&mut fleet, "edit", EDIT);
-    feed(&mut fleet, "build", BUILD);
+    feed(&mut fleet, &mut sessions, "edit", EDIT);
+    feed(&mut fleet, &mut sessions, "build", BUILD);
 
     // The detached session is observed, and its mirror has the session's OWN
     // grid — a square-ish 100×50 here — so its card takes that shape instead
     // of the window's aspect.
-    fleet.update(UiEvent::SessionPush {
-        name: "prod".to_string(),
-        push: ghost_ui_core::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
-            cols: 100,
-            rows: 50,
-        }),
-    });
+    fleet.update(
+        &mut sessions,
+        UiEvent::SessionPush {
+            name: "prod".to_string(),
+            push: ghost_ui_core::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
+                cols: 100,
+                rows: 50,
+            }),
+        },
+    );
     feed(
         &mut fleet,
+        &mut sessions,
         "prod",
         "$ uptime\r\n 14:02:11 up 41 days,  3:07,  1 user\r\n$ ",
     );
@@ -848,14 +878,18 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
             connection: None,
         },
     ]);
-    fleet.update(UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
-        name: "db".to_string(),
-        display_name: String::new(),
-        command: vec!["psql".to_string(), "prod".to_string()],
-        cwd: Some("~/ops".to_string()),
-    }]));
+    fleet.update(
+        &mut sessions,
+        UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
+            name: "db".to_string(),
+            display_name: String::new(),
+            command: vec!["psql".to_string(), "prod".to_string()],
+            cwd: Some("~/ops".to_string()),
+        }]),
+    );
     feed(
         &mut fleet,
+        &mut sessions,
         "db",
         "prod=# select count(*) from orders;\r\n count \r\n-------\r\n 42917\r\n(1 row)\r\n\r\nprod=# ",
     );
@@ -864,7 +898,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     // `fleet-revealed` renders the expanded state.
     fleet.set_show_elsewhere(revealed);
 
-    let scene = fleet.view();
+    let scene = fleet.view(&sessions);
     (scene, size.0, size.1)
 }
 
@@ -1090,12 +1124,15 @@ fn single_scene() -> (ghost_render::Scene, u32, u32) {
     (root.view(), size.0, size.1)
 }
 
-fn feed(fleet: &mut FleetModel, name: &str, content: &str) {
-    fleet.update(UiEvent::SessionData {
-        name: name.to_string(),
-        bytes: content.as_bytes().to_vec(),
-        ended: false,
-    });
+fn feed(fleet: &mut FleetModel, sessions: &mut Sessions, name: &str, content: &str) {
+    fleet.update(
+        sessions,
+        UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: content.as_bytes().to_vec(),
+            ended: false,
+        },
+    );
 }
 
 fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {

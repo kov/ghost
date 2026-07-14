@@ -1,17 +1,19 @@
 //! `FleetModel` — the overview grid of session previews, as a pure reducer.
 //!
-//! Sessions this window drives are fed by the shell and mirrored by a per-tile
-//! [`TerminalModel`], so their previews are live — laid out at the session's
-//! real size and scaled to the tile at draw time. The fleet never attaches
-//! sessions itself; a tile with no live source renders as a placeholder. The
-//! model reconciles a `SessionList` into tiles bucketed by attach-state section,
-//! routes pumped `SessionData` to the matching tile by id, moves focus on
-//! arrow/Tab navigation (previews are view-only, so keystrokes/text are never
-//! forwarded), focuses on click via a shared grid layout that doubles as the
-//! hit-test, and renders the whole grid — dimming unfocused tiles, bordering the
-//! focused one, and badging bell/activity. Like [`TerminalModel`] it is pure, so
-//! all of this is asserted headlessly by feeding events and inspecting the
-//! returned `Vec<Cmd>`, the focused id, per-tile screen text, and the `Scene`.
+//! Sessions this window drives are fed by the shell, and each tile holds a
+//! [`TerminalView`] onto the session — its emulator [`SessionState`] lives in the
+//! window's one [`Sessions`](crate::Sessions) owner, which the fleet borrows by id
+//! — so previews are live, laid out at the session's real size and scaled to the
+//! tile at draw time. The fleet never attaches sessions itself; a tile with no live
+//! source renders as a placeholder. The model reconciles a `SessionList` into tiles
+//! bucketed by attach-state section, routes pumped `SessionData` to the matching
+//! tile by id, moves focus on arrow/Tab navigation (previews are view-only, so
+//! keystrokes/text are never forwarded), focuses on click via a shared grid layout
+//! that doubles as the hit-test, and renders the whole grid — dimming unfocused
+//! tiles, bordering the focused one, and badging bell/activity. Like
+//! [`TerminalModel`](crate::TerminalModel) it is pure, so all of this is asserted
+//! headlessly by feeding events and inspecting the returned `Vec<Cmd>`, the focused
+//! id, per-tile screen text, and the `Scene`.
 
 use std::collections::HashSet;
 
@@ -22,14 +24,14 @@ use ghost_render::{
     SceneItem, Style, Transform, layout_frame,
 };
 use ghost_vt::protocol::{SessionEvent, SessionState};
-use ghost_vt::query::ThemeColors;
 use ghost_vt::session::SessionInfo;
 
 use crate::event::SessionPush;
 use crate::group::{Group, GroupId};
 use crate::input::{Key, Mods, NamedKey};
+use crate::terminal::TerminalView;
 use crate::text_input::TextInput;
-use crate::{Cmd, PointPx, PointerPhase, SessionId, TerminalModel, UiEvent};
+use crate::{Cmd, PointPx, PointerPhase, SessionId, Sessions, UiEvent};
 
 const GAP: f32 = 10.0;
 const FOCUS_BORDER: f32 = 2.0;
@@ -103,6 +105,17 @@ const MAX_TILE_ASPECT: f32 = 4.0;
 
 /// A laid-out tile: stable handle, session id, and pixel rect.
 type Placement = (u64, SessionId, RectPx);
+
+/// What leaving the overview for the single view yields: the kept session's id and
+/// view, the other driven sessions' `(id, view)` pairs to keep warm, and the resize
+/// commands sizing them to the window. The states themselves stay in the window's
+/// [`Sessions`] owner — only the views move.
+type Extracted = (
+    SessionId,
+    TerminalView,
+    Vec<(SessionId, TerminalView)>,
+    Vec<Cmd>,
+);
 
 /// The confirm modal's geometry: the message line and the two choice buttons.
 struct ConfirmLayout {
@@ -370,10 +383,39 @@ fn tile_order_key(t: &Tile) -> (i64, &str) {
     (t.created_at.unwrap_or(i64::MAX), t.id.as_str())
 }
 
+impl Tile {
+    /// The name a human should see on the card: the display name when labeled, else
+    /// the immutable id. Reads the tile's cached [`Tile::display_name`], so the card
+    /// renders (and the rename seeds) without borrowing the session state.
+    fn display(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.id
+        } else {
+            &self.display_name
+        }
+    }
+}
+
 struct Tile {
     handle: u64,
     id: SessionId,
-    model: TerminalModel,
+    /// The view onto this session's preview. Its [`SessionState`] — the emulator
+    /// this view reads its screen from — lives in the window's one [`Sessions`]
+    /// owner, keyed by `id`; the fleet borrows it (as `&/&mut Sessions`) only when
+    /// it needs the live screen (laying out the preview, feeding output, answering a
+    /// query). Everything the card renders *without* the emulator is cached here so
+    /// the whole layout/pointer path never has to reach for a state.
+    view: TerminalView,
+    /// The session's grid (cols, rows), cached from the state so tile aspect,
+    /// dive-camera geometry, and the resize-detection compare read it without a
+    /// `Sessions` borrow. The fleet never resizes a tile's session, so this only
+    /// changes when the tile is minted or an observed-resize rebuilds it.
+    grid: (u16, u16),
+    /// The session's user-chosen display name (empty when unlabeled), cached from
+    /// the state so rendering, the rename seed, the confirm-modal text, and the
+    /// reconcile compare never borrow a state. Kept in step with the state at every
+    /// rename/listing update (see [`Tile::display`]).
+    display_name: String,
     bell: bool,
     locality: Locality,
     /// The command the session runs (empty = the user's `$SHELL`), shown in the
@@ -458,11 +500,6 @@ pub struct FleetModel {
     /// the sole insertion — mirrors the terminal's preedit guard, avoiding a
     /// double-type of composed characters.
     preedit: String,
-    /// The scheme's default fg/bg, stamped on every tile model so previews
-    /// answer OSC 10/11 color queries like the single view does.
-    theme: ThemeColors,
-    /// Stamped on every tile model, like the theme (see `RootModel::set_policy`).
-    policy: ghost_term::SessionPolicy,
     /// Vertical scroll offset in physical pixels (0 = top). The grid lays out at a
     /// readable tile size regardless of session count and scrolls when it overflows
     /// the viewport, rather than shrinking previews to fit.
@@ -649,8 +686,6 @@ impl FleetModel {
             renaming_group: None,
             preedit: String::new(),
             scroll_y: 0.0,
-            theme: ThemeColors::default(),
-            policy: ghost_term::SessionPolicy::default(),
             observing: HashSet::new(),
             marked: HashSet::new(),
             killed: HashSet::new(),
@@ -660,27 +695,6 @@ impl FleetModel {
             my_group: Group::auto(String::new(), 0),
             grab: None,
             now_ms: 0,
-        }
-    }
-
-    /// Set the scheme's default fg/bg (for OSC 10/11 color-query replies) on
-    /// every tile model, current and future. Returns the mode-2031 dark/light
-    /// notifications a real change owes subscribed sessions.
-    pub fn set_theme(&mut self, theme: ThemeColors) -> Vec<Cmd> {
-        self.theme = theme;
-        let mut cmds = Vec::new();
-        for tile in &mut self.tiles {
-            cmds.extend(tile.model.set_theme(theme));
-        }
-        cmds
-    }
-
-    /// Stamp the policy on every tile model, current and future — a preview runs a
-    /// real emulator over a real session's bytes, so it is governed like any other.
-    pub fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
-        self.policy = policy;
-        for tile in &mut self.tiles {
-            tile.model.set_policy(policy);
         }
     }
 
@@ -731,10 +745,15 @@ impl FleetModel {
     }
 
     /// Start a fleet that already holds `primary` as its focused tile, so its
-    /// screen state survives a toggle from the single-terminal view.
+    /// screen survives a toggle from the single-terminal view. The session states
+    /// stay in the window's [`Sessions`] owner (borrowed here only to seed each
+    /// tile's cached grid/display); the fleet takes just the views.
+    #[allow(clippy::too_many_arguments)]
     pub fn adopting(
-        primary: TerminalModel,
-        warm: Vec<TerminalModel>,
+        sessions: &Sessions,
+        primary_id: SessionId,
+        primary_view: TerminalView,
+        warm: Vec<(SessionId, TerminalView)>,
         metrics: CellMetrics,
         size_px: (u32, u32),
         scale: f32,
@@ -742,18 +761,30 @@ impl FleetModel {
     ) -> (Self, Vec<Cmd>) {
         let mut f = FleetModel::new(metrics, size_px, mine);
         f.scale = scale;
-        let id = primary.session().to_string();
-        f.focused = Some(id.clone());
+        f.focused = Some(primary_id.clone());
         // The primary and the window's other driven sessions are all already
         // live; add each as a fed tile so every preview is warm, not "starting…".
         // Command/pid fill in on the next reconcile.
-        for model in std::iter::once(primary).chain(warm) {
-            let id = model.session().to_string();
+        for (id, view) in std::iter::once((primary_id, primary_view)).chain(warm) {
             let locality = locality_for(&f.mine, &id, true);
-            // No SessionInfo yet (these are live models handed over on a toggle);
+            let (grid, display_name) = sessions
+                .get(&id)
+                .map(|s| (s.dims(), s.display_name().to_string()))
+                .unwrap_or(((PREVIEW_COLS, PREVIEW_ROWS), String::new()));
+            // No SessionInfo yet (these are live sessions handed over on a toggle);
             // creation time fills in on the next reconcile. Until then they sort
             // last — which is correct, they are the window's current sessions.
-            f.push_tile(id, model, false, locality, Vec::new(), 0, None);
+            f.push_tile(
+                id,
+                view,
+                grid,
+                display_name,
+                false,
+                locality,
+                Vec::new(),
+                0,
+                None,
+            );
             if let Some(t) = f.tiles.last_mut() {
                 t.fed = true;
             }
@@ -766,7 +797,9 @@ impl FleetModel {
     fn push_tile(
         &mut self,
         id: SessionId,
-        model: TerminalModel,
+        view: TerminalView,
+        grid: (u16, u16),
+        display_name: String,
         bell: bool,
         locality: Locality,
         command: Vec<String>,
@@ -778,7 +811,9 @@ impl FleetModel {
         self.tiles.push(Tile {
             handle,
             id,
-            model,
+            view,
+            grid,
+            display_name,
             bell,
             locality,
             command,
@@ -839,11 +874,12 @@ impl FleetModel {
     }
 
     /// The screen text of a tile, for assertions.
-    pub fn tile_text(&self, id: &str) -> Option<Vec<String>> {
+    pub fn tile_text(&self, sessions: &Sessions, id: &str) -> Option<Vec<String>> {
         self.tiles
             .iter()
             .find(|t| t.id == id)
-            .map(|t| t.model.screen().text())
+            .and_then(|t| sessions.get(&t.id))
+            .map(|s| s.screen().text())
     }
 
     pub fn locality_of(&self, id: &str) -> Option<Locality> {
@@ -869,7 +905,7 @@ impl FleetModel {
     pub fn dive_target_rect(&self, id: &str) -> Option<RectPx> {
         let preview = self.preview_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
-        let (cols, rows) = tile.model.dims();
+        let (cols, rows) = tile.grid;
         let (fw, fh) = (
             cols as f32 * self.metrics.advance,
             rows as f32 * self.metrics.line_height,
@@ -896,7 +932,7 @@ impl FleetModel {
     pub fn dive_camera(&self, id: &str) -> Option<Transform> {
         let from = self.dive_target_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
-        let (cols, rows) = tile.model.dims();
+        let (cols, rows) = tile.grid;
         let to = RectPx {
             x: 0.0,
             y: 0.0,
@@ -919,6 +955,7 @@ impl FleetModel {
     /// preview is ready, so the caller should dive immediately) or absent.
     pub fn prepare_takeover(
         &mut self,
+        sessions: &mut Sessions,
         id: &str,
         size_px: (u32, u32),
         scale: f32,
@@ -927,11 +964,19 @@ impl FleetModel {
         if tile.fed {
             return None;
         }
-        Some(tile.model.update(UiEvent::Resize {
-            w_px: size_px.0.max(1),
-            h_px: size_px.1.max(1),
-            scale: scale as f64,
-        }))
+        let state = sessions.get_mut(id)?;
+        let cmds = tile.view.update(
+            state,
+            UiEvent::Resize {
+                w_px: size_px.0.max(1),
+                h_px: size_px.1.max(1),
+                scale: scale as f64,
+            },
+        );
+        // A window-sized takeover changes the session grid; keep the cached grid in
+        // step so the tile's aspect/dive geometry follows.
+        tile.grid = state.dims();
+        Some(cmds)
     }
 
     /// Extract a single terminal for a toggle back to the single view, detaching
@@ -941,25 +986,27 @@ impl FleetModel {
     /// what the window actually drives.
     pub fn into_single(
         self,
+        sessions: &mut Sessions,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
-        self.into_single_keeping(None, size_px, scale)
+    ) -> Extracted {
+        self.into_single_keeping(sessions, None, size_px, scale)
     }
 
     /// Like [`into_single`](Self::into_single) but, when `target` names a present
     /// tile, keeps *that* session (a take-over of a specific tile). Otherwise it
     /// falls back to the owned session, then the focused tile, then any tile.
-    /// Returns the kept model, the *other driven sessions'* models (to keep warm
-    /// in the single view so their previews and Ctrl-Tab switches stay live), and
-    /// the resize commands. Placeholder tiles for sessions this window doesn't
-    /// drive are dropped.
+    /// Returns the kept view (with its id), the *other driven sessions'* views (to
+    /// keep warm in the single view so their previews and Ctrl-Tab switches stay
+    /// live), and the resize commands. The states stay in `sessions`; the foreign
+    /// previews' states are dropped from it.
     pub fn into_single_keeping(
         self,
+        sessions: &mut Sessions,
         target: Option<SessionId>,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
+    ) -> Extracted {
         let keep = target
             .filter(|id| self.tiles.iter().any(|t| &t.id == id))
             .or_else(|| {
@@ -975,7 +1022,13 @@ impl FleetModel {
                     .map(|t| t.id.clone())
             })
             .or_else(|| self.tiles.first().map(|t| t.id.clone()));
-        self.extract(keep.clone(), keep.unwrap_or_default(), size_px, scale)
+        self.extract(
+            sessions,
+            keep.clone(),
+            keep.unwrap_or_default(),
+            size_px,
+            scale,
+        )
     }
 
     /// Leave the overview showing `id` *specifically* — a spawn or take-over.
@@ -986,32 +1039,36 @@ impl FleetModel {
     /// a different session: the caller asked for `id`.
     pub fn into_single_adopting(
         self,
+        sessions: &mut Sessions,
         id: SessionId,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
-        self.extract(Some(id.clone()), id, size_px, scale)
+    ) -> Extracted {
+        self.extract(sessions, Some(id.clone()), id, size_px, scale)
     }
 
-    /// Consume the fleet, returning `keep`'s model (or a fresh one named `fresh`),
-    /// every other *driven* (this-window) session's model to keep warm, and the
-    /// resize commands sizing them all to the window.
+    /// Consume the fleet, returning `keep`'s view (or a freshly-minted one named
+    /// `fresh`) with its id, every other *driven* (this-window) session's view to
+    /// keep warm, and the resize commands sizing them all to the window. The states
+    /// stay in `sessions`; a foreign preview's state — no longer shown by any view —
+    /// is removed, so the window's theme/policy broadcast never reaches a ghost.
     fn extract(
         self,
+        sessions: &mut Sessions,
         keep: Option<SessionId>,
         fresh: SessionId,
         size_px: (u32, u32),
         scale: f32,
-    ) -> (TerminalModel, Vec<TerminalModel>, Vec<Cmd>) {
+    ) -> Extracted {
         let metrics = self.metrics;
-        let theme = self.theme;
         let mine = self.mine.clone();
         // Leaving the overview closes every live mirror; the single view's
         // sessions are fed by their own clients, and a re-opened fleet
         // re-observes from a fresh snapshot.
         let mut cmds: Vec<Cmd> = self.observing.iter().cloned().map(Cmd::Unobserve).collect();
-        let mut kept = None;
+        let mut kept: Option<(SessionId, TerminalView)> = None;
         let mut warm = Vec::new();
+        let mut dropped = Vec::new();
         for tile in self.tiles {
             if Some(&tile.id) == keep.as_ref() {
                 // Adopting a session as the foreground claims it into this
@@ -1026,37 +1083,46 @@ impl FleetModel {
                     "refusing to adopt session '{}': it is attached in another window",
                     tile.id,
                 );
-                kept = Some(tile.model);
+                kept = Some((tile.id, tile.view));
             } else if mine.contains(&tile.id) {
-                warm.push(tile.model); // a driven session: keep it warm
+                warm.push((tile.id, tile.view)); // a driven session: keep it warm
+            } else {
+                dropped.push(tile.id); // a foreign preview: its state goes too
             }
-            // else: a placeholder for a session we don't drive — drop it.
+        }
+        for id in dropped {
+            sessions.remove(&id);
         }
         let resize = UiEvent::Resize {
             w_px: size_px.0.max(1),
             h_px: size_px.1.max(1),
             scale: scale as f64,
         };
-        let mut model = kept.unwrap_or_else(|| {
-            let mut m = TerminalModel::new(fresh, 1, 1, metrics);
-            m.set_theme(theme);
-            m.set_policy(self.policy);
-            m
+        let (kept_id, mut kept_view) = kept.unwrap_or_else(|| {
+            // A just-spawned session with no tile: mint its state (stamped with the
+            // window's theme/policy) and a fresh view sized below.
+            sessions.get_or_mint(&fresh, 1, 1);
+            (fresh, TerminalView::new(metrics, 1, 1))
         });
-        cmds.append(&mut model.update(resize.clone()));
-        for m in &mut warm {
-            cmds.append(&mut m.update(resize.clone()));
+        let state = sessions
+            .get_mut(&kept_id)
+            .expect("kept session state present in the registry");
+        cmds.append(&mut kept_view.update(state, resize.clone()));
+        for (id, view) in &mut warm {
+            if let Some(state) = sessions.get_mut(id) {
+                cmds.append(&mut view.update(state, resize.clone()));
+            }
         }
-        (model, warm, cmds)
+        (kept_id, kept_view, warm, cmds)
     }
 
     // ---- update ----
 
-    pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
+    pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         let mut cmds = match ev {
-            UiEvent::SessionList(infos) => self.reconcile(infos),
-            UiEvent::DeadSessions(dead) => self.dead_sessions(dead),
-            UiEvent::SessionPush { name, push } => self.session_push(&name, push),
+            UiEvent::SessionList(infos) => self.reconcile(sessions, infos),
+            UiEvent::DeadSessions(dead) => self.dead_sessions(sessions, dead),
+            UiEvent::SessionPush { name, push } => self.session_push(sessions, &name, push),
             // Authoritative groups from the shell (startup load, or another
             // window saved): replace ours without echoing a save back (the
             // sync below re-adds my entry — and re-saves — only if the
@@ -1070,7 +1136,9 @@ impl FleetModel {
                     vec![Cmd::Redraw]
                 }
             }
-            UiEvent::SessionData { name, bytes, ended } => self.session_data(&name, bytes, ended),
+            UiEvent::SessionData { name, bytes, ended } => {
+                self.session_data(sessions, &name, bytes, ended)
+            }
             UiEvent::Resize { w_px, h_px, scale } => {
                 self.size_px = (w_px, h_px);
                 if scale > 0.0 && self.scale != scale as f32 {
@@ -1104,7 +1172,7 @@ impl FleetModel {
             }
             // Input goes through the modal router (rename / confirm / normal).
             ev @ (UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }) => {
-                self.input(ev)
+                self.input(sessions, ev)
             }
             _ => Vec::new(),
         };
@@ -1113,21 +1181,36 @@ impl FleetModel {
         cmds.extend(self.sync_registry());
         // Rebuild any preview whose content or size this event changed, so `view`
         // can stay a pure read of cached frames.
-        self.refresh_dirty_frames();
+        self.refresh_dirty_frames(sessions);
         // A resize, or tiles appearing/disappearing, can change the content height
         // or viewport — keep the scroll offset valid (nav/wheel clamp themselves).
         self.clamp_scroll();
+        // The tiles are the only views onto this window's fleet-side session states,
+        // and this event may have dropped some (reconcile, kill, ungroup). Prune the
+        // now-unreferenced states so a dropped tile's emulator can't linger to catch
+        // a theme/policy broadcast or resurrect a stale screen under a reused name.
+        // Tiles come and go without moving state, so this is where state follows.
+        sessions.retain(|id| self.tiles.iter().any(|t| t.id == id));
+        debug_assert!(
+            self.tiles.iter().all(|t| sessions.contains(&t.id)),
+            "every fleet tile must have a session state in the registry",
+        );
         cmds
     }
 
     /// Re-lay-out the previews of tiles marked [`Tile::frame_dirty`] and clear the
     /// flag, leaving unchanged tiles' cached frames untouched. Effective metrics
     /// are the same for every tile, so they're computed once.
-    fn refresh_dirty_frames(&mut self) {
+    fn refresh_dirty_frames(&mut self, sessions: &Sessions) {
         let metrics = self.effective_metrics();
         for tile in &mut self.tiles {
             if tile.frame_dirty {
-                tile.frame = Some(Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
+                let vt = sessions
+                    .get(&tile.id)
+                    .expect("fleet tile has a session state")
+                    .screen()
+                    .vt();
+                tile.frame = Some(Rc::new(layout_frame(vt, metrics)));
                 tile.frame_dirty = false;
                 self.frames.miss();
                 self.frames.insert();
@@ -1148,7 +1231,7 @@ impl FleetModel {
         self.frames
     }
 
-    fn reconcile(&mut self, infos: Vec<SessionInfo>) -> Vec<Cmd> {
+    fn reconcile(&mut self, sessions: &mut Sessions, infos: Vec<SessionInfo>) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         let mut dirty = false;
         let new_ids: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
@@ -1228,7 +1311,7 @@ impl FleetModel {
                     || tile.pid != info.pid
                     || tile.created_at != info.created_at
                     || tile.cwd != info.cwd
-                    || (apply_display && tile.model.display_name() != info.display_name)
+                    || (apply_display && tile.display_name != info.display_name)
                 {
                     // A creation-time change reorders the grid (it's the sort key),
                     // so it warrants a repaint just like locality/metadata changes.
@@ -1250,21 +1333,35 @@ impl FleetModel {
                 tile.cwd = info.cwd.clone();
                 tile.host = info.connection.as_ref().map(|c| c.target());
                 if apply_display {
-                    tile.model.set_display_name(info.display_name.clone());
+                    // Author the name on the one owner and cache it on the tile; the
+                    // state remembers it (a later adopt titles the window from it), the
+                    // cache renders the card without a borrow.
+                    if let Some(state) = sessions.get_mut(&tile.id) {
+                        state.set_display_name(info.display_name.clone());
+                    }
+                    tile.display_name = info.display_name.clone();
                 }
             } else {
                 // Born at the session's listed grid, so the tile has its real
                 // aspect before the observer's first snapshot lands — a dive-out
                 // freezes the layout at listing time, and the grid must not
-                // reshuffle under the animation when the mirrors catch up.
+                // reshuffle under the animation when the mirrors catch up. Minting
+                // through the one owner stamps the window's theme/policy for us.
                 let (cols, rows) = info.size.unwrap_or((PREVIEW_COLS, PREVIEW_ROWS));
-                let mut model = TerminalModel::new(info.name.clone(), cols, rows, self.metrics);
-                model.set_theme(self.theme);
-                model.set_policy(self.policy);
-                model.set_display_name(info.display_name.clone());
+                // The prune keeps the registry matched to the tiles, so a tile that
+                // doesn't exist yet has no leftover state — get_or_mint always mints
+                // fresh here, never resurrecting a stale screen under a reused name.
+                debug_assert!(
+                    !sessions.contains(&info.name),
+                    "a brand-new fleet tile's id must have no leftover session state",
+                );
+                let state = sessions.get_or_mint(&info.name, cols, rows);
+                state.set_display_name(info.display_name.clone());
                 self.push_tile(
                     info.name.clone(),
-                    model,
+                    TerminalView::new(self.metrics, cols, rows),
+                    (cols, rows),
+                    info.display_name.clone(),
                     info.bell,
                     locality,
                     info.command.clone(),
@@ -1316,7 +1413,11 @@ impl FleetModel {
     /// tile (metadata from the durable descriptor; the shell follows up with
     /// the recording's last screen as ordinary tile output). Only group
     /// members are remembered — a stray descriptor seeds nothing.
-    fn dead_sessions(&mut self, dead: Vec<crate::event::DeadSession>) -> Vec<Cmd> {
+    fn dead_sessions(
+        &mut self,
+        sessions: &mut Sessions,
+        dead: Vec<crate::event::DeadSession>,
+    ) -> Vec<Cmd> {
         let mut dirty = false;
         // The sweep is also the authority on what is still resurrectable: a
         // remembered member that is neither a live tile nor named by the
@@ -1366,19 +1467,22 @@ impl FleetModel {
                 continue;
             }
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == d.name) {
-                if tile.dead && tile.model.display_name() != d.display_name {
-                    tile.model.set_display_name(d.display_name);
+                if tile.dead && tile.display_name != d.display_name {
+                    if let Some(state) = sessions.get_mut(&tile.id) {
+                        state.set_display_name(d.display_name.clone());
+                    }
+                    tile.display_name = d.display_name;
                     dirty = true;
                 }
             } else {
-                let mut model =
-                    TerminalModel::new(d.name.clone(), PREVIEW_COLS, PREVIEW_ROWS, self.metrics);
-                model.set_theme(self.theme);
-                model.set_policy(self.policy);
-                model.set_display_name(d.display_name);
+                // Minting through the one owner stamps the window's theme/policy.
+                let state = sessions.get_or_mint(&d.name, PREVIEW_COLS, PREVIEW_ROWS);
+                state.set_display_name(d.display_name.clone());
                 self.push_tile(
                     d.name.clone(),
-                    model,
+                    TerminalView::new(self.metrics, PREVIEW_COLS, PREVIEW_ROWS),
+                    (PREVIEW_COLS, PREVIEW_ROWS),
+                    d.display_name,
                     false,
                     Locality::Detached,
                     d.command,
@@ -1399,7 +1503,7 @@ impl FleetModel {
     /// moment the host pushes them instead of on the next list. A push for a
     /// session with no tile yet is dropped — the reconcile seeds tiles, and
     /// the list it reads carries the same state.
-    fn session_push(&mut self, id: &str, push: SessionPush) -> Vec<Cmd> {
+    fn session_push(&mut self, sessions: &mut Sessions, id: &str, push: SessionPush) -> Vec<Cmd> {
         let focused = self.focused.as_deref() == Some(id);
         let observed = self.observing.contains(id);
         let mine = &self.mine;
@@ -1422,11 +1526,14 @@ impl FleetModel {
                 dirty |= tile.bell != bell
                     || tile.locality != locality
                     || tile.holder != holder
-                    || tile.model.display_name() != display_name;
+                    || tile.display_name != display_name;
                 tile.bell = bell;
                 tile.locality = locality;
                 tile.holder = holder;
-                tile.model.set_display_name(display_name);
+                if let Some(state) = sessions.get_mut(id) {
+                    state.set_display_name(display_name.clone());
+                }
+                tile.display_name = display_name;
             }
             SessionPush::Event(SessionEvent::Bell) => {
                 // Marker parity: only a bell nobody was attached to witness is
@@ -1454,8 +1561,11 @@ impl FleetModel {
                 tile.holder = None;
             }
             SessionPush::Event(SessionEvent::Renamed(name)) => {
-                dirty |= tile.model.display_name() != name;
-                tile.model.set_display_name(name);
+                dirty |= tile.display_name != name;
+                if let Some(state) = sessions.get_mut(id) {
+                    state.set_display_name(name.clone());
+                }
+                tile.display_name = name;
             }
             SessionPush::Event(SessionEvent::Activity) => {
                 if !focused {
@@ -1472,12 +1582,14 @@ impl FleetModel {
             // shell also uses this for a dead tile's recording playback (the
             // recording's grid, then its last screen as ordinary output).
             SessionPush::Event(SessionEvent::Resized { cols, rows }) => {
-                if (observed || tile.dead) && tile.model.dims() != (cols, rows) {
-                    let mut model = TerminalModel::new(tile.id.clone(), cols, rows, self.metrics);
-                    model.set_theme(self.theme);
-                    model.set_policy(self.policy);
-                    model.set_display_name(tile.model.display_name().to_string());
-                    tile.model = model;
+                if (observed || tile.dead) && tile.grid != (cols, rows) {
+                    // Throw the mirror away and re-seed it at the new grid: a fresh
+                    // state (stamped with the window's theme/policy, keeping the
+                    // display name) and a fresh view, exactly as the old whole-model
+                    // rebuild did. The resync that follows re-fills the content.
+                    sessions.rebuild(id, cols, rows);
+                    tile.view = TerminalView::new(self.metrics, cols, rows);
+                    tile.grid = (cols, rows);
                     tile.fed = false; // placeholder until the resync lands
                     tile.frame_dirty = true;
                     dirty = true;
@@ -1652,7 +1764,7 @@ impl FleetModel {
         // driven tiles are window-sized and placeholders keep the 80×24 default.
         // Clamped so one degenerate grid can't blow up its row.
         let aspect = |t: &Tile| -> f32 {
-            let (cols, rows) = t.model.dims();
+            let (cols, rows) = t.grid;
             ((cols.max(1) as f32 * metrics.advance) / (rows.max(1) as f32 * metrics.line_height))
                 .clamp(MIN_TILE_ASPECT, MAX_TILE_ASPECT)
         };
@@ -1856,7 +1968,13 @@ impl FleetModel {
         self.clamp_scroll();
     }
 
-    fn session_data(&mut self, name: &str, bytes: Vec<u8>, ended: bool) -> Vec<Cmd> {
+    fn session_data(
+        &mut self,
+        sessions: &mut Sessions,
+        name: &str,
+        bytes: Vec<u8>,
+        ended: bool,
+    ) -> Vec<Cmd> {
         let background = self.focused.as_deref() != Some(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
@@ -1864,16 +1982,22 @@ impl FleetModel {
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
             return Vec::new();
         };
+        let Some(state) = sessions.get_mut(name) else {
+            return Vec::new();
+        };
         if observation_ended {
             tile.fed = false;
             tile.frame_dirty = true;
         }
         let had_output = !bytes.is_empty();
-        let cmds = tile.model.update(UiEvent::SessionData {
-            name: name.to_string(),
-            bytes,
-            ended,
-        });
+        let cmds = tile.view.update(
+            state,
+            UiEvent::SessionData {
+                name: name.to_string(),
+                bytes,
+                ended,
+            },
+        );
         if had_output {
             tile.fed = true; // attached and live: stop re-attaching it
             tile.frame_dirty = true; // its screen changed; preview is stale
@@ -1885,7 +2009,7 @@ impl FleetModel {
         }
         // A progress report dirties no screen rows, so the model won't ask for
         // a redraw — but the card header shows it, so a change repaints here.
-        let progress = tile.model.screen().vt().progress();
+        let progress = state.screen().vt().progress();
         let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
         // A tile reaches nothing outside itself: not the window title (that would
         // retitle the window out from under the single view), not the window's state
@@ -1973,9 +2097,9 @@ impl FleetModel {
     /// Route an input event. An active inline rename or confirm dialog swallows
     /// input until resolved; otherwise arrows/Tab navigate, Enter activates the
     /// focused tile, and a press hits a button or activates a tile.
-    fn input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+    fn input(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         if self.renaming.is_some() {
-            return self.rename_input(ev);
+            return self.rename_input(sessions, ev);
         }
         if self.pending.is_some() {
             return self.pending_input(ev);
@@ -2604,7 +2728,7 @@ impl FleetModel {
                     .tiles
                     .iter()
                     .find(|t| t.id == id)
-                    .map(|t| t.model.display().to_string())
+                    .map(|t| t.display().to_string())
                     .unwrap_or_else(|| id.clone());
                 self.renaming = Some(Renaming {
                     buffer: TextInput::new(seed),
@@ -2803,7 +2927,7 @@ impl FleetModel {
             .tiles
             .iter()
             .find(|t| &t.id == id)
-            .map(|t| t.model.display().to_string())
+            .map(|t| t.display().to_string())
             .unwrap_or_else(|| id.clone());
         match p.action {
             PendingAction::Kill => (format!("Kill {shown}?"), "Kill"),
@@ -2870,7 +2994,7 @@ impl FleetModel {
     /// otherwise a name could be deleted but never typed. Ctrl/Cmd chords are
     /// shortcuts, not text, and are ignored; while an IME composition is active the
     /// raw keys belong to it, so they are swallowed until the `Text` commit lands.
-    fn rename_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+    fn rename_input(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         match ev {
             UiEvent::Text(s) => {
                 // A commit ends any composition; the committed text is the insertion.
@@ -2903,7 +3027,7 @@ impl FleetModel {
                     let name = r.buffer.into_text();
                     let deadline_ms = self.now_ms + RENAME_CONFIRM_TIMEOUT_MS;
                     let tile = self.tiles.iter_mut().find(|t| t.id == r.id);
-                    let unchanged = tile.as_ref().is_some_and(|t| t.model.display() == name);
+                    let unchanged = tile.as_ref().is_some_and(|t| t.display() == name);
                     if name.is_empty() || unchanged {
                         vec![Cmd::Redraw]
                     } else {
@@ -2920,7 +3044,10 @@ impl FleetModel {
                             name.clone()
                         };
                         if let Some(t) = tile {
-                            t.model.set_display_name(label.clone());
+                            if let Some(state) = sessions.get_mut(&t.id) {
+                                state.set_display_name(label.clone());
+                            }
+                            t.display_name = label.clone();
                             t.pending_rename = Some(PendingRename {
                                 name: label,
                                 deadline_ms,
@@ -3272,7 +3399,7 @@ impl FleetModel {
 
     // ---- view ----
 
-    pub fn view(&self) -> Scene {
+    pub fn view(&self, sessions: &Sessions) -> Scene {
         let (headers, placements, band, _content_h) = self.sections_layout();
         let metrics = self.effective_metrics();
         let view_h = self.size_px.1 as f32;
@@ -3432,6 +3559,9 @@ impl FleetModel {
             let Some(tile) = self.tiles.iter().find(|t| t.id == id) else {
                 continue;
             };
+            let state = sessions
+                .get(&tile.id)
+                .expect("fleet tile has a session state");
             let focused = self.focused.as_deref() == Some(id.as_str());
             let (header, preview, buttons) = card_layout(rect, band);
 
@@ -3455,7 +3585,7 @@ impl FleetModel {
                 None if tile.dead => format!(
                     "{} \u{b7} exited",
                     card_meta(
-                        tile.model.display(),
+                        tile.display(),
                         &tile.command,
                         0,
                         tile.cwd.clone(),
@@ -3464,11 +3594,11 @@ impl FleetModel {
                     )
                 ),
                 None => card_meta(
-                    tile.model.display(),
+                    tile.display(),
                     &tile.command,
                     tile.pid,
                     tile.cwd.clone(),
-                    tile.model.screen().vt().progress(),
+                    state.screen().vt().progress(),
                     tile.host.as_deref(),
                 ),
             };
@@ -3495,14 +3625,14 @@ impl FleetModel {
                 let frame = tile
                     .frame
                     .clone()
-                    .unwrap_or_else(|| Rc::new(layout_frame(tile.model.screen().vt(), metrics)));
+                    .unwrap_or_else(|| Rc::new(layout_frame(state.screen().vt(), metrics)));
                 out.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
                     session: ghost_render::session_key(&tile.id),
                     rect: preview,
                     frame,
                     selection: if focused {
-                        tile.model.selection()
+                        tile.view.selection(state)
                     } else {
                         None
                     },
@@ -3828,7 +3958,9 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TerminalModel;
     use crate::input::KeyEventKind;
+    use crate::terminal::SessionState;
     use ghost_vt::protocol::AttachInfo;
 
     const METRICS: CellMetrics = CellMetrics {
@@ -3836,6 +3968,116 @@ mod tests {
         line_height: 18.0,
     };
     const SIZE: (u32, u32) = (400, 200);
+
+    /// Test harness: a [`FleetModel`] paired with the window's [`Sessions`] owner it
+    /// borrows its tiles' states from. The real window keeps `Sessions` on
+    /// `RootModel` and threads `&/&mut Sessions` into every fleet call; a fleet test
+    /// in isolation carries its own. `Deref` forwards the many session-free methods
+    /// unchanged; the session-taking ones are overridden here to thread `s`, so a
+    /// test drives `m.update(ev)` / `m.view()` exactly as before.
+    struct Fleet {
+        m: FleetModel,
+        s: Sessions,
+    }
+
+    impl std::ops::Deref for Fleet {
+        type Target = FleetModel;
+        fn deref(&self) -> &FleetModel {
+            &self.m
+        }
+    }
+    impl std::ops::DerefMut for Fleet {
+        fn deref_mut(&mut self) -> &mut FleetModel {
+            &mut self.m
+        }
+    }
+
+    impl Fleet {
+        fn new(metrics: CellMetrics, size_px: (u32, u32), mine: HashSet<SessionId>) -> Self {
+            Fleet {
+                m: FleetModel::new(metrics, size_px, mine),
+                s: Sessions::new(),
+            }
+        }
+
+        /// Mirror the real [`FleetModel::adopting`] hand-off, but taking whole models
+        /// (as a toggle from the single view once did): each state goes into the
+        /// registry, its view into the fleet.
+        fn adopting(
+            primary: TerminalModel,
+            warm: Vec<TerminalModel>,
+            metrics: CellMetrics,
+            size_px: (u32, u32),
+            scale: f32,
+            mine: HashSet<SessionId>,
+        ) -> (Self, Vec<Cmd>) {
+            let mut s = Sessions::new();
+            let primary_id = primary.session().to_string();
+            let primary_view = s.adopt(primary);
+            let warm: Vec<(SessionId, TerminalView)> = warm
+                .into_iter()
+                .map(|model| {
+                    let id = model.session().to_string();
+                    (id, s.adopt(model))
+                })
+                .collect();
+            let (m, cmds) = FleetModel::adopting(
+                &s,
+                primary_id,
+                primary_view,
+                warm,
+                metrics,
+                size_px,
+                scale,
+                mine,
+            );
+            (Fleet { m, s }, cmds)
+        }
+
+        fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
+            self.m.update(&mut self.s, ev)
+        }
+
+        fn view(&self) -> Scene {
+            self.m.view(&self.s)
+        }
+
+        fn tile_text(&self, id: &str) -> Option<Vec<String>> {
+            self.m.tile_text(&self.s, id)
+        }
+
+        fn into_single(self, size_px: (u32, u32), scale: f32) -> Extracted {
+            let Fleet { m, mut s } = self;
+            m.into_single(&mut s, size_px, scale)
+        }
+
+        fn into_single_keeping(
+            self,
+            target: Option<SessionId>,
+            size_px: (u32, u32),
+            scale: f32,
+        ) -> Extracted {
+            let Fleet { m, mut s } = self;
+            m.into_single_keeping(&mut s, target, size_px, scale)
+        }
+
+        fn into_single_adopting(self, id: SessionId, size_px: (u32, u32), scale: f32) -> Extracted {
+            let Fleet { m, mut s } = self;
+            m.into_single_adopting(&mut s, id, size_px, scale)
+        }
+
+        /// The session state behind a tile — for the assertions that once read it off
+        /// the tile's whole model (screen text, title, remembered display name).
+        fn state(&self, id: &str) -> Option<&SessionState> {
+            self.s.get(id)
+        }
+
+        /// Set the policy on every held session, as the window's `set_policy` does
+        /// (the fleet no longer owns a policy of its own).
+        fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
+            self.s.set_policy(policy);
+        }
+    }
 
     /// A detached session — safe for the fleet to attach and preview.
     fn info(name: &str) -> SessionInfo {
@@ -3854,15 +4096,15 @@ mod tests {
         }
     }
 
-    fn fleet() -> FleetModel {
-        FleetModel::new(METRICS, SIZE, HashSet::new())
+    fn fleet() -> Fleet {
+        Fleet::new(METRICS, SIZE, HashSet::new())
     }
 
     /// A window wide enough for a multi-column grid, for tests that exercise
     /// horizontal arrow nav or 2-D layout (the narrow default fits one column).
     const WIDE: (u32, u32) = (1000, 700);
 
-    fn widen(m: &mut FleetModel) {
+    fn widen(m: &mut Fleet) {
         m.update(UiEvent::Resize {
             w_px: WIDE.0,
             h_px: WIDE.1,
@@ -3870,13 +4112,13 @@ mod tests {
         });
     }
 
-    fn list(m: &mut FleetModel, names: &[&str]) -> Vec<Cmd> {
+    fn list(m: &mut Fleet, names: &[&str]) -> Vec<Cmd> {
         m.update(UiEvent::SessionList(
             names.iter().map(|n| info(n)).collect(),
         ))
     }
 
-    fn data(m: &mut FleetModel, name: &str, bytes: &[u8]) -> Vec<Cmd> {
+    fn data(m: &mut Fleet, name: &str, bytes: &[u8]) -> Vec<Cmd> {
         m.update(UiEvent::SessionData {
             name: name.to_string(),
             bytes: bytes.to_vec(),
@@ -3884,7 +4126,7 @@ mod tests {
         })
     }
 
-    fn key(m: &mut FleetModel, k: Key) -> Vec<Cmd> {
+    fn key(m: &mut Fleet, k: Key) -> Vec<Cmd> {
         m.update(UiEvent::Key {
             key: k,
             mods: crate::Mods::NONE,
@@ -3893,7 +4135,7 @@ mod tests {
         })
     }
 
-    fn wheel(m: &mut FleetModel, dy: f64) -> Vec<Cmd> {
+    fn wheel(m: &mut Fleet, dy: f64) -> Vec<Cmd> {
         m.update(UiEvent::Pointer {
             phase: PointerPhase::Wheel,
             button: None,
@@ -3905,7 +4147,7 @@ mod tests {
     }
 
     /// List `n` detached sessions named `s0..sn`.
-    fn list_many(m: &mut FleetModel, n: usize) {
+    fn list_many(m: &mut Fleet, n: usize) {
         let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
         m.update(UiEvent::SessionList(infos));
     }
@@ -3920,7 +4162,7 @@ mod tests {
     /// `(label, top-y)` for each section header in the rendered scene: the
     /// FIRST Section-id Text per id — the band's label (a group's chips share
     /// their band's id and come after it).
-    fn headers(m: &FleetModel) -> Vec<(String, f32)> {
+    fn headers(m: &Fleet) -> Vec<(String, f32)> {
         let mut seen = HashSet::new();
         m.view().layers[0]
             .items
@@ -3940,7 +4182,7 @@ mod tests {
     }
 
     /// The laid-out top-y of a tile (tests reach into the private layout).
-    fn tile_y(m: &FleetModel, id: &str) -> f32 {
+    fn tile_y(m: &Fleet, id: &str) -> f32 {
         m.layout()
             .into_iter()
             .find(|(_, i, _)| i == id)
@@ -3958,22 +4200,22 @@ mod tests {
     }
 
     /// Session ids in laid-out order (section order, then within-section order).
-    fn order(m: &FleetModel) -> Vec<String> {
+    fn order(m: &Fleet) -> Vec<String> {
         m.layout().into_iter().map(|(_, id, _)| id).collect()
     }
 
-    fn push(m: &mut FleetModel, name: &str, p: SessionPush) -> Vec<Cmd> {
+    fn push(m: &mut Fleet, name: &str, p: SessionPush) -> Vec<Cmd> {
         m.update(UiEvent::SessionPush {
             name: name.to_string(),
             push: p,
         })
     }
 
-    fn tile<'a>(m: &'a FleetModel, id: &str) -> &'a Tile {
+    fn tile<'a>(m: &'a Fleet, id: &str) -> &'a Tile {
         m.tiles.iter().find(|t| t.id == id).unwrap()
     }
 
-    fn press_ctrl(m: &mut FleetModel, pos: PointPx) -> Vec<Cmd> {
+    fn press_ctrl(m: &mut Fleet, pos: PointPx) -> Vec<Cmd> {
         m.update(UiEvent::Pointer {
             phase: PointerPhase::Press,
             button: Some(crate::PointerButton::Left),
@@ -3987,7 +4229,7 @@ mod tests {
         })
     }
 
-    fn centre_of(m: &FleetModel, id: &str) -> PointPx {
+    fn centre_of(m: &Fleet, id: &str) -> PointPx {
         let r = m
             .layout()
             .into_iter()
@@ -4042,14 +4284,14 @@ mod tests {
 
     /// This window's fleet: `mine` pre-owned, with a minted group identity —
     /// what the root hands a real fleet.
-    fn my_fleet(mine: &[&str]) -> FleetModel {
-        let mut m = FleetModel::new(METRICS, SIZE, mine.iter().map(|s| s.to_string()).collect());
+    fn my_fleet(mine: &[&str]) -> Fleet {
+        let mut m = Fleet::new(METRICS, SIZE, mine.iter().map(|s| s.to_string()).collect());
         m.set_my_group(Group::auto("w1".into(), 0));
         m
     }
 
     /// Seed a foreign group into the registry, as a shell broadcast would.
-    fn seed_group(m: &mut FleetModel, gid: &str, name: &str, members: &[&str]) {
+    fn seed_group(m: &mut Fleet, gid: &str, name: &str, members: &[&str]) {
         let mut groups: Vec<Group> = m.groups().to_vec();
         groups.retain(|g| g.id != gid);
         groups.push(Group {
@@ -4151,7 +4393,7 @@ mod tests {
     }
 
     /// Press Enter with Ctrl held.
-    fn ctrl_enter(m: &mut FleetModel) -> Vec<Cmd> {
+    fn ctrl_enter(m: &mut Fleet) -> Vec<Cmd> {
         m.update(UiEvent::Key {
             key: Key::Named(NamedKey::Enter),
             mods: crate::Mods {
@@ -4164,7 +4406,7 @@ mod tests {
     }
 
     /// Focus `id` without leaving a mark (Ctrl-click toggles it on and off).
-    fn focus(m: &mut FleetModel, id: &str) {
+    fn focus(m: &mut Fleet, id: &str) {
         for _ in 0..2 {
             let pos = centre_of(m, id);
             press_ctrl(m, pos);
@@ -4174,7 +4416,7 @@ mod tests {
     }
 
     /// The rect of `button` on group `gid`'s header band.
-    fn group_button_rect(m: &FleetModel, gid: &str, button: GroupButton) -> RectPx {
+    fn group_button_rect(m: &Fleet, gid: &str, button: GroupButton) -> RectPx {
         let (headers, _, _, _) = m.sections_layout();
         let header = headers
             .iter()
@@ -4388,12 +4630,12 @@ mod tests {
 
     /// Reveal the hidden attached-elsewhere content — for tests whose
     /// subject lives behind the toggle.
-    fn reveal(m: &mut FleetModel) {
+    fn reveal(m: &mut Fleet) {
         m.show_elsewhere = true;
     }
 
     /// The reveal toggle's band rect, if one renders.
-    fn toggle_rect(m: &FleetModel) -> Option<RectPx> {
+    fn toggle_rect(m: &Fleet) -> Option<RectPx> {
         let (headers, _, _, _) = m.sections_layout();
         headers.iter().find_map(|(b, r)| match b {
             Band::Elsewhere { .. } => Some(*r),
@@ -4459,7 +4701,7 @@ mod tests {
     }
 
     /// The reveal toggle's band, if one renders.
-    fn toggle_band(m: &FleetModel) -> Option<Band> {
+    fn toggle_band(m: &Fleet) -> Option<Band> {
         let (headers, _, _, _) = m.sections_layout();
         headers.iter().find_map(|(b, _)| match b {
             Band::Elsewhere { .. } => Some(b.clone()),
@@ -4696,7 +4938,7 @@ mod tests {
 
     #[test]
     fn the_detach_button_releases_the_session_and_keeps_a_live_preview() {
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         widen(&mut m);
         m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
@@ -4815,7 +5057,7 @@ mod tests {
             .find(|t| t.id == "x")
             .expect("the dead member gets a tile");
         assert!(x.dead);
-        assert_eq!(x.model.display_name(), "worker");
+        assert_eq!(x.display_name, "worker");
         assert_eq!(x.command, vec!["npm", "run", "dev"]);
         assert!(
             m.layout().iter().any(|(_, id, _)| id == "x"),
@@ -4914,7 +5156,7 @@ mod tests {
 
     /// My block's outline rect (content space) — the drop target for the
     /// attach gesture.
-    fn my_block_rect(m: &FleetModel) -> RectPx {
+    fn my_block_rect(m: &Fleet) -> RectPx {
         let (headers, _, _, _) = m.sections_layout();
         headers
             .iter()
@@ -5128,7 +5370,7 @@ mod tests {
     }
 
     /// Press `key` with Ctrl held.
-    fn key_ctrl(m: &mut FleetModel, key: Key) -> Vec<Cmd> {
+    fn key_ctrl(m: &mut Fleet, key: Key) -> Vec<Cmd> {
         m.update(UiEvent::Key {
             key,
             mods: crate::Mods {
@@ -5667,7 +5909,7 @@ mod tests {
             ..info("a")
         }]));
         assert_eq!(
-            tile(&m, "a").model.dims(),
+            tile(&m, "a").grid,
             (120, 60),
             "the placeholder is born at the listed grid, not the 80×24 guess"
         );
@@ -5692,7 +5934,7 @@ mod tests {
 
     #[test]
     fn the_fleet_observes_sessions_it_does_not_drive() {
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
         assert!(
             cmds.contains(&Cmd::Observe("b".to_string())),
@@ -5723,7 +5965,7 @@ mod tests {
         let mut m = fleet();
         widen(&mut m);
         list(&mut m, &["b", "c"]);
-        let (_, _, cmds) = m.into_single_keeping(None, WIDE, 1.0);
+        let (_, _, _, cmds) = m.into_single_keeping(None, WIDE, 1.0);
         assert!(cmds.contains(&Cmd::Unobserve("b".to_string())));
         assert!(cmds.contains(&Cmd::Unobserve("c".to_string())));
     }
@@ -5740,7 +5982,7 @@ mod tests {
                 rows: 30,
             }),
         );
-        assert_eq!(tile(&m, "b").model.dims(), (100, 30));
+        assert_eq!(tile(&m, "b").grid, (100, 30));
         assert!(cmds.contains(&Cmd::Redraw));
     }
 
@@ -5812,7 +6054,7 @@ mod tests {
             "a",
             SessionPush::Event(SessionEvent::Renamed("otter".to_string())),
         );
-        assert_eq!(tile(&m, "a").model.display_name(), "otter");
+        assert_eq!(tile(&m, "a").display_name, "otter");
         assert!(cmds.contains(&Cmd::Redraw));
     }
 
@@ -5841,18 +6083,18 @@ mod tests {
             }),
         );
         assert_eq!(tile(&m, "a").locality, Locality::Elsewhere);
-        assert_eq!(tile(&m, "a").model.display_name(), "box");
+        assert_eq!(tile(&m, "a").display_name, "box");
         assert!(cmds.contains(&Cmd::Redraw));
     }
 
     /// The header labels in rendered order.
-    fn header_labels(m: &FleetModel) -> Vec<String> {
+    fn header_labels(m: &Fleet) -> Vec<String> {
         headers(m).into_iter().map(|(l, _)| l).collect()
     }
 
     /// A snapshot push naming the session's holder (`client` = the attaching
     /// window's self-reported identity).
-    fn snap_attached(m: &mut FleetModel, name: &str, client: Option<&str>) -> Vec<Cmd> {
+    fn snap_attached(m: &mut Fleet, name: &str, client: Option<&str>) -> Vec<Cmd> {
         push(
             m,
             name,
@@ -6237,7 +6479,7 @@ mod tests {
 
     #[test]
     fn tiles_are_split_into_attach_state_sections() {
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         m.update(UiEvent::SessionList(vec![
             sinfo("a", false), // ours -> Attached
             sinfo("b", true),  // attached elsewhere
@@ -6300,7 +6542,7 @@ mod tests {
 
     #[test]
     fn arrow_down_crosses_into_the_next_section() {
-        let mut m = FleetModel::new(
+        let mut m = Fleet::new(
             METRICS,
             SIZE,
             HashSet::from(["a1".to_string(), "a2".to_string()]),
@@ -6445,7 +6687,7 @@ mod tests {
         let (cols, rows) = primary.dims();
         let session_aspect = (cols as f32 * METRICS.advance) / (rows as f32 * METRICS.line_height);
         let mine = HashSet::from(["alpha".to_string()]);
-        let (f, _) = FleetModel::adopting(primary, Vec::new(), METRICS, win, 1.0, mine);
+        let (f, _) = Fleet::adopting(primary, Vec::new(), METRICS, win, 1.0, mine);
 
         let aspect = |r: RectPx| r.w / r.h;
         let target = f.dive_target_rect("alpha").expect("the tile is present");
@@ -6616,9 +6858,8 @@ mod tests {
         m.set_policy(ghost_term::SessionPolicy::deny_all());
         list(&mut m, &["a", "b"]);
         data(&mut m, "a", b"\x1b]2;pwned\x07");
-        let tile = m.tiles.iter().find(|t| t.id == "a").expect("tile a");
         assert_eq!(
-            tile.model.screen().vt().title(),
+            m.state("a").expect("state a").screen().vt().title(),
             "",
             "the tile inherited the fleet's policy"
         );
@@ -6697,19 +6938,19 @@ mod tests {
     }
 
     /// Click (press + release in place) at the centre of `id`'s tile.
-    fn press(m: &mut FleetModel, id: &str) -> Vec<Cmd> {
+    fn press(m: &mut Fleet, id: &str) -> Vec<Cmd> {
         let (_, _, rect) = m.layout().into_iter().find(|(_, i, _)| i == id).unwrap();
         press_at(m, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
     }
 
     /// Click (press + release in place) at `(x, y)`. Returns the release's
     /// commands — where click actions live now that a press may become a drag.
-    fn press_at(m: &mut FleetModel, x: f32, y: f32) -> Vec<Cmd> {
+    fn press_at(m: &mut Fleet, x: f32, y: f32) -> Vec<Cmd> {
         pointer_phase(m, PointerPhase::Press, x, y);
         pointer_phase(m, PointerPhase::Release, x, y)
     }
 
-    fn pointer_phase(m: &mut FleetModel, phase: PointerPhase, x: f32, y: f32) -> Vec<Cmd> {
+    fn pointer_phase(m: &mut Fleet, phase: PointerPhase, x: f32, y: f32) -> Vec<Cmd> {
         m.update(UiEvent::Pointer {
             phase,
             button: Some(crate::PointerButton::Left),
@@ -6725,7 +6966,7 @@ mod tests {
 
     /// Drag from `(fx, fy)` to `(tx, ty)` (press, motion, release), returning
     /// the release's commands.
-    fn drag(m: &mut FleetModel, (fx, fy): (f32, f32), (tx, ty): (f32, f32)) -> Vec<Cmd> {
+    fn drag(m: &mut Fleet, (fx, fy): (f32, f32), (tx, ty): (f32, f32)) -> Vec<Cmd> {
         pointer_phase(m, PointerPhase::Press, fx, fy);
         pointer_phase(m, PointerPhase::Motion, tx, ty);
         pointer_phase(m, PointerPhase::Release, tx, ty)
@@ -6735,7 +6976,7 @@ mod tests {
         (r.x + r.w / 2.0, r.y + r.h / 2.0)
     }
 
-    fn tile_rect(m: &FleetModel, id: &str) -> RectPx {
+    fn tile_rect(m: &Fleet, id: &str) -> RectPx {
         m.layout()
             .into_iter()
             .find(|(_, i, _)| i == id)
@@ -6744,7 +6985,7 @@ mod tests {
     }
 
     /// The pixel rect of `id`'s `button` (centre is a good press target).
-    fn button_rect(m: &FleetModel, id: &str, button: Button) -> RectPx {
+    fn button_rect(m: &Fleet, id: &str, button: Button) -> RectPx {
         let (_, placements, band, _) = m.sections_layout();
         let (_, _, rect) = placements.into_iter().find(|(_, i, _)| i == id).unwrap();
         let (_, _, buttons) = card_layout(rect, band);
@@ -6765,7 +7006,7 @@ mod tests {
 
     #[test]
     fn clicking_the_detach_button_detaches_instead_of_opening() {
-        let mut m = FleetModel::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
         m.update(UiEvent::SessionList(vec![info("a"), sinfo("b", true)]));
         let r = button_rect(&m, "b", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -6882,19 +7123,18 @@ mod tests {
     }
 
     /// The name a tile currently shows (its optimistic-or-confirmed label).
-    fn tile_display(m: &FleetModel, id: &str) -> String {
+    fn tile_display(m: &Fleet, id: &str) -> String {
         m.tiles
             .iter()
             .find(|t| t.id == id)
             .expect("tile present")
-            .model
             .display()
             .to_string()
     }
 
     /// Commit an inline rename of tile `id` to `new` through the real input flow:
     /// open the editor, clear the buffer, type `new` via a Text commit, Enter.
-    fn commit_rename(m: &mut FleetModel, id: &str, new: &str) {
+    fn commit_rename(m: &mut Fleet, id: &str, new: &str) {
         let r = button_rect(m, id, Button::Rename);
         press_at(m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         for _ in 0..64 {
@@ -6959,7 +7199,7 @@ mod tests {
         );
     }
 
-    fn key_mods(m: &mut FleetModel, k: Key, mods: crate::Mods) -> Vec<Cmd> {
+    fn key_mods(m: &mut Fleet, k: Key, mods: crate::Mods) -> Vec<Cmd> {
         m.update(UiEvent::Key {
             key: k,
             mods,
@@ -7036,7 +7276,7 @@ mod tests {
     }
 
     /// All card/header text currently in the view.
-    fn view_texts(m: &FleetModel) -> Vec<String> {
+    fn view_texts(m: &Fleet) -> Vec<String> {
         m.view().layers[0]
             .items
             .iter()
@@ -7216,7 +7456,7 @@ mod tests {
 
     /// The confirm chips' rects, read from the view by their colours; the
     /// confirm chip's expected colour depends on the pending action.
-    fn chip_rects(m: &FleetModel, confirm_bg: Rgba) -> (RectPx, RectPx) {
+    fn chip_rects(m: &Fleet, confirm_bg: Rgba) -> (RectPx, RectPx) {
         let items = m.view().layers[0].items.clone();
         let find = |color: Rgba| {
             items
@@ -7361,7 +7601,7 @@ mod tests {
         let mut infos = vec![info("a"), info("b")];
         infos[1].bell = true; // "b" rang the bell
         m.update(UiEvent::SessionList(infos));
-        let badges = |m: &FleetModel| {
+        let badges = |m: &Fleet| {
             m.view().layers[0]
                 .items
                 .iter()
@@ -7572,7 +7812,7 @@ mod tests {
 
         // End to end: a session reporting progress shows it on its card;
         // clearing the report removes it.
-        let texts = |m: &FleetModel| -> Vec<String> {
+        let texts = |m: &Fleet| -> Vec<String> {
             m.view().layers[0]
                 .items
                 .iter()
@@ -7912,7 +8152,7 @@ mod tests {
         // The window owns "alpha"; the fleet also previews a foreign "beta".
         let mine = HashSet::from(["alpha".to_string()]);
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
-        let (mut f, _) = FleetModel::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
+        let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(vec![info("alpha"), info("beta")]));
         // Move focus onto the foreign tile (it's in the section below ours).
         f.update(UiEvent::Key {
@@ -7924,8 +8164,8 @@ mod tests {
         assert_eq!(f.focused(), Some("beta"));
         // Toggling back returns the OWNED session and detaches nothing — the
         // other sessions stay attached (warm) for Ctrl-Tab and live previews.
-        let (model, _warm, cmds) = f.into_single(SIZE, 1.0);
-        assert_eq!(model.session(), "alpha", "keeps the window's own session");
+        let (kept_id, _view, _warm, cmds) = f.into_single(SIZE, 1.0);
+        assert_eq!(kept_id, "alpha", "keeps the window's own session");
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Detach(_))),
             "no session is detached on toggle-back: {cmds:?}"
