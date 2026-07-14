@@ -323,7 +323,24 @@ feature gaps — what's left is listed under "Still open" at the end:
 - **DECDSR** (~11): the niche device-status reports (printer, keyboard, locator).
 - **DECRQSS** (6): the selectors we don't answer —
   DECSACE/DECSASD/DECSCL/DECSLPP/DECSNLS/DECSSDT.
-- **DA / DA2 / DECID** (5): device-attribute strings.
+- **DA / DA2** (4): device-attribute strings. **DECID (`ESC Z`) is now answered**
+  — as DA1 itself, so it cannot drift from it nor slip past the policy that
+  shapes it. DA1 also reports the level DECSCL actually has us at (`60 + level`,
+  so 65 by default) instead of the inherited flat "VT100" (61), which no longer
+  contradicts the VT420/VT510 command set ghost implements, and it now claims
+  selective erase (6), which slice 7 built. The remaining four failures are
+  **honest**, and closing them means claiming things we do not do:
+  - **DA1** (2): esctest wants xterm's whole option list — printer port (2),
+    national replacement charsets (9), the DEC technical set (15), the locators
+    (16, 29), terminal state reports (17), user windows (18). Ghost has none of
+    them (its charsets are ASCII + line-drawing, and the DECDSR locator/printer
+    reports are the ~11 failures below). A DA1 reply is a *promise* a program may
+    act on without asking again, so we advertise only what we have: `1;6;21;22;28`.
+  - **DA2** (2): at VT level 4 esctest asserts the terminal id is `41` *and* the
+    version is in `314..=999` — an xterm patch number. Passing means claiming to
+    be a specific xterm build, and programs do fingerprint DA2 to decide whether
+    a feature is safe to use. Same call as `MoveToXY`: we would rather say what we
+    are than lie convincingly. Revisit if a real program is found to need it.
 - Odds and ends: `XtermSave`, `SCORC`, `DECRC`, `DECSET_ALTBUF`/`MoreFix`,
   `DECSET_TiteInhibit`.
 

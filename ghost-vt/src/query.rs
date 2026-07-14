@@ -364,17 +364,28 @@ fn termcap_value(name: &str) -> Option<Option<String>> {
 impl Query {
     /// The reply bytes to write back to the child's PTY.
     ///
-    /// The device-attribute strings mirror VTE's non-test replies: DA1 reports a
-    /// VT100-level (61) terminal with 132-column mode (1), horizontal scrolling
-    /// (21), colour (22) and rectangular editing (28); DA2 reports the same level
-    /// with VTE's version encoding as the firmware field.
+    /// DA1 answers with the level DECSCL is *actually* running at (`60 + level`:
+    /// 61 VT100 … 65 VT510), then the options ghost really has — 132-column mode
+    /// (1), selective erase (6), horizontal scrolling, i.e. left/right margins
+    /// (21), colour (22) and rectangular editing (28). Nothing else is claimed:
+    /// the printer port (2), national replacement charsets (9), the DEC technical
+    /// set (15), the locators (16, 29), terminal state reports (17) and user
+    /// windows (18) are all things ghost does not do, and a DA1 reply is a
+    /// promise a program is entitled to act on. (This is why esctest's DA tests
+    /// still fail: they expect xterm's full option list.)
+    ///
+    /// DA2 still mirrors VTE's version encoding.
     pub fn reply(&self, ctx: &ReplyCtx) -> Vec<u8> {
         let (col, row) = ctx.cursor;
         let (cols, rows) = ctx.size;
         match self {
             Query::CursorPosition => format!("\x1b[{row};{col}R").into_bytes(),
             Query::DeviceStatus => b"\x1b[0n".to_vec(),
-            Query::PrimaryDeviceAttributes => b"\x1b[?61;1;21;22;28c".to_vec(),
+            Query::PrimaryDeviceAttributes => {
+                // 61 VT100, 62 VT220, … 65 VT510 — the level DECSCL has us at.
+                let level = 60 + u16::from(ctx.conformance_level.clamp(1, 5));
+                format!("\x1b[?{level};1;6;21;22;28c").into_bytes()
+            }
             Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
             Query::TertiaryDeviceAttributes => b"\x1bP!|00000000\x1b\\".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
@@ -687,6 +698,12 @@ impl QueryScanner {
                         self.dcs.clear();
                         self.dcs_overflow = false;
                         self.state = State::Dcs;
+                    }
+                    // DECID: the old spelling of DA1, and answered as one — so it
+                    // cannot drift from it, nor slip past the policy shaping it.
+                    b'Z' => {
+                        out.push(Query::PrimaryDeviceAttributes);
+                        self.state = State::Ground;
                     }
                     // SOS, PM, APC: string controls skipped until their ST.
                     b'X' | b'^' | b'_' => self.state = State::Str,
@@ -1040,6 +1057,34 @@ mod tests {
         assert_eq!(s.scan(b"\x07"), [Query::BackgroundColor]);
     }
 
+    /// DA1's leading number is the terminal's *level*, and DECSCL is what sets it
+    /// (`CSI Ps " p`) — so the two have to tell a program the same story. A
+    /// terminal that runs at VT420 and answers "VT100" gets treated as a VT100.
+    #[test]
+    fn primary_device_attributes_follow_the_conformance_level() {
+        let at = |level: u8| {
+            Query::PrimaryDeviceAttributes.reply(&ReplyCtx {
+                conformance_level: level,
+                ..ctx()
+            })
+        };
+        assert_eq!(at(1), b"\x1b[?61;1;6;21;22;28c"); // VT100
+        assert_eq!(at(4), b"\x1b[?64;1;6;21;22;28c"); // VT420
+        assert_eq!(at(5), b"\x1b[?65;1;6;21;22;28c"); // VT510 (ghost's default)
+    }
+
+    /// DECID is the VT52-era spelling of DA1 and must answer the same thing —
+    /// including being shaped by the same policy.
+    #[test]
+    fn decid_is_answered_as_primary_device_attributes() {
+        let mut s = QueryScanner::default();
+        assert_eq!(s.scan(b"\x1bZ"), [Query::PrimaryDeviceAttributes]);
+        // Split across two reads, as a PTY is free to deliver it.
+        let mut s = QueryScanner::default();
+        assert_eq!(s.scan(b"\x1b"), []);
+        assert_eq!(s.scan(b"Z"), [Query::PrimaryDeviceAttributes]);
+    }
+
     #[test]
     fn reply_strings_match_vte() {
         assert_eq!(
@@ -1052,7 +1097,7 @@ mod tests {
         assert_eq!(Query::DeviceStatus.reply(&ctx()), b"\x1b[0n");
         assert_eq!(
             Query::PrimaryDeviceAttributes.reply(&ctx()),
-            b"\x1b[?61;1;21;22;28c"
+            b"\x1b[?65;1;6;21;22;28c"
         );
         assert_eq!(
             Query::SecondaryDeviceAttributes.reply(&ctx()),
