@@ -42,6 +42,113 @@ impl Drop for KillOnDrop<'_> {
     }
 }
 
+/// A query fired in the instant a client detaches must still be answered.
+///
+/// The host answers queries only while nobody is attached — an attached client
+/// answers its own. So a query the host reads while it still believes a client is
+/// there is forwarded to that client rather than answered. If the client has in
+/// fact just closed its socket, the query is written to a dead connection and
+/// consumed: nobody answers, and the program blocks on a reply that will never
+/// come.
+///
+/// The window is one poll turn: the host reads the PTY *before* it services the
+/// client's disconnect, so a query that arrives while the host has not yet been
+/// scheduled to notice the close is forwarded into the void. In the wild that
+/// needs the host to lose the CPU at the wrong moment — which is why this only
+/// ever surfaced as a flake in the theme test next door, under parallel load. Here
+/// we hold the host still (SIGSTOP) across the detach and the query, so both are
+/// waiting on the same wake, and let it go. No load, no luck, same window.
+#[test]
+fn a_query_racing_a_detach_is_still_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "detach-race";
+    let _guard = KillOnDrop { xdg, name };
+
+    let marker = xdg.join("detached");
+    let sentinel = xdg.join("race-answered");
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.02; done; \
+         printf '\\033[6n'; \
+         if IFS= read -r -s -d R -t 5 _; then touch '{}'; fi; \
+         exec sleep 60",
+        marker.display(),
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--no-record",
+            "--",
+            "bash",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let sock = xdg.join("run/ghost").join(name).join("sock");
+    assert!(
+        wait_until(Duration::from_secs(5), || sock.exists()),
+        "session socket never appeared"
+    );
+    // The host's own pid, from its pidfile — never a pattern match.
+    let pidfile = xdg.join("run/ghost").join(name).join("pid");
+    assert!(
+        wait_until(Duration::from_secs(5), || pidfile.exists()),
+        "host pidfile never appeared"
+    );
+    let host: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("host pid");
+    let signal = |sig: &str| {
+        assert!(
+            Command::new("kill")
+                .args([sig, &host.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "signalling the host failed"
+        );
+    };
+
+    {
+        let mut s =
+            ghost_vt::client::Session::attach_path(&sock, name, 80, 24).expect("attach failed");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || s
+                .pump()
+                .map(|p| !p.output.is_empty())
+                .unwrap_or(false)),
+            "resync repaint never arrived"
+        );
+
+        // Freeze the host, so it cannot notice anything that happens next...
+        signal("-STOP");
+    }
+    // ...the client's socket closes (dropped above), and the child fires its query
+    // into a host that has not run since. Both land on the host's next wake.
+    std::fs::write(&marker, b"").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    signal("-CONT");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || sentinel.exists()),
+        "a query sent as the client detached went unanswered — the host forwarded \
+         it to the client it had not yet noticed was gone"
+    );
+}
+
 #[test]
 fn detached_session_answers_cursor_position_query() {
     let tmp = tempfile::tempdir().unwrap();

@@ -619,6 +619,30 @@ fn host_main(
         let mut rang = false;
         let mut activity = false;
 
+        // Display client -> host, BEFORE the PTY is read: a query the PTY hands us
+        // is answered by whoever is attached *now*, so who is attached must be the
+        // freshest thing we know. See `service_display_client`.
+        if client_re.intersects(PollFlags::IN | PollFlags::HUP) {
+            match service_display_client(
+                &mut client,
+                &pty,
+                &mut screen,
+                &mut recorder,
+                current_name,
+                &mut meta,
+                &mut last_theme,
+                &attached_info,
+                bell_marked,
+            )? {
+                Disposition::Keep | Disposition::Drop => {}
+                Disposition::Kill => {
+                    kill_child(&mut child);
+                    discard_traces(current_name, opts.record.as_deref());
+                    return Ok(0);
+                }
+            }
+        }
+
         // PTY output -> authoritative screen state, and live to the attached
         // client (if any). State is always tracked so the next attach can be
         // repainted even after a period with nobody attached.
@@ -658,6 +682,35 @@ fn host_main(
                     // the way to avoid a doubled reply. The scanner is always fed,
                     // attached or not, so split sequences stay tracked.
                     let asked = queries.scan(&ptybuf[..n]);
+                    // Scanning consumed the queries, so this is the last moment
+                    // anyone can answer them: whatever we decide here, the bytes are
+                    // gone. `poll` told us who was attached when it returned, which
+                    // is not the same as who is attached now — a client that closed
+                    // in between still looks alive in `client_re`, and forwarding a
+                    // query into its dead socket loses the query for good. So ask the
+                    // socket itself, which answers with a read: a closed peer reads
+                    // EOF no matter what the last poll believed.
+                    if !asked.is_empty()
+                        && client.is_some()
+                        && matches!(
+                            service_display_client(
+                                &mut client,
+                                &pty,
+                                &mut screen,
+                                &mut recorder,
+                                current_name,
+                                &mut meta,
+                                &mut last_theme,
+                                &attached_info,
+                                bell_marked,
+                            )?,
+                            Disposition::Kill
+                        )
+                    {
+                        kill_child(&mut child);
+                        discard_traces(current_name, opts.record.as_deref());
+                        return Ok(0);
+                    }
                     if client.is_none() && !asked.is_empty() {
                         let mode_state = |m: u16| screen.vt().dec_mode_state(m);
                         let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
@@ -818,41 +871,6 @@ fn host_main(
                     pending.push(Client::new(stream)?);
                 }
                 // Otherwise drop it: too many half-open connections.
-            }
-        }
-
-        // Display client -> host. Read once, then process every buffered message
-        // (so a Resize batched with input is fully handled, not just the first).
-        if client_re.intersects(PollFlags::IN | PollFlags::HUP) {
-            let mut disposition = Disposition::Keep;
-            if let Some(c) = &mut client {
-                match c.conn.recv::<ClientMsg>() {
-                    Ok(None) => disposition = Disposition::Drop,
-                    Ok(Some(msgs)) => {
-                        disposition = handle_client_messages(
-                            c,
-                            msgs,
-                            &pty,
-                            &mut screen,
-                            &mut recorder,
-                            current_name,
-                            &mut meta,
-                            &mut last_theme,
-                            &attached_info,
-                            bell_marked,
-                        )?;
-                    }
-                    Err(_) => disposition = Disposition::Drop,
-                }
-            }
-            match disposition {
-                Disposition::Keep => {}
-                Disposition::Drop => client = None,
-                Disposition::Kill => {
-                    kill_child(&mut child);
-                    discard_traces(current_name, opts.record.as_deref());
-                    return Ok(0);
-                }
             }
         }
 
@@ -1114,6 +1132,52 @@ enum Disposition {
     Drop,
     /// Kill the whole session.
     Kill,
+}
+
+/// Read the display client once and act on whatever it sent, dropping it (to
+/// `None`) if it has gone. Safe to call at any point in a turn: the socket is
+/// non-blocking, so with nothing to say it reads as would-block and keeps the
+/// client.
+///
+/// It exists to be called *twice* — once when the poll says the client is ready,
+/// and again just before the host decides who answers a query — because those two
+/// facts must not disagree. A `read` is the only thing that can tell us the client
+/// is gone; `poll`'s readiness is a memory of the moment it returned.
+#[allow(clippy::too_many_arguments)] // the host's whole mutable state, threaded once
+fn service_display_client(
+    client: &mut Option<Client>,
+    pty: &pty_process::blocking::Pty,
+    screen: &mut Screen,
+    recorder: &mut Option<crate::record::FileRecorder>,
+    current_name: &str,
+    meta: &mut crate::meta::Meta,
+    last_theme: &mut crate::query::ThemeColors,
+    attached_info: &Option<crate::protocol::AttachInfo>,
+    bell_marked: bool,
+) -> io::Result<Disposition> {
+    let Some(c) = client.as_mut() else {
+        return Ok(Disposition::Keep);
+    };
+    let disposition = match c.conn.recv::<ClientMsg>() {
+        Ok(None) => Disposition::Drop,
+        Ok(Some(msgs)) => handle_client_messages(
+            c,
+            msgs,
+            pty,
+            screen,
+            recorder,
+            current_name,
+            meta,
+            last_theme,
+            attached_info,
+            bell_marked,
+        )?,
+        Err(_) => Disposition::Drop,
+    };
+    if matches!(disposition, Disposition::Drop) {
+        *client = None;
+    }
+    Ok(disposition)
 }
 
 /// Process a batch of decoded client messages: write input to the PTY, apply
