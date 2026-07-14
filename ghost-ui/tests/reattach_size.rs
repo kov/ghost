@@ -272,6 +272,109 @@ fn reattach_at_window_size_keeps_the_cursor_at_the_bottom() {
     );
 }
 
+/// Spawn a detached session that fills past one screen, leaves a prompt, then takes
+/// the alternate screen and stays there until it reads a line — at which point it
+/// hands the screen back and idles on `cat`.
+fn spawn_on_the_alt_screen(xdg: &Xdg, name: &str) {
+    let out = xdg
+        .ghost()
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1 100); do printf 'LINE-%d-padpadpadpadpad\\n' \"$i\"; done; \
+             printf 'PROMPT$ '; \
+             printf '\\033[?1049hALT-SCREEN'; \
+             head -n 1 >/dev/null; \
+             printf '\\033[?1049l'; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || xdg.sock(name).exists()),
+        "session socket never appeared"
+    );
+}
+
+/// Reattaching at a bigger size while an app holds the alternate screen resizes the
+/// host from behind that screen. What the app gets back when it exits has to be the
+/// same screen for the client that lived through the resize as for one attaching
+/// fresh afterwards — the host's own, authoritative, view.
+#[test]
+fn a_client_that_resized_the_alt_screen_gets_the_real_primary_back() {
+    let xdg = Xdg::new();
+    let name = format!("alt-resize-{}", std::process::id());
+    spawn_on_the_alt_screen(&xdg, &name);
+    let sock = xdg.sock(&name);
+
+    // The app takes the alt screen while the window is small.
+    let mut small = GuiClient::attach(&sock, &name, (COLS, 24), (COLS, 24));
+    assert!(
+        small.pump_until(Duration::from_secs(5), |c| has_line(
+            &c.viewport(),
+            "ALT-SCREEN"
+        )),
+        "app never took the alt screen; got: {:?}",
+        small.viewport()
+    );
+    drop(small);
+
+    // Reattach bigger: the host resizes with the primary parked behind the alt
+    // screen. Then let the app hand the screen back.
+    let mut grown = GuiClient::attach(&sock, &name, (COLS, ROWS), (COLS, ROWS));
+    assert!(
+        grown.pump_until(Duration::from_secs(5), |c| has_line(
+            &c.viewport(),
+            "ALT-SCREEN"
+        )),
+        "reattach never replayed the alt screen; got: {:?}",
+        grown.viewport()
+    );
+    grown.send(b"\n");
+    assert!(
+        grown.pump_until(Duration::from_secs(5), |c| has_line(
+            &c.viewport(),
+            "PROMPT$"
+        )),
+        "app never gave the primary screen back; got: {:?}",
+        grown.viewport()
+    );
+    let restored = grown.viewport();
+    let restored_cursor = grown.cursor_row();
+    drop(grown);
+
+    // Ground truth: what the host says the screen is, to a client that missed all
+    // of it. The primary the app got back must be the one the host actually has.
+    let mut fresh = GuiClient::attach(&sock, &name, (COLS, ROWS), (COLS, ROWS));
+    assert!(
+        fresh.pump_until(Duration::from_secs(5), |c| has_line(
+            &c.viewport(),
+            "PROMPT$"
+        )),
+        "fresh attach never replayed; got: {:?}",
+        fresh.viewport()
+    );
+
+    assert_eq!(
+        restored,
+        fresh.viewport(),
+        "the primary restored after the resize differs from the host's own screen"
+    );
+    assert_eq!(
+        restored_cursor,
+        fresh.cursor_row(),
+        "the cursor restored after the resize sits on the wrong row"
+    );
+}
+
 /// Characterizes the failure the fix prevents: a provisional 80×24 handshake on a
 /// 100×40 window leaves the cursor stranded at row 24, so the next output corrupts
 /// the middle of the screen. This is the host behaving correctly for the size it
