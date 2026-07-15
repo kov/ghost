@@ -4117,6 +4117,7 @@ mod tests {
     #[test]
     fn the_foreground_session_drives_the_windows_state() {
         let mut r = root(); // foreground alpha
+        r.set_policy(ghost_term::SessionPolicy::allow_all()); // this tests routing, not policy
         let cmds = feed(&mut r, "alpha", b"\x1b[2t"); // iconify
         assert!(
             cmds.contains(&Cmd::SetIconified(true)),

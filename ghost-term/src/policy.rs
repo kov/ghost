@@ -8,9 +8,11 @@
 //! some of it reaches past the screen: it changes the window, the desktop, or what
 //! the terminal *says back*.
 //!
-//! This is the seam where that gets decided. Today every field is on — the policy
-//! changes nothing yet, by design — but the enforcement points exist, so choosing
-//! a different default later is a config question and not an archaeology project.
+//! This is the seam where that gets decided. The [`Default`] leaves on everything
+//! a program needs to drive its own screen and turns off the three unprompted
+//! reaches a program rarely needs — reading the title back, resizing the window
+//! from output, and taking the window over — matching what xterm ships.
+//! [`TerminalPolicy::allow_all`] keeps the lot for the callers that need it.
 //!
 //! # The two policies, and why there are two
 //!
@@ -63,7 +65,7 @@
 ///
 /// Enforced inside the emulator (see [`Terminal::execute`](crate::Terminal)), so
 /// the GUI and the session host must be given the *same* one — see the module
-/// docs. [`Default`] is what ghost has always done: all of it.
+/// docs. [`Default`] is the safe set; [`Self::allow_all`] is everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalPolicy {
     /// Set the window/icon title (OSC 0/1/2) and push/pop the title stack
@@ -122,21 +124,28 @@ pub struct TerminalPolicy {
 }
 
 impl Default for TerminalPolicy {
-    /// Everything ghost has always honoured, still honoured.
+    /// The safe defaults for a real session: everything a program may do to its
+    /// own terminal, minus the two unprompted hazards it rarely needs — reading
+    /// the title *back* (the reflection trick, see [`Self::report_title`]) and
+    /// resizing the window/grid from output ([`Self::program_resize`]). xterm
+    /// ships both off. [`Self::allow_all`] keeps the lot for the callers that need
+    /// it (the conformance harness).
     fn default() -> Self {
-        Self::allow_all()
+        Self {
+            report_title: false,
+            program_resize: false,
+            ..Self::allow_all()
+        }
     }
 }
 
 impl TerminalPolicy {
-    /// Everything on, whatever the defaults become.
-    ///
-    /// Identical to [`Default`] today — deliberately a *separate* constructor, so
-    /// that the day the defaults are argued down (and they should be: xterm ships
-    /// with window ops off), the callers that genuinely need the lot don't quietly
-    /// lose it. The conformance harness is one: esctest drives the window ops, the
-    /// title stack and the palette, and it should keep passing on its own terms
-    /// rather than be a hostage to what we decide is safe for a stranger's tty.
+    /// Everything on — a *separate* constructor from [`Default`] (which now argues
+    /// three of these down, as xterm does), so the callers that genuinely need the
+    /// lot don't quietly lose it. The conformance harness is one: esctest drives the
+    /// window ops, the title stack and the palette, and it should keep passing on its
+    /// own terms rather than be a hostage to what we decide is safe for a stranger's
+    /// tty.
     pub fn allow_all() -> Self {
         Self {
             title: true,
@@ -186,8 +195,14 @@ pub struct ActionPolicy {
 }
 
 impl Default for ActionPolicy {
+    /// Safe default: a program may put text on the clipboard (remote copy is too
+    /// useful to lose, and read-back is impossible anyway), but may not take the
+    /// window over — iconify/maximize/full-screen — unprompted.
     fn default() -> Self {
-        Self::allow_all()
+        Self {
+            window_control: false,
+            ..Self::allow_all()
+        }
     }
 }
 
@@ -236,5 +251,39 @@ impl SessionPolicy {
             terminal: TerminalPolicy::deny_all(),
             action: ActionPolicy::deny_all(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_denies_the_unprompted_hazards() {
+        // A real session's default: everything a program may do to its own
+        // terminal, minus the three unprompted hazards it rarely needs — reading
+        // the title back (a reflection trick), resizing the window/grid from
+        // output, and taking the window over (iconify/maximize/full-screen). This
+        // is what the GUI and the detached host both start from.
+        let t = TerminalPolicy::default();
+        assert!(!t.report_title, "title read-back off by default");
+        assert!(!t.program_resize, "program-driven resize off by default");
+        // The rest a program may still do to its own terminal.
+        assert!(t.title);
+        assert!(t.colors);
+        assert!(t.cursor_style);
+        assert!(t.graphics);
+        assert!(t.progress);
+        assert!(t.mouse_report);
+
+        let a = ActionPolicy::default();
+        assert!(!a.window_control, "window take-over off by default");
+        assert!(a.clipboard_write, "clipboard write (remote copy) stays on");
+
+        // `allow_all` is unchanged — the conformance harness pins it.
+        assert!(TerminalPolicy::allow_all().report_title);
+        assert!(TerminalPolicy::allow_all().program_resize);
+        assert!(ActionPolicy::allow_all().window_control);
+        assert_ne!(TerminalPolicy::default(), TerminalPolicy::allow_all());
     }
 }

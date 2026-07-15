@@ -2374,7 +2374,12 @@ mod tests {
     };
 
     fn model() -> TerminalModel {
-        TerminalModel::new("alpha".to_string(), 80, 24, METRICS)
+        let mut m = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        // Exercise the mechanisms under a permissive policy — the *default*
+        // policy's denials (title read-back, program resize, window take-over)
+        // are pinned by their own tests here and in `ghost_term::policy`.
+        m.set_policy(ghost_term::SessionPolicy::allow_all());
+        m
     }
 
     /// The reply a program reading `bytes` gets back, as text (the `Cmd::SendInput`
@@ -2471,15 +2476,21 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_still_carries_out_the_clipboard_and_the_window() {
-        let mut m = model();
+    fn the_default_policy_writes_the_clipboard_but_denies_the_window() {
+        // A fresh model keeps the safe default (unlike the `model()` helper, which
+        // opts into allow_all): a program may still put text on the clipboard, but
+        // may no longer take the window over (iconify) unprompted.
+        let mut m = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
         let cmds = m.update(UiEvent::SessionData {
             name: "alpha".to_string(),
             bytes: b"\x1b]52;c;aGVsbG8=\x07\x1b[2t".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::WriteClipboard("hello".to_string())));
-        assert!(cmds.contains(&Cmd::SetIconified(true)));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetIconified(_))),
+            "window take-over is denied by the default policy"
+        );
     }
 
     #[test]

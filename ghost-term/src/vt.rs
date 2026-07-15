@@ -1289,6 +1289,7 @@ mod tests {
         // Allow80To132, matching the physical switch.
         use crate::ModeReport::{Reset, Set};
         let mut vt = Vt::new(80, 24);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
         assert_eq!(vt.dec_mode_state(3), Reset, "DECCOLM starts reset");
         // Without ?40 the switch is inert, so the bit stays reset.
         vt.feed_str("\x1b[?3h");
@@ -1307,6 +1308,7 @@ mod tests {
         // esctest test_RIS_ResetDECCOLM. The grid normally belongs to the window,
         // so a hard reset must not resize it...
         let mut vt = Vt::new(100, 24);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
         vt.feed_str("\x1bc");
         assert_eq!(vt.size(), (100, 24), "RIS left the window's grid alone");
         // ...but 132-column mode is a width the *program* asked for (DECCOLM, gated
@@ -1377,6 +1379,7 @@ mod tests {
         // esctest test_DECSET_DECCOLM: with Allow80To132 on, DECCOLM switches to
         // 132 columns, clears the screen, and homes the cursor.
         let mut vt = Vt::new(80, 25);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
         vt.feed_str("\x1b[?40h"); // Allow80To132
         vt.feed_str("\x1b[5;5Hxyz"); // 'xyz' at row 4
         vt.feed_str("\x1b[6;11r\x1b[?69h\x1b[3;10s"); // top/bottom + L/R margins
@@ -1402,6 +1405,7 @@ mod tests {
         // esctest test_DECSET_Allow80To132: DECCOLM only has an effect while ?40
         // is on; toggling ?3 without it leaves the width unchanged.
         let mut vt = Vt::new(80, 25);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
         vt.feed_str("\x1b[?3h"); // no ?40
         assert_eq!(vt.size().0, 80, "inert without Allow80To132");
         vt.feed_str("\x1b[?40h\x1b[?3h"); // allow, then enter 132
@@ -1414,6 +1418,7 @@ mod tests {
     fn deccolm_preserves_the_screen_under_decncsm() {
         // With DECNCSM (?95, level 5) set, a column change keeps the screen.
         let mut vt = Vt::new(80, 25);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
         vt.feed_str("\x1b[65\"p"); // DECSCL level 5 (so ?95 is settable)
         vt.feed_str("\x1b[?40h\x1b[?95h"); // Allow80To132 + DECNCSM
         vt.feed_str("\x1b[1;1H1"); // '1' at the origin
@@ -2380,6 +2385,7 @@ mod tests {
     #[test]
     fn the_window_ops_that_only_move_the_grid_are_the_emulators_to_do() {
         let mut vt = Vt::new(80, 24);
+        vt.set_policy(crate::TerminalPolicy::allow_all()); // program-driven resize
 
         // `CSI 8 ; rows ; cols t` with both dimensions given re-grids us outright.
         vt.feed_str("\x1b[8;10;90t");
@@ -2664,9 +2670,10 @@ mod tests {
 
     #[test]
     fn an_allowed_program_still_does_all_of_it() {
-        // The default policy is what ghost has always done — the seam changes
-        // nothing until someone sets a policy.
+        // The counterpart to the deny test: under `allow_all`, every op still
+        // lands — including the ones the *default* now gates (program resize).
         let mut vt = Vt::new(80, 24);
+        vt.set_policy(crate::TerminalPolicy::allow_all());
         vt.feed_str("\x1b]2;a title\x07\x1b]4;1;rgb:ff/00/00\x07\x1b[8;40;100t\x1b[?1000h");
         assert_eq!(vt.title(), "a title");
         assert_eq!(vt.palette_color(1), Some([255, 0, 0]));

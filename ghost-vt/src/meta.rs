@@ -99,8 +99,9 @@ mod tests {
         assert_eq!(meta.size, (0, 0), "pre-size metadata reads as unknown");
         assert_eq!(
             meta.policy,
-            ghost_term::TerminalPolicy::allow_all(),
-            "a session from before the policy existed keeps the behavior it had"
+            ghost_term::TerminalPolicy::default(),
+            "a session from before the policy existed reads with today's safe \
+             default (and re-negotiates to the attaching client's policy anyway)"
         );
     }
 

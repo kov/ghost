@@ -1606,6 +1606,9 @@ mod tests {
         let told = ReplyCtx {
             title: "rm -rf ~",
             icon_title: "rm -rf ~",
+            // The default policy now denies the read-back, so the allowed case
+            // has to ask for it explicitly.
+            policy: ghost_term::TerminalPolicy::allow_all(),
             ..ctx()
         };
         assert_eq!(Query::WindowTitle.reply(&told), b"\x1b]lrm -rf ~\x1b\\");
