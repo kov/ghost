@@ -126,6 +126,40 @@ pub enum Query {
         bottom: u16,
         right: u16,
     },
+    /// DECXCPR `CSI ? 6 n` — the DEC-private extended cursor-position report. Like
+    /// CPR but private and with a page field: `CSI ? Pl ; Pc ; Pp R`, `Pp` always
+    /// 1 (ghost has one page). Distinct from plain CPR (`CSI 6 n`), which omits it.
+    ExtendedCursorPosition,
+    /// DECDSR printer status `CSI ? 15 n`. Reply `CSI ? 13 n` — no printer.
+    PrinterStatus,
+    /// DECDSR user-defined-key lock status `CSI ? 25 n`. Reply `CSI ? 21 n` —
+    /// locked, since ghost has no UDKs to set (unlocked would promise settable ones).
+    UdkStatus,
+    /// DECDSR keyboard status `CSI ? 26 n`. Reply `CSI ? 27 ; Pn ; Pst ; Ptyp n` —
+    /// North American (1), ready (0), LK201 (0). Four fields to match the VT level
+    /// our secondary DA advertises.
+    KeyboardStatus,
+    /// DECDSR locator status `CSI ? 55 n` (the DEC and xterm forms share the code).
+    /// Reply `CSI ? 50 n` — no locator. NB xterm/esctest read 50 as "no locator,"
+    /// 53/55 as "available"; DEC's VT420 manual reads them the other way. We follow
+    /// xterm (what every modern terminal and the conformance suite expect), so don't
+    /// "fix" this against the DEC docs.
+    LocatorStatus,
+    /// DECDSR locator type `CSI ? 56 n`. Reply `CSI ? 57 ; 0 n` — unknown/no device.
+    LocatorType,
+    /// DECMSR macro space `CSI ? 62 n`. Reply `CSI 0 * {` — zero bytes available
+    /// for macros (ghost supports no DECDMAC).
+    MacroSpace,
+    /// DECCKSR macro-memory checksum `CSI ? 63 [; Pid] n`. Reply the DCS
+    /// `DCS Pid ! ~ 0000 ST` — `Pid` echoed (0 when omitted), checksum 0 (no macros).
+    MacroChecksum {
+        pid: u16,
+    },
+    /// DECDSR data-integrity report `CSI ? 75 n`. Reply `CSI ? 70 n` — no errors.
+    DataIntegrity,
+    /// DECDSR multiple-session status `CSI ? 85 n`. Reply `CSI ? 83 n` — not
+    /// configured for multiple sessions (the SSU/TDSMP tech it refers to is dead).
+    MultipleSessionStatus,
 }
 
 /// The default fg/bg an OSC 10/11 color query is answered with. The attached
@@ -516,10 +550,29 @@ impl Query {
                 // silence would just stall the querying program for a timeout.
                 let z = |v: u16| v.saturating_sub(1) as usize;
                 let sum = (ctx.checksum)(z(*top), z(*left), z(*bottom), z(*right));
-                format!("\x1bP{pid}!~{sum:04X}\x1b\\").into_bytes()
+                deccksr_reply(*pid, sum)
             }
+            // DECDSR device-status family. Pure status reports — no window/display
+            // facts and nothing an app could probe for secrets, so unlike the title
+            // and color replies these are policy-exempt (always answered).
+            Query::ExtendedCursorPosition => format!("\x1b[?{row};{col};1R").into_bytes(),
+            Query::PrinterStatus => b"\x1b[?13n".to_vec(),
+            Query::UdkStatus => b"\x1b[?21n".to_vec(),
+            Query::KeyboardStatus => b"\x1b[?27;1;0;0n".to_vec(),
+            Query::LocatorStatus => b"\x1b[?50n".to_vec(),
+            Query::LocatorType => b"\x1b[?57;0n".to_vec(),
+            Query::MacroSpace => b"\x1b[0*{".to_vec(),
+            Query::MacroChecksum { pid } => deccksr_reply(*pid, 0),
+            Query::DataIntegrity => b"\x1b[?70n".to_vec(),
+            Query::MultipleSessionStatus => b"\x1b[?83n".to_vec(),
         }
     }
+}
+
+/// The DECCKSR reply envelope `DCS Pid ! ~ HHHH ST`, shared by DECRQCRA (a screen
+/// rectangle's checksum) and DECCKSR (a macro-memory checksum, always 0 for us).
+fn deccksr_reply(pid: u16, sum: u16) -> Vec<u8> {
+    format!("\x1bP{pid}!~{sum:04X}\x1b\\").into_bytes()
 }
 
 /// Upper bound on the bytes collected for one CSI sequence; well beyond any query
@@ -791,13 +844,12 @@ impl QueryScanner {
 /// Only the query sequences we answer return `Some`.
 fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
     match final_byte {
-        // DSR — device status report. Of the `?`-private DEC variants only the
-        // color-scheme request (996) is ours to answer.
+        // DSR — device status report. The two ANSI forms, then the `?`-private DEC
+        // variants (DECDSR + the color-scheme request), classified by `classify_dsr`.
         b'n' => match params {
             b"6" => Some(Query::CursorPosition),
             b"5" => Some(Query::DeviceStatus),
-            b"?996" => Some(Query::ColorScheme),
-            _ => None,
+            _ => params.strip_prefix(b"?").and_then(classify_dsr),
         },
         // DA — device attributes. `>` marks the secondary request, `=` the
         // tertiary (unit id).
@@ -877,6 +929,36 @@ fn classify_csi(params: &[u8], final_byte: u8) -> Option<Query> {
     }
 }
 
+/// Classify a DEC-private DSR (`CSI ? Ps n`) from its body (the `?` already
+/// stripped): the DECDSR device-status family and the color-scheme request. Exact
+/// byte-matches only, so a stray parameter (`?6;1`, `?06`) stays unanswered.
+fn classify_dsr(body: &[u8]) -> Option<Query> {
+    // DECCKSR carries an optional request id: `CSI ? 63 [; Pid] n` (Pid 0 omitted).
+    if let Some(rest) = body.strip_prefix(b"63") {
+        let pid = match rest {
+            b"" => 0,
+            _ => std::str::from_utf8(rest.strip_prefix(b";")?)
+                .ok()?
+                .parse()
+                .ok()?,
+        };
+        return Some(Query::MacroChecksum { pid });
+    }
+    match body {
+        b"6" => Some(Query::ExtendedCursorPosition),
+        b"15" => Some(Query::PrinterStatus),
+        b"25" => Some(Query::UdkStatus),
+        b"26" => Some(Query::KeyboardStatus),
+        b"55" => Some(Query::LocatorStatus),
+        b"56" => Some(Query::LocatorType),
+        b"62" => Some(Query::MacroSpace),
+        b"75" => Some(Query::DataIntegrity),
+        b"85" => Some(Query::MultipleSessionStatus),
+        b"996" => Some(Query::ColorScheme),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +999,53 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_dec_dsr_queries() {
+        assert_eq!(scan_all(b"\x1b[?6n"), [Query::ExtendedCursorPosition]);
+        assert_eq!(scan_all(b"\x1b[?15n"), [Query::PrinterStatus]);
+        assert_eq!(scan_all(b"\x1b[?25n"), [Query::UdkStatus]);
+        assert_eq!(scan_all(b"\x1b[?26n"), [Query::KeyboardStatus]);
+        assert_eq!(scan_all(b"\x1b[?55n"), [Query::LocatorStatus]);
+        assert_eq!(scan_all(b"\x1b[?56n"), [Query::LocatorType]);
+        assert_eq!(scan_all(b"\x1b[?62n"), [Query::MacroSpace]);
+        assert_eq!(scan_all(b"\x1b[?75n"), [Query::DataIntegrity]);
+        assert_eq!(scan_all(b"\x1b[?85n"), [Query::MultipleSessionStatus]);
+        assert_eq!(scan_all(b"\x1b[?996n"), [Query::ColorScheme]);
+        // DECCKSR carries a request id, and defaults it to 0 when omitted.
+        assert_eq!(
+            scan_all(b"\x1b[?63;123n"),
+            [Query::MacroChecksum { pid: 123 }]
+        );
+        assert_eq!(scan_all(b"\x1b[?63n"), [Query::MacroChecksum { pid: 0 }]);
+    }
+
+    #[test]
+    fn dec_dsr_replies_match_esctest() {
+        // DECXCPR mirrors CPR's row;col order and adds the page (always 1). Cursor
+        // here is (col 5, row 6), as esctest's CUP(Point(5,6)) leaves it.
+        let at_5_6 = ReplyCtx {
+            cursor: (5, 6),
+            ..ctx()
+        };
+        assert_eq!(
+            Query::ExtendedCursorPosition.reply(&at_5_6),
+            b"\x1b[?6;5;1R"
+        );
+        assert_eq!(Query::PrinterStatus.reply(&ctx()), b"\x1b[?13n");
+        assert_eq!(Query::UdkStatus.reply(&ctx()), b"\x1b[?21n");
+        assert_eq!(Query::KeyboardStatus.reply(&ctx()), b"\x1b[?27;1;0;0n");
+        assert_eq!(Query::LocatorStatus.reply(&ctx()), b"\x1b[?50n");
+        assert_eq!(Query::LocatorType.reply(&ctx()), b"\x1b[?57;0n");
+        assert_eq!(Query::MacroSpace.reply(&ctx()), b"\x1b[0*{");
+        assert_eq!(Query::DataIntegrity.reply(&ctx()), b"\x1b[?70n");
+        assert_eq!(Query::MultipleSessionStatus.reply(&ctx()), b"\x1b[?83n");
+        // DECCKSR: DCS Pid ! ~ 0000 ST, Pid echoed.
+        assert_eq!(
+            Query::MacroChecksum { pid: 123 }.reply(&ctx()),
+            b"\x1bP123!~0000\x1b\\"
+        );
+    }
+
+    #[test]
     fn rect_checksum_reply_is_deccksr() {
         // esctest coords are 1-based; the closure receives 0-based (here echoed
         // as 1;2;1;2 -> 1212 = 0x04BC). Pid echoes back, 4 uppercase hex in a
@@ -937,7 +1066,8 @@ mod tests {
         assert!(scan_all(b"hello world").is_empty());
         assert!(scan_all(b"\x1b[31m\x1b[2J\x1b[H").is_empty()); // SGR, clear, home
         assert!(scan_all(b"\x1b[8;24;80t").is_empty()); // a resize op, not a query
-        assert!(scan_all(b"\x1b[?6n").is_empty()); // DEC-private DSR, left alone
+        assert!(scan_all(b"\x1b[?6;1n").is_empty()); // a stray param defeats DECXCPR
+        assert!(scan_all(b"\x1b[?99n").is_empty()); // an unknown DEC-private DSR
         assert!(scan_all(b"\x1b[u").is_empty()); // bare CSI u is SCO restore-cursor
         assert!(scan_all(b"\x1b[0 q").is_empty()); // DECSCUSR shares `q`, not a query
         assert!(scan_all(b"\x1b[!p").is_empty()); // DECSTR shares `p`, not a query
