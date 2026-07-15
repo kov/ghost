@@ -578,6 +578,28 @@ mod tests {
     }
 
     #[test]
+    fn decrc_does_not_restore_autowrap() {
+        // esctest SaveRestoreCursor_Wrap: DECRC restores the cursor, pen, origin
+        // mode and charset — but NOT auto-wrap mode. xterm leaves wrap as it is at
+        // restore time (our avt heritage wrongly saved/restored it, matching the
+        // non-xterm terminals the test contrasts). So with wrap toggled off after
+        // the save, DECRC must leave it off, and writing past the last column must
+        // not wrap to the next row.
+        let mut vt = Vt::new(5, 3);
+        vt.feed_str("\x1b[?7h"); // DECAWM on
+        vt.feed_str("\x1b7"); // DECSC (saved while wrap is on)
+        vt.feed_str("\x1b[?7l"); // DECAWM off
+        vt.feed_str("\x1b8"); // DECRC — must not turn wrap back on
+        vt.feed_str("\x1b[1;4H"); // CUP to the second-to-last column
+        vt.feed_str("abcd");
+        assert_eq!(
+            vt.cursor().row,
+            0,
+            "wrap stayed off across DECRC, so writing past the edge did not wrap"
+        );
+    }
+
+    #[test]
     fn a_tab_stops_at_the_right_margin() {
         // esctest test_DECSET_DECAWM_NoLineWrapOnTabWithLeftRightMargin: inside a
         // left/right-margin box a tab stops at the right margin rather than

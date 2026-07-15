@@ -233,34 +233,17 @@ pub(crate) enum CursorKeysMode {
     Application,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct SavedCtx {
     pub cursor_col: usize,
     pub cursor_row: usize,
     pub pen: Pen,
     pub origin_mode: bool,
-    pub auto_wrap_mode: bool,
-}
-
-impl Default for SavedCtx {
-    fn default() -> Self {
-        SavedCtx {
-            cursor_col: 0,
-            cursor_row: 0,
-            pen: Pen::default(),
-            origin_mode: false,
-            auto_wrap_mode: true,
-        }
-    }
 }
 
 impl SavedCtx {
     fn is_default(&self) -> bool {
-        self.cursor_col == 0
-            && self.cursor_row == 0
-            && self.pen.is_default()
-            && !self.origin_mode
-            && self.auto_wrap_mode
+        self.cursor_col == 0 && self.cursor_row == 0 && self.pen.is_default() && !self.origin_mode
     }
 }
 
@@ -1178,7 +1161,6 @@ impl Terminal {
         self.saved_ctx.cursor_row = self.cursor.row;
         self.saved_ctx.pen = self.pen;
         self.saved_ctx.origin_mode = self.origin_mode;
-        self.saved_ctx.auto_wrap_mode = self.auto_wrap_mode;
     }
 
     fn restore_cursor(&mut self) {
@@ -1186,7 +1168,9 @@ impl Terminal {
         self.cursor.row = self.saved_ctx.cursor_row;
         self.pen = self.saved_ctx.pen;
         self.origin_mode = self.saved_ctx.origin_mode;
-        self.auto_wrap_mode = self.saved_ctx.auto_wrap_mode;
+        // DECRC restores the cursor, pen, origin mode and charset — NOT auto-wrap
+        // mode (xterm; esctest SaveRestoreCursor_Wrap). It does clear the pending
+        // wrap, as resetting the last-column state is part of the restore.
         self.pending_wrap = false;
     }
 
@@ -3166,11 +3150,6 @@ impl Terminal {
         // 3. configure saved context for primary screen
 
         if !primary_ctx.is_default() {
-            if !primary_ctx.auto_wrap_mode {
-                // disable auto-wrap mode
-                funs.push(Function::Decrst(DecModes::one(DecMode::AutoWrap)));
-            }
-
             if primary_ctx.origin_mode {
                 // enable origin mode
                 funs.push(Function::Decset(DecModes::one(DecMode::Origin)));
@@ -3192,11 +3171,6 @@ impl Terminal {
             // clear the protection back off so it does not bleed into later writes
             if primary_ctx.pen.protection() != Protection::None {
                 funs.push(Function::Decsca(0));
-            }
-
-            if !primary_ctx.auto_wrap_mode {
-                // re-enable auto-wrap mode
-                funs.push(Function::Decset(DecModes::one(DecMode::AutoWrap)));
             }
 
             if primary_ctx.origin_mode {
@@ -3226,11 +3200,6 @@ impl Terminal {
         // 5. configure saved context for alternate screen
 
         if !alternate_ctx.is_default() {
-            if !alternate_ctx.auto_wrap_mode {
-                // disable auto-wrap mode
-                funs.push(Function::Decrst(DecModes::one(DecMode::AutoWrap)));
-            }
-
             if alternate_ctx.origin_mode {
                 // enable origin mode
                 funs.push(Function::Decset(DecModes::one(DecMode::Origin)));
@@ -3252,11 +3221,6 @@ impl Terminal {
             // clear the protection back off so it does not bleed into later writes
             if alternate_ctx.pen.protection() != Protection::None {
                 funs.push(Function::Decsca(0));
-            }
-
-            if !alternate_ctx.auto_wrap_mode {
-                // re-enable auto-wrap mode
-                funs.push(Function::Decset(DecModes::one(DecMode::AutoWrap)));
             }
 
             if alternate_ctx.origin_mode {
@@ -4752,7 +4716,10 @@ mod tests {
             assert_eq!(term.cursor(), (2, 2));
             assert_eq!(term.pen.intensity, Intensity::Bold);
             assert!(term.origin_mode);
-            assert!(!term.auto_wrap_mode);
+            // Auto-wrap is NOT among the restored modes (xterm; esctest
+            // SaveRestoreCursor_Wrap): it keeps the value it had at restore time
+            // (turned back on above), not the one captured at save.
+            assert!(term.auto_wrap_mode);
         }
 
         assert_save_restore(Decsc, Decrc);
@@ -5467,7 +5434,9 @@ mod tests {
         assert_eq!(term.cursor(), (2, 2));
         assert_eq!(term.pen.intensity, Intensity::Bold);
         assert!(term.origin_mode);
-        assert!(!term.auto_wrap_mode);
+        // Auto-wrap is NOT restored (xterm; esctest SaveRestoreCursor_Wrap): it
+        // keeps its restore-time value (on), not the one saved (off).
+        assert!(term.auto_wrap_mode);
     }
 
     #[test]
