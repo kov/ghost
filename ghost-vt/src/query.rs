@@ -15,8 +15,11 @@
 //! sequence split over two PTY reads is still recognized, and skips OSC/DCS/etc.
 //! string payloads so their contents can't be mistaken for a query.
 //!
-//! Replies mirror what VTE reports (per the user's choice), so a program sees the
-//! same answers whether the session is attached or detached.
+//! The attached and detached paths run through this same scanner, so a program
+//! sees identical answers either way. Where an answer is a matter of identity
+//! rather than fact — the device-attributes replies — ghost presents xterm, which
+//! is what the rest of its surface (`TERM`, XTVERSION, the emulator's graded
+//! behavior) already claims.
 
 /// A query the host knows how to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +30,17 @@ pub enum Query {
     DeviceStatus,
     /// `CSI c` / `CSI 0 c` — primary device attributes.
     PrimaryDeviceAttributes,
-    /// `CSI > c` / `CSI > 0 c` — secondary device attributes.
+    /// `CSI > c` / `CSI > 0 c` — secondary device attributes. Reply
+    /// `CSI > 41 ; 420 ; 0 c` — an xterm-emulating VT420 (`41`).
+    ///
+    /// We present xterm, not the VTE identity ghost carried as a VTE frontend:
+    /// VTE is out of the loop now (both attached and detached answer through this
+    /// same scanner), so mirroring it bought nothing, while every other face ghost
+    /// shows — `TERM=xterm-256color`, the xterm-shaped primary DA, XTVERSION's
+    /// honest `ghost <version>` — is xterm's, and the emulator is graded against
+    /// xterm's behavior. DA2 has no "ghost" model number, so *some* mask is
+    /// unavoidable; the `420` firmware field is a fixed placeholder in xterm's
+    /// DA2-reported range (a real version can't be honest here either).
     SecondaryDeviceAttributes,
     /// `CSI = c` / `CSI = 0 c` — tertiary device attributes (unit id). Reply:
     /// DECRPTUI `DCS ! | 00000000 ST` (xterm's anonymous default).
@@ -420,7 +433,7 @@ impl Query {
                 let level = 60 + u16::from(ctx.conformance_level.clamp(1, 5));
                 format!("\x1b[?{level};1;6;21;22;28c").into_bytes()
             }
-            Query::SecondaryDeviceAttributes => b"\x1b[>61;8400;1c".to_vec(),
+            Query::SecondaryDeviceAttributes => b"\x1b[>41;420;0c".to_vec(),
             Query::TertiaryDeviceAttributes => b"\x1bP!|00000000\x1b\\".to_vec(),
             Query::TextAreaSize => format!("\x1b[8;{rows};{cols}t").into_bytes(),
             Query::DisplaySize => {
@@ -1216,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_strings_match_vte() {
+    fn common_reply_strings() {
         assert_eq!(
             Query::CursorPosition.reply(&ReplyCtx {
                 cursor: (5, 3),
@@ -1229,9 +1242,10 @@ mod tests {
             Query::PrimaryDeviceAttributes.reply(&ctx()),
             b"\x1b[?65;1;6;21;22;28c"
         );
+        // Secondary DA presents an xterm-emulating VT420 (see the variant docs).
         assert_eq!(
             Query::SecondaryDeviceAttributes.reply(&ctx()),
-            b"\x1b[>61;8400;1c"
+            b"\x1b[>41;420;0c"
         );
         // DA3: DECRPTUI with xterm's all-zero site/serial unit id.
         assert_eq!(
