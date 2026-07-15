@@ -116,11 +116,20 @@ impl Vt {
     /// screen so an out-of-range request can't panic.
     pub fn rect_checksum(&self, top: usize, left: usize, bottom: usize, right: usize) -> u16 {
         let (cols, rows) = self.terminal.size();
-        if cols == 0 || rows == 0 || top >= rows || left >= cols {
+        if cols == 0 || rows == 0 {
             return 0;
         }
-        let bottom = bottom.min(rows - 1);
-        let right = right.min(cols - 1);
+        // DECRQCRA coordinates are origin-relative (like CUP): in origin mode they
+        // count from the scroll region's top-left and are confined to it; with
+        // origin mode off the region is the whole screen, so the offsets are 0 and
+        // this reduces to the plain absolute read.
+        let (atop, aleft, abot, aright) = self.terminal.addressable_region();
+        let (top, left) = (top + atop, left + aleft);
+        if top > abot || left > aright {
+            return 0;
+        }
+        let bottom = (bottom + atop).min(abot);
+        let right = (right + aleft).min(aright);
         let mut sum: u32 = 0;
         let mut first = true;
         for r in top..=bottom {
@@ -1436,18 +1445,19 @@ mod tests {
             "CPR is origin-relative (0-based)"
         );
 
-        // The write lands at the corner; DECRQCRA reads 'X' there, blank elsewhere.
+        // The write lands at the corner; DECRQCRA is origin-relative too, so the
+        // corner is (0,0) and its neighbour inside the box is (0,1) — blank.
         vt.feed_str("X");
         let neg_x = 0u16.wrapping_sub(u16::from(b'X'));
         assert_eq!(
-            vt.rect_checksum(5, 4, 5, 4),
+            vt.rect_checksum(0, 0, 0, 0),
             neg_x,
-            "X at absolute (col5,row6)"
+            "origin-relative (0,0) is the corner, where X is"
         );
         assert_eq!(
-            vt.rect_checksum(5, 0, 5, 0),
+            vt.rect_checksum(0, 1, 0, 1),
             0xFFE0,
-            "col1 of that row is blank"
+            "the next column in the box is blank"
         );
 
         // `CSI s` with the mode on resets margins to full; disabling ?69 too.
@@ -1678,6 +1688,23 @@ mod tests {
         let mut vt = Vt::new(10, 1);
         vt.feed_str("\x1b[4mA\x1b[0m"); // underline 'A' = 65 + 0x10 = 81
         assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFFAF);
+    }
+
+    #[test]
+    fn rect_checksum_is_origin_relative_in_origin_mode() {
+        // esctest DECSET_DECOM_DECRQCRA: a rectangle checksum addresses cells
+        // relative to the scroll region's top-left when origin mode is on, just
+        // as the DECRA rect ops do.
+        let mut vt = Vt::new(20, 20);
+        vt.feed_str("\x1b[5;5HX"); // 'X' at absolute row 5, col 5 (origin off)
+        vt.feed_str("\x1b[5;7r"); // DECSTBM: rows 5..7
+        vt.feed_str("\x1b[?69h"); // DECLRMM on
+        vt.feed_str("\x1b[5;7s"); // DECSLRM: cols 5..7
+        vt.feed_str("\x1b[?6h"); // DECOM on
+                                 // Origin-relative top-left (0,0) is absolute (5,5) — the 'X'. As the sole
+                                 // (and first) cell it checksums to 0x10000 - 'X' (0x58) = 0xFFA8; without
+                                 // the origin offset it would read absolute (0,0), a blank (0xFFE0).
+        assert_eq!(vt.rect_checksum(0, 0, 0, 0), 0xFFA8);
     }
 
     #[test]

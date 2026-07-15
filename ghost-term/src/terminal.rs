@@ -1380,6 +1380,19 @@ impl Terminal {
         }
     }
 
+    /// The addressable region as 0-based inclusive `(top, left, bottom, right)`:
+    /// the scroll region in origin mode, the whole screen otherwise. DECRQCRA (a
+    /// rectangle checksum), like the DECRA rect ops, addresses cells relative to
+    /// its top-left corner.
+    pub(crate) fn addressable_region(&self) -> (usize, usize, usize, usize) {
+        (
+            self.actual_top_margin(),
+            self.actual_left_margin(),
+            self.actual_bottom_margin(),
+            self.actual_right_margin(),
+        )
+    }
+
     /// The columns a scroll/insert/delete acts on: the left/right-margin box,
     /// which is the full width `0..cols` whenever DECLRMM is off (margins reset
     /// to full then), so the buffer takes its fast whole-row path.
