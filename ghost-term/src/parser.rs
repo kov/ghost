@@ -86,6 +86,12 @@ pub enum Function {
     /// with SCOSC (`CSI s`): the terminal treats it as DECSLRM only while
     /// DECLRMM (`?69`) is on, otherwise as SCOSC (save cursor).
     Decslrm(u16, u16),
+    /// XTSAVE `CSI ? Pm s` — save the current on/off state of each named DEC
+    /// private mode into a per-terminal slot. The `?` marks it apart from DECSLRM.
+    XtSaveModes(DecModes),
+    /// XTRESTORE `CSI ? Pm r` — set each named DEC private mode back to its saved
+    /// state (a no-op for a mode never saved). The `?` marks it apart from DECSTBM.
+    XtRestoreModes(DecModes),
     /// DECIC `CSI Pn ' }` — insert `Pn` blank columns at the cursor column.
     Decic(u16),
     /// DECDC `CSI Pn ' ~` — delete `Pn` columns at the cursor column.
@@ -1309,6 +1315,16 @@ impl Parser {
                 ps[..=self.cur_param].iter().filter_map(dec_mode),
             ))),
 
+            // XTSAVE / XTRESTORE: `CSI ? Pm s` / `CSI ? Pm r`. The `?` is what
+            // separates them from DECSLRM (`s`) and DECSTBM (`r`).
+            (Some('?'), 's') => Some(XtSaveModes(DecModes::collect(
+                ps[..=self.cur_param].iter().filter_map(dec_mode),
+            ))),
+
+            (Some('?'), 'r') => Some(XtRestoreModes(DecModes::collect(
+                ps[..=self.cur_param].iter().filter_map(dec_mode),
+            ))),
+
             // XTMODKEYS: `CSI > Pp ; Pv m`. We track only modifyOtherKeys
             // (Pp == 4); the other resources (modifyCursorKeys, …) are ignored.
             // The reset form `CSI > 4 m` omits Pv, which defaults to 0 (off).
@@ -1798,6 +1814,21 @@ fn dump_function(seq: &mut String, fun: &Function) {
 
         Decslrm(left, right) => {
             push_csi(seq, None, &[left.to_string(), right.to_string()], 's');
+        }
+
+        XtSaveModes(modes) | XtRestoreModes(modes) => {
+            // Every `DecMode` discriminant is its DEC mode number (`#[repr(u16)]`).
+            let params = modes
+                .as_slice()
+                .iter()
+                .map(|mode| (*mode as u16).to_string())
+                .collect::<Vec<_>>();
+            let final_byte = if matches!(fun, XtSaveModes(_)) {
+                's'
+            } else {
+                'r'
+            };
+            push_csi(seq, Some('?'), &params, final_byte);
         }
 
         Decic(n) => push_csi(seq, Some('\''), &[n.to_string()], '}'),
@@ -3018,6 +3049,28 @@ mod tests {
                 DecMode::SaveCursorAltScreenBuffer,
             ]))]
         );
+    }
+
+    #[test]
+    fn parse_xtsave_xtrestore() {
+        assert_eq!(
+            parse("\x1b[?7s"),
+            [XtSaveModes(dec_modes([DecMode::AutoWrap]))]
+        );
+        assert_eq!(
+            parse("\x1b[?7r"),
+            [XtRestoreModes(dec_modes([DecMode::AutoWrap]))]
+        );
+        assert_eq!(
+            parse("\x1b[?7;1000s"),
+            [XtSaveModes(dec_modes([
+                DecMode::AutoWrap,
+                DecMode::MouseReportX11,
+            ]))]
+        );
+        // Without the `?` marker these stay DECSTBM (`r`) and DECSLRM (`s`).
+        assert_eq!(parse("\x1b[5;6r"), [Decstbm(5, 6)]);
+        assert_eq!(parse("\x1b[5;6s"), [Decslrm(5, 6)]);
     }
 
     #[test]

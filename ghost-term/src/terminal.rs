@@ -17,7 +17,7 @@ use crate::pen::{Intensity, Pen, Protection};
 use crate::policy::TerminalPolicy;
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem;
 use unicode_width::UnicodeWidthChar;
 
@@ -127,6 +127,10 @@ pub struct Terminal {
     /// Enabled non-display modes (mouse/focus/paste). Tracked but not rendered;
     /// re-emitted on dump so they survive a reattach.
     tracked_modes: BTreeSet<DecMode>,
+    /// DEC private modes saved by XTSAVE (`CSI ? Pm s`), for XTRESTORE to put
+    /// back. Transient app state, like the kitty-keyboard stack — deliberately
+    /// not carried across a dump/resync (a restore after a reattach is a no-op).
+    saved_modes: BTreeMap<DecMode, bool>,
     /// Current window title (OSC 0/2). Tracked but not rendered; re-emitted on
     /// dump so it survives a reattach.
     title: String,
@@ -301,6 +305,7 @@ impl Terminal {
             policy: TerminalPolicy::default(),
             window_ops: Vec::new(),
             tracked_modes: BTreeSet::new(),
+            saved_modes: BTreeMap::new(),
             title: String::new(),
             icon_title: String::new(),
             title_stack: Vec::new(),
@@ -591,6 +596,26 @@ impl Terminal {
                     self.decslrm(left, right);
                 } else {
                     self.sc();
+                }
+            }
+
+            XtSaveModes(modes) => {
+                for &mode in modes.as_slice() {
+                    if let Some(set) = self.dec_mode_set(mode) {
+                        self.saved_modes.insert(mode, set);
+                    }
+                }
+            }
+
+            XtRestoreModes(modes) => {
+                for &mode in modes.as_slice() {
+                    if let Some(&set) = self.saved_modes.get(&mode) {
+                        if set {
+                            self.decset(DecModes::one(mode));
+                        } else {
+                            self.decrst(DecModes::one(mode));
+                        }
+                    }
                 }
             }
 
@@ -1781,21 +1806,12 @@ impl Terminal {
     }
 
     /// How a DEC private mode reports to DECRQM (`CSI ? Ps $ p`), by raw number.
-    pub(crate) fn mode_state(&self, param: u16) -> ModeReport {
+    /// A DEC private mode's current on/off state, or `None` for one that names an
+    /// action rather than a queryable state (DECSC-mode 1048). Shared by DECRQM
+    /// ([`mode_state`](Self::mode_state)) and XTSAVE.
+    fn dec_mode_set(&self, mode: DecMode) -> Option<bool> {
         use DecMode::*;
-        use ModeReport::*;
-
-        // DECHCCM (horizontal cursor coupling): recognized by name, but ghost has
-        // no horizontal scrolling, so it is permanently reset. Not in the DecMode
-        // enum, so it must be checked before `dec_mode_from`.
-        if param == 60 {
-            return PermanentlyReset;
-        }
-
-        let Some(mode) = crate::parser::dec_mode_from(param) else {
-            return Unrecognized;
-        };
-        let set = match mode {
+        Some(match mode {
             CursorKeys => self.cursor_keys_mode == CursorKeysMode::Application,
             Origin => self.origin_mode,
             AutoWrap => self.auto_wrap_mode,
@@ -1811,13 +1827,28 @@ impl Terminal {
             // DECCOLM's mode bit, tracked apart from the physical column count.
             Columns132 => self.column_mode_132,
             // 1048 is a save/restore action, not a queryable state.
-            SaveCursor => return Unrecognized,
+            SaveCursor => return None,
             m => self.tracked_modes.contains(&m),
+        })
+    }
+
+    pub(crate) fn mode_state(&self, param: u16) -> ModeReport {
+        use ModeReport::*;
+
+        // DECHCCM (horizontal cursor coupling): recognized by name, but ghost has
+        // no horizontal scrolling, so it is permanently reset. Not in the DecMode
+        // enum, so it must be checked before `dec_mode_from`.
+        if param == 60 {
+            return PermanentlyReset;
+        }
+
+        let Some(mode) = crate::parser::dec_mode_from(param) else {
+            return Unrecognized;
         };
-        if set {
-            Set
-        } else {
-            Reset
+        match self.dec_mode_set(mode) {
+            Some(true) => Set,
+            Some(false) => Reset,
+            None => Unrecognized,
         }
     }
 
@@ -4737,6 +4768,31 @@ mod tests {
 
         assert_save_restore(Decsc, Decrc);
         assert_save_restore(Scosc, Scorc);
+    }
+
+    #[test]
+    fn xtsave_and_xtrestore_dec_private_modes() {
+        // esctest XtermSave_SaveSetState: save wrap on, turn it off, restore -> on.
+        let mut term = Terminal::new((5, 3), None);
+        term.execute(Decset(dec_modes([DecMode::AutoWrap])));
+        term.execute(XtSaveModes(dec_modes([DecMode::AutoWrap])));
+        term.execute(Decrst(dec_modes([DecMode::AutoWrap])));
+        term.execute(XtRestoreModes(dec_modes([DecMode::AutoWrap])));
+        assert!(term.auto_wrap_mode, "restore brought wrap back on");
+
+        // esctest XtermSave_SaveResetState: save wrap off, turn it on, restore -> off.
+        let mut term = Terminal::new((5, 3), None);
+        term.execute(Decrst(dec_modes([DecMode::AutoWrap])));
+        term.execute(XtSaveModes(dec_modes([DecMode::AutoWrap])));
+        term.execute(Decset(dec_modes([DecMode::AutoWrap])));
+        term.execute(XtRestoreModes(dec_modes([DecMode::AutoWrap])));
+        assert!(!term.auto_wrap_mode, "restore brought wrap back off");
+
+        // A mode never saved is left untouched by restore.
+        let mut term = Terminal::new((5, 3), None);
+        term.execute(Decset(dec_modes([DecMode::Origin])));
+        term.execute(XtRestoreModes(dec_modes([DecMode::Origin])));
+        assert!(term.origin_mode, "an unsaved mode is not disturbed");
     }
 
     #[test]
