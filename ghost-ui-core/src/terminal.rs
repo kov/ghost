@@ -431,6 +431,116 @@ fn merge_rows(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> Option<(u
     }
 }
 
+/// The geometry facts a feed's replies and window-op reconciliation need that
+/// live on the *driving* view, not the session: the physical window size, the
+/// display size, the cell metrics, the padding, and the window's focus. A
+/// session may be looked at by several windows; the one that *drives* it (in the
+/// single-view world, the only one) hands this snapshot to
+/// [`SessionState::ingest`] so a `CSI 14 t`/`CSI 18 t`/DECCOLM in the same feed
+/// answers with — and resizes to — the driving window's geometry, not some other
+/// view's. Kept as a by-value snapshot so `ingest` borrows the session alone.
+pub(crate) struct DrivingGeometry {
+    /// Effective (device- and zoom-scaled) cell metrics of the driving view.
+    metrics: CellMetrics,
+    /// Scaled inner padding (physical px per side) of the driving view.
+    pad_px: f32,
+    /// Physical window size the driving view was last laid at.
+    size_px: (u32, u32),
+    /// Resolved display size (physical px) — the driving view's, or the nominal
+    /// fallback a headless/never-told view stands in with.
+    display_px: (u32, u32),
+    /// Whether the driving window holds OS focus, for the DEC ?1004 rising-edge report.
+    focused: bool,
+}
+
+impl DrivingGeometry {
+    /// Physical inner-window size fitting a `cols`×`rows` grid — the inverse of the
+    /// grid math in [`TerminalView::resize`], rounded up so that floor gives it back.
+    fn window_px_for_grid(&self, cols: u16, rows: u16) -> (u32, u32) {
+        let w = (f32::from(cols) * self.metrics.advance + 2.0 * self.pad_px)
+            .ceil()
+            .max(1.0);
+        let h = (f32::from(rows) * self.metrics.line_height + 2.0 * self.pad_px)
+            .ceil()
+            .max(1.0);
+        (w as u32, h as u32)
+    }
+
+    /// The grid a window filling the display would hold — what a maximized or
+    /// full-screen program gets, and what `CSI 19 t` reports.
+    fn display_grid(&self) -> (u16, u16) {
+        let (w_px, h_px) = self.display_px;
+        let cols = ((w_px as f32 - 2.0 * self.pad_px).max(0.0) / self.metrics.advance)
+            .floor()
+            .max(1.0);
+        let rows = ((h_px as f32 - 2.0 * self.pad_px).max(0.0) / self.metrics.line_height)
+            .floor()
+            .max(1.0);
+        (cols as u16, rows as u16)
+    }
+
+    /// Cell size in physical px, for `CSI 16 t` and the query reply context.
+    fn cell_px(&self) -> (u32, u32) {
+        (
+            self.metrics.advance.ceil() as u32,
+            self.metrics.line_height.ceil() as u32,
+        )
+    }
+}
+
+/// What one feed did to a [`SessionState`], captured by value so that *every* view
+/// of the session can fold the same change into its own damage/scroll/selection
+/// exactly once. [`SessionState::ingest`] produces it — feeding the screen and
+/// draining the consume-once emulator facts into the returned `Cmd`s — and each
+/// [`TerminalView::apply_feed`] consumes it. Effects fall in three buckets, and a
+/// new effect added to the feed path must be placed in the right one:
+///
+/// - **once per session** — done in `ingest`, returned as `Cmd`s: the child's
+///   query replies, the DEC ?1004 focus report, graphics acknowledgements,
+///   clipboard writes, window ops, and the DECCOLM/maximize child `Resize`. These
+///   drain the emulator, so re-running them per view would double-answer the child
+///   or corrupt the shared state.
+/// - **per view** — done in `apply_feed` off the fields here: the repaint request
+///   and its trace, the title change (each view tracks its own `last_title`), image
+///   uploads (each window's renderer needs its own copy of the pixels), damage
+///   accumulation, and the scroll-pin.
+/// - **shared facts** — the fields below, snapshots taken across the feed so a view
+///   reacting later sees the same change the first one did.
+struct FeedOutcome {
+    /// A feed carrying bytes actually ran (vs a bare end-of-session with none).
+    fed: bool,
+    /// The viewport rows this feed changed — the localizable damage hint, `None`
+    /// when nothing on screen moved (a mode set, a bare query, a UTF-8 tail).
+    dirty: Option<(usize, usize)>,
+    /// Gross lines that scrolled off the top this feed — the scroll-pin advance.
+    /// Survives scrollback trimming, unlike the net length delta (which reads zero
+    /// once the cap is hit).
+    scrolled_off: usize,
+    /// The emulator re-gridded from within the feed (DECCOLM / a maximize op):
+    /// every view must drop selection and scroll and force a full repaint; the
+    /// driving view also adopts `new_size_px`.
+    grid_changed: bool,
+    /// The window px the driving view should adopt after a `grid_changed` feed —
+    /// the size a `CSI 14 t` in the same burst already reported.
+    new_size_px: Option<(u32, u32)>,
+    /// Cursor rows the move/show/hide implicitly redrew (`Screen::feed`'s separate
+    /// hint). Folded per view, and only at the live bottom — see [`TerminalView::apply_feed`].
+    cursor: screen::CursorDamage,
+    /// A direct graphics placement changed without a new upload (a delete, move, or
+    /// re-place) — alters the frame but writes no cell, so it forces whole-view damage.
+    placements_changed: bool,
+    /// App-set dynamic colors (OSC 10/11/12) changed — recolors every cell, so it
+    /// forces whole-view damage the way a resize does.
+    colors_changed: bool,
+    /// App-set OSC 4/104 palette changed — like `colors_changed`, whole-view damage.
+    palette_changed: bool,
+    /// Synchronized output (DEC 2026) is held open after this feed: a view holds its
+    /// repaint until the mode resets or a backstop tick fires.
+    sync: bool,
+    /// The session ended (its transport closed): each view repaints the final frame.
+    ended: bool,
+}
+
 impl SessionState {
     pub(crate) fn new(session: SessionId, cols: u16, rows: u16) -> Self {
         SessionState {
@@ -662,6 +772,319 @@ impl SessionState {
     pub(crate) fn set_policy(&mut self, policy: ghost_term::SessionPolicy) {
         self.set_terminal_policy(policy.terminal);
         self.set_action_policy(policy.action);
+    }
+
+    /// Carry out the window ops the emulator queued (see [`ghost_term::XtwinopsOp`]).
+    /// The ones that grow the window re-grid the screen here — the emulator can't,
+    /// since the size depends on the display — and the caller turns that into the
+    /// window resize and the child's SIGWINCH, exactly as for a DECCOLM. The window
+    /// may of course refuse any of it; a program reads back what it asked for.
+    ///
+    /// This is session state (the screen grid, the iconify/maximize/full-screen
+    /// flags the program reads back), so it lives on the session — but sizing needs
+    /// the driving window's display, hence the [`DrivingGeometry`].
+    fn apply_window_ops(&mut self, geom: &DrivingGeometry) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for op in self.screen.take_window_ops() {
+            // Minimizing, maximizing and going full-screen are the window's, not the
+            // screen's — the emulator only queued them, and this is where they would
+            // actually happen, so this is where the policy gets a say. Drained either
+            // way, so a refusal doesn't leave them piling up. (The resizes below are
+            // *grid* ops that reach the window as a consequence; the emulator gates
+            // those, since the grid is screen state it must agree with the host on.)
+            if !self.action_policy.window_control
+                && matches!(
+                    op,
+                    XtwinopsOp::Iconify
+                        | XtwinopsOp::Deiconify
+                        | XtwinopsOp::Maximize(_)
+                        | XtwinopsOp::Fullscreen(_)
+                )
+            {
+                continue;
+            }
+            // The screen's own size, not `self.cols`/`self.rows` — those are
+            // reconciled once, after this loop, so within a burst they are the grid
+            // we *started* with. Two ops in one write (`\e[9;2t\e[9;3t`: grow one
+            // axis, then the other) have to each see what the one before it left.
+            let (cols, rows) = self.screen.dimensions();
+            let (display_cols, display_rows) = geom.display_grid();
+            match op {
+                XtwinopsOp::Iconify => {
+                    self.iconified = true;
+                    cmds.push(Cmd::SetIconified(true));
+                }
+                XtwinopsOp::Deiconify => {
+                    self.iconified = false;
+                    cmds.push(Cmd::SetIconified(false));
+                }
+                XtwinopsOp::Maximize(op) => {
+                    let leaving = op == MaximizeOp::Restore;
+                    let grid = match op {
+                        MaximizeOp::Both => Some((display_cols, display_rows)),
+                        MaximizeOp::Horizontally => Some((display_cols, rows)),
+                        MaximizeOp::Vertically => Some((cols, display_rows)),
+                        // Only a maximize we made has anything to come back to.
+                        MaximizeOp::Restore => self.maximize_restore.take(),
+                    };
+                    if !leaving && !self.maximized {
+                        // Save on the way in only: growing the second axis (or
+                        // maximizing twice) must not overwrite the grid from before
+                        // the first with an already-grown one.
+                        self.maximize_restore = Some((cols, rows));
+                    }
+                    self.maximized = !leaving;
+                    // Only a both-axes maximize is a state a window manager has;
+                    // one axis is just a size, which the re-grid below asks for.
+                    if op == MaximizeOp::Both || leaving {
+                        cmds.push(Cmd::SetMaximized(!leaving));
+                    }
+                    if let Some((cols, rows)) = grid {
+                        self.resize_grid(cols, rows);
+                    }
+                }
+                XtwinopsOp::Fullscreen(op) => {
+                    let entering = match op {
+                        FullscreenOp::Enter => true,
+                        FullscreenOp::Leave => false,
+                        FullscreenOp::Toggle => !self.fullscreen,
+                    };
+                    // Full-screen keeps its *own* saved grid, and only touches it on
+                    // a real transition. Sharing one slot with the maximize let a
+                    // leave-full-screen we were never in (a no-op in xterm, and one
+                    // programs send defensively) walk off with the grid the maximize
+                    // saved. Keeping them apart also nests the two the way xterm
+                    // does: full-screen over a maximize comes back to the maximized
+                    // grid, and the maximize still restores what preceded it.
+                    if entering && !self.fullscreen {
+                        self.fullscreen_restore = Some((cols, rows));
+                        self.resize_grid(display_cols, display_rows);
+                    } else if !entering
+                        && self.fullscreen
+                        && let Some((cols, rows)) = self.fullscreen_restore.take()
+                    {
+                        self.resize_grid(cols, rows);
+                    }
+                    self.fullscreen = entering;
+                    cmds.push(Cmd::SetFullscreen(entering));
+                }
+                // A resize the emulator left to us: one with a zero dimension, which
+                // xterm reads as "as big as the display fits" — it has no display.
+                // An omitted dimension keeps the one it has.
+                XtwinopsOp::Resize(w, h) => {
+                    let cols = TerminalView::fit_dimension(w, cols, display_cols);
+                    let rows = TerminalView::fit_dimension(h, rows, display_rows);
+                    self.resize_grid(cols, rows);
+                }
+                // The same, in pixels: only we know how many a cell is.
+                XtwinopsOp::ResizePixels(w_px, h_px) => {
+                    let m = geom.metrics;
+                    let pad = geom.pad_px;
+                    let cells = |px: u16, per_cell: f32| {
+                        (((f32::from(px) - 2.0 * pad).max(0.0) / per_cell).floor() as u16).max(1)
+                    };
+                    let cols = match w_px {
+                        Some(0) => display_cols,
+                        Some(px) => cells(px, m.advance),
+                        None => cols,
+                    };
+                    let rows = match h_px {
+                        Some(0) => display_rows,
+                        Some(px) => cells(px, m.line_height),
+                        None => rows,
+                    };
+                    self.resize_grid(cols, rows);
+                }
+                // The emulator does these itself: a fully-given grid, the page
+                // height, and the title stack (it holds the titles).
+                XtwinopsOp::SetLines(..) | XtwinopsOp::PushTitle(..) | XtwinopsOp::PopTitle(..) => {
+                }
+            }
+        }
+        cmds
+    }
+
+    /// Feed `bytes` into the session's emulator and drain the *session-once* effects
+    /// of that feed — everything a view must not run twice: the child's query
+    /// replies, the DEC ?1004 focus report, graphics acknowledgements, clipboard
+    /// writes, window ops, and any DECCOLM/maximize re-grid (which SIGWINCHes the
+    /// child). Those go out as the returned `Cmd`s. The returned [`FeedOutcome`]
+    /// carries the *per-view* facts (dirtied rows, scroll-off count, grid/colors/
+    /// palette/placement/cursor changes, the 2026 hold) so every view of this
+    /// session can react to the one feed exactly once via [`TerminalView::apply_feed`].
+    ///
+    /// `geom` is the driving view's geometry (see [`DrivingGeometry`]), so a
+    /// `CSI 14 t`/`CSI 18 t` in this same burst answers with the driving window's
+    /// pixels/grid — including the size a DECCOLM here just asked it to become.
+    fn ingest(
+        &mut self,
+        bytes: &[u8],
+        geom: &DrivingGeometry,
+        ended: bool,
+    ) -> (Vec<Cmd>, FeedOutcome) {
+        let mut cmds = Vec::new();
+        let mut out = FeedOutcome {
+            fed: false,
+            dirty: None,
+            scrolled_off: 0,
+            grid_changed: false,
+            new_size_px: None,
+            cursor: screen::CursorDamage::default(),
+            placements_changed: false,
+            colors_changed: false,
+            palette_changed: false,
+            sync: false,
+            ended,
+        };
+        if !bytes.is_empty() {
+            out.fed = true;
+            let before = self.screen.vt().lines_scrolled_off();
+            let colors_before = self.render_colors();
+            let palette_before = *self.palette();
+            let focus_report_before = self.screen.vt().focus_report();
+            let placements_before = self.placement_signature();
+            // `Screen::feed` reports the viewport rows this feed changed; an empty
+            // slice means nothing on screen moved (a mode set, a query that only
+            // produced a reply, an incomplete UTF-8 tail). Carry the dirtied row
+            // range for the views' per-session `TermDamage`.
+            out.dirty = {
+                let d = self.feed(bytes);
+                d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi))
+            };
+            // The window ops a program asked for that the emulator couldn't do
+            // itself (iconify, maximize, full-screen). Carried out *before* the grid
+            // is reconciled below, so a maximize's new grid rides the same path a
+            // DECCOLM does — and so a `CSI 18 t` in this very burst already answers
+            // with it.
+            cmds.extend(self.apply_window_ops(geom));
+            // A program can resize the emulator from within the feed (DECCOLM
+            // 80↔132) — the one change that comes bottom-up, from the child rather
+            // than from the window. Follow it: adopt the new grid, ask the window to
+            // resize to fit, and tell the child its new size (xterm SIGWINCHes after
+            // DECCOLM too). The reply context below is built from the adopted grid,
+            // so a `CSI 18 t`/`CSI 14 t` in the same burst answers with the size the
+            // program just asked for. The window may refuse or clamp; its next
+            // `UiEvent::Resize` re-grids us to what it actually is. Every view drops
+            // its (now meaningless) selection/scroll and repaints fully — that part
+            // is in `apply_feed`, keyed off `grid_changed`.
+            let mut size_px = geom.size_px;
+            if self.screen.dimensions() != (self.cols, self.rows) {
+                (self.cols, self.rows) = self.screen.dimensions();
+                out.grid_changed = true;
+                let (w_px, h_px) = geom.window_px_for_grid(self.cols, self.rows);
+                size_px = (w_px, h_px);
+                out.new_size_px = Some(size_px);
+                cmds.push(Cmd::ResizeWindow { w_px, h_px });
+                cmds.push(Cmd::Resize {
+                    session: self.session.clone(),
+                    cols: self.cols,
+                    rows: self.rows,
+                });
+            }
+            // The gross lines that scrolled off the top this feed — a scrolled-up
+            // view advances its offset by this to stay pinned to its content (done
+            // per view in `apply_feed`, since the offset is a view fact).
+            out.scrolled_off = self.screen.vt().lines_scrolled_off().saturating_sub(before);
+            let display_size = geom.display_grid();
+            let screen = &self.screen;
+            let mode_state = |m: u16| screen.vt().dec_mode_state(m);
+            let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
+            let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
+            let palette = |i: u8| screen.vt().palette_color(i);
+            let special = |t| screen.vt().special_color(t);
+            let (lm, rm) = screen.vt().left_right_margins();
+            let (tm, bm) = screen.vt().top_bottom_margins();
+            let ctx = ReplyCtx {
+                cursor: screen.cursor_report(),
+                size: screen.dimensions(),
+                policy: screen.vt().policy(),
+                display_size,
+                iconified: self.iconified,
+                size_px,
+                display_px: geom.display_px,
+                cell_px: geom.cell_px(),
+                title: screen.title(),
+                icon_title: screen.icon_title(),
+                kitty_flags: screen.kitty_keyboard_flags(),
+                cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
+                left_right_margins: (lm as u16, rm as u16),
+                top_bottom_margins: (tm as u16, bm as u16),
+                sgr_report: screen.vt().sgr_report(),
+                decsca: screen.vt().decsca_report(),
+                conformance_level: screen.vt().conformance_level(),
+                ansi_mode_state: &ansi_mode_state,
+                colors: screen.effective_colors(self.theme),
+                palette: &palette,
+                special: &special,
+                mode_state: &mode_state,
+                checksum: &checksum,
+            };
+            let replies = query_replies(&mut self.scanner, bytes, &ctx);
+            if !replies.is_empty() {
+                cmds.push(Cmd::SendInput {
+                    session: self.session.clone(),
+                    bytes: replies,
+                });
+            }
+            // Report the current focus state when an app first subscribes to focus
+            // events (DEC ?1004 rising edge). xterm reports only on the next
+            // *change*, so an app that enables focus reporting while the window
+            // already holds focus never learns it does — Claude Code's prompt does
+            // exactly this and then swallows input until a focus change arrives.
+            if self.screen.vt().focus_report() && !focus_report_before {
+                cmds.push(Cmd::SendInput {
+                    session: self.session.clone(),
+                    bytes: if geom.focused {
+                        b"\x1b[I".to_vec()
+                    } else {
+                        b"\x1b[O".to_vec()
+                    },
+                });
+            }
+            // kitty-graphics acknowledgements are stateful, so (unlike the scanner
+            // queries) they come from the emulator. The detached host stays out of
+            // the way while a client is attached, so we — the attached frontend —
+            // send them back to the child ourselves.
+            let graphics_replies = self.screen.take_graphics_responses();
+            if !graphics_replies.is_empty() {
+                cmds.push(Cmd::SendInput {
+                    session: self.session.clone(),
+                    bytes: graphics_replies,
+                });
+            }
+            // OSC 52: apply the app's clipboard writes (copy-over-ssh, tmux
+            // set-clipboard). The emulator already decoded, size-capped, and refused
+            // the read form; route each write to its selection.
+            for (target, text) in self.screen.take_clipboard_writes() {
+                // Drained whatever the policy says — a refused write is dropped here,
+                // not left to pile up in the emulator.
+                if !self.action_policy.clipboard_write {
+                    continue;
+                }
+                cmds.push(match target {
+                    ClipboardSelection::Clipboard => Cmd::WriteClipboard(text),
+                    ClipboardSelection::Primary => Cmd::WritePrimary(text),
+                });
+            }
+            // Snapshots taken *across* the feed, so a view reacting later sees the
+            // same change the first one did.
+            out.placements_changed = placements_before != self.placement_signature();
+            out.colors_changed = colors_before != self.render_colors();
+            out.palette_changed = palette_before != *self.palette();
+            // The cursor is part of the drawn frame, but moving it writes no cell.
+            // `Screen::feed` reports the move as its own damage; a view folds it in
+            // only at the live bottom (in `apply_feed`). The read is a snapshot —
+            // `Screen` re-baselines on the next feed — so capturing it here for every
+            // view is safe.
+            out.cursor = self.screen.cursor_damage();
+            // Synchronized output (DEC 2026): between set and reset the app is
+            // composing one atomic frame, so a view holds its repaint.
+            out.sync = self.screen.vt().synchronized_output();
+        }
+        if ended {
+            self.ended = true;
+        }
+        (cmds, out)
     }
 }
 
@@ -1061,17 +1484,18 @@ impl TerminalView {
         }
     }
 
-    /// Physical inner-window size that fits a `cols` × `rows` grid at the current
-    /// metrics — the inverse of the grid math in [`Self::resize`], padding included.
-    /// Rounded *up* so the floor there gives back exactly this grid.
-    fn window_px_for_grid(&self, cols: u16, rows: u16) -> (u32, u32) {
-        let m = self.effective_metrics();
-        let pad = self.pad_px();
-        let w = (f32::from(cols) * m.advance + 2.0 * pad).ceil().max(1.0);
-        let h = (f32::from(rows) * m.line_height + 2.0 * pad)
-            .ceil()
-            .max(1.0);
-        (w as u32, h as u32)
+    /// The driving geometry this view hands [`SessionState::ingest`] when it feeds
+    /// its session — a snapshot of the view facts a feed's replies and resizes need.
+    fn driving_geometry(&self) -> DrivingGeometry {
+        DrivingGeometry {
+            metrics: self.effective_metrics(),
+            pad_px: self.pad_px(),
+            size_px: self.size_px,
+            display_px: self
+                .display_px
+                .unwrap_or(ghost_vt::query::NOMINAL_DISPLAY_PX),
+            focused: self.focused,
+        }
     }
 
     /// One dimension of an XTWINOPS resize: omitted keeps what it has, zero is
@@ -1082,156 +1506,6 @@ impl TerminalView {
             Some(0) => display,
             Some(n) => n,
         }
-    }
-
-    /// The grid a window filling the whole display would hold — what a maximized
-    /// or full-screen program gets, and what `CSI 19 t` reports. Until the shell
-    /// says how big the display is (a headless model is never told), the nominal
-    /// one stands in — but measured in *our* cell, so the grid we report and the
-    /// pixels we report are the same display. A program that maximizes and then
-    /// checks its arithmetic finds it adds up.
-    fn display_grid(&self) -> (u16, u16) {
-        let (w_px, h_px) = self
-            .display_px
-            .unwrap_or(ghost_vt::query::NOMINAL_DISPLAY_PX);
-        let m = self.effective_metrics();
-        let pad = self.pad_px();
-        let cols = ((w_px as f32 - 2.0 * pad).max(0.0) / m.advance)
-            .floor()
-            .max(1.0);
-        let rows = ((h_px as f32 - 2.0 * pad).max(0.0) / m.line_height)
-            .floor()
-            .max(1.0);
-        (cols as u16, rows as u16)
-    }
-
-    /// Carry out the window ops the emulator queued for us (see
-    /// [`ghost_term::XtwinopsOp`]). The ones that grow the window re-grid the
-    /// screen here — the emulator can't, since the size depends on the display —
-    /// and the caller's grid reconciliation turns that into the window resize and
-    /// the child's SIGWINCH, exactly as for a DECCOLM.
-    ///
-    /// The window may of course refuse any of it; a program reads back what it
-    /// asked for, which is all xterm promises it.
-    fn apply_window_ops(&mut self, state: &mut SessionState) -> Vec<Cmd> {
-        let mut cmds = Vec::new();
-        for op in state.screen.take_window_ops() {
-            // Minimizing, maximizing and going full-screen are the window's, not the
-            // screen's — the emulator only queued them, and this is where they would
-            // actually happen, so this is where the policy gets a say. Drained either
-            // way, so a refusal doesn't leave them piling up. (The resizes below are
-            // *grid* ops that reach the window as a consequence; the emulator gates
-            // those, since the grid is screen state it must agree with the host on.)
-            if !state.action_policy.window_control
-                && matches!(
-                    op,
-                    XtwinopsOp::Iconify
-                        | XtwinopsOp::Deiconify
-                        | XtwinopsOp::Maximize(_)
-                        | XtwinopsOp::Fullscreen(_)
-                )
-            {
-                continue;
-            }
-            // The screen's own size, not `state.cols`/`state.rows` — those are
-            // reconciled once, after this loop, so within a burst they are the grid
-            // we *started* with. Two ops in one write (`\e[9;2t\e[9;3t`: grow one
-            // axis, then the other) have to each see what the one before it left.
-            let (cols, rows) = state.screen.dimensions();
-            let (display_cols, display_rows) = self.display_grid();
-            match op {
-                XtwinopsOp::Iconify => {
-                    state.iconified = true;
-                    cmds.push(Cmd::SetIconified(true));
-                }
-                XtwinopsOp::Deiconify => {
-                    state.iconified = false;
-                    cmds.push(Cmd::SetIconified(false));
-                }
-                XtwinopsOp::Maximize(op) => {
-                    let leaving = op == MaximizeOp::Restore;
-                    let grid = match op {
-                        MaximizeOp::Both => Some((display_cols, display_rows)),
-                        MaximizeOp::Horizontally => Some((display_cols, rows)),
-                        MaximizeOp::Vertically => Some((cols, display_rows)),
-                        // Only a maximize we made has anything to come back to.
-                        MaximizeOp::Restore => state.maximize_restore.take(),
-                    };
-                    if !leaving && !state.maximized {
-                        // Save on the way in only: growing the second axis (or
-                        // maximizing twice) must not overwrite the grid from before
-                        // the first with an already-grown one.
-                        state.maximize_restore = Some((cols, rows));
-                    }
-                    state.maximized = !leaving;
-                    // Only a both-axes maximize is a state a window manager has;
-                    // one axis is just a size, which the re-grid below asks for.
-                    if op == MaximizeOp::Both || leaving {
-                        cmds.push(Cmd::SetMaximized(!leaving));
-                    }
-                    if let Some((cols, rows)) = grid {
-                        state.resize_grid(cols, rows);
-                    }
-                }
-                XtwinopsOp::Fullscreen(op) => {
-                    let entering = match op {
-                        FullscreenOp::Enter => true,
-                        FullscreenOp::Leave => false,
-                        FullscreenOp::Toggle => !state.fullscreen,
-                    };
-                    // Full-screen keeps its *own* saved grid, and only touches it on
-                    // a real transition. Sharing one slot with the maximize let a
-                    // leave-full-screen we were never in (a no-op in xterm, and one
-                    // programs send defensively) walk off with the grid the maximize
-                    // saved. Keeping them apart also nests the two the way xterm
-                    // does: full-screen over a maximize comes back to the maximized
-                    // grid, and the maximize still restores what preceded it.
-                    if entering && !state.fullscreen {
-                        state.fullscreen_restore = Some((cols, rows));
-                        state.resize_grid(display_cols, display_rows);
-                    } else if !entering
-                        && state.fullscreen
-                        && let Some((cols, rows)) = state.fullscreen_restore.take()
-                    {
-                        state.resize_grid(cols, rows);
-                    }
-                    state.fullscreen = entering;
-                    cmds.push(Cmd::SetFullscreen(entering));
-                }
-                // A resize the emulator left to us: one with a zero dimension, which
-                // xterm reads as "as big as the display fits" — it has no display.
-                // An omitted dimension keeps the one it has.
-                XtwinopsOp::Resize(w, h) => {
-                    let cols = Self::fit_dimension(w, cols, display_cols);
-                    let rows = Self::fit_dimension(h, rows, display_rows);
-                    state.resize_grid(cols, rows);
-                }
-                // The same, in pixels: only we know how many a cell is.
-                XtwinopsOp::ResizePixels(w_px, h_px) => {
-                    let m = self.effective_metrics();
-                    let pad = self.pad_px();
-                    let cells = |px: u16, per_cell: f32| {
-                        (((f32::from(px) - 2.0 * pad).max(0.0) / per_cell).floor() as u16).max(1)
-                    };
-                    let cols = match w_px {
-                        Some(0) => display_cols,
-                        Some(px) => cells(px, m.advance),
-                        None => cols,
-                    };
-                    let rows = match h_px {
-                        Some(0) => display_rows,
-                        Some(px) => cells(px, m.line_height),
-                        None => rows,
-                    };
-                    state.resize_grid(cols, rows);
-                }
-                // The emulator does these itself: a fully-given grid, the page
-                // height, and the title stack (it holds the titles).
-                XtwinopsOp::SetLines(..) | XtwinopsOp::PushTitle(..) | XtwinopsOp::PopTitle(..) => {
-                }
-            }
-        }
-        cmds
     }
 
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
@@ -1662,6 +1936,14 @@ impl TerminalView {
         ]
     }
 
+    /// Feed child output for this view's session and react to it. The thin seam
+    /// over the split [`SessionState::ingest`] (session-once effects: the feed, the
+    /// child's query replies, window ops) and [`Self::apply_feed`] (this view's
+    /// per-view reaction: damage, scroll-pin, title, image uploads, the repaint).
+    /// Kept byte-for-byte equivalent to the pre-split monolith so a single view
+    /// behaves exactly as before; the value of the split is that a *second* view of
+    /// the same session can react to the one ingested feed via `apply_feed` without
+    /// re-feeding the emulator.
     fn session_data(
         &mut self,
         state: &mut SessionState,
@@ -1672,179 +1954,54 @@ impl TerminalView {
         if name != state.session {
             return Vec::new();
         }
+        let geom = self.driving_geometry();
+        let (mut cmds, outcome) = state.ingest(bytes, &geom, ended);
+        cmds.extend(self.apply_feed(state, &outcome));
+        cmds
+    }
+
+    /// Fold one [`FeedOutcome`] into this view — the *per-view* half of a feed: the
+    /// scroll-pin, the live-bottom selection drop, the title change, this window's
+    /// image uploads, the accumulated damage, and the repaint request (held while a
+    /// DEC 2026 frame is open). Runs once per view of the session, off the same
+    /// outcome [`SessionState::ingest`] produced, so several windows looking at one
+    /// session each react to its output exactly once without re-feeding it.
+    fn apply_feed(&mut self, state: &SessionState, outcome: &FeedOutcome) -> Vec<Cmd> {
         let mut cmds = Vec::new();
-        if !bytes.is_empty() {
+        if outcome.fed {
             self.trace.feeds_seen += 1;
-            let before = state.screen.vt().lines_scrolled_off();
-            let colors_before = state.render_colors();
-            let palette_before = *state.palette();
-            let focus_report_before = state.screen.vt().focus_report();
-            let placements_before = state.placement_signature();
-            // `Screen::feed` reports the viewport rows this feed changed; an empty
-            // slice means nothing on screen moved (a mode set, a query that only
-            // produced a reply, an incomplete UTF-8 tail). That is the "backing
-            // buffer modified since last composition" signal — gate the repaint on
-            // it so a no-op feed doesn't drive a present, and carry the dirtied row
-            // range into `view`'s per-session `TermDamage` (see [`Self::damage`]).
-            let (viewport_changed, dirty) = {
-                let d = state.feed(bytes);
-                (
-                    !d.is_empty(),
-                    d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
-                )
-            };
-            // The window ops a program asked for that the emulator couldn't do
-            // itself (iconify, maximize, full-screen). Carried out *before* the grid
-            // is reconciled below, so a maximize's new grid rides the same path a
-            // DECCOLM does — and so a `CSI 18 t` in this very burst already answers
-            // with it.
-            cmds.extend(self.apply_window_ops(state));
-            // A program can resize the emulator from within the feed (DECCOLM
-            // 80↔132) — the one change that comes bottom-up, from the child rather
-            // than from the window. Follow it: adopt the new grid, ask the window to
-            // resize to fit, and tell the child its new size (xterm SIGWINCHes after
-            // DECCOLM too). The reply context below is built from the adopted grid,
-            // so a `CSI 18 t` in the same burst answers with the size the program
-            // just asked for. The window may refuse or clamp the request; its next
-            // `UiEvent::Resize` re-grids us to what it actually is, which is the
-            // fallback. Force a full repaint — the reflow invalidates every cell
-            // coordinate — and drop the (now meaningless) selection and scroll.
-            if state.screen.dimensions() != (state.cols, state.rows) {
-                (state.cols, state.rows) = state.screen.dimensions();
+            // A DECCOLM/maximize re-grid from within the feed invalidates every cell
+            // coordinate: drop the (now meaningless) selection and scroll and force a
+            // full repaint. The driving view also adopts the window px the ingest
+            // asked for, so a `CSI 14 t` in the same burst reported them.
+            if outcome.grid_changed {
                 self.selection = None;
                 self.sel_anchor = None;
                 self.scroll_offset = 0;
                 self.view_slid = true;
-                let (w_px, h_px) = self.window_px_for_grid(state.cols, state.rows);
-                // Hold the size we asked the window for, so a `CSI 14 t` in this
-                // burst reports the pixels the program just asked for rather than
-                // the ones it had. The window's next `UiEvent::Resize` — what it
-                // actually granted — overwrites this, as it does the grid.
-                self.size_px = (w_px, h_px);
-                cmds.push(Cmd::ResizeWindow { w_px, h_px });
-                cmds.push(Cmd::Resize {
-                    session: state.session.clone(),
-                    cols: state.cols,
-                    rows: state.rows,
-                });
+                if let Some(px) = outcome.new_size_px {
+                    self.size_px = px;
+                }
             }
             // Keep a scrolled-up view pinned to its content: advance the offset by
-            // the GROSS lines that scrolled off the top this feed. That count
-            // survives scrollback trimming (unlike the net scrollback_len delta,
-            // which reads zero once the cap is hit), clamped to retained history.
-            // At the bottom (offset 0) we just follow the live output.
+            // the gross lines that scrolled off the top this feed, clamped to
+            // retained history. At the bottom (offset 0) we just follow the live
+            // output. At the scrollback cap the offset can't grow to stay pinned, so
+            // the evicted lines slide the whole visible window while the offset stays
+            // put — force a full repaint the way a scroll does (see [`Self::damage`]).
             if self.scroll_offset > 0 {
-                let pushed = state
-                    .screen
-                    .vt()
-                    .lines_scrolled_off()
-                    .saturating_sub(before);
-                let desired = self.scroll_offset + pushed;
+                let desired = self.scroll_offset + outcome.scrolled_off;
                 let capped = desired.min(state.max_scroll());
-                // At the scrollback cap the offset can't grow to keep the view pinned to
-                // its content, so the evicted lines slide the whole visible window while
-                // the offset stays put. The per-row feed hint names only the live rows
-                // that changed, not the slid history above them — force a full repaint the
-                // way a scroll does (see [`Self::damage`]).
                 if capped < desired {
                     self.view_slid = true;
                 }
                 self.scroll_offset = capped;
             }
-            let display_size = self.display_grid();
-            let screen = &state.screen;
-            let mode_state = |m: u16| screen.vt().dec_mode_state(m);
-            let ansi_mode_state = |m: u16| screen.vt().ansi_mode_state(m);
-            let checksum = |t, l, b, r| screen.vt().rect_checksum(t, l, b, r);
-            let palette = |i: u8| screen.vt().palette_color(i);
-            let special = |t| screen.vt().special_color(t);
-            let (lm, rm) = screen.vt().left_right_margins();
-            let (tm, bm) = screen.vt().top_bottom_margins();
-            let ctx = ReplyCtx {
-                cursor: screen.cursor_report(),
-                size: screen.dimensions(),
-                policy: screen.vt().policy(),
-                display_size,
-                iconified: state.iconified,
-                size_px: self.size_px,
-                display_px: self
-                    .display_px
-                    .unwrap_or(ghost_vt::query::NOMINAL_DISPLAY_PX),
-                cell_px: {
-                    let m = self.effective_metrics();
-                    (m.advance.ceil() as u32, m.line_height.ceil() as u32)
-                },
-                title: screen.title(),
-                icon_title: screen.icon_title(),
-                kitty_flags: screen.kitty_keyboard_flags(),
-                cursor_style: ghost_vt::query::decscusr_digit(screen.vt().cursor().shape),
-                left_right_margins: (lm as u16, rm as u16),
-                top_bottom_margins: (tm as u16, bm as u16),
-                sgr_report: screen.vt().sgr_report(),
-                decsca: screen.vt().decsca_report(),
-                conformance_level: screen.vt().conformance_level(),
-                ansi_mode_state: &ansi_mode_state,
-                colors: screen.effective_colors(state.theme),
-                palette: &palette,
-                special: &special,
-                mode_state: &mode_state,
-                checksum: &checksum,
-            };
-            let replies = query_replies(&mut state.scanner, bytes, &ctx);
-            if !replies.is_empty() {
-                cmds.push(Cmd::SendInput {
-                    session: state.session.clone(),
-                    bytes: replies,
-                });
-            }
-            // Report the current focus state when an app first subscribes to
-            // focus events (DEC ?1004 rising edge). xterm reports only on the
-            // next *change*, so an app that enables focus reporting while the
-            // window already holds focus never learns it does — Claude Code's
-            // prompt does exactly this and then swallows input until a focus
-            // change happens to arrive. Emit the current state on enable so a
-            // newly-subscribed app is never left guessing (a deliberate,
-            // documented divergence from xterm).
-            if state.screen.vt().focus_report() && !focus_report_before {
-                cmds.push(Cmd::SendInput {
-                    session: state.session.clone(),
-                    bytes: if self.focused {
-                        b"\x1b[I".to_vec()
-                    } else {
-                        b"\x1b[O".to_vec()
-                    },
-                });
-            }
-            // kitty-graphics acknowledgements are stateful, so (unlike the scanner
-            // queries) they come from the emulator. The detached host stays out of
-            // the way while a client is attached, so we — the attached frontend —
-            // send them back to the child ourselves.
-            let graphics_replies = state.screen.take_graphics_responses();
-            if !graphics_replies.is_empty() {
-                cmds.push(Cmd::SendInput {
-                    session: state.session.clone(),
-                    bytes: graphics_replies,
-                });
-            }
-            // OSC 52: apply the app's clipboard writes (copy-over-ssh, tmux
-            // set-clipboard). The emulator already decoded, size-capped, and
-            // refused the read form; route each write to its selection.
-            for (target, text) in state.screen.take_clipboard_writes() {
-                // Drained whatever the policy says — a refused write is dropped
-                // here, not left to pile up in the emulator.
-                if !state.action_policy.clipboard_write {
-                    continue;
-                }
-                cmds.push(match target {
-                    ClipboardSelection::Clipboard => Cmd::WriteClipboard(text),
-                    ClipboardSelection::Primary => Cmd::WritePrimary(text),
-                });
-            }
             // At the live bottom, new output replaces the viewport, so a
-            // viewport-relative selection no longer maps — drop it (unless a drag
-            // is live). While scrolled back, stay-put keeps the same content on
-            // screen, so the selection stays valid and is preserved. Dropping a
-            // visible highlight is itself a repaint even if no row's text changed.
+            // viewport-relative selection no longer maps — drop it (unless a drag is
+            // live). While scrolled back, stay-put keeps the same content on screen,
+            // so the selection stays valid and is preserved. Dropping a visible
+            // highlight is itself a repaint even if no row's text changed.
             let had_selection = self.selection.is_some();
             if self.held.is_none() && self.scroll_offset == 0 {
                 self.selection = None;
@@ -1859,14 +2016,15 @@ impl TerminalView {
                 cmds.push(Cmd::SetTitle(state.title()));
             }
             // A new image may be a direct placement the row-damage hint doesn't
-            // cover, so upload count is its own repaint trigger.
+            // cover, so upload count is its own repaint trigger. Per view: each
+            // window's renderer needs its own copy of the pixels.
             let images_before = cmds.len();
             self.upload_new_images(state, &mut cmds);
             let images_added = cmds.len() > images_before;
             // Fold this feed's dirty rows into the pending damage. A new image gets the
             // whole viewport (its footprint may sit outside the row hint); a dropped
             // selection needs no range — `view`'s structural check reports it as `All`.
-            if let Some((lo, hi)) = dirty {
+            if let Some((lo, hi)) = outcome.dirty {
                 self.accumulate_dirty(lo, hi);
             }
             if images_added {
@@ -1877,43 +2035,35 @@ impl TerminalView {
             // writes no cell and sends no blob, so nothing above dirtied its rows. Damage
             // the whole viewport (a placement's footprint sits outside any row hint), the
             // same as a fresh upload does.
-            let placements_changed = placements_before != state.placement_signature();
-            if placements_changed && !images_added {
+            if outcome.placements_changed && !images_added {
                 self.accumulate_dirty(0, state.rows.saturating_sub(1) as usize);
             }
-            // App-set dynamic colors (OSC 10/11/12) dirty no rows, but they
-            // recolor everything; `damage` reports All via the `Presented`
-            // snapshot — this only makes sure a repaint is actually requested.
-            let colors_changed = colors_before != state.render_colors();
-            // OSC 4/104 palette edits, like the dynamic colors above, recolor drawn
-            // cells without writing any — `damage` reports All via the `Presented`
-            // snapshot; this makes sure a repaint is requested for a palette-only feed.
-            let palette_changed = palette_before != *state.palette();
             // The cursor is part of the drawn frame, but moving it writes no cell, so a
             // bare CUP/CUF (how full-screen apps like an editor or Claude Code reposition
-            // between keystrokes) dirties no content row. `Screen::feed` tracks the drawn
-            // cursor and reports the move as its own damage (the row it left + entered);
-            // fold that in — but only at the live bottom, since scrolled into history the
-            // cursor isn't drawn (and a scroll is already a full repaint). `Screen`
-            // advances its own baseline every feed, so there's nothing to do when scrolled.
+            // between keystrokes) dirties no content row. `Screen::feed` tracked the drawn
+            // cursor's move (the row it left + entered, in the outcome); fold that in —
+            // but only at the live bottom, since scrolled into history the cursor isn't
+            // drawn (and a scroll is already a full repaint).
             let cursor_redrawn = if self.scroll_offset == 0 {
-                let cursor = state.screen.cursor_damage();
-                if let Some(r) = cursor.left {
+                if let Some(r) = outcome.cursor.left {
                     self.accumulate_dirty(r, r);
                 }
-                if let Some(r) = cursor.entered {
+                if let Some(r) = outcome.cursor.entered {
                     self.accumulate_dirty(r, r);
                 }
-                cursor.repaint
+                outcome.cursor.repaint
             } else {
                 false
             };
+            // A feed that moved viewport rows (the hint was non-empty) is itself a
+            // reason to repaint, alongside the structural changes above.
+            let viewport_changed = outcome.dirty.is_some();
             let want_redraw = viewport_changed
                 || selection_dropped
                 || images_added
-                || placements_changed
-                || colors_changed
-                || palette_changed
+                || outcome.placements_changed
+                || outcome.colors_changed
+                || outcome.palette_changed
                 || cursor_redrawn
                 || self.view_slid;
             if want_redraw {
@@ -1924,8 +2074,7 @@ impl TerminalView {
             // accumulating above) and schedule a release tick as the backstop.
             // Any tick releases the hold — an early animation tick just means
             // one mid-frame paint, the status quo without the mode.
-            let sync = state.screen.vt().synchronized_output();
-            if sync && want_redraw {
+            if outcome.sync && want_redraw {
                 // Re-arm the release backstop on EVERY swallowed feed, not just
                 // the rising edge. A hold can be latched into a warm background
                 // mirror whose one rising-edge tick is then spent on the wrong
@@ -1946,7 +2095,7 @@ impl TerminalView {
                     after_ms: SYNC_RELEASE_MS,
                 });
             }
-            if !sync {
+            if !outcome.sync {
                 let released = std::mem::take(&mut self.sync_held);
                 if released {
                     self.trace.sync_released_by_reset += 1;
@@ -1957,8 +2106,7 @@ impl TerminalView {
                 }
             }
         }
-        if ended {
-            state.ended = true;
+        if outcome.ended {
             cmds.push(Cmd::Redraw);
         }
         cmds
@@ -4001,6 +4149,66 @@ mod tests {
         assert_eq!(
             t.redraws_emitted, 1,
             "the release drove the deferred repaint"
+        );
+    }
+
+    /// The point of splitting the feed into [`SessionState::ingest`] (session-once)
+    /// and [`TerminalView::apply_feed`] (per-view): the multi-window case where two
+    /// windows in one process look at ONE session — a foreground here, an
+    /// "attached-elsewhere" preview there. A single feed ingested into the shared
+    /// state must let *both* views react — accumulate the dirtied rows and want a
+    /// repaint — while the child hears the query reply exactly once, from the
+    /// ingest, never re-answered per view. Before the split this was impossible: the
+    /// monolith fed and reacted as one call, so reaching a second view meant feeding
+    /// the emulator twice (double reply, divergent state). This pins the taxonomy —
+    /// move the reply into a view, or the repaint into the ingest, and it fails.
+    #[test]
+    fn one_ingest_reaches_every_view_but_answers_the_child_once() {
+        let mut state = SessionState::new("alpha".to_string(), 80, 24);
+        state.set_policy(ghost_term::SessionPolicy::allow_all());
+        let mut a = TerminalView::new(METRICS, 80, 24);
+        let mut b = TerminalView::new(METRICS, 80, 24);
+        let geom = a.driving_geometry();
+
+        // Warm both views past the unconditional first-frame `All`: one feed lands a
+        // line (dirtying the fresh screen wholesale), both views fold it, then both
+        // present so their damage baseline is the settled screen.
+        let (_warm, warm) = state.ingest(b"line one\r\n", &geom, false);
+        a.apply_feed(&state, &warm);
+        b.apply_feed(&state, &warm);
+        a.mark_presented(&state);
+        b.mark_presented(&state);
+
+        // Now the measured feed: window A drives, one feed prints on the current row
+        // (row 1) AND asks for the cursor position. It is ingested once.
+        let (ingest_cmds, outcome) = state.ingest(b"hi\x1b[6n", &geom, false);
+        let a_cmds = a.apply_feed(&state, &outcome);
+        let b_cmds = b.apply_feed(&state, &outcome);
+
+        // The child is answered exactly once — by the ingest, not by either view.
+        let sends = |cmds: &[Cmd]| {
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::SendInput { .. }))
+                .count()
+        };
+        assert_eq!(sends(&ingest_cmds), 1, "the ingest answers the DSR once");
+        assert_eq!(sends(&a_cmds), 0, "a view never answers the child");
+        assert_eq!(sends(&b_cmds), 0, "a view never answers the child");
+
+        // Both views want to repaint the printed line...
+        assert!(a_cmds.contains(&Cmd::Redraw), "driving view repaints");
+        assert!(b_cmds.contains(&Cmd::Redraw), "second view repaints too");
+        // ...and both localize the SAME dirtied row off the one shared outcome —
+        // row 1, not the whole view (a per-view feed hint, applied identically).
+        assert_eq!(
+            a.damage(&state),
+            b.damage(&state),
+            "both views localize the one feed identically"
+        );
+        assert!(
+            matches!(a.damage(&state), TermDamage::Rows { lo: 1, hi: 1 }),
+            "the shared feed localizes to row 1, not the whole view: {:?}",
+            a.damage(&state)
         );
     }
 
