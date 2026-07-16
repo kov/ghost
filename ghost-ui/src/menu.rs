@@ -85,6 +85,17 @@ pub enum UserEvent {
         wid: winit::window::WindowId,
         name: String,
     },
+    /// Opening a new session on an already-connected remote host finished off the
+    /// event loop (the `ghost new -d` over the transport is a blocking `ssh` round
+    /// trip): posted by the spawn worker so the main loop attaches the new session
+    /// on the main thread (see `App::finish_remote_session_spawn`).
+    RemoteSessionSpawned {
+        wid: winit::window::WindowId,
+        target: String,
+        name: String,
+        /// `Ok` when the remote `ghost new` succeeded; `Err(message)` otherwise.
+        result: Result<(), String>,
+    },
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main

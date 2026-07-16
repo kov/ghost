@@ -2542,7 +2542,7 @@ impl App {
                     if let Some((target, real)) =
                         remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
                     {
-                        self.spawn_remote_session(wid, &target, &real, event_loop);
+                        self.spawn_remote_session(wid, &target, &real);
                     } else if self.respawn_dead(wid, &id) && self.attach_into(wid, &id) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
@@ -2635,7 +2635,7 @@ impl App {
                         .map(|m| m.keys().cloned().collect())
                         .unwrap_or_default();
                     match remote_spawn_target(connection.as_ref(), &connected) {
-                        Some(target) => self.spawn_remote_session(wid, &target, &name, event_loop),
+                        Some(target) => self.spawn_remote_session(wid, &target, &name),
                         None => {
                             spawn_session(&name, vec![], connection);
                             if self.attach_into(wid, &name) {
@@ -3562,13 +3562,14 @@ impl App {
     /// under the fleet-namespaced id — the same shape as a fresh connect or a
     /// take-over, so the new session is a full remote ghost session rather than a
     /// local `ssh` child. `target` must be a currently-connected host.
-    fn spawn_remote_session(
-        &mut self,
-        wid: WindowId,
-        target: &str,
-        name: &str,
-        event_loop: &dyn Frontend,
-    ) {
+    ///
+    /// The `ghost new -d` is a blocking `ssh` round trip, so it runs on a worker
+    /// thread; the attach continues on the main loop in
+    /// [`finish_remote_session_spawn`](Self::finish_remote_session_spawn) when the
+    /// worker posts [`UserEvent::RemoteSessionSpawned`] back — never blocking the
+    /// event loop, which a slow or wedged host would otherwise freeze for every
+    /// window. Mirrors the connect worker ([`spawn_connect_worker`]).
+    fn spawn_remote_session(&mut self, wid: WindowId, target: &str, name: &str) {
         let host = self
             .remotes
             .lock()
@@ -3578,21 +3579,66 @@ impl App {
             eprintln!("ghost: no live connection to {target} to open a session on");
             return;
         };
-        // Recovery (a dead remote tile's Recreate) reaches here after a reboot may
-        // have wedged the shared master; clear it so the spawn opens a fresh
-        // connection. A no-op on the healthy interactive new-session path.
-        host.remote.reap_wedged_master();
-        if let Err(e) = host.remote.spawn_host(&host.remote_ghost, name) {
+        let Some(proxy) = self.proxy.clone() else {
+            // No event-loop proxy (a headless/behaviour-only App): nothing to post
+            // the worker's result back to. A live GUI always has one.
+            return;
+        };
+        let (target, name) = (target.to_string(), name.to_string());
+        std::thread::spawn(move || {
+            // Recovery (a dead remote tile's Recreate) reaches here after a reboot may
+            // have wedged the shared master; clear it so the spawn opens a fresh
+            // connection. A no-op on the healthy interactive new-session path.
+            host.remote.reap_wedged_master();
+            let result = host
+                .remote
+                .spawn_host(&host.remote_ghost, &name)
+                .map_err(|e| e.to_string());
+            let _ = proxy.send_event(UserEvent::RemoteSessionSpawned {
+                wid,
+                target,
+                name,
+                result,
+            });
+        });
+    }
+
+    /// Attach a new remote session whose off-loop `ghost new -d` just finished (see
+    /// [`spawn_remote_session`](Self::spawn_remote_session)): drive it as this-window
+    /// under the composite id the watcher will discover it by. A window closed while
+    /// the spawn ran drops the result — the created session persists on the host and
+    /// surfaces in the fleet like any other detached one.
+    fn finish_remote_session_spawn(
+        &mut self,
+        wid: WindowId,
+        target: String,
+        name: String,
+        result: Result<(), String>,
+        event_loop: &dyn Frontend,
+    ) {
+        if !self.windows.contains_key(&wid) {
+            return;
+        }
+        if let Err(e) = result {
             eprintln!("ghost: could not open a session on {target}: {e}");
             return;
         }
+        let host = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&target).cloned());
+        let Some(host) = host else {
+            eprintln!("ghost: lost the connection to {target} before attaching its new session");
+            return;
+        };
         // Drive it under the composite id the watcher will discover it by, so the
         // window owns its own new session in the fleet (the transport uses the bare
         // name); see [`finish_connect`](Self::finish_connect).
-        let local_id = remote_fleet_id(target, name);
+        let local_id = remote_fleet_id(&target, &name);
         self.remote_index
-            .insert(local_id.clone(), (target.to_string(), name.to_string()));
-        let cmd = host.remote.pipe_command(&host.remote_ghost, name);
+            .insert(local_id.clone(), (target.clone(), name.clone()));
+        let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
         if self.attach_ssh_into(wid, &local_id, cmd) {
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
@@ -4314,6 +4360,17 @@ impl App {
             // The host is back but the session is gone (rebooted): end the hold.
             UserEvent::RemoteSessionGone { wid, name } => {
                 self.end_reconnect_gone(wid, name, fe);
+                return;
+            }
+            // The off-loop `ghost new -d` on a connected remote finished: attach the
+            // new session (or report the failure) on the main thread.
+            UserEvent::RemoteSessionSpawned {
+                wid,
+                target,
+                name,
+                result,
+            } => {
+                self.finish_remote_session_spawn(wid, target, name, result, fe);
                 return;
             }
         };
@@ -5431,7 +5488,20 @@ mod tests {
                 .set_group_connection(Some(spec.clone()));
 
             let name = "hr-attach-1";
-            app.spawn_remote_session(wid, "kov@box", name, &fe);
+            // Stand in for the off-loop spawn worker: create the detached remote
+            // session (shim → local) exactly as `spawn_host` does, then hand the
+            // main-loop continuation the result the worker posts back.
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                wid,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
 
             let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
             let held = app.windows[&wid].sessions.contains_key(&composite);
@@ -5493,7 +5563,19 @@ mod tests {
                 .set_group_connection(Some(spec.clone()));
 
             let name = "hr-route-1";
-            app.spawn_remote_session(wid, "kov@box", name, &fe);
+            // Stand in for the off-loop spawn worker (as above), then run the
+            // main-loop continuation that indexes and attaches the new session.
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                wid,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
             let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
 
             // Another host pushes a listing before kov@box has listed our session,
