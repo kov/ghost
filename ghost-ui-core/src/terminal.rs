@@ -14,13 +14,14 @@
 //! (`query_replies`, `bracket_paste`, `selection_text`) live here too.
 
 use ghost_render::{
-    Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
+    Frame, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
 };
 use ghost_term::{
     ActionPolicy, ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp,
 };
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
+use std::rc::Rc;
 
 use std::collections::HashMap;
 
@@ -215,6 +216,16 @@ pub(crate) struct SessionState {
     /// but it is remembered here so a detached session still answers with the colors
     /// it was last shown in. Defaults to ghost's default scheme.
     theme: ThemeColors,
+    /// Monotonic content version: bumped on every mutation of `screen` that can
+    /// change what [`ghost_render::layout_frame_at`] would produce (a feed, a
+    /// resize, a policy scrub). A view memoizes its laid-out frame keyed partly on
+    /// this, so an unchanged session hands back the *same* `Rc<Frame>` — making
+    /// `Rc::ptr_eq` the one freshness signal the renderer needs (idle-skip and the
+    /// per-session Surface both key off it), instead of deep-diffing frame content.
+    /// The theme is deliberately NOT tracked here: it isn't a `layout_frame_at`
+    /// input (the renderer applies it) and its changes go through
+    /// `SceneCache::invalidate` at the shell.
+    content_gen: u64,
 }
 
 /// A session paired with one view of it. A thin shell over a [`SessionState`] and
@@ -331,7 +342,21 @@ pub struct TerminalView {
     /// `redraws_emitted`, the sync-hold tallies, and `presents_marked` are stored
     /// here; the live `sync_held`/`feed_dirty` are folded in by [`Self::trace`].
     trace: TermTrace,
+    /// Memoized laid-out frame, keyed on everything [`ghost_render::layout_frame_at`]
+    /// reads: the session's [`content_gen`](SessionState::content_gen), the effective
+    /// (scaled) metrics, and the scroll offset. [`Self::view`] reuses the cached `Rc`
+    /// on a key hit, so an over-triggered repaint with unchanged content hands the
+    /// renderer the SAME `Rc<Frame>` — the O(1) `Rc::ptr_eq` freshness signal the
+    /// idle-skip and per-session Surface both rely on. `RefCell` because `view` is
+    /// `&self` (it runs at several call sites and must not need `&mut`).
+    frame_memo: std::cell::RefCell<Option<(FrameKey, Rc<Frame>)>>,
 }
+
+/// The inputs [`ghost_render::layout_frame_at`] depends on — the key for
+/// [`TerminalView`]'s frame memo. Two views/presents with an equal key produce a
+/// byte-identical frame, so the memo can hand back the same `Rc` and let
+/// `Rc::ptr_eq` stand in for a content compare.
+type FrameKey = (u64, CellMetrics, usize);
 
 /// How long a synchronized-output hold may last before the scheduled tick
 /// releases it anyway. Generous for an atomic repaint burst, short enough that
@@ -407,7 +432,32 @@ impl SessionState {
             reconnecting: false,
             display_name: String::new(),
             theme: ThemeColors::default(),
+            content_gen: 0,
         }
+    }
+
+    /// The current content version (see [`content_gen`](Self::content_gen)). A view
+    /// folds it into its frame-memo key.
+    pub(crate) fn content_gen(&self) -> u64 {
+        self.content_gen
+    }
+
+    /// Feed bytes to the emulator, bumping the content version. Every content
+    /// mutation of `screen` must go through a bumping wrapper (this,
+    /// [`resize`](Self::resize), or [`set_terminal_policy`](Self::set_terminal_policy))
+    /// so a view's frame memo can never serve a stale `Rc` — the invariant the
+    /// no-stale-skip proptest pins. The bump is unconditional (a no-op feed can't
+    /// under-report): a feed that requested no repaint never reaches a present, so a
+    /// spurious bump costs at most one frame rebuild the next time one happens.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> &[usize] {
+        self.content_gen = self.content_gen.wrapping_add(1);
+        self.screen.feed(bytes)
+    }
+
+    /// Re-grid the emulator, bumping the content version (a reflow changes the frame).
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        self.content_gen = self.content_gen.wrapping_add(1);
+        self.screen.resize(cols, rows);
     }
 
     fn send(&self, bytes: Vec<u8>) -> Vec<Cmd> {
@@ -429,7 +479,7 @@ impl SessionState {
     fn resize_grid(&mut self, cols: u16, rows: u16) {
         let cols = cols.clamp(1, ghost_term::MAX_PROGRAM_COLS as u16);
         let rows = rows.clamp(1, ghost_term::MAX_PROGRAM_ROWS as u16);
-        self.screen.resize(cols, rows);
+        self.resize(cols, rows);
     }
 
     /// The on-screen direct graphics placements as cheap identity tuples, so a feed that
@@ -575,6 +625,9 @@ impl SessionState {
     /// What the program may change about the terminal itself (see
     /// [`ghost_term::policy`]). Set this when the session is created and leave it.
     pub(crate) fn set_terminal_policy(&mut self, policy: ghost_term::TerminalPolicy) {
+        // Adopting a stricter policy scrubs cells the program may no longer set, so
+        // this can change the rendered frame — bump the content version like a feed.
+        self.content_gen = self.content_gen.wrapping_add(1);
         self.screen.set_policy(policy);
     }
 
@@ -750,6 +803,7 @@ impl TerminalView {
             focused: false,
             hovered_link: None,
             trace: TermTrace::default(),
+            frame_memo: std::cell::RefCell::new(None),
         }
     }
 
@@ -1161,12 +1215,33 @@ impl TerminalView {
     /// Render the current state to a single terminal scene. The canvas is the whole
     /// window; the terminal item is inset by the padding, leaving a background-filled
     /// border (see [`Self::pad`]).
-    pub(crate) fn view(&self, state: &SessionState) -> Scene {
-        let frame = std::rc::Rc::new(layout_frame_at(
+    /// The laid-out frame for the current `(content_gen, metrics, scroll)`, reusing
+    /// the memoized `Rc` when the key is unchanged so an over-triggered repaint hands
+    /// the renderer the SAME allocation (an `Rc::ptr_eq` idle-skip / Surface hit). The
+    /// key captures exactly [`layout_frame_at`]'s inputs, so a hit is byte-identical.
+    fn memoized_frame(&self, state: &SessionState) -> Rc<Frame> {
+        let key: FrameKey = (
+            state.content_gen(),
+            self.effective_metrics(),
+            self.scroll_offset,
+        );
+        let mut memo = self.frame_memo.borrow_mut();
+        if let Some((k, frame)) = memo.as_ref()
+            && *k == key
+        {
+            return Rc::clone(frame);
+        }
+        let frame = Rc::new(layout_frame_at(
             state.screen.vt(),
             self.effective_metrics(),
             self.scroll_offset,
         ));
+        *memo = Some((key, Rc::clone(&frame)));
+        frame
+    }
+
+    pub(crate) fn view(&self, state: &SessionState) -> Scene {
+        let frame = self.memoized_frame(state);
         let pad = self.pad_px();
         let rect = RectPx {
             x: pad,
@@ -1521,7 +1596,7 @@ impl TerminalView {
         }
         state.cols = cols;
         state.rows = rows;
-        state.screen.resize(cols, rows);
+        state.resize(cols, rows);
         // Reflow invalidates cell coordinates and the history view; drop any
         // stale selection and return to the live bottom.
         self.selection = None;
@@ -1562,7 +1637,7 @@ impl TerminalView {
             // it so a no-op feed doesn't drive a present, and carry the dirtied row
             // range into `view`'s per-session `TermDamage` (see [`Self::damage`]).
             let (viewport_changed, dirty) = {
-                let d = state.screen.feed(bytes);
+                let d = state.feed(bytes);
                 (
                     !d.is_empty(),
                     d.first().zip(d.last()).map(|(&lo, &hi)| (lo, hi)),
@@ -5553,6 +5628,52 @@ mod tests {
         assert_eq!(
             selection_text(&screen, Selection::new((0, 0), (0, 2))),
             "a  "
+        );
+    }
+
+    /// The laid-out frame `Rc` the single view carries on its terminal item.
+    fn frame_rc(m: &TerminalModel) -> Rc<Frame> {
+        match m.view().terminals().next().expect("one terminal item") {
+            SceneItem::Terminal { frame, .. } => frame.clone(),
+            other => panic!("the single view is one terminal item, got {other:?}"),
+        }
+    }
+
+    /// The frame memo hands back the SAME `Rc` while the session's content, scroll,
+    /// and metrics are unchanged — the O(1) `Rc::ptr_eq` freshness signal the renderer
+    /// idle-skips on — and a fresh one the moment any of those moves. Without the memo
+    /// every `view()` built a new `Rc`, so this pins that the reuse actually happens.
+    #[test]
+    fn the_view_reuses_its_frame_until_content_scroll_or_metrics_change() {
+        let mut m = model();
+        feed(&mut m, b"hello");
+        let a = frame_rc(&m);
+        let b = frame_rc(&m);
+        assert!(
+            Rc::ptr_eq(&a, &b),
+            "an unchanged view rebuilt the frame instead of reusing it"
+        );
+
+        // A feed bumps the content generation → a fresh frame.
+        feed(&mut m, b" world");
+        let c = frame_rc(&m);
+        assert!(!Rc::ptr_eq(&b, &c), "a feed must produce a new frame");
+
+        // Fill some scrollback, then a scroll re-lays-out at the new offset.
+        for _ in 0..40 {
+            feed(&mut m, b"line\r\n");
+        }
+        let before = frame_rc(&m);
+        key(&mut m, Key::Named(NamedKey::PageUp), Mods::SHIFT);
+        let after = frame_rc(&m);
+        assert!(
+            !Rc::ptr_eq(&before, &after),
+            "scrolling into history must produce a new frame"
+        );
+        // And it settles again: no change → same allocation once more.
+        assert!(
+            Rc::ptr_eq(&after, &frame_rc(&m)),
+            "a settled view rebuilt the frame"
         );
     }
 
