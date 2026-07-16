@@ -465,13 +465,27 @@ fn watch_stream_once(
         *g = Some(proc);
     }
     let mut pushed = false;
+    let mut warned_parse = false;
     for line in std::io::BufReader::new(stdout).lines() {
         if stop.load(Relaxed) {
             break;
         }
         let Ok(line) = line else { break };
-        let Ok(infos) = ghost_vt::watch::parse_listing(&line) else {
-            continue;
+        let infos = match ghost_vt::watch::parse_listing(&line) {
+            Ok(infos) => infos,
+            // A parse failure means every line from this host fails the same way (a
+            // field mismatch, not a torn line), so it silently costs the whole remote
+            // fleet. Say so once per stream instead of dropping it without a trace.
+            Err(e) => {
+                if !warned_parse {
+                    warned_parse = true;
+                    eprintln!(
+                        "ghost: cannot parse the session listing from {target} ({e}); \
+                         its fleet will not update"
+                    );
+                }
+                continue;
+            }
         };
         pushed = true;
         let infos = namespace_remote_infos(target, infos);

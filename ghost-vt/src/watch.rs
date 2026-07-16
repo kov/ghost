@@ -127,4 +127,28 @@ mod tests {
         let _: Vec<session::SessionInfo> =
             serde_json::from_str(line).expect("emitted listing parses");
     }
+
+    #[test]
+    fn a_listing_from_a_host_predating_every_optional_field_still_parses() {
+        // Cross-version forward-compat. A listing written by an OLDER host omits the
+        // fields appended to SessionInfo since (created_at, cwd, size, connection),
+        // so parsing it on a newer client must still succeed — every appended field
+        // stays omittable (Option or #[serde(default)]). If a *non*-Option field is
+        // ever appended this breaks, and the client's __watch reader would drop the
+        // WHOLE remote fleet against any host predating the field, not just miss the
+        // one value. Keep new listing fields omittable (or update this test knowing
+        // it severs cross-version listings).
+        let older_host_line = r#"[{
+            "name": "s1", "pid": 42, "title": "", "command": ["bash"],
+            "attached": false, "bell": false, "display_name": ""
+        }]"#;
+        let infos =
+            parse_listing(older_host_line).expect("an older host's listing must still parse");
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "s1");
+        assert_eq!(infos[0].size, None);
+        assert_eq!(infos[0].connection, None);
+        assert_eq!(infos[0].created_at, None);
+        assert_eq!(infos[0].cwd, None);
+    }
 }
