@@ -1983,6 +1983,11 @@ impl FleetModel {
         ended: bool,
     ) -> Vec<Cmd> {
         let background = self.focused.as_deref() != Some(name);
+        // Whether this window DRIVES the session (has a client for it) or only
+        // observes it. An observed tile has no write path, so its emulator's query
+        // replies must be dropped in the core rather than leak out as SendInput the
+        // shell silently discards (finding #4).
+        let driven = self.mine.contains(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
         let observation_ended = ended && self.observing.remove(name);
@@ -2026,6 +2031,7 @@ impl FleetModel {
         let mut cmds: Vec<Cmd> = cmds
             .into_iter()
             .filter(|c| !c.reaches_the_desktop())
+            .filter(|c| driven || !matches!(c, Cmd::SendInput { .. }))
             .collect();
         if progress_changed && !cmds.contains(&Cmd::Redraw) {
             cmds.push(Cmd::Redraw);
@@ -8128,6 +8134,35 @@ mod tests {
             alts: None,
         });
         assert_eq!(m.focused(), Some("c"));
+    }
+
+    #[test]
+    fn an_observed_tile_never_answers_a_query() {
+        // A program on an OBSERVED (foreign, not-driven) session can emit a device
+        // query — here DSR cursor-position, ESC[6n. The tile's emulator produces a
+        // reply, but this window only watches the session; it has no client to send
+        // it through. The core must drop that reply structurally, not lean on the
+        // shell's session lookup happening to miss (finding #4).
+        let mut m = fleet();
+        list(&mut m, &["b"]); // foreign → observed, not driven
+        let cmds = data(&mut m, "b", b"\x1b[6n");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "an observed tile has no write path and must not emit a query reply: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_driven_tile_still_answers_a_query() {
+        // A session this window DRIVES, previewed in the fleet, keeps its write
+        // path: its emulator's query replies must still flow out as SendInput.
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
+        list(&mut m, &["b"]); // in `mine` → a driven tile
+        let cmds = data(&mut m, "b", b"\x1b[6n");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "a driven tile must still answer a query it can route: {cmds:?}"
+        );
     }
 
     #[test]

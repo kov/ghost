@@ -616,6 +616,15 @@ impl SessionState {
         Vec::new()
     }
 
+    /// The colors this session would answer an OSC 10/11 (or `?996`) query with —
+    /// the window's theme folded with any app-set dynamic overrides. Lets a test
+    /// confirm the theme reached a session that has no write path to answer over
+    /// (an observed fleet tile never emits the reply — see finding #4's fix).
+    #[cfg(test)]
+    pub(crate) fn effective_theme(&self) -> ThemeColors {
+        self.screen.effective_colors(self.theme)
+    }
+
     /// What this session may do outside its own screen — the clipboard, the window
     /// (see [`ghost_term::policy`]). Safe to change while the session runs.
     pub(crate) fn set_action_policy(&mut self, policy: ActionPolicy) {

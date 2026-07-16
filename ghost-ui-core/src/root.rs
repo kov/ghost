@@ -4465,15 +4465,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fleet_tile_minted_after_the_theme_is_set_answers_queries_with_it() {
+    fn a_fleet_tile_minted_after_the_theme_is_set_carries_it() {
         // The single-owner invariant must hold for the FLEET previews too, not just
-        // the single view: a tile minted *after* the window's theme was set answers
-        // OSC 10/11 with it — even though the tile is a foreign session this window
-        // only observes. Today the fleet keeps its own theme copy and stamps each
-        // minted tile from it; the "one model, many views" hoist routes the same
-        // minting through the single `Sessions` owner instead. Either way this must
-        // hold — it is the fleet twin of
-        // `a_view_minted_after_the_theme_is_set_answers_queries_with_it`.
+        // the single view: a tile minted *after* the window's theme was set carries
+        // it — even though the tile is a foreign session this window only observes.
+        // Today the fleet keeps its own theme copy and stamps each minted tile from
+        // it; the "one model, many views" hoist routes the same minting through the
+        // single `Sessions` owner instead. Either way this must hold — the fleet twin
+        // of `a_view_minted_after_the_theme_is_set_answers_queries_with_it`.
+        //
+        // An observed tile has no write path, so it does NOT emit the query reply
+        // (finding #4); the theme reaching it is confirmed on its state directly.
         let mut r = root(); // single view of alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet overview
         r.set_theme(ThemeColors {
@@ -4487,19 +4489,25 @@ mod tests {
             sess("alpha", true, 1),
             sess("gamma", true, 2), // attached elsewhere → observed, not `mine`
         ]));
-        // Querying the freshly-minted observed preview: it answers OSC 11 with the
-        // window's theme (the reply is session input, so the fleet forwards it).
+        // The freshly-minted observed preview carries the window's theme...
+        assert_eq!(
+            r.sessions
+                .get("gamma")
+                .expect("gamma's state")
+                .effective_theme()
+                .bg,
+            [0x0a, 0x0b, 0x0c],
+            "a fleet tile minted after the theme was set must carry it"
+        );
+        // ...but must not answer a query it has no way to route (finding #4).
         let cmds = r.update(UiEvent::SessionData {
             name: "gamma".into(),
             bytes: b"\x1b]11;?\x07".to_vec(),
             ended: false,
         });
         assert!(
-            cmds.contains(&Cmd::SendInput {
-                session: "gamma".into(),
-                bytes: b"\x1b]11;rgb:0a0a/0b0b/0c0c\x1b\\".to_vec(),
-            }),
-            "a fleet tile minted after the theme was set answers with it: {cmds:?}"
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "an observed tile must not emit a query reply: {cmds:?}"
         );
     }
 
