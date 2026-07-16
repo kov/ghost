@@ -81,12 +81,11 @@ pub fn session_key(id: &str) -> u64 {
 /// per-feed dirty-row hint (`ghost_vt`'s `Screen::feed`), never from a frame diff, so
 /// the [`Frame`] is a pure render input.
 ///
-/// Its [`PartialEq`] is deliberately CONSTANT (`true`): damage is per-present metadata
-/// that changes even when the rendered content does not, so it must NOT perturb `Scene`
-/// equality. The idle-skip (`SceneCache` in `ghost-renderer`) compares scenes to skip
-/// identical repaints; a differing damage tag on otherwise-identical content must still
-/// compare equal and skip.
-#[derive(Clone, Copy, Debug)]
+/// `PartialEq` is an honest structural derive. It used to be a constant-`true` hack so a
+/// per-present damage tag couldn't perturb the whole-`Scene` equality the idle-skip ran;
+/// the renderer's skip now hand-walks the scene and ignores the `damage` field on a
+/// terminal outright (see `scenes_equivalent`), so the type no longer has to lie.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TermDamage {
     /// Re-render the whole Surface: a first frame, a scroll, a resize/zoom, a selection
     /// change, or any change the model couldn't localize to a contiguous row range.
@@ -95,12 +94,6 @@ pub enum TermDamage {
     Rows { lo: usize, hi: usize },
     /// Nothing changed since the last composite — the Surface is already current.
     None,
-}
-
-impl PartialEq for TermDamage {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

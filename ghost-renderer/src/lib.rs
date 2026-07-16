@@ -1237,12 +1237,10 @@ fn lone_terminal(scene: &Scene) -> Option<LoneTerminal<'_>> {
 
 /// Whether `new` differs from the last presented scene `prev` (at `font_px`). No prior
 /// frame, a different font size, any non-identity layer transform (mid-animation), or
-/// any structural/content difference ⇒ `Full`; a byte-identical scene ⇒ `Identical`.
+/// any structural/content difference ⇒ `Full`; an equivalent scene ⇒ `Identical`.
 ///
-/// The transform scan runs FIRST, before the deep `prev == new` compare, so an
-/// animation tick — whose frozen frames flow through as shared `Rc`s — never deep-walks
-/// their rows/runs to reach the same `Full` verdict (`Layer` compares `items` before
-/// `transform`).
+/// The transform scan runs FIRST so an animation tick — whose frozen frames flow through
+/// as shared `Rc`s — reaches `Full` without walking any item.
 fn scene_damage(prev: Option<&(Scene, f32)>, new: &Scene, font_px: f32) -> RawDamage {
     let Some((prev, px)) = prev else {
         return RawDamage::Full;
@@ -1255,10 +1253,72 @@ fn scene_damage(prev: Option<&(Scene, f32)>, new: &Scene, font_px: f32) -> RawDa
     {
         return RawDamage::Full;
     }
-    if prev == new {
+    if scenes_equivalent(prev, new) {
         RawDamage::Identical
     } else {
         RawDamage::Full
+    }
+}
+
+/// Whether two identity-transform scenes would draw the same pixels — a hand-walk in
+/// place of `Scene`'s derived `==`, differing from it in exactly two ways that make it
+/// both correct and O(items) on the hot path:
+///
+///   * a terminal's `Rc<Frame>` is compared by POINTER identity, not a deep row/run
+///     diff. The model hands back the *same* `Rc` for unchanged content (see
+///     `TerminalView`'s frame memo), so `Rc::ptr_eq` is an exact "unchanged" test, and
+///     an over-triggered repaint (a tick, an occlusion re-arm, a platform redraw) with
+///     no new feed skips in one pointer compare instead of walking every row twice; and
+///   * the per-present `damage` tag is IGNORED — it changes even when the drawn content
+///     does not, so comparing it would defeat the skip. (This is what lets `TermDamage`
+///     drop the constant-`true` `PartialEq` hack it used to need so `Scene` equality
+///     wouldn't see it.)
+///
+/// Everything else — layer/item count and order, z, opacity, transform, chrome
+/// primitives, a terminal's selection/dim/rect — compares structurally, so any of those
+/// moving is a `Full`. Chrome items stay a plain derived `==`: they are small and cheap.
+fn scenes_equivalent(a: &Scene, b: &Scene) -> bool {
+    a.size_px == b.size_px
+        && a.layers.len() == b.layers.len()
+        && a.layers.iter().zip(&b.layers).all(|(la, lb)| {
+            la.z == lb.z
+                && la.transform == lb.transform
+                && la.opacity == lb.opacity
+                && la.items.len() == lb.items.len()
+                && la
+                    .items
+                    .iter()
+                    .zip(&lb.items)
+                    .all(|(ia, ib)| items_equivalent(ia, ib))
+        })
+}
+
+/// Whether two scene items would draw the same. A `Terminal` compares by frame POINTER
+/// identity plus its O(1) fields (id, session, rect, selection, dim), ignoring `damage`;
+/// every other item — and a mismatched pair of variants — falls back to structural `==`.
+fn items_equivalent(a: &SceneItem, b: &SceneItem) -> bool {
+    match (a, b) {
+        (
+            SceneItem::Terminal {
+                id: ia,
+                session: sa,
+                rect: ra,
+                frame: fa,
+                selection: sela,
+                dim: da,
+                ..
+            },
+            SceneItem::Terminal {
+                id: ib,
+                session: sb,
+                rect: rb,
+                frame: fb,
+                selection: selb,
+                dim: db,
+                ..
+            },
+        ) => ia == ib && sa == sb && ra == rb && sela == selb && da == db && Rc::ptr_eq(fa, fb),
+        _ => a == b,
     }
 }
 
@@ -6252,6 +6312,105 @@ mod tests {
         let mut c2 = SceneCache::default();
         assert_eq!(c2.damage(&with_chrome("x\r\ny"), 15.0), Damage::Full);
         assert_eq!(c2.damage(&with_chrome("x\r\nY"), 15.0), Damage::Full);
+    }
+
+    #[test]
+    fn scene_cache_skips_a_terminal_on_frame_identity_and_ignores_its_damage() {
+        // The terminal idle-skip keys on frame POINTER identity (the model's memo
+        // hands back the same `Rc` for unchanged content), NOT a deep frame compare,
+        // and ignores the per-present `damage` tag. Build single-terminal scenes from
+        // a shared `Rc` with explicit fields so each axis can be moved independently.
+        let scene = |frame: &Rc<Frame>, damage, selection, dim: bool, chrome: bool| {
+            let mut items = vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("single"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 180.0,
+                    h: 90.0,
+                },
+                frame: Rc::clone(frame),
+                selection,
+                dim,
+                damage,
+            }];
+            if chrome {
+                items.push(SceneItem::Rect {
+                    id: SceneId::Tile(1),
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 10.0,
+                        h: 10.0,
+                    },
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    radius: 0.0,
+                });
+            }
+            Scene {
+                size_px: (180, 90),
+                layers: vec![Layer::new(0, items)],
+            }
+        };
+
+        let mut c = SceneCache::default();
+        let f = Rc::new(frame(20, 5, "hi"));
+
+        // First present of this frame draws and caches it.
+        assert_eq!(
+            c.damage(&scene(&f, TermDamage::All, None, false, false), 15.0),
+            Damage::Full
+        );
+        // Same `Rc`, same fields, but a DIFFERENT damage tag each time — still a skip:
+        // the walk ignores `damage`, which is exactly why `TermDamage` no longer needs
+        // a constant-`true` `PartialEq` to stay out of scene equality.
+        assert_eq!(
+            c.damage(
+                &scene(&f, TermDamage::Rows { lo: 0, hi: 0 }, None, false, false),
+                15.0
+            ),
+            Damage::None
+        );
+        assert_eq!(
+            c.damage(&scene(&f, TermDamage::None, None, false, false), 15.0),
+            Damage::None
+        );
+
+        // A NEW frame `Rc` is the model's "content changed" signal — draw, even though
+        // these laid-out bytes happen to be identical (a fresh `Rc` is a real change).
+        let f2 = Rc::new(frame(20, 5, "hi"));
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, None, false, false), 15.0),
+            Damage::Full
+        );
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, None, false, false), 15.0),
+            Damage::None
+        );
+
+        // Selection, dim, and an added chrome item each redraw over the same frame `Rc`.
+        let sel = Some(Selection::new((0, 0), (0, 1)));
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, sel, false, false), 15.0),
+            Damage::Full
+        );
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, sel, false, false), 15.0),
+            Damage::None
+        );
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, sel, true, false), 15.0),
+            Damage::Full
+        );
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, sel, true, false), 15.0),
+            Damage::None
+        );
+        assert_eq!(
+            c.damage(&scene(&f2, TermDamage::None, sel, true, true), 15.0),
+            Damage::Full
+        );
     }
 
     #[test]
