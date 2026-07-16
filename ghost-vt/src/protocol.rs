@@ -39,19 +39,6 @@ pub enum ClientMsg {
     /// built-in defaults. Clients that know their scheme (the GUI) send it
     /// right after attaching.
     Theme(crate::query::ThemeColors),
-    /// The policy the attaching terminal enforces — what a program on this
-    /// session's tty may change about the terminal (see [`ghost_term::policy`]).
-    ///
-    /// The host adopts it: it runs its own emulator over the same bytes, and its
-    /// dump re-seeds the client on every attach, so the two must agree or state
-    /// would appear and vanish depending on who was looking. It also *keeps* it, and
-    /// goes on enforcing it while detached — the session has no terminal of its own,
-    /// so the last one to attach speaks for it, exactly as with [`ClientMsg::Theme`].
-    ///
-    /// Sent by a display client right after attaching. An observer never sends one:
-    /// the terminal the user is actually driving owns the policy; the rest are
-    /// watching.
-    Policy(ghost_term::TerminalPolicy),
     /// Identify this connection: an opaque self-chosen id (e.g. one GUI
     /// window). A display client sends it right after attaching — like
     /// [`ClientMsg::Theme`] — so the host can say *who* holds the display in
@@ -75,6 +62,25 @@ pub enum ClientMsg {
     /// not "seen" — it watches the session exactly as the display client
     /// shapes it (live fleet previews).
     Observe,
+    /// The policy the attaching terminal enforces — what a program on this
+    /// session's tty may change about the terminal (see [`ghost_term::policy`]).
+    ///
+    /// The host adopts it: it runs its own emulator over the same bytes, and its
+    /// dump re-seeds the client on every attach, so the two must agree or state
+    /// would appear and vanish depending on who was looking. It also *keeps* it, and
+    /// goes on enforcing it while detached — the session has no terminal of its own,
+    /// so the last one to attach speaks for it, exactly as with [`ClientMsg::Theme`].
+    ///
+    /// Sent by a display client right after attaching. An observer never sends one:
+    /// the terminal the user is actually driving owns the policy; the rest are
+    /// watching.
+    ///
+    /// Kept LAST on purpose. Postcard tags a variant by its position, so the wire
+    /// is positional and a variant may only ever be *appended*: `Policy`
+    /// (PROTO_POLICY=5) is newer than Hello/Subscribe/Observe and must sit after
+    /// them, or a level-4 host decodes those three at the wrong ordinals. The
+    /// `client_msg_wire_discriminants_are_frozen` test pins this.
+    Policy(ghost_term::TerminalPolicy),
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -304,6 +310,74 @@ mod tests {
             assert_eq!(got, msg);
             assert!(r.next_msg::<ClientMsg>().unwrap().is_none());
         }
+    }
+
+    /// The wire tag postcard assigns a variant: its index, as the first body
+    /// byte (a varint — single-byte for our < 128 indices).
+    fn wire_tag<M: Serialize>(msg: &M) -> u8 {
+        postcard::to_allocvec(msg).expect("encode cannot fail")[0]
+    }
+
+    #[test]
+    fn client_msg_wire_discriminants_are_frozen() {
+        // Postcard encodes an enum variant as its INDEX, so the wire is
+        // positional: inserting a variant mid-enum silently shifts the ordinal of
+        // every variant below it, and a newer client's message then decodes as a
+        // *different* variant on a host built before the insertion.
+        //
+        // Hello/Subscribe/Observe predate Policy (PROTO_SUBSCRIBE=3 / PROTO_OBSERVE=4
+        // vs PROTO_POLICY=5), so their tags MUST stay 7/8/9 to keep decoding
+        // correctly on the still-running level-4 hosts that expect them there.
+        // Policy and anything newer belongs strictly at the tail. Freezing every
+        // tag here makes the next append go to the end or fail this test.
+        assert_eq!(wire_tag(&ClientMsg::Input(Vec::new())), 0);
+        assert_eq!(wire_tag(&ClientMsg::Resize { cols: 0, rows: 0 }), 1);
+        assert_eq!(wire_tag(&ClientMsg::Detach), 2);
+        assert_eq!(wire_tag(&ClientMsg::Kill), 3);
+        assert_eq!(wire_tag(&ClientMsg::Rename(String::new())), 4);
+        assert_eq!(wire_tag(&ClientMsg::Repaint), 5);
+        assert_eq!(
+            wire_tag(&ClientMsg::Theme(crate::query::ThemeColors::default())),
+            6
+        );
+        assert_eq!(
+            wire_tag(&ClientMsg::Hello {
+                client: String::new()
+            }),
+            7
+        );
+        assert_eq!(wire_tag(&ClientMsg::Subscribe), 8);
+        assert_eq!(wire_tag(&ClientMsg::Observe), 9);
+        assert_eq!(
+            wire_tag(&ClientMsg::Policy(ghost_term::TerminalPolicy::default())),
+            10,
+        );
+    }
+
+    #[test]
+    fn server_and_event_wire_discriminants_are_frozen() {
+        // Same positional-wire hazard: freeze so a new variant can only append.
+        assert_eq!(wire_tag(&ServerMsg::Output(Vec::new())), 0);
+        assert_eq!(wire_tag(&ServerMsg::Exited(0)), 1);
+        assert_eq!(
+            wire_tag(&ServerMsg::RenameResult {
+                ok: true,
+                message: String::new()
+            }),
+            2,
+        );
+        assert_eq!(wire_tag(&ServerMsg::Snapshot(SessionState::default())), 3);
+        assert_eq!(wire_tag(&ServerMsg::Event(SessionEvent::Bell)), 4);
+
+        // SessionEvent::Resized was appended after PROTO_SUBSCRIBE shipped; it must
+        // stay at the tail so level-3 subscribers keep skipping only it.
+        assert_eq!(wire_tag(&SessionEvent::Bell), 0);
+        assert_eq!(wire_tag(&SessionEvent::TitleChanged(String::new())), 1);
+        assert_eq!(wire_tag(&SessionEvent::Attached(AttachInfo::default())), 2);
+        assert_eq!(wire_tag(&SessionEvent::Detached), 3);
+        assert_eq!(wire_tag(&SessionEvent::Activity), 4);
+        assert_eq!(wire_tag(&SessionEvent::Renamed(String::new())), 5);
+        assert_eq!(wire_tag(&SessionEvent::Resized { cols: 0, rows: 0 }), 6);
     }
 
     #[test]
