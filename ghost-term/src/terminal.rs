@@ -3661,6 +3661,16 @@ fn dump_buffer_lines(
         wrapped = line.wrapped;
     }
 
+    // With scrollback, every retained line must be emitted: a scrolled-off line
+    // only lands back in the target's scrollback if enough lines follow to scroll
+    // it off the viewport top, so the trailing blank rows below the cursor are the
+    // scroll distance and are load-bearing — trimming them would leave scrolled-off
+    // content sitting in the viewport. Without scrollback the trailing blanks are
+    // just empty rows the cursor restore repositions over, so they stay trimmed.
+    if include_scrollback {
+        cutoff = total;
+    }
+
     let last = total - 1;
     let mut pen = Pen::default();
     // `marks` holds buffer-relative line indices (ascending) of prompt starts;

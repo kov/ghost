@@ -1144,6 +1144,7 @@ dependencies = [
  "nix",
  "notify",
  "postcard",
+ "proptest",
  "pty-process",
  "rustix 1.1.4",
  "serde",

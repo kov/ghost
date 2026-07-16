@@ -3201,6 +3201,32 @@ mod tests {
         vt1.terminal.assert_eq(&vt2.terminal);
     }
 
+    #[test]
+    fn a_scrolled_off_line_stays_in_scrollback_across_a_dump_with_trailing_blanks() {
+        // A line pushed into scrollback with blank viewport rows below the cursor
+        // must reconstruct back into SCROLLBACK, not the viewport. The scrolled-off
+        // line only lands in scrollback if the dump emits enough following lines to
+        // scroll it off the top — the trailing blank rows are that scroll distance,
+        // so they must not be trimmed when scrollback is included.
+        for scroll in 1..=6 {
+            let mut host = Vt::builder().size(24, 4).scrollback_limit(100).build();
+            // 25 chars overflow row 0 (wrapped) then blank lines scroll it up.
+            host.feed_str(&"x".repeat(25));
+            host.feed_str(&"\n".repeat(scroll));
+
+            let dump = format!("\x1b[2J\x1b[H{}", host.dump_with_scrollback());
+            let mut client = Vt::builder().size(24, 4).scrollback_limit(100).build();
+            client.feed_str(&dump);
+
+            assert_eq!(
+                host.text(),
+                client.text(),
+                "scroll={scroll}: reseeded screen (scrollback + viewport) diverged"
+            );
+            client.terminal.assert_eq(&host.terminal);
+        }
+    }
+
     // kitty graphics protocol — receiving and storing images. The base64 strings
     // below are tiny hand-checkable images:
     //   "/wAAAP8A" = FF 00 00  00 FF 00     (a red then a green RGB pixel)

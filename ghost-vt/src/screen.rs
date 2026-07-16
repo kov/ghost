@@ -622,4 +622,121 @@ mod tests {
         let from_bounded = Screen::from_recording(&bounded, 1000);
         assert_eq!(from_bounded.text(), live.text());
     }
+
+    // ---- host↔client resync convergence property ----
+    //
+    // The whole reseed contract in one invariant: a client that starts blank,
+    // feeds the host's `resync()`, then feeds the same live tail the host feeds,
+    // must end in the SAME screen (scrollback + viewport) and cursor as the host.
+    // That holds iff the resync's dump reconstructs the host exactly — so a red
+    // seed here is a genuine dump/resync divergence (a real bug), per the
+    // dump-representable invariant. The generator deliberately omits synchronized
+    // output (mode 2026, a held frame with no end marker) and kitty-graphics APC
+    // (image bytes the dump handles on a separate, already-tested path).
+    use proptest::prelude::*;
+
+    /// One UTF-8 char: mostly ASCII, some multi-byte (incl. wide), so runs
+    /// exercise multi-byte and double-width handling across the reseed.
+    fn gen_char() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            8 => (0x20u8..0x7f).prop_map(|c| vec![c]),
+            2 => prop::sample::select(vec!['é', 'ñ', '⠋', 'λ', '→', 'あ', '界', '│'])
+                .prop_map(|c| c.to_string().into_bytes()),
+        ]
+    }
+
+    /// One stream token: a printable run, a control byte, or a curated escape
+    /// sequence — the vocabulary a resync must survive. NB: no `?2026` and no
+    /// `\x1b_G` (see the module note above).
+    fn gen_token() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            30 => prop::collection::vec(gen_char(), 1..8).prop_map(|cs| cs.concat()),
+            8 => prop::sample::select(vec![
+                b"\n".to_vec(), b"\r".to_vec(), b"\t".to_vec(), b"\x08".to_vec(),
+                b"\x1bM".to_vec(), b"\x1bD".to_vec(), b"\x1bE".to_vec(),
+            ]),
+            6 => prop::sample::select(vec![
+                b"\x1b[0m".to_vec(), b"\x1b[1m".to_vec(), b"\x1b[4m".to_vec(),
+                b"\x1b[7m".to_vec(), b"\x1b[31m".to_vec(), b"\x1b[38;5;200m".to_vec(),
+                b"\x1b[38;2;10;20;30m".to_vec(), b"\x1b[27m".to_vec(),
+            ]),
+            5 => prop::sample::select(vec![
+                b"\x1b[3;5H".to_vec(), b"\x1b[2A".to_vec(), b"\x1b[2B".to_vec(),
+                b"\x1b[3C".to_vec(), b"\x1b[2D".to_vec(), b"\x1b[H".to_vec(),
+            ]),
+            5 => prop::sample::select(vec![
+                b"\x1b[2J".to_vec(), b"\x1b[0J".to_vec(), b"\x1b[1J".to_vec(),
+                b"\x1b[K".to_vec(), b"\x1b[1K".to_vec(), b"\x1b[2K".to_vec(),
+            ]),
+            3 => prop::sample::select(vec![
+                b"\x1b[?1049h".to_vec(), b"\x1b[?1049l".to_vec(),
+                b"\x1b[?47h".to_vec(), b"\x1b[?47l".to_vec(),
+            ]),
+            3 => prop::sample::select(vec![
+                b"\x1b7".to_vec(), b"\x1b8".to_vec(), b"\x1b[2;6r".to_vec(),
+                b"\x1b[?6h".to_vec(), b"\x1b[?6l".to_vec(),
+                b"\x1b[?7h".to_vec(), b"\x1b[?7l".to_vec(),
+                b"\x1b[4h".to_vec(), b"\x1b[4l".to_vec(),
+            ]),
+            2 => prop::sample::select(vec![
+                b"\x1b[?1000h".to_vec(), b"\x1b[?2004h".to_vec(),
+                b"\x1b(0".to_vec(), b"\x1b(B".to_vec(),
+            ]),
+            2 => prop::sample::select(vec![
+                b"\x1b[>1u".to_vec(), b"\x1b[>15u".to_vec(),
+                b"\x1b[<1u".to_vec(), b"\x1b[=5;1u".to_vec(),
+            ]),
+        ]
+    }
+
+    fn gen_stream(max: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(gen_token(), 0..=max).prop_map(|toks| toks.concat())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn a_reseeded_client_converges_with_the_host(
+            prefix in gen_stream(40),
+            tail in gen_stream(20),
+            tail2 in gen_stream(20),
+        ) {
+            let cap = 100usize;
+            let mut host = Screen::new(24, 8, cap);
+            host.feed(&prefix);
+
+            // A fresh client reseeds from the resync at the host's dimensions, then
+            // both take the same live tail — they must stay identical.
+            let (cols, rows) = host.dimensions();
+            let mut client = Screen::new(cols, rows, cap);
+            client.feed(&host.resync());
+            host.feed(&tail);
+            client.feed(&tail);
+            prop_assert_eq!(
+                screen_text(&host), screen_text(&client),
+                "screen diverged after reseed + shared tail"
+            );
+            prop_assert_eq!(
+                host.cursor(), client.cursor(),
+                "cursor diverged after reseed + shared tail"
+            );
+
+            // A SECOND client reseeding at this later point converges just as well —
+            // the resync is a faithful snapshot at any moment, not just at attach.
+            let (cols, rows) = host.dimensions();
+            let mut client2 = Screen::new(cols, rows, cap);
+            client2.feed(&host.resync());
+            host.feed(&tail2);
+            client2.feed(&tail2);
+            prop_assert_eq!(
+                screen_text(&host), screen_text(&client2),
+                "screen diverged after a second, later reseed"
+            );
+            prop_assert_eq!(
+                host.cursor(), client2.cursor(),
+                "cursor diverged after a second, later reseed"
+            );
+        }
+    }
 }
