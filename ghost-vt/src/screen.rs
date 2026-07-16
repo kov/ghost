@@ -208,6 +208,12 @@ impl Screen {
         self.cols = cols;
         self.rows = rows;
         self.vt.resize(cols as usize, rows as usize);
+        // Re-sync the cursor-damage baseline to the reflowed cursor. A resize forces a
+        // full repaint (the drawn cursor lands at its post-reflow position), so the next
+        // feed's [`cursor_damage`] must diff against THAT, not the pre-resize cursor —
+        // otherwise a resize that moved the cursor leaves a stale baseline, and a later
+        // bare cursor move that happens to match it reports no damage and never repaints.
+        self.prev_cursor = self.vt.cursor();
     }
 
     /// Current terminal size as `(cols, rows)`.

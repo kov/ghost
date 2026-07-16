@@ -5771,6 +5771,7 @@ mod tests {
             Tick,
             ScrollUp,
             ScrollDown,
+            Resize { w_px: u32, h_px: u32 },
         }
 
         fn op() -> impl Strategy<Value = Op> {
@@ -5780,6 +5781,8 @@ mod tests {
                 1 => Just(Op::Tick),
                 1 => Just(Op::ScrollUp),
                 1 => Just(Op::ScrollDown),
+                1 => (120u32..=1600, 60u32..=1200)
+                    .prop_map(|(w_px, h_px)| Op::Resize { w_px, h_px }),
             ]
         }
 
@@ -5826,6 +5829,13 @@ mod tests {
                         }
                         Op::ScrollDown => {
                             key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+                        }
+                        Op::Resize { w_px, h_px } => {
+                            m.update(UiEvent::Resize {
+                                w_px,
+                                h_px,
+                                scale: 1.0,
+                            });
                         }
                         Op::Present => {
                             let (cur, dmg) = frame_and_damage(&m);
