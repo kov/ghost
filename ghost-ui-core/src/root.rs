@@ -954,6 +954,27 @@ impl RootModel {
     }
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        let cmds = self.update_dispatch(ev);
+        // Enforce the resync/reseed contract at the one boundary every command
+        // crosses. A Cmd::Attach means a session just became driven here, and the
+        // attach's resync — which carries the whole screen AND its scrollback — is
+        // on its way. Rebuild that session's mirror to a fresh emulator so the
+        // resync lands clean: an observed/previewed session's warm mirror already
+        // holds that history, and replaying it on top would double the scrollback.
+        // This matches a cold attach (a fresh emulator the resync fills) and holds
+        // for every present and future Cmd::Attach emitter, wherever it routes.
+        if cmds.iter().any(|c| matches!(c, Cmd::Attach(_))) {
+            let (cols, rows) = self.grid();
+            for c in &cmds {
+                if let Cmd::Attach(id) = c {
+                    self.sessions.rebuild(id, cols, rows);
+                }
+            }
+        }
+        cmds
+    }
+
+    fn update_dispatch(&mut self, ev: UiEvent) -> Vec<Cmd> {
         // While an animation plays it owns the tick stream (driving the timeline at
         // ~60fps); the model swap already happened, so this is purely the visual
         // hand-off. On completion it hands one tick back so the periodic session
@@ -1046,6 +1067,15 @@ impl RootModel {
                 }
                 _ => unreachable!(),
             };
+            // A reattach re-sends a full resync (the whole screen AND scrollback);
+            // rebuild the mirror first so it lands on a fresh emulator, exactly as
+            // a cold attach does. Replaying the history onto the mirror that was
+            // live until the drop would double the scrollback. (A disconnect only
+            // freezes the mirror — there is nothing to reset.)
+            if matches!(ev, UiEvent::SessionReattached { .. }) {
+                let (cols, rows) = self.grid();
+                self.sessions.rebuild(&name, cols, rows);
+            }
             if let Mode::Single { id, view } = &mut self.mode
                 && *id == name
             {
@@ -2319,6 +2349,117 @@ mod tests {
             ended: true,
         });
         assert!(r.is_fleet(), "a real exit still drops to the fleet");
+    }
+
+    /// Lines (scrollback + viewport) of a session's mirror that contain `needle`.
+    fn marker_lines(r: &RootModel, id: &str, needle: &str) -> usize {
+        r.sessions
+            .get(id)
+            .expect("session state")
+            .screen()
+            .text()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn a_reattach_rebuilds_the_mirror_so_the_resync_does_not_double_the_scrollback() {
+        // A dropped-then-reattached foreground gets a fresh resync, which carries
+        // the whole screen AND scrollback. Replaying it onto the still-live mirror
+        // would double the history; the reattach must rebuild the mirror first, so
+        // the resync lands on an empty emulator exactly as a cold attach does.
+        use ghost_vt::screen::Screen;
+
+        // A host with enough output to have scrolled most of it into scrollback.
+        let mut host = Screen::new(80, 24, 1000);
+        for i in 0..50 {
+            host.feed(format!("MARKER-{i:03}\r\n").as_bytes());
+        }
+        let resync = host.resync();
+
+        let mut r = root(); // single view of alpha
+        feed(&mut r, "alpha", &resync); // the first attach's resync
+        assert_eq!(
+            marker_lines(&r, "alpha", "MARKER-"),
+            50,
+            "precondition: the first resync lands each marker line exactly once"
+        );
+
+        r.update(UiEvent::SessionDisconnected {
+            name: "alpha".into(),
+        });
+        r.update(UiEvent::SessionReattached {
+            name: "alpha".into(),
+        });
+        feed(&mut r, "alpha", &resync); // the reattach re-sends the resync
+
+        assert_eq!(
+            marker_lines(&r, "alpha", "MARKER-"),
+            50,
+            "the reattach resync must land on a rebuilt mirror, not double the scrollback"
+        );
+    }
+
+    #[test]
+    fn claiming_an_observed_session_rebuilds_it_so_the_attach_resync_does_not_double() {
+        // A session previewed in the fleet has a warm mirror fed by observation.
+        // Claiming it (here: a background member of a group being opened) attaches
+        // a display client, and that attach's resync carries the whole screen AND
+        // scrollback. Without a rebuild the resync replays the history the mirror
+        // already holds, doubling the scrollback. The claim (its Cmd::Attach) must
+        // rebuild the mirror first, so the attach lands like a cold one.
+        use ghost_vt::screen::Screen;
+        let mut host = Screen::new(80, 24, 1000);
+        for i in 0..50 {
+            host.feed(format!("MARKER-{i:03}\r\n").as_bytes());
+        }
+        let resync = host.resync();
+
+        let mut r = root(); // owns alpha
+        dive_out(
+            &mut r,
+            &[
+                sess("alpha", true, 1),
+                sess("gamma", false, 3), // detached, foreign → observed
+            ],
+        );
+        settle(&mut r);
+        feed(&mut r, "gamma", &resync); // observed content mirrors the host
+        assert_eq!(
+            marker_lines(&r, "gamma", "MARKER-"),
+            50,
+            "precondition: observation seeds each marker line exactly once"
+        );
+
+        // Open a group with gamma as a background member: Ctrl-Enter claims it
+        // (a Cmd::Attach), which the contract wrapper turns into a mirror rebuild.
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g".into(),
+            name: "g".into(),
+            color: 0,
+            members: vec!["alpha".into(), "gamma".into()],
+            connection: None,
+        }]));
+        let cmds = key(
+            &mut r,
+            Key::Named(NamedKey::Enter),
+            Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+        );
+        assert!(
+            cmds.contains(&Cmd::Attach("gamma".into())),
+            "opening the group attaches gamma in the background: {cmds:?}"
+        );
+        feed(&mut r, "gamma", &resync); // the attach's resync
+
+        assert_eq!(
+            marker_lines(&r, "gamma", "MARKER-"),
+            50,
+            "the attach resync must land on a rebuilt mirror, not double the scrollback"
+        );
     }
 
     fn click(r: &mut RootModel, x: f32, y: f32) -> Vec<Cmd> {
