@@ -89,6 +89,15 @@ impl Sessions {
     }
 
     fn insert(&mut self, id: SessionId, state: SessionState) {
+        // Adopting a whole model must not clobber a live state already held for
+        // this id — that would leave two owners for one session, the very thing
+        // the single-owner world exists to prevent. Replacing an *ended* state is
+        // fine (a reused name); a deliberate live replace goes through `rebuild`,
+        // which does not route here.
+        debug_assert!(
+            self.map.get(&id).is_none_or(|s| s.ended()),
+            "Sessions::insert would clobber a live state for {id} — two owners"
+        );
         self.map.insert(id, state);
     }
 
