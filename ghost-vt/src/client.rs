@@ -102,6 +102,19 @@ impl Client {
         self.conn.send(msg)
     }
 
+    /// Flush any output an earlier [`send`](Client::send) left buffered when the
+    /// transport was not writable — [`Conn::flush`] stops on `WouldBlock` and
+    /// [`Conn::send`] swallows it, so bytes can linger in the outbuf. A caller that
+    /// then only reads (a display client pumping while idle) would never retry the
+    /// write, stranding e.g. a query reply the child is blocked on. Pumps call this
+    /// each tick; the host loop already does the equivalent.
+    pub fn flush_pending(&mut self) -> io::Result<()> {
+        if self.conn.wants_write() {
+            self.conn.flush()?;
+        }
+        Ok(())
+    }
+
     /// Read once from the socket and return every [`ServerMsg`] that completed;
     /// `Ok(None)` on clean EOF. See [`Conn::recv`].
     pub fn recv_ready(&mut self) -> io::Result<Option<Vec<ServerMsg>>> {
@@ -220,6 +233,7 @@ impl Subscriber {
     /// the subscription (reported via [`ended`](SubscriberPump::ended)) — for
     /// an observer, a broken connection and a dead host mean the same thing.
     pub fn pump(&mut self) -> io::Result<SubscriberPump> {
+        self.client.flush_pending()?;
         let mut pump = SubscriberPump::default();
         match self.client.recv_ready() {
             Ok(Some(msgs)) => {
@@ -425,6 +439,7 @@ impl Session {
     /// bytes plus an end-of-session flag. Non-blocking when [`as_fd`](Session::as_fd)
     /// polls readable or a read timeout is set; see [`Client::recv_ready`].
     pub fn pump(&mut self) -> io::Result<Pump> {
+        self.client.flush_pending()?;
         let mut pump = Pump::default();
         match self.client.recv_ready()? {
             None => {
@@ -831,5 +846,74 @@ mod tests {
             p.disconnected,
             "a closed connection is flagged disconnected"
         );
+    }
+
+    /// A `Subscriber` on one end of a socketpair, plus the host-side [`Conn`].
+    fn paired_subscriber() -> (Conn<AnyTransport>, Subscriber) {
+        let (host, cli) = UnixStream::pair().unwrap();
+        cli.set_nonblocking(true).unwrap();
+        let host = Conn::new(AnyTransport::Unix(host));
+        let sub = Subscriber {
+            client: Client {
+                conn: Conn::new(AnyTransport::Unix(cli)),
+                proto: crate::protocol::PROTO_LEVEL,
+            },
+        };
+        (host, sub)
+    }
+
+    /// A `send()` that hits `WouldBlock` leaves its bytes in the `Conn`'s outbuf —
+    /// `flush` swallows `WouldBlock`. An idle display client that then only ever
+    /// reads (its child blocked awaiting a query reply) never re-flushes, so the
+    /// reply strands indefinitely until the user happens to type. `pump` must drain
+    /// any pending output each tick.
+    #[test]
+    fn session_pump_flushes_output_stranded_by_back_pressure() {
+        let (mut host, mut session) = paired_session();
+        host.set_nonblocking(true).unwrap();
+
+        // Stand in for a query reply a prior flush left buffered under back-pressure.
+        session
+            .client
+            .conn
+            .queue(&ClientMsg::Input(b"\x1b[0n".to_vec()));
+        assert!(
+            session.client.conn.wants_write(),
+            "precondition: the reply is stranded in the outbuf"
+        );
+
+        // The idle client only pumps (reads) — it sends nothing new to re-flush.
+        session.pump().unwrap();
+
+        assert!(
+            !session.client.conn.wants_write(),
+            "pump drained the stranded reply"
+        );
+        let got: Vec<ClientMsg> = host.recv().unwrap().unwrap();
+        assert_eq!(
+            got,
+            vec![ClientMsg::Input(b"\x1b[0n".to_vec())],
+            "the host received the stranded reply"
+        );
+    }
+
+    /// The same drain contract on the observer/subscriber pump: output left
+    /// buffered under back-pressure must not strand.
+    #[test]
+    fn subscriber_pump_flushes_stranded_output() {
+        let (mut host, mut sub) = paired_subscriber();
+        host.set_nonblocking(true).unwrap();
+
+        sub.client.conn.queue(&ClientMsg::Subscribe);
+        assert!(sub.client.conn.wants_write());
+
+        sub.pump().unwrap();
+
+        assert!(
+            !sub.client.conn.wants_write(),
+            "pump drained the stranded frame"
+        );
+        let got: Vec<ClientMsg> = host.recv().unwrap().unwrap();
+        assert_eq!(got, vec![ClientMsg::Subscribe]);
     }
 }
