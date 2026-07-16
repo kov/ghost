@@ -75,6 +75,24 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Retry `f` until it yields `Some`, or `None` once `timeout` elapses. The *first*
+/// negotiate over a just-spawned sshd occasionally loses the ssh/ControlMaster
+/// handshake even though the port already accepts — a fixture race a real host
+/// (long-running sshd, GUI warms the master first) never hits. Retrying it is the
+/// same read-until-predicate sync the post-reboot negotiate already uses.
+fn retry_some<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A real, unprivileged `sshd` on loopback plus everything needed to drive ghost's
 /// transport at it. Killed and cleaned up on drop.
 struct RealRemote {
@@ -285,7 +303,7 @@ fn ghost_reconnects_a_remote_after_a_reboot() {
 
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     assert!(
-        r.negotiate().is_some(),
+        retry_some(Duration::from_secs(10), || r.negotiate()).is_some(),
         "the initial connection should negotiate the remote ghost"
     );
 
@@ -313,7 +331,7 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
-    let ghost = r.negotiate().expect("initial negotiate");
+    let ghost = retry_some(Duration::from_secs(10), || r.negotiate()).expect("initial negotiate");
 
     let listed = |ghost: &str| {
         r.list_sessions(ghost)
@@ -398,7 +416,7 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
-    let ghost = r.negotiate().expect("initial negotiate");
+    let ghost = retry_some(Duration::from_secs(10), || r.negotiate()).expect("initial negotiate");
 
     // A live session with recognizable content on its screen.
     r.spawn_host(&ghost, "survivor")
