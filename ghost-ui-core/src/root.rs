@@ -9,6 +9,7 @@
 //! shell drives this model exactly as it drove a bare `TerminalModel` — `update`
 //! in, `Cmd`s out, `view` to draw — so the whole tree stays headlessly testable.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
@@ -438,6 +439,15 @@ pub struct RootModel {
     /// ssh window before its first session): it swallows the keyboard into the
     /// entry and renders the prompt overlay instead of the live view.
     connect: Option<ConnectPrompt>,
+    /// Whether the most recent [`view`](Self::view) actually painted the live
+    /// foreground terminal — set by `view` in the branch it took, read by
+    /// [`mark_presented`](Self::mark_presented) to decide whether clearing the
+    /// foreground's damage baseline is safe. `view` is `&self`, so this is the one
+    /// interior-mutable field; the shell calls `view` then `mark_presented` with no
+    /// state change between (main.rs), so the flag is never stale. Making `view`
+    /// the single source means a new full-window overlay suppresses the baseline
+    /// advance automatically — no hand-maintained mirror of `view`'s early returns.
+    foreground_painted: Cell<bool>,
 }
 
 /// The stage of the "connect to a host over SSH" flow — a small state machine
@@ -595,6 +605,9 @@ impl RootModel {
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
             connect: None,
+            // Set by the first `view`, before the shell ever presents; no
+            // `mark_presented` runs until then.
+            foreground_painted: Cell::new(false),
         }
     }
 
@@ -620,6 +633,7 @@ impl RootModel {
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
             connect: None,
+            foreground_painted: Cell::new(false),
         };
         (root, vec![Cmd::ListSessions, Cmd::Redraw])
     }
@@ -1574,6 +1588,12 @@ impl RootModel {
     }
 
     pub fn view(&self) -> Scene {
+        // Record which branch this paint took, so `mark_presented` clears the
+        // foreground's damage baseline only when the live foreground terminal was
+        // actually on screen. Every early return below is an overlay owning the
+        // whole window in the terminal's place — none paints it.
+        self.foreground_painted.set(false);
+
         // The connect prompt owns the whole window until it resolves.
         if let Some(prompt) = &self.connect {
             return self.connect_scene(prompt);
@@ -1595,6 +1615,11 @@ impl RootModel {
             return with_camera(f.view(&self.sessions), camera, 0.0);
         }
 
+        // The live scene: in a single view this paints the foreground terminal; in
+        // the fleet there is no single foreground (its tiles feed themselves, and
+        // `foreground_mut` is `None`), so only the single case marks it painted.
+        self.foreground_painted
+            .set(matches!(self.mode, Mode::Single { .. }));
         self.live_scene()
     }
 
@@ -2035,27 +2060,19 @@ impl RootModel {
     /// screen) and in the fleet (downscaled previews carry no row-localized damage), so
     /// on returning to a single view the foreground repaints in full once and resumes.
     pub fn mark_presented(&mut self) {
-        // Only when `view` actually painted the live foreground terminal. While an
-        // overlay owns the window in its place (the connect prompt, a dive/slide
-        // animation), the terminal's texture wasn't refreshed, so clearing its
-        // accumulated damage now would leave it stale when the overlay closes — the
-        // connect-prompt foreground stall.
-        if self.overlay_covers_foreground() {
+        // Only when the last `view` actually painted the live foreground terminal.
+        // While an overlay owns the window in its place (the connect prompt, a
+        // dive/slide animation), the terminal's texture wasn't refreshed, so clearing
+        // its accumulated damage now would leave it stale when the overlay closes —
+        // the connect-prompt foreground stall. `view` records which branch it took, so
+        // a new full-window overlay suppresses this with no separate condition to keep
+        // in sync — the lockstep is definitional, not a convention.
+        if !self.foreground_painted.get() {
             return;
         }
         if let Some((view, state)) = self.foreground_mut() {
             view.mark_presented(state);
         }
-    }
-
-    /// Whether an overlay owns the whole window in place of the live foreground
-    /// terminal — the connect prompt, or an animation (frozen textures, not a live
-    /// model). Mirrors the early returns in [`Self::view`]; keep the two in lockstep,
-    /// so [`Self::mark_presented`] never clears damage for a frame the terminal was
-    /// not actually on. (The fleet and dive-hold cases need no entry here: there is no
-    /// single foreground then, so [`Self::foreground_mut`] is already `None`.)
-    fn overlay_covers_foreground(&self) -> bool {
-        self.connect.is_some() || self.anim.is_some()
     }
 
     /// A snapshot of the live foreground session's render-gate counters, for the
@@ -3904,6 +3921,7 @@ mod tests {
         // connect-prompt foreground stall.
         let mut r = root(); // single view of alpha
         feed(&mut r, "alpha", b"before");
+        let _ = r.view();
         r.mark_presented();
         assert_eq!(
             r.foreground_trace().unwrap().feed_dirty,
@@ -3929,6 +3947,47 @@ mod tests {
         assert!(
             r.foreground_trace().unwrap().feed_dirty.is_some(),
             "mark_presented cleared a feed the prompt scene never painted → stale foreground on close"
+        );
+    }
+
+    #[test]
+    fn a_feed_behind_a_slide_animation_is_not_marked_presented() {
+        // The other overlay that owns the whole window: a session slide (Ctrl-Tab).
+        // While it plays, `view` returns the composed animation frame, not the live
+        // foreground terminal — so, exactly like the connect prompt, a feed that lands
+        // mid-slide never reaches the screen and `mark_presented` must NOT clear its
+        // damage, or the terminal shows its stale pre-feed screen when the slide ends.
+        let mut r = root(); // single view of alpha, mine = {alpha}
+        r.update(UiEvent::AdoptSession("beta".into())); // foreground beta, alpha warm
+        feed(&mut r, "beta", b"before");
+        let _ = r.view();
+        r.mark_presented();
+        assert_eq!(
+            r.foreground_trace().unwrap().feed_dirty,
+            None,
+            "baseline: a presented feed leaves no pending damage"
+        );
+
+        // Ctrl-Tab starts a slide (back toward alpha); the animation owns the window.
+        ctrl_tab(&mut r, false);
+        assert!(r.is_animating(), "the slide is in flight");
+
+        // A feed lands on the foreground session behind the slide.
+        feed(&mut r, "alpha", b"behind the slide");
+        assert!(
+            r.foreground_trace().unwrap().feed_dirty.is_some(),
+            "the feed dirtied the foreground view"
+        );
+
+        // The shell builds and presents the animation frame, then marks it presented.
+        let _ = r.view();
+        r.mark_presented();
+
+        // The terminal was never in that scene, so its damage must survive to the
+        // frame that shows the terminal again.
+        assert!(
+            r.foreground_trace().unwrap().feed_dirty.is_some(),
+            "mark_presented cleared a feed the slide frame never painted → stale foreground on end"
         );
     }
 
