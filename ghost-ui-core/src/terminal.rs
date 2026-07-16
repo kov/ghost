@@ -506,7 +506,7 @@ impl DrivingGeometry {
 ///   accumulation, and the scroll-pin.
 /// - **shared facts** — the fields below, snapshots taken across the feed so a view
 ///   reacting later sees the same change the first one did.
-struct FeedOutcome {
+pub(crate) struct FeedOutcome {
     /// A feed carrying bytes actually ran (vs a bare end-of-session with none).
     fed: bool,
     /// The viewport rows this feed changed — the localizable damage hint, `None`
@@ -916,7 +916,13 @@ impl SessionState {
     /// `geom` is the driving view's geometry (see [`DrivingGeometry`]), so a
     /// `CSI 14 t`/`CSI 18 t` in this same burst answers with the driving window's
     /// pixels/grid — including the size a DECCOLM here just asked it to become.
-    fn ingest(
+    ///
+    /// **Call-site law:** an `ingest` mutates the one shared emulator and drains its
+    /// consume-once facts, so it must be paired with an [`TerminalView::apply_feed`]
+    /// on *every* view of the session — no more (double-answer / corrupt state) and
+    /// no fewer (a view stuck stale). Only two call sites are allowed: `session_data`
+    /// (the one-view path) and [`crate::feed_shared`] (the many-view fan-out).
+    pub(crate) fn ingest(
         &mut self,
         bytes: &[u8],
         geom: &DrivingGeometry,
@@ -1486,7 +1492,7 @@ impl TerminalView {
 
     /// The driving geometry this view hands [`SessionState::ingest`] when it feeds
     /// its session — a snapshot of the view facts a feed's replies and resizes need.
-    fn driving_geometry(&self) -> DrivingGeometry {
+    pub(crate) fn driving_geometry(&self) -> DrivingGeometry {
         DrivingGeometry {
             metrics: self.effective_metrics(),
             pad_px: self.pad_px(),
@@ -1956,7 +1962,7 @@ impl TerminalView {
         }
         let geom = self.driving_geometry();
         let (mut cmds, outcome) = state.ingest(bytes, &geom, ended);
-        cmds.extend(self.apply_feed(state, &outcome));
+        cmds.extend(self.apply_feed(state, &outcome, true));
         cmds
     }
 
@@ -1966,20 +1972,33 @@ impl TerminalView {
     /// DEC 2026 frame is open). Runs once per view of the session, off the same
     /// outcome [`SessionState::ingest`] produced, so several windows looking at one
     /// session each react to its output exactly once without re-feeding it.
-    fn apply_feed(&mut self, state: &SessionState, outcome: &FeedOutcome) -> Vec<Cmd> {
+    ///
+    /// `driving` marks the one view whose window grids the session — the attached
+    /// window. Only it adopts the window pixels a DECCOLM in the feed asked for; an
+    /// observer window keeps its own size (the shared emulator re-grids, but the
+    /// observer's window did not resize). Everything else — the selection drop, the
+    /// scroll reset, the full repaint on a grid change — fans out to every view.
+    pub(crate) fn apply_feed(
+        &mut self,
+        state: &SessionState,
+        outcome: &FeedOutcome,
+        driving: bool,
+    ) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         if outcome.fed {
             self.trace.feeds_seen += 1;
             // A DECCOLM/maximize re-grid from within the feed invalidates every cell
             // coordinate: drop the (now meaningless) selection and scroll and force a
             // full repaint. The driving view also adopts the window px the ingest
-            // asked for, so a `CSI 14 t` in the same burst reported them.
+            // asked for, so a `CSI 14 t` in the same burst reported them — but an
+            // observer view must not, or a DECCOLM in the shared session would clobber
+            // its unchanged window size.
             if outcome.grid_changed {
                 self.selection = None;
                 self.sel_anchor = None;
                 self.scroll_offset = 0;
                 self.view_slid = true;
-                if let Some(px) = outcome.new_size_px {
+                if driving && let Some(px) = outcome.new_size_px {
                     self.size_px = px;
                 }
             }
@@ -4174,16 +4193,16 @@ mod tests {
         // line (dirtying the fresh screen wholesale), both views fold it, then both
         // present so their damage baseline is the settled screen.
         let (_warm, warm) = state.ingest(b"line one\r\n", &geom, false);
-        a.apply_feed(&state, &warm);
-        b.apply_feed(&state, &warm);
+        a.apply_feed(&state, &warm, true);
+        b.apply_feed(&state, &warm, false);
         a.mark_presented(&state);
         b.mark_presented(&state);
 
         // Now the measured feed: window A drives, one feed prints on the current row
         // (row 1) AND asks for the cursor position. It is ingested once.
         let (ingest_cmds, outcome) = state.ingest(b"hi\x1b[6n", &geom, false);
-        let a_cmds = a.apply_feed(&state, &outcome);
-        let b_cmds = b.apply_feed(&state, &outcome);
+        let a_cmds = a.apply_feed(&state, &outcome, true);
+        let b_cmds = b.apply_feed(&state, &outcome, false);
 
         // The child is answered exactly once — by the ingest, not by either view.
         let sends = |cmds: &[Cmd]| {
@@ -4209,6 +4228,47 @@ mod tests {
             matches!(a.damage(&state), TermDamage::Rows { lo: 1, hi: 1 }),
             "the shared feed localizes to row 1, not the whole view: {:?}",
             a.damage(&state)
+        );
+    }
+
+    /// The one asymmetry between a session's views: on a grid change from within the
+    /// feed (a DECCOLM here), only the *driving* view adopts the new window pixels —
+    /// its window is the one being asked to resize. An observer view keeps its own
+    /// size: the shared emulator re-grids, but the observer's window did not. (Both
+    /// still drop selection/scroll and repaint — that fan-out is not view-specific.)
+    /// Without the `driving` gate, a DECCOLM in a shared session would clobber every
+    /// observer's window size with the driver's, corrupting its layout math.
+    #[test]
+    fn a_deccolm_resizes_only_the_driving_views_window() {
+        let mut state = SessionState::new("alpha".to_string(), 80, 24);
+        state.set_policy(ghost_term::SessionPolicy::allow_all());
+        let mut driver = TerminalView::new(METRICS, 80, 24);
+        let mut observer = TerminalView::new(METRICS, 80, 24);
+        assert_eq!(driver.size_px, (720, 432));
+        assert_eq!(observer.size_px, (720, 432));
+
+        // An app enables 80↔132 switching and requests 132 columns. Ingested once off
+        // the driver's geometry: the shared emulator grows to 132×24.
+        let geom = driver.driving_geometry();
+        let (_cmds, outcome) = state.ingest(b"\x1b[?40h\x1b[?3h", &geom, false);
+        assert!(
+            outcome.grid_changed,
+            "the DECCOLM re-grids the shared screen"
+        );
+        driver.apply_feed(&state, &outcome, true);
+        observer.apply_feed(&state, &outcome, false);
+
+        // The driving window adopts the 132-column pixel width (132 * 9 = 1188)...
+        assert_eq!(
+            driver.size_px,
+            (1188, 432),
+            "the driving view adopts the DECCOLM window size"
+        );
+        // ...while the observer's window is untouched (it never resized).
+        assert_eq!(
+            observer.size_px,
+            (720, 432),
+            "an observer view keeps its own window size across a shared DECCOLM"
         );
     }
 

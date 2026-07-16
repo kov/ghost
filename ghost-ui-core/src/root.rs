@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
-use crate::terminal::{SessionState, TerminalView};
+use crate::terminal::{FeedOutcome, SessionState, TerminalView};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::text_input::TextInput;
 use crate::{
@@ -565,6 +565,70 @@ fn resize_model(
     )
 }
 
+/// Shape a *background* view's feed commands before they reach the shell: a mirror
+/// that isn't the foreground must neither reach onto the desktop (title, clipboard,
+/// window ops — only the foreground may, `Cmd::reaches_the_desktop`) nor ask for a
+/// repaint (its content changed, the foreground's did not — a deep scene-compare
+/// ending in a Clean skip, up to 60×/s under a chatty session). Everything else
+/// flows: replies to a querying program, image pre-uploads, and the `ScheduleTick`
+/// that backstops a synchronized-output hold. Shared by [`RootModel::feed_warm`] and
+/// the shared-feed fan-out ([`RootModel::apply_shared_feed`]) so the two can't drift.
+fn filter_background(cmds: Vec<Cmd>) -> Vec<Cmd> {
+    cmds.into_iter()
+        .filter(|c| !c.reaches_the_desktop() && !matches!(c, Cmd::Redraw))
+        .collect()
+}
+
+/// Feed one session's output to every window viewing it, ingesting into the one
+/// shared [`SessionState`] exactly once and fanning the result out to each view —
+/// the routine that makes "one model, many views" real across windows.
+///
+/// `driver` is the attached window: its view of the session supplies the ingest
+/// geometry (so a `CSI 14 t`/`CSI 18 t` in the burst answers with *its* window),
+/// its ingest drains the session-once effects (the child's query replies, the DEC
+/// ?1004 focus report, graphics acks, clipboard writes, and any DECCOLM/maximize
+/// child `Resize`), and it is the only view that adopts a window-px change. Each
+/// `observers` window then folds the same [`FeedOutcome`] into its own view, shaped
+/// for its slot (a foreground view's commands flow whole; a warm mirror's are
+/// [`filter_background`]-ed). Returns the driver's commands (its ingest-once effects
+/// first, then its view's, preserving `session_data`'s order) and one command list
+/// per observer, in the given order.
+///
+/// The seam the shell's dispatch will mirror. The shell still keeps a `Sessions` per
+/// window today, so this has one caller — a test — until the process-wide collapse;
+/// only this routine and `session_data` may [`SessionState::ingest`] (see its law).
+///
+/// KNOWN gaps, deferred to enablement (connection ownership): an observer whose
+/// window never resized is left showing a DECCOLM-re-gridded emulator at a
+/// mismatched grid; and re-gridding is not yet gated on drivership, so an observer
+/// that also answered `Resize` would fight the driver's SIGWINCH.
+pub fn feed_shared(
+    sessions: &mut Sessions,
+    driver: &mut RootModel,
+    observers: &mut [&mut RootModel],
+    name: &str,
+    bytes: &[u8],
+    ended: bool,
+) -> (Vec<Cmd>, Vec<Vec<Cmd>>) {
+    // The driver's view of the session (foreground or backgrounded — a window can
+    // drive a session it has Ctrl-Tabbed away from) supplies the ingest geometry.
+    let Some(geom) = driver.view_of(name).map(|v| v.driving_geometry()) else {
+        return (Vec::new(), vec![Vec::new(); observers.len()]);
+    };
+    let Some(state) = sessions.get_mut(name) else {
+        return (Vec::new(), vec![Vec::new(); observers.len()]);
+    };
+    // Ingested once: the child is answered once, and the shared emulator advances
+    // once. The `&mut` borrow ends here; the applies below re-borrow immutably.
+    let (mut driver_cmds, outcome) = state.ingest(bytes, &geom, ended);
+    driver_cmds.extend(driver.apply_shared_feed(sessions, name, &outcome, true));
+    let obs_cmds = observers
+        .iter_mut()
+        .map(|w| w.apply_shared_feed(sessions, name, &outcome, false))
+        .collect();
+    (driver_cmds, obs_cmds)
+}
+
 /// F9 toggles the fleet overview.
 fn is_fleet_toggle(key: &Key) -> bool {
     matches!(key, Key::Named(NamedKey::F9))
@@ -616,6 +680,47 @@ impl RootModel {
             foreground_painted: Cell::new(false),
         };
         (root, sessions)
+    }
+
+    /// A single-view window onto a session whose [`SessionState`] already lives in a
+    /// shared [`Sessions`] this window does not mint — the second (and later) window
+    /// viewing one session in the "one model, many views" world. Unlike
+    /// [`Self::single`] it creates no state: the caller's shared registry must already
+    /// hold `name`. `mine` is left empty — this window observes; *which* window drives
+    /// (connection ownership) is an App-level fact decided elsewhere.
+    ///
+    /// Test-only until enablement wires the shell to open a second window onto a live
+    /// session; written in its final shape so promotion is deleting the attribute.
+    #[cfg(test)]
+    fn viewing(
+        name: &str,
+        cols: u16,
+        rows: u16,
+        metrics: CellMetrics,
+        size_px: (u32, u32),
+    ) -> Self {
+        RootModel {
+            mode: Mode::Single {
+                id: name.to_string(),
+                view: Box::new(TerminalView::new(metrics, cols, rows)),
+            },
+            metrics,
+            size_px,
+            scale: 1.0,
+            mine: HashSet::new(),
+            primary: None,
+            warm: HashMap::new(),
+            pending_dive: None,
+            pending_dive_in: None,
+            anim: None,
+            anim_ms: ANIM_MS,
+            focused_win: true,
+            groups: Vec::new(),
+            my_group: crate::Group::auto(String::new(), 0),
+            pad: 0.0,
+            connect: None,
+            foreground_painted: Cell::new(false),
+        }
     }
 
     /// Start in the fleet overview owning no session — a freshly-opened window.
@@ -700,6 +805,48 @@ impl RootModel {
         match &self.mode {
             Mode::Single { id, view } => Some((view, sessions.get(id)?)),
             Mode::Fleet(_) => None,
+        }
+    }
+
+    /// This window's live view of `name`, if it shows it — the foreground `Single`
+    /// view or a `warm` background mirror. Fleet tiles are deliberately *not* reached
+    /// here: a tile's feed routes through [`FleetModel::update`], which does more than
+    /// `apply_feed` (frame-cache refresh, deferred-dive completion), so a bare
+    /// `apply_feed` on a tile would leave its preview stale. Used by the shared-feed
+    /// fan-out ([`feed_shared`]) to source the driving geometry.
+    pub(crate) fn view_of(&self, name: &str) -> Option<&TerminalView> {
+        if let Mode::Single { id, view } = &self.mode
+            && id == name
+        {
+            return Some(view);
+        }
+        self.warm.get(name)
+    }
+
+    /// Fold one already-ingested [`FeedOutcome`] into this window's view of `name`,
+    /// shaped for the slot it sits in: a foreground view's commands flow whole; a
+    /// warm mirror's are [`filter_background`]-ed (no desktop reach, no repaint), the
+    /// same guard [`Self::feed_warm`] applies. `driving` is true only for the
+    /// attached window, gating the DECCOLM window-px adopt inside `apply_feed`. Empty
+    /// when this window does not show `name` (or shows it only as a fleet tile).
+    fn apply_shared_feed(
+        &mut self,
+        sessions: &Sessions,
+        name: &str,
+        outcome: &FeedOutcome,
+        driving: bool,
+    ) -> Vec<Cmd> {
+        let Some(state) = sessions.get(name) else {
+            return Vec::new();
+        };
+        if let Mode::Single { id, view } = &mut self.mode
+            && id == name
+        {
+            return view.apply_feed(state, outcome, driving);
+        }
+        match self.warm.get_mut(name) {
+            Some(view) => filter_background(view.apply_feed(state, outcome, driving)),
+            None => Vec::new(),
         }
     }
 
@@ -1350,11 +1497,7 @@ impl RootModel {
             // Everything else flows: replies to a program querying the terminal
             // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
             // that backstops a mirror's synchronized-output hold for when it's promoted.
-            (Some(view), Some(state)) => view
-                .update(state, ev)
-                .into_iter()
-                .filter(|c| !c.reaches_the_desktop() && !matches!(c, Cmd::Redraw))
-                .collect(),
+            (Some(view), Some(state)) => filter_background(view.update(state, ev)),
             // Not a session this window mirrors: the feed has nowhere to land.
             // This is the under-delivery mirror of the double-feed hazard — a
             // breadcrumb so a dropped feed is diagnosable, not silent (finding #7).
@@ -2381,6 +2524,68 @@ mod tests {
                 _ => None,
             })
             .expect("a terminal item")
+    }
+
+    /// The multi-window payoff of the ingest/apply_feed split, now at the *window*
+    /// layer: two windows in ONE process view the same session, sharing a single
+    /// `Sessions` (one emulator, one feed). [`feed_shared`] ingests the feed once — so
+    /// the child is answered once and the shared screen advances once — and fans the
+    /// outcome out to both windows' views, so each repaints. Doing this with per-window
+    /// `update` instead would ingest, and answer the child, once *per window* (the
+    /// double-feed hazard the split exists to remove).
+    #[test]
+    fn a_shared_feed_reaches_every_window_but_answers_the_child_once() {
+        // One shared registry; mint alpha's state once (both windows reference it).
+        let mut sessions = Sessions::new();
+        sessions.set_policy(SessionPolicy::allow_all()); // so a DSR is answered
+        sessions.get_or_mint("alpha", 80, 24);
+        // Two windows onto the SAME shared state: A drives, B is a second view.
+        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut b = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+
+        // Warm both past the unconditional first-frame `All`, then present so each
+        // window's damage baseline is the settled screen.
+        feed_shared(
+            &mut sessions,
+            &mut a,
+            &mut [&mut b],
+            "alpha",
+            b"line one\r\n",
+            false,
+        );
+        a.mark_presented(&mut sessions);
+        b.mark_presented(&mut sessions);
+
+        // The measured feed: it prints on the current row AND asks the cursor position.
+        let (a_cmds, obs) = feed_shared(
+            &mut sessions,
+            &mut a,
+            &mut [&mut b],
+            "alpha",
+            b"hi\x1b[6n",
+            false,
+        );
+        let b_cmds = &obs[0];
+
+        // The child is answered exactly once — by the driver's ingest, not per window.
+        let sends = |cmds: &[Cmd]| {
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::SendInput { .. }))
+                .count()
+        };
+        assert_eq!(sends(&a_cmds), 1, "the driving window answers the DSR once");
+        assert_eq!(
+            sends(b_cmds),
+            0,
+            "the observing window never answers the child"
+        );
+
+        // Both windows repaint the printed line off the one shared outcome.
+        assert!(a_cmds.contains(&Cmd::Redraw), "the driving window repaints");
+        assert!(
+            b_cmds.contains(&Cmd::Redraw),
+            "the observing window repaints too"
+        );
     }
 
     #[test]
