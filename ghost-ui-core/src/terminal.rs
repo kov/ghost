@@ -5555,4 +5555,191 @@ mod tests {
             "a  "
         );
     }
+
+    /// View-level damage/redraw soundness — the enforcement `ghost-term`'s
+    /// `damage_audit` gives the emulator, one layer up.
+    ///
+    /// The single view decides *whether* to repaint (the `want_redraw` OR-chain
+    /// in [`TerminalView::session_data`]) and *how much* to re-raster (the
+    /// [`TermDamage`] [`TerminalView::damage`] stamps). Both are hand-maintained:
+    /// every new frame-visible fact (a palette edit, a dynamic color, a moved
+    /// cursor, a scroll) must be folded into both, and forgetting one is exactly
+    /// the recurring "fleet preview live, foreground frozen" stall — the
+    /// foreground never repaints, or repaints too little and keeps a stale
+    /// texture until a scroll forces a full redraw.
+    ///
+    /// Ground truth is the laid-out [`Frame`] the renderer actually draws
+    /// (`ghost_render::layout_frame_at`, carried on the scene's terminal item).
+    /// Two properties over an arbitrary feed/present/scroll/tick sequence:
+    ///
+    ///   * **redraw soundness** — a feed that changes the laid-out frame must
+    ///     request a repaint (`Cmd::Redraw`), unless a DEC-2026 synchronized
+    ///     hold is deliberately swallowing it (`sync_held`), and
+    ///   * **damage soundness** — at a present, if the frame differs from the
+    ///     last presented frame the stamped damage must cover the difference: a
+    ///     `Rows` band must leave no changed row outside it *and* carry no global
+    ///     recolor (OSC 4 palette / OSC 10-12 default colors recolor every drawn
+    ///     cell, so they must force `All`, never band as `Rows`).
+    ///
+    /// A new frame field wired into neither gate reds this test the way a new
+    /// under-reported row reds `damage_audit`.
+    mod damage_soundness {
+        use super::{key, model};
+        use crate::input::{Key, Mods, NamedKey};
+        use crate::{Cmd, UiEvent};
+        use ghost_render::{Frame, SceneItem, TermDamage, rows_differ_outside};
+        use proptest::prelude::*;
+        use std::rc::Rc;
+
+        /// The laid-out frame the renderer would draw and the damage the model
+        /// stamps beside it — read off the single terminal scene item together,
+        /// so the claim is always measured against the exact frame it describes.
+        /// The frame is shared by `Rc` on the scene; `Rc<Frame>` still compares
+        /// and derefs by value, which is all the property needs.
+        fn frame_and_damage(m: &super::TerminalModel) -> (Rc<Frame>, TermDamage) {
+            let scene = m.view();
+            match scene.terminals().next().expect("one terminal item") {
+                SceneItem::Terminal { frame, damage, .. } => (frame.clone(), *damage),
+                other => panic!("the single view is one terminal item, got {other:?}"),
+            }
+        }
+
+        /// One feed's worth of bytes: printable text, wide glyphs, cursor moves,
+        /// erases, OSC 4/104 palette edits, OSC 10-12 dynamic colors and their
+        /// resets, cursor show/hide and shape, DEC-2026 synchronized output, and
+        /// SGR — the sequences that reshape the frame without necessarily writing
+        /// a cell (which is where the gates get missed).
+        fn feed_bytes() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                "[ -~]{1,8}".prop_map(String::into_bytes),
+                Just("日本".as_bytes().to_vec()),
+                Just(b"\r\n".to_vec()),
+                (1u16..=24, 1u16..=80).prop_map(|(r, c)| format!("\x1b[{r};{c}H").into_bytes()),
+                (0u16..=3).prop_map(|n| format!("\x1b[{n}J").into_bytes()),
+                (0u16..=2).prop_map(|n| format!("\x1b[{n}K").into_bytes()),
+                // OSC 4 palette set + OSC 104 reset — recolor without a cell write.
+                (0u16..=15, 0u8..=255, 0u8..=255, 0u8..=255).prop_map(|(i, r, g, b)| format!(
+                    "\x1b]4;{i};rgb:{r:02x}/{g:02x}/{b:02x}\x07"
+                )
+                .into_bytes()),
+                (0u16..=15).prop_map(|i| format!("\x1b]104;{i}\x07").into_bytes()),
+                // OSC 10/11/12 dynamic colors, set and reset (OSC 110/111/112).
+                prop::sample::select(vec![10u16, 11, 12]).prop_flat_map(|osc| {
+                    prop_oneof![
+                        (0u8..=255, 0u8..=255, 0u8..=255).prop_map(move |(r, g, b)| format!(
+                            "\x1b]{osc};rgb:{r:02x}/{g:02x}/{b:02x}\x07"
+                        )
+                        .into_bytes()),
+                        Just(format!("\x1b]{};\x07", osc + 100).into_bytes()),
+                    ]
+                }),
+                prop::bool::ANY
+                    .prop_map(|on| format!("\x1b[?25{}", if on { 'h' } else { 'l' }).into_bytes()),
+                (0u16..=6).prop_map(|n| format!("\x1b[{n} q").into_bytes()),
+                prop::bool::ANY
+                    .prop_map(|on| format!("\x1b[?2026{}", if on { 'h' } else { 'l' }).into_bytes()),
+                prop::sample::select(vec![0u16, 1, 7, 31, 42])
+                    .prop_map(|n| format!("\x1b[{n}m").into_bytes()),
+            ]
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Feed(Vec<u8>),
+            Present,
+            Tick,
+            ScrollUp,
+            ScrollDown,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                6 => feed_bytes().prop_map(Op::Feed),
+                3 => Just(Op::Present),
+                1 => Just(Op::Tick),
+                1 => Just(Op::ScrollUp),
+                1 => Just(Op::ScrollDown),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+
+            #[test]
+            fn view_damage_and_redraw_cover_every_frame_change(
+                ops in prop::collection::vec(op(), 1..80),
+            ) {
+                let mut m = model();
+                // Present once so damage measures from a real frame rather than
+                // the unconditional All of the very first, never-presented frame.
+                let (mut last_present, _) = frame_and_damage(&m);
+                m.mark_presented();
+
+                for op in ops {
+                    match op {
+                        Op::Feed(bytes) => {
+                            let (before, _) = frame_and_damage(&m);
+                            let cmds = m.update(UiEvent::SessionData {
+                                name: "alpha".to_string(),
+                                bytes,
+                                ended: false,
+                            });
+                            let (after, _) = frame_and_damage(&m);
+                            let redrew = cmds.iter().any(|c| matches!(c, Cmd::Redraw));
+                            // A DEC-2026 hold defers the repaint on purpose; the
+                            // frame accumulates and repaints when the hold releases.
+                            let held = m.trace().sync_held;
+                            if after != before {
+                                prop_assert!(
+                                    redrew || held,
+                                    "a feed changed the laid-out frame but requested no \
+                                     repaint (redraw={redrew}, sync_held={held})"
+                                );
+                            }
+                        }
+                        Op::Tick => {
+                            m.update(UiEvent::Tick { now_ms: 1_000 });
+                        }
+                        Op::ScrollUp => {
+                            key(&mut m, Key::Named(NamedKey::PageUp), Mods::SHIFT);
+                        }
+                        Op::ScrollDown => {
+                            key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+                        }
+                        Op::Present => {
+                            let (cur, dmg) = frame_and_damage(&m);
+                            if cur != last_present {
+                                // NB: `TermDamage`'s `PartialEq` is constant-true (it
+                                // must not perturb `Scene` equality), so the variant
+                                // must be matched, never compared with `==`.
+                                prop_assert!(
+                                    !matches!(dmg, TermDamage::None),
+                                    "the frame changed since the last present but damage is None"
+                                );
+                                if let TermDamage::Rows { lo, hi } = dmg {
+                                    prop_assert!(
+                                        rows_differ_outside(&last_present, &cur, Some((lo, hi)))
+                                            .is_none(),
+                                        "a Rows({lo},{hi}) band left a changed row unrepainted"
+                                    );
+                                    // A Rows band re-rasters cells only; a global
+                                    // recolor under it would leave the rest of the
+                                    // texture in the old colors — it must be All.
+                                    prop_assert!(
+                                        cur.default_fg == last_present.default_fg
+                                            && cur.default_bg == last_present.default_bg
+                                            && cur.cursor_color == last_present.cursor_color
+                                            && cur.palette == last_present.palette,
+                                        "a global recolor was banded as Rows instead of All"
+                                    );
+                                }
+                            }
+                            m.mark_presented();
+                            last_present = cur;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

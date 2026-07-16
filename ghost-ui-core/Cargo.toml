@@ -16,3 +16,8 @@ serde = { version = "1", features = ["derive"] }
 # Cache-efficiency instrumentation is emitted via `tracing`; free unless a
 # subscriber (installed by the binary) enables the target under `RUST_LOG`.
 tracing = "0.1.44"
+
+[dev-dependencies]
+# Property tests for the view-level damage/redraw soundness invariant (mirrors
+# `ghost-term`'s `damage_audit`, one layer up). Pinned to the same version.
+proptest = "=1.9.0"
