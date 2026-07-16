@@ -1,4 +1,6 @@
-/target
+# Rust build output — any crate's target dir, at any depth (not just the root
+# workspace one), so a stray per-crate target never gets committed again.
+target/
 
 # Scratch crates and spikes kept beside the workspace, not part of it.
 /experiments
