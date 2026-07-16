@@ -211,32 +211,38 @@ fn bench(tiles: usize, frames: usize) {
     };
 
     // A freshly-opened window starts in the fleet overview, owning nothing.
-    let (mut root, _) = RootModel::fleet(METRICS, size, 1.0);
-    root.update(UiEvent::Resize {
-        w_px: size.0,
-        h_px: size.1,
-        scale: 1.0,
-    });
+    let (mut root, mut states, _) = RootModel::fleet(METRICS, size, 1.0);
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: 1.0,
+        },
+    );
     // Attach `tiles` sessions the way the shell does (spawn / take-over reply with
     // AdoptSession), each producing a full screen of output.
     for i in 0..tiles {
         let name = format!("s{i}");
-        root.update(UiEvent::AdoptSession(name.clone()));
-        root.update(UiEvent::SessionData {
-            name,
-            bytes: dense_screen().into_bytes(),
-            ended: false,
-        });
+        root.update(&mut states, UiEvent::AdoptSession(name.clone()));
+        root.update(
+            &mut states,
+            UiEvent::SessionData {
+                name,
+                bytes: dense_screen().into_bytes(),
+                ended: false,
+            },
+        );
     }
     // Open the fleet overview (F9).
-    root.update(key(NamedKey::F9));
+    root.update(&mut states, key(NamedKey::F9));
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
     let mut renderer = Renderer::headless(Theme::default());
     let px = |r: &RootModel| SIZE_PX * r.render_scale();
 
     // Warm up (first frame builds the glyph atlas + shaping/frame caches).
-    let _ = renderer.render_offscreen_scene(&root.view(), font, px(&root));
+    let _ = renderer.render_offscreen_scene(&root.view(&states), font, px(&root));
 
     let dirs = [
         NamedKey::ArrowDown,
@@ -247,8 +253,8 @@ fn bench(tiles: usize, frames: usize) {
     let (mut model_ns, mut render_ns) = (0u128, 0u128);
     for i in 0..frames {
         let nav = Instant::now();
-        root.update(key(dirs[i % dirs.len()]));
-        let scene = root.view();
+        root.update(&mut states, key(dirs[i % dirs.len()]));
+        let scene = root.view(&states);
         model_ns += nav.elapsed().as_nanos();
 
         let r = Instant::now();
@@ -283,22 +289,28 @@ fn bench_resize(tiles: usize, steps: usize) {
     };
 
     let base = (1400u32, 900u32);
-    let (mut root, _) = RootModel::fleet(METRICS, base, 1.0);
-    root.update(UiEvent::Resize {
-        w_px: base.0,
-        h_px: base.1,
-        scale: 1.0,
-    });
+    let (mut root, mut states, _) = RootModel::fleet(METRICS, base, 1.0);
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: base.0,
+            h_px: base.1,
+            scale: 1.0,
+        },
+    );
     for i in 0..tiles {
         let name = format!("s{i}");
-        root.update(UiEvent::AdoptSession(name.clone()));
-        root.update(UiEvent::SessionData {
-            name,
-            bytes: dense_screen().into_bytes(),
-            ended: false,
-        });
+        root.update(&mut states, UiEvent::AdoptSession(name.clone()));
+        root.update(
+            &mut states,
+            UiEvent::SessionData {
+                name,
+                bytes: dense_screen().into_bytes(),
+                ended: false,
+            },
+        );
     }
-    root.update(key(NamedKey::F9));
+    root.update(&mut states, key(NamedKey::F9));
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
     let mut renderer = Renderer::headless(Theme::default());
@@ -315,29 +327,35 @@ fn bench_resize(tiles: usize, steps: usize) {
         .collect();
 
     // Warm caches at the base size.
-    let _ = renderer.render_offscreen_scene(&root.view(), font, px(&root));
+    let _ = renderer.render_offscreen_scene(&root.view(&states), font, px(&root));
 
     // Old behaviour: every drag step relayouts the model and re-rasters every tile.
     let mut relayout_ns = 0u128;
     for &(w, h) in &sizes {
         let t = Instant::now();
-        root.update(UiEvent::Resize {
-            w_px: w,
-            h_px: h,
-            scale: 1.0,
-        });
-        let scene = root.view();
+        root.update(
+            &mut states,
+            UiEvent::Resize {
+                w_px: w,
+                h_px: h,
+                scale: 1.0,
+            },
+        );
+        let scene = root.view(&states);
         let _ = renderer.render_offscreen_scene(&scene, font, px(&root));
         relayout_ns += t.elapsed().as_nanos();
     }
 
     // New behaviour: capture once at the gesture start, then stretch-blit each step.
-    root.update(UiEvent::Resize {
-        w_px: base.0,
-        h_px: base.1,
-        scale: 1.0,
-    });
-    renderer.capture_snapshot(&root.view(), font, px(&root));
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: base.0,
+            h_px: base.1,
+            scale: 1.0,
+        },
+    );
+    renderer.capture_snapshot(&root.view(&states), font, px(&root));
     let mut blit_ns = 0u128;
     for &(w, h) in &sizes {
         let t = Instant::now();
@@ -410,28 +428,34 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
 
     let name = "bench";
     let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
-    let mut root = RootModel::single(model, METRICS, size);
-    root.update(UiEvent::Resize {
-        w_px: size.0,
-        h_px: size.1,
-        scale: scale as f64,
-    });
+    let (mut root, mut states) = RootModel::single(model, METRICS, size);
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: scale as f64,
+        },
+    );
     let cols = (size.0 as f32 / (METRICS.advance * scale)).floor().max(1.0) as usize;
     let rows = (size.1 as f32 / (METRICS.line_height * scale))
         .floor()
         .max(1.0) as usize;
-    root.update(UiEvent::SessionData {
-        name: name.to_string(),
-        bytes: dense_screen_sized(cols, rows).into_bytes(),
-        ended: false,
-    });
+    root.update(
+        &mut states,
+        UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: dense_screen_sized(cols, rows).into_bytes(),
+            ended: false,
+        },
+    );
 
     let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
     let mut renderer = Renderer::headless(Theme::default());
     let px = SIZE_PX * root.render_scale();
 
     // Warm up (first frame builds the glyph atlas + shaping/frame caches).
-    let _ = renderer.render_offscreen_scene(&root.view(), font, px);
+    let _ = renderer.render_offscreen_scene(&root.view(&states), font, px);
 
     let (mut model_ns, mut render_ns) = (0u128, 0u128);
     for i in 0..frames {
@@ -440,12 +464,15 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
             16 + (i % 200)
         );
         let m = Instant::now();
-        root.update(UiEvent::SessionData {
-            name: name.to_string(),
-            bytes: line.into_bytes(),
-            ended: false,
-        });
-        let scene = root.view();
+        root.update(
+            &mut states,
+            UiEvent::SessionData {
+                name: name.to_string(),
+                bytes: line.into_bytes(),
+                ended: false,
+            },
+        );
+        let scene = root.view(&states);
         model_ns += m.elapsed().as_nanos();
 
         let r = Instant::now();
@@ -492,28 +519,41 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
     let keystroke = |i: usize| format!("\x1b[{};{}Hx", mid, (i % cols) + 1).into_bytes();
 
     let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
-    let mut root = RootModel::single(model, METRICS, size);
-    root.update(UiEvent::Resize {
-        w_px: size.0,
-        h_px: size.1,
-        scale: scale as f64,
-    });
-    root.update(UiEvent::SessionData {
-        name: name.to_string(),
-        bytes: dense_screen_sized(cols, rows).into_bytes(),
-        ended: false,
-    });
+    let (mut root, mut states) = RootModel::single(model, METRICS, size);
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: scale as f64,
+        },
+    );
+    root.update(
+        &mut states,
+        UiEvent::SessionData {
+            name: name.to_string(),
+            bytes: dense_screen_sized(cols, rows).into_bytes(),
+            ended: false,
+        },
+    );
     let px = SIZE_PX * root.render_scale();
     let mut renderer = Renderer::headless(Theme::default());
     let mut cache = SceneCache::default();
 
-    let feed = |root: &mut RootModel, renderer: &mut Renderer, cache: &mut SceneCache, i| {
-        root.update(UiEvent::SessionData {
-            name: name.to_string(),
-            bytes: keystroke(i),
-            ended: false,
-        });
-        let scene = root.view();
+    let feed = |root: &mut RootModel,
+                states: &mut Sessions,
+                renderer: &mut Renderer,
+                cache: &mut SceneCache,
+                i| {
+        root.update(
+            states,
+            UiEvent::SessionData {
+                name: name.to_string(),
+                bytes: keystroke(i),
+                ended: false,
+            },
+        );
+        let scene = root.view(states);
         if cache.damage(&scene, px) == Damage::None {
             return;
         }
@@ -522,11 +562,11 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
 
     // Warm the caches before measuring.
     for i in 0..16 {
-        feed(&mut root, &mut renderer, &mut cache, i);
+        feed(&mut root, &mut states, &mut renderer, &mut cache, i);
     }
     let t = Instant::now();
     for i in 0..frames {
-        feed(&mut root, &mut renderer, &mut cache, i);
+        feed(&mut root, &mut states, &mut renderer, &mut cache, i);
     }
     let ms = (t.elapsed().as_nanos() as f64) / (frames as f64) / 1.0e6;
     println!(
@@ -920,7 +960,7 @@ const DIVE_MS: u64 = 180;
 /// Build a `count`-session fleet and kick a dive into/out of the *second* session,
 /// returning the model and the `base` time whose first tick stamps the dive's start
 /// (tick at `base + DIVE_MS * pct / 100` to land at `pct` %).
-fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
+fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
     let size = (1400u32, 900u32);
     let key = |k: NamedKey| UiEvent::Key {
         key: Key::Named(k),
@@ -936,12 +976,15 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
     // The "second" session (clamped), the one we dive into and out of.
     let target = names[1.min(names.len() - 1)].clone();
 
-    let (mut root, _) = RootModel::fleet(METRICS, size, 1.0);
-    root.update(UiEvent::Resize {
-        w_px: size.0,
-        h_px: size.1,
-        scale: 1.0,
-    });
+    let (mut root, mut states, _) = RootModel::fleet(METRICS, size, 1.0);
+    root.update(
+        &mut states,
+        UiEvent::Resize {
+            w_px: size.0,
+            h_px: size.1,
+            scale: 1.0,
+        },
+    );
     // Reconcile WITH creation times (oldest first), as the host does and as a real
     // window has already seen by the time it dives. RootModel caches these across the
     // toggle, so the fleet it rebuilds on F9 is in its final order from the start.
@@ -958,13 +1001,13 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
                 .collect(),
         )
     };
-    root.update(reconcile());
+    root.update(&mut states, reconcile());
     // Each session gets a distinct solid fill so it's obvious *which* session a dive
     // frames: green = first, red = second, then blue/yellow; a full-grid calibration
     // pattern for any beyond. The border/fill is flush to the window-sized grid, so a
     // tile's extent (and which session it is) reads unambiguously at any zoom.
     for (i, n) in names.iter().enumerate() {
-        root.update(UiEvent::AdoptSession(n.clone()));
+        root.update(&mut states, UiEvent::AdoptSession(n.clone()));
         let content = match i {
             0 => solid_screen(0, 200, 0),
             1 => solid_screen(220, 0, 0),
@@ -972,58 +1015,67 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, u64) {
             3 => solid_screen(230, 200, 0),
             _ => calibration_screen(155, 50),
         };
-        root.update(UiEvent::SessionData {
-            name: n.clone(),
-            bytes: content.into_bytes(),
-            ended: false,
-        });
+        root.update(
+            &mut states,
+            UiEvent::SessionData {
+                name: n.clone(),
+                bytes: content.into_bytes(),
+                ended: false,
+            },
+        );
     }
     // Make the target the foreground so a dive-out pulls back from it.
-    root.update(UiEvent::AdoptSession(target.clone()));
+    root.update(&mut states, UiEvent::AdoptSession(target.clone()));
 
     // `base` is well past the settle ticks so its first tick cleanly stamps the start.
     let base = 10_000u64;
     if dir == "in" {
-        root.update(key(NamedKey::F9)); // → fleet (dive-out)
-        root.update(UiEvent::Tick { now_ms: 0 });
-        root.update(UiEvent::Tick { now_ms: 1_000 }); // settle it
-        root.update(UiEvent::AdoptSession(target)); // dive into the target tile
+        root.update(&mut states, key(NamedKey::F9)); // → fleet (dive-out)
+        root.update(&mut states, UiEvent::Tick { now_ms: 0 });
+        root.update(&mut states, UiEvent::Tick { now_ms: 1_000 }); // settle it
+        root.update(&mut states, UiEvent::AdoptSession(target)); // dive into the target tile
     } else {
-        root.update(key(NamedKey::F9)); // single → fleet (dive-out)
+        root.update(&mut states, key(NamedKey::F9)); // single → fleet (dive-out)
         // The host keeps reconciling mid-dive; with the cache seeded above this is a
         // no-op for ordering, so the dive lands in the same order it animated.
-        root.update(reconcile());
+        root.update(&mut states, reconcile());
     }
-    (root, base)
+    (root, states, base)
 }
 
 /// Render a single full-resolution dive frame at `pct` %, for inspecting detail the
 /// downscaled contact sheet can't show (e.g. the handoff at 0 % / 100 %).
 fn dive_frame_scene(dir: &str, count: usize, pct: u64) -> (ghost_render::Scene, u32, u32) {
-    let (mut root, base) = kicked_dive(dir, count);
+    let (mut root, mut states, base) = kicked_dive(dir, count);
     // The first tick only stamps the dive's start (elapsed 0); a second advances it.
-    root.update(UiEvent::Tick { now_ms: base });
-    root.update(UiEvent::Tick {
-        now_ms: base + DIVE_MS * pct.min(100) / 100,
-    });
-    (root.view(), 1400, 900)
+    root.update(&mut states, UiEvent::Tick { now_ms: base });
+    root.update(
+        &mut states,
+        UiEvent::Tick {
+            now_ms: base + DIVE_MS * pct.min(100) / 100,
+        },
+    );
+    (root.view(&states), 1400, 900)
 }
 
 /// Render a contact sheet of the fleet dive — one tile per 5 % step — so the whole
 /// camera motion can be inspected at once. `out` dives single → fleet from the second
 /// session; `in` dives fleet → single into it (the "select a session" gesture).
 fn zoom_contact_sheet(dir: &str, count: usize, out_path: &str) {
-    let (mut root, base) = kicked_dive(dir, count);
+    let (mut root, mut states, base) = kicked_dive(dir, count);
     let font = ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads");
     let mut renderer = Renderer::headless(Theme::default());
     let pcts: Vec<u64> = (0..=100).step_by(5).collect();
     let frames: Vec<Rendered> = pcts
         .iter()
         .map(|pct| {
-            root.update(UiEvent::Tick {
-                now_ms: base + DIVE_MS * pct / 100,
-            });
-            renderer.render_offscreen_scene(&root.view(), font, SIZE_PX)
+            root.update(
+                &mut states,
+                UiEvent::Tick {
+                    now_ms: base + DIVE_MS * pct / 100,
+                },
+            );
+            renderer.render_offscreen_scene(&root.view(&states), font, SIZE_PX)
         })
         .collect();
 
@@ -1125,8 +1177,8 @@ fn single_scene() -> (ghost_render::Scene, u32, u32) {
         bytes: EDIT.as_bytes().to_vec(),
         ended: false,
     });
-    let root = RootModel::single(model, METRICS, size);
-    (root.view(), size.0, size.1)
+    let (root, states) = RootModel::single(model, METRICS, size);
+    (root.view(&states), size.0, size.1)
 }
 
 fn feed(
@@ -1262,30 +1314,36 @@ mod tests {
         let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
 
         // A single session sized to the window; learn its grid from the scene.
-        let mut root = RootModel::single(
+        let (mut root, mut states) = RootModel::single(
             TerminalModel::new("m".to_string(), 80, 24, METRICS),
             METRICS,
             size,
         );
-        root.update(UiEvent::Resize {
-            w_px: size.0,
-            h_px: size.1,
-            scale: 1.0,
-        });
-        let (cols, rows) = match root.view().terminals().next().unwrap() {
+        root.update(
+            &mut states,
+            UiEvent::Resize {
+                w_px: size.0,
+                h_px: size.1,
+                scale: 1.0,
+            },
+        );
+        let (cols, rows) = match root.view(&states).terminals().next().unwrap() {
             ghost_render::SceneItem::Terminal { frame, .. } => {
                 (frame.cols as u16, frame.rows as u16)
             }
             _ => unreachable!(),
         };
-        root.update(UiEvent::SessionData {
-            name: "m".to_string(),
-            bytes: corner_markers(cols, rows).into_bytes(),
-            ended: false,
-        });
+        root.update(
+            &mut states,
+            UiEvent::SessionData {
+                name: "m".to_string(),
+                bytes: corner_markers(cols, rows).into_bytes(),
+                ended: false,
+            },
+        );
 
         // Reference: the single (full-window) view.
-        let single = renderer.render_offscreen_scene(&root.view(), font, SIZE_PX);
+        let single = renderer.render_offscreen_scene(&root.view(&states), font, SIZE_PX);
         let want: Vec<(f32, f32)> = colors
             .iter()
             .enumerate()
@@ -1301,10 +1359,13 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         };
-        root.update(key);
-        root.update(UiEvent::SessionList(vec![info("m", true, &[], 1)]));
-        root.update(UiEvent::Tick { now_ms: 10_000 }); // stamp t0 → progress 0 = full zoom
-        let dive = renderer.render_offscreen_scene(&root.view(), font, SIZE_PX);
+        root.update(&mut states, key);
+        root.update(
+            &mut states,
+            UiEvent::SessionList(vec![info("m", true, &[], 1)]),
+        );
+        root.update(&mut states, UiEvent::Tick { now_ms: 10_000 }); // stamp t0 → progress 0 = full zoom
+        let dive = renderer.render_offscreen_scene(&root.view(&states), font, SIZE_PX);
 
         for (i, c) in colors.iter().enumerate() {
             let (wx, wy) = want[i];

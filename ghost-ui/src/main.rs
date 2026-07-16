@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
-    RootModel, Scene, SessionPush, TerminalModel, UiEvent, WindowRecord,
+    RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WindowRecord,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -1884,6 +1884,11 @@ struct WindowState {
     /// the render/redraw paths are inert (see [`WindowState::request_redraw`]).
     gfx: Option<Graphics>,
     root: RootModel,
+    /// The emulator/terminal state for each session this window drives or previews —
+    /// the map hoisted out of `RootModel` (Scope B), threaded into every
+    /// `root.update`/`root.view`. Distinct from [`Self::sessions`], which holds the
+    /// transport *clients*; this holds what each session's screen looks like.
+    states: Sessions,
     /// This window's own session clients (the single-view session plus any fleet
     /// previews). Dropping the window drops these, which detaches every session
     /// it held — the "close = detach" default, with no shared-pool bookkeeping.
@@ -2256,7 +2261,7 @@ impl App {
                     continue;
                 };
                 // Model side (headless-observable): the default colors and padding.
-                let cmds = w.root.set_theme(colors);
+                let cmds = w.root.set_theme(&mut w.states, colors);
                 w.root.set_padding(pad);
                 // Gfx side (no model representation; absent under a headless
                 // frontend): the renderer theme — opacity/frost/scheme colours bake
@@ -2296,7 +2301,7 @@ impl App {
     /// Feed an event to window `wid`'s model and execute the effects it returns.
     fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
         let cmds = match self.windows.get_mut(&wid) {
-            Some(w) => w.root.update(ev),
+            Some(w) => w.root.update(&mut w.states, ev),
             None => return,
         };
         self.exec(wid, cmds, event_loop);
@@ -3770,7 +3775,7 @@ impl App {
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
-                            let scene = w.root.view();
+                            let scene = w.root.view(&w.states);
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
                         }
@@ -3836,12 +3841,12 @@ impl App {
             rows: req_rows,
             pad: cfg.padding(),
         });
-        let (mut root, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
-        root.set_theme(theme_colors(&cfg.theme()));
+        let (mut root, mut states, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
+        root.set_theme(&mut states, theme_colors(&cfg.theme()));
         // The same policy we report to every session host we attach to — the
         // window's emulators and the hosts' must agree, or an attached window would
         // honour what the host is refusing (see `ghost_term::policy`).
-        root.set_policy(session_policy_pair());
+        root.set_policy(&mut states, session_policy_pair());
         root.set_padding(cfg.padding());
         // A fleet window owns nothing yet, so reclaiming a group here just adopts
         // its identity — the members come from the loaded registry below.
@@ -3853,6 +3858,7 @@ impl App {
             WindowState {
                 gfx,
                 root,
+                states,
                 sessions: HashMap::new(),
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),
@@ -4137,13 +4143,13 @@ impl App {
         if let Some(g) = &gfx {
             g.window.set_title(&model.title());
         }
-        let mut root = RootModel::single(model, metrics(), (w, h));
-        root.set_theme(theme_colors(&cfg.theme()));
-        root.set_policy(session_policy_pair());
+        let (mut root, mut states) = RootModel::single(model, metrics(), (w, h));
+        root.set_theme(&mut states, theme_colors(&cfg.theme()));
+        root.set_policy(&mut states, session_policy_pair());
         root.set_padding(cfg.padding());
         // Seed the persisted registry BEFORE the group claim, so the claim's
         // save extends it rather than clobbering it with just this window.
-        root.update(UiEvent::GroupsLoaded(self.groups.clone()));
+        root.update(&mut states, UiEvent::GroupsLoaded(self.groups.clone()));
         let claims = root.set_my_group(group);
         apply_anim_ms(&mut root);
         let mut sessions = HashMap::new();
@@ -4153,6 +4159,7 @@ impl App {
             WindowState {
                 gfx,
                 root,
+                states,
                 sessions,
                 observers: HashMap::new(),
                 dead_fed: HashSet::new(),
@@ -4759,7 +4766,7 @@ impl ApplicationHandler<UserEvent> for App {
                         win.pacer.settle(landed, now_ms);
                     } else {
                         let t_model = Instant::now();
-                        let scene = win.root.view();
+                        let scene = win.root.view(&win.states);
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
                         // loop: a mid-animation tile that needs a full raster blits the best
@@ -4771,7 +4778,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // glyph size matches the grid the scene was laid out for.
                         let font_px = size_px() * win.root.render_scale();
                         // Keep the IME candidate window pinned to the text cursor.
-                        if let Some(a) = win.root.ime_cursor_area() {
+                        if let Some(a) = win.root.ime_cursor_area(&win.states) {
                             gfx.window.set_ime_cursor_area(
                                 PhysicalPosition::new(a.x, a.y),
                                 PhysicalSize::new(a.w, a.h),
@@ -4787,7 +4794,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // damage baseline so the next `view` measures change from
                                 // here (a Lost frame leaves the pending damage to fold into
                                 // the next real present). See `RootModel::mark_presented`.
-                                win.root.mark_presented();
+                                win.root.mark_presented(&mut win.states);
                                 // Model-side cache line (fleet preview frames) under
                                 // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
                                 win.root.emit_cache_trace();
@@ -5124,7 +5131,10 @@ mod tests {
 
             // They open at the built-in defaults (no ui.toml under the isolated XDG).
             let default_pad = app.windows[&w1].root.padding();
-            let default_theme = app.windows[&w1].root.theme();
+            let default_theme = {
+                let ws = &app.windows[&w1];
+                ws.root.theme(&ws.states)
+            };
 
             // Reload a config that changes both padding and the color scheme.
             let cfg = config::UiConfig::parse(
@@ -5141,10 +5151,10 @@ mod tests {
             app.reload_config(&cfg, &fe);
 
             for wid in [w1, w2] {
-                let root = &app.windows[&wid].root;
-                assert_eq!(root.padding(), 21.0, "reload updates padding on {wid:?}");
+                let ws = &app.windows[&wid];
+                assert_eq!(ws.root.padding(), 21.0, "reload updates padding on {wid:?}");
                 assert_eq!(
-                    root.theme(),
+                    ws.root.theme(&ws.states),
                     theme_colors(&cfg.theme()),
                     "reload updates theme colors on {wid:?}"
                 );

@@ -22,7 +22,7 @@ use std::time::Duration;
 use ghost_render::{CellMetrics, Scene};
 use ghost_renderer::{FrameOutcome, Rendered, Renderer, SceneCache, Theme};
 use ghost_shaper::FontRef;
-use ghost_ui_core::{Cmd, RootModel, SessionId, TerminalModel, UiEvent};
+use ghost_ui_core::{Cmd, RootModel, SessionId, Sessions, TerminalModel, UiEvent};
 use ghost_vt::session::SessionInfo;
 
 /// The swappable render target (re-exported from the renderer): a real window
@@ -43,6 +43,9 @@ pub const SIZE_PX: f32 = 15.0;
 /// [`scene`](Self::scene) / [`render`](Self::render).
 pub struct Harness {
     root: RootModel,
+    /// The session states this window drives — the map the shell hoisted out of
+    /// `RootModel` (Scope B). Threaded into every `root.update`/`root.view`.
+    states: Sessions,
     /// Created on first render; absent for pure behaviour tests (no GPU needed).
     renderer: Option<Renderer>,
     cache: SceneCache,
@@ -68,8 +71,8 @@ pub struct Harness {
 impl Harness {
     /// A fleet-overview frontend at `size_px`/`scale`, with no sessions yet.
     pub fn fleet(metrics: CellMetrics, size_px: (u32, u32), scale: f32) -> Self {
-        let (root, cmds) = RootModel::fleet(metrics, size_px, scale);
-        let mut h = Self::wrap(root);
+        let (root, states, cmds) = RootModel::fleet(metrics, size_px, scale);
+        let mut h = Self::wrap(root, states);
         h.exec(cmds);
         h.inject(UiEvent::Resize {
             w_px: size_px.0,
@@ -88,7 +91,8 @@ impl Harness {
         size_px: (u32, u32),
     ) -> Self {
         let model = TerminalModel::new(name.to_string(), cols, rows, metrics);
-        let mut h = Self::wrap(RootModel::single(model, metrics, size_px));
+        let (root, states) = RootModel::single(model, metrics, size_px);
+        let mut h = Self::wrap(root, states);
         h.inject(UiEvent::Resize {
             w_px: size_px.0,
             h_px: size_px.1,
@@ -97,9 +101,10 @@ impl Harness {
         h
     }
 
-    fn wrap(root: RootModel) -> Self {
+    fn wrap(root: RootModel, states: Sessions) -> Self {
         Self {
             root,
+            states,
             renderer: None,
             cache: SceneCache::default(),
             font: ghost_shaper::font_from_bytes(FIRA).expect("bundled font loads"),
@@ -140,7 +145,7 @@ impl Harness {
 
     /// Feed one event to the model and execute the effects it returns.
     pub fn inject(&mut self, ev: UiEvent) {
-        let cmds = self.root.update(ev);
+        let cmds = self.root.update(&mut self.states, ev);
         self.exec(cmds);
     }
 
@@ -153,9 +158,10 @@ impl Harness {
             match cmd {
                 Cmd::SendInput { session, bytes } => self.sent.push((session, bytes)),
                 Cmd::ListSessions => {
-                    let more = self
-                        .root
-                        .update(UiEvent::SessionList(self.sessions.clone()));
+                    let more = self.root.update(
+                        &mut self.states,
+                        UiEvent::SessionList(self.sessions.clone()),
+                    );
                     self.exec(more);
                 }
                 Cmd::ScheduleTick { after_ms } => {
@@ -186,7 +192,7 @@ impl Harness {
     /// The model's current `Scene` — the thing the renderer draws, and what a
     /// behaviour test asserts on.
     pub fn scene(&self) -> Scene {
-        self.root.view()
+        self.root.view(&self.states)
     }
 
     /// Whether an animation (e.g. a dive) is in flight.
@@ -217,7 +223,7 @@ impl Harness {
     /// Render the current scene offscreen and read back its pixels — for tests that
     /// assert on what was drawn. Needs a GPU (lazily creates the renderer).
     pub fn render(&mut self) -> Rendered {
-        let scene = self.root.view();
+        let scene = self.root.view(&self.states);
         let px = self.render_px();
         let font = self.font;
         self.renderer().render_offscreen_scene(&scene, font, px)
@@ -230,7 +236,7 @@ impl Harness {
     /// frame was drawn, or `None` for an unchanged scene / lost surface. This is the
     /// faithful per-frame work a benchmark measures. Needs a GPU.
     pub fn present(&mut self) -> Option<(Duration, Duration)> {
-        let scene = self.root.view();
+        let scene = self.root.view(&self.states);
         let px = self.render_px();
         let font = self.font;
         self.renderer
