@@ -2542,6 +2542,18 @@ impl Renderer {
             h: (((hi - lo + 1) as f32) * lh).min(th as f32 - top).max(0.0),
         };
         let scissor = clamp_scissor(band, tw, th);
+        // An empty scissor means the band clamped to zero pixels. For a legitimate
+        // `Band` plan this is only the degenerate (zero-size) surface: a band starting
+        // at or below the texture bottom can't happen here, because the plan requires
+        // `contain_scale >= 1.0` (a native-size texture) and the model already clips a
+        // `Rows` claim to the live grid, so `lo * line_height < texture_height` and the
+        // band has positive height. So there is nothing to paint — adopt the frame as
+        // current and return. NB the adopt is sound ONLY because the band is genuinely
+        // empty; were a real changed band to reach here, recording the frame as current
+        // without painting it would leave a stale texture on screen. Non-adoption
+        // wouldn't rescue that (the next idle re-layout is a fresh `Rc` marked `None`,
+        // which reuses the texture anyway) — the real fix would be to upgrade the plan
+        // to `Full`, which this path deliberately does not attempt.
         if scissor[2] == 0 || scissor[3] == 0 {
             surface.frame = frame.clone();
             return;
