@@ -407,12 +407,29 @@ struct Presented {
     /// App-set OSC 4 indexed palette at the present. Like `colors`, a change
     /// recolors drawn cells without writing any, so it must force whole-view damage.
     palette: [Option<[u8; 3]>; 256],
+    /// The cursor as it was *drawn* at the present — `(row, col, DECSCUSR shape)`,
+    /// or `None` when it wasn't drawn (hidden, or scrolled into history). The live
+    /// per-row feed hint is dropped while scrolled back ([`Self::session_data`]),
+    /// so a cursor move/shape/visibility change made up in history lands no row and
+    /// isn't a scroll *change* when the view returns to the presented offset — the
+    /// one gap `moved` can't see. Diffing this against the current drawn cursor in
+    /// [`Self::damage`] dirties just its row(s), no whole-view repaint.
+    cursor: Option<(usize, usize, u8)>,
 }
 
 /// A cheap identity of one direct graphics placement — image id, placement id, cell
 /// position, footprint, and z — for detecting a feed that changed the placed images
 /// without writing a cell (see [`TerminalModel::placement_signature`]).
 type PlacementSig = (u32, u32, usize, usize, u32, u32, i32);
+
+/// Union two optional inclusive row ranges into the one range covering both.
+fn merge_rows(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    match (a, b) {
+        (Some((al, ah)), Some((bl, bh))) => Some((al.min(bl), ah.max(bh))),
+        (r @ Some(_), None) | (None, r @ Some(_)) => r,
+        (None, None) => None,
+    }
+}
 
 impl SessionState {
     pub(crate) fn new(session: SessionId, cols: u16, rows: u16) -> Self {
@@ -837,29 +854,52 @@ impl TerminalView {
         if moved {
             TermDamage::All
         } else {
-            match self.feed_dirty {
-                // `feed_dirty` rows are live-viewport rows, but the renderer bands
-                // `TermDamage::Rows` in frame space. While scrolled back a stable offset
-                // (a scroll *change* is already `All` via `moved`), live row L is drawn at
-                // frame row L + offset, so shift the claim into frame space and clip to the
-                // visible window; a range entirely below the fold changed nothing on
-                // screen. Omitting this left the banded foreground texture stale on an
-                // in-place rewrite while scrolled — the recurring foreground-stall bug.
-                Some((lo, hi)) => {
-                    let rows = state.rows as usize;
-                    let lo = lo + self.scroll_offset;
-                    if lo >= rows {
-                        TermDamage::None
-                    } else {
-                        TermDamage::Rows {
-                            lo,
-                            hi: (hi + self.scroll_offset).min(rows - 1),
-                        }
-                    }
-                }
+            let rows = state.rows as usize;
+            // `feed_dirty` rows are live-viewport rows, but the renderer bands
+            // `TermDamage::Rows` in frame space. While scrolled back a stable offset
+            // (a scroll *change* is already `All` via `moved`), live row L is drawn at
+            // frame row L + offset, so shift the claim into frame space and clip to the
+            // visible window; a range entirely below the fold changed nothing on
+            // screen. Omitting this left the banded foreground texture stale on an
+            // in-place rewrite while scrolled — the recurring foreground-stall bug.
+            let feed_rows = self.feed_dirty.and_then(|(lo, hi)| {
+                let lo = lo + self.scroll_offset;
+                (lo < rows).then(|| (lo, (hi + self.scroll_offset).min(rows - 1)))
+            });
+            // The drawn cursor changing since the present dirties its row(s) — a
+            // shape/visibility/position change made while scrolled away leaves no
+            // feed row (the hint is dropped up in history) and returns to view when
+            // the offset comes back, which isn't a scroll *change* `moved` can see.
+            // The cursor is drawn only at offset 0, so its rows are already frame rows.
+            let cur_cursor = self.drawn_cursor(state);
+            let cursor_rows = self.presented.as_ref().and_then(|p| {
+                (p.cursor != cur_cursor).then(|| {
+                    let rs = p.cursor.iter().chain(cur_cursor.iter()).map(|c| c.0);
+                    rs.fold(None, |acc: Option<(usize, usize)>, r| {
+                        Some(acc.map_or((r, r), |(lo, hi)| (lo.min(r), hi.max(r))))
+                    })
+                })
+            });
+            match merge_rows(feed_rows, cursor_rows.flatten()) {
+                Some((lo, hi)) => TermDamage::Rows { lo, hi },
                 None => TermDamage::None,
             }
         }
+    }
+
+    /// The cursor as it is *drawn* right now — `(row, col, DECSCUSR shape)`, or
+    /// `None` when it isn't drawn: hidden (DECTCEM), or scrolled into history where
+    /// the live cursor is off screen. Snapshotted into [`Presented`] and diffed in
+    /// [`Self::damage`]; the row is clamped so a shrink can't point past the bottom.
+    fn drawn_cursor(&self, state: &SessionState) -> Option<(usize, usize, u8)> {
+        if self.scroll_offset != 0 {
+            return None;
+        }
+        let c = state.screen.vt().cursor();
+        c.visible.then(|| {
+            let row = c.row.min((state.rows as usize).saturating_sub(1));
+            (row, c.col, ghost_vt::query::decscusr_digit(c.shape))
+        })
     }
 
     /// Record that the current view was just composited: snapshot the view-shaping state
@@ -875,6 +915,7 @@ impl TerminalView {
             scale: self.scale,
             colors: state.render_colors(),
             palette: *state.palette(),
+            cursor: self.drawn_cursor(state),
         });
         self.feed_dirty = None;
         self.view_slid = false;
