@@ -2999,6 +2999,31 @@ mod tests {
             gen_csi_sm_seq(),
             gen_csi_rm_seq(),
             gen_csi_any_seq(),
+            gen_kitty_kbd_seq(),
+        ]
+    }
+
+    /// kitty-keyboard push (`CSI > flags u`), pop (`CSI < n u`) and set
+    /// (`CSI = flags ; mode u`). Interleaved with the buffer switches the mode
+    /// generators already emit, this drives per-buffer stacks through dump.
+    fn gen_kitty_kbd_seq() -> impl Strategy<Value = Vec<char>> {
+        fn digits(n: u16) -> Vec<char> {
+            n.to_string().chars().collect()
+        }
+        prop_oneof![
+            (0..32u16).prop_map(|flags| flatten(vec![
+                vec!['\x1b', '[', '>'],
+                digits(flags),
+                vec!['u'],
+            ])),
+            (1..4u16).prop_map(|n| flatten(vec![vec!['\x1b', '[', '<'], digits(n), vec!['u'],])),
+            (0..32u16, 1..4u16).prop_map(|(flags, mode)| flatten(vec![
+                vec!['\x1b', '[', '='],
+                digits(flags),
+                vec![';'],
+                digits(mode),
+                vec!['u'],
+            ])),
         ]
     }
 

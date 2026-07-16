@@ -128,8 +128,8 @@ pub struct Terminal {
     /// re-emitted on dump so they survive a reattach.
     tracked_modes: BTreeSet<DecMode>,
     /// DEC private modes saved by XTSAVE (`CSI ? Pm s`), for XTRESTORE to put
-    /// back. Transient app state, like the kitty-keyboard stack — deliberately
-    /// not carried across a dump/resync (a restore after a reattach is a no-op).
+    /// back. Transient app state deliberately not carried across a dump/resync
+    /// (an XTRESTORE after a reattach is a no-op).
     saved_modes: BTreeMap<DecMode, bool>,
     /// Current window title (OSC 0/2). Tracked but not rendered; re-emitted on
     /// dump so it survives a reattach.
@@ -1992,9 +1992,15 @@ impl Terminal {
         assert_eq!(self.new_line_mode, other.new_line_mode);
         assert_eq!(self.cursor_keys_mode, other.cursor_keys_mode);
         assert_eq!(self.modify_other_keys, other.modify_other_keys);
-        // Only the resolved current flags survive a dump/resync — the push/pop
-        // stack is the app's transient state and is deliberately not re-emitted.
+        // The full kitty-keyboard state round-trips: the current flags AND the
+        // push/pop stack, for the active buffer and the parked (alternate) one.
         assert_eq!(self.kitty_kbd, other.kitty_kbd);
+        assert_eq!(self.kitty_kbd_stack, other.kitty_kbd_stack);
+        assert_eq!(self.alternate_kitty_kbd, other.alternate_kitty_kbd);
+        assert_eq!(
+            self.alternate_kitty_kbd_stack,
+            other.alternate_kitty_kbd_stack
+        );
         assert_eq!(self.top_margin, other.top_margin);
         assert_eq!(self.bottom_margin, other.bottom_margin);
         assert_eq!(self.left_margin, other.left_margin);
@@ -3226,10 +3232,31 @@ impl Terminal {
         // prevent pen bleed into alt screen buffer
         funs.push(to_sgr(&Pen::default()));
 
+        // The parked (inactive) buffer keeps its own kitty-keyboard stack in the
+        // alternate_* slots. It has to be restored while that buffer is active in
+        // the replay, so the alt-buffer switch parks it into the matching slot.
+        let inactive_has_kitty =
+            self.alternate_kitty_kbd != 0 || !self.alternate_kitty_kbd_stack.is_empty();
+        // The alt window (switch out, then back) must open even when the alt
+        // saved-ctx is default, if only to carry that parked kitty state. One
+        // shared flag drives both the switch and the switch-back so they cannot
+        // drift (a lone switch would strand the replay on the wrong buffer).
+        let needs_alt_window = !alternate_ctx.is_default() || inactive_has_kitty;
+
+        // When active == Alternate the *primary* buffer is the parked one, and it
+        // is the buffer active in the replay right here, before the switch below.
+        if self.active_buffer_type == BufferType::Alternate && inactive_has_kitty {
+            push_kitty_kbd_restore(
+                &self.alternate_kitty_kbd_stack,
+                self.alternate_kitty_kbd,
+                &mut funs,
+            );
+        }
+
         // 4. dump alternate screen buffer
 
         // switch to alternate screen
-        if self.active_buffer_type == BufferType::Alternate || !alternate_ctx.is_default() {
+        if self.active_buffer_type == BufferType::Alternate || needs_alt_window {
             funs.push(Function::Decset(DecModes::one(DecMode::AltScreenBuffer)));
         }
 
@@ -3273,9 +3300,20 @@ impl Terminal {
             }
         }
 
+        // When active == Primary the *alternate* buffer is the parked one, and it
+        // is the buffer active in the replay only inside this window — restore its
+        // kitty state now, before the switch back parks it into the alt slot.
+        if self.active_buffer_type == BufferType::Primary && inactive_has_kitty {
+            push_kitty_kbd_restore(
+                &self.alternate_kitty_kbd_stack,
+                self.alternate_kitty_kbd,
+                &mut funs,
+            );
+        }
+
         // 6. ensure the right buffer is active
 
-        if self.active_buffer_type == BufferType::Primary && !alternate_ctx.is_default() {
+        if self.active_buffer_type == BufferType::Primary && needs_alt_window {
             // switch back to primary screen
             funs.push(Function::Decrst(DecModes::one(DecMode::AltScreenBuffer)));
         }
@@ -3501,12 +3539,12 @@ impl Terminal {
             funs.push(Function::ModifyOtherKeys(self.modify_other_keys));
         }
 
-        // re-arm the kitty keyboard flags. A reattaching client starts with an
-        // empty stack, so re-emit the resolved current flags via the set form
-        // (idempotent) rather than replaying the app's push/pop history.
-        if self.kitty_kbd != 0 {
-            funs.push(Function::KittyKeyboardSet(self.kitty_kbd, 1));
-        }
+        // re-arm the active buffer's kitty keyboard state — current flags and the
+        // full push/pop stack — so a reattaching app can still pop back through
+        // the modes it nested. The parked buffer's stack is restored inside its
+        // own buffer window above (sections 4–6), where the alt-buffer switch
+        // swaps it into the right slot.
+        push_kitty_kbd_restore(&self.kitty_kbd_stack, self.kitty_kbd, &mut funs);
 
         // 15. re-enable non-display modes (mouse / focus / paste). Order is
         // deterministic (BTreeSet by discriminant) and these don't move the
@@ -3804,6 +3842,32 @@ fn push_protection(funs: &mut Vec<Function>, protection: Protection) {
         Protection::None => {}
         Protection::Dec => funs.push(Function::Decsca(1)),
         Protection::Iso => funs.push(Function::Spa),
+    }
+}
+
+/// Rebuild one screen buffer's kitty-keyboard state — the current flags plus its
+/// whole push/pop stack — into whichever buffer is active in the replay right
+/// now. `Set(stack[0])` seeds the base, each further stack entry is a `Push`, and
+/// a final `Push(current)` leaves `current` on top with the stack underneath it
+/// (a push saves the prior current, so `Set(s0), Push(s1..sn-1), Push(current)`
+/// reproduces stack `[s0..sn-1]` + current exactly). An empty stack collapses to
+/// a single `Set` — skipped when current is 0, since a fresh buffer is already
+/// there. A non-empty stack always emits, even at current 0: `>0u` then a value
+/// leaves a real `[0]` under it that a bare `Set` could not express.
+fn push_kitty_kbd_restore(stack: &[u8], current: u8, funs: &mut Vec<Function>) {
+    match stack.split_first() {
+        None => {
+            if current != 0 {
+                funs.push(Function::KittyKeyboardSet(current, 1));
+            }
+        }
+        Some((&base, rest)) => {
+            funs.push(Function::KittyKeyboardSet(base, 1));
+            for &flags in rest {
+                funs.push(Function::KittyKeyboardPush(flags));
+            }
+            funs.push(Function::KittyKeyboardPush(current));
+        }
     }
 }
 
@@ -5361,13 +5425,19 @@ mod tests {
         term.execute(Function::KittyKeyboardPop(9));
         assert_eq!(term.kitty_keyboard_flags(), 0);
 
-        // The resolved current flags are re-emitted on dump (as the set form);
-        // RIS clears them.
+        // The state is re-emitted on dump so a reattach can pop back through it:
+        // this push leaves stack [0] under current 5, which dumps as the base set
+        // plus a push, and replays to exactly that.
         term.execute(Function::KittyKeyboardPush(5));
-        assert!(
-            term.dump().contains(&Function::KittyKeyboardSet(5, 1)),
-            "kitty keyboard flags must be re-emitted on dump"
-        );
+        let mut resumed = Terminal::new((4, 2), None);
+        for f in term.dump() {
+            resumed.execute(f);
+        }
+        assert_eq!(resumed.kitty_keyboard_flags(), 5);
+        resumed.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(resumed.kitty_keyboard_flags(), 0);
+
+        // RIS clears the live flags.
         term.execute(Function::Ris);
         assert_eq!(term.kitty_keyboard_flags(), 0);
     }
@@ -5393,6 +5463,50 @@ mod tests {
             DecMode::SaveCursorAltScreenBuffer,
         )));
         assert_eq!(term.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn dump_restores_both_screens_kitty_stacks_not_just_the_current_flags() {
+        // A dump must carry the whole per-buffer push/pop stack, on BOTH screens,
+        // so a reattaching app can still pop back through the modes it nested —
+        // not just land on the resolved current flags.
+        let mut term = Terminal::new((4, 2), None);
+
+        // Primary screen: nest 1 then 5, leaving stack [0, 1] under current 5.
+        term.execute(Function::KittyKeyboardPush(1));
+        term.execute(Function::KittyKeyboardPush(5));
+
+        // Alternate screen keeps its own independent stack: nest 8 then 12.
+        term.execute(Function::Decset(DecModes::one(
+            DecMode::SaveCursorAltScreenBuffer,
+        )));
+        term.execute(Function::KittyKeyboardPush(8));
+        term.execute(Function::KittyKeyboardPush(12));
+        assert_eq!(term.kitty_keyboard_flags(), 12);
+
+        // Replay the dump into a fresh same-size terminal, as a reattach does.
+        let mut resumed = Terminal::new((4, 2), None);
+        for f in term.dump() {
+            resumed.execute(f);
+        }
+        term.assert_eq(&resumed);
+
+        // Behavioural proof the stacks (not merely the current flags) came back:
+        // pop down the active (alternate) screen, cross to the primary, pop it.
+        assert_eq!(resumed.kitty_keyboard_flags(), 12);
+        resumed.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(resumed.kitty_keyboard_flags(), 8);
+        resumed.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(resumed.kitty_keyboard_flags(), 0);
+
+        resumed.execute(Function::Decrst(DecModes::one(
+            DecMode::SaveCursorAltScreenBuffer,
+        )));
+        assert_eq!(resumed.kitty_keyboard_flags(), 5);
+        resumed.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(resumed.kitty_keyboard_flags(), 1);
+        resumed.execute(Function::KittyKeyboardPop(1));
+        assert_eq!(resumed.kitty_keyboard_flags(), 0);
     }
 
     #[test]
