@@ -2420,10 +2420,14 @@ impl App {
                     // Live remote preview: observe the session over its host's
                     // transport, feeding the tile exactly like a local observer.
                     if self.bench.is_none()
-                        && self
-                            .windows
-                            .get(&wid)
-                            .is_some_and(|w| !w.observers.contains_key(&id))
+                        && self.windows.get(&wid).is_some_and(|w| {
+                            // Never observe a session this window already drives:
+                            // an observer plus a display client double-feeds the one
+                            // emulator, garbling it unhealably (finding #7). The core
+                            // stops asking, but the executor is the last seam where
+                            // both sets are live, so it holds the invariant too.
+                            !w.observers.contains_key(&id) && !w.sessions.contains_key(&id)
+                        })
                         && let Some((target, real)) = self.remote_index.get(&id).cloned()
                     {
                         match self.observe_remote(&target, &real) {
@@ -2450,7 +2454,10 @@ impl App {
                 Cmd::Observe(id) => {
                     if self.bench.is_none()
                         && let Some(w) = self.windows.get_mut(&wid)
+                        // Never observe a session this window already drives — see
+                        // the remote arm above (finding #7).
                         && !w.observers.contains_key(&id)
+                        && !w.sessions.contains_key(&id)
                     {
                         match Subscriber::observe(&id) {
                             Ok(sub) => {
@@ -4512,6 +4519,13 @@ impl ApplicationHandler<UserEvent> for App {
         // resync, which heals any pre-resize bytes fed to the new mirror.
         let mut observed: Vec<(WindowId, UiEvent)> = Vec::new();
         for (wid, w) in self.windows.iter_mut() {
+            // A session must never be both driven (a display client in `sessions`)
+            // and observed at once — that double-feeds its one emulator. The Observe
+            // guards keep the sets disjoint; assert it here where both are in hand.
+            debug_assert!(
+                w.observers.keys().all(|k| !w.sessions.contains_key(k)),
+                "a session is both driven and observed — double-feed (finding #7)"
+            );
             let mut dead = Vec::new();
             for (name, sub) in w.observers.iter_mut() {
                 let p = sub.pump().unwrap_or_default();

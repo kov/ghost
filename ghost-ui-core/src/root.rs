@@ -1331,7 +1331,17 @@ impl RootModel {
                 .into_iter()
                 .filter(|c| !c.reaches_the_desktop() && !matches!(c, Cmd::Redraw))
                 .collect(),
-            _ => Vec::new(), // not a session this window mirrors
+            // Not a session this window mirrors: the feed has nowhere to land.
+            // This is the under-delivery mirror of the double-feed hazard — a
+            // breadcrumb so a dropped feed is diagnosable, not silent (finding #7).
+            _ => {
+                tracing::debug!(
+                    target: "ghost::feed",
+                    session = %name,
+                    "feed_warm dropped output for a session with no warm mirror"
+                );
+                Vec::new()
+            }
         };
         if ended {
             // A dead background session is no longer ours: drop its mirror, its
