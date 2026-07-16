@@ -220,6 +220,26 @@ pub fn probe_line() -> String {
     format!("{PROBE_MARKER} proto={}", crate::protocol::PROTO_LEVEL)
 }
 
+/// Whether a `__probe` reply is from a remote ghost this initiator can actually
+/// speak to: it must carry the [`PROBE_MARKER`] AND advertise a protocol level at
+/// least our own, so every frame we may send is one the remote can decode.
+///
+/// A remote *below* our level — or one too old to print `proto=` at all — is
+/// rejected even though it answered, so [`negotiate`](RemoteSsh::negotiate) skips
+/// it and stages a version-matched copy rather than preferring a stale `ghost` on
+/// the remote `PATH` that would mis-decode our newer frames (postcard tags enum
+/// variants positionally; see [`crate::protocol`]).
+fn probe_reply_speaks_our_protocol(reply: &str) -> bool {
+    if !reply.contains(PROBE_MARKER) {
+        return false;
+    }
+    reply
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("proto="))
+        .and_then(|level| level.parse::<u32>().ok())
+        .is_some_and(|proto| proto >= crate::protocol::PROTO_LEVEL)
+}
+
 /// One multiplexed ssh connection to a host, for the transport initiator.
 pub struct RemoteSsh {
     spec: ConnectionSpec,
@@ -522,7 +542,7 @@ impl RemoteSsh {
             use std::io::Read as _;
             let _ = out.read_to_string(&mut buf);
         }
-        buf.contains(PROBE_MARKER)
+        probe_reply_speaks_our_protocol(&buf)
     }
 
     /// Copy `binary` (the resolver's pick — our own exe or a prebuilt for the
@@ -847,6 +867,31 @@ mod tests {
             resolve_for(foreign, local, Some(&exe), &search),
             Some(prebuilt)
         );
+    }
+
+    #[test]
+    fn a_probe_reply_is_accepted_only_at_or_above_our_protocol_level() {
+        // Our own probe line passes, and a remote at or above our level passes — a
+        // newer host decodes every frame we might send.
+        assert!(probe_reply_speaks_our_protocol(&probe_line()));
+        assert!(probe_reply_speaks_our_protocol("ghost-transport proto=999"));
+
+        // A remote BELOW our level is rejected even though it answered, so negotiate
+        // stages a version-matched copy instead of preferring a stale PATH ghost that
+        // would mis-decode our newer frames.
+        let below = crate::protocol::PROTO_LEVEL - 1;
+        assert!(
+            !probe_reply_speaks_our_protocol(&format!("ghost-transport proto={below}")),
+            "an under-level remote must be rejected"
+        );
+        // A ghost too old to print `proto=` at all is rejected.
+        assert!(!probe_reply_speaks_our_protocol("ghost-transport"));
+        // Not a ghost — a shell that echoed the command line carries no marker.
+        assert!(!probe_reply_speaks_our_protocol("ghost __probe"));
+        // A non-numeric proto is not a pass.
+        assert!(!probe_reply_speaks_our_protocol(
+            "ghost-transport proto=abc"
+        ));
     }
 
     #[test]
