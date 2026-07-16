@@ -22,7 +22,7 @@ use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -403,6 +403,18 @@ fn host_main(
     listener.set_nonblocking(true)?;
 
     let (pty, pts) = open().map_err(io::Error::other)?;
+    // Non-blocking master: writes into the child are queued and drained under
+    // POLLOUT (see `pty_out` below), never done with a blocking `write_all`. A
+    // blocking write would wedge this single-threaded loop the moment the child
+    // stopped reading its stdin (e.g. it is itself blocked on a full stdout),
+    // deadlocking the two. The read path already tolerates `WouldBlock`.
+    {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+        let fd = pty.as_fd();
+        let mut flags = fcntl_getfl(fd).map_err(io::Error::from)?;
+        flags.set(OFlags::NONBLOCK, true);
+        fcntl_setfl(fd, flags).map_err(io::Error::from)?;
+    }
     let (cols, rows) = opts.size;
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
@@ -545,6 +557,15 @@ fn host_main(
     // a reflow cannot be patched from outside.
     let mut last_grid = screen.dimensions();
     let mut ptybuf = [0u8; 8192];
+    // Bytes bound for the child's PTY, buffered here rather than written with a
+    // blocking `write_all`: client input, and — while detached — the query and
+    // graphics replies the host answers itself. Drained under POLLOUT at the end
+    // of each turn (see the drain step below). Unbounded, like the display
+    // client's own outbound queue: a child that never reads lets this grow, but
+    // that is strictly better than the deadlock a blocking write would cause, and
+    // realistically the child resumes reading. (Read-side throttling of the
+    // client socket is the future direction if that ever needs a bound.)
+    let mut pty_out: Vec<u8> = Vec::new();
     // Spots the child's terminal queries so the host can answer them while no
     // client is attached to do so (kept fed every chunk to track split sequences).
     let mut queries = crate::query::QueryScanner::new();
@@ -555,8 +576,14 @@ fn host_main(
     loop {
         // Build the poll set: fixed fds first, then the display client (if any),
         // then the pending connections.
+        let mut pty_flags = PollFlags::IN;
+        if !pty_out.is_empty() {
+            // Queued input waiting on a full child: wake when the master can take
+            // more, so the end-of-turn drain makes progress.
+            pty_flags |= PollFlags::OUT;
+        }
         let mut fds = vec![
-            PollFd::new(&pty, PollFlags::IN),
+            PollFd::new(&pty, pty_flags),
             PollFd::new(listener, PollFlags::IN),
             PollFd::new(&sfd, PollFlags::IN),
         ];
@@ -626,6 +653,7 @@ fn host_main(
             match service_display_client(
                 &mut client,
                 &pty,
+                &mut pty_out,
                 &mut screen,
                 &mut recorder,
                 current_name,
@@ -696,6 +724,7 @@ fn host_main(
                             service_display_client(
                                 &mut client,
                                 &pty,
+                                &mut pty_out,
                                 &mut screen,
                                 &mut recorder,
                                 current_name,
@@ -765,8 +794,7 @@ fn host_main(
                         for q in asked {
                             reply.extend_from_slice(&q.reply(&ctx));
                         }
-                        let mut w: &pty_process::blocking::Pty = &pty;
-                        let _ = w.write_all(&reply);
+                        pty_out.extend_from_slice(&reply);
                     }
                     // kitty graphics acknowledgements are stateful, so they come
                     // from the emulator rather than the scanner. Drain them every
@@ -775,8 +803,7 @@ fn host_main(
                     // graphics-capable outer terminal answers via the pipe.
                     let graphics_reply = screen.take_graphics_responses();
                     if client.is_none() && !graphics_reply.is_empty() {
-                        let mut w: &pty_process::blocking::Pty = &pty;
-                        let _ = w.write_all(&graphics_reply);
+                        pty_out.extend_from_slice(&graphics_reply);
                     }
                     // OSC 52 clipboard writes are applied by an attached
                     // frontend (which feeds its own emulator from the same
@@ -892,6 +919,7 @@ fn host_main(
                         &mut s,
                         msgs,
                         &pty,
+                        &mut pty_out,
                         &mut screen,
                         &mut recorder,
                         current_name,
@@ -935,6 +963,7 @@ fn host_main(
                         &mut p,
                         msgs,
                         &pty,
+                        &mut pty_out,
                         &mut screen,
                         &mut recorder,
                         current_name,
@@ -987,6 +1016,29 @@ fn host_main(
             && c.flush().is_err()
         {
             client = None;
+        }
+
+        // Drain queued child-bound input as far as the non-blocking master will
+        // accept, keeping the remainder for the next POLLOUT wake — so a child
+        // that has stopped reading throttles the input rather than wedging the
+        // loop. Runs every turn after all the sites that enqueue (client input,
+        // detached query/graphics replies). A hard write error means the child is
+        // gone: there is nowhere to deliver these bytes, so drop them and let the
+        // read path drive the clean, tail-complete exit — finalizing from here
+        // could truncate output still buffered on the master.
+        while !pty_out.is_empty() {
+            match (&pty).write(&pty_out) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pty_out.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    pty_out.clear();
+                    break;
+                }
+            }
         }
 
         // Reconcile the attach marker with the display client's presence. All the
@@ -1147,6 +1199,7 @@ enum Disposition {
 fn service_display_client(
     client: &mut Option<Client>,
     pty: &pty_process::blocking::Pty,
+    pty_out: &mut Vec<u8>,
     screen: &mut Screen,
     recorder: &mut Option<crate::record::FileRecorder>,
     current_name: &str,
@@ -1164,6 +1217,7 @@ fn service_display_client(
             c,
             msgs,
             pty,
+            pty_out,
             screen,
             recorder,
             current_name,
@@ -1189,6 +1243,7 @@ fn handle_client_messages(
     c: &mut Client,
     msgs: Vec<ClientMsg>,
     pty: &pty_process::blocking::Pty,
+    pty_out: &mut Vec<u8>,
     screen: &mut Screen,
     recorder: &mut Option<crate::record::FileRecorder>,
     current_name: &str,
@@ -1200,8 +1255,7 @@ fn handle_client_messages(
     for msg in msgs {
         match msg {
             ClientMsg::Input(bytes) => {
-                let mut w: &pty_process::blocking::Pty = pty;
-                w.write_all(&bytes)?;
+                pty_out.extend_from_slice(&bytes);
             }
             ClientMsg::Resize { cols, rows } => {
                 let _ = pty.resize(Size::new(rows, cols));
