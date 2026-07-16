@@ -5708,7 +5708,7 @@ mod tests {
         use super::{key, model};
         use crate::input::{Key, Mods, NamedKey};
         use crate::{Cmd, UiEvent};
-        use ghost_render::{Frame, SceneItem, TermDamage, rows_differ_outside};
+        use ghost_render::{Frame, SceneItem, TermDamage, layout_frame_at, rows_differ_outside};
         use proptest::prelude::*;
         use std::rc::Rc;
 
@@ -5869,6 +5869,68 @@ mod tests {
                             last_present = cur;
                         }
                     }
+                }
+            }
+        }
+
+        /// Lay out the CURRENT session state directly, BYPASSING the view's frame
+        /// memo — the ground truth the memoized frame must always equal.
+        fn fresh_frame(m: &super::TerminalModel) -> Frame {
+            layout_frame_at(
+                m.state.screen().vt(),
+                m.view.effective_metrics(),
+                m.view.scroll_offset,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+
+            /// The frame the renderer idle-skips on is the one the view's memo hands
+            /// it; the renderer trusts pointer identity, so a stale memo is a silently
+            /// stranded frame — the foreground-stall bug class. This is the deep frame
+            /// compare the renderer no longer runs, retired into an oracle: after every
+            /// operation the memoized frame must equal a from-scratch layout of the
+            /// current state. A content mutation that forgot to bump `content_gen`
+            /// leaves the key unchanged, so the memo returns the pre-mutation frame and
+            /// this reds — which no distributed damage-bump scheme could catch locally.
+            #[test]
+            fn the_frame_memo_never_hands_the_renderer_a_stale_frame(
+                ops in prop::collection::vec(op(), 1..80),
+            ) {
+                let mut m = model();
+                for op in ops {
+                    match op {
+                        Op::Feed(bytes) => {
+                            m.update(UiEvent::SessionData {
+                                name: "alpha".to_string(),
+                                bytes,
+                                ended: false,
+                            });
+                        }
+                        Op::Tick => {
+                            m.update(UiEvent::Tick { now_ms: 1_000 });
+                        }
+                        Op::ScrollUp => {
+                            key(&mut m, Key::Named(NamedKey::PageUp), Mods::SHIFT);
+                        }
+                        Op::ScrollDown => {
+                            key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+                        }
+                        Op::Resize { w_px, h_px } => {
+                            m.update(UiEvent::Resize { w_px, h_px, scale: 1.0 });
+                        }
+                        Op::Present => {
+                            m.mark_presented();
+                        }
+                    }
+                    let (memoized, _) = frame_and_damage(&m);
+                    let fresh = fresh_frame(&m);
+                    prop_assert!(
+                        *memoized == fresh,
+                        "the frame memo returned a stale frame — a content mutation \
+                         didn't bump content_gen"
+                    );
                 }
             }
         }
