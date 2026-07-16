@@ -480,7 +480,6 @@ pub struct FleetModel {
     /// Device scale factor, propagated to every tile so previews track HiDPI.
     scale: f32,
     size_px: (u32, u32),
-    mine: HashSet<SessionId>,
     next_handle: u64,
     /// Hit/miss tallies for the per-tile preview-frame cache: a dirty tile re-lays-out
     /// (miss + insert), an unchanged tile keeps its `Rc<Frame>` (hit). Lets a test — and
@@ -671,14 +670,13 @@ struct Grab {
 }
 
 impl FleetModel {
-    pub fn new(metrics: CellMetrics, size_px: (u32, u32), mine: HashSet<SessionId>) -> Self {
+    pub fn new(metrics: CellMetrics, size_px: (u32, u32)) -> Self {
         FleetModel {
             tiles: Vec::new(),
             focused: None,
             metrics,
             scale: 1.0,
             size_px,
-            mine,
             next_handle: 0,
             frames: CacheCounters::default(),
             pending: None,
@@ -757,16 +755,16 @@ impl FleetModel {
         metrics: CellMetrics,
         size_px: (u32, u32),
         scale: f32,
-        mine: HashSet<SessionId>,
+        mine: &HashSet<SessionId>,
     ) -> (Self, Vec<Cmd>) {
-        let mut f = FleetModel::new(metrics, size_px, mine);
+        let mut f = FleetModel::new(metrics, size_px);
         f.scale = scale;
         f.focused = Some(primary_id.clone());
         // The primary and the window's other driven sessions are all already
         // live; add each as a fed tile so every preview is warm, not "starting…".
         // Command/pid fill in on the next reconcile.
         for (id, view) in std::iter::once((primary_id, primary_view)).chain(warm) {
-            let locality = locality_for(&f.mine, &id, true);
+            let locality = locality_for(mine, &id, true);
             let (grid, display_name) = sessions
                 .get(&id)
                 .map(|s| (s.dims(), s.display_name().to_string()))
@@ -1012,7 +1010,7 @@ impl FleetModel {
             .or_else(|| {
                 self.tiles
                     .iter()
-                    .find(|t| self.mine.contains(&t.id))
+                    .find(|t| t.locality == Locality::ThisWindow)
                     .map(|t| t.id.clone())
             })
             .or_else(|| {
@@ -1061,7 +1059,6 @@ impl FleetModel {
         scale: f32,
     ) -> Extracted {
         let metrics = self.metrics;
-        let mine = self.mine.clone();
         // Leaving the overview closes every live mirror; the single view's
         // sessions are fed by their own clients, and a re-opened fleet
         // re-observes from a fresh snapshot.
@@ -1084,7 +1081,7 @@ impl FleetModel {
                     tile.id,
                 );
                 kept = Some((tile.id, tile.view));
-            } else if mine.contains(&tile.id) {
+            } else if tile.locality == Locality::ThisWindow {
                 warm.push((tile.id, tile.view)); // a driven session: keep it warm
             } else {
                 dropped.push(tile.id); // a foreign preview: its state goes too
@@ -1118,11 +1115,16 @@ impl FleetModel {
 
     // ---- update ----
 
-    pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
+    pub fn update(
+        &mut self,
+        sessions: &mut Sessions,
+        mine: &HashSet<SessionId>,
+        ev: UiEvent,
+    ) -> Vec<Cmd> {
         let mut cmds = match ev {
-            UiEvent::SessionList(infos) => self.reconcile(sessions, infos),
+            UiEvent::SessionList(infos) => self.reconcile(sessions, mine, infos),
             UiEvent::DeadSessions(dead) => self.dead_sessions(sessions, dead),
-            UiEvent::SessionPush { name, push } => self.session_push(sessions, &name, push),
+            UiEvent::SessionPush { name, push } => self.session_push(sessions, mine, &name, push),
             // Authoritative groups from the shell (startup load, or another
             // window saved): replace ours without echoing a save back (the
             // sync below re-adds my entry — and re-saves — only if the
@@ -1231,7 +1233,12 @@ impl FleetModel {
         self.frames
     }
 
-    fn reconcile(&mut self, sessions: &mut Sessions, infos: Vec<SessionInfo>) -> Vec<Cmd> {
+    fn reconcile(
+        &mut self,
+        sessions: &mut Sessions,
+        mine: &HashSet<SessionId>,
+        infos: Vec<SessionInfo>,
+    ) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         let mut dirty = false;
         let new_ids: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
@@ -1285,7 +1292,7 @@ impl FleetModel {
             if self.killed.contains(&info.name) {
                 continue;
             }
-            let locality = locality_for(&self.mine, &info.name, info.attached);
+            let locality = locality_for(mine, &info.name, info.attached);
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
                 // A just-committed rename defends its optimistic label: don't let a
                 // listing that hasn't caught up (a remote rename still in flight)
@@ -1503,10 +1510,15 @@ impl FleetModel {
     /// moment the host pushes them instead of on the next list. A push for a
     /// session with no tile yet is dropped — the reconcile seeds tiles, and
     /// the list it reads carries the same state.
-    fn session_push(&mut self, sessions: &mut Sessions, id: &str, push: SessionPush) -> Vec<Cmd> {
+    fn session_push(
+        &mut self,
+        sessions: &mut Sessions,
+        mine: &HashSet<SessionId>,
+        id: &str,
+        push: SessionPush,
+    ) -> Vec<Cmd> {
         let focused = self.focused.as_deref() == Some(id);
         let observed = self.observing.contains(id);
-        let mine = &self.mine;
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) else {
             return Vec::new();
         };
@@ -1983,17 +1995,18 @@ impl FleetModel {
         ended: bool,
     ) -> Vec<Cmd> {
         let background = self.focused.as_deref() != Some(name);
-        // Whether this window DRIVES the session (has a client for it) or only
-        // observes it. An observed tile has no write path, so its emulator's query
-        // replies must be dropped in the core rather than leak out as SendInput the
-        // shell silently discards (finding #4).
-        let driven = self.mine.contains(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
         let observation_ended = ended && self.observing.remove(name);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
             return Vec::new();
         };
+        // Whether this window DRIVES the session (has a client for it) or only
+        // observes it — a ThisWindow tile is driven. An observed tile has no
+        // write path, so its emulator's query replies must be dropped in the
+        // core rather than leak out as SendInput the shell silently discards
+        // (finding #4).
+        let driven = tile.locality == Locality::ThisWindow;
         let Some(state) = sessions.get_mut(name) else {
             return Vec::new();
         };
@@ -2531,10 +2544,17 @@ impl FleetModel {
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
         }
-        let newly = self.mine.insert(id.clone());
-        if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+        // Ownership is a projection of the tile's locality (the root re-derives
+        // `mine` from the fleet's ThisWindow tiles after each update); flipping
+        // the tile IS the claim. `newly` — whether an Attach is owed — is whether
+        // the tile wasn't already ours (idempotent for an already-driven member).
+        let newly = if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+            let was_mine = t.locality == Locality::ThisWindow;
             t.locality = Locality::ThisWindow;
-        }
+            !was_mine
+        } else {
+            true
+        };
         for g in &mut self.groups {
             if g.id != self.my_group.id {
                 g.members.retain(|m| m != id);
@@ -2571,7 +2591,7 @@ impl FleetModel {
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
         }
-        self.mine.remove(id);
+        // Removing the tile drops the session from the root's re-derived `mine`.
         self.marked.remove(id);
         self.killed.insert(id.clone());
         self.tiles.retain(|t| &t.id != id);
@@ -2701,7 +2721,8 @@ impl FleetModel {
     /// commands (the client drop and the observation).
     fn detach_session(&mut self, id: &SessionId) -> Vec<Cmd> {
         let mut cmds = vec![Cmd::Detach(id.clone())];
-        self.mine.remove(id);
+        // Flipping the tile off ThisWindow IS the release: the root re-derives
+        // `mine` from the fleet's ThisWindow tiles after this update.
         if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
             t.locality = Locality::Detached;
         }
@@ -2859,7 +2880,10 @@ impl FleetModel {
         // instead merges the members into its group, and the claims strip
         // them from the source, which dissolves once emptied.
         if gid != self.my_group.id
-            && self.mine.is_empty()
+            && !self
+                .tiles
+                .iter()
+                .any(|t| t.locality == Locality::ThisWindow)
             && self.group(&self.my_group.id).is_none()
             && self.group_is_closed(gid)
             && let Some(g) = self.group(gid)
@@ -3991,6 +4015,10 @@ mod tests {
     struct Fleet {
         m: FleetModel,
         s: Sessions,
+        /// The window's single ownership set — the real one lives on `RootModel`.
+        /// Threaded into the session-taking calls and re-derived from the fleet's
+        /// tiles after each update, exactly as the root does.
+        mine: HashSet<SessionId>,
     }
 
     impl std::ops::Deref for Fleet {
@@ -4008,8 +4036,9 @@ mod tests {
     impl Fleet {
         fn new(metrics: CellMetrics, size_px: (u32, u32), mine: HashSet<SessionId>) -> Self {
             Fleet {
-                m: FleetModel::new(metrics, size_px, mine),
+                m: FleetModel::new(metrics, size_px),
                 s: Sessions::new(),
+                mine,
             }
         }
 
@@ -4042,13 +4071,29 @@ mod tests {
                 metrics,
                 size_px,
                 scale,
-                mine,
+                &mine,
             );
-            (Fleet { m, s }, cmds)
+            (Fleet { m, s, mine }, cmds)
         }
 
         fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-            self.m.update(&mut self.s, ev)
+            let cmds = self.m.update(&mut self.s, &self.mine, ev);
+            // Mirror ownership Cmds into `mine`, standing in for the root's two
+            // seams: Attach/Kill at its update boundary, Detach in
+            // `release_detached`. A claim emits Attach, a detach Detach, a kill
+            // Kill; everything else (a Resize, a feed) leaves ownership alone.
+            for c in &cmds {
+                match c {
+                    Cmd::Attach(id) => {
+                        self.mine.insert(id.clone());
+                    }
+                    Cmd::Detach(id) | Cmd::Kill(id) => {
+                        self.mine.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+            cmds
         }
 
         fn view(&self) -> Scene {
@@ -4060,7 +4105,7 @@ mod tests {
         }
 
         fn into_single(self, size_px: (u32, u32), scale: f32) -> Extracted {
-            let Fleet { m, mut s } = self;
+            let Fleet { m, mut s, mine: _ } = self;
             m.into_single(&mut s, size_px, scale)
         }
 
@@ -4070,12 +4115,12 @@ mod tests {
             size_px: (u32, u32),
             scale: f32,
         ) -> Extracted {
-            let Fleet { m, mut s } = self;
+            let Fleet { m, mut s, mine: _ } = self;
             m.into_single_keeping(&mut s, target, size_px, scale)
         }
 
         fn into_single_adopting(self, id: SessionId, size_px: (u32, u32), scale: f32) -> Extracted {
-            let Fleet { m, mut s } = self;
+            let Fleet { m, mut s, mine: _ } = self;
             m.into_single_adopting(&mut s, id, size_px, scale)
         }
 

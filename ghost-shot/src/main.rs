@@ -755,17 +755,17 @@ fn calib_scene(size: (u32, u32), count: usize) -> ghost_render::Scene {
         METRICS,
         size,
         1.0,
-        mine,
+        &mine,
     );
     let infos: Vec<_> = names
         .iter()
         .enumerate()
         .map(|(i, n)| info(n, true, &[], i as i32 + 1))
         .collect();
-    fleet.update(&mut sessions, UiEvent::SessionList(infos));
+    fleet.update(&mut sessions, &mine, UiEvent::SessionList(infos));
     let cal = calibration_screen(80, 24);
     for n in &names {
-        feed(&mut fleet, &mut sessions, n, &cal);
+        feed(&mut fleet, &mut sessions, &mine, n, &cal);
     }
     fleet.view(&sessions)
 }
@@ -810,12 +810,13 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
         METRICS,
         size,
         1.0,
-        mine,
+        &mine,
     );
     fleet.set_my_group(ghost_ui_core::Group::auto("win-shot-0".to_string(), 0));
 
     fleet.update(
         &mut sessions,
+        &mine,
         UiEvent::SessionList(vec![
             info("edit", true, &["nvim", "src/fleet.rs"], 4011),
             info("build", true, &[], 4012),
@@ -826,14 +827,15 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     );
 
     // Live previews for the sessions this window drives.
-    feed(&mut fleet, &mut sessions, "edit", EDIT);
-    feed(&mut fleet, &mut sessions, "build", BUILD);
+    feed(&mut fleet, &mut sessions, &mine, "edit", EDIT);
+    feed(&mut fleet, &mut sessions, &mine, "build", BUILD);
 
     // The detached session is observed, and its mirror has the session's OWN
     // grid — a square-ish 100×50 here — so its card takes that shape instead
     // of the window's aspect.
     fleet.update(
         &mut sessions,
+        &mine,
         UiEvent::SessionPush {
             name: "prod".to_string(),
             push: ghost_ui_core::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
@@ -845,6 +847,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     feed(
         &mut fleet,
         &mut sessions,
+        &mine,
         "prod",
         "$ uptime\r\n 14:02:11 up 41 days,  3:07,  1 user\r\n$ ",
     );
@@ -880,6 +883,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     ]);
     fleet.update(
         &mut sessions,
+        &mine,
         UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
             name: "db".to_string(),
             display_name: String::new(),
@@ -890,6 +894,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     feed(
         &mut fleet,
         &mut sessions,
+        &mine,
         "db",
         "prod=# select count(*) from orders;\r\n count \r\n-------\r\n 42917\r\n(1 row)\r\n\r\nprod=# ",
     );
@@ -1124,9 +1129,16 @@ fn single_scene() -> (ghost_render::Scene, u32, u32) {
     (root.view(), size.0, size.1)
 }
 
-fn feed(fleet: &mut FleetModel, sessions: &mut Sessions, name: &str, content: &str) {
+fn feed(
+    fleet: &mut FleetModel,
+    sessions: &mut Sessions,
+    mine: &HashSet<String>,
+    name: &str,
+    content: &str,
+) {
     fleet.update(
         sessions,
+        mine,
         UiEvent::SessionData {
             name: name.to_string(),
             bytes: content.as_bytes().to_vec(),

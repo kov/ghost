@@ -625,7 +625,7 @@ impl RootModel {
     /// (the reconcile reply re-arms the periodic refresh).
     pub fn fleet(metrics: CellMetrics, size_px: (u32, u32), scale: f32) -> (Self, Vec<Cmd>) {
         let root = RootModel {
-            mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px, HashSet::new()))),
+            mode: Mode::Fleet(Box::new(FleetModel::new(metrics, size_px))),
             metrics,
             sessions: Sessions::new(),
             size_px,
@@ -708,7 +708,7 @@ impl RootModel {
                     .expect("foreground session state present");
                 view.update(state, ev)
             }
-            Mode::Fleet(f) => f.update(&mut self.sessions, ev),
+            Mode::Fleet(f) => f.update(&mut self.sessions, &self.mine, ev),
         }
     }
 
@@ -964,20 +964,31 @@ impl RootModel {
 
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
         let cmds = self.update_dispatch(ev);
-        // Enforce the resync/reseed contract at the one boundary every command
-        // crosses. A Cmd::Attach means a session just became driven here, and the
-        // attach's resync — which carries the whole screen AND its scrollback — is
-        // on its way. Rebuild that session's mirror to a fresh emulator so the
-        // resync lands clean: an observed/previewed session's warm mirror already
-        // holds that history, and replaying it on top would double the scrollback.
-        // This matches a cold attach (a fresh emulator the resync fills) and holds
-        // for every present and future Cmd::Attach emitter, wherever it routes.
-        if cmds.iter().any(|c| matches!(c, Cmd::Attach(_))) {
-            let (cols, rows) = self.grid();
-            for c in &cmds {
-                if let Cmd::Attach(id) = c {
+        // Mirror ownership changes into the window's single `mine` set at the one
+        // boundary every command crosses (finding #18): a fleet claim emits a
+        // Cmd::Attach — the session became driven here — and a kill emits a
+        // Cmd::Kill — it's gone. The fleet owns no ownership set of its own, so
+        // this seam is where its claims and kills reach the window. (A detach's
+        // release, which also drops the warm mirror and its state, is handled in
+        // `release_detached`.)
+        //
+        // A Cmd::Attach also enforces the resync/reseed contract: the attach's
+        // resync — which carries the whole screen AND its scrollback — is on its
+        // way, so rebuild that session's mirror to a fresh emulator or the replay
+        // doubles the scrollback (an observed/previewed session's warm mirror
+        // already holds that history). This matches a cold attach and holds for
+        // every present and future Cmd::Attach emitter, wherever it routes.
+        let (cols, rows) = self.grid();
+        for c in &cmds {
+            match c {
+                Cmd::Attach(id) => {
+                    self.mine.insert(id.clone());
                     self.sessions.rebuild(id, cols, rows);
                 }
+                Cmd::Kill(id) => {
+                    self.mine.remove(id);
+                }
+                _ => {}
             }
         }
         cmds
@@ -1050,7 +1061,11 @@ impl RootModel {
         if let UiEvent::GroupsLoaded(groups) = ev {
             self.groups = groups.clone();
             return match &mut self.mode {
-                Mode::Fleet(f) => f.update(&mut self.sessions, UiEvent::GroupsLoaded(groups)),
+                Mode::Fleet(f) => f.update(
+                    &mut self.sessions,
+                    &self.mine,
+                    UiEvent::GroupsLoaded(groups),
+                ),
                 Mode::Single { .. } => Vec::new(),
             };
         }
@@ -1129,7 +1144,7 @@ impl RootModel {
         {
             let name = name.clone();
             let mut cmds = match &mut self.mode {
-                Mode::Fleet(f) => f.update(&mut self.sessions, ev),
+                Mode::Fleet(f) => f.update(&mut self.sessions, &self.mine, ev),
                 Mode::Single { .. } => unreachable!(),
             };
             if self.pending_dive_in.as_deref() == Some(name.as_str())
@@ -1161,7 +1176,11 @@ impl RootModel {
                     resize_model(view, state, self.size_px, self.scale, self.pad)
                 }
                 Mode::Fleet(f) => {
-                    return f.update(&mut self.sessions, UiEvent::Resize { w_px, h_px, scale });
+                    return f.update(
+                        &mut self.sessions,
+                        &self.mine,
+                        UiEvent::Resize { w_px, h_px, scale },
+                    );
                 }
             };
             for (id, view) in self.warm.iter_mut() {
@@ -1562,12 +1581,16 @@ impl RootModel {
         // `sessions`, so a fleet built here needs no stamping — its tiles borrow from
         // there. (This window drives nothing now, so the grid is empty until the
         // reconcile; `sessions` is likewise empty after the dead foreground was removed.)
-        let mut fleet = FleetModel::new(self.metrics, self.size_px, self.mine.clone());
+        let mut fleet = FleetModel::new(self.metrics, self.size_px);
         fleet.set_groups(self.groups.clone());
         fleet.set_my_group(self.my_group.clone());
         // `FleetModel::new` defaults the device scale to 1.0; hand it this window's.
+        // No re-derive of `mine` here: this fleet has no tiles yet (the
+        // ListSessions reply seeds them), so the window's ownership must be
+        // preserved, not recomputed from an empty grid.
         fleet.update(
             &mut self.sessions,
+            &self.mine,
             UiEvent::Resize {
                 w_px: self.size_px.0.max(1),
                 h_px: self.size_px.1.max(1),
@@ -2183,7 +2206,7 @@ impl RootModel {
                     self.metrics,
                     self.size_px,
                     self.scale,
-                    self.mine.clone(),
+                    &self.mine,
                 );
                 fleet.set_groups(self.groups.clone());
                 fleet.set_my_group(self.my_group.clone());
@@ -2569,6 +2592,47 @@ mod tests {
         assert!(rec.fleet, "fleet overview");
         assert_eq!(rec.group_id, "w1");
         assert_eq!(rec.attached, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn a_fleet_side_claim_reaches_the_window_record_before_the_dive_lands() {
+        // Finding #18: `mine` had two owners — RootModel's and the fleet's. A
+        // group open claims its background members NOW (Cmd::Attach), but the
+        // adopt that switches the foreground round-trips through the shell. If a
+        // crash or quit persists `window_record()` in that gap — it reads the
+        // ownership set — the claim must already be there, or restore silently
+        // loses the just-claimed member. One owner makes that structural.
+        let mut r = root(); // owns "alpha"
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("gamma", false, 3)]);
+        settle(&mut r);
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g-web".into(),
+            name: "web".into(),
+            color: 0,
+            members: vec!["alpha".into(), "gamma".into()],
+            connection: None,
+        }]));
+        // Ctrl-Enter opens the group: it claims the detached member (gamma) now
+        // and dives into the first (alpha) via an adopt round-trip.
+        let cmds = key(
+            &mut r,
+            Key::Named(NamedKey::Enter),
+            Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+        );
+        assert!(
+            cmds.contains(&Cmd::Attach("gamma".into())),
+            "the group open claims the background member now: {cmds:?}"
+        );
+        assert!(r.is_fleet(), "the adopt has not round-tripped yet");
+        assert!(
+            r.window_record().attached.contains(&"gamma".to_string()),
+            "a fleet-side claim must reach the window record immediately, not \
+             wait for the fleet to close: {:?}",
+            r.window_record().attached
+        );
     }
 
     #[test]
