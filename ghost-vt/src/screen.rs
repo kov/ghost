@@ -110,13 +110,25 @@ impl Screen {
     /// Feed raw PTY bytes, decoding as much valid UTF-8 as possible and holding
     /// back only a genuinely incomplete trailing sequence for next time.
     ///
-    /// Returns the viewport rows this feed changed (sorted, deduplicated). The
-    /// contract is **"these rows definitely changed"**, not "only these changed":
+    /// Returns the viewport rows whose **cell content** (character, width, or
+    /// pen) this feed changed — sorted and deduplicated. The claim is a
+    /// **superset**: every row whose cells changed is listed, so a row that is
+    /// *not* listed had no cell change and row-banded redraw may leave it in the
+    /// surface it already holds. That one-directional guarantee is pinned by
+    /// `ghost-term`'s `damage_audit`; over-reporting is fine and deliberate —
     /// scrolling, full clears, alt-screen switches and reflow conservatively
-    /// report the whole viewport. It is a damage hint — useful to skip work when
-    /// it is *empty or small*, never to assume an unlisted row is untouched. An
-    /// empty slice means nothing in the viewport changed (e.g. a query that only
-    /// produced a reply, or bytes held back as an incomplete tail).
+    /// claim the whole viewport.
+    ///
+    /// **Cell content only.** A change that recolors or repositions without
+    /// writing a cell is *not* here — it is handled above this hint: the drawn
+    /// cursor moving, hiding, or reshaping (its own diffed channel,
+    /// [`cursor_damage`](Self::cursor_damage)), OSC 4/104 palette and OSC
+    /// 10/11/12 dynamic colors (they recolor every drawn cell — the view layer
+    /// snapshots them and forces a full repaint), and kitty-graphics placement
+    /// changes. An empty slice therefore means no viewport **cell** changed, not
+    /// that nothing observable did — a query reply, a palette edit, a bare
+    /// cursor move, or bytes held back as an incomplete UTF-8 tail all return
+    /// empty.
     pub fn feed(&mut self, bytes: &[u8]) -> &[usize] {
         self.dirty_rows.clear();
         self.pending.extend_from_slice(bytes);
