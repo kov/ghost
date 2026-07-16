@@ -2035,12 +2035,27 @@ impl RootModel {
     /// screen) and in the fleet (downscaled previews carry no row-localized damage), so
     /// on returning to a single view the foreground repaints in full once and resumes.
     pub fn mark_presented(&mut self) {
-        if self.anim.is_some() {
+        // Only when `view` actually painted the live foreground terminal. While an
+        // overlay owns the window in its place (the connect prompt, a dive/slide
+        // animation), the terminal's texture wasn't refreshed, so clearing its
+        // accumulated damage now would leave it stale when the overlay closes — the
+        // connect-prompt foreground stall.
+        if self.overlay_covers_foreground() {
             return;
         }
         if let Some((view, state)) = self.foreground_mut() {
             view.mark_presented(state);
         }
+    }
+
+    /// Whether an overlay owns the whole window in place of the live foreground
+    /// terminal — the connect prompt, or an animation (frozen textures, not a live
+    /// model). Mirrors the early returns in [`Self::view`]; keep the two in lockstep,
+    /// so [`Self::mark_presented`] never clears damage for a frame the terminal was
+    /// not actually on. (The fleet and dive-hold cases need no entry here: there is no
+    /// single foreground then, so [`Self::foreground_mut`] is already `None`.)
+    fn overlay_covers_foreground(&self) -> bool {
+        self.connect.is_some() || self.anim.is_some()
     }
 
     /// A snapshot of the live foreground session's render-gate counters, for the
@@ -3877,6 +3892,44 @@ mod tests {
             bytes: bytes.to_vec(),
             ended: false,
         })
+    }
+
+    #[test]
+    fn a_feed_behind_the_connect_prompt_is_not_marked_presented() {
+        // The connect prompt owns the whole window: `view` returns the prompt scene,
+        // not the foreground terminal. A feed that lands while the prompt is open never
+        // reaches the screen, so `mark_presented` — which the shell calls after it
+        // presents the prompt — must NOT clear that feed's damage. Clearing it leaves
+        // the terminal showing its stale pre-feed screen when the prompt closes: the
+        // connect-prompt foreground stall.
+        let mut r = root(); // single view of alpha
+        feed(&mut r, "alpha", b"before");
+        r.mark_presented();
+        assert_eq!(
+            r.foreground_trace().unwrap().feed_dirty,
+            None,
+            "baseline: a presented feed leaves no pending damage"
+        );
+
+        // Open the prompt (Cmd+G), then a feed lands on the session behind it.
+        r.begin_connect_session();
+        assert!(r.is_connecting());
+        feed(&mut r, "alpha", b"behind the prompt");
+        assert!(
+            r.foreground_trace().unwrap().feed_dirty.is_some(),
+            "the feed dirtied the foreground view"
+        );
+
+        // The shell builds and presents the prompt scene, then marks it presented.
+        let _ = r.view();
+        r.mark_presented();
+
+        // The terminal was never in that scene, so its feed damage must survive to the
+        // frame that shows the terminal again.
+        assert!(
+            r.foreground_trace().unwrap().feed_dirty.is_some(),
+            "mark_presented cleared a feed the prompt scene never painted → stale foreground on close"
+        );
     }
 
     #[test]
