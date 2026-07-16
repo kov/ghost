@@ -511,6 +511,11 @@ fn host_main(
     // A seeded session's recording must stand alone: open it with a checkpoint
     // of the inherited state, so replaying it never needs the predecessor's
     // file (which this recording typically just replaced on disk).
+    //
+    // Unlike the cadence checkpoint below, this one is NOT gated on a pending
+    // UTF-8 tail: this is a fresh child, so any incomplete trailing bytes the seed
+    // ended on have no continuation coming — they are dead bytes, and dropping
+    // them from the standalone checkpoint is correct.
     if opts.seed_from.is_some()
         && let Some(r) = &mut recorder
     {
@@ -823,7 +828,14 @@ fn host_main(
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
-                        if bytes_since_checkpoint >= checkpoint_interval {
+                        // Never checkpoint mid-split-char: the checkpoint dump can't
+                        // carry the pending UTF-8 tail, and truncation discards the
+                        // frame that held the leading bytes, so replay from it would
+                        // render the completing byte as U+FFFD. Defer to the next feed
+                        // (a byte or two away) — the budget is left UNSPENT (we don't
+                        // reach the reset below), so we retry on the very next chunk
+                        // rather than a whole interval later.
+                        if bytes_since_checkpoint >= checkpoint_interval && !screen.has_pending() {
                             if dirty_since_checkpoint {
                                 let (c, rws) = screen.dimensions();
                                 // Bake images into the recording via content-

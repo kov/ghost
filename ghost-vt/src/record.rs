@@ -1103,6 +1103,74 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_deferred_past_a_split_char_replays_the_glyph_not_ufffd() {
+        // The host records raw output and periodically checkpoints the emulator
+        // dump. A checkpoint taken while a multibyte char is still split across
+        // feeds (braille ⠋ = E2 A0 8B) can't carry the pending tail, and once the
+        // recording truncates to that checkpoint the frame holding the leading
+        // bytes is gone — replay then renders the completing byte as U+FFFD. Gating
+        // the checkpoint on `!has_pending()` defers it until the char completes.
+        use crate::screen::Screen;
+
+        // Ground truth: a live host fed the whole stream shows the glyph.
+        let mut host = Screen::new(20, 4, 100);
+        host.feed(b"spin: ");
+        host.feed(&[0xE2, 0xA0]);
+        host.feed(&[0x8B]);
+        assert!(host.text()[0].starts_with("spin: ⠋"));
+
+        // The gated host: checkpoint only once the pending tail has cleared.
+        let gated = record_to_buf(|rec| {
+            let mut s = Screen::new(20, 4, 100);
+            rec.output(b"spin: ").unwrap();
+            s.feed(b"spin: ");
+            rec.output(&[0xE2, 0xA0]).unwrap();
+            s.feed(&[0xE2, 0xA0]);
+            assert!(
+                s.has_pending(),
+                "the split char is pending at the cadence point"
+            );
+            rec.output(&[0x8B]).unwrap();
+            s.feed(&[0x8B]);
+            assert!(
+                !s.has_pending(),
+                "pending cleared, so the checkpoint is safe"
+            );
+            let (c, r) = s.dimensions();
+            rec.checkpoint(c, r, &s.dump_without_images()).unwrap();
+        });
+        let bounded = truncate_before_latest_checkpoint(&gated).unwrap();
+        let replayed = Screen::from_recording(&read_bytes(&bounded).unwrap(), 100);
+        assert_eq!(
+            replayed.text()[0],
+            host.text()[0],
+            "a checkpoint deferred past the split char replays the glyph"
+        );
+
+        // The hazard the gate avoids: checkpointing mid-pending (as the host did
+        // before the gate) and truncating before it strands the tail as U+FFFD.
+        let ungated = record_to_buf(|rec| {
+            let mut s = Screen::new(20, 4, 100);
+            rec.output(b"spin: ").unwrap();
+            s.feed(b"spin: ");
+            rec.output(&[0xE2, 0xA0]).unwrap();
+            s.feed(&[0xE2, 0xA0]);
+            let (c, r) = s.dimensions();
+            rec.checkpoint(c, r, &s.dump_without_images()).unwrap();
+            rec.output(&[0x8B]).unwrap();
+        });
+        let bad = Screen::from_recording(
+            &read_bytes(&truncate_before_latest_checkpoint(&ungated).unwrap()).unwrap(),
+            100,
+        );
+        assert!(
+            bad.text()[0].contains('\u{fffd}'),
+            "sanity: an un-gated mid-pending checkpoint strands the tail, got {:?}",
+            bad.text()[0]
+        );
+    }
+
+    #[test]
     fn truncate_to_fit_keeps_a_recent_checkpoint_window() {
         // Five checkpoints, each preceded by a distinct output segment.
         let buf = record_to_buf(|rec| {

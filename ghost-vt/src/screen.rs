@@ -345,6 +345,15 @@ impl Screen {
         seq
     }
 
+    /// Whether the last feed left an incomplete trailing UTF-8 sequence buffered.
+    /// A recording checkpoint (an image-free dump) can't express it, and
+    /// `truncate_before_latest_checkpoint` discards the frame that carried the
+    /// leading bytes, so a checkpoint taken here would make replay render the
+    /// completing byte as U+FFFD — the caller defers the checkpoint until it clears.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// The current screen as text lines (scrollback + viewport).
     pub fn text(&self) -> Vec<String> {
         self.vt.text()
