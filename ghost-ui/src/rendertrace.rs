@@ -407,21 +407,31 @@ impl RenderTrace {
         // Visible changes produced but not really presented for a while: a dropped
         // redraw, a stuck pacer, or a Clean loop over a stale screen (`Clean` no longer
         // advances `last_present_ms`/`visible_at_last_present`, so it can no longer hide
-        // this). Two guards keep it honest: `visible_pending` measures against the last
-        // REAL present, and `feeds_ongoing` requires a visible feed within the quiet
-        // window — an idle window that settled into Clean frames stops feeding, so it
-        // ages out here rather than false-alarming (the job the Clean re-baseline used
-        // to do, minus the blind spot). Suppressed mid-resize (the stretch-blit snapshot
-        // is intentionally holding the last frame).
+        // this). `visible_pending` measures against the last REAL present. Two arming
+        // shapes, both requiring a still-unpresented visible feed:
+        //   * `feeds_ongoing` — a visible feed within the quiet window: the app is still
+        //     streaming but nothing lands (a live Clean-over-stale freeze); and
+        //   * `screen_unconfirmed` — the tail has gone quiet, but the last visible feed
+        //     was never confirmed on glass: no Clean (or present) landed at or after it.
+        //     This is the commonest freeze — the final feed's redraw is dropped and the
+        //     program falls silent, so no feed arrives inside the narrow window where
+        //     `feeds_ongoing` would still be true. A Clean AT or AFTER the last visible
+        //     feed is the opposite: the renderer confirmed the scene matches the glass,
+        //     so an idle window that settled into Clean frames is current, not stalled.
+        // Suppressed mid-resize (the stretch-blit snapshot intentionally holds the last
+        // frame).
         let visible_pending = core
             .visible_feeds
             .saturating_sub(self.visible_at_last_present);
         let feeds_ongoing = self
             .last_visible_feed_ms
             .is_some_and(|t| now_ms.saturating_sub(t) < STALL_QUIET_MS);
+        let screen_unconfirmed = self
+            .last_visible_feed_ms
+            .is_some_and(|vf| self.last_clean_ms.is_none_or(|c| c < vf));
         if !has_snapshot
             && visible_pending > 0
-            && feeds_ongoing
+            && (feeds_ongoing || screen_unconfirmed)
             && self
                 .last_present_ms
                 .is_some_and(|p| now_ms.saturating_sub(p) >= STALL_QUIET_MS)
@@ -549,6 +559,14 @@ mod tests {
             .expect("a latched hold is a stall");
         assert_eq!(r.class, StallClass::HeldTooLong);
         assert!(r.held_for_ms.unwrap() >= 1_000);
+        // The self-healer deliberately does NOT force-repaint a hold: a
+        // synchronized-output hold releases on the core's own backstop tick, and a
+        // forced re-present can't end it. Only a StaleNoPresent stall heals — this
+        // stays false so nobody later "fixes" HeldTooLong into a repaint storm.
+        assert!(
+            !t.self_heal_due(1_100),
+            "a latched hold is not force-repainted; its backstop tick releases it"
+        );
     }
 
     #[test]
@@ -615,6 +633,35 @@ mod tests {
         assert!(
             !t.self_heal_due(7_000),
             "a recovered view does not ask to heal"
+        );
+    }
+
+    #[test]
+    fn a_dropped_final_present_arms_even_after_the_burst_goes_quiet() {
+        let mut t = RenderTrace::new();
+        // Baseline: the first visible feed is really presented.
+        t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
+        t.poll(0, Some(core(1, 1, false)), false, false, true);
+        // The last visible feed of a burst arrives and its redraw is DROPPED — no
+        // present or Clean outcome follows it — then the program goes quiet. This is
+        // the commonest freeze: "Claude finished, the screen is frozen until I
+        // scroll." The first poll far enough past the present to trip the 2 s gate
+        // lands after the burst has already gone quiet, so `feeds_ongoing` is false.
+        assert_eq!(
+            t.poll(100, Some(core(2, 2, false)), true, false, true),
+            None,
+            "not yet 2 s since the present"
+        );
+        // Well past the quiet window, no feed since t=100: a naive feeds-ongoing gate
+        // would miss this, but a visible feed that no Clean ever confirmed is still a
+        // stale screen — it must arm so the self-healer can force the repaint.
+        let r = t
+            .poll(2_500, Some(core(2, 2, false)), true, false, true)
+            .expect("a dropped final present with a quiet, unconfirmed tail is a stall");
+        assert_eq!(r.class, StallClass::StaleNoPresent);
+        assert!(
+            t.self_heal_due(2_500),
+            "the armed stall asks the shell to force one corrective present"
         );
     }
 
