@@ -1582,11 +1582,18 @@ impl FleetModel {
             // shell also uses this for a dead tile's recording playback (the
             // recording's grid, then its last screen as ordinary output).
             SessionPush::Event(SessionEvent::Resized { cols, rows }) => {
-                if (observed || tile.dead) && tile.grid != (cols, rows) {
-                    // Throw the mirror away and re-seed it at the new grid: a fresh
-                    // state (stamped with the window's theme/policy, keeping the
-                    // display name) and a fresh view, exactly as the old whole-model
-                    // rebuild did. The resync that follows re-fills the content.
+                if (observed || tile.dead) && (tile.grid != (cols, rows) || tile.fed) {
+                    // Throw the mirror away and re-seed it at the given grid: a
+                    // fresh state (stamped with the window's theme/policy, keeping
+                    // the display name) and a fresh view, exactly as the old
+                    // whole-model rebuild did. Rebuild on a grid change, and also
+                    // on a same-grid Resized once the mirror holds content: the
+                    // host emits one before *every* resync (the lagged-drain
+                    // re-seed included, where the grid is unchanged) to say "the
+                    // mirror is stale, the resync replaces it". A same-grid Resized
+                    // on a still-empty placeholder (an observation confirming the
+                    // listed size) has nothing to discard, so it stays a no-op.
+                    // The resync that follows re-fills the content.
                     sessions.rebuild(id, cols, rows);
                     tile.view = TerminalView::new(self.metrics, cols, rows);
                     tile.grid = (cols, rows);
@@ -5984,6 +5991,39 @@ mod tests {
         );
         assert_eq!(tile(&m, "b").grid, (100, 30));
         assert!(cmds.contains(&Cmd::Redraw));
+    }
+
+    #[test]
+    fn a_same_grid_resized_still_rebuilds_the_mirror_for_the_resync() {
+        // The host prefaces *every* observer resync with a Resized — including
+        // the lagged-drain re-seed, where the grid has not changed. That Resized
+        // is the client's cue to throw the stale mirror away so the resync that
+        // follows lands on a clean screen. A same-grid Resized must therefore
+        // still rebuild; skipping it would replay the resync on top of the old
+        // content and diverge from the host.
+        let mut m = fleet();
+        list(&mut m, &["b"]);
+        data(&mut m, "b", b"STALE");
+        assert!(
+            m.state("b").unwrap().screen().text()[0].contains("STALE"),
+            "precondition: the mirror shows the pre-reseed content"
+        );
+
+        let (cols, rows) = tile(&m, "b").grid;
+        push(
+            &mut m,
+            "b",
+            SessionPush::Event(SessionEvent::Resized { cols, rows }),
+        );
+
+        assert!(
+            !tile(&m, "b").fed,
+            "a same-grid Resized must reset the tile to a placeholder awaiting resync"
+        );
+        assert!(
+            !m.state("b").unwrap().screen().text()[0].contains("STALE"),
+            "the stale mirror content must be gone — rebuilt fresh for the resync"
+        );
     }
 
     #[test]

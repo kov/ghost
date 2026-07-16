@@ -1158,6 +1158,15 @@ fn host_main(
             // reason to wake and run a later check.
             if s.lagged && !s.conn.wants_write() {
                 s.lagged = false;
+                // Preface the re-seed with the current grid, exactly as the
+                // regridded path does: the observer rebuilds its mirror at the
+                // host's size before the resync lands, so the dump — written for
+                // that grid — never reflows onto a stale one.
+                let (cols, rows) = screen.dimensions();
+                s.queue(&ServerMsg::Event(crate::protocol::SessionEvent::Resized {
+                    cols,
+                    rows,
+                }));
                 s.queue_output(screen.resync());
                 if s.flush().is_err() {
                     return false;

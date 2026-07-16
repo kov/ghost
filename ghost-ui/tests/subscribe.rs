@@ -399,37 +399,52 @@ fn a_lagging_observer_is_capped_and_heals_by_resync() {
     let mut vt: Option<ghost_vt::screen::Screen> = None;
     let mut grid = (0u16, 0u16);
     let mut received = 0usize;
-    let mut drain =
-        |obs: &mut Client, vt: &mut Option<ghost_vt::screen::Screen>, received: &mut usize| {
-            for msg in obs.recv_ready().ok().flatten().unwrap_or_default() {
-                match msg {
-                    ServerMsg::Event(SessionEvent::Resized { cols, rows }) => {
-                        grid = (cols, rows);
-                        *vt = Some(ghost_vt::screen::Screen::new(cols, rows, 0));
-                    }
-                    ServerMsg::Output(bytes) => {
-                        *received += bytes.len();
-                        if let Some(vt) = vt.as_mut() {
-                            vt.feed(&bytes);
-                        }
-                    }
-                    _ => {}
+    let mut resized = 0usize;
+    #[allow(clippy::too_many_arguments)]
+    let drain = |obs: &mut Client,
+                 vt: &mut Option<ghost_vt::screen::Screen>,
+                 received: &mut usize,
+                 grid: &mut (u16, u16),
+                 resized: &mut usize| {
+        for msg in obs.recv_ready().ok().flatten().unwrap_or_default() {
+            match msg {
+                ServerMsg::Event(SessionEvent::Resized { cols, rows }) => {
+                    *grid = (cols, rows);
+                    *resized += 1;
+                    // The client rebuilds its mirror on every Resized — the
+                    // host prefaces each resync with one for exactly this.
+                    *vt = Some(ghost_vt::screen::Screen::new(cols, rows, 0));
                 }
+                ServerMsg::Output(bytes) => {
+                    *received += bytes.len();
+                    if let Some(vt) = vt.as_mut() {
+                        vt.feed(&bytes);
+                    }
+                }
+                _ => {}
             }
-        };
+        }
+    };
     assert!(
         wait_until(Duration::from_secs(5), || {
-            drain(&mut obs, &mut vt, &mut received);
+            drain(&mut obs, &mut vt, &mut received, &mut grid, &mut resized);
             vt.is_some()
         }),
         "no Resized grid arrived"
     );
+    let observed_grid = grid;
+    let resized_before_flood = resized;
 
     // Trigger the flood while the observer is NOT reading, so the host's
-    // outbound queue for it fills past any cap.
+    // outbound queue for it fills past any cap. Resize the display client to the
+    // grid the observer already saw, so this resize does not itself re-grid the
+    // session (which would emit a Resized of its own and muddy the count below).
     let mut display = Client::connect_path(&sock).expect("display connect");
     display
-        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .send(&ClientMsg::Resize {
+            cols: observed_grid.0,
+            rows: observed_grid.1,
+        })
         .unwrap();
     display.send(&ClientMsg::Input(b"\n".to_vec())).unwrap();
     std::thread::sleep(Duration::from_secs(2));
@@ -438,11 +453,19 @@ fn a_lagging_observer_is_capped_and_heals_by_resync() {
     // re-seeds a lagged observer with a resync once it catches up)…
     assert!(
         wait_until(Duration::from_secs(10), || {
-            drain(&mut obs, &mut vt, &mut received);
+            drain(&mut obs, &mut vt, &mut received, &mut grid, &mut resized);
             vt.as_ref()
                 .is_some_and(|v| v.text().join("\n").contains("END-MARKER"))
         }),
         "the lagged observer never converged; received {received} bytes"
+    );
+    // …and the healing re-seed is prefaced by a Resized, exactly as the regrid
+    // path is: it is the observer's cue to rebuild its mirror before the resync
+    // lands, so the dump never reflows onto a stale grid. Without that preamble
+    // the count stays at the single observation-start Resized.
+    assert!(
+        resized > resized_before_flood,
+        "the lagged-drain re-seed sent no Resized preamble (resized={resized}, was {resized_before_flood})"
     );
     // …while receiving far less than the flood: the host dropped, not
     // buffered, what the observer was too slow to take.
