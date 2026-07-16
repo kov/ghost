@@ -336,6 +336,12 @@ impl Screen {
     pub fn resync(&self) -> Vec<u8> {
         let mut seq = Vec::from(b"\x1b[2J\x1b[H".as_slice());
         seq.extend_from_slice(&self.dump());
+        // Carry the incomplete trailing UTF-8 bytes the host is still buffering. A
+        // client (or the transparent-pipe real terminal) reseeded mid-split-char
+        // holds these exactly as the host does, so when the completing byte streams
+        // in live it forms the same glyph — without them the client would render the
+        // lone continuation byte as U+FFFD while the host shows the character.
+        seq.extend_from_slice(&self.pending);
         seq
     }
 
@@ -375,6 +381,36 @@ mod tests {
         let mut s = Screen::new(20, 4, 100);
         s.feed(b"hello world");
         assert!(screen_text(&s)[0].starts_with("hello world"));
+    }
+
+    #[test]
+    fn resync_carries_the_pending_utf8_tail_so_a_reseeded_client_matches_the_host() {
+        // A 3-byte char — braille ⠋ = U+280B = E2 A0 8B — split across the attach
+        // boundary: the host has buffered the first two bytes in `pending` when a
+        // client attaches. The resync must carry that tail, or the client, fed only
+        // the completing byte live, renders U+FFFD where the host renders the glyph.
+        let mut host = Screen::new(20, 4, 100);
+        host.feed(b"spin: ");
+        host.feed(&[0xE2, 0xA0]); // first two bytes of ⠋, held back in `pending`
+
+        // A fresh client reseeds from the resync, then both get the same live tail.
+        let resync = host.resync();
+        let mut client = Screen::new(20, 4, 100);
+        client.feed(&resync);
+
+        host.feed(&[0x8B]); // the completing byte, streamed live to both
+        client.feed(&[0x8B]);
+
+        assert_eq!(
+            screen_text(&client)[0],
+            screen_text(&host)[0],
+            "a client reseeded mid-split-char must render the same glyph as the host"
+        );
+        assert!(
+            screen_text(&host)[0].starts_with("spin: ⠋"),
+            "sanity: the host completed the glyph, got {:?}",
+            screen_text(&host)[0]
+        );
     }
 
     #[test]
