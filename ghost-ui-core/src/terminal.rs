@@ -379,6 +379,9 @@ struct Presented {
     /// no rows — the default bg is every otherwise-untouched pixel — so it
     /// must force whole-view damage the way a resize does.
     colors: [Option<[u8; 3]>; 3],
+    /// App-set OSC 4 indexed palette at the present. Like `colors`, a change
+    /// recolors drawn cells without writing any, so it must force whole-view damage.
+    palette: [Option<[u8; 3]>; 256],
 }
 
 /// A cheap identity of one direct graphics placement — image id, placement id, cell
@@ -464,6 +467,15 @@ impl SessionState {
             vt.dynamic_background(),
             vt.dynamic_cursor_color(),
         ]
+    }
+
+    /// The app-set OSC 4 indexed palette the renderer paints cells with. Like the
+    /// dynamic colors, a change recolors already-drawn cells without writing any, so
+    /// [`Presented`] snapshots it and [`TerminalView::damage`] treats a move as
+    /// whole-view damage (a `pywal`-style remap-without-repaint would otherwise leave
+    /// the texture in the old palette).
+    fn palette(&self) -> &[Option<[u8; 3]>; 256] {
+        self.screen.vt().palette()
     }
 
     /// Enter or leave the reconnecting hold for `name` (a no-op for another
@@ -756,6 +768,7 @@ impl TerminalView {
                         || p.zoom != self.zoom
                         || p.scale != self.scale
                         || p.colors != state.render_colors()
+                        || p.palette != *state.palette()
                 }
             };
         if moved {
@@ -798,6 +811,7 @@ impl TerminalView {
             zoom: self.zoom,
             scale: self.scale,
             colors: state.render_colors(),
+            palette: *state.palette(),
         });
         self.feed_dirty = None;
         self.view_slid = false;
@@ -1538,6 +1552,7 @@ impl TerminalView {
             self.trace.feeds_seen += 1;
             let before = state.screen.vt().lines_scrolled_off();
             let colors_before = state.render_colors();
+            let palette_before = *state.palette();
             let focus_report_before = state.screen.vt().focus_report();
             let placements_before = state.placement_signature();
             // `Screen::feed` reports the viewport rows this feed changed; an empty
@@ -1745,6 +1760,10 @@ impl TerminalView {
             // recolor everything; `damage` reports All via the `Presented`
             // snapshot — this only makes sure a repaint is actually requested.
             let colors_changed = colors_before != state.render_colors();
+            // OSC 4/104 palette edits, like the dynamic colors above, recolor drawn
+            // cells without writing any — `damage` reports All via the `Presented`
+            // snapshot; this makes sure a repaint is requested for a palette-only feed.
+            let palette_changed = palette_before != *state.palette();
             // The cursor is part of the drawn frame, but moving it writes no cell, so a
             // bare CUP/CUF (how full-screen apps like an editor or Claude Code reposition
             // between keystrokes) dirties no content row. `Screen::feed` tracks the drawn
@@ -1769,6 +1788,7 @@ impl TerminalView {
                 || images_added
                 || placements_changed
                 || colors_changed
+                || palette_changed
                 || cursor_redrawn
                 || self.view_slid;
             if want_redraw {
@@ -5232,6 +5252,52 @@ mod tests {
         // Once presented, the view settles again.
         m.mark_presented();
         assert_eq!(term_damage(&m), ghost_render::TermDamage::None);
+    }
+
+    #[test]
+    fn palette_changes_repaint_and_damage_the_whole_view() {
+        let term_damage = |m: &TerminalModel| {
+            let scene = m.view();
+            match scene.terminals().next().unwrap() {
+                SceneItem::Terminal { damage, .. } => *damage,
+                _ => unreachable!(),
+            }
+        };
+        let mut m = model();
+        feed(&mut m, b"hello");
+        m.mark_presented();
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::None);
+
+        // An OSC 4 palette-only feed (recolor index 1) writes no cell, but it
+        // recolors every cell already drawn in that index — a `pywal`-style
+        // remap-without-repaint. Like a dynamic-color change it must repaint and
+        // report whole-view damage; banding only the (zero) written rows would leave
+        // the rest of the texture in the old palette.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]4;1;#204060\x07".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "no repaint on palette change: {cmds:?}"
+        );
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::All);
+
+        m.mark_presented();
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::None);
+
+        // OSC 104 reset (index 1 back to the theme default) is the same recolor.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b]104;1\x07".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "no repaint on palette reset: {cmds:?}"
+        );
+        assert_eq!(term_damage(&m), ghost_render::TermDamage::All);
     }
 
     #[test]
