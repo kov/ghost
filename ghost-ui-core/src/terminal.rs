@@ -1168,9 +1168,10 @@ impl TerminalModel {
         self.state.reconnecting
     }
 
-    /// Apply an event, returning the effects to perform.
+    /// Apply an event, returning the effects to perform. A standalone model owns its
+    /// session outright, so it always drives its own grid (`driving = true`).
     pub fn update(&mut self, ev: UiEvent) -> Vec<Cmd> {
-        self.view.update(&mut self.state, ev)
+        self.view.update(&mut self.state, ev, true)
     }
 
     /// Render the current state to a single terminal scene (see
@@ -1405,17 +1406,26 @@ impl TerminalView {
     }
 
     /// Apply an event, returning the effects to perform.
-    pub(crate) fn update(&mut self, state: &mut SessionState, ev: UiEvent) -> Vec<Cmd> {
+    /// `driving` marks the window that owns this session's grid — only it re-grids the
+    /// emulator on a zoom/resize (see [`Self::resize`]). It is consulted only by the
+    /// grid-mutating events (zoom, resize); every other event ignores it. A standalone
+    /// [`TerminalModel`] always drives its own session, so its delegator passes `true`.
+    pub(crate) fn update(
+        &mut self,
+        state: &mut SessionState,
+        ev: UiEvent,
+        driving: bool,
+    ) -> Vec<Cmd> {
         match ev {
             UiEvent::Key {
                 key,
                 mods,
                 kind,
                 alts,
-            } => self.key(state, &key, mods, kind, alts),
+            } => self.key(state, &key, mods, kind, alts, driving),
             UiEvent::Text(s) => self.text(state, &s),
             UiEvent::Preedit(s) => self.set_preedit(s),
-            UiEvent::SetZoom(z) => self.apply_zoom(state, z.clamp(ZOOM_MIN, ZOOM_MAX)),
+            UiEvent::SetZoom(z) => self.apply_zoom(state, z.clamp(ZOOM_MIN, ZOOM_MAX), driving),
             UiEvent::Pointer {
                 phase,
                 button,
@@ -1425,11 +1435,11 @@ impl TerminalView {
                 clicks,
             } => self.pointer(state, phase, button, pos, mods, wheel_dy, clicks),
             UiEvent::Focus(focused) => self.focus(state, focused),
-            // A standalone view (esctest, direct-feed, a lone TerminalModel) owns its
-            // session outright, so it drives its own grid. The multi-window Resize
-            // path routes through `resize_model`, which threads real drivership.
+            // The multi-window Resize path routes through `resize_model` (which calls
+            // `resize` directly with real drivership); a lone `TerminalModel` reaching
+            // here drives its own session and passes `driving = true`.
             UiEvent::Resize { w_px, h_px, scale } => {
-                self.resize(state, w_px, h_px, scale as f32, true)
+                self.resize(state, w_px, h_px, scale as f32, driving)
             }
             UiEvent::DisplaySize { w_px, h_px } => {
                 self.display_px = Some((w_px, h_px));
@@ -1536,18 +1546,18 @@ impl TerminalView {
         })
     }
 
-    /// Set the user zoom and re-grid the child for it. A no-op (no commands)
-    /// when the level is unchanged, e.g. a step that clamps at a bound.
-    fn apply_zoom(&mut self, state: &mut SessionState, zoom: f32) -> Vec<Cmd> {
+    /// Set the user zoom and, for the driving view, re-grid the child for it (a bigger
+    /// font fits fewer cells). A no-op (no commands) when the level is unchanged, e.g. a
+    /// step that clamps at a bound. An observer's zoom rescales what it renders of the
+    /// shared grid but never re-grids the emulator or SIGWINCHes the child — the same
+    /// drivership gate as a resize, since `resize` enforces it.
+    fn apply_zoom(&mut self, state: &mut SessionState, zoom: f32, driving: bool) -> Vec<Cmd> {
         if (zoom - self.zoom).abs() < f32::EPSILON {
             return Vec::new();
         }
         self.zoom = zoom;
         let (w, h) = self.size_px;
-        // Zoom re-grids as the driver for now; gating zoom on drivership is its own
-        // slice (its shortcut path enters through `key`, where drivership isn't yet in
-        // scope). See the "one model, many views" plan.
-        self.resize(state, w, h, self.scale, true)
+        self.resize(state, w, h, self.scale, driving)
     }
 
     /// Render the current state to a single terminal scene. The canvas is the whole
@@ -1746,6 +1756,7 @@ impl TerminalView {
         mods: Mods,
         kind: KeyEventKind,
         alts: Option<KeyAlternates>,
+        driving: bool,
     ) -> Vec<Cmd> {
         // While an IME composition is active the keystrokes belong to the IME
         // (which delivers its result via `Preedit`/`Text`); sending them to the
@@ -1806,9 +1817,13 @@ impl TerminalView {
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
             Some(Shortcut::Copy) => self.copy(state),
-            Some(Shortcut::ZoomIn) => self.apply_zoom(state, step_zoom(self.zoom, ZOOM_STEP)),
-            Some(Shortcut::ZoomOut) => self.apply_zoom(state, step_zoom(self.zoom, -ZOOM_STEP)),
-            Some(Shortcut::ZoomReset) => self.apply_zoom(state, 1.0),
+            Some(Shortcut::ZoomIn) => {
+                self.apply_zoom(state, step_zoom(self.zoom, ZOOM_STEP), driving)
+            }
+            Some(Shortcut::ZoomOut) => {
+                self.apply_zoom(state, step_zoom(self.zoom, -ZOOM_STEP), driving)
+            }
+            Some(Shortcut::ZoomReset) => self.apply_zoom(state, 1.0, driving),
             Some(Shortcut::Quit) => vec![Cmd::Quit],
             // Window/session management is window-level; `RootModel` intercepts
             // these before delegation, so these arms are the safety net that

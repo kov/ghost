@@ -970,6 +970,9 @@ impl FleetModel {
                 h_px: size_px.1.max(1),
                 scale: scale as f64,
             },
+            // A takeover promotes this tile to the window's foreground — the window
+            // drives it now, so this resize re-grids the session for real.
+            true,
         );
         // A window-sized takeover changes the session grid; keep the cached grid in
         // step so the tile's aspect/dive geometry follows.
@@ -1104,10 +1107,12 @@ impl FleetModel {
         let state = sessions
             .get_mut(&kept_id)
             .expect("kept session state present in the registry");
-        cmds.append(&mut kept_view.update(state, resize.clone()));
+        // Adopting fleet → single: the kept view becomes the window's foreground and
+        // the warm ones are its own driven sessions (`mine`), so both re-grid for real.
+        cmds.append(&mut kept_view.update(state, resize.clone(), true));
         for (id, view) in &mut warm {
             if let Some(state) = sessions.get_mut(id) {
-                cmds.append(&mut view.update(state, resize.clone()));
+                cmds.append(&mut view.update(state, resize.clone(), true));
             }
         }
         (kept_id, kept_view, warm, cmds)
@@ -2022,6 +2027,9 @@ impl FleetModel {
                 bytes,
                 ended,
             },
+            // A feed doesn't re-grid off drivership, but pass the honest bit anyway: a
+            // `ThisWindow` tile is driven, an observed preview is not.
+            driven,
         );
         if had_output {
             tile.fed = true; // attached and live: stop re-attaching it

@@ -594,10 +594,12 @@ fn filter_background(cmds: Vec<Cmd>) -> Vec<Cmd> {
 /// window today, so this has one caller — a test — until the process-wide collapse;
 /// only this routine and `session_data` may [`SessionState::ingest`] (see its law).
 ///
-/// KNOWN gaps, deferred to enablement (connection ownership): an observer whose
-/// window never resized is left showing a DECCOLM-re-gridded emulator at a
-/// mismatched grid; and re-gridding is not yet gated on drivership, so an observer
-/// that also answered `Resize` would fight the driver's SIGWINCH.
+/// Grid mutation is already drivership-gated (a resize or zoom re-grids the shared
+/// emulator only for the window that [`drives`](RootModel::drives) the session, so no
+/// observer can fight the driver's SIGWINCH). The remaining gap, deferred with the
+/// observer-render story: an observer whose window never resized is left showing a
+/// DECCOLM-re-gridded (or driver-resized) emulator at a grid that doesn't fill its
+/// window — a clip/letterbox, not a corruption.
 pub fn feed_shared(
     sessions: &mut Sessions,
     driver: &mut RootModel,
@@ -862,10 +864,11 @@ impl RootModel {
     fn drive(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         match &mut self.mode {
             Mode::Single { id, view } => {
+                let driving = self.mine.contains(id);
                 let state = sessions
                     .get_mut(id)
                     .expect("foreground session state present");
-                view.update(state, ev)
+                view.update(state, ev, driving)
             }
             Mode::Fleet(f) => f.update(sessions, &self.mine, ev),
         }
@@ -1255,18 +1258,21 @@ impl RootModel {
                 let (cols, rows) = self.grid();
                 sessions.rebuild(&name, cols, rows);
             }
+            // A feed never re-grids off drivership (that is DECCOLM's job, inside
+            // `ingest`), but `update` still needs the bit; compute it once.
+            let driving = self.mine.contains(&name);
             if let Mode::Single { id, view } = &mut self.mode
                 && *id == name
             {
                 let state = sessions
                     .get_mut(id)
                     .expect("foreground session state present");
-                return view.update(state, ev);
+                return view.update(state, ev, driving);
             }
             if let Some(view) = self.warm.get_mut(&name)
                 && let Some(state) = sessions.get_mut(&name)
             {
-                return view.update(state, ev);
+                return view.update(state, ev, driving);
             }
             return Vec::new();
         }
@@ -1494,6 +1500,7 @@ impl RootModel {
             return Vec::new();
         };
         let (name, ended) = (name.clone(), *ended);
+        let driving = self.mine.contains(&name);
         let cmds = match (self.warm.get_mut(&name), sessions.get_mut(&name)) {
             // A background mirror still tracks its own title, screen and window state
             // internally (so a later Ctrl-Tab restores them), but it is NOT visible, so
@@ -1506,7 +1513,7 @@ impl RootModel {
             // Everything else flows: replies to a program querying the terminal
             // (`SendInput`), image pre-uploads, and — load-bearing — the `ScheduleTick`
             // that backstops a mirror's synchronized-output hold for when it's promoted.
-            (Some(view), Some(state)) => filter_background(view.update(state, ev)),
+            (Some(view), Some(state)) => filter_background(view.update(state, ev, driving)),
             // Not a session this window mirrors: the feed has nowhere to land.
             // This is the under-delivery mirror of the double-feed hazard — a
             // breadcrumb so a dropped feed is diagnosable, not silent (finding #7).
@@ -1538,8 +1545,13 @@ impl RootModel {
     /// app the ESC[I / ESC[O a real terminal sends as its view comes forward.
     fn reassert_foreground_focus(&mut self, sessions: &mut Sessions) -> Vec<Cmd> {
         let focused = self.focused_win;
+        // Focus never re-grids, but `update` wants the drivership bit anyway.
+        let driving = match &self.mode {
+            Mode::Single { id, .. } => self.mine.contains(id),
+            Mode::Fleet(_) => false,
+        };
         match self.foreground_mut(sessions) {
-            Some((view, state)) => view.update(state, UiEvent::Focus(focused)),
+            Some((view, state)) => view.update(state, UiEvent::Focus(focused), driving),
             None => Vec::new(),
         }
     }
@@ -2700,6 +2712,49 @@ mod tests {
                 |c| matches!(c, Cmd::Resize { session, cols: 160, rows: 48 } if session == "alpha")
             ),
             "the driver's resize SIGWINCHes the child: {drv:?}"
+        );
+    }
+
+    /// The same gate for zoom (Ctrl-+): a font-size change re-grids the child only for
+    /// the window that drives the session — an observer's zoom rescales what it renders
+    /// but must not re-grid the shared emulator or SIGWINCH the child. The driver's zoom
+    /// still does. Zoom's shortcut enters through the view's key path, so this pins that
+    /// drivership reaches it too.
+    #[test]
+    fn only_the_driving_window_re_grids_the_shared_session_on_zoom() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        let mut driver = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        driver.mine.insert("alpha".into());
+        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+
+        let before = sessions.get("alpha").unwrap().dims();
+        assert_eq!(before, (80, 24));
+
+        // Zoom in on the observer: bigger glyphs, but the shared grid is the driver's.
+        let obs = observer.update(&mut sessions, UiEvent::SetZoom(1.5));
+        assert_eq!(
+            sessions.get("alpha").unwrap().dims(),
+            before,
+            "an observer zoom must not re-grid the shared session"
+        );
+        assert!(
+            !obs.iter().any(|c| matches!(c, Cmd::Resize { .. })),
+            "an observer zoom must not SIGWINCH the child: {obs:?}"
+        );
+
+        // The driver zooming to bigger glyphs fits fewer cells, so it re-grids and
+        // SIGWINCHes (1.5x on a 9px advance / 18px line over 720x432 → 53x16).
+        let drv = driver.update(&mut sessions, UiEvent::SetZoom(1.5));
+        assert_ne!(
+            sessions.get("alpha").unwrap().dims(),
+            before,
+            "the driver's zoom re-grids the shared session"
+        );
+        assert!(
+            drv.iter()
+                .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "alpha")),
+            "the driver's zoom SIGWINCHes the child: {drv:?}"
         );
     }
 
