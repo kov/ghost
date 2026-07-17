@@ -618,6 +618,46 @@ fn run_attach(mut client: Client) -> io::Result<()> {
 /// [`PROTO_RENAME_LABEL`](crate::protocol::PROTO_RENAME_LABEL)): such a host
 /// would move the session's files, detaching clients — the very churn the
 /// label design removed.
+/// Ask a session's host to upgrade itself in place onto a (possibly newer)
+/// binary, keeping its running child, PTY, socket, and liveness lock — only the
+/// host's code image is replaced (see `docs/host-self-upgrade.md`). `path` names
+/// the target binary, or `None` for the host's own current executable.
+///
+/// Refused for a host predating the mechanism
+/// ([`PROTO_UPGRADE`](crate::protocol::PROTO_UPGRADE)): such a host cannot
+/// self-upgrade and would treat the unknown message as a broken connection. This
+/// is the going-forward-only gate — restart the session (`__restart`) to bring
+/// an older host up instead.
+pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
+    if session_proto(name) < crate::protocol::PROTO_UPGRADE {
+        return Err(io::Error::other(format!(
+            "session '{name}' is hosted by an older ghost that cannot upgrade itself \
+             in place; restart it to bring it up to the current binary"
+        )));
+    }
+    let mut conn = Conn::connect(&paths::socket_path(name))
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot reach session '{name}': {e}")))?;
+    conn.send(&ClientMsg::Upgrade { path })?;
+    // The host performs the upgrade at its next clean handoff boundary, then
+    // re-execs — closing this control connection, whose fd does not cross the
+    // exec. Wait (bounded) for that EOF as confirmation the request was taken; a
+    // host whose child never quiesces holds the connection open, so time out and
+    // report delivery rather than hang forever.
+    conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+    loop {
+        match conn.recv::<ServerMsg>() {
+            Ok(None) => return Ok(()), // re-exec'd (or closed): request delivered
+            Ok(Some(_)) => {}          // drain any late output frames, keep waiting
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Ok(()); // delivered; the boundary is just slow to arrive
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub fn rename(old: &str, new: &str) -> io::Result<()> {
     if session_proto(old) < crate::protocol::PROTO_RENAME_LABEL {
         return Err(io::Error::other(format!(

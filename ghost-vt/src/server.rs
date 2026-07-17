@@ -28,7 +28,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Options for starting a session.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SpawnOpts {
     /// Session name (used for the socket and pidfile).
     pub name: String,
@@ -179,6 +179,24 @@ struct HostArgs {
     /// The directory the session was launched from, applied to the child (like
     /// dtach) since the daemon itself `chdir`s to `/`.
     launch_dir: Option<std::path::PathBuf>,
+    /// Set only for an in-place **self-upgrade** re-exec (see
+    /// `docs/host-self-upgrade.md`): the new host adopts an already-running
+    /// child on its existing PTY instead of opening a PTY and spawning. `None`
+    /// for an ordinary spawn.
+    #[serde(default)]
+    adopt: Option<Adopt>,
+}
+
+/// The running child a self-upgrade hands to its successor. The child stays
+/// *our* direct child across an in-place `execv` (same pid), so the new host
+/// reaps it by pid and talks to it over the carried PTY master fd.
+#[derive(Serialize, Deserialize)]
+struct Adopt {
+    /// The live child's pid, adopted via [`crate::child::Child::from_pid`].
+    child_pid: u32,
+    /// The PTY master fd, kept open across the exec (CLOEXEC cleared) so the
+    /// new host reads/writes the same terminal the child is attached to.
+    pty_master_fd: RawFd,
 }
 
 /// Start a session in the background.
@@ -254,6 +272,7 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     let host_args = HostArgs {
         launch_dir: std::env::current_dir().ok(),
         opts,
+        adopt: None,
     };
     let blob = encode_host_args(&host_args);
 
@@ -315,18 +334,35 @@ fn run_host(
     let _lock = unsafe { OwnedFd::from_raw_fd(lock_fd) };
     // SAFETY: the listening socket the parent bound and passed with CLOEXEC cleared.
     let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
-    let HostArgs { opts, launch_dir } = host_args;
+    let HostArgs {
+        opts,
+        launch_dir,
+        adopt,
+    } = host_args;
     // The name is the session's immutable identity: a rename only changes the
     // display-name label in `meta`, so files never move and cleanup always
-    // targets the spawn-time directory.
-    let result = host_main(&listener, &opts, launch_dir.as_deref(), &opts.name);
+    // targets the spawn-time directory. `lock_fd` is passed through so a
+    // self-upgrade can re-hand the same held lock to its successor on argv.
+    let result = host_main(
+        &listener,
+        lock_fd,
+        &opts,
+        launch_dir.as_deref(),
+        &opts.name,
+        adopt,
+    );
     let _ = std::fs::remove_dir_all(paths::session_dir(&opts.name));
     result.unwrap_or(1)
 }
 
 /// Clear `FD_CLOEXEC` so a descriptor survives `execv` into the host process.
 fn clear_cloexec(fd: &impl AsRawFd) -> io::Result<()> {
-    let raw = fd.as_raw_fd();
+    clear_cloexec_raw(fd.as_raw_fd())
+}
+
+/// Clear `FD_CLOEXEC` on a raw fd (a self-upgrade carries the lock fd only as a
+/// number, not as an owned handle).
+fn clear_cloexec_raw(raw: RawFd) -> io::Result<()> {
     // SAFETY: plain fcntl on a fd we own.
     unsafe {
         let flags = libc::fcntl(raw, libc::F_GETFD);
@@ -338,6 +374,125 @@ fn clear_cloexec(fd: &impl AsRawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Put the PTY master into non-blocking mode. Writes into the child are then
+/// queued and drained under POLLOUT (never a blocking `write_all`, which would
+/// wedge the single-threaded loop the moment the child stopped reading); the
+/// read path already tolerates `WouldBlock`.
+fn set_pty_nonblocking(pty: &pty_process::blocking::Pty) -> io::Result<()> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let fd = pty.as_fd();
+    let mut flags = fcntl_getfl(fd).map_err(io::Error::from)?;
+    flags.set(OFlags::NONBLOCK, true);
+    fcntl_setfl(fd, flags).map_err(io::Error::from)
+}
+
+/// Build the signal set a self-upgrade blocks across the `execv`: SIGTERM and
+/// SIGINT, the two that would otherwise hit the default disposition (terminate)
+/// in the window after `execv` resets dispositions to `SIG_DFL` and before the
+/// new host installs its handlers.
+fn upgrade_signal_set() -> libc::sigset_t {
+    // SAFETY: `sigemptyset`/`sigaddset` initialize and populate the set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
+    }
+}
+
+/// Block SIGTERM/SIGINT before an `execv`. The mask is preserved across the
+/// exec, so a signal that arrives during the handler-less window stays PENDING
+/// (not delivered at default disposition) until the new host unblocks it.
+fn block_upgrade_signals() -> io::Result<()> {
+    let set = upgrade_signal_set();
+    // SAFETY: valid set pointer; no old-set out param.
+    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Unblock SIGTERM/SIGINT after the new host has reinstalled its handlers. A
+/// signal that was blocked-and-pending across the upgrade fires the instant it
+/// is unblocked — now into the self-pipe handler, not at default disposition.
+/// A no-op for an ordinary spawn (they were never blocked); `signals::make`
+/// only sets a per-handler mask, never the process mask, so this is what clears
+/// the block a self-upgrade left.
+fn unblock_upgrade_signals() {
+    let set = upgrade_signal_set();
+    // SAFETY: valid set pointer; ignoring failure — an unblock cannot leave us
+    // worse off than blocked, and there is no recovery from here anyway.
+    unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+}
+
+/// Re-exec THIS process in place — same pid, no fork — onto the host at `exe`,
+/// adopting the running `child_pid` on the carried PTY master. Only the code
+/// image is replaced; the listener, the liveness lock, the PTY, and the child
+/// all survive.
+///
+/// Returns `Err` on failure and NEVER `Ok`: on success `execv` never returns.
+/// A failure return is not fatal — this process still holds the PTY master, the
+/// child, and the flock, so the caller MUST keep running (refuse the upgrade),
+/// never exit. Every step here is therefore reversible: on any error the live
+/// host is left exactly as it was, save the CLOEXEC flags we cleared (harmless)
+/// and the signal block, which we lift before returning.
+fn self_upgrade(
+    listener: &UnixListener,
+    lock_fd: RawFd,
+    pty: &pty_process::blocking::Pty,
+    child_pid: u32,
+    opts: &SpawnOpts,
+    launch_dir: Option<&std::path::Path>,
+    path: Option<&str>,
+) -> io::Result<()> {
+    let exe = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_exe()?,
+    };
+    let exe_c = CString::new(exe.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
+
+    // Keep the listener, the lock, and the PTY master open across the exec.
+    clear_cloexec(listener)?;
+    clear_cloexec_raw(lock_fd)?;
+    let master_fd = pty.as_raw_fd();
+    clear_cloexec_raw(master_fd)?;
+
+    let host_args = HostArgs {
+        opts: opts.clone(),
+        launch_dir: launch_dir.map(Into::into),
+        adopt: Some(Adopt {
+            child_pid,
+            pty_master_fd: master_fd,
+        }),
+    };
+    let blob = encode_host_args(&host_args);
+    let argv_owned = [
+        exe_c.clone(),
+        CString::new(HOST_ARG).expect("HOST_ARG has no NUL"),
+        CString::new(listener.as_raw_fd().to_string()).expect("fd digits have no NUL"),
+        CString::new(lock_fd.to_string()).expect("fd digits have no NUL"),
+        CString::new(blob).expect("hex blob has no NUL"),
+    ];
+    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // Block the terminating signals LAST, immediately before the exec, so the
+    // window they guard is as small as possible. If the exec fails we unblock
+    // again below.
+    block_upgrade_signals()?;
+    // SAFETY: `argv` is NUL-terminated and its pointers (and `exe_c`) live until
+    // the call returns; `execv` only returns on failure.
+    let err = unsafe {
+        libc::execv(exe_c.as_ptr(), argv.as_ptr());
+        io::Error::last_os_error()
+    };
+    // Only here on failure: lift the block and report. The host keeps running.
+    unblock_upgrade_signals();
+    Err(err)
 }
 
 /// Serialize the host's startup state to a NUL-free, argv-safe hex string.
@@ -379,11 +534,14 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // the host's whole startup state
 fn host_main(
     listener: &UnixListener,
+    lock_fd: RawFd,
     opts: &SpawnOpts,
     launch_dir: Option<&std::path::Path>,
     current_name: &str,
+    adopt: Option<Adopt>,
 ) -> io::Result<i32> {
     // An explicit cwd (a recreate) beats where the spawning process happened
     // to run; everything below sees only the effective launch directory.
@@ -396,26 +554,48 @@ fn host_main(
     // signal just queues on the self-pipe until the poll loop drains it, after
     // the recorder exists (its drop flushes the file even on that first turn).
     let sfd = crate::signals::make(&[Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT])?;
+    // A self-upgrade blocks SIGTERM/SIGINT across the `execv` (so a racing
+    // `ghost kill` can't hit the default disposition mid-exec and orphan the
+    // child) and leaves them blocked-and-pending for us to inherit. Unblock them
+    // now that handlers are installed: a signal that raced the upgrade fires into
+    // the self-pipe here instead of killing us. Idempotent for an ordinary spawn,
+    // whose mask is already empty. See `docs/host-self-upgrade.md`.
+    unblock_upgrade_signals();
     std::fs::write(
         paths::pid_path(current_name),
         std::process::id().to_string(),
     )?;
     listener.set_nonblocking(true)?;
 
-    let (pty, pts) = open().map_err(io::Error::other)?;
-    // Non-blocking master: writes into the child are queued and drained under
-    // POLLOUT (see `pty_out` below), never done with a blocking `write_all`. A
-    // blocking write would wedge this single-threaded loop the moment the child
-    // stopped reading its stdin (e.g. it is itself blocked on a full stdout),
-    // deadlocking the two. The read path already tolerates `WouldBlock`.
-    {
-        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-        let fd = pty.as_fd();
-        let mut flags = fcntl_getfl(fd).map_err(io::Error::from)?;
-        flags.set(OFlags::NONBLOCK, true);
-        fcntl_setfl(fd, flags).map_err(io::Error::from)?;
-    }
     let (cols, rows) = opts.size;
+    // PTY and child. An ordinary spawn opens a fresh PTY and (eagerly or on the
+    // first attach) spawns the child itself. A self-upgrade instead ADOPTS the
+    // running child on its existing PTY master, carried across the `execv`: no
+    // new PTY, no spawn — the same terminal, the same live process. Non-blocking
+    // master either way: writes into the child are queued and drained under
+    // POLLOUT (see `pty_out`), never with a blocking `write_all`, which would
+    // wedge this single-threaded loop the moment the child stopped reading.
+    #[allow(clippy::type_complexity)] // a one-off setup tuple, named right below
+    let (pty, mut pts, mut child): (
+        pty_process::blocking::Pty,
+        Option<pty_process::blocking::Pts>,
+        Option<crate::child::Child>,
+    ) = match &adopt {
+        Some(a) => {
+            // SAFETY: the master fd our predecessor handed us with CLOEXEC
+            // cleared; we take sole ownership now. The child is still attached.
+            let pty = unsafe {
+                pty_process::blocking::Pty::from_fd(OwnedFd::from_raw_fd(a.pty_master_fd))
+            };
+            set_pty_nonblocking(&pty)?;
+            (pty, None, Some(crate::child::Child::from_pid(a.child_pid)))
+        }
+        None => {
+            let (pty, pts) = open().map_err(io::Error::other)?;
+            set_pty_nonblocking(&pty)?;
+            (pty, Some(pts), None)
+        }
+    };
     pty.resize(Size::new(rows, cols))
         .map_err(io::Error::other)?;
 
@@ -458,13 +638,12 @@ fn host_main(
     // The child is started eagerly for a plain detached session, or deferred
     // until the first attach handshake (see `SpawnOpts::start_on_attach`). While
     // deferred we hold the slave (`pts`) so the PTY master never sees EOF and the
-    // poll loop just idles until a client attaches.
-    let mut pts = Some(pts);
-    let mut child: Option<crate::child::Child> = None;
+    // poll loop just idles until a client attaches. A self-upgrade already
+    // adopted its child above, so neither branch runs.
     // The last cwd written to the durable descriptor, so refreshes only touch
     // the file when the child actually moved.
     let mut desc_cwd: Option<std::path::PathBuf> = None;
-    if !opts.start_on_attach {
+    if adopt.is_none() && !opts.start_on_attach {
         child = Some(spawn_child(
             &child_command,
             current_name,
@@ -479,12 +658,18 @@ fn host_main(
     // attach can be repainted to the current state. A seeded spawn (a
     // recreate) starts from its predecessor's recording instead of blank:
     // read it NOW, before the recorder below truncates the (typically same)
-    // path, and reflow the restored state to this session's grid.
-    let mut screen = match opts.seed_from.as_ref().and_then(|p| {
-        crate::record::read(p)
-            .map(|rec| Screen::from_recording(&rec, opts.scrollback))
-            .ok()
-    }) {
+    // path, and reflow the restored state to this session's grid. A self-upgrade
+    // starts blank for now — carrying the emulator state across the exec is
+    // Phase 2 Step 4 (a checkpoint memfd); the child's next output repaints it.
+    let mut screen = match opts
+        .seed_from
+        .as_ref()
+        .filter(|_| adopt.is_none())
+        .and_then(|p| {
+            crate::record::read(p)
+                .map(|rec| Screen::from_recording(&rec, opts.scrollback))
+                .ok()
+        }) {
         Some(mut seeded) => {
             seeded.resize(cols, rows);
             seeded
@@ -516,7 +701,8 @@ fn host_main(
     // UTF-8 tail: this is a fresh child, so any incomplete trailing bytes the seed
     // ended on have no continuation coming — they are dead bytes, and dropping
     // them from the standalone checkpoint is correct.
-    if opts.seed_from.is_some()
+    if adopt.is_none()
+        && opts.seed_from.is_some()
         && let Some(r) = &mut recorder
     {
         let (c, rws) = screen.dimensions();
@@ -577,6 +763,12 @@ fn host_main(
     // The last theme a client reported (ClientMsg::Theme); detached color
     // queries answer with it. Ghost's default scheme until someone attaches.
     let mut last_theme = crate::query::ThemeColors::default();
+    // A requested in-place self-upgrade (`ClientMsg::Upgrade`), held until the
+    // screen reaches a clean handoff boundary and the child exists to adopt.
+    // `Some(path)` = pending, where `path` names the target binary (or `None`
+    // for our own current exe). See the boundary trigger at the loop's tail and
+    // `docs/host-self-upgrade.md`.
+    let mut pending_upgrade: Option<Option<String>> = None;
 
     loop {
         // Build the poll set: fixed fds first, then the display client (if any),
@@ -666,6 +858,7 @@ fn host_main(
                 &mut last_theme,
                 &attached_info,
                 bell_marked,
+                &mut pending_upgrade,
             )? {
                 Disposition::Keep | Disposition::Drop => {}
                 Disposition::Kill => {
@@ -737,6 +930,7 @@ fn host_main(
                                 &mut last_theme,
                                 &attached_info,
                                 bell_marked,
+                                &mut pending_upgrade,
                             )?,
                             Disposition::Kill
                         )
@@ -939,6 +1133,7 @@ fn host_main(
                         &mut last_theme,
                         &attached_info,
                         bell_marked,
+                        &mut pending_upgrade,
                     )?,
                     Err(_) => Disposition::Drop,
                 };
@@ -983,6 +1178,7 @@ fn host_main(
                         &mut last_theme,
                         &attached_info,
                         bell_marked,
+                        &mut pending_upgrade,
                     )?,
                     Err(_) => Disposition::Drop,
                 };
@@ -1051,6 +1247,32 @@ fn host_main(
                     break;
                 }
             }
+        }
+
+        // A requested in-place self-upgrade fires only at a clean handoff
+        // boundary (parser ground, no pending UTF-8, no in-flight graphics
+        // chunk) and only once the child exists to adopt — until then we hold it
+        // and re-check next turn. Placed after the input drain so queued
+        // keystrokes reach the child first. On SUCCESS `self_upgrade` never
+        // returns: this process image is replaced by the new host, which adopts
+        // `child` on the same PTY. A return means the exec — or its reversible
+        // prep — failed; we take the request (a one-shot attempt, so a
+        // structural failure can't spin re-exec every turn) and run on as a
+        // fully-working host. See `docs/host-self-upgrade.md`.
+        if pending_upgrade.is_some()
+            && screen.at_boundary()
+            && let Some(pid) = child.as_ref().map(|c| c.id())
+        {
+            let path = pending_upgrade.take().flatten();
+            let _ = self_upgrade(
+                listener,
+                lock_fd,
+                &pty,
+                pid,
+                opts,
+                launch_dir,
+                path.as_deref(),
+            );
         }
 
         // Reconcile the attach marker with the display client's presence. All the
@@ -1228,6 +1450,7 @@ fn service_display_client(
     last_theme: &mut crate::query::ThemeColors,
     attached_info: &Option<crate::protocol::AttachInfo>,
     bell_marked: bool,
+    pending_upgrade: &mut Option<Option<String>>,
 ) -> io::Result<Disposition> {
     let Some(c) = client.as_mut() else {
         return Ok(Disposition::Keep);
@@ -1246,6 +1469,7 @@ fn service_display_client(
             last_theme,
             attached_info,
             bell_marked,
+            pending_upgrade,
         )?,
         Err(_) => Disposition::Drop,
     };
@@ -1272,6 +1496,7 @@ fn handle_client_messages(
     last_theme: &mut crate::query::ThemeColors,
     attached_info: &Option<crate::protocol::AttachInfo>,
     bell_marked: bool,
+    pending_upgrade: &mut Option<Option<String>>,
 ) -> io::Result<Disposition> {
     for msg in msgs {
         match msg {
@@ -1382,6 +1607,16 @@ fn handle_client_messages(
                 c.subscribed = true;
                 c.observing = true;
             }
+            // Request an in-place self-upgrade. Like `Policy`, only a
+            // display/control client may ask (never an observer — a fleet
+            // preview must not re-exec the session someone is typing in). We
+            // only RECORD the request here; the loop's tail performs it once the
+            // screen is at a clean handoff boundary and a child exists to adopt.
+            // The last request wins if several arrive before a boundary.
+            ClientMsg::Upgrade { path } if !c.subscribed && !c.observing => {
+                *pending_upgrade = Some(path);
+            }
+            ClientMsg::Upgrade { .. } => {}
         }
     }
     Ok(Disposition::Keep)

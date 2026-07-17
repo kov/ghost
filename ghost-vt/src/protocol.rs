@@ -75,12 +75,21 @@ pub enum ClientMsg {
     /// the terminal the user is actually driving owns the policy; the rest are
     /// watching.
     ///
-    /// Kept LAST on purpose. Postcard tags a variant by its position, so the wire
-    /// is positional and a variant may only ever be *appended*: `Policy`
-    /// (PROTO_POLICY=5) is newer than Hello/Subscribe/Observe and must sit after
-    /// them, or a level-4 host decodes those three at the wrong ordinals. The
-    /// `client_msg_wire_discriminants_are_frozen` test pins this.
+    /// Postcard tags a variant by its position, so the wire is positional and a
+    /// variant may only ever be *appended*: `Policy` (PROTO_POLICY=5) is newer
+    /// than Hello/Subscribe/Observe and must sit after them, or a level-4 host
+    /// decodes those three at the wrong ordinals. The
+    /// `client_msg_wire_discriminants_are_frozen` test pins this. `Upgrade`
+    /// (PROTO_UPGRADE=6) is newer still, so it goes after `Policy`.
     Policy(ghost_term::TerminalPolicy),
+    /// Ask the host to re-exec itself in place onto a (possibly newer) binary,
+    /// keeping its child, PTY, socket, and liveness lock — only the host's code
+    /// image is replaced (see `docs/host-self-upgrade.md`). `path` names the
+    /// target binary, or `None` to re-exec the host's own current executable.
+    /// The host honors it only at a clean handoff boundary and only once its
+    /// child exists to adopt; on success the connection drops as the image is
+    /// replaced. Sent by a display/control client, never an observer.
+    Upgrade { path: Option<String> },
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -158,7 +167,7 @@ pub enum ServerMsg {
 /// level 0. Bump this when appending a message clients send unprompted — or
 /// when an existing message's *semantics* change in a way clients must gate on
 /// — and add a `PROTO_*` constant for it.
-pub const PROTO_LEVEL: u32 = 5;
+pub const PROTO_LEVEL: u32 = 6;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
@@ -192,6 +201,17 @@ pub const PROTO_POLICY: u32 = 5;
 
 const _: () = assert!(PROTO_POLICY > PROTO_OBSERVE);
 const _: () = assert!(PROTO_LEVEL >= PROTO_POLICY);
+
+/// Feature level at which the host understands [`ClientMsg::Upgrade`] — an
+/// in-place self-upgrade to a newer binary keeping the running child. A host
+/// below it cannot self-upgrade (it predates the mechanism), and a client must
+/// not send it one: the unknown message would be a decode error the host treats
+/// as a broken connection. This is the "going-forward only" gate — only a host
+/// already speaking level 6 can be upgraded live.
+pub const PROTO_UPGRADE: u32 = 6;
+
+const _: () = assert!(PROTO_UPGRADE > PROTO_POLICY);
+const _: () = assert!(PROTO_LEVEL >= PROTO_UPGRADE);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
@@ -352,6 +372,7 @@ mod tests {
             wire_tag(&ClientMsg::Policy(ghost_term::TerminalPolicy::default())),
             10,
         );
+        assert_eq!(wire_tag(&ClientMsg::Upgrade { path: None }), 11);
     }
 
     #[test]

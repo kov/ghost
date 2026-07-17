@@ -186,6 +186,20 @@ enum Command {
         /// Immutable id of the session to restart.
         name: String,
     },
+    /// Ask a session's host to upgrade itself IN PLACE onto a (possibly newer)
+    /// binary, keeping its running child — same pid, same PTY, same program (see
+    /// `docs/host-self-upgrade.md`). Unlike `__restart`, the running program
+    /// survives. Only a host already speaking the upgrade protocol can do it
+    /// (going-forward only). An internal plumbing command; not for direct use.
+    #[command(name = "__upgrade", hide = true)]
+    Upgrade {
+        /// Immutable id of the session to upgrade.
+        name: String,
+        /// Target binary to re-exec onto; omitted means the host's own current
+        /// executable (upgrade to self — proves the mechanism, or re-execs an
+        /// on-disk-replaced binary at the same path).
+        path: Option<String>,
+    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -449,6 +463,12 @@ fn dispatch(command: Command) {
         // Immutable id, like `__pipe`.
         Command::Restart { name } => {
             if let Err(e) = ghost_vt::session::restart_session(&name) {
+                fail(&e.to_string());
+            }
+        }
+        // Immutable id, like `__pipe`.
+        Command::Upgrade { name, path } => {
+            if let Err(e) = ghost_vt::client::upgrade_session(&name, path) {
                 fail(&e.to_string());
             }
         }

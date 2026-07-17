@@ -47,7 +47,6 @@ impl Child {
     /// Adopt a child we no longer hold a handle for — its pid survived an
     /// in-place re-exec. The caller warrants the pid is still our direct child
     /// (true after an `execv` that keeps the pid), so `waitpid` can reap it.
-    #[allow(dead_code)] // First caller lands with Phase 2 Step 3 (child adoption).
     pub fn from_pid(pid: u32) -> Self {
         Self { pid, handle: None }
     }
