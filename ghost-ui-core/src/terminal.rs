@@ -324,10 +324,24 @@ pub struct TerminalView {
     /// last present. Like a scroll, this is whole-view damage the per-row feed hint
     /// can't localize, so [`Self::damage`] reports `All` until the next present clears it.
     view_slid: bool,
-    /// A repaint is being held back because the app is mid synchronized-output
-    /// frame (DEC mode 2026). Released by the mode resetting, or by the tick
-    /// scheduled when the hold began (so a stuck app can't freeze the window).
-    sync_held: bool,
+    /// A repaint a synchronized-output (DEC 2026) hold deferred and no present has
+    /// drained yet. Set on every held feed that wanted a redraw; cleared ONLY by
+    /// [`Self::mark_presented`], never on emitting the deferred `Cmd::Redraw`. That
+    /// present-driven lifecycle is what keeps a hold fanned into a warm background
+    /// mirror from freezing when a non-animated promotion carries it foreground: the
+    /// debt rides with the model until a real present drains it, so a backstop tick
+    /// mis-delivered to the wrong view can't clear it. The live hold the shell sees
+    /// (`TermTrace::sync_held`) is `synchronized_output() && redraw_owed` — a fact of
+    /// the session mode ANDed with this owed flag, never a standalone latch.
+    ///
+    /// Because only a present clears it, a pathological app that opens a 2026 frame,
+    /// makes a net-zero change (a color set then reset), and parks forever leaves this
+    /// `true` under an open mode: the shell's re-present composites an identical scene,
+    /// lands a `Clean` (which deliberately does not `mark_presented`), and the flag
+    /// stays set — so `sync_held` reads held indefinitely. Harmless (the glass already
+    /// matches; the shell's self-heal just re-renders identical pixels, no flicker) and
+    /// unreachable from any real app, which closes its frame.
+    redraw_owed: bool,
     /// Whether this session's window currently holds keyboard focus. Tracked so
     /// that when an app first enables focus reporting (DEC ?1004) we can report
     /// the *current* focus state immediately, not only on the next change (see
@@ -339,8 +353,8 @@ pub struct TerminalView {
     /// [`Cmd::PointerIcon`]). Updated on pointer motion.
     hovered_link: Option<u16>,
     /// Render-gate counters (see [`TermTrace`]). Only `feeds_seen`, `visible_feeds`,
-    /// `redraws_emitted`, the sync-hold tallies, and `presents_marked` are stored
-    /// here; the live `sync_held`/`feed_dirty` are folded in by [`Self::trace`].
+    /// `redraws_emitted`, `feeds_while_held`, and `presents_marked` are stored here;
+    /// the derived `sync_held` and live `feed_dirty` are folded in by [`Self::trace`].
     trace: TermTrace,
     /// Memoized laid-out frame, keyed on everything [`ghost_render::layout_frame_at`]
     /// reads: the session's [`content_gen`](SessionState::content_gen), the effective
@@ -376,14 +390,11 @@ pub struct TermTrace {
     pub visible_feeds: u64,
     /// Repaints this model emitted from the feed/tick path (`Cmd::Redraw`).
     pub redraws_emitted: u64,
-    /// The live synchronized-output (DEC 2026) hold flag.
+    /// The synchronized-output (DEC 2026) hold, derived from the live session mode
+    /// and whether a repaint is owed for it — not a stored latch (see
+    /// [`TerminalView::trace`]). The shell edge-detects this to time a `HeldTooLong`
+    /// stall.
     pub sync_held: bool,
-    /// Synchronized-output holds entered.
-    pub sync_holds: u64,
-    /// Holds released by the mode resetting (2026l).
-    pub sync_released_by_reset: u64,
-    /// Holds released by the backstop or an animation tick.
-    pub sync_released_by_tick: u64,
     /// Visible feeds swallowed by an open hold (their repaint deferred).
     pub feeds_while_held: u64,
     /// Accumulated feed damage awaiting the next present.
@@ -1223,7 +1234,7 @@ impl TerminalModel {
     /// A snapshot of this session's render-gate counters (see
     /// [`TerminalView::trace`]).
     pub fn trace(&self) -> TermTrace {
-        self.view.trace()
+        self.view.trace(&self.state)
     }
 
     /// Combined render scale: device scale x user zoom (see
@@ -1289,7 +1300,7 @@ impl TerminalView {
             feed_dirty: None,
             presented: None,
             view_slid: false,
-            sync_held: false,
+            redraw_owed: false,
             focused: false,
             hovered_link: None,
             trace: TermTrace::default(),
@@ -1383,14 +1394,19 @@ impl TerminalView {
         });
         self.feed_dirty = None;
         self.view_slid = false;
+        self.redraw_owed = false;
         self.trace.presents_marked += 1;
     }
 
-    /// A snapshot of this session's render-gate counters, with the live
-    /// `sync_held`/`feed_dirty` folded in (see [`TermTrace`]).
-    pub(crate) fn trace(&self) -> TermTrace {
+    /// A snapshot of this session's render-gate counters, with the live `feed_dirty`
+    /// and the derived `sync_held` folded in (see [`TermTrace`]). `sync_held` is a
+    /// synchronized frame open (the live session mode) AND a repaint owed for it
+    /// ([`redraw_owed`](Self::redraw_owed)) — never a standalone latch, so a present
+    /// draining the owed repaint, or the app resetting the mode, drops the hold with
+    /// no counter to un-stick.
+    pub(crate) fn trace(&self, state: &SessionState) -> TermTrace {
         TermTrace {
-            sync_held: self.sync_held,
+            sync_held: state.screen.vt().synchronized_output() && self.redraw_owed,
             feed_dirty: self.feed_dirty,
             ..self.trace
         }
@@ -1485,11 +1501,13 @@ impl TerminalView {
             }
             UiEvent::SessionDisconnected { name } => state.set_reconnecting(&name, true),
             UiEvent::SessionReattached { name } => state.set_reconnecting(&name, false),
-            // The clock releases a synchronized-output hold and steps an armed
-            // selection autoscroll.
+            // The clock is the release backstop for a synchronized-output hold and
+            // steps an armed selection autoscroll. Flush a repaint a hold deferred and
+            // no present has drained (`redraw_owed`) — the debt rides with the model,
+            // so even a tick that should have gone to the promoted view flushes it
+            // once it arrives, rather than being lost to a cleared latch.
             UiEvent::Tick { .. } => {
-                let mut cmds = if std::mem::take(&mut self.sync_held) {
-                    self.trace.sync_released_by_tick += 1;
+                let mut cmds = if self.redraw_owed {
                     self.trace.redraws_emitted += 1;
                     vec![Cmd::Redraw]
                 } else {
@@ -2170,38 +2188,30 @@ impl TerminalView {
             // Synchronized output (DEC 2026): between set and reset the app is
             // composing one atomic frame, so hold the repaint (damage keeps
             // accumulating above) and schedule a release tick as the backstop.
-            // Any tick releases the hold — an early animation tick just means
-            // one mid-frame paint, the status quo without the mode.
+            // The hold is NOT a latched bit any more — a view derives it from the
+            // live session mode plus whether a repaint is owed (see `trace`), so a
+            // hold can't drift or be cleared on the wrong (foreground) view.
             if outcome.sync && want_redraw {
-                // Re-arm the release backstop on EVERY swallowed feed, not just
-                // the rising edge. A hold can be latched into a warm background
-                // mirror whose one rising-edge tick is then spent on the wrong
-                // (foreground) model; a later non-animated promotion carries the
-                // still-held mirror to the foreground with nothing pending, and
-                // it freezes until output happens to pause outside a frame.
-                // Re-scheduling every feed closes that race for free: the shell
-                // coalesces deadlines and a tick to an unlatched model is a
-                // no-op. `sync_holds` still counts the rising edge only.
-                if !self.sync_held {
-                    self.sync_held = true;
-                    self.trace.sync_holds += 1;
-                }
-                // The repaint is deferred by the open hold — counted so the render
-                // trace can see feeds piling up behind a latched 2026 frame.
+                // A synchronized frame is open: defer this repaint. Record the debt
+                // and arm the release backstop. `redraw_owed` is cleared ONLY by a
+                // present (`mark_presented`), never on emitting the Redraw — so a hold
+                // whose backstop tick lands on the wrong (foreground) view stays owed
+                // and is flushed when the promoted view is next ticked. That closes
+                // the warm-mirror-promotion freeze structurally, not by re-arming a
+                // latch that a mis-delivered tick could clear. Arm on every held feed
+                // (no rising edge to gate on); the shell coalesces the deadlines.
+                self.redraw_owed = true;
                 self.trace.feeds_while_held += 1;
                 cmds.push(Cmd::ScheduleTick {
                     after_ms: SYNC_RELEASE_MS,
                 });
-            }
-            if !outcome.sync {
-                let released = std::mem::take(&mut self.sync_held);
-                if released {
-                    self.trace.sync_released_by_reset += 1;
-                }
-                if want_redraw || released {
-                    cmds.push(Cmd::Redraw);
-                    self.trace.redraws_emitted += 1;
-                }
+            } else if !outcome.sync && (want_redraw || self.redraw_owed) {
+                // The frame is closed (or never opened): flush this feed's change and
+                // any repaint a prior hold deferred that no present has drained yet —
+                // including one that wrote no viewport row (a palette/colors remap,
+                // a selection drop, a cursor move), which `redraw_owed` remembers.
+                cmds.push(Cmd::Redraw);
+                self.trace.redraws_emitted += 1;
             }
         }
         if outcome.ended {
@@ -4224,29 +4234,75 @@ mod tests {
     }
 
     #[test]
-    fn trace_counts_a_latched_synchronized_hold() {
+    fn a_synchronized_hold_is_derived_from_live_mode_and_owed_work() {
         let mut m = model();
-        // A synchronized-output frame opens and content lands but never resets:
-        // the hold latches — this is the shape of the freeze bug.
+        // A synchronized-output frame opens and content lands but never resets: the
+        // repaint is held. `sync_held` is DERIVED — the mode is open AND a repaint is
+        // owed — not a stored latch, so it can't drift or be cleared on the wrong view.
         feed(&mut m, b"\x1b[?2026hhello");
         let t = m.trace();
         assert_eq!(t.feeds_seen, 1);
         assert_eq!(t.visible_feeds, 1);
-        assert!(t.sync_held, "the hold is latched");
-        assert_eq!(t.sync_holds, 1);
+        assert!(t.sync_held, "mode open with a repaint owed reads as held");
         assert_eq!(
             t.feeds_while_held, 1,
             "the visible feed was swallowed by the hold"
         );
         assert_eq!(t.redraws_emitted, 0, "no repaint is emitted while held");
-        // A tick (the backstop, or an animation tick) releases it.
-        m.update(UiEvent::Tick { now_ms: 1_000 });
-        let t = m.trace();
-        assert!(!t.sync_held, "the tick released the hold");
-        assert_eq!(t.sync_released_by_tick, 1);
-        assert_eq!(
-            t.redraws_emitted, 1,
-            "the release drove the deferred repaint"
+        // The backstop tick flushes the held frame even though the app never reset
+        // the mode.
+        let cmds = m.update(UiEvent::Tick { now_ms: 1_000 });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "the backstop tick flushes the held frame: {cmds:?}"
+        );
+        // Presenting that flush drains the owed work: with the glass now matching the
+        // model, nothing is held any more — even though the 2026 mode is still open.
+        // (The old latch would have reported this only via its own take/reset; the
+        // derived hold reads it straight from live state.)
+        m.mark_presented();
+        assert!(
+            !m.trace().sync_held,
+            "a present with the frame drained reads as not held, mode still open"
+        );
+    }
+
+    /// A synchronized-output hold must release a change that wrote no viewport rows —
+    /// an OSC 4 palette remap (also OSC 10/11 colors, a selection drop, a bare cursor
+    /// move, a stored image). That change never reaches the `feed_dirty` row
+    /// accumulator, but it DID want a repaint, so the held branch recorded the debt in
+    /// `redraw_owed`. A hold that decides "is a repaint owed?" from `feed_dirty` alone
+    /// leaves the palette stale when the frame closes — the pywal foreground-stall
+    /// shape. The release gates on `want_redraw || redraw_owed`, so any deferred
+    /// want-a-repaint — rows or not — flushes.
+    #[test]
+    fn a_synchronized_hold_releases_a_palette_change_that_touched_no_rows() {
+        let mut m = model();
+        // Open a 2026 frame and remap palette index 1 — no cell is written.
+        feed(&mut m, b"\x1b[?2026h\x1b]4;1;rgb:ff/00/00\x1b\\");
+        // The reset lands in a quiet batch: nothing new to draw *except* the deferred
+        // palette remap the hold has been sitting on.
+        let cmds = m.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: b"\x1b[?2026l".to_vec(),
+            ended: false,
+        });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "closing the frame must repaint the held palette change: {cmds:?}"
+        );
+    }
+
+    /// The backstop-tick twin of the above: if the app never resets the frame, the
+    /// scheduled release tick must still flush a held palette change with no dirty rows.
+    #[test]
+    fn the_backstop_tick_flushes_a_held_palette_change() {
+        let mut m = model();
+        feed(&mut m, b"\x1b[?2026h\x1b]4;1;rgb:00/ff/00\x1b\\");
+        let cmds = m.update(UiEvent::Tick { now_ms: 1_000 });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "the backstop must flush the held palette change: {cmds:?}"
         );
     }
 
@@ -4649,13 +4705,27 @@ mod tests {
             ended: false,
         });
         // The app never closes the frame: the scheduled tick releases the hold
-        // so a stuck client cannot freeze the window.
+        // by re-issuing the deferred repaint, so a stuck client cannot freeze the
+        // window.
         let cmds = m.update(UiEvent::Tick { now_ms: 1_000 });
         assert!(
             cmds.contains(&Cmd::Redraw),
             "timeout did not release the hold: {cmds:?}"
         );
-        // With nothing held, a tick is a no-op.
+        // The debt clears when a present drains it, not when the Redraw is emitted —
+        // the very reason the flag is present-cleared rather than tick-cleared. If the
+        // shell drops that repaint (a wedged pacer), a further tick MUST re-issue it,
+        // else the window freezes on a stale glass. This is the behaviour that
+        // distinguishes 5e from the old latch (which cleared on the first tick and
+        // forgot the debt).
+        let cmds = m.update(UiEvent::Tick { now_ms: 1_500 });
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "a dropped release must be re-issued by the next tick: {cmds:?}"
+        );
+        // Model the present that finally lands: now nothing is owed and a tick is a
+        // no-op.
+        m.mark_presented();
         let cmds = m.update(UiEvent::Tick { now_ms: 2_000 });
         assert!(!cmds.contains(&Cmd::Redraw), "spurious redraw: {cmds:?}");
     }

@@ -69,9 +69,10 @@ pub enum Outcome {
 /// Which repaint gate the classifier believes is stuck.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StallClass {
-    /// A DEC-2026 synchronized-output hold has been open too long — its release
-    /// tick was dropped (the recurring latch). The report's `sync_holds` /
-    /// `released_by_tick` counts and `pending_tick` sub-classify it.
+    /// A DEC-2026 synchronized-output hold has been open too long — a deferred
+    /// repaint whose release tick never landed a present. `sync_held` (the live
+    /// mode ANDed with a still-owed repaint), `feeds_while_held` and `pending_tick`
+    /// sub-classify it.
     HeldTooLong,
     /// Feeds keep arriving but none change anything visible — the core's per-feed
     /// dirty-row hint is dropping updates, so no repaint is even requested.
@@ -130,9 +131,6 @@ pub struct RenderReport {
     pub feeds_seen: u64,
     pub visible_feeds: u64,
     pub feeds_while_held: u64,
-    pub sync_holds: u64,
-    pub released_by_tick: u64,
-    pub released_by_reset: u64,
     pub pending_tick: bool,
     pub presents: u64,
     /// Clean presents since the last real `Presented` — a high count with a stale
@@ -148,7 +146,7 @@ impl std::fmt::Display for RenderReport {
             "class={} stalled_for={}ms held_for={} feed_ago={} visible_ago={} \
              redraw_cmd_ago={} release_ago={} redraw_event_ago={} present_ago={} \
              input_ago={} last_outcome={:?} pacer_pending={} pending_tick={} \
-             feeds_seen={} visible={} while_held={} holds={} rel_tick={} rel_reset={} \
+             feeds_seen={} visible={} while_held={} \
              presents={} cleans_since_present={}",
             self.class,
             self.stalled_for_ms,
@@ -166,9 +164,6 @@ impl std::fmt::Display for RenderReport {
             self.feeds_seen,
             self.visible_feeds,
             self.feeds_while_held,
-            self.sync_holds,
-            self.released_by_tick,
-            self.released_by_reset,
             self.presents,
             self.cleans_since_present,
         )
@@ -391,6 +386,9 @@ impl RenderTrace {
         has_snapshot: bool,
     ) -> Option<StallClass> {
         // A synchronized-output hold: healthy within the backstop, stuck past it.
+        // Past `STALL_HOLD_MS` (a full second, versus the core's 150 ms backstop) a
+        // still-set hold means the release repaint never landed — a wedged present the
+        // self-healer forces past (see `self_heal_due`), not a benign in-flight frame.
         if core.sync_held {
             return self
                 .held_since_ms
@@ -451,17 +449,29 @@ impl RenderTrace {
         None
     }
 
-    /// While a stale-no-present stall is armed, ask the shell to force one corrective
+    /// While a repaint-owed stall is armed, ask the shell to force one corrective
     /// re-present — at most once per [`HEAL_COOLDOWN_MS`], so a persistent freeze heals
     /// promptly without a repaint storm. Returns `true` on the pass the shell should
-    /// invalidate its foreground cache and re-request a paint. Scoped to
-    /// [`StallClass::StaleNoPresent`]: a synchronized-output hold releases on its own
-    /// tick (a forced repaint wouldn't help), and a `SurfaceLost` window is the platform
-    /// withholding the drawable (nothing to heal). Healing a true stale-frame freeze
-    /// repaints the burst; a false trigger (idempotent-active content) just re-renders
-    /// identical pixels — no flicker, since it re-renders rather than reconfiguring.
+    /// invalidate its foreground cache and re-request a paint. Scoped to the two classes
+    /// a forced re-present actually fixes.
+    ///
+    /// [`StallClass::StaleNoPresent`] is visible output that never reached the glass.
+    /// [`StallClass::HeldTooLong`] is a synchronized-output hold still set a full second
+    /// past the 150 ms backstop: a hold now releases on a LANDED present, not on the
+    /// backstop tick (the core defers the repaint and clears its debt in
+    /// `mark_presented`), so a hold stuck this long is a wedged present just like
+    /// StaleNoPresent — a forced re-present composites and lands the deferred frame.
+    /// (Under the old tick-cleared latch a forced repaint couldn't end a hold, so this
+    /// was deliberately excluded; that rationale died with the latch.)
+    /// A `SurfaceLost` window is the platform withholding the drawable (nothing to heal).
+    /// Healing a true freeze repaints the burst; a false trigger (idempotent-active
+    /// content) just re-renders identical pixels — no flicker, since it re-renders rather
+    /// than reconfiguring.
     pub fn self_heal_due(&mut self, now_ms: u64) -> bool {
-        if !matches!(self.stalled, Some((StallClass::StaleNoPresent, _))) {
+        if !matches!(
+            self.stalled,
+            Some((StallClass::StaleNoPresent | StallClass::HeldTooLong, _))
+        ) {
             return false;
         }
         let due = self
@@ -499,9 +509,6 @@ impl RenderTrace {
             feeds_seen: c.feeds_seen,
             visible_feeds: c.visible_feeds,
             feeds_while_held: c.feeds_while_held,
-            sync_holds: c.sync_holds,
-            released_by_tick: c.sync_released_by_tick,
-            released_by_reset: c.sync_released_by_reset,
             pending_tick: self.last_tick_scheduled_ms > self.last_tick_fired_ms,
             presents: c.presents_marked,
             cleans_since_present: self.cleans_since_present,
@@ -559,14 +566,18 @@ mod tests {
             .expect("a latched hold is a stall");
         assert_eq!(r.class, StallClass::HeldTooLong);
         assert!(r.held_for_ms.unwrap() >= 1_000);
-        // The self-healer deliberately does NOT force-repaint a hold: a
-        // synchronized-output hold releases on the core's own backstop tick, and a
-        // forced re-present can't end it. Only a StaleNoPresent stall heals — this
-        // stays false so nobody later "fixes" HeldTooLong into a repaint storm.
+        // A hold now releases only on a LANDED present (the core defers the repaint and
+        // clears its debt in `mark_presented`, not on emitting the backstop Redraw). So
+        // a hold still set a full second past the 150 ms backstop means the release
+        // repaint never reached the glass — a wedged present, which a forced re-present
+        // is exactly what fixes. The self-healer therefore heals HeldTooLong too, once
+        // per cooldown, like StaleNoPresent.
         assert!(
-            !t.self_heal_due(1_100),
-            "a latched hold is not force-repainted; its backstop tick releases it"
+            t.self_heal_due(1_100),
+            "a hold stuck a second past the backstop is a wedged present; force one \
+             corrective re-present"
         );
+        assert!(!t.self_heal_due(1_200), "not again within the cooldown");
     }
 
     #[test]

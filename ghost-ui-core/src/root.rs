@@ -2496,9 +2496,9 @@ impl RootModel {
     /// shell's render trace (see [`TermTrace`](crate::TermTrace)). `None` in the
     /// fleet overview — no single foreground there; its tiles feed themselves. Pure:
     /// never calls `view`, so reading it can't perturb the timing it measures.
-    pub fn foreground_trace(&self) -> Option<crate::TermTrace> {
+    pub fn foreground_trace(&self, sessions: &Sessions) -> Option<crate::TermTrace> {
         match &self.mode {
-            Mode::Single { view, .. } => Some(view.trace()),
+            Mode::Single { id, view } => Some(view.trace(sessions.get(id)?)),
             Mode::Fleet(_) => None,
         }
     }
@@ -2705,6 +2705,9 @@ mod tests {
         }
         fn mark_presented(&mut self) {
             self.root.mark_presented(&mut self.sessions)
+        }
+        fn foreground_trace(&self) -> Option<crate::TermTrace> {
+            self.root.foreground_trace(&self.sessions)
         }
     }
 
@@ -5840,6 +5843,12 @@ mod tests {
             cmds.contains(&Cmd::Redraw),
             "the settling tick repaints: {cmds:?}"
         );
+        // The repaint drains the debt on present (the mode stays open here — the app
+        // never sent 2026l — so it is the owed repaint, not a mode reset, that clears
+        // the hold). Paint the settled foreground, then model the present it drove;
+        // the promoted view is no longer held, and the freeze is gone.
+        r.view();
+        r.mark_presented();
         assert!(
             !r.foreground_trace().expect("single view").sync_held,
             "the slide's completion tick released the hold latched while warm"
