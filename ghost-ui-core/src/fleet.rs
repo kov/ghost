@@ -946,6 +946,28 @@ impl FleetModel {
         self.tiles.iter().any(|t| t.id == id && t.fed)
     }
 
+    /// Whether this fleet holds a tile for `id` at all (live, cold, or dead). The
+    /// shell's shared feed fan uses it to count a fleet window among a session's
+    /// viewers — a tile is a view even though its feed routes through the fleet.
+    pub(crate) fn has_tile(&self, id: &str) -> bool {
+        self.tiles.iter().any(|t| t.id == id)
+    }
+
+    /// The driving geometry of `id`'s tile view, if the fleet holds one — the geometry
+    /// source when a session is driven while its window sits in the fleet overview (a
+    /// live `ThisWindow` tile). The tile's preview rect stands in for the window here (a
+    /// documented edge for pixel queries); what matters is that the shared feed keeps a
+    /// geometry to ingest against instead of stalling.
+    pub(crate) fn tile_driving_geometry(
+        &self,
+        id: &str,
+    ) -> Option<crate::terminal::DrivingGeometry> {
+        self.tiles
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.view.driving_geometry())
+    }
+
     /// Prepare a cold tile (a detached session we're taking over, with no live
     /// preview yet) for a deferred dive-in: size its session to the window so its
     /// preview loads — and the dive lands — at full size, returning the resize
@@ -1593,25 +1615,22 @@ impl FleetModel {
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
             // The observed session's real grid (observation start, or the
-            // display client resized it). Rebuild the mirror at that size —
+            // display client resized it). Reset the tile's own view to that size —
             // the resync that follows the event re-seeds its content. Driven
             // tiles size through their own client, never through this. The
             // shell also uses this for a dead tile's recording playback (the
             // recording's grid, then its last screen as ordinary output).
+            //
+            // The SHARED emulator's rebuild is NOT done here: under the process-wide
+            // `Sessions`, a rebuild from this per-window arm would wipe an emulator a
+            // driving window keeps live (this same Resized also echoes to windows that
+            // merely preview an in-process-driven session, via the app-wide
+            // subscription, where no resync will refill it). The shell owns that
+            // rebuild — once, for a genuine observer's own resize or a dead tile's
+            // recording grid — so it can never blank a shared session. This tile just
+            // re-sizes its local preview view; the fan refills it on the next output.
             SessionPush::Event(SessionEvent::Resized { cols, rows }) => {
                 if (observed || tile.dead) && (tile.grid != (cols, rows) || tile.fed) {
-                    // Throw the mirror away and re-seed it at the given grid: a
-                    // fresh state (stamped with the window's theme/policy, keeping
-                    // the display name) and a fresh view, exactly as the old
-                    // whole-model rebuild did. Rebuild on a grid change, and also
-                    // on a same-grid Resized once the mirror holds content: the
-                    // host emits one before *every* resync (the lagged-drain
-                    // re-seed included, where the grid is unchanged) to say "the
-                    // mirror is stale, the resync replaces it". A same-grid Resized
-                    // on a still-empty placeholder (an observation confirming the
-                    // listed size) has nothing to discard, so it stays a no-op.
-                    // The resync that follows re-fills the content.
-                    sessions.rebuild(id, cols, rows);
                     tile.view = TerminalView::new(self.metrics, cols, rows);
                     tile.grid = (cols, rows);
                     tile.fed = false; // placeholder until the resync lands
@@ -6119,13 +6138,14 @@ mod tests {
     }
 
     #[test]
-    fn a_same_grid_resized_still_rebuilds_the_mirror_for_the_resync() {
+    fn a_same_grid_resized_resets_the_tile_awaiting_the_resync() {
         // The host prefaces *every* observer resync with a Resized — including
         // the lagged-drain re-seed, where the grid has not changed. That Resized
-        // is the client's cue to throw the stale mirror away so the resync that
-        // follows lands on a clean screen. A same-grid Resized must therefore
-        // still rebuild; skipping it would replay the resync on top of the old
-        // content and diverge from the host.
+        // is the tile's cue to reset its preview to a placeholder so the resync
+        // that follows lands on a clean view. A same-grid Resized must therefore
+        // still reset the tile. (The SHARED emulator's rebuild is the shell's job
+        // now, keyed to a genuine observer stream — under the process-wide registry
+        // a per-window rebuild here would blank a session another window drives.)
         let mut m = fleet();
         list(&mut m, &["b"]);
         data(&mut m, "b", b"STALE");
@@ -6144,10 +6164,6 @@ mod tests {
         assert!(
             !tile(&m, "b").fed,
             "a same-grid Resized must reset the tile to a placeholder awaiting resync"
-        );
-        assert!(
-            !m.state("b").unwrap().screen().text()[0].contains("STALE"),
-            "the stale mirror content must be gone — rebuilt fresh for the resync"
         );
     }
 

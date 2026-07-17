@@ -109,6 +109,17 @@ pub enum UiEvent {
         bytes: Vec<u8>,
         ended: bool,
     },
+    /// A session this window views has ended (its child exited) — the *lifecycle*
+    /// half of an ended feed, split out from [`SessionData`](UiEvent::SessionData)
+    /// for the process-wide shared-state world. The shell ingests the final output
+    /// once via the feed fan (which renders every view's last frame), then sends this
+    /// to each viewing window so the reaction a single view used to run inline still
+    /// fires per view: the foreground switches to the next session (or drops to the
+    /// fleet), a warm mirror is dropped, ownership is released. It never removes the
+    /// shared [`SessionState`] — the shell prunes that once the last viewer lets go.
+    SessionEnded {
+        name: SessionId,
+    },
     /// A driven session's transport dropped without the child exiting — a lost
     /// connection whose session may still be alive on the far side (a remote
     /// session over ssh). The tile enters a *reconnecting* hold (frozen, dimmed)

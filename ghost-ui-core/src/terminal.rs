@@ -1499,11 +1499,13 @@ impl TerminalView {
                 cmds
             }
             // A lone terminal ignores enumeration, subscription, and group
-            // state, and never sees `AdoptSession` — `RootModel` handles those.
+            // state, and never sees `AdoptSession` or the fanned `SessionEnded`
+            // lifecycle — `RootModel` handles those.
             UiEvent::SessionList(_)
             | UiEvent::AdoptSession(_)
             | UiEvent::SessionPush { .. }
             | UiEvent::SessionsChanged
+            | UiEvent::SessionEnded { .. }
             | UiEvent::GroupsLoaded(_)
             | UiEvent::DeadSessions(_) => Vec::new(),
         }

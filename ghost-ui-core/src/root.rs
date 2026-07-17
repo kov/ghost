@@ -84,6 +84,13 @@ impl Sessions {
         self.map.get(id)
     }
 
+    /// The rendered rows of session `id`'s screen, if held — the visible viewport as
+    /// lines of text. For the shell to read what a session currently shows (tests,
+    /// diagnostics) without reaching through a view.
+    pub fn text_of(&self, id: &str) -> Option<Vec<String>> {
+        self.map.get(id).map(|s| s.screen().vt().text())
+    }
+
     pub(crate) fn get_mut(&mut self, id: &str) -> Option<&mut SessionState> {
         self.map.get_mut(id)
     }
@@ -103,6 +110,15 @@ impl Sessions {
 
     pub(crate) fn remove(&mut self, id: &str) -> Option<SessionState> {
         self.map.remove(id)
+    }
+
+    /// Drop `id`'s shared state — the shell's last-viewer prune, run once no window
+    /// views the session any more. Public twin of the crate-internal [`remove`](
+    /// Self::remove) (the core's own lifecycle sweeps): under the process-wide
+    /// registry the shell owns the "removed once the last view lets go" rule, so a
+    /// window closing can't delete a state another window still renders.
+    pub fn discard(&mut self, id: &str) {
+        self.map.remove(id);
     }
 
     /// Whether this window holds a state for `id`.
@@ -153,6 +169,29 @@ impl Sessions {
         state.set_policy(policy);
         state.set_display_name(display_name);
         self.map.insert(id.to_string(), state);
+    }
+
+    /// Re-seed an *observed* session's shared state at `cols`×`rows` — the shell's
+    /// once-per-resize rebuild for a genuine mirror (a real subscriber's own resize,
+    /// or a dead tile's recording grid) before the resync that follows. A fresh
+    /// emulator so the resync lands clean instead of doubling the scrollback; creates
+    /// the state if absent. The per-window fleet arm no longer rebuilds — under the
+    /// process-wide registry only the shell may, keyed to a genuine observer stream, so
+    /// a session a window merely previews-while-driven-elsewhere is never blanked.
+    pub fn resize_observed(&mut self, id: &str, cols: u16, rows: u16) {
+        self.rebuild(id, cols, rows);
+    }
+
+    /// Fold every state from `other` this registry doesn't already hold into it — the
+    /// shell merging a freshly-built window's minted session(s) into the one
+    /// process-wide registry. An id already present keeps its existing (shared) state:
+    /// a second window onto a live session borrows the one emulator rather than
+    /// clobbering it. `other`'s theme/policy are dropped; this registry's own stamp
+    /// governs (the caller re-applies it via `set_theme`/`set_policy`).
+    pub fn absorb(&mut self, other: Sessions) {
+        for (id, state) in other.map {
+            self.map.entry(id).or_insert(state);
+        }
     }
 
     /// Restamp the theme on every held state, broadcasting the mode-2031 dark/light
@@ -610,7 +649,7 @@ pub fn feed_shared(
 ) -> (Vec<Cmd>, Vec<Vec<Cmd>>) {
     // The driver's view of the session (foreground or backgrounded — a window can
     // drive a session it has Ctrl-Tabbed away from) supplies the ingest geometry.
-    let Some(geom) = driver.view_of(name).map(|v| v.driving_geometry()) else {
+    let Some(geom) = driver.driving_geometry_of(name) else {
         return (Vec::new(), vec![Vec::new(); observers.len()]);
     };
     let Some(state) = sessions.get_mut(name) else {
@@ -853,8 +892,45 @@ impl RootModel {
     /// re-gridding the shared emulator and SIGWINCHing the child). Input delivery, feed
     /// reaction, and rendering are identical either way. Sourced from `mine` today;
     /// enablement will repoint it at the App-level connection owner in one place.
-    fn drives(&self, name: &str) -> bool {
+    pub fn drives(&self, name: &str) -> bool {
         self.mine.contains(name)
+    }
+
+    /// Whether this window shows `name` in any slot — the foreground `Single` view, a
+    /// `warm` background mirror, or a fleet tile. The shell's process-wide feed fan
+    /// uses this to find every window a session's one shared feed must reach. Unlike
+    /// [`Self::view_of`], this DOES count fleet tiles (a tile is a view of the session
+    /// even though its feed routes through [`FleetModel`], not a bare `apply_feed`).
+    pub fn views(&self, name: &str) -> bool {
+        if self.view_of(name).is_some() {
+            return true;
+        }
+        matches!(&self.mode, Mode::Fleet(f) if f.has_tile(name))
+    }
+
+    /// Whether `name` is this window's Single-view *foreground* (not merely warm or a
+    /// fleet tile). The shell prefers a foregrounding window when it must pick the one
+    /// driver of a session two windows transiently claim during a take-over steal, so
+    /// the geometry/query-answer source is stable across wakes.
+    pub fn foregrounds(&self, name: &str) -> bool {
+        matches!(&self.mode, Mode::Single { id, .. } if id == name)
+    }
+
+    /// The driving geometry to ingest `name`'s feed against — the grid/pixels/focus of
+    /// this window's view of it. Covers the foreground `Single` view, a `warm` mirror,
+    /// AND a fleet tile this window drives (the normal fleet case: a live `ThisWindow`
+    /// tile). [`Self::view_of`] misses fleet tiles, so [`feed_shared`] sources geometry
+    /// through here instead — else a session driven while its window sits in the fleet
+    /// overview would ingest against no geometry and stop feeding. (A fleet tile answers
+    /// pixel queries with its preview rect — a pre-existing documented edge.)
+    pub(crate) fn driving_geometry_of(&self, name: &str) -> Option<DrivingGeometry> {
+        if let Some(v) = self.view_of(name) {
+            return Some(v.driving_geometry());
+        }
+        if let Mode::Fleet(f) = &self.mode {
+            return f.tile_driving_geometry(name);
+        }
+        None
     }
 
     /// This window's live view of `name`, if it shows it — the foreground `Single`
@@ -1186,18 +1262,18 @@ impl RootModel {
         // release, which also drops the warm mirror and its state, is handled in
         // `release_detached`.)
         //
-        // A Cmd::Attach also enforces the resync/reseed contract: the attach's
-        // resync — which carries the whole screen AND its scrollback — is on its
-        // way, so rebuild that session's mirror to a fresh emulator or the replay
-        // doubles the scrollback (an observed/previewed session's warm mirror
-        // already holds that history). This matches a cold attach and holds for
-        // every present and future Cmd::Attach emitter, wherever it routes.
-        let (cols, rows) = self.grid();
+        // The attach's resync/reseed contract — rebuild the mirror to a fresh
+        // emulator so the incoming resync (whole screen AND scrollback) doesn't
+        // double the history — now lives in the SHELL's `Cmd::Attach` executor,
+        // keyed to actually opening a transport. Under the process-wide shared
+        // `Sessions`, a rebuild here would wipe an emulator another window drives
+        // when this window's Attach opens no new client (a same-process take-over),
+        // and there'd be no resync to refill it. So the shell rebuilds exactly when
+        // a resync is inbound; the core only tracks ownership.
         for c in &cmds {
             match c {
                 Cmd::Attach(id) => {
                     self.mine.insert(id.clone());
-                    sessions.rebuild(id, cols, rows);
                 }
                 Cmd::Kill(id) => {
                     self.mine.remove(id);
@@ -1301,15 +1377,14 @@ impl RootModel {
                 }
                 _ => unreachable!(),
             };
-            // A reattach re-sends a full resync (the whole screen AND scrollback);
-            // rebuild the mirror first so it lands on a fresh emulator, exactly as
-            // a cold attach does. Replaying the history onto the mirror that was
-            // live until the drop would double the scrollback. (A disconnect only
-            // freezes the mirror — there is nothing to reset.)
-            if matches!(ev, UiEvent::SessionReattached { .. }) {
-                let (cols, rows) = self.grid();
-                sessions.rebuild(&name, cols, rows);
-            }
+            // A reattach re-sends a full resync (the whole screen AND scrollback):
+            // the mirror must be rebuilt to a fresh emulator first, or replaying the
+            // history onto the still-live mirror doubles the scrollback. Under the
+            // shared `Sessions` that rebuild is the SHELL's job (done once, for the
+            // driver, before it dispatches this event) — the same reason the
+            // `Cmd::Attach` rebuild moved there: a rebuild here would wipe a session
+            // another window also views. (A disconnect only freezes the mirror.)
+            //
             // A feed never re-grids off drivership (that is DECCOLM's job, inside
             // `ingest`), but `update` still needs the bit; compute it once.
             let driving = self.mine.contains(&name);
@@ -1328,9 +1403,26 @@ impl RootModel {
             }
             return Vec::new();
         }
+        // A session this window views ended — the lifecycle half of an ended feed,
+        // fanned by the shell after the one shared ingest rendered every view's final
+        // frame. React per view: the foreground switches away (or drops to the fleet),
+        // a warm mirror and its ownership are dropped. The fleet tile's revert already
+        // happened in the render fan (`apply_shared_to_tile` on `outcome.ended()`). The
+        // shared state is left for the shell's last-viewer prune.
+        if let UiEvent::SessionEnded { name } = &ev {
+            let name = name.clone();
+            if matches!(&self.mode, Mode::Single { id, .. } if *id == name) {
+                return self.foreground_ended(sessions);
+            }
+            if self.warm.remove(&name).is_some() {
+                self.mine.remove(&name);
+            }
+            return Vec::new();
+        }
         // The foreground session's child exited (the shell was quit). Exiting a
         // shell never quits the app: switch to the next attached session, or drop
-        // to the fleet overview when this window has none left.
+        // to the fleet overview when this window has none left. (Standalone/test feed
+        // path; in the shell this is the fanned `SessionEnded` above.)
         if let UiEvent::SessionData {
             name, ended: true, ..
         } = &ev
@@ -1734,11 +1826,13 @@ impl RootModel {
         // Freeze the dead session's last frame now, before we discard it — it's the
         // rendered stand-in that slides out under the switch.
         let outgoing = self.live_scene(sessions);
-        // The session is dead: drop our ownership, its state, and any warm mirror of
-        // it, and cancel any in-flight dive/slide so a stale camera can't linger.
+        // The session is dead: drop our ownership and any warm mirror of it, and
+        // cancel any in-flight dive/slide so a stale camera can't linger. The shared
+        // `SessionState` itself is NOT removed here — another window may still be
+        // rendering its final frame; the shell drops it once the last viewer lets go
+        // (a last-viewer prune after the ended fan reaches every window).
         self.mine.remove(&gone);
         self.warm.remove(&gone);
-        sessions.remove(&gone);
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
@@ -2896,116 +2990,13 @@ mod tests {
         assert!(r.is_fleet(), "a real exit still drops to the fleet");
     }
 
-    /// Lines (scrollback + viewport) of a session's mirror that contain `needle`.
-    fn marker_lines(r: &Win, id: &str, needle: &str) -> usize {
-        r.sessions
-            .get(id)
-            .expect("session state")
-            .screen()
-            .text()
-            .iter()
-            .filter(|l| l.contains(needle))
-            .count()
-    }
-
-    #[test]
-    fn a_reattach_rebuilds_the_mirror_so_the_resync_does_not_double_the_scrollback() {
-        // A dropped-then-reattached foreground gets a fresh resync, which carries
-        // the whole screen AND scrollback. Replaying it onto the still-live mirror
-        // would double the history; the reattach must rebuild the mirror first, so
-        // the resync lands on an empty emulator exactly as a cold attach does.
-        use ghost_vt::screen::Screen;
-
-        // A host with enough output to have scrolled most of it into scrollback.
-        let mut host = Screen::new(80, 24, 1000);
-        for i in 0..50 {
-            host.feed(format!("MARKER-{i:03}\r\n").as_bytes());
-        }
-        let resync = host.resync();
-
-        let mut r = root(); // single view of alpha
-        feed(&mut r, "alpha", &resync); // the first attach's resync
-        assert_eq!(
-            marker_lines(&r, "alpha", "MARKER-"),
-            50,
-            "precondition: the first resync lands each marker line exactly once"
-        );
-
-        r.update(UiEvent::SessionDisconnected {
-            name: "alpha".into(),
-        });
-        r.update(UiEvent::SessionReattached {
-            name: "alpha".into(),
-        });
-        feed(&mut r, "alpha", &resync); // the reattach re-sends the resync
-
-        assert_eq!(
-            marker_lines(&r, "alpha", "MARKER-"),
-            50,
-            "the reattach resync must land on a rebuilt mirror, not double the scrollback"
-        );
-    }
-
-    #[test]
-    fn claiming_an_observed_session_rebuilds_it_so_the_attach_resync_does_not_double() {
-        // A session previewed in the fleet has a warm mirror fed by observation.
-        // Claiming it (here: a background member of a group being opened) attaches
-        // a display client, and that attach's resync carries the whole screen AND
-        // scrollback. Without a rebuild the resync replays the history the mirror
-        // already holds, doubling the scrollback. The claim (its Cmd::Attach) must
-        // rebuild the mirror first, so the attach lands like a cold one.
-        use ghost_vt::screen::Screen;
-        let mut host = Screen::new(80, 24, 1000);
-        for i in 0..50 {
-            host.feed(format!("MARKER-{i:03}\r\n").as_bytes());
-        }
-        let resync = host.resync();
-
-        let mut r = root(); // owns alpha
-        dive_out(
-            &mut r,
-            &[
-                sess("alpha", true, 1),
-                sess("gamma", false, 3), // detached, foreign → observed
-            ],
-        );
-        settle(&mut r);
-        feed(&mut r, "gamma", &resync); // observed content mirrors the host
-        assert_eq!(
-            marker_lines(&r, "gamma", "MARKER-"),
-            50,
-            "precondition: observation seeds each marker line exactly once"
-        );
-
-        // Open a group with gamma as a background member: Ctrl-Enter claims it
-        // (a Cmd::Attach), which the contract wrapper turns into a mirror rebuild.
-        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
-            id: "g".into(),
-            name: "g".into(),
-            color: 0,
-            members: vec!["alpha".into(), "gamma".into()],
-            connection: None,
-        }]));
-        let cmds = key(
-            &mut r,
-            Key::Named(NamedKey::Enter),
-            Mods {
-                ctrl: true,
-                ..Mods::NONE
-            },
-        );
-        assert!(
-            cmds.contains(&Cmd::Attach("gamma".into())),
-            "opening the group attaches gamma in the background: {cmds:?}"
-        );
-        feed(&mut r, "gamma", &resync); // the attach's resync
-
-        assert_eq!(
-            marker_lines(&r, "gamma", "MARKER-"),
-            50,
-            "the attach resync must land on a rebuilt mirror, not double the scrollback"
-        );
-    }
+    // The reattach/claim "resync must not double the scrollback" contract moved with
+    // the rebuild it depends on: under the process-wide shared `Sessions`, the mirror
+    // rebuild-before-resync is the SHELL's (its `Cmd::Attach` executor and reconnect
+    // path rebuild `self.states` exactly when a transport that will resync opens), so
+    // a rebuild here could wipe a session another window drives. The two former core
+    // tests (`a_reattach_rebuilds…`, `claiming_an_observed_session_rebuilds…`) are
+    // re-homed as shell-level tests over the real attach/reconnect flow in `main.rs`.
 
     fn click(r: &mut Win, x: f32, y: f32) -> Vec<Cmd> {
         r.update(UiEvent::Pointer {

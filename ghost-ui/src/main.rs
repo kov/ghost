@@ -1372,6 +1372,10 @@ fn interactive(fresh: bool) {
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
         windows: HashMap::new(),
+        states: Sessions::new(),
+        sessions: HashMap::new(),
+        observers: HashMap::new(),
+        dead_fed: HashSet::new(),
         clipboard: None,
         start: Instant::now(),
         startup,
@@ -1782,6 +1786,10 @@ impl App {
     fn headless() -> Self {
         App {
             windows: HashMap::new(),
+            states: Sessions::new(),
+            sessions: HashMap::new(),
+            observers: HashMap::new(),
+            dead_fed: HashSet::new(),
             clipboard: None,
             start: Instant::now(),
             startup: Startup::Fleet,
@@ -1884,24 +1892,6 @@ struct WindowState {
     /// the render/redraw paths are inert (see [`WindowState::request_redraw`]).
     gfx: Option<Graphics>,
     root: RootModel,
-    /// The emulator/terminal state for each session this window drives or previews —
-    /// the map hoisted out of `RootModel` (Scope B), threaded into every
-    /// `root.update`/`root.view`. Distinct from [`Self::sessions`], which holds the
-    /// transport *clients*; this holds what each session's screen looks like.
-    states: Sessions,
-    /// This window's own session clients (the single-view session plus any fleet
-    /// previews). Dropping the window drops these, which detaches every session
-    /// it held — the "close = detach" default, with no shared-pool bookkeeping.
-    sessions: HashMap<String, Session>,
-    /// Read-only mirrors of the sessions this window's fleet shows but does
-    /// not drive (`Cmd::Observe`). Live only while the overview is open; their
-    /// output feeds the tiles as `SessionData`, and only their `Resized` event
-    /// is forwarded (the app-wide subscription already delivers the rest).
-    observers: HashMap<String, Subscriber>,
-    /// Dead sessions whose recording has been played into their tile already,
-    /// so the periodic sweep doesn't re-feed the same last screen every tick.
-    /// A name is cleared when its session lives again (a fresh death re-feeds).
-    dead_fed: HashSet<String>,
     mods: ModifiersState,
     /// Last pointer position in physical pixels (winit reports it only on move,
     /// so we cache it for button/wheel events).
@@ -1993,8 +1983,32 @@ impl WindowState {
 /// clock), holds the pure models, and shuttles `UiEvent`s in and `Cmd`s out.
 /// Each window owns its own session clients (see [`WindowState::sessions`]).
 struct App {
-    /// Live windows by id; each owns its GPU surface, pure model, and sessions.
+    /// Live windows by id; each owns its GPU surface and pure model.
     windows: HashMap<WindowId, WindowState>,
+    /// The one emulator/terminal state per session in this process (the "one model,
+    /// many views" collapse): what each session's screen looks like, keyed by id.
+    /// Every window viewing a session borrows the SAME state from here, so a session
+    /// driven in one window and previewed in another is emulated once and fanned to
+    /// each view — never re-run per window. Distinct from [`Self::sessions`], the
+    /// transport *clients*.
+    states: Sessions,
+    /// The process's session clients (the driving transport connections), keyed by
+    /// id — exactly one per session regardless of how many windows view it. Input
+    /// from any viewing window reaches the one client; the last viewer letting go
+    /// drops it (the "close = detach" default). One of the three feed sources fanned
+    /// into [`Self::states`]: the driven half.
+    sessions: HashMap<String, Session>,
+    /// Read-only mirrors of sessions previewed but driven nowhere in this process
+    /// (`Cmd::Observe` — a session attached elsewhere, or on a remote host), keyed by
+    /// id. Deduped against [`Self::sessions`]: a session with a local client is never
+    /// also observed (that would double-feed its one emulator). The observed feed
+    /// source; last-viewer-gated on teardown like the clients.
+    observers: HashMap<String, Subscriber>,
+    /// Dead sessions whose recording has been played into the shared state already,
+    /// so the periodic sweep doesn't re-feed the same last screen every tick.
+    /// Process-wide: the recording replays once, fanned to every window's tile.
+    /// A name is cleared when its session lives again (a fresh death re-feeds).
+    dead_fed: HashSet<String>,
     /// Lazily-opened system clipboard for copy/paste (shared).
     clipboard: Option<arboard::Clipboard>,
     /// Start of the monotonic clock injected into models via `Tick`.
@@ -2137,15 +2151,12 @@ impl App {
             });
         }
         self.dispatch(wid, UiEvent::DeadSessions(dead.clone()), event_loop);
-        // A session alive again may die again later: let it re-feed then.
-        if let Some(w) = self.windows.get_mut(&wid) {
-            w.dead_fed.retain(|n| !live_names.contains(n.as_str()));
-        }
+        // A session alive again may die again later: let it re-feed then. The mark is
+        // process-wide now (the recording replays once into the one shared state,
+        // fanned to every window's tile), so a live session clears it for all.
+        self.dead_fed.retain(|n| !live_names.contains(n.as_str()));
         for d in dead {
-            let fresh = self
-                .windows
-                .get_mut(&wid)
-                .is_some_and(|w| w.dead_fed.insert(d.name.clone()));
+            let fresh = self.dead_fed.insert(d.name.clone());
             if !fresh {
                 continue;
             }
@@ -2154,26 +2165,31 @@ impl App {
             };
             let s = screen::Screen::from_recording(&rec, 0);
             let (cols, rows) = s.dimensions();
-            self.dispatch(
-                wid,
-                UiEvent::SessionPush {
-                    name: d.name.clone(),
-                    push: SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
-                        cols,
-                        rows,
-                    }),
-                },
-                event_loop,
-            );
-            self.dispatch(
-                wid,
-                UiEvent::SessionData {
-                    name: d.name,
-                    bytes: s.resync(),
-                    ended: false,
-                },
-                event_loop,
-            );
+            // Seed the ONE shared state at the recording's grid (the fleet arm no
+            // longer rebuilds it), push the grid to every window's dead tile so it
+            // resets its preview view, then replay the last screen into the shared
+            // state once and fan the render to all of them.
+            self.states.resize_observed(&d.name, cols, rows);
+            let viewers: Vec<WindowId> = self
+                .windows
+                .iter()
+                .filter(|(_, w)| w.root.views(&d.name))
+                .map(|(id, _)| *id)
+                .collect();
+            for v in &viewers {
+                self.dispatch(
+                    *v,
+                    UiEvent::SessionPush {
+                        name: d.name.clone(),
+                        push: SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
+                            cols,
+                            rows,
+                        }),
+                    },
+                    event_loop,
+                );
+            }
+            self.feed_observed_to_viewers(&d.name, &s.resync(), false, event_loop);
         }
         let grouped: HashSet<&String> = self.groups.iter().flat_map(|g| &g.members).collect();
         for name in ghost_vt::descriptor::all_names() {
@@ -2261,7 +2277,7 @@ impl App {
                     continue;
                 };
                 // Model side (headless-observable): the default colors and padding.
-                let cmds = w.root.set_theme(&mut w.states, colors);
+                let cmds = w.root.set_theme(&mut self.states, colors);
                 w.root.set_padding(pad);
                 // Gfx side (no model representation; absent under a headless
                 // frontend): the renderer theme — opacity/frost/scheme colours bake
@@ -2301,7 +2317,7 @@ impl App {
     /// Feed an event to window `wid`'s model and execute the effects it returns.
     fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
         let cmds = match self.windows.get_mut(&wid) {
-            Some(w) => w.root.update(&mut w.states, ev),
+            Some(w) => w.root.update(&mut self.states, ev),
             None => return,
         };
         self.exec(wid, cmds, event_loop);
@@ -2315,9 +2331,8 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
-                    if let Some(w) = self.windows.get_mut(&wid)
-                        && let Some(s) = w.sessions.get_mut(&session)
-                    {
+                    // Input from any viewing window reaches the one process-wide client.
+                    if let Some(s) = self.sessions.get_mut(&session) {
                         let _ = s.send_input(&bytes);
                     }
                 }
@@ -2326,9 +2341,9 @@ impl App {
                     cols,
                     rows,
                 } => {
-                    if let Some(w) = self.windows.get_mut(&wid)
-                        && let Some(s) = w.sessions.get_mut(&session)
-                    {
+                    // Only the driving window emits `Cmd::Resize` (grid mutation is a
+                    // drivership privilege), so this reaches the one shared client.
+                    if let Some(s) = self.sessions.get_mut(&session) {
                         let _ = s.resize(cols, rows);
                     }
                 }
@@ -2411,13 +2426,27 @@ impl App {
                     }
                 }
                 Cmd::Attach(id) => {
-                    if let Some(w) = self.windows.get_mut(&wid)
-                        && !w.sessions.contains_key(&id)
+                    // A session already driven in THIS process (a client in the shared
+                    // map) is adopted in place: the core already took drivership
+                    // (`mine`), so we open no second client and DON'T rebuild — the one
+                    // shared emulator and its scrollback stay live. This is the
+                    // same-process take-over / second-view path; a second client or a
+                    // rebuild here would double-drive or blank a session another window
+                    // still views (there'd be no resync to refill it).
+                    if !self.sessions.contains_key(&id)
+                        && let Some(w) = self.windows.get(&wid)
                     {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&id, cols, rows, &w.root.client_identity()) {
-                            w.sessions.insert(id, s);
+                        let identity = w.root.client_identity();
+                        if let Ok(s) = attach(&id, cols, rows, &identity) {
+                            // A fresh transport means a resync (whole screen AND
+                            // scrollback) is inbound: rebuild the shared mirror first so
+                            // the replay lands on an empty emulator instead of doubling
+                            // the history (W1, hoisted out of the core so it fires
+                            // exactly when a resync is coming, never on an adopt).
+                            self.states.resize_observed(&id, cols, rows);
+                            self.sessions.insert(id, s);
                         }
                     }
                 }
@@ -2425,21 +2454,19 @@ impl App {
                     // Live remote preview: observe the session over its host's
                     // transport, feeding the tile exactly like a local observer.
                     if self.bench.is_none()
-                        && self.windows.get(&wid).is_some_and(|w| {
-                            // Never observe a session this window already drives:
-                            // an observer plus a display client double-feeds the one
-                            // emulator, garbling it unhealably (finding #7). The core
-                            // stops asking, but the executor is the last seam where
-                            // both sets are live, so it holds the invariant too.
-                            !w.observers.contains_key(&id) && !w.sessions.contains_key(&id)
-                        })
+                        // Never observe a session anything in THIS PROCESS already
+                        // drives or observes: a second feed source double-feeds the one
+                        // shared emulator, garbling it unhealably (finding #7). The maps
+                        // are process-wide now, so this dedup is process-wide — the whole
+                        // point of the collapse (a preview of an in-process-driven
+                        // session borrows the driver's state, opens no mirror).
+                        && !self.observers.contains_key(&id)
+                        && !self.sessions.contains_key(&id)
                         && let Some((target, real)) = self.remote_index.get(&id).cloned()
                     {
                         match self.observe_remote(&target, &real) {
                             Some(sub) => {
-                                if let Some(w) = self.windows.get_mut(&wid) {
-                                    w.observers.insert(id, sub);
-                                }
+                                self.observers.insert(id, sub);
                             }
                             // No live connection (host gone) or a failed channel:
                             // report the mirror dead so the tile reverts to a
@@ -2458,15 +2485,15 @@ impl App {
                 }
                 Cmd::Observe(id) => {
                     if self.bench.is_none()
-                        && let Some(w) = self.windows.get_mut(&wid)
-                        // Never observe a session this window already drives — see
-                        // the remote arm above (finding #7).
-                        && !w.observers.contains_key(&id)
-                        && !w.sessions.contains_key(&id)
+                        // Process-wide dedup — see the remote arm above (finding #7).
+                        // A session driven or already observed anywhere in this process
+                        // is never given a second feed source.
+                        && !self.observers.contains_key(&id)
+                        && !self.sessions.contains_key(&id)
                     {
                         match Subscriber::observe(&id) {
                             Ok(sub) => {
-                                w.observers.insert(id, sub);
+                                self.observers.insert(id, sub);
                             }
                             // An old host or a dying session: report the
                             // mirror dead so the fleet reverts the tile to a
@@ -2484,8 +2511,13 @@ impl App {
                     }
                 }
                 Cmd::Unobserve(id) => {
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.observers.remove(&id);
+                    // Last-viewer-gate (W5): the observer is the ONE shared feed source
+                    // for this session now, so a fleet closing must not kill it while
+                    // another window still previews it. Drop it only when no window
+                    // views `id` any more. (Symmetric to the Observe dedup: creation is
+                    // deduped, destruction is refcounted by the live viewer set.)
+                    if !self.windows.values().any(|w| w.root.views(&id)) {
+                        self.observers.remove(&id);
                     }
                 }
                 Cmd::SaveGroups(new_groups) => {
@@ -2517,15 +2549,15 @@ impl App {
                     }
                 }
                 Cmd::Detach(id) => {
-                    // Drop this window's client for the session (it keeps running
-                    // under its host); other windows' clients are unaffected.
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.sessions.remove(&id);
-                    }
+                    // The core already dropped this window's ownership/mirror; reconcile
+                    // the one shared client against the remaining viewers — dropped if no
+                    // window views it (it keeps running under its host), downgraded to a
+                    // read-only mirror if another window only previews it.
+                    self.reconcile_source(&id);
                 }
                 Cmd::Kill(id) if is_remote_id(&id) => {
                     // Kill the remote session over its host's transport (off-loop),
-                    // then drop any client we hold; the watcher drops the tile.
+                    // then reconcile the shared source; the watcher drops the tile.
                     // Route by the id itself, like Rename below: a remote id is
                     // self-describing, and the one most worth killing — a cold tile
                     // whose host dropped — is neither driven nor listed, so the
@@ -2534,16 +2566,13 @@ impl App {
                     if let Some((target, real)) = remote_id_parts(&id) {
                         self.spawn_remote_kill(target, real);
                     }
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.sessions.remove(&id);
-                    }
+                    self.reconcile_source(&id);
                 }
                 Cmd::Kill(id) => {
-                    // Kill the session and its process, then drop any client we held.
+                    // Kill the session and its process, then reconcile the shared source
+                    // (the client is dropped; a dead tile falls back to its recording).
                     let _ = session::kill_session(&id);
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.sessions.remove(&id);
-                    }
+                    self.reconcile_source(&id);
                 }
                 Cmd::Recreate(id) => {
                     // Bring a dead session back and step into it. A REMOTE tile is
@@ -2555,7 +2584,7 @@ impl App {
                         remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         self.spawn_remote_session(wid, &target, &real);
-                    } else if self.respawn_dead(wid, &id) && self.attach_into(wid, &id) {
+                    } else if self.respawn_dead(&id) && self.attach_into(wid, &id) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
@@ -2573,7 +2602,7 @@ impl App {
                     {
                         self.respawn_remote_dead(&target, &real);
                     } else {
-                        self.respawn_dead(wid, &id);
+                        self.respawn_dead(&id);
                     }
                 }
                 Cmd::Rename { session, name } => {
@@ -2591,12 +2620,17 @@ impl App {
                 }
                 Cmd::Spawn { name, command } => {
                     spawn_session(&name, command, None);
-                    // Best-effort attach; a later reconcile re-attaches if it lost the race.
-                    if let Some(w) = self.windows.get_mut(&wid) {
+                    // Best-effort attach; a later reconcile re-attaches if it lost the
+                    // race. A freshly-spawned name is new, so the shared client map has
+                    // no entry — this window becomes its driver.
+                    if !self.sessions.contains_key(&name)
+                        && let Some(w) = self.windows.get(&wid)
+                    {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
-                        if let Ok(s) = attach(&name, cols, rows, &w.root.client_identity()) {
-                            w.sessions.insert(name, s);
+                        let identity = w.root.client_identity();
+                        if let Ok(s) = attach(&name, cols, rows, &identity) {
+                            self.sessions.insert(name, s);
                         }
                     }
                 }
@@ -2662,13 +2696,11 @@ impl App {
                     if let Some((target, real)) = self.remote_index.get(&id).cloned() {
                         self.take_over_remote(wid, &id, &target, &real, event_loop);
                     } else {
-                        // Switch the window to `id`'s single view. Attach if we don't
-                        // already hold it — stealing the display from another window
-                        // for a confirmed take-over of a session attached elsewhere.
-                        let held = self
-                            .windows
-                            .get(&wid)
-                            .is_some_and(|w| w.sessions.contains_key(&id));
+                        // Switch the window to `id`'s single view. Attach only if the
+                        // process holds no client yet — a session already driven here
+                        // (even by another window) is adopted in place (no second
+                        // transport), the same-process take-over the shared map enables.
+                        let held = self.sessions.contains_key(&id);
                         if held || self.attach_into(wid, &id) {
                             self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                         }
@@ -2863,15 +2895,13 @@ impl App {
     /// `descriptor.command` — a relaunch restores context, it does not re-run what
     /// died (which could be anything, and re-running it unbidden is the surprise
     /// we avoid). The child is deferred to the first attach (`start_on_attach`).
-    fn respawn_dead(&mut self, wid: WindowId, id: &str) -> bool {
+    fn respawn_dead(&mut self, id: &str) -> bool {
         if !spawn_dead(id) {
             return false;
         }
         // Its tile previews the OLD recording; a fresh death after this new life
-        // must re-feed.
-        if let Some(w) = self.windows.get_mut(&wid) {
-            w.dead_fed.remove(id);
-        }
+        // must re-feed (the mark is process-wide now).
+        self.dead_fed.remove(id);
         true
     }
 
@@ -3019,21 +3049,27 @@ impl App {
     }
 
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
-        let Some(w) = self.windows.get_mut(&wid) else {
-            return false;
-        };
-        if w.sessions.contains_key(name) {
+        // Already driven somewhere in this process → adopt in place: the caller's
+        // AdoptSession takes drivership, and no second client / rebuild is opened.
+        if self.sessions.contains_key(name) {
             return true;
         }
+        let Some(w) = self.windows.get(&wid) else {
+            return false;
+        };
         // Complete the handshake at the window's real grid, never a provisional
         // 80×24: the host lays out its resync at the handshake size, so attaching
         // a maximized window at 80×24 would reflow a full-size screen down and
         // pin its cursor to that smaller bottom row — the next output then lands
         // mid-screen (see `RootModel::grid`).
         let (cols, rows) = w.root.grid();
-        match attach(name, cols, rows, &w.root.client_identity()) {
+        let identity = w.root.client_identity();
+        match attach(name, cols, rows, &identity) {
             Ok(s) => {
-                w.sessions.insert(name.to_string(), s);
+                // Fresh transport → a resync (screen + scrollback) is inbound: rebuild
+                // the shared mirror first so the replay lands clean (W1).
+                self.states.resize_observed(name, cols, rows);
+                self.sessions.insert(name.to_string(), s);
                 true
             }
             Err(e) => {
@@ -3046,16 +3082,18 @@ impl App {
     /// [`attach_into`](Self::attach_into) over the SSH transport: attach a remote
     /// session (reached by `cmd`, an `ssh … __pipe`) into window `wid`.
     fn attach_ssh_into(&mut self, wid: WindowId, name: &str, cmd: std::process::Command) -> bool {
-        let Some(w) = self.windows.get_mut(&wid) else {
-            return false;
-        };
-        if w.sessions.contains_key(name) {
+        if self.sessions.contains_key(name) {
             return true;
         }
+        let Some(w) = self.windows.get(&wid) else {
+            return false;
+        };
         let (cols, rows) = w.root.grid();
-        match attach_over_ssh(cmd, name, cols, rows, &w.root.client_identity()) {
+        let identity = w.root.client_identity();
+        match attach_over_ssh(cmd, name, cols, rows, &identity) {
             Ok(s) => {
-                w.sessions.insert(name.to_string(), s);
+                self.states.resize_observed(name, cols, rows);
+                self.sessions.insert(name.to_string(), s);
                 true
             }
             Err(e) => {
@@ -3523,13 +3561,11 @@ impl App {
         // watcher reports it). Without this, a rebuild triggered by another host's
         // push would drop the driven id and its rename/kill/observe would misroute
         // to the local path. The composite id carries its own (target, real).
-        for w in self.windows.values() {
-            for id in w.sessions.keys() {
-                if let Some((target, real)) = id.split_once(REMOTE_ID_SEP) {
-                    self.remote_index
-                        .entry(id.clone())
-                        .or_insert_with(|| (target.to_string(), real.to_string()));
-                }
+        for id in self.sessions.keys() {
+            if let Some((target, real)) = id.split_once(REMOTE_ID_SEP) {
+                self.remote_index
+                    .entry(id.clone())
+                    .or_insert_with(|| (target.to_string(), real.to_string()));
             }
         }
     }
@@ -3546,10 +3582,7 @@ impl App {
         real: &str,
         event_loop: &dyn Frontend,
     ) {
-        let held = self
-            .windows
-            .get(&wid)
-            .is_some_and(|w| w.sessions.contains_key(id));
+        let held = self.sessions.contains_key(id);
         if held {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
             return;
@@ -3775,7 +3808,7 @@ impl App {
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
-                            let scene = w.root.view(&w.states);
+                            let scene = w.root.view(&self.states);
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
                         }
@@ -3841,12 +3874,15 @@ impl App {
             rows: req_rows,
             pad: cfg.padding(),
         });
-        let (mut root, mut states, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
-        root.set_theme(&mut states, theme_colors(&cfg.theme()));
+        let (mut root, states, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
+        // A fresh fleet owns no session, so its minted registry is empty; fold it in
+        // for symmetry and stamp the shared registry so later mints take this theme.
+        self.states.absorb(states);
+        root.set_theme(&mut self.states, theme_colors(&cfg.theme()));
         // The same policy we report to every session host we attach to — the
         // window's emulators and the hosts' must agree, or an attached window would
         // honour what the host is refusing (see `ghost_term::policy`).
-        root.set_policy(&mut states, session_policy_pair());
+        root.set_policy(&mut self.states, session_policy_pair());
         root.set_padding(cfg.padding());
         // A fleet window owns nothing yet, so reclaiming a group here just adopts
         // its identity — the members come from the loaded registry below.
@@ -3858,10 +3894,6 @@ impl App {
             WindowState {
                 gfx,
                 root,
-                states,
-                sessions: HashMap::new(),
-                observers: HashMap::new(),
-                dead_fed: HashSet::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -3952,11 +3984,59 @@ impl App {
         }
     }
 
-    /// Remove a window; dropping its [`WindowState`] drops its session clients,
-    /// which detaches them (the hosts keep the sessions running for reattach) —
-    /// the "close = detach" default.
+    /// Reconcile a session's ONE process-wide feed source against its live viewers —
+    /// the seam that keeps "exactly one source per session, fanned to every viewer"
+    /// true across every open/close. Run after any change to who drives or views `id`:
+    /// - no window views it → drop the client, observer, shared state, and dead-replay
+    ///   mark (the last-viewer prune; the session detaches on its host and lives on for
+    ///   a later reattach).
+    /// - a window drives it → the client is the source; drop any observer (a driver
+    ///   plus an observer would double-feed the one emulator, finding #7).
+    /// - viewed but driven nowhere → the source must be a read-only mirror: if a client
+    ///   lingers (its driver just left/closed) detach it and downgrade to an observer so
+    ///   previewers keep updating; open one if none exists yet. (Remote sessions are
+    ///   re-observed by the fleet reconcile instead; they'd need `observe_remote`, so
+    ///   here they just hold their last frame until then.)
+    fn reconcile_source(&mut self, id: &str) {
+        let driven = self.windows.values().any(|w| w.root.drives(id));
+        let viewed = self.windows.values().any(|w| w.root.views(id));
+        if !viewed {
+            self.sessions.remove(id);
+            self.observers.remove(id);
+            self.states.discard(id);
+            self.dead_fed.remove(id);
+            return;
+        }
+        if driven {
+            self.observers.remove(id);
+            return;
+        }
+        let had_client = self.sessions.remove(id).is_some();
+        if (had_client || !self.observers.contains_key(id))
+            && !is_remote_id(id)
+            && let Ok(sub) = Subscriber::observe(id)
+        {
+            self.observers.insert(id.to_string(), sub);
+        }
+    }
+
+    /// Remove a window; its session clients/observers/states are process-wide and
+    /// outlive it, so a last-viewer prune ([`reconcile_source`](Self::reconcile_source))
+    /// drops only those no surviving window views — the "close = detach" default,
+    /// refcounted across windows. A session another window still drives or previews
+    /// keeps its one live source (its driver downgraded to a mirror if this window was
+    /// the driver and another only previews it).
     fn close_window(&mut self, wid: WindowId) {
         self.windows.remove(&wid);
+        let touched: Vec<String> = self
+            .sessions
+            .keys()
+            .chain(self.observers.keys())
+            .cloned()
+            .collect();
+        for id in touched {
+            self.reconcile_source(&id);
+        }
         // Drop any remote reconnects still queued for this window: it is gone, so a
         // late host reconnect has nowhere to land (`finish_remote_reconnect` would
         // skip it), and a host that never returns would leak the entry forever.
@@ -3992,12 +4072,13 @@ impl App {
             if let Some(spec) = w.root.group_connection() {
                 targets.insert(spec.target());
             }
-            // A driven remote session's id is `<target>␟<real>`; read the target
-            // straight off it (not via the index, which a poll failure can clear).
-            for name in w.sessions.keys() {
-                if let Some((target, _)) = remote_id_parts(name) {
-                    targets.insert(target.to_string());
-                }
+        }
+        // A driven remote session's id is `<target>␟<real>`; read the target straight
+        // off the process-wide client set (not via the index, which a poll failure can
+        // clear).
+        for name in self.sessions.keys() {
+            if let Some((target, _)) = remote_id_parts(name) {
+                targets.insert(target.to_string());
             }
         }
         // A group still remembering a remote member keeps its host in use even when no
@@ -4143,26 +4224,28 @@ impl App {
         if let Some(g) = &gfx {
             g.window.set_title(&model.title());
         }
-        let (mut root, mut states) = RootModel::single(model, metrics(), (w, h));
-        root.set_theme(&mut states, theme_colors(&cfg.theme()));
-        root.set_policy(&mut states, session_policy_pair());
+        let (mut root, states) = RootModel::single(model, metrics(), (w, h));
+        // Fold this window's minted foreground state into the one process-wide
+        // registry (a no-op-keep if another window already drives it — this window
+        // then borrows the shared emulator), then stamp the shared registry.
+        self.states.absorb(states);
+        root.set_theme(&mut self.states, theme_colors(&cfg.theme()));
+        root.set_policy(&mut self.states, session_policy_pair());
         root.set_padding(cfg.padding());
         // Seed the persisted registry BEFORE the group claim, so the claim's
         // save extends it rather than clobbering it with just this window.
-        root.update(&mut states, UiEvent::GroupsLoaded(self.groups.clone()));
+        root.update(&mut self.states, UiEvent::GroupsLoaded(self.groups.clone()));
         let claims = root.set_my_group(group);
         apply_anim_ms(&mut root);
-        let mut sessions = HashMap::new();
-        sessions.insert(name.to_string(), session);
+        // The process holds exactly one client per session; this window drives it.
+        // If one already exists (a second window onto a live session), keep it and
+        // drop the extra attach rather than double-driving the one emulator.
+        self.sessions.entry(name.to_string()).or_insert(session);
         self.windows.insert(
             wid,
             WindowState {
                 gfx,
                 root,
-                states,
-                sessions,
-                observers: HashMap::new(),
-                dead_fed: HashSet::new(),
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 next_tick: None,
@@ -4540,7 +4623,7 @@ impl ApplicationHandler<UserEvent> for App {
                         win.pacer.settle(landed, now_ms);
                     } else {
                         let t_model = Instant::now();
-                        let scene = win.root.view(&win.states);
+                        let scene = win.root.view(&self.states);
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
                         // loop: a mid-animation tile that needs a full raster blits the best
@@ -4552,7 +4635,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // glyph size matches the grid the scene was laid out for.
                         let font_px = size_px() * win.root.render_scale();
                         // Keep the IME candidate window pinned to the text cursor.
-                        if let Some(a) = win.root.ime_cursor_area(&win.states) {
+                        if let Some(a) = win.root.ime_cursor_area(&self.states) {
                             gfx.window.set_ime_cursor_area(
                                 PhysicalPosition::new(a.x, a.y),
                                 PhysicalSize::new(a.w, a.h),
@@ -4568,7 +4651,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // damage baseline so the next `view` measures change from
                                 // here (a Lost frame leaves the pending damage to fold into
                                 // the next real present). See `RootModel::mark_presented`.
-                                win.root.mark_presented(&mut win.states);
+                                win.root.mark_presented(&mut self.states);
                                 // Model-side cache line (fleet preview frames) under
                                 // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
                                 win.root.emit_cache_trace();
@@ -4834,114 +4917,255 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// Deterministically choose the ONE window that drives `name` — the geometry
+    /// source and reconnect owner for its shared feed. Prefer the window showing it as
+    /// its Single foreground (a take-over claimant foregrounds it), else any window
+    /// that drives it, else none. Stable across wakes so a transient two-driver steal
+    /// doesn't flip the child's query answers (HashMap order is nondeterministic).
+    fn pick_driver(&self, name: &str) -> Option<WindowId> {
+        let mut fallback = None;
+        for (wid, w) in &self.windows {
+            if w.root.drives(name) {
+                if w.root.foregrounds(name) {
+                    return Some(*wid);
+                }
+                fallback.get_or_insert(*wid);
+            }
+        }
+        fallback
+    }
+
+    /// Feed a driven session's output into the ONE shared emulator once and fan the
+    /// reaction to every window viewing it: the [`pick_driver`](Self::pick_driver)
+    /// window supplies the ingest geometry and answers the child; the rest fold the
+    /// same outcome as observers. A client with no driving view (transitional) is fed
+    /// as observed so any previewer still updates. Commands are buffered while the
+    /// window borrows are live, then executed.
+    fn feed_driven_to_windows(&mut self, name: &str, bytes: &[u8], ended: bool, fe: &dyn Frontend) {
+        let driver_wid = self.pick_driver(name);
+        let mut buffered: Vec<(WindowId, Vec<Cmd>)> = Vec::new();
+        {
+            let App {
+                windows, states, ..
+            } = self;
+            let mut driver: Option<&mut RootModel> = None;
+            let mut obs_wids: Vec<WindowId> = Vec::new();
+            let mut observers: Vec<&mut RootModel> = Vec::new();
+            for (wid, w) in windows.iter_mut() {
+                if Some(*wid) == driver_wid {
+                    driver = Some(&mut w.root);
+                } else if w.root.views(name) {
+                    obs_wids.push(*wid);
+                    observers.push(&mut w.root);
+                }
+            }
+            match driver {
+                Some(driver) => {
+                    let (dc, oc) = ghost_ui_core::feed_shared(
+                        states,
+                        driver,
+                        &mut observers,
+                        name,
+                        bytes,
+                        ended,
+                    );
+                    if let Some(dw) = driver_wid {
+                        buffered.push((dw, dc));
+                    }
+                    for (wid, cmds) in obs_wids.into_iter().zip(oc) {
+                        buffered.push((wid, cmds));
+                    }
+                }
+                None => {
+                    let oc =
+                        ghost_ui_core::feed_observed(states, &mut observers, name, bytes, ended);
+                    for (wid, cmds) in obs_wids.into_iter().zip(oc) {
+                        buffered.push((wid, cmds));
+                    }
+                }
+            }
+        }
+        for (wid, cmds) in buffered {
+            self.exec(wid, cmds, fe);
+        }
+    }
+
+    /// Feed an observed session's output (a mirror no window in this process drives)
+    /// into the shared emulator once and fan to every previewing tile — the child's
+    /// own effects dropped, every view folded as an observer. Buffered-then-executed
+    /// like [`feed_driven_to_windows`](Self::feed_driven_to_windows).
+    fn feed_observed_to_viewers(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        ended: bool,
+        fe: &dyn Frontend,
+    ) {
+        let mut buffered: Vec<(WindowId, Vec<Cmd>)> = Vec::new();
+        {
+            let App {
+                windows, states, ..
+            } = self;
+            let mut wids: Vec<WindowId> = Vec::new();
+            let mut viewers: Vec<&mut RootModel> = Vec::new();
+            for (wid, w) in windows.iter_mut() {
+                if w.root.views(name) {
+                    wids.push(*wid);
+                    viewers.push(&mut w.root);
+                }
+            }
+            let per = ghost_ui_core::feed_observed(states, &mut viewers, name, bytes, ended);
+            for (wid, cmds) in wids.into_iter().zip(per) {
+                buffered.push((wid, cmds));
+            }
+        }
+        for (wid, cmds) in buffered {
+            self.exec(wid, cmds, fe);
+        }
+    }
+
+    /// Fan an ended session's lifecycle to every window viewing it — the foreground
+    /// switches to the next session (or drops to the fleet), a warm mirror and its
+    /// ownership are released — then prune the shared source once the last viewer let
+    /// go. The final frame already rendered in each view via the feed that carried
+    /// `ended`; this is only the reaction the per-window dispatch used to run inline.
+    fn end_session_in_views(&mut self, name: &str, fe: &dyn Frontend) {
+        let viewers: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.root.views(name))
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in viewers {
+            self.dispatch(
+                wid,
+                UiEvent::SessionEnded {
+                    name: name.to_string(),
+                },
+                fe,
+            );
+        }
+        self.reconcile_source(name);
+    }
+
     /// The once-per-wake work behind [`ApplicationHandler::about_to_wait`], taken
     /// over the abstract [`Frontend`] rather than winit's `ActiveEventLoop` — so a
     /// headless test can drive the very same session pump/feed/tick/repaint pass the
-    /// live loop runs, with no window server. Pump each window's session clients and
-    /// read-only observers, feed the output back, fan pushed session state, fire due
-    /// ticks, and release paced repaints.
+    /// live loop runs, with no window server. Pump each session's one client and each
+    /// read-only observer, fan the output into every viewing window, fan pushed
+    /// session state, fire due ticks, and release paced repaints.
     fn wake(&mut self, fe: &dyn Frontend) {
         // Flush the workspace snapshot once per wake if a handled event or a
         // window open/close marked it dirty (write-on-change guards the disk).
         if self.workspace_dirty {
             self.save_workspace();
         }
-        // Pump each window's own session clients and route the output back to
-        // that window (a window only holds clients for sessions it's showing).
-        let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
-        let mut dropped: Vec<(WindowId, String, Vec<u8>)> = Vec::new();
-        for (wid, w) in self.windows.iter_mut() {
-            let mut dead = Vec::new();
-            for (name, s) in w.sessions.iter_mut() {
-                let (bytes, end) = pump(s, 32);
-                // A REMOTE session whose transport dropped is held and reconnected,
-                // not torn down — its session may still be alive on the far side. A
-                // local EOF (the host process is gone) is a genuine end, as before.
-                if end == PumpEnd::Disconnected && is_remote_id(name) {
-                    dropped.push((*wid, name.clone(), bytes));
-                    dead.push(name.clone());
-                    continue;
-                }
-                let ended = end.is_end();
-                if !bytes.is_empty() || ended {
-                    pumped.push((*wid, name.clone(), bytes, ended));
-                }
-                if ended {
-                    dead.push(name.clone());
-                }
+        // Pump the process's session clients once each — one client per session no
+        // matter how many windows view it — and fan each one's output into the ONE
+        // shared emulator and out to every window showing it (the driven half of the
+        // "one model, many views" feed).
+        let driven: Vec<String> = self.sessions.keys().cloned().collect();
+        let mut dropped: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut ended_driven: Vec<String> = Vec::new();
+        for name in driven {
+            let (bytes, end) = match self.sessions.get_mut(&name) {
+                Some(s) => pump(s, 32),
+                None => continue,
+            };
+            // A REMOTE session whose transport dropped is held and reconnected, not
+            // torn down — its session may still be alive on the far side. A local EOF
+            // (the host process is gone) is a genuine end, as before.
+            if end == PumpEnd::Disconnected && is_remote_id(&name) {
+                self.sessions.remove(&name);
+                dropped.push((name, bytes));
+                continue;
             }
-            // Drop dead clients before dispatch so a stale query-reply is ignored;
-            // whether the window itself ends is decided below via `root.ended()`.
-            for name in dead {
-                w.sessions.remove(&name);
+            let ended = end.is_end();
+            if ended {
+                // Drop the dead client before the fan so a stale query-reply is
+                // ignored; whether a window itself ends is decided by `SessionEnded`.
+                self.sessions.remove(&name);
+            }
+            if !bytes.is_empty() || ended {
+                self.feed_driven_to_windows(&name, &bytes, ended, fe);
+            }
+            if ended {
+                ended_driven.push(name);
             }
         }
-        for (wid, name, bytes, ended) in pumped {
-            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, fe);
+        // Fan the ended lifecycle: the final frame already rendered in every view via
+        // the feed above; now switch each foreground away / drop each warm mirror, and
+        // prune the shared state once its last viewer let go.
+        for name in ended_driven {
+            self.end_session_in_views(&name, fe);
         }
         // A dropped remote session: flush its last bytes, put its tile into the
-        // reconnecting hold (frozen + dimmed, not torn down), and start retrying.
-        for (wid, name, bytes) in dropped {
+        // reconnecting hold (frozen + dimmed, not torn down), and start retrying under
+        // the window that was driving it.
+        for (name, bytes) in dropped {
             if !bytes.is_empty() {
-                let ev = UiEvent::SessionData {
-                    name: name.clone(),
-                    bytes,
-                    ended: false,
-                };
-                self.dispatch(wid, ev, fe);
+                self.feed_driven_to_windows(&name, &bytes, false, fe);
             }
-            self.dispatch(wid, UiEvent::SessionDisconnected { name: name.clone() }, fe);
-            self.begin_reconnect(wid, name);
+            let driver = self.pick_driver(&name);
+            let viewers: Vec<WindowId> = self
+                .windows
+                .iter()
+                .filter(|(_, w)| w.root.views(&name))
+                .map(|(id, _)| *id)
+                .collect();
+            for v in viewers {
+                self.dispatch(v, UiEvent::SessionDisconnected { name: name.clone() }, fe);
+            }
+            if let Some(wid) = driver {
+                self.begin_reconnect(wid, name);
+            }
         }
-        // Pump each window's read-only observers: mirrored output feeds its
-        // fleet tiles as `SessionData`, and only the `Resized` event is
-        // forwarded (the app-wide subscription already delivers the rest).
-        // Within one pump the event/output interleaving is lost; dispatching
-        // Resized first is safe because the host follows every re-grid with a
-        // resync, which heals any pre-resize bytes fed to the new mirror.
-        let mut observed: Vec<(WindowId, UiEvent)> = Vec::new();
-        for (wid, w) in self.windows.iter_mut() {
-            // A session must never be both driven (a display client in `sessions`)
-            // and observed at once — that double-feeds its one emulator. The Observe
-            // guards keep the sets disjoint; assert it here where both are in hand.
-            debug_assert!(
-                w.observers.keys().all(|k| !w.sessions.contains_key(k)),
-                "a session is both driven and observed — double-feed (finding #7)"
-            );
-            let mut dead = Vec::new();
-            for (name, sub) in w.observers.iter_mut() {
-                let p = sub.pump().unwrap_or_default();
-                for e in p.events {
-                    if matches!(e, ghost_vt::protocol::SessionEvent::Resized { .. }) {
-                        observed.push((
-                            *wid,
+        // Pump the process's read-only observers once each: a mirror's output feeds the
+        // shared state once and fans to every previewing tile; its `Resized` re-seeds
+        // the shared state at the new grid (only the shell may, keyed to this genuine
+        // observer stream) before the resync that follows heals the content.
+        let observed: Vec<String> = self.observers.keys().cloned().collect();
+        debug_assert!(
+            self.observers
+                .keys()
+                .all(|k| !self.sessions.contains_key(k)),
+            "a session is both driven and observed — double-feed (finding #7)"
+        );
+        for name in observed {
+            let p = match self.observers.get_mut(&name) {
+                Some(sub) => sub.pump().unwrap_or_default(),
+                None => continue,
+            };
+            for e in p.events {
+                if let ghost_vt::protocol::SessionEvent::Resized { cols, rows } = e {
+                    self.states.resize_observed(&name, cols, rows);
+                    let viewers: Vec<WindowId> = self
+                        .windows
+                        .iter()
+                        .filter(|(_, w)| w.root.views(&name))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for v in viewers {
+                        self.dispatch(
+                            v,
                             UiEvent::SessionPush {
                                 name: name.clone(),
-                                push: SessionPush::Event(e),
+                                push: SessionPush::Event(
+                                    ghost_vt::protocol::SessionEvent::Resized { cols, rows },
+                                ),
                             },
-                        ));
+                            fe,
+                        );
                     }
                 }
-                if !p.output.is_empty() || p.ended {
-                    observed.push((
-                        *wid,
-                        UiEvent::SessionData {
-                            name: name.clone(),
-                            bytes: p.output,
-                            ended: p.ended,
-                        },
-                    ));
-                }
-                if p.ended {
-                    dead.push(name.clone());
-                }
             }
-            for name in dead {
-                w.observers.remove(&name);
+            if !p.output.is_empty() || p.ended {
+                self.feed_observed_to_viewers(&name, &p.output, p.ended, fe);
             }
-        }
-        for (wid, ev) in observed {
-            self.dispatch(wid, ev, fe);
+            if p.ended {
+                self.observers.remove(&name);
+                self.end_session_in_views(&name, fe);
+            }
         }
         // Pump any in-flight ssh connects: drain the warm-up ssh's PTY, surface a
         // password prompt when ssh asks, and finish (or fail) the connect on exit.
@@ -5139,10 +5363,7 @@ mod tests {
 
             // They open at the built-in defaults (no ui.toml under the isolated XDG).
             let default_pad = app.windows[&w1].root.padding();
-            let default_theme = {
-                let ws = &app.windows[&w1];
-                ws.root.theme(&ws.states)
-            };
+            let default_theme = app.windows[&w1].root.theme(&app.states);
 
             // Reload a config that changes both padding and the color scheme.
             let cfg = config::UiConfig::parse(
@@ -5159,10 +5380,10 @@ mod tests {
             app.reload_config(&cfg, &fe);
 
             for wid in [w1, w2] {
-                let ws = &app.windows[&wid];
-                assert_eq!(ws.root.padding(), 21.0, "reload updates padding on {wid:?}");
+                let root = &app.windows[&wid].root;
+                assert_eq!(root.padding(), 21.0, "reload updates padding on {wid:?}");
                 assert_eq!(
-                    ws.root.theme(&ws.states),
+                    root.theme(&app.states),
                     theme_colors(&cfg.theme()),
                     "reload updates theme colors on {wid:?}"
                 );
@@ -5460,7 +5681,7 @@ mod tests {
             );
 
             let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
-            let adopted = app.windows[&wid].sessions.contains_key(&composite);
+            let adopted = app.sessions.contains_key(&composite);
 
             // The orphan kill is best-effort off-thread; poll until it's gone.
             let gone = wait_until(false, name);
@@ -5536,7 +5757,7 @@ mod tests {
             );
 
             let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
-            let held = app.windows[&wid].sessions.contains_key(&composite);
+            let held = app.sessions.contains_key(&composite);
 
             // Tear the real host down before asserting, so a failure never leaks it.
             let _ = ghost_vt::session::kill_session(name);
@@ -5556,6 +5777,104 @@ mod tests {
                 app.remote_index.get(&composite),
                 Some(&("kov@box".to_string(), name.to_string())),
                 "the driven session is indexed back to its host"
+            );
+        });
+    }
+
+    /// Two windows in ONE process, one session: window A drives a real local session
+    /// X; window B opens the fleet and previews X. Because X is driven *in this very
+    /// process*, B must NOT open a redundant read-only mirror of it — it shares A's one
+    /// emulator — yet its preview must still show X's live content. Today B opens a
+    /// `Subscriber` and emulates X a second time (this test is red on the observer
+    /// assertion); the process-wide state collapse makes B borrow A's shared state and
+    /// preview it with no second stream. The content half blocks a cheat that merely
+    /// stops observing without wiring the shared feed (B would preview nothing).
+    #[test]
+    fn a_previewing_window_shares_the_drivers_state_without_a_second_mirror() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "share-1";
+            // A real local session that prints a marker then holds open on `cat`.
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'SHARED-MARKER\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+
+            // Window A drives X (a real attach into a single view).
+            let group_a = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, group_a, None)
+                .expect("window A attaches the session");
+            assert!(
+                app.sessions.contains_key(name),
+                "window A drives the session it attached"
+            );
+
+            // Window B opens the fleet and reconciles the live listing — it sees X
+            // attached elsewhere (to A, same process) and previews it.
+            let group_b = app.mint_group();
+            let b = app.open_fleet_window(&fe, group_b, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+
+            // Pump the real per-wake pass until the shared state holds the marker (A's
+            // attach resync + the feed have to travel the sockets). Post-collapse the one
+            // emulator lives in `app.states`; B's tile borrows it — no second stream.
+            let b_sees_marker = |app: &App| {
+                app.states
+                    .text_of(name)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
+            };
+            let mut spun = 0;
+            while !b_sees_marker(&app) && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let observers_len = app.observers.len();
+            let saw_marker = b_sees_marker(&app);
+
+            // Tear the real host down before asserting so a failure never leaks it.
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(
+                saw_marker,
+                "B's preview shows the driver's live content ({spun} wakes)"
+            );
+            assert_eq!(
+                observers_len, 0,
+                "B previews A's same-process session with NO second mirror"
             );
         });
     }
@@ -5996,12 +6315,14 @@ mod tests {
 
             app.finish_remote_reconnect(spec, "ghost".to_string(), &fe);
 
-            let w = &app.windows[&wid];
-            assert!(w.root.is_fleet(), "the fleet window stays in the overview");
             assert!(
-                w.sessions.is_empty(),
+                app.windows[&wid].root.is_fleet(),
+                "the fleet window stays in the overview"
+            );
+            assert!(
+                app.sessions.is_empty(),
                 "its remote members are observed, not driven: {:?}",
-                w.sessions.keys().collect::<Vec<_>>()
+                app.sessions.keys().collect::<Vec<_>>()
             );
             assert!(
                 app.remote_index.contains_key(&one) && app.remote_index.contains_key(&two),
@@ -6069,7 +6390,7 @@ mod tests {
             );
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
-            let held = app.windows[&wid].sessions.contains_key(&composite);
+            let held = app.sessions.contains_key(&composite);
             let single = !app.windows[&wid].root.is_fleet();
             let drained = !app.pending_remote_restores.contains_key("kov@box");
 
@@ -6153,8 +6474,8 @@ mod tests {
             );
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
-            let held_fg = app.windows[&wid].sessions.contains_key(&fg);
-            let held_bg = app.windows[&wid].sessions.contains_key(&bg);
+            let held_fg = app.sessions.contains_key(&fg);
+            let held_bg = app.sessions.contains_key(&bg);
             let foreground = app.windows[&wid].root.foreground().cloned();
 
             let _ = ghost_vt::session::kill_session("fg-1");
