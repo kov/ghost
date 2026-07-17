@@ -486,6 +486,25 @@ impl DrivingGeometry {
             self.metrics.line_height.ceil() as u32,
         )
     }
+
+    /// The stand-in geometry for feeding a session *no window drives* — an observed
+    /// mirror ([`crate::feed_observed`]). A driverless ingest still asks its geometry
+    /// for the reply/resize context, but every output that geometry shapes (the child's
+    /// query replies, a DECCOLM's `ResizeWindow`) is dropped by the observer path, so
+    /// the exact values only need to be non-degenerate. Nominal cell metrics over the
+    /// nominal display keep the grid math well-defined without pretending a real window.
+    pub(crate) fn nominal() -> Self {
+        DrivingGeometry {
+            metrics: CellMetrics {
+                advance: 9.0,
+                line_height: 18.0,
+            },
+            pad_px: 0.0,
+            size_px: ghost_vt::query::NOMINAL_DISPLAY_PX,
+            display_px: ghost_vt::query::NOMINAL_DISPLAY_PX,
+            focused: false,
+        }
+    }
 }
 
 /// What one feed did to a [`SessionState`], captured by value so that *every* view
@@ -539,6 +558,21 @@ pub(crate) struct FeedOutcome {
     sync: bool,
     /// The session ended (its transport closed): each view repaints the final frame.
     ended: bool,
+}
+
+impl FeedOutcome {
+    /// Whether this feed carried bytes (vs a bare end-of-session). The fleet fan uses
+    /// it the way `session_data` used a non-empty byte slice: mark the tile fed + its
+    /// preview stale, and bump its background-activity badge.
+    pub(crate) fn fed(&self) -> bool {
+        self.fed
+    }
+
+    /// Whether the feed that produced this outcome ended the session — the fleet fan
+    /// uses it to close a dead mirror's observation.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
 }
 
 impl SessionState {

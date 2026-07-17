@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
-use crate::terminal::{FeedOutcome, SessionState, TerminalView};
+use crate::terminal::{DrivingGeometry, FeedOutcome, SessionState, TerminalView};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::text_input::TextInput;
 use crate::{
@@ -627,6 +627,47 @@ pub fn feed_shared(
     (driver_cmds, obs_cmds)
 }
 
+/// Feed one *observed* session's output — a mirror no window in this process drives (a
+/// preview of a session attached elsewhere, or on a remote host) — into the one shared
+/// [`SessionState`] exactly once, fanning the result to every window previewing it.
+///
+/// The observer twin of [`feed_shared`], and deliberately NOT a mode of it: an observed
+/// feed has no driver, so it differs in three coupled ways the boolean-parameter version
+/// would hide. (1) *Geometry*: with no attached window, the ingest is handed a
+/// [`DrivingGeometry::nominal`] stand-in — the mirror's grid follows the far side (its
+/// own DECCOLM in the byte stream, or an explicit remote resize), never a local window.
+/// (2) *Session-once effects are DROPPED*: the ingest still drains the child's query
+/// replies, the focus report, graphics acks, clipboard writes, and any window ops, but a
+/// mirror has no write path to a program it doesn't drive, so those are discarded here —
+/// answering locally would fork the mirror from the real emulator and speak for a program
+/// this process doesn't own (the same load-bearing silence as never answering a clipboard
+/// read). (3) *Fan is observer-only*: every viewer folds the outcome with `driving = false`
+/// (a preview never adopts window px or re-grids).
+///
+/// Returns one command list per viewer, in the given order. Like [`feed_shared`], the
+/// only non-test callers permitted to run [`SessionState::ingest`] are it and
+/// `session_data`; this is the third once the shell's process-wide collapse wires it in.
+pub fn feed_observed(
+    sessions: &mut Sessions,
+    viewers: &mut [&mut RootModel],
+    name: &str,
+    bytes: &[u8],
+    ended: bool,
+) -> Vec<Vec<Cmd>> {
+    let Some(state) = sessions.get_mut(name) else {
+        return vec![Vec::new(); viewers.len()];
+    };
+    // Ingest once into the shared mirror. The returned `Cmd`s are the session-once
+    // effects (query replies, focus report, graphics acks, clipboard writes, window
+    // ops) — DROPPED: a mirror never speaks for the program it observes (see above).
+    let geom = DrivingGeometry::nominal();
+    let (_dropped_child_effects, outcome) = state.ingest(bytes, &geom, ended);
+    viewers
+        .iter_mut()
+        .map(|w| w.apply_shared_feed(sessions, name, &outcome, false))
+        .collect()
+}
+
 /// F9 toggles the fleet overview.
 fn is_fleet_toggle(key: &Key) -> bool {
     matches!(key, Key::Named(NamedKey::F9))
@@ -844,16 +885,27 @@ impl RootModel {
         outcome: &FeedOutcome,
         driving: bool,
     ) -> Vec<Cmd> {
-        let Some(state) = sessions.get(name) else {
-            return Vec::new();
-        };
         if let Mode::Single { id, view } = &mut self.mode
             && id == name
         {
-            return view.apply_feed(state, outcome, driving);
+            return match sessions.get(name) {
+                Some(state) => view.apply_feed(state, outcome, driving),
+                None => Vec::new(),
+            };
+        }
+        // A fleet tile is this window's view onto the session too — the slot an
+        // *observed* session lives in — so the shared outcome must reach it through the
+        // tile's own apply (preview-frame refresh, activity badge), never a bare
+        // `apply_feed`. Routing an observed feed through here also means a session
+        // driven in one window and previewed in another's fleet fans to both.
+        if let Mode::Fleet(f) = &mut self.mode {
+            return f.apply_shared_to_tile(sessions, name, outcome);
         }
         match self.warm.get_mut(name) {
-            Some(view) => filter_background(view.apply_feed(state, outcome, driving)),
+            Some(view) => match sessions.get(name) {
+                Some(state) => filter_background(view.apply_feed(state, outcome, driving)),
+                None => Vec::new(),
+            },
             None => Vec::new(),
         }
     }
@@ -2756,6 +2808,53 @@ mod tests {
                 .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "alpha")),
             "the driver's zoom SIGWINCHes the child: {drv:?}"
         );
+    }
+
+    /// The observer half of "one model, many views": a session *nobody drives* (a fleet
+    /// preview of a session attached elsewhere or on a remote host) is mirrored into the
+    /// one shared [`SessionState`] by [`feed_observed`] and fanned to its preview. The
+    /// load-bearing contrast with [`feed_shared`] (where the driver answers the child
+    /// once): a mirror answers the child *never*. The emulator here processes a DSR — the
+    /// cursor advances past the printed bytes, so a reply *would* have been produced — yet
+    /// no `SendInput` leaves the routine: the ingest's session-once effects are dropped
+    /// because no window owns a write path to a session it only observes. (Answering
+    /// locally would fork the mirror from the real emulator and speak for a program we
+    /// don't drive — the seam that must stay silent; see the ingest call-site law.)
+    #[test]
+    fn an_observed_feed_advances_the_mirror_but_never_answers_the_child() {
+        let mut sessions = Sessions::new();
+        sessions.set_policy(SessionPolicy::allow_all()); // a *driven* feed WOULD answer the DSR
+        // A fleet window previewing a session attached elsewhere (not `mine`) — the
+        // observed slot: reconcile mints its state once and shows it as a tile.
+        let (mut w, _, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+        w.update(
+            &mut sessions,
+            UiEvent::SessionList(vec![sess("x", false, 1)]),
+        );
+        assert!(sessions.get("x").is_some(), "the observed state is minted");
+
+        // A burst that prints "hi" AND asks the cursor position (DSR `\x1b[6n`).
+        let outs = feed_observed(&mut sessions, &mut [&mut w], "x", b"hi\x1b[6n", false);
+
+        // The mirror emulator DID process the burst — the cursor sits past "hi" (col 3,
+        // 1-based) — so the DSR was seen and a reply was due...
+        let text = sessions.get("x").unwrap().screen().vt().text();
+        assert!(
+            text[0].starts_with("hi"),
+            "the mirror ingested the burst: {text:?}"
+        );
+
+        // ...yet the reply is drained by the ingest and DROPPED, never fanned to anyone.
+        let sends: usize = outs
+            .iter()
+            .flatten()
+            .filter(|c| matches!(c, Cmd::SendInput { .. }))
+            .count();
+        assert_eq!(sends, 0, "a mirror never answers the child: {outs:?}");
+
+        // The previewing window still reacts to the one shared outcome (its tile is stale).
+        assert_eq!(outs.len(), 1, "one command list per viewer");
+        assert!(outs[0].contains(&Cmd::Redraw), "the preview repaints");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use ghost_vt::session::SessionInfo;
 use crate::event::SessionPush;
 use crate::group::{Group, GroupId};
 use crate::input::{Key, Mods, NamedKey};
-use crate::terminal::TerminalView;
+use crate::terminal::{FeedOutcome, TerminalView};
 use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, Sessions, UiEvent};
 
@@ -2057,6 +2057,72 @@ impl FleetModel {
         if progress_changed && !cmds.contains(&Cmd::Redraw) {
             cmds.push(Cmd::Redraw);
         }
+        cmds
+    }
+
+    /// Fold a single already-ingested [`FeedOutcome`] into this window's preview of
+    /// `name` — the tile half of a *shared* feed. Where [`Self::session_data`] both
+    /// feeds the emulator and reacts, this only reacts: the shared [`SessionState`] was
+    /// advanced once by the fan-out ([`crate::feed_observed`] / [`crate::feed_shared`]),
+    /// so re-feeding here would double-answer the child and corrupt the one screen. The
+    /// bookkeeping matches `session_data` — mark the tile fed + stale, bump its
+    /// background activity, revert a dead mirror to a placeholder, repaint on a progress
+    /// change — but the outcome is applied, not produced.
+    ///
+    /// A tile is only ever an *observing* view (a session it drove would be its Single
+    /// foreground, not a tile), so the outcome folds with `driving = false`, and the
+    /// per-view apply never speaks for the child (any stray `SendInput` is dropped —
+    /// the driver's ingest already answered, once). Runs outside the `update` wrapper,
+    /// so it refreshes its own dirtied preview frame; it deliberately does NOT prune the
+    /// registry (`update`'s per-window `retain` would delete a state another window still
+    /// views once `Sessions` is shared).
+    pub(crate) fn apply_shared_to_tile(
+        &mut self,
+        sessions: &Sessions,
+        name: &str,
+        outcome: &FeedOutcome,
+    ) -> Vec<Cmd> {
+        let background = self.focused.as_deref() != Some(name);
+        // A dead mirror reverts its tile to a placeholder; the next reconcile
+        // re-observes if the session still exists.
+        let observation_ended = outcome.ended() && self.observing.remove(name);
+        let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
+            return Vec::new();
+        };
+        let Some(state) = sessions.get(name) else {
+            return Vec::new();
+        };
+        if observation_ended {
+            tile.fed = false;
+            tile.frame_dirty = true;
+        }
+        let cmds = tile.view.apply_feed(state, outcome, false);
+        if outcome.fed() {
+            tile.fed = true; // attached and live: stop re-attaching it
+            tile.frame_dirty = true; // its screen changed; preview is stale
+            // A dead tile's feed is its recording played back — history,
+            // not activity; no badge for it.
+            if background && !tile.dead {
+                tile.activity = tile.activity.saturating_add(1);
+            }
+        }
+        // A progress report dirties no screen rows, so the model won't ask for a
+        // redraw — but the card header shows it, so a change repaints here.
+        let progress = state.screen().vt().progress();
+        let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
+        // A tile reaches nothing outside itself (see `session_data`), and never speaks
+        // for the child — the shared ingest already answered, once.
+        let mut cmds: Vec<Cmd> = cmds
+            .into_iter()
+            .filter(|c| !c.reaches_the_desktop())
+            .filter(|c| !matches!(c, Cmd::SendInput { .. }))
+            .collect();
+        if progress_changed && !cmds.contains(&Cmd::Redraw) {
+            cmds.push(Cmd::Redraw);
+        }
+        // Rebuild the dirtied preview now: the fan bypasses the `update` wrapper that
+        // normally refreshes frames, and `view` must stay a pure read of cached frames.
+        self.refresh_dirty_frames(sessions);
         cmds
     }
 
