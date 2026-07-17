@@ -4020,6 +4020,25 @@ impl App {
         }
     }
 
+    /// Drop shared states nothing references any more — a session that vanished (killed
+    /// from another process, its tile gone) leaving no view and no feed source. The
+    /// process-wide replacement for the fleet's old per-window `sessions.retain`, which
+    /// under the shared registry would delete a state another window still uses. Pruning
+    /// only a state that is BOTH unviewed AND has no client AND no observer is safe: a
+    /// mid-construction or mid-feed state always has one of those, so this never races a
+    /// state into deletion while a window is wiring it up.
+    fn prune_orphan_states(&mut self) {
+        for id in self.states.ids() {
+            if !self.sessions.contains_key(&id)
+                && !self.observers.contains_key(&id)
+                && !self.windows.values().any(|w| w.root.views(&id))
+            {
+                self.states.discard(&id);
+                self.dead_fed.remove(&id);
+            }
+        }
+    }
+
     /// Remove a window; its session clients/observers/states are process-wide and
     /// outlive it, so a last-viewer prune ([`reconcile_source`](Self::reconcile_source))
     /// drops only those no surviving window views — the "close = detach" default,
@@ -5181,6 +5200,10 @@ impl App {
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.
         self.pump_subscriptions(fe);
+        // Reap shared states nothing references any more (a session that vanished with
+        // its tile, leaving no view and no source) — the process-wide replacement for
+        // the fleet's old per-window prune, run once all this wake's reconciles landed.
+        self.prune_orphan_states();
         // A changed `ui.toml` (config-dir watch) hot-reloads the live-reloadable
         // settings into every window — the compositor blur, opacity, frost, color
         // scheme, and padding.

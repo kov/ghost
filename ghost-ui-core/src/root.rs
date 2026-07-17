@@ -126,12 +126,10 @@ impl Sessions {
         self.map.contains_key(id)
     }
 
-    /// Drop every held state whose id `keep` rejects — the lifecycle sweep that keeps
-    /// the registry matched to the views that actually reference it (fleet tiles come
-    /// and go without moving state, so a dropped tile's state is pruned here). A
-    /// pruned state is unreferenced, so this can never orphan a live view.
-    pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
-        self.map.retain(|id, _| keep(id));
+    /// The ids of every held state — the shell's iteration order for its last-viewer
+    /// prune of orphaned states (a session that vanished with no view and no source).
+    pub fn ids(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
     }
 
     /// Borrow the state for `id`, minting it (stamped with the current theme and

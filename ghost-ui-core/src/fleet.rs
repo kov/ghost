@@ -1214,12 +1214,12 @@ impl FleetModel {
         // A resize, or tiles appearing/disappearing, can change the content height
         // or viewport — keep the scroll offset valid (nav/wheel clamp themselves).
         self.clamp_scroll();
-        // The tiles are the only views onto this window's fleet-side session states,
-        // and this event may have dropped some (reconcile, kill, ungroup). Prune the
-        // now-unreferenced states so a dropped tile's emulator can't linger to catch
-        // a theme/policy broadcast or resurrect a stale screen under a reused name.
-        // Tiles come and go without moving state, so this is where state follows.
-        sessions.retain(|id| self.tiles.iter().any(|t| t.id == id));
+        // A dropped tile's state is NOT pruned here any more: under the process-wide
+        // shared `Sessions` this per-window fleet would delete a state another window
+        // still drives or previews (e.g. a session just spawned in another window,
+        // not yet in this fleet's tiles). The shell owns the last-viewer prune across
+        // all windows (`App::prune_orphan_states` / `reconcile_source`). Every tile
+        // still has a state — mints route through `get_or_mint` on reconcile.
         debug_assert!(
             self.tiles.iter().all(|t| sessions.contains(&t.id)),
             "every fleet tile must have a session state in the registry",
@@ -1382,13 +1382,14 @@ impl FleetModel {
                 // reshuffle under the animation when the mirrors catch up. Minting
                 // through the one owner stamps the window's theme/policy for us.
                 let (cols, rows) = info.size.unwrap_or((PREVIEW_COLS, PREVIEW_ROWS));
-                // The prune keeps the registry matched to the tiles, so a tile that
-                // doesn't exist yet has no leftover state — get_or_mint always mints
-                // fresh here, never resurrecting a stale screen under a reused name.
-                debug_assert!(
-                    !sessions.contains(&info.name),
-                    "a brand-new fleet tile's id must have no leftover session state",
-                );
+                // Under the process-wide shared registry a brand-new tile's id may
+                // ALREADY hold a state — another window drives or previews the same
+                // session — and this tile then borrows that one live emulator.
+                // `get_or_mint` does the right thing either way: it returns an existing
+                // live state (the shared borrow) and mints fresh only when absent or the
+                // prior state ended. A vanished session's stale state can't linger to be
+                // resurrected under a reused name: the shell's per-wake prune drops it
+                // (names are process-unique anyway).
                 let state = sessions.get_or_mint(&info.name, cols, rows);
                 state.set_display_name(info.display_name.clone());
                 self.push_tile(
