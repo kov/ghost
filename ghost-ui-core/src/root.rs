@@ -2588,6 +2588,32 @@ mod tests {
         );
     }
 
+    /// Input from a window that does NOT drive the session still reaches it: there is
+    /// one child, keyed by session id, so a keystroke in an observer window (empty
+    /// `mine`) routes to the shared session exactly as the driver's would. This is the
+    /// "observed ≈ attached for input" contract the enablement dispatch builds on — the
+    /// asymmetry between a driving and an observing view is confined to *grid* mutation
+    /// (resize/zoom/DECCOLM), never to input delivery.
+    #[test]
+    fn an_observer_windows_input_still_reaches_the_shared_session() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        // A pure observer: it shows alpha but does not drive it (`mine` is empty).
+        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        assert!(
+            !observer.mine.contains("alpha"),
+            "the observer does not own the session"
+        );
+        assert_eq!(
+            observer.update(&mut sessions, UiEvent::Text("a".into())),
+            vec![Cmd::SendInput {
+                session: "alpha".into(),
+                bytes: b"a".to_vec()
+            }],
+            "an observer's keystroke reaches the shared session by id"
+        );
+    }
+
     #[test]
     fn a_disconnected_foreground_holds_reconnecting_but_an_exit_drops_to_the_fleet() {
         let mut r = root(); // single view of alpha
