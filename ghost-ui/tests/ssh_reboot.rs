@@ -303,14 +303,14 @@ fn ghost_reconnects_a_remote_after_a_reboot() {
 
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     assert!(
-        retry_some(Duration::from_secs(10), || r.negotiate()).is_some(),
+        retry_some(Duration::from_secs(10), || r.negotiate().ok()).is_some(),
         "the initial connection should negotiate the remote ghost"
     );
 
     remote.reboot();
 
     assert!(
-        wait_until(Duration::from_secs(20), || r.negotiate().is_some()),
+        wait_until(Duration::from_secs(20), || r.negotiate().is_ok()),
         "after a remote reboot ghost must reap the wedged control master and \
          reconnect, but it never did within 20s"
     );
@@ -331,7 +331,8 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
-    let ghost = retry_some(Duration::from_secs(10), || r.negotiate()).expect("initial negotiate");
+    let ghost =
+        retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("initial negotiate");
 
     let listed = |ghost: &str| {
         r.list_sessions(ghost)
@@ -416,7 +417,8 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
-    let ghost = retry_some(Duration::from_secs(10), || r.negotiate()).expect("initial negotiate");
+    let ghost =
+        retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("initial negotiate");
 
     // A live session with recognizable content on its screen.
     r.spawn_host(&ghost, "survivor")

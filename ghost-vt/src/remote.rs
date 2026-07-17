@@ -67,6 +67,67 @@ pub struct StageProgress {
     pub total: u64,
 }
 
+/// Why [`RemoteSsh::negotiate`] could not put a protocol-matched ghost on the
+/// remote — the reason a connect degrades to a local ssh child. Carried (instead
+/// of a bare `None`) so the connect prompt can show it and offer a
+/// reason-appropriate choice, and so logs/tests stop seeing a silent fallback.
+/// [`Self::retryable`] separates the transient failures (worth a Retry) from the
+/// structural ones (where retrying is futile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NegotiateFailure {
+    /// `GHOST_REMOTE_GHOST` was set but that binary didn't answer our probe
+    /// (missing, or below our protocol level).
+    EnvOverrideUnusable,
+    /// Couldn't interrogate the remote (its `$HOME` didn't resolve) — often
+    /// transient (a flaky link, a noisy login shell); a retry may work.
+    RemoteUnready,
+    /// The remote's `uname` named an OS/arch we don't map, so nothing is stageable.
+    UnknownPlatform,
+    /// The remote's platform is known but we have no binary for it — our own exe
+    /// doesn't match and no `ghost-<os>-<arch>` prebuilt was found. A prebuilt must
+    /// be provided (`cargo xtask prebuilt`); retrying won't help.
+    NoPrebuilt { platform: String },
+    /// Copying the binary to the remote failed (disk full, a dropped link); a retry
+    /// may work.
+    StageFailed(String),
+    /// The binary copied but wouldn't run there (an old libc, a `noexec` home): it
+    /// staged yet still doesn't answer the probe. Retrying won't help.
+    StagedButUnrunnable,
+}
+
+impl NegotiateFailure {
+    /// Whether re-running negotiation could plausibly succeed — a transient
+    /// failure, versus a structural one (no binary for the platform, or a binary
+    /// that won't run there) where a Retry only wastes the user's click.
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::RemoteUnready | Self::StageFailed(_))
+    }
+}
+
+impl std::fmt::Display for NegotiateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvOverrideUnusable => {
+                write!(f, "the GHOST_REMOTE_GHOST binary didn't answer our probe")
+            }
+            Self::RemoteUnready => write!(f, "couldn't read the remote's home directory"),
+            Self::UnknownPlatform => {
+                write!(f, "the remote runs an OS/arch ghost doesn't support")
+            }
+            Self::NoPrebuilt { platform } => {
+                write!(
+                    f,
+                    "no prebuilt ghost for the remote's platform ({platform})"
+                )
+            }
+            Self::StageFailed(e) => write!(f, "staging ghost to the remote failed: {e}"),
+            Self::StagedButUnrunnable => {
+                write!(f, "ghost copied to the remote but wouldn't run there")
+            }
+        }
+    }
+}
+
 /// The remote directory a staged ghost lands in, under the given remote `$HOME`.
 fn staged_dir(home: &str) -> String {
     format!("{home}/.cache/ghost/bin")
@@ -423,7 +484,7 @@ impl RemoteSsh {
 
     /// [`negotiate_with_progress`](Self::negotiate_with_progress) without progress
     /// reporting — for callers (the CLI) that don't render a staging bar.
-    pub fn negotiate(&self) -> Option<String> {
+    pub fn negotiate(&self) -> Result<String, NegotiateFailure> {
         self.negotiate_with_progress(&mut |_| {})
     }
 
@@ -473,32 +534,35 @@ impl RemoteSsh {
     pub fn negotiate_with_progress(
         &self,
         on_progress: &mut dyn FnMut(StageProgress),
-    ) -> Option<String> {
+    ) -> Result<String, NegotiateFailure> {
+        use NegotiateFailure as F;
         // Clear a wedged master up front so the probes below open (and reuse) a fresh
         // one instead of hanging on a dead socket left by a prior run.
         self.reap_wedged_master();
         if let Ok(path) = std::env::var(REMOTE_GHOST_ENV) {
-            return self.probe(&path).then_some(path);
+            return self
+                .probe(&path)
+                .then_some(path)
+                .ok_or(F::EnvOverrideUnusable);
         }
         if self.probe("ghost") {
-            return Some("ghost".to_string());
+            return Ok("ghost".to_string());
         }
         // Staging needs the remote home (for an absolute path) and its platform
         // (to pick the binary — our own exe for a matching host, else a prebuilt).
-        let home = self.remote_home()?;
-        let platform = self.remote_platform()?;
-        let binary = resolve_ghost_binary(platform)?;
+        let home = self.remote_home().ok_or(F::RemoteUnready)?;
+        let platform = self.remote_platform().ok_or(F::UnknownPlatform)?;
+        let binary = resolve_ghost_binary(platform).ok_or_else(|| F::NoPrebuilt {
+            platform: format!("{}-{}", platform.os, platform.arch),
+        })?;
         let staged = staged_path(&home, &build_stamp(&binary));
         if self.probe(&staged) {
-            return Some(staged);
+            return Ok(staged);
         }
         match self.stage(&binary, &home, &staged, on_progress) {
-            Ok(()) if self.probe(&staged) => Some(staged),
-            Ok(()) => None,
-            Err(e) => {
-                eprintln!("ghost: cannot use the remote host transport ({e}); using ssh directly");
-                None
-            }
+            Ok(()) if self.probe(&staged) => Ok(staged),
+            Ok(()) => Err(F::StagedButUnrunnable),
+            Err(e) => Err(F::StageFailed(e.to_string())),
         }
     }
 

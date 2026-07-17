@@ -543,13 +543,13 @@ fn spawn_connect_worker(
                     });
                 };
                 match remote.negotiate_with_progress(&mut on_progress) {
-                    Some(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
+                    Ok(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
                         Ok(()) => ConnectOutcome::Transport { remote_ghost },
                         Err(e) => {
                             ConnectOutcome::Error(format!("could not start the remote host: {e}"))
                         }
                     },
-                    None => ConnectOutcome::Fallback,
+                    Err(why) => ConnectOutcome::Fallback(why),
                 }
             }
             Err(e) => ConnectOutcome::Error(format!("could not open the ssh connection: {e}")),
@@ -580,8 +580,16 @@ fn spawn_remote_reconnect(
         if !remote.open_master_batch() {
             return; // password/unreachable — deferred, degrade to cold tiles
         }
-        if let Some(remote_ghost) = remote.negotiate() {
-            let _ = proxy.send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+        match remote.negotiate() {
+            Ok(remote_ghost) => {
+                let _ = proxy.send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+            }
+            // A restore reconnect that can't use the transport degrades to cold tiles;
+            // log why so this path stops failing even more silently than a fresh connect.
+            Err(why) => eprintln!(
+                "ghost: restoring {} over ssh: {why}; leaving its sessions cold",
+                spec.target()
+            ),
         }
     });
 }
@@ -3358,8 +3366,11 @@ impl App {
                 }
             }
             // The remote can't host ghost: fall back to a local ssh child (it runs
-            // in its own PTY view and prompts for the password there).
-            ConnectOutcome::Fallback => {
+            // in its own PTY view and prompts for the password there). Step 0 logs the
+            // reason so the degrade is no longer silent; Phase 1 turns this into a
+            // prompt choice (`RootModel`'s connect state machine).
+            ConnectOutcome::Fallback(why) => {
+                eprintln!("ghost: {why}; using plain ssh for '{name}'");
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.root.end_connect();
                 }

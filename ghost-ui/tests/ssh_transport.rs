@@ -454,6 +454,13 @@ fn ghost_ssh_falls_back_to_the_ssh_child_when_no_prebuilt_matches_the_remote() {
         "`ghost ssh` fallback failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The fallback must say WHY it used plain ssh instead of silently degrading —
+    // here specifically that no prebuilt matched the remote's platform.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no prebuilt"),
+        "the ssh-child fallback must surface the reason, not fall back silently: {stderr}"
+    );
     let _guard = KillOnDrop {
         xdg,
         name: "ssh-example",

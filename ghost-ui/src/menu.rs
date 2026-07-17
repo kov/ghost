@@ -105,8 +105,9 @@ pub enum ConnectOutcome {
     /// A remote ghost was negotiated (staged if needed) and the host spawned;
     /// attach the window over the transport using this remote binary.
     Transport { remote_ghost: String },
-    /// The remote can't host ghost — fall back to a local ssh child.
-    Fallback,
+    /// The remote can't host ghost — fall back to a local ssh child. Carries WHY,
+    /// so the prompt can show it and offer a reason-appropriate choice.
+    Fallback(ghost_vt::remote::NegotiateFailure),
     /// The setup failed; show the message on the connect prompt.
     Error(String),
 }

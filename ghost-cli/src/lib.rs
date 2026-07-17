@@ -286,7 +286,7 @@ fn dispatch(command: Command) {
                 Err(e) => fail(&e.to_string()),
             };
             match remote.negotiate() {
-                Some(remote_ghost) => {
+                Ok(remote_ghost) => {
                     if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
                         fail(&format!("failed to start the remote host: {e}"));
                     }
@@ -300,7 +300,12 @@ fn dispatch(command: Command) {
                         ));
                     }
                 }
-                None => ssh_child_fallback(spec, name, detached, seed_from),
+                Err(why) => {
+                    // Say why the real remote session wasn't used before degrading to a
+                    // plain ssh child, so a silent downgrade never surprises the user.
+                    eprintln!("ghost: {why}; using plain ssh instead");
+                    ssh_child_fallback(spec, name, detached, seed_from);
+                }
             }
         }
         Command::Ls { json } => match session::list() {
