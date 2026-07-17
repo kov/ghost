@@ -4462,233 +4462,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let fe = WinitFrontend { event_loop };
-        // Flush the workspace snapshot once per wake if a handled event or a
-        // window open/close marked it dirty (write-on-change guards the disk).
-        if self.workspace_dirty {
-            self.save_workspace();
-        }
-        // Pump each window's own session clients and route the output back to
-        // that window (a window only holds clients for sessions it's showing).
-        let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
-        let mut dropped: Vec<(WindowId, String, Vec<u8>)> = Vec::new();
-        for (wid, w) in self.windows.iter_mut() {
-            let mut dead = Vec::new();
-            for (name, s) in w.sessions.iter_mut() {
-                let (bytes, end) = pump(s, 32);
-                // A REMOTE session whose transport dropped is held and reconnected,
-                // not torn down — its session may still be alive on the far side. A
-                // local EOF (the host process is gone) is a genuine end, as before.
-                if end == PumpEnd::Disconnected && is_remote_id(name) {
-                    dropped.push((*wid, name.clone(), bytes));
-                    dead.push(name.clone());
-                    continue;
-                }
-                let ended = end.is_end();
-                if !bytes.is_empty() || ended {
-                    pumped.push((*wid, name.clone(), bytes, ended));
-                }
-                if ended {
-                    dead.push(name.clone());
-                }
-            }
-            // Drop dead clients before dispatch so a stale query-reply is ignored;
-            // whether the window itself ends is decided below via `root.ended()`.
-            for name in dead {
-                w.sessions.remove(&name);
-            }
-        }
-        for (wid, name, bytes, ended) in pumped {
-            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, &fe);
-        }
-        // A dropped remote session: flush its last bytes, put its tile into the
-        // reconnecting hold (frozen + dimmed, not torn down), and start retrying.
-        for (wid, name, bytes) in dropped {
-            if !bytes.is_empty() {
-                let ev = UiEvent::SessionData {
-                    name: name.clone(),
-                    bytes,
-                    ended: false,
-                };
-                self.dispatch(wid, ev, &fe);
-            }
-            self.dispatch(
-                wid,
-                UiEvent::SessionDisconnected { name: name.clone() },
-                &fe,
-            );
-            self.begin_reconnect(wid, name);
-        }
-        // Pump each window's read-only observers: mirrored output feeds its
-        // fleet tiles as `SessionData`, and only the `Resized` event is
-        // forwarded (the app-wide subscription already delivers the rest).
-        // Within one pump the event/output interleaving is lost; dispatching
-        // Resized first is safe because the host follows every re-grid with a
-        // resync, which heals any pre-resize bytes fed to the new mirror.
-        let mut observed: Vec<(WindowId, UiEvent)> = Vec::new();
-        for (wid, w) in self.windows.iter_mut() {
-            // A session must never be both driven (a display client in `sessions`)
-            // and observed at once — that double-feeds its one emulator. The Observe
-            // guards keep the sets disjoint; assert it here where both are in hand.
-            debug_assert!(
-                w.observers.keys().all(|k| !w.sessions.contains_key(k)),
-                "a session is both driven and observed — double-feed (finding #7)"
-            );
-            let mut dead = Vec::new();
-            for (name, sub) in w.observers.iter_mut() {
-                let p = sub.pump().unwrap_or_default();
-                for e in p.events {
-                    if matches!(e, ghost_vt::protocol::SessionEvent::Resized { .. }) {
-                        observed.push((
-                            *wid,
-                            UiEvent::SessionPush {
-                                name: name.clone(),
-                                push: SessionPush::Event(e),
-                            },
-                        ));
-                    }
-                }
-                if !p.output.is_empty() || p.ended {
-                    observed.push((
-                        *wid,
-                        UiEvent::SessionData {
-                            name: name.clone(),
-                            bytes: p.output,
-                            ended: p.ended,
-                        },
-                    ));
-                }
-                if p.ended {
-                    dead.push(name.clone());
-                }
-            }
-            for name in dead {
-                w.observers.remove(&name);
-            }
-        }
-        for (wid, ev) in observed {
-            self.dispatch(wid, ev, &fe);
-        }
-        // Pump any in-flight ssh connects: drain the warm-up ssh's PTY, surface a
-        // password prompt when ssh asks, and finish (or fail) the connect on exit.
-        let connecting: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, w)| w.connect.is_some())
-            .map(|(id, _)| *id)
-            .collect();
-        for wid in connecting {
-            self.pump_connect(wid);
-        }
-        // Pushed session state (subscriptions) and set-change hints (the
-        // runtime-dir watch), fanned out to every window.
-        self.pump_subscriptions(&fe);
-        // A changed `ui.toml` (config-dir watch) hot-reloads the live-reloadable
-        // settings into every window — the compositor blur, opacity, frost, color
-        // scheme, and padding.
-        if self
-            .config_changed
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.reload_config(&config::UiConfig::load(), &fe);
-        }
-        // Fire any per-window ticks that are now due.
-        let now = Instant::now();
-        let due: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, w)| w.next_tick.is_some_and(|t| now >= t))
-            .map(|(id, _)| *id)
-            .collect();
-        for wid in due {
-            let now_ms = self.now_ms();
-            if let Some(w) = self.windows.get_mut(&wid) {
-                w.next_tick = None;
-                w.render_trace.saw_tick_fired(now_ms);
-            }
-            self.dispatch(wid, UiEvent::Tick { now_ms }, &fe);
-        }
-        // Bench mode: advance the scripted animation (after ticks, so `is_animating`
-        // reflects this turn's animation state).
-        if self.bench.is_some() {
-            self.drive_bench(&fe);
-        }
-        // A session ending never closes its window: the model has already switched
-        // to the next attached session (or the fleet), so the window lives on until
-        // the user closes it. Windows are removed only on an explicit close.
-        // Commit any interactive resize that has settled (drag paused/released) or
-        // hit its max refresh interval: drop the stretch-blit snapshot and dispatch
-        // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred
-        // while dragging. Its `Cmd::Redraw` then paints the crisp scene.
-        let now_ms = self.now_ms();
-        let commits: Vec<(WindowId, u32, u32, f64)> = self
-            .windows
-            .iter_mut()
-            .filter_map(|(id, w)| w.resize.poll(now_ms).map(|(cw, ch, cs)| (*id, cw, ch, cs)))
-            .collect();
-        for (wid, cw, ch, cs) in commits {
-            if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
-                gfx.renderer.clear_snapshot();
-            }
-            self.dispatch(
-                wid,
-                UiEvent::Resize {
-                    w_px: cw,
-                    h_px: ch,
-                    scale: cs,
-                },
-                &fe,
-            );
-        }
-        // Release any paced repaint that the frame budget now allows. The loop
-        // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
-        // paint is always re-checked and fires within a frame of becoming due;
-        // a keystroke's repaint, handled in this same pass, paints at once.
-        for (id, w) in self.windows.iter_mut() {
-            if !w.presented_ok {
-                // The opening frame hasn't landed yet: a window created mid-run can drop
-                // its first present(s) while macOS finishes compositing it (the drawable
-                // isn't acquirable, so the present is silently skipped). Keep asking every
-                // pass until one lands, rather than trusting the pacer's single request —
-                // else the window sits blank (title bar only) until an unrelated event.
-                w.request_redraw();
-            } else if w.pacer.release(now_ms) {
-                w.render_trace.saw_release(now_ms);
-                w.request_redraw();
-            }
-            // Once per pass, fold the foreground gate state and classify. Runs always
-            // (not just under the trace flag) so a stale-frame freeze can self-heal in
-            // the wild — the fold/verdict is a few subtractions, and the diagnostic dump
-            // self-filters through the `trace!` level. The window id separates concurrent
-            // windows' tracks in a multi-window log.
-            let core = w.root.foreground_trace();
-            let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
-            let pending = w.pacer.pending();
-            let visible = !w.occluded;
-            if let Some(report) = w
-                .render_trace
-                .poll(now_ms, core, pending, has_snapshot, visible)
-            {
-                tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
-            }
-            // Self-heal: when the watchdog sees a stale-no-present freeze (visible output
-            // streaming, but no real present reached the glass — the Clean-over-stale
-            // texture staleness), force one full foreground re-present. Rate-limited to
-            // one per HEAL_COOLDOWN_MS, so a persistent freeze becomes a one-frame glitch
-            // and a false trigger just redraws identical pixels (no flicker). Warn so a
-            // recovery leaves a breadcrumb even without the trace flag.
-            if w.render_trace.self_heal_due(now_ms) {
-                if let Some(gfx) = w.gfx.as_mut() {
-                    gfx.force_foreground_repaint();
-                }
-                w.pacer.request();
-                tracing::warn!(
-                    target: "ghost::render",
-                    window = ?id,
-                    "forced a foreground re-present (watchdog: suspected stale frame)"
-                );
-            }
-        }
-        fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+        self.wake(&fe);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -5056,6 +4830,240 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+impl App {
+    /// The once-per-wake work behind [`ApplicationHandler::about_to_wait`], taken
+    /// over the abstract [`Frontend`] rather than winit's `ActiveEventLoop` — so a
+    /// headless test can drive the very same session pump/feed/tick/repaint pass the
+    /// live loop runs, with no window server. Pump each window's session clients and
+    /// read-only observers, feed the output back, fan pushed session state, fire due
+    /// ticks, and release paced repaints.
+    fn wake(&mut self, fe: &dyn Frontend) {
+        // Flush the workspace snapshot once per wake if a handled event or a
+        // window open/close marked it dirty (write-on-change guards the disk).
+        if self.workspace_dirty {
+            self.save_workspace();
+        }
+        // Pump each window's own session clients and route the output back to
+        // that window (a window only holds clients for sessions it's showing).
+        let mut pumped: Vec<(WindowId, String, Vec<u8>, bool)> = Vec::new();
+        let mut dropped: Vec<(WindowId, String, Vec<u8>)> = Vec::new();
+        for (wid, w) in self.windows.iter_mut() {
+            let mut dead = Vec::new();
+            for (name, s) in w.sessions.iter_mut() {
+                let (bytes, end) = pump(s, 32);
+                // A REMOTE session whose transport dropped is held and reconnected,
+                // not torn down — its session may still be alive on the far side. A
+                // local EOF (the host process is gone) is a genuine end, as before.
+                if end == PumpEnd::Disconnected && is_remote_id(name) {
+                    dropped.push((*wid, name.clone(), bytes));
+                    dead.push(name.clone());
+                    continue;
+                }
+                let ended = end.is_end();
+                if !bytes.is_empty() || ended {
+                    pumped.push((*wid, name.clone(), bytes, ended));
+                }
+                if ended {
+                    dead.push(name.clone());
+                }
+            }
+            // Drop dead clients before dispatch so a stale query-reply is ignored;
+            // whether the window itself ends is decided below via `root.ended()`.
+            for name in dead {
+                w.sessions.remove(&name);
+            }
+        }
+        for (wid, name, bytes, ended) in pumped {
+            self.dispatch(wid, UiEvent::SessionData { name, bytes, ended }, fe);
+        }
+        // A dropped remote session: flush its last bytes, put its tile into the
+        // reconnecting hold (frozen + dimmed, not torn down), and start retrying.
+        for (wid, name, bytes) in dropped {
+            if !bytes.is_empty() {
+                let ev = UiEvent::SessionData {
+                    name: name.clone(),
+                    bytes,
+                    ended: false,
+                };
+                self.dispatch(wid, ev, fe);
+            }
+            self.dispatch(wid, UiEvent::SessionDisconnected { name: name.clone() }, fe);
+            self.begin_reconnect(wid, name);
+        }
+        // Pump each window's read-only observers: mirrored output feeds its
+        // fleet tiles as `SessionData`, and only the `Resized` event is
+        // forwarded (the app-wide subscription already delivers the rest).
+        // Within one pump the event/output interleaving is lost; dispatching
+        // Resized first is safe because the host follows every re-grid with a
+        // resync, which heals any pre-resize bytes fed to the new mirror.
+        let mut observed: Vec<(WindowId, UiEvent)> = Vec::new();
+        for (wid, w) in self.windows.iter_mut() {
+            // A session must never be both driven (a display client in `sessions`)
+            // and observed at once — that double-feeds its one emulator. The Observe
+            // guards keep the sets disjoint; assert it here where both are in hand.
+            debug_assert!(
+                w.observers.keys().all(|k| !w.sessions.contains_key(k)),
+                "a session is both driven and observed — double-feed (finding #7)"
+            );
+            let mut dead = Vec::new();
+            for (name, sub) in w.observers.iter_mut() {
+                let p = sub.pump().unwrap_or_default();
+                for e in p.events {
+                    if matches!(e, ghost_vt::protocol::SessionEvent::Resized { .. }) {
+                        observed.push((
+                            *wid,
+                            UiEvent::SessionPush {
+                                name: name.clone(),
+                                push: SessionPush::Event(e),
+                            },
+                        ));
+                    }
+                }
+                if !p.output.is_empty() || p.ended {
+                    observed.push((
+                        *wid,
+                        UiEvent::SessionData {
+                            name: name.clone(),
+                            bytes: p.output,
+                            ended: p.ended,
+                        },
+                    ));
+                }
+                if p.ended {
+                    dead.push(name.clone());
+                }
+            }
+            for name in dead {
+                w.observers.remove(&name);
+            }
+        }
+        for (wid, ev) in observed {
+            self.dispatch(wid, ev, fe);
+        }
+        // Pump any in-flight ssh connects: drain the warm-up ssh's PTY, surface a
+        // password prompt when ssh asks, and finish (or fail) the connect on exit.
+        let connecting: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.connect.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in connecting {
+            self.pump_connect(wid);
+        }
+        // Pushed session state (subscriptions) and set-change hints (the
+        // runtime-dir watch), fanned out to every window.
+        self.pump_subscriptions(fe);
+        // A changed `ui.toml` (config-dir watch) hot-reloads the live-reloadable
+        // settings into every window — the compositor blur, opacity, frost, color
+        // scheme, and padding.
+        if self
+            .config_changed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.reload_config(&config::UiConfig::load(), fe);
+        }
+        // Fire any per-window ticks that are now due.
+        let now = Instant::now();
+        let due: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.next_tick.is_some_and(|t| now >= t))
+            .map(|(id, _)| *id)
+            .collect();
+        for wid in due {
+            let now_ms = self.now_ms();
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.next_tick = None;
+                w.render_trace.saw_tick_fired(now_ms);
+            }
+            self.dispatch(wid, UiEvent::Tick { now_ms }, fe);
+        }
+        // Bench mode: advance the scripted animation (after ticks, so `is_animating`
+        // reflects this turn's animation state).
+        if self.bench.is_some() {
+            self.drive_bench(fe);
+        }
+        // A session ending never closes its window: the model has already switched
+        // to the next attached session (or the fleet), so the window lives on until
+        // the user closes it. Windows are removed only on an explicit close.
+        // Commit any interactive resize that has settled (drag paused/released) or
+        // hit its max refresh interval: drop the stretch-blit snapshot and dispatch
+        // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred
+        // while dragging. Its `Cmd::Redraw` then paints the crisp scene.
+        let now_ms = self.now_ms();
+        let commits: Vec<(WindowId, u32, u32, f64)> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(id, w)| w.resize.poll(now_ms).map(|(cw, ch, cs)| (*id, cw, ch, cs)))
+            .collect();
+        for (wid, cw, ch, cs) in commits {
+            if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
+                gfx.renderer.clear_snapshot();
+            }
+            self.dispatch(
+                wid,
+                UiEvent::Resize {
+                    w_px: cw,
+                    h_px: ch,
+                    scale: cs,
+                },
+                fe,
+            );
+        }
+        // Release any paced repaint that the frame budget now allows. The loop
+        // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
+        // paint is always re-checked and fires within a frame of becoming due;
+        // a keystroke's repaint, handled in this same pass, paints at once.
+        for (id, w) in self.windows.iter_mut() {
+            if !w.presented_ok {
+                // The opening frame hasn't landed yet: a window created mid-run can drop
+                // its first present(s) while macOS finishes compositing it (the drawable
+                // isn't acquirable, so the present is silently skipped). Keep asking every
+                // pass until one lands, rather than trusting the pacer's single request —
+                // else the window sits blank (title bar only) until an unrelated event.
+                w.request_redraw();
+            } else if w.pacer.release(now_ms) {
+                w.render_trace.saw_release(now_ms);
+                w.request_redraw();
+            }
+            // Once per pass, fold the foreground gate state and classify. Runs always
+            // (not just under the trace flag) so a stale-frame freeze can self-heal in
+            // the wild — the fold/verdict is a few subtractions, and the diagnostic dump
+            // self-filters through the `trace!` level. The window id separates concurrent
+            // windows' tracks in a multi-window log.
+            let core = w.root.foreground_trace();
+            let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
+            let pending = w.pacer.pending();
+            let visible = !w.occluded;
+            if let Some(report) = w
+                .render_trace
+                .poll(now_ms, core, pending, has_snapshot, visible)
+            {
+                tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
+            }
+            // Self-heal: when the watchdog sees a stale-no-present freeze (visible output
+            // streaming, but no real present reached the glass — the Clean-over-stale
+            // texture staleness), force one full foreground re-present. Rate-limited to
+            // one per HEAL_COOLDOWN_MS, so a persistent freeze becomes a one-frame glitch
+            // and a false trigger just redraws identical pixels (no flicker). Warn so a
+            // recovery leaves a breadcrumb even without the trace flag.
+            if w.render_trace.self_heal_due(now_ms) {
+                if let Some(gfx) = w.gfx.as_mut() {
+                    gfx.force_foreground_repaint();
+                }
+                w.pacer.request();
+                tracing::warn!(
+                    target: "ghost::render",
+                    window = ?id,
+                    "forced a foreground re-present (watchdog: suspected stale frame)"
+                );
+            }
+        }
+        fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 }
 
