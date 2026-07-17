@@ -2645,6 +2645,16 @@ impl App {
                         self.respawn_dead(&id);
                     }
                 }
+                Cmd::RestartRemote(id) => {
+                    // Restart a live remote session's host under the current binary
+                    // over the transport (off-loop), keeping its screen. The old
+                    // host's death drops any client driving it; the existing
+                    // reconnect path then re-attaches to the fresh host — reading its
+                    // new (current) proto level. Route by the self-describing id.
+                    if let Some((target, real)) = remote_id_parts(&id) {
+                        self.spawn_remote_restart(target, real);
+                    }
+                }
                 Cmd::Rename { session, name } => {
                     // A remote session renames over its host's transport (off-loop);
                     // a local one over its control connection. Either works whether
@@ -3839,6 +3849,29 @@ impl App {
         std::thread::spawn(move || {
             if let Err(e) = host.remote.kill_session(&host.remote_ghost, &real) {
                 eprintln!("ghost: remote kill failed: {e}");
+            }
+        });
+    }
+
+    /// Restart remote session `real` on `target` under the current binary, over its
+    /// host's transport, off the event loop (a blocking ssh round trip). The remote
+    /// host is ended and respawned seeded from its recording, so the session returns
+    /// speaking the current protocol level; a client driving it sees the transport
+    /// drop (the old host died) and the reconnect path re-attaches to the new host.
+    fn spawn_remote_restart(&self, target: &str, real: &str) {
+        let Some(host) = self
+            .remotes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(target).cloned())
+        else {
+            eprintln!("ghost: no live connection to {target} to restart its session");
+            return;
+        };
+        let real = real.to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = host.remote.restart_session(&host.remote_ghost, &real) {
+                eprintln!("ghost: remote restart failed: {e}");
             }
         });
     }

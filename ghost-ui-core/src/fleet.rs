@@ -312,6 +312,11 @@ enum PendingAction {
     TakeOver,
     /// Kill the session and its process.
     Kill,
+    /// Restart a live remote session's host under the current binary (`r` on a
+    /// remote tile): the running program is lost but the screen survives. Only
+    /// created for [`PendingTarget::Session`]/[`Sessions`](PendingTarget::Sessions)
+    /// of remote ids.
+    Restart,
 }
 
 /// An in-progress inline rename of a tile.
@@ -2340,7 +2345,9 @@ impl FleetModel {
             }
             // `r` relaunches dead tiles in the background (the relaunch
             // chip's verb — Enter on a dead tile is the recreate-and-open
-            // path); Ctrl-r relaunches the focused tile's group's dead.
+            // path); Ctrl-r relaunches the focused tile's group's dead. On a
+            // LIVE REMOTE tile the same verb restarts its host under the current
+            // ghost (a confirmed, destructive action — see below).
             UiEvent::Key {
                 key, mods, kind, ..
             } if kind.is_down() && !mods.sup && matches!(&key, Key::Char(s) if s == "r") => {
@@ -2349,17 +2356,38 @@ impl FleetModel {
                 } else {
                     self.key_targets()
                 };
-                let mut cmds: Vec<Cmd> = targets
-                    .into_iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == id && t.dead))
+                let dead: Vec<Cmd> = targets
+                    .iter()
+                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
+                    .cloned()
                     .map(Cmd::Resurrect)
                     .collect();
-                if cmds.is_empty() {
-                    return Vec::new(); // nothing dead under the verb
+                if !dead.is_empty() {
+                    self.marked.clear();
+                    let mut cmds = dead;
+                    cmds.push(Cmd::Redraw);
+                    return cmds;
                 }
-                self.marked.clear();
-                cmds.push(Cmd::Redraw);
-                cmds
+                // Nothing dead: a live REMOTE tile restarts its host under the new
+                // ghost instead. Destructive (the running program is lost, only the
+                // screen survives), so confirm first. Local live tiles have no such
+                // verb — restart is transport-only.
+                let live_remote: Vec<SessionId> = targets
+                    .into_iter()
+                    .filter(|id| {
+                        crate::group::is_remote_id(id)
+                            && self.tiles.iter().any(|t| &t.id == id && !t.dead)
+                    })
+                    .collect();
+                if live_remote.is_empty() {
+                    return Vec::new();
+                }
+                self.pending = Some(Pending {
+                    target: PendingTarget::Sessions(live_remote),
+                    action: PendingAction::Restart,
+                    selected: Choice::Cancel,
+                });
+                vec![Cmd::Redraw]
             }
             // `u` ungroups (the drag-out's keyboard twin); Ctrl-u dissolves
             // the focused tile's whole group, dead members included.
@@ -2970,6 +2998,17 @@ impl FleetModel {
                 self.marked.clear();
                 self.kill_sessions(&ids)
             }
+            (PendingTarget::Session(id), PendingAction::Restart) => {
+                vec![Cmd::RestartRemote(id.clone())]
+            }
+            (PendingTarget::Sessions(ids), PendingAction::Restart) => {
+                let ids = ids.clone();
+                self.marked.clear();
+                ids.into_iter().map(Cmd::RestartRemote).collect()
+            }
+            // Restart is only ever created for session targets (a live remote tile
+            // or a marked set of them), never a whole group.
+            (PendingTarget::Group(_), PendingAction::Restart) => Vec::new(),
         };
         cmds.push(Cmd::Redraw);
         cmds
@@ -3051,6 +3090,25 @@ impl FleetModel {
                             )
                         }
                     }
+                    PendingAction::Restart => {
+                        let n = ids.len();
+                        if n == 1 {
+                            (
+                                "Restart 1 session under the new ghost? (its running \
+                                 program is lost; the screen survives)"
+                                    .to_string(),
+                                "Restart",
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "Restart {n} sessions under the new ghost? (their running \
+                                     programs are lost; the screens survive)"
+                                ),
+                                "Restart",
+                            )
+                        }
+                    }
                 };
             }
             PendingTarget::Group(gid) => {
@@ -3067,6 +3125,8 @@ impl FleetModel {
                         ),
                         "Take over",
                     ),
+                    // Never created for a group target (restart is per remote session).
+                    PendingAction::Restart => (format!("Restart the {name} group?"), "Restart"),
                 };
             }
         };
@@ -3081,6 +3141,13 @@ impl FleetModel {
             PendingAction::TakeOver => (
                 format!("{shown} is open in another window \u{2014} take it over?"),
                 "Take over",
+            ),
+            PendingAction::Restart => (
+                format!(
+                    "Restart {shown} under the new ghost? (its running program is \
+                     lost; the screen survives)"
+                ),
+                "Restart",
             ),
         }
     }
@@ -3935,7 +4002,9 @@ impl FleetModel {
                 scale: MODAL_SCALE,
             });
             let confirm_bg = match p.action {
-                PendingAction::Kill => DESTRUCTIVE_BUTTON_BG,
+                // Restart discards the running program (only the screen survives),
+                // so it wears the destructive colour like a kill.
+                PendingAction::Kill | PendingAction::Restart => DESTRUCTIVE_BUTTON_BG,
                 PendingAction::TakeOver => AFFIRM_BUTTON_BG,
             };
             let buttons = [
@@ -4752,6 +4821,35 @@ mod tests {
             ],
             "the kills forget the members; the emptied entry dissolves"
         );
+    }
+
+    #[test]
+    fn r_on_a_live_remote_tile_confirms_then_restarts_it_under_the_new_ghost() {
+        let mut m = fleet();
+        let remote = format!("h{}work", crate::group::REMOTE_ID_SEP);
+        // A live remote tile (a listed session is live), focused by the listing.
+        m.update(UiEvent::SessionList(vec![info(&remote)]));
+        // `r` reuses the relaunch verb: on a LIVE remote tile it offers a restart
+        // under the current ghost — destructive (the running program is lost), so
+        // it is confirmed first rather than acting immediately.
+        let cmds = key(&mut m, Key::Char("r".into()));
+        assert!(
+            m.modal_open(),
+            "restarting a live remote tile is confirmed first: {cmds:?}"
+        );
+        // Confirm (Space) → the shell restarts the remote host under the new binary.
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert_eq!(cmds, vec![Cmd::RestartRemote(remote.clone()), Cmd::Redraw]);
+    }
+
+    #[test]
+    fn r_on_a_live_local_tile_does_nothing() {
+        let mut m = fleet();
+        m.update(UiEvent::SessionList(vec![info("local")]));
+        // A live LOCAL tile has nothing dead to relaunch and isn't remote, so `r`
+        // is inert — restart-under-the-new-ghost is a remote-only action.
+        assert!(key(&mut m, Key::Char("r".into())).is_empty());
+        assert!(!m.modal_open());
     }
 
     #[test]

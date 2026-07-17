@@ -76,6 +76,13 @@ pub enum Cmd {
     /// listing shows the session alive (claimed on success, never
     /// optimistically). A failed spawn just leaves the tile dead.
     Resurrect(SessionId),
+    /// Restart a *remote* session's host under the current binary, keeping its
+    /// screen (`r` on a live remote tile, confirmed): the shell runs `ghost
+    /// __restart` on the host over the transport, which ends the (possibly older)
+    /// host and respawns the session seeded from its recording — bringing a session
+    /// served by an older host up to the current protocol level. The running
+    /// program on the host is lost; the screen and scrollback survive.
+    RestartRemote(SessionId),
     /// Rename a session (the shell sends `ClientMsg::Rename`).
     Rename {
         session: SessionId,
