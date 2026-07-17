@@ -2100,7 +2100,7 @@ impl RootModel {
                 // The transport-fallback screen takes its own choice keys (Retry /
                 // Plain ssh / Cancel), not text entry, so route it before the
                 // per-field handling below.
-                if let Some(cmds) = self.connect_fallback_key(&key) {
+                if let Some(cmds) = self.connect_fallback_key(&key, mods) {
                     return cmds;
                 }
                 match key {
@@ -2260,12 +2260,17 @@ impl RootModel {
     }
 
     /// Choice keys for the transport-fallback screen
-    /// ([`Fallback`](ConnectPhase::Fallback)): Retry (`r`, or Enter when the reason
-    /// is retryable), Plain ssh (`p`, or Enter when Retry isn't offered), and — by
-    /// returning `None` for Escape — the shared cancel/close path. Returns `None`
-    /// when the prompt isn't on that screen (so the caller's per-field key handling
-    /// runs); a `Some` (possibly empty, to swallow the key) when it is.
-    fn connect_fallback_key(&mut self, key: &Key) -> Option<Vec<Cmd>> {
+    /// ([`Fallback`](ConnectPhase::Fallback)): Retry (`r`, or Enter — but only when
+    /// the reason is retryable), Plain ssh (an explicit `p`), and — by returning
+    /// `None` for Escape — the shared cancel/close path. Returns `None` when the
+    /// prompt isn't on that screen (so the caller's per-field key handling runs); a
+    /// `Some` (possibly empty, to swallow the key) when it is.
+    ///
+    /// Enter is *inert* on a structural (non-retryable) screen: plain ssh must be an
+    /// explicit `p`, so a reflexive second Enter (or key-repeat off the host submit)
+    /// can't spawn a plain ssh child before the user has read the reason. A chorded
+    /// `r`/`p` (Ctrl/Cmd held) is ignored too, matching the Host field's exclusion.
+    fn connect_fallback_key(&mut self, key: &Key, mods: Mods) -> Option<Vec<Cmd>> {
         let retryable = match &self.connect {
             Some(ConnectPrompt {
                 phase: ConnectPhase::Fallback { retryable, .. },
@@ -2277,15 +2282,17 @@ impl RootModel {
         if matches!(key, Key::Named(NamedKey::Escape)) {
             return None;
         }
-        let is_char = |want: &str| matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(want));
+        let is_char = |want: &str| {
+            !mods.ctrl && !mods.sup && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(want))
+        };
         let enter = matches!(key, Key::Named(NamedKey::Enter));
         if (is_char("r") || enter) && retryable {
             Some(self.resubmit_connect())
-        } else if is_char("p") || enter {
-            // `p`, or Enter when no Retry is offered (the only forward action).
+        } else if is_char("p") {
             Some(vec![Cmd::UsePlainSshFallback])
         } else {
-            // Swallow any other key so the choice screen never leaks to a field.
+            // Swallow any other key so the choice screen never leaks to a field —
+            // including Enter on a structural screen (plain ssh needs an explicit `p`).
             Some(Vec::new())
         }
     }
@@ -4554,8 +4561,15 @@ mod tests {
             !scene_has(&r, "retry"),
             "a structural failure offers no Retry (it would only waste a click)"
         );
-        // Enter takes the only forward action — plain ssh — when Retry is absent.
-        let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        // Enter is inert here: plain ssh needs an explicit `p`, so a reflexive
+        // second Enter (or key-repeat off the host submit) can't spawn a plain ssh
+        // child before the user has read the reason.
+        assert!(
+            key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE).is_empty(),
+            "Enter takes no action on a structural fallback screen"
+        );
+        // An explicit `p` takes the plain-ssh fallback.
+        let cmds = key(&mut r, Key::Char("p".into()), Mods::NONE);
         assert_eq!(cmds, vec![Cmd::UsePlainSshFallback]);
     }
 

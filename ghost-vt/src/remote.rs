@@ -99,6 +99,13 @@ impl NegotiateFailure {
     /// Whether re-running negotiation could plausibly succeed — a transient
     /// failure, versus a structural one (no binary for the platform, or a binary
     /// that won't run there) where a Retry only wastes the user's click.
+    ///
+    /// `StagedButUnrunnable` is treated as structural: the copy succeeded but the
+    /// binary doesn't run there (old libc, `noexec` home), which a retry won't fix.
+    /// A retry *would* re-stage (the post-stage probe failed, so the staged path
+    /// isn't trusted), re-uploading the whole ~126 MiB binary per click — the exact
+    /// futile-click cost this split exists to avoid — so it stays non-retryable even
+    /// though a probe can, rarely, fail transiently right after a good upload.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::RemoteUnready | Self::StageFailed(_))
     }
@@ -551,7 +558,7 @@ impl RemoteSsh {
         // Staging needs the remote home (for an absolute path) and its platform
         // (to pick the binary — our own exe for a matching host, else a prebuilt).
         let home = self.remote_home().ok_or(F::RemoteUnready)?;
-        let platform = self.remote_platform().ok_or(F::UnknownPlatform)?;
+        let platform = self.remote_platform()?;
         let binary = resolve_ghost_binary(platform).ok_or_else(|| F::NoPrebuilt {
             platform: format!("{}-{}", platform.os, platform.arch),
         })?;
@@ -578,11 +585,24 @@ impl RemoteSsh {
     }
 
     /// The remote's OS+arch from `uname -s -m`, so staging can pick a binary for
-    /// it. `None` if the command fails or names a platform we don't map.
-    fn remote_platform(&self) -> Option<Platform> {
-        let out = self.command(&["uname", "-s", "-m"]).output().ok()?;
-        out.status.success().then_some(())?;
+    /// it. Distinguishes a failed interrogation ([`RemoteUnready`] — the ssh
+    /// command didn't run/exit cleanly, a transient link failure worth a retry)
+    /// from a platform we simply don't map ([`UnknownPlatform`] — structural):
+    /// they earn different reasons and different Retry offers, so they must not
+    /// collapse to one `None`.
+    ///
+    /// [`RemoteUnready`]: NegotiateFailure::RemoteUnready
+    /// [`UnknownPlatform`]: NegotiateFailure::UnknownPlatform
+    fn remote_platform(&self) -> Result<Platform, NegotiateFailure> {
+        let out = self
+            .command(&["uname", "-s", "-m"])
+            .output()
+            .map_err(|_| NegotiateFailure::RemoteUnready)?;
+        if !out.status.success() {
+            return Err(NegotiateFailure::RemoteUnready);
+        }
         parse_platform(&String::from_utf8_lossy(&out.stdout))
+            .ok_or(NegotiateFailure::UnknownPlatform)
     }
 
     /// Run `<candidate> __probe` and confirm the reply carries the

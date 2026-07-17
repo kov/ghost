@@ -4028,6 +4028,13 @@ impl App {
     /// adopts the remote session as an additional tab (see `Cmd::ConnectSshSession`).
     fn open_connect_session(&mut self, wid: WindowId) {
         if let Some(w) = self.windows.get_mut(&wid) {
+            // Supersede any in-flight connect on this window (a menu Cmd+G can reach
+            // here while a worker runs): drop its warm-up, bump the generation so a
+            // late worker is gen-rejected in `finish_connect` rather than hijacking
+            // the fresh prompt, and clear a held fallback choice from a prior connect.
+            w.connect = None;
+            w.connect_gen = w.connect_gen.wrapping_add(1);
+            w.pending_fallback = None;
             w.root.begin_connect_session();
             w.request_redraw();
         }
