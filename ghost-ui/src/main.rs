@@ -2486,6 +2486,15 @@ impl App {
                             // No live connection (host gone) or a failed channel:
                             // report the mirror dead so the tile reverts to a
                             // placeholder and a later reconcile retries.
+                            //
+                            // Deliberately single-window: this reaches only the window
+                            // that emitted the Observe. If another window also previews
+                            // this session, its tile keeps the last frame until the next
+                            // `SessionList` reconcile drops it (in every window at once) —
+                            // a sub-second, self-healing display lag, never a wrong shared
+                            // state (the dedup above guarantees no second feed source). The
+                            // multi-view fan (`end_session_in_views`) is not worth its cost
+                            // here; see the "one model, many views" 5c notes (item 4).
                             None => self.dispatch(
                                 wid,
                                 UiEvent::SessionData {
@@ -2513,6 +2522,8 @@ impl App {
                             // An old host or a dying session: report the
                             // mirror dead so the fleet reverts the tile to a
                             // placeholder and retries on a later reconcile.
+                            // Single-window on purpose, same as the remote arm above: a
+                            // co-previewer's tile self-heals on the next reconcile.
                             Err(_) => self.dispatch(
                                 wid,
                                 UiEvent::SessionData {
