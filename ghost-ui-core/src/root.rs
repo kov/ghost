@@ -916,6 +916,14 @@ impl RootModel {
         }
     }
 
+    /// Reveal (or fold) the fleet's attached-elsewhere band, so its foreign tiles
+    /// join the layout and can be focused/opened. No-op outside fleet mode.
+    pub fn set_show_elsewhere(&mut self, show: bool) {
+        if let Mode::Fleet(f) = &mut self.mode {
+            f.set_show_elsewhere(show);
+        }
+    }
+
     /// Whether `name` is this window's Single-view *foreground* (not merely warm or a
     /// fleet tile). The shell prefers a foregrounding window when it must pick the one
     /// driver of a session two windows transiently claim during a take-over steal, so
@@ -1215,7 +1223,11 @@ impl RootModel {
             cols,
             rows,
             fleet: self.is_fleet(),
-            foreground: self.primary.clone(),
+            // Never persist a foreground this window no longer drives: after an
+            // in-process take-over the old window may still *show* the session
+            // (a live, non-driving view) while it left `mine`, and a record whose
+            // foreground is outside its attached set would restore inconsistently.
+            foreground: self.primary.clone().filter(|p| self.mine.contains(p)),
             attached,
         }
     }
@@ -1361,6 +1373,20 @@ impl RootModel {
             return match &mut self.mode {
                 Mode::Fleet(f) => f.update(sessions, &self.mine, UiEvent::GroupsLoaded(groups)),
                 Mode::Single { .. } => Vec::new(),
+            };
+        }
+        // Another window in this process took over a session this one drives (an
+        // in-process adopt-in-place of an already-driven session). Relinquish grid
+        // ownership so only the new owner re-grids the one shared child — the view and
+        // input stay, since drivership gates only grid mutation (see `drives`). The shell
+        // fans this exactly to the prior driver(s) at the take-over, so no group/predicate
+        // guesswork: it is an unambiguous "you no longer own the grid" signal.
+        if let UiEvent::DriverLost { name } = &ev {
+            let existed = self.mine.remove(name);
+            return if existed {
+                vec![Cmd::Redraw]
+            } else {
+                Vec::new()
             };
         }
         // A set-change hint (a session appeared/vanished, a subscription ended):
@@ -2909,6 +2935,72 @@ mod tests {
             drv.iter()
                 .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "alpha")),
             "the driver's zoom SIGWINCHes the child: {drv:?}"
+        );
+    }
+
+    /// The take-over handoff (5c item 3): a window driving a session, told via the fanned
+    /// [`DriverLost`](UiEvent::DriverLost) that another window took it over in-process,
+    /// relinquishes grid ownership of it — its resize no longer re-grids the one shared
+    /// child. It keeps the session in view and keeps typing to it (drivership gates only
+    /// grid mutation; see [`only_the_driving_window_re_grids_the_shared_session_on_resize`]
+    /// and [`an_observer_windows_input_still_reaches_the_shared_session`]). The signal is
+    /// scoped to the one named session: a window's *other* driven sessions are untouched.
+    #[test]
+    fn a_driver_relinquishes_grid_ownership_when_told_another_window_took_over() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint("beta", 80, 24);
+        // A drives alpha (its foreground) and beta.
+        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        a.mine.insert("alpha".into());
+        a.mine.insert("beta".into());
+        assert!(
+            a.drives("alpha") && a.drives("beta"),
+            "precondition: A drives both sessions"
+        );
+
+        // Another window took over alpha; the shell fans the loss to A.
+        let cmds = a.update(
+            &mut sessions,
+            UiEvent::DriverLost {
+                name: "alpha".into(),
+            },
+        );
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "relinquishing repaints the downgraded view: {cmds:?}"
+        );
+
+        assert!(
+            !a.drives("alpha"),
+            "the old driver relinquishes the taken-over session"
+        );
+        assert!(
+            a.drives("beta"),
+            "the handoff is scoped to the named session; others stay driven"
+        );
+
+        // alpha's grid is no longer A's to author: resizing A's window (alpha is the
+        // foreground) must not re-grid the shared child or SIGWINCH it.
+        let before = sessions.get("alpha").unwrap().dims();
+        let cmds = a.update(
+            &mut sessions,
+            UiEvent::Resize {
+                w_px: 1440,
+                h_px: 864,
+                scale: 1.0,
+            },
+        );
+        assert_eq!(
+            sessions.get("alpha").unwrap().dims(),
+            before,
+            "a relinquished foreground's resize must not re-grid the shared session"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "alpha")),
+            "the relinquished session's child is not SIGWINCHed: {cmds:?}"
         );
     }
 

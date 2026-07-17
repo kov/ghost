@@ -120,6 +120,16 @@ pub enum UiEvent {
     SessionEnded {
         name: SessionId,
     },
+    /// Another window in this process took over a session this one drives (an
+    /// in-process adopt-in-place, e.g. clicking a session's tile in another window's
+    /// fleet). Only one window may own a shared session's grid, so the shell fans this
+    /// to the prior driver(s) at the take-over: relinquish drivership (drop it from
+    /// `mine`) so only the new owner re-grids and SIGWINCHes the one shared child. The
+    /// losing window keeps its live view and its input — drivership gates *only* grid
+    /// mutation ([`RootModel::drives`]).
+    DriverLost {
+        name: SessionId,
+    },
     /// A driven session's transport dropped without the child exiting — a lost
     /// connection whose session may still be alive on the far side (a remote
     /// session over ssh). The tile enters a *reconnecting* hold (frozen, dimmed)

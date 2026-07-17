@@ -2446,8 +2446,23 @@ impl App {
                             // the history (W1, hoisted out of the core so it fires
                             // exactly when a resync is coming, never on an adopt).
                             self.states.resize_observed(&id, cols, rows);
-                            self.sessions.insert(id, s);
+                            self.sessions.insert(id.clone(), s);
                         }
+                    }
+                    // This window (`wid`) now drives `id`. Only one window may own a
+                    // shared session's grid, so any OTHER window that still drives it has
+                    // just been taken over in-process — tell it to relinquish grid
+                    // ownership. A fresh attach (no prior driver) finds no losers; only a
+                    // real cross-window take-over does. This is the unambiguous handoff
+                    // signal (another window drives it), free of any group guesswork.
+                    let losers: Vec<WindowId> = self
+                        .windows
+                        .iter()
+                        .filter(|(owid, w)| **owid != wid && w.root.drives(&id))
+                        .map(|(owid, _)| *owid)
+                        .collect();
+                    for owid in losers {
+                        self.dispatch(owid, UiEvent::DriverLost { name: id.clone() }, event_loop);
                     }
                 }
                 Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
@@ -6190,6 +6205,131 @@ mod tests {
                 observers_len, 0,
                 "B previews A's same-process session with NO second mirror"
             );
+        });
+    }
+
+    /// The take-over handoff (5c item 3): window A drives session X; window B previews
+    /// it in its fleet (sharing A's one emulator). B takes over X in-process — adopt in
+    /// place, no second client. Only ONE window may own the grid (the driver that
+    /// re-grids the shared child on resize/zoom), so A must relinquish drivership: after
+    /// the take-over A no longer `drives` X, while B does. A KEEPS its live view of X —
+    /// input and rendering are drivership-independent by the shipped contract (see
+    /// `RootModel::drives`); only grid ownership moves. The shared emulator is never
+    /// blanked. Without the handoff both windows keep X in `mine`, both believe they
+    /// drive it, and their resizes fight over the child's size.
+    #[test]
+    fn a_take_over_hands_grid_ownership_over_and_the_old_window_lets_go() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "handoff-1";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'HANDOFF-MARKER\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+
+            // A drives X; B opens a fleet and previews it. B's tile exists before the
+            // pump, so A's inbound resync fans to it (making the preview live/`fed`, so
+            // the take-over adopts immediately rather than deferring a dive).
+            let ga = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, ga, None)
+                .expect("window A attaches");
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            let sees = |app: &App| {
+                app.states
+                    .text_of(name)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains("HANDOFF-MARKER")))
+            };
+            let mut spun = 0;
+            while !sees(&app) && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(
+                sees(&app),
+                "precondition: the shared state holds the marker"
+            );
+            assert!(
+                app.windows[&a].root.drives(name),
+                "precondition: A drives X"
+            );
+            assert!(
+                !app.windows[&b].root.drives(name),
+                "precondition: B only previews X"
+            );
+
+            // B takes over X through the real UI flow. X is attached elsewhere (to A), so
+            // its tile sits folded under the "attached elsewhere" band — reveal it and
+            // re-reconcile so the tile joins the layout and B focuses it. Enter then raises
+            // the take-over confirm; Space confirms. `run_pending` claims the tile — flips
+            // it to ThisWindow, moving X into B's group — before the adopt, and the
+            // adopt-in-place reuses the one shared client.
+            use ghost_ui_core::{Key, KeyEventKind, Mods, NamedKey};
+            app.windows
+                .get_mut(&b)
+                .unwrap()
+                .root
+                .set_show_elsewhere(true);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            let key = |k| ghost_ui_core::UiEvent::Key {
+                key: k,
+                mods: Mods::NONE,
+                kind: KeyEventKind::Press,
+                alts: None,
+            };
+            app.dispatch(b, key(Key::Named(NamedKey::Enter)), &fe);
+            app.dispatch(b, key(Key::Named(NamedKey::Space)), &fe);
+
+            let a_drives = app.windows[&a].root.drives(name);
+            let b_drives = app.windows[&b].root.drives(name);
+            let a_still_views = app.windows[&a].root.views(name);
+            let survived = sees(&app);
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(
+                !a_drives,
+                "the old window relinquishes grid ownership when another takes over"
+            );
+            assert!(b_drives, "the new window drives the taken-over session");
+            assert!(
+                a_still_views,
+                "the old window keeps its live view — only grid ownership moved"
+            );
+            assert!(survived, "the take-over must not blank the shared emulator");
         });
     }
 
