@@ -230,6 +230,66 @@ pub fn kill_session(name: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Restart the named session's host under THIS binary, keeping its screen. End
+/// the current host with a graceful SIGTERM — a logout-equivalent that leaves the
+/// recording and descriptor in place (NOT [`kill_session`], which discards them) —
+/// wait for it to exit, then respawn seeded from the recording with the child
+/// deferred to the next attach. The running *program* is lost (a re-exec upgrade
+/// would preserve it); the visible screen and scrollback survive, and the session
+/// returns under a fresh host process. Used to bring a session served by an OLDER
+/// host up to the current protocol level.
+pub fn restart_session(name: &str) -> io::Result<()> {
+    // Graceful SIGTERM so the host finalizes and LEAVES its recording (a kill
+    // would discard it, defeating the seed); then wait for it to exit — the
+    // respawn must not race a host still holding the lock. `kill(pid, 0)` polls a
+    // non-child, as [`kill_session`] does.
+    if let Some(pid) = read_pid(name).filter(|&p| pid_alive(p)) {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if pid_alive(pid) {
+            return Err(io::Error::other(format!(
+                "session '{name}' did not exit for a restart"
+            )));
+        }
+    }
+    // The host removes its own sock/lock/pid on exit; prune as a backstop so the
+    // respawn binds a fresh socket and lock under the same name.
+    prune(name);
+    crate::server::spawn(restart_opts(name))
+}
+
+/// Spawn options to respawn session `name` seeded from its own recording: a fresh
+/// `$SHELL` (or a reconnect, for a connection session) laid over the recorded
+/// screen + scrollback, child deferred to the first attach. The recorded workload
+/// (`descriptor.command`) is intentionally dropped — a restart restores the
+/// substrate, not the program. Mirrors the front-end's dead-session recreate
+/// (`respawn_opts`), kept here because a restart runs where the session's files
+/// live (the host), not in the GUI process.
+fn restart_opts(name: &str) -> crate::server::SpawnOpts {
+    let d = crate::descriptor::read(name).unwrap_or_default();
+    let recording = crate::paths::recording_path(name);
+    let seed_from = recording.exists().then(|| recording.clone());
+    crate::server::SpawnOpts {
+        name: name.to_string(),
+        command: Vec::new(),
+        // Provisional — the child is deferred, and the first attach resizes to the
+        // display's real grid before it starts.
+        size: (80, 24),
+        cwd: d.cwd.clone(),
+        record: Some(recording),
+        seed_from,
+        scrollback: crate::screen::DEFAULT_SCROLLBACK,
+        max_recording_bytes: Some(crate::record::DEFAULT_MAX_RECORDING_BYTES),
+        start_on_attach: true,
+        // Carry the connection forward so a restarted ssh/mosh session reconnects
+        // rather than dropping to a local shell over frozen remote scrollback.
+        connection: d.connection.clone(),
+    }
+}
+
 /// Discard `name`'s durable traces — the descriptor and the recording at its
 /// default path — making the session unresurrectable and unremembered. Used
 /// by every explicit end (kill, the child's own exit); an unclean death

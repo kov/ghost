@@ -761,6 +761,22 @@ impl RemoteSsh {
         Ok(())
     }
 
+    /// Restart a remote session's host under the staged (current) binary, keeping
+    /// its screen (`<remote_ghost> __restart <name>`), over the shared connection.
+    /// The remote host is ended gracefully and respawned seeded from its recording,
+    /// so a session that was served by an OLDER host comes back speaking the current
+    /// protocol level. The running program on the remote is lost.
+    pub fn restart_session(&self, remote_ghost: &str, name: &str) -> io::Result<()> {
+        let out = self.command(&[remote_ghost, "__restart", name]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost __restart` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Rename a remote session over the shared connection (`<remote_ghost> rename
     /// <old> <new>`). For the fleet's rename action on a remote tile.
     pub fn rename_session(&self, remote_ghost: &str, old: &str, new: &str) -> io::Result<()> {

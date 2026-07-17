@@ -343,6 +343,102 @@ fn the_transport_reports_a_remote_sessions_own_protocol_level() {
     );
 }
 
+/// Restarting a remote session under the current binary, over the transport:
+/// `ghost __restart` ends the (possibly older) remote host and respawns the
+/// session seeded from its recording, so it returns live under a fresh host with
+/// its screen intact — the mechanism the GUI's "restart under new ghost" drives to
+/// bring an old-protocol remote session up to the current level.
+#[test]
+fn restarting_a_remote_session_over_the_transport_keeps_it_live_and_seeded() {
+    let remote = tempfile::tempdir().unwrap();
+    let root = remote.path();
+    let shim = isolated_shim();
+    let ssh = shim.path().join("ssh");
+    let target = "dev@example";
+
+    transport(
+        root,
+        &ssh,
+        target,
+        &[
+            GHOST,
+            "new",
+            "-d",
+            "restarter",
+            "--",
+            "sh",
+            "-c",
+            "echo REMOTE-BEFORE; sleep 30",
+        ],
+    )
+    .output()
+    .unwrap();
+    let _guard = KillRemote {
+        remote_root: root,
+        ssh: &ssh,
+        target,
+        name: "restarter",
+    };
+
+    // Attach once to drive the marker into the host's recording (a restart can only
+    // seed what the recorder already holds), and note the original host pid.
+    let pidfile = root.join("dev_example/run/ghost/restarter/pid");
+    assert!(
+        wait_until(Duration::from_secs(5), || pidfile.exists()),
+        "the remote host never wrote its pidfile"
+    );
+    {
+        let pipe = transport(root, &ssh, target, &[GHOST, "__pipe", "restarter"]);
+        let mut s = Session::attach_ssh(pipe, "restarter", 80, 24, ghost_vt::protocol::PROTO_LEVEL)
+            .expect("attach over transport");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "REMOTE-BEFORE"),
+            "the remote marker never arrived; saw:\n{}",
+            screen.text().join("\n")
+        );
+    }
+    let before = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Restart the remote host over the transport.
+    let out = transport(root, &ssh, target, &[GHOST, "__restart", "restarter"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "remote `ghost __restart` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // It comes back live under a NEW host process…
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            remote_ls(root, &ssh, target).contains("restarter")
+                && std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .is_some_and(|p| p != before)
+        }),
+        "the remote session did not return under a new host after restart"
+    );
+
+    // …with its screen SEEDED from the recording that survived the restart.
+    let pipe = transport(root, &ssh, target, &[GHOST, "__pipe", "restarter"]);
+    let mut s = Session::attach_ssh(pipe, "restarter", 80, 24, ghost_vt::protocol::PROTO_LEVEL)
+        .expect("re-attach over transport");
+    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    let mut screen = Screen::new(80, 24, 100);
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "REMOTE-BEFORE"),
+        "the remote screen did not survive the restart; saw:\n{}",
+        screen.text().join("\n")
+    );
+}
+
 /// Pump a session and feed its output into `screen` until `needle` renders or a
 /// short deadline passes.
 fn wait_for_screen(session: &mut Session, screen: &mut Screen, needle: &str) -> bool {

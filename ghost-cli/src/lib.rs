@@ -176,6 +176,16 @@ enum Command {
         /// Immutable id of the session whose host level to report.
         name: String,
     },
+    /// Restart a session's host under this binary, keeping its screen — end the
+    /// running host gracefully, then respawn seeded from its recording. Run over
+    /// ssh as `ssh <host> -- ghost __restart <name>` to bring a session served by
+    /// an older host up to the current protocol level. An internal plumbing
+    /// command; not for direct use.
+    #[command(name = "__restart", hide = true)]
+    Restart {
+        /// Immutable id of the session to restart.
+        name: String,
+    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -436,6 +446,12 @@ fn dispatch(command: Command) {
         Command::Probe => println!("{}", ghost_vt::remote::probe_line()),
         // Addressed by immutable id, like `__pipe` — no display-name resolution.
         Command::Proto { name } => println!("{}", ghost_vt::client::session_proto(&name)),
+        // Immutable id, like `__pipe`.
+        Command::Restart { name } => {
+            if let Err(e) = ghost_vt::session::restart_session(&name) {
+                fail(&e.to_string());
+            }
+        }
     }
 }
 
