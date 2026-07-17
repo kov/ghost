@@ -60,13 +60,17 @@ impl Client {
 
     /// Tunnel to a remote session host over SSH: `cmd` is the `ssh … -- ghost
     /// __pipe <name>` whose stdio relays to the remote host's control socket.
-    /// The remote ghost is staged version-matched to us, so it speaks our own
-    /// [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL) — there is no local `proto`
-    /// marker to read for a remote session.
-    pub fn connect_ssh(cmd: std::process::Command) -> io::Result<Self> {
+    ///
+    /// `proto` is the *running host's* level, which the caller reads over the
+    /// transport ([`RemoteSsh::session_proto`](crate::remote::RemoteSsh::session_proto)) —
+    /// NOT this binary's, because a staged binary can outrun a host still serving
+    /// an older session, and gating a post-marker message on the wrong level makes
+    /// the old host drop us. A freshly-spawned session (spawned by the current
+    /// staged binary) passes [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL).
+    pub fn connect_ssh(cmd: std::process::Command, proto: u32) -> io::Result<Self> {
         Ok(Client {
             conn: Conn::connect_ssh(cmd)?,
-            proto: crate::protocol::PROTO_LEVEL,
+            proto,
         })
     }
 
@@ -91,8 +95,12 @@ fn proto_at(sock: &Path) -> u32 {
         .unwrap_or(0)
 }
 
-/// The named session's declared protocol feature level (see [`proto_at`]).
-fn session_proto(name: &str) -> u32 {
+/// The named session's declared protocol feature level (see [`proto_at`]). Read
+/// from the session's own `proto` marker, so it reflects the *running* host that
+/// serves it, not this binary — the `ghost __proto <name>` far end of the SSH
+/// transport prints it so an initiator with a newer binary learns whether a
+/// session's (possibly older) host can decode a post-marker message.
+pub fn session_proto(name: &str) -> u32 {
     proto_at(&paths::socket_path(name))
 }
 
@@ -199,10 +207,11 @@ impl Subscriber {
     /// Observe a *remote* session over the SSH transport: `cmd` is the
     /// `ssh … -- ghost __pipe <name>` tunnel to the remote host's control socket.
     /// Same read-only mirror as [`observe`](Subscriber::observe), for live remote
-    /// fleet previews; the remote ghost is version-matched, so it speaks our own
-    /// protocol level and supports observation.
-    pub fn observe_ssh(cmd: std::process::Command) -> io::Result<Subscriber> {
-        Self::from_client(Client::connect_ssh(cmd)?, ClientMsg::Observe)
+    /// fleet previews. `proto` is the running host's level (see
+    /// [`Client::connect_ssh`]): an older host that predates `Observe` is refused
+    /// here rather than sent a verb it drops the connection over.
+    pub fn observe_ssh(cmd: std::process::Command, proto: u32) -> io::Result<Subscriber> {
+        Self::from_client(Client::connect_ssh(cmd, proto)?, ClientMsg::Observe)
     }
 
     fn from_client(mut client: Client, verb: ClientMsg) -> io::Result<Subscriber> {
@@ -317,17 +326,23 @@ impl Session {
         name: &str,
         cols: u16,
         rows: u16,
+        proto: u32,
     ) -> io::Result<Session> {
-        Self::from_client(Client::connect_ssh(cmd)?, name, cols, rows)
+        Self::from_client(Client::connect_ssh(cmd, proto)?, name, cols, rows)
     }
 
     /// [`attach_deferred`](Session::attach_deferred) over an SSH tunnel: connect
     /// but send no size until the caller's first [`resize`](Session::resize), so
-    /// the remote repaint is generated at the GUI's real geometry.
-    pub fn attach_deferred_ssh(cmd: std::process::Command, name: &str) -> io::Result<Session> {
+    /// the remote repaint is generated at the GUI's real geometry. `proto` is the
+    /// running host's level (see [`Client::connect_ssh`]).
+    pub fn attach_deferred_ssh(
+        cmd: std::process::Command,
+        name: &str,
+        proto: u32,
+    ) -> io::Result<Session> {
         Ok(Session {
             name: name.to_string(),
-            client: Client::connect_ssh(cmd)?,
+            client: Client::connect_ssh(cmd, proto)?,
         })
     }
 
@@ -474,8 +489,11 @@ pub fn attach(name: &str) -> io::Result<()> {
 /// Attach to a *remote* session over the SSH transport: `cmd` is the
 /// `ssh … -- ghost __pipe <name>` whose stdio tunnels to the remote host. The
 /// terminal pipe is identical to a local attach — only the transport differs.
-pub fn attach_ssh(cmd: std::process::Command) -> io::Result<()> {
-    run_attach(Client::connect_ssh(cmd)?)
+/// `proto` is the running host's level (see [`Client::connect_ssh`]); this raw
+/// attach sends only Resize/Input/Kill so it never trips the gate, but it carries
+/// the real level for consistency with the GUI paths.
+pub fn attach_ssh(cmd: std::process::Command, proto: u32) -> io::Result<()> {
+    run_attach(Client::connect_ssh(cmd, proto)?)
 }
 
 /// The raw-mode terminal pipe shared by [`attach`] and [`attach_ssh`]: forward

@@ -167,6 +167,15 @@ enum Command {
     /// runs it over ssh to decide transport-vs-ssh-child. Internal.
     #[command(name = "__probe", hide = true)]
     Probe,
+    /// Print the named session's protocol feature level (its `proto` marker), run
+    /// over ssh as `ssh <host> -- ghost __proto <name>` so an initiator learns the
+    /// level of the *running* host serving that session — which can predate the
+    /// staged binary. An internal plumbing command; not for direct use.
+    #[command(name = "__proto", hide = true)]
+    Proto {
+        /// Immutable id of the session whose host level to report.
+        name: String,
+    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -292,9 +301,10 @@ fn dispatch(command: Command) {
                     }
                     if detached {
                         println!("started remote session '{name}' on {}", spec.target());
-                    } else if let Err(e) =
-                        client::attach_ssh(remote.pipe_command(&remote_ghost, &name))
-                    {
+                    } else if let Err(e) = client::attach_ssh(
+                        remote.pipe_command(&remote_ghost, &name),
+                        remote.session_proto(&remote_ghost, &name),
+                    ) {
                         fail(&format!(
                             "remote session '{name}' started but attach failed: {e}"
                         ));
@@ -424,6 +434,8 @@ fn dispatch(command: Command) {
             }
         }
         Command::Probe => println!("{}", ghost_vt::remote::probe_line()),
+        // Addressed by immutable id, like `__pipe` — no display-name resolution.
+        Command::Proto { name } => println!("{}", ghost_vt::client::session_proto(&name)),
     }
 }
 

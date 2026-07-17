@@ -706,6 +706,32 @@ impl RemoteSsh {
         serde_json::from_slice(&out.stdout).map_err(io::Error::other)
     }
 
+    /// The protocol level of the *running host* serving remote session `name`
+    /// (`<remote_ghost> __proto <name>`), read from that session's `proto` marker
+    /// over the shared connection. A staged binary can be newer than a host still
+    /// serving an older session (`negotiate` never restarts running hosts), so an
+    /// attach/observe must gate its post-marker messages on THIS, not the binary's
+    /// level, or an old host drops the client on a message it can't decode.
+    ///
+    /// Falls back to the initiator's own [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL)
+    /// when the read fails — an older remote binary lacks `__proto` (unknown
+    /// subcommand), which leaves today's optimistic assumption in place rather than
+    /// silently disabling features against a genuinely-current host; the read only
+    /// changes behavior where it succeeds and reports a *lower* level.
+    pub fn session_proto(&self, remote_ghost: &str, name: &str) -> u32 {
+        let level = || -> Option<u32> {
+            let out = self
+                .command(&[remote_ghost, "__proto", name])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+                .flatten()
+        };
+        level().unwrap_or(crate::protocol::PROTO_LEVEL)
+    }
+
     /// Kill a remote session by id over the shared connection (`<remote_ghost>
     /// kill <name>`). For the fleet's kill action on a remote tile.
     pub fn kill_session(&self, remote_ghost: &str, name: &str) -> io::Result<()> {

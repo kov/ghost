@@ -257,7 +257,8 @@ fn a_remote_title_change_propagates_over_the_watch_transport() {
     // shell; the remote host rewrites its `titled/meta`, and its recursive watcher
     // must push the fresh title back over the transport well under the heartbeat.
     let pipe = transport(root, &ssh, target, &[GHOST, "__pipe", "titled"]);
-    let mut session = Session::attach_ssh(pipe, "titled", 80, 24).expect("attach over transport");
+    let mut session = Session::attach_ssh(pipe, "titled", 80, 24, ghost_vt::protocol::PROTO_LEVEL)
+        .expect("attach over transport");
     session
         .set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
@@ -283,6 +284,63 @@ fn a_remote_title_change_propagates_over_the_watch_transport() {
 
     let _ = watch.kill();
     let _ = watch.wait();
+}
+
+/// A remote session's *host* can predate the staged binary — `negotiate` stages a
+/// newer ghost but never restarts running hosts, so a session may still be served
+/// by an older `__host` process. The client must therefore honor the RUNNING
+/// host's protocol level (its on-disk `proto` marker), not assume the staged
+/// binary's level; otherwise it sends a message the old host can't decode and gets
+/// dropped — a frozen remote attach. This proves the transport can report a
+/// session's actual level, the read the attach path relies on.
+#[test]
+fn the_transport_reports_a_remote_sessions_own_protocol_level() {
+    let remote = tempfile::tempdir().unwrap();
+    let root = remote.path();
+    let shim = isolated_shim();
+    let ssh = shim.path().join("ssh");
+    let target = "dev@example";
+
+    transport(
+        root,
+        &ssh,
+        target,
+        &[GHOST, "new", "-d", "oldhost", "--", "sleep", "600"],
+    )
+    .output()
+    .unwrap();
+    let _guard = KillRemote {
+        remote_root: root,
+        ssh: &ssh,
+        target,
+        name: "oldhost",
+    };
+
+    // The host writes its own `proto` marker at spawn; wait for it, then rewrite it
+    // to a level below ours to stand in for an older running host (a real old host
+    // would have written this value itself).
+    let marker = root.join("dev_example/run/ghost/oldhost/proto");
+    assert!(
+        wait_until(Duration::from_secs(5), || marker.exists()),
+        "the remote host never wrote its proto marker"
+    );
+    std::fs::write(&marker, "4\n").unwrap();
+
+    // Read it back over the transport: the far end reports the SESSION's level,
+    // read from that session's marker — not this binary's compiled-in level.
+    let out = transport(root, &ssh, target, &[GHOST, "__proto", "oldhost"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "remote `ghost __proto` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "4",
+        "the transport must report the running host's level, not the staged binary's"
+    );
 }
 
 /// Pump a session and feed its output into `screen` until `needle` renders or a

@@ -136,7 +136,8 @@ fn attaching_over_the_ssh_transport_shows_the_remote_hosts_screen() {
     // host's output arrives across the tunnel, framed protocol intact.
     let spec = ConnectionSpec::parse_target("dev@example").unwrap();
     let cmd = transport_cmd(xdg, &ssh, &spec, "remote");
-    let mut session = Session::attach_ssh(cmd, "remote", 80, 24).expect("attach over ssh");
+    let mut session = Session::attach_ssh(cmd, "remote", 80, 24, ghost_vt::protocol::PROTO_LEVEL)
+        .expect("attach over ssh");
     session
         .set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
@@ -200,7 +201,8 @@ fn observing_over_the_ssh_transport_mirrors_the_remote_screen() {
 
     let spec = ConnectionSpec::parse_target("dev@example").unwrap();
     let cmd = transport_cmd(xdg, &ssh, &spec, "watched");
-    let mut obs = Subscriber::observe_ssh(cmd).expect("observe over ssh");
+    let mut obs =
+        Subscriber::observe_ssh(cmd, ghost_vt::protocol::PROTO_LEVEL).expect("observe over ssh");
 
     let mut snapshot = None;
     let mut screen: Option<Screen> = None;

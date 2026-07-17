@@ -431,8 +431,14 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
         "the session was never listed on the remote"
     );
     let mut screen = Screen::new(80, 24, 100);
-    let mut session = Session::attach_ssh(r.pipe_command(&ghost, "survivor"), "survivor", 80, 24)
-        .expect("attach");
+    let mut session = Session::attach_ssh(
+        r.pipe_command(&ghost, "survivor"),
+        "survivor",
+        80,
+        24,
+        ghost_vt::protocol::PROTO_LEVEL,
+    )
+    .expect("attach");
     assert!(
         type_until(
             &mut session,
@@ -456,8 +462,13 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
     r.reap_wedged_master();
     let mut screen = Screen::new(80, 24, 100);
     let reattached = wait_until(Duration::from_secs(25), || {
-        let Ok(mut s) = Session::attach_ssh(r.pipe_command(&ghost, "survivor"), "survivor", 80, 24)
-        else {
+        let Ok(mut s) = Session::attach_ssh(
+            r.pipe_command(&ghost, "survivor"),
+            "survivor",
+            80,
+            24,
+            ghost_vt::protocol::PROTO_LEVEL,
+        ) else {
             return false;
         };
         pump_until(&mut s, &mut screen, "GHOSTMARK", Duration::from_secs(5))

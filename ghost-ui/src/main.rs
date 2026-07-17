@@ -285,8 +285,9 @@ fn attach_over_ssh(
     cols: u16,
     rows: u16,
     identity: &str,
+    proto: u32,
 ) -> io::Result<Session> {
-    let mut s = Session::attach_deferred_ssh(cmd, name)?;
+    let mut s = Session::attach_deferred_ssh(cmd, name, proto)?;
     // Non-blocking, like the local [`attach`]: `about_to_wait` pumps this session
     // on the frame loop and the ssh pipe never wakes winit, so a bounded wait buys
     // no latency. (On the ssh transport `set_read_timeout(Some(_))` already maps to
@@ -2995,7 +2996,8 @@ impl App {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let cmd = host.remote.pipe_command(&host.remote_ghost, real);
-            if self.attach_ssh_into(wid, composite, cmd) {
+            // Freshly (re)created by the current staged binary → our own level.
+            if self.attach_ssh_into(wid, composite, cmd, ghost_vt::protocol::PROTO_LEVEL) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -3062,7 +3064,9 @@ impl App {
             return;
         };
         let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
-        if self.attach_ssh_into(wid, &name, cmd) {
+        // A pre-existing session that dropped: honor its running host's level.
+        let proto = host.remote.session_proto(&host.remote_ghost, &real);
+        if self.attach_ssh_into(wid, &name, cmd, proto) {
             self.reconnecting.remove(&(wid, name.clone()));
             self.dispatch(wid, UiEvent::SessionReattached { name }, event_loop);
         } else if let Some(proxy) = self.proxy.clone() {
@@ -3122,7 +3126,22 @@ impl App {
 
     /// [`attach_into`](Self::attach_into) over the SSH transport: attach a remote
     /// session (reached by `cmd`, an `ssh … __pipe`) into window `wid`.
-    fn attach_ssh_into(&mut self, wid: WindowId, name: &str, cmd: std::process::Command) -> bool {
+    /// Attach a remote session over the transport. `proto` is the *running host's*
+    /// level (see [`RemoteSsh::session_proto`]): a freshly-spawned session passes
+    /// [`PROTO_LEVEL`] (spawned by the current staged binary, and reading its
+    /// not-yet-written marker could race to 0); a discovered/pre-existing session
+    /// passes the value read over its host's transport, so a post-marker message
+    /// isn't sent to an older host that would drop the client.
+    ///
+    /// [`RemoteSsh::session_proto`]: ghost_vt::remote::RemoteSsh::session_proto
+    /// [`PROTO_LEVEL`]: ghost_vt::protocol::PROTO_LEVEL
+    fn attach_ssh_into(
+        &mut self,
+        wid: WindowId,
+        name: &str,
+        cmd: std::process::Command,
+        proto: u32,
+    ) -> bool {
         if self.sessions.contains_key(name) {
             return true;
         }
@@ -3131,7 +3150,7 @@ impl App {
         };
         let (cols, rows) = w.root.grid();
         let identity = w.root.client_identity();
-        match attach_over_ssh(cmd, name, cols, rows, &identity) {
+        match attach_over_ssh(cmd, name, cols, rows, &identity, proto) {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
@@ -3369,7 +3388,13 @@ impl App {
                 let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec) else {
                     return self.connect_fail(wid, "could not open the ssh connection".into());
                 };
-                if self.attach_ssh_into(wid, &local_id, remote.pipe_command(&remote_ghost, &name)) {
+                // Just spawned by the current staged binary → our own level.
+                if self.attach_ssh_into(
+                    wid,
+                    &local_id,
+                    remote.pipe_command(&remote_ghost, &name),
+                    ghost_vt::protocol::PROTO_LEVEL,
+                ) {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.root.end_connect();
                     }
@@ -3504,7 +3529,9 @@ impl App {
                 continue;
             }
             let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
-            if !self.attach_ssh_into(wid, &composite, cmd)
+            // A remembered session restored on its host: honor its running level.
+            let proto = host.remote.session_proto(&host.remote_ghost, &real);
+            if !self.attach_ssh_into(wid, &composite, cmd, proto)
                 && !self.relaunch_remote_and_attach(wid, &host, &composite, &real)
             {
                 // Host reachable but the session is gone AND could not be
@@ -3674,7 +3701,9 @@ impl App {
             return;
         };
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
-        if self.attach_ssh_into(wid, id, cmd) {
+        // Taking over a discovered session: honor its running host's level.
+        let proto = host.remote.session_proto(&host.remote_ghost, real);
+        if self.attach_ssh_into(wid, id, cmd, proto) {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
         }
     }
@@ -3761,7 +3790,8 @@ impl App {
         self.remote_index
             .insert(local_id.clone(), (target.clone(), name.clone()));
         let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
-        if self.attach_ssh_into(wid, &local_id, cmd) {
+        // Just spawned by the current staged binary → our own level.
+        if self.attach_ssh_into(wid, &local_id, cmd, ghost_vt::protocol::PROTO_LEVEL) {
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
             self.remote_index.remove(&local_id);
@@ -3779,7 +3809,11 @@ impl App {
             .ok()
             .and_then(|m| m.get(target).cloned())?;
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
-        Subscriber::observe_ssh(cmd).ok()
+        // Gate the Observe verb on the RUNNING host's level, not the staged
+        // binary's: an older host that predates observation refuses cleanly here
+        // (the preview stays a cold tile) instead of being dropped mid-connect.
+        let proto = host.remote.session_proto(&host.remote_ghost, real);
+        Subscriber::observe_ssh(cmd, proto).ok()
     }
 
     /// Kill remote session `real` on `target` over its host's transport, off the
