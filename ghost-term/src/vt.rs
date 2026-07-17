@@ -63,6 +63,15 @@ impl Vt {
         self.parser.state == parser::State::Ground
     }
 
+    /// Whether a chunked kitty-graphics image transfer is mid-flight. The main
+    /// parser returns to ground *between* an image's chunks, so `parser_at_ground`
+    /// alone would call a mid-transfer stream a clean boundary — but a half-assembled
+    /// image is buffered and only its completed form is checkpointed, so handing off
+    /// here silently loses it. The quiesce gate must exclude this too.
+    pub fn graphics_chunking(&self) -> bool {
+        self.terminal.graphics_chunking()
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) -> Changes<'_> {
         self.terminal.resize(cols, rows);
 

@@ -271,6 +271,16 @@ impl GraphicsState {
         self.images.len()
     }
 
+    /// Whether a chunked image transfer is mid-flight — the first chunk's control
+    /// data is buffered awaiting `m=0` continuations, but no complete image exists
+    /// yet. Between chunks the escape parser is back at ground and no UTF-8 is
+    /// pending, so this is the only signal that the byte stream can't be safely
+    /// handed to a fresh terminal (which would drop the arriving continuations and
+    /// lose the image). Surfaced via [`Vt::graphics_chunking`](crate::Vt).
+    pub fn chunking(&self) -> bool {
+        self.chunk.is_some()
+    }
+
     /// The placements the renderer should draw, in insertion order.
     pub fn placements(&self) -> impl Iterator<Item = &Placement> {
         self.placements.iter()

@@ -355,15 +355,18 @@ impl Screen {
     }
 
     /// Whether the byte stream is at a **clean handoff boundary**: the VT parser is
-    /// in its ground state (no escape/OSC/DCS/APC partially consumed) AND no
-    /// incomplete UTF-8 tail is buffered. Only here may a host self-upgrade re-exec
-    /// hand the live PTY to a fresh process — a mid-sequence or mid-codepoint
-    /// handoff would strand bytes whose leading part the old parser already ate.
-    /// Stricter than `!has_pending()`, which sees only the UTF-8 tail, not a
-    /// half-read escape sequence (its bytes are valid UTF-8 and leave `pending`
-    /// empty).
+    /// in its ground state (no escape/OSC/DCS/APC partially consumed), no incomplete
+    /// UTF-8 tail is buffered, AND no chunked kitty-graphics transfer is mid-flight.
+    /// Only here may a host self-upgrade re-exec hand the live PTY to a fresh
+    /// process — a mid-sequence, mid-codepoint, or mid-image handoff would strand
+    /// bytes whose leading part the old process already consumed.
+    ///
+    /// Stricter than `!has_pending()`, which sees only the UTF-8 tail: a half-read
+    /// escape sequence is valid UTF-8 with `pending` empty (the parser state catches
+    /// it), and a chunked image sits *between* complete APC sequences with the parser
+    /// back at ground (only the graphics chunk state catches it).
     pub fn at_boundary(&self) -> bool {
-        self.pending.is_empty() && self.vt.parser_at_ground()
+        self.pending.is_empty() && self.vt.parser_at_ground() && !self.vt.graphics_chunking()
     }
 
     /// The current screen as text lines (scrollback + viewport).
@@ -432,6 +435,23 @@ mod tests {
         assert!(
             s.at_boundary(),
             "the completed codepoint returns to a boundary"
+        );
+
+        // Mid-image: a chunked kitty-graphics transfer. The parser returns to ground
+        // BETWEEN chunks and no UTF-8 is pending, so parser+UTF-8 alone would call
+        // this a boundary — but a half-assembled image is buffered (only its
+        // completed form is checkpointed), so a handoff here would lose it.
+        // `QUFBQQ==` decodes to 4 bytes = one 1x1 RGBA pixel, split across two chunks.
+        s.feed(b"\x1b_Gi=1,a=t,f=32,s=1,v=1,m=1;QUFB\x1b\\");
+        assert!(s.pending.is_empty() && s.vt.parser_at_ground());
+        assert!(
+            !s.at_boundary(),
+            "a mid-flight chunked image transfer is not a boundary"
+        );
+        s.feed(b"\x1b_Gm=0;QQ==\x1b\\");
+        assert!(
+            s.at_boundary(),
+            "the completed image transfer returns to a boundary"
         );
     }
 

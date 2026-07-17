@@ -344,6 +344,12 @@ impl Terminal {
         self.graphics.image(id)
     }
 
+    /// Whether a chunked kitty-graphics transfer is mid-flight (see
+    /// [`GraphicsState::chunking`]).
+    pub fn graphics_chunking(&self) -> bool {
+        self.graphics.chunking()
+    }
+
     /// Re-emit the kitty-graphics state as escapes, so a terminal fed the dump
     /// regains it (reattach / replay-from-checkpoint): the stored image transmits
     /// followed by the direct placements. Used by the resync dump, where the
