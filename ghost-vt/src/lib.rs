@@ -11,6 +11,7 @@
 //! This crate is the reusable engine behind the `ghost` CLI and any future GUI
 //! front-end.
 
+pub mod child;
 pub mod client;
 pub mod connection;
 pub mod descriptor;

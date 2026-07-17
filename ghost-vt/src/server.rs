@@ -460,7 +460,7 @@ fn host_main(
     // deferred we hold the slave (`pts`) so the PTY master never sees EOF and the
     // poll loop just idles until a client attaches.
     let mut pts = Some(pts);
-    let mut child: Option<std::process::Child> = None;
+    let mut child: Option<crate::child::Child> = None;
     // The last cwd written to the durable descriptor, so refreshes only touch
     // the file when the child actually moved.
     let mut desc_cwd: Option<std::path::PathBuf> = None;
@@ -1458,7 +1458,7 @@ fn set_display_name(
 /// always present here — EOF can only follow a spawn — but it is threaded as an
 /// `Option` because the session may not have spawned its child yet.
 fn child_exited(
-    child: &mut Option<std::process::Child>,
+    child: &mut Option<crate::child::Child>,
     client: &mut Option<Client>,
     name: &str,
     record: Option<&std::path::Path>,
@@ -1497,7 +1497,7 @@ fn spawn_child(
     session_name: &str,
     launch_dir: Option<&std::path::Path>,
     pts: pty_process::blocking::Pts,
-) -> io::Result<std::process::Child> {
+) -> io::Result<crate::child::Child> {
     let (prog, args) = split_command(command);
     let mut cmd = PtyCommand::new(&prog).args(&args);
     // The child talks to ghost's own `vt` emulator, not the user's outer
@@ -1520,13 +1520,15 @@ fn spawn_child(
     if let Some(dir) = launch_dir {
         cmd = cmd.current_dir(dir);
     }
-    cmd.spawn(pts).map_err(io::Error::other)
+    cmd.spawn(pts)
+        .map(crate::child::Child::from_handle)
+        .map_err(io::Error::other)
 }
 
 /// The child's current working directory, best-effort: Linux reads it from
 /// `/proc`; elsewhere (or on any error) `None`, and the descriptor keeps the
 /// launch directory.
-fn child_cwd(child: &Option<std::process::Child>) -> Option<std::path::PathBuf> {
+fn child_cwd(child: &Option<crate::child::Child>) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     {
         child
@@ -1559,10 +1561,9 @@ fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path:
 
 /// Kill and reap the child if one has been spawned; a no-op for a deferred
 /// session whose child never started.
-fn kill_child(child: &mut Option<std::process::Child>) {
+fn kill_child(child: &mut Option<crate::child::Child>) {
     if let Some(c) = child {
-        let _ = c.kill();
-        let _ = c.wait();
+        c.kill();
     }
 }
 
