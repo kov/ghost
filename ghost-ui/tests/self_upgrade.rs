@@ -270,6 +270,70 @@ fn a_self_upgrade_refuses_a_target_that_cannot_speak_the_handoff_format() {
     );
 }
 
+/// The recording must CONTINUE across an upgrade, not restart: the successor
+/// appends to the existing file instead of truncating it, so a marker recorded
+/// before the upgrade is still there afterward. (`ghost search` replays the
+/// recording through the emulator and greps the rendered lines.)
+#[test]
+fn a_self_upgrade_continues_the_recording_instead_of_truncating_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    // Recording is on by default; the child prints a distinctive marker, then
+    // becomes `cat` so the session stays live for the upgrade.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            "recup",
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo BEFORE-UPGRADE-MARK; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop { xdg, name: "recup" };
+
+    // Attach and confirm the marker rendered, so the host has recorded it.
+    {
+        let mut s = Session::attach_path(&sock(xdg, "recup"), "recup", 80, 24)
+            .expect("attach before upgrade");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "BEFORE-UPGRADE-MARK"),
+            "marker never rendered; saw:\n{}",
+            screen.text().join("\n")
+        );
+    }
+
+    // Upgrade in place.
+    let out = ghost(xdg).args(["__upgrade", "recup"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The pre-upgrade marker is STILL searchable: the successor appended to the
+    // recording rather than truncating it. A `create`-truncating adopt would
+    // have wiped this.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let out = ghost(xdg).args(["search", "BEFORE-UPGRADE-MARK"]).output();
+            out.map(|o| String::from_utf8_lossy(&o.stdout).contains("BEFORE-UPGRADE-MARK"))
+                .unwrap_or(false)
+        }),
+        "the pre-upgrade recording was truncated across the upgrade"
+    );
+}
+
 #[test]
 fn a_self_upgrade_replaces_the_host_in_place_and_keeps_its_child_alive() {
     let tmp = tempfile::tempdir().unwrap();

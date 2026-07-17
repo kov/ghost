@@ -200,6 +200,11 @@ pub enum Item {
 pub struct Recorder<W: Write> {
     writer: W,
     start: Instant,
+    /// Milliseconds already elapsed in the recording when THIS recorder took
+    /// over — 0 for a fresh recording, the predecessor's last elapsed time when
+    /// appending across a self-upgrade (so timestamps stay monotonic instead of
+    /// resetting toward zero with the new process's `Instant`).
+    base_ms: u64,
     pending: Vec<Event>,
     pending_bytes: usize,
     /// Content hashes of images already written to a [`FRAME_IMAGES`] frame, so a
@@ -240,6 +245,25 @@ impl FileRecorder {
         })
     }
 
+    /// CONTINUE an existing recording at `path` instead of truncating it — used
+    /// when a self-upgrade adopts a session that was already recording, so its
+    /// `ghost search` history survives the swap. Opens the file for append and
+    /// writes no header (a second header mid-file would corrupt the stream);
+    /// rehydrates the image-dedup set from what is physically stored, and reads
+    /// the last timestamp so appended events stay monotonic. Fails (caller falls
+    /// back to a fresh recording) if the file is missing or unreadable.
+    pub fn open_append(path: &Path, max_bytes: Option<usize>) -> io::Result<Self> {
+        let existing = std::fs::read(path)?;
+        let written_hashes = stored_image_hashes(&existing);
+        let base_ms = last_t_ms(&existing);
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        Ok(FileRecorder {
+            inner: Recorder::append(BufWriter::new(file), base_ms, written_hashes),
+            path: path.to_path_buf(),
+            max_bytes,
+        })
+    }
+
     /// Record a chunk of terminal output.
     pub fn output(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.inner.output(bytes)
@@ -248,6 +272,12 @@ impl FileRecorder {
     /// Record a window-size change.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.inner.resize(cols, rows)
+    }
+
+    /// Flush any buffered frame to disk. Used before a self-upgrade re-execs, so
+    /// the successor appends after complete data.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 
     /// Move the recording to `new_path`, keeping the open writer valid. The
@@ -315,6 +345,25 @@ impl FileRecorder {
     }
 }
 
+/// The largest timestamp in an encoded recording (0 if empty/unreadable), so an
+/// appending recorder can carry the time base forward and keep events monotonic.
+/// A torn trailing frame is tolerated by [`read_bytes`].
+fn last_t_ms(bytes: &[u8]) -> u64 {
+    read_bytes(bytes)
+        .ok()
+        .and_then(|rec| {
+            rec.items
+                .iter()
+                .map(|i| match i {
+                    Item::Output { t_ms, .. }
+                    | Item::Resize { t_ms, .. }
+                    | Item::Checkpoint { t_ms, .. } => *t_ms,
+                })
+                .max()
+        })
+        .unwrap_or(0)
+}
+
 /// The content hashes of every image physically stored (in a [`FRAME_IMAGES`]
 /// frame) in an encoded recording. Used to resync a recorder's dedup set with
 /// the file after compaction. Frames that fail to decode are skipped.
@@ -367,10 +416,29 @@ impl<W: Write> Recorder<W> {
         Ok(Recorder {
             writer,
             start: Instant::now(),
+            base_ms: 0,
             pending: Vec::new(),
             pending_bytes: 0,
             written_hashes: HashSet::new(),
         })
+    }
+
+    /// Continue an EXISTING recording on `writer` (which must already be
+    /// positioned to append after its last frame): writes NO header — a second
+    /// header mid-file would be parsed as a bogus frame and the torn-frame
+    /// tolerance would then discard everything after it. `base_ms` is the
+    /// recording's elapsed time at the handoff (keeps timestamps monotonic) and
+    /// `written_hashes` is the set of images already stored (so a returning image
+    /// stays a reference rather than a dangling one).
+    pub fn append(writer: W, base_ms: u64, written_hashes: HashSet<u64>) -> Self {
+        Recorder {
+            writer,
+            start: Instant::now(),
+            base_ms,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            written_hashes,
+        }
     }
 
     /// Record a chunk of terminal output.
@@ -457,7 +525,7 @@ impl<W: Write> Recorder<W> {
     }
 
     fn elapsed_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        self.base_ms + self.start.elapsed().as_millis() as u64
     }
 
     fn flush_frame(&mut self) -> io::Result<()> {

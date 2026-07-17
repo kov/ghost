@@ -854,8 +854,15 @@ fn host_main(
     screen.set_policy(inherited_policy);
 
     // Optional durable recording. Best-effort: if it cannot be created, the
-    // session still runs (just unrecorded).
+    // session still runs (just unrecorded). A self-upgrade CONTINUES the existing
+    // recording (append, no truncation) so `ghost search` history survives the
+    // swap; a fresh spawn (or an upgrade whose file is somehow gone) creates one.
     let mut recorder = opts.record.as_ref().and_then(|path| {
+        if adopt.is_some()
+            && let Ok(r) = crate::record::FileRecorder::open_append(path, opts.max_recording_bytes)
+        {
+            return Some(r);
+        }
         crate::record::FileRecorder::create(
             path,
             cols,
@@ -1437,6 +1444,12 @@ fn host_main(
             && let Some(pid) = child.as_ref().map(|c| c.id())
         {
             let path = pending_upgrade.take().flatten();
+            // Flush the recorder's buffered frame to disk BEFORE the exec so the
+            // successor appends after complete data (it reopens the file to
+            // continue it). Harmless if the upgrade is then refused.
+            if let Some(r) = &mut recorder {
+                let _ = r.flush();
+            }
             let _ = self_upgrade(
                 listener,
                 lock_fd,
