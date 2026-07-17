@@ -553,16 +553,12 @@ fn resize_model(
     size_px: (u32, u32),
     scale: f32,
     pad: f32,
+    driving: bool,
 ) -> Vec<Cmd> {
     view.set_padding(pad);
-    view.update(
-        state,
-        UiEvent::Resize {
-            w_px: size_px.0.max(1),
-            h_px: size_px.1.max(1),
-            scale: scale as f64,
-        },
-    )
+    // Straight to `resize` (bypassing `update`'s trivial Resize delegation) so real
+    // drivership rides through: only the window that owns the session re-grids it.
+    view.resize(state, size_px.0.max(1), size_px.1.max(1), scale, driving)
 }
 
 /// Shape a *background* view's feed commands before they reach the shell: a mirror
@@ -806,6 +802,16 @@ impl RootModel {
             Mode::Single { id, view } => Some((view, sessions.get(id)?)),
             Mode::Fleet(_) => None,
         }
+    }
+
+    /// Whether this window *drives* session `name` — is attached to / owns it — as
+    /// opposed to merely observing it in another window. The one bit that separates a
+    /// driving view from an observing one: it gates *grid* mutation (a resize or zoom
+    /// re-gridding the shared emulator and SIGWINCHing the child). Input delivery, feed
+    /// reaction, and rendering are identical either way. Sourced from `mine` today;
+    /// enablement will repoint it at the App-level connection owner in one place.
+    fn drives(&self, name: &str) -> bool {
+        self.mine.contains(name)
     }
 
     /// This window's live view of `name`, if it shows it — the foreground `Single`
@@ -1317,16 +1323,18 @@ impl RootModel {
             // full-screen program like `top` would come back mis-laid-out).
             let mut cmds = match &mut self.mode {
                 Mode::Single { id, view } => {
+                    let driving = self.mine.contains(id);
                     let state = sessions
                         .get_mut(id)
                         .expect("foreground session state present");
-                    resize_model(view, state, self.size_px, self.scale, self.pad)
+                    resize_model(view, state, self.size_px, self.scale, self.pad, driving)
                 }
                 Mode::Fleet(f) => {
                     return f.update(sessions, &self.mine, UiEvent::Resize { w_px, h_px, scale });
                 }
             };
             for (id, view) in self.warm.iter_mut() {
+                let driving = self.mine.contains(id);
                 if let Some(state) = sessions.get_mut(id) {
                     cmds.extend(resize_model(
                         view,
@@ -1334,6 +1342,7 @@ impl RootModel {
                         self.size_px,
                         self.scale,
                         self.pad,
+                        driving,
                     ));
                 }
             }
@@ -1611,7 +1620,10 @@ impl RootModel {
                 }
             }
         };
-        // Size the (possibly restored or fresh) foreground to the window.
+        // Size the (possibly restored or fresh) foreground to the window. Adopting a
+        // session *is* taking ownership (`self.mine.insert(id)` below), so this window
+        // drives its grid from here on — it re-grids and SIGWINCHes even though `mine`
+        // is written a few lines down.
         let state = sessions
             .get_mut(&id)
             .expect("adopted session state present");
@@ -1621,6 +1633,7 @@ impl RootModel {
             self.size_px,
             self.scale,
             self.pad,
+            true,
         ));
         // The window title follows the foreground: reassert this session's remembered
         // title on the switch, since it changed no title of its own to trigger one.
@@ -1686,10 +1699,20 @@ impl RootModel {
                     TerminalView::new(self.metrics, 1, 1)
                 }
             };
+            // `next` is one of this window's own attached sessions (drawn from `mine`),
+            // so promoting it to the foreground drives its grid.
+            let driving = self.drives(&next);
             let state = sessions
                 .get_mut(&next)
                 .expect("promoted session state present");
-            let mut cmds = resize_model(&mut view, state, self.size_px, self.scale, self.pad);
+            let mut cmds = resize_model(
+                &mut view,
+                state,
+                self.size_px,
+                self.scale,
+                self.pad,
+                driving,
+            );
             // The window title follows the new foreground, not the exited session.
             let title = state.title();
             self.mode = Mode::Single {
@@ -2611,6 +2634,72 @@ mod tests {
                 bytes: b"a".to_vec()
             }],
             "an observer's keystroke reaches the shared session by id"
+        );
+    }
+
+    /// Grid ownership is a driving-view privilege: an observer window's resize follows
+    /// only its own view geometry — it must not re-grid the shared emulator or SIGWINCH
+    /// the child, which belong to the one window that drives the session. Two windows
+    /// share one session; resizing the observer leaves the shared grid and the child
+    /// untouched (it repaints at its new size), while the driver's resize still re-grids
+    /// and SIGWINCHes. Without the gate the two windows would fight the child's size.
+    #[test]
+    fn only_the_driving_window_re_grids_the_shared_session_on_resize() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        // A drives alpha (it owns it); B merely observes it (empty `mine`).
+        let mut driver = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        driver.mine.insert("alpha".into());
+        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+
+        let before = sessions.get("alpha").unwrap().dims();
+        assert_eq!(before, (80, 24));
+
+        // The observer's window grows to a bigger size. Its own geometry follows, but
+        // the shared grid is the driver's to author — and a window that doesn't drive
+        // the session must never SIGWINCH its child.
+        let obs = observer.update(
+            &mut sessions,
+            UiEvent::Resize {
+                w_px: 1440,
+                h_px: 864,
+                scale: 1.0,
+            },
+        );
+        assert_eq!(
+            sessions.get("alpha").unwrap().dims(),
+            before,
+            "an observer resize must not re-grid the shared session"
+        );
+        assert!(
+            !obs.iter().any(|c| matches!(c, Cmd::Resize { .. })),
+            "an observer resize must not SIGWINCH the child: {obs:?}"
+        );
+        assert!(
+            obs.contains(&Cmd::Redraw),
+            "the observer still repaints at its new window size"
+        );
+
+        // The driver growing to the same window DOES re-grid the shared session and
+        // SIGWINCH the child (1440 / 9 = 160 cols, 864 / 18 = 48 rows).
+        let drv = driver.update(
+            &mut sessions,
+            UiEvent::Resize {
+                w_px: 1440,
+                h_px: 864,
+                scale: 1.0,
+            },
+        );
+        assert_eq!(
+            sessions.get("alpha").unwrap().dims(),
+            (160, 48),
+            "the driver's resize re-grids the shared session"
+        );
+        assert!(
+            drv.iter().any(
+                |c| matches!(c, Cmd::Resize { session, cols: 160, rows: 48 } if session == "alpha")
+            ),
+            "the driver's resize SIGWINCHes the child: {drv:?}"
         );
     }
 

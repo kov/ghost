@@ -1425,7 +1425,12 @@ impl TerminalView {
                 clicks,
             } => self.pointer(state, phase, button, pos, mods, wheel_dy, clicks),
             UiEvent::Focus(focused) => self.focus(state, focused),
-            UiEvent::Resize { w_px, h_px, scale } => self.resize(state, w_px, h_px, scale as f32),
+            // A standalone view (esctest, direct-feed, a lone TerminalModel) owns its
+            // session outright, so it drives its own grid. The multi-window Resize
+            // path routes through `resize_model`, which threads real drivership.
+            UiEvent::Resize { w_px, h_px, scale } => {
+                self.resize(state, w_px, h_px, scale as f32, true)
+            }
             UiEvent::DisplaySize { w_px, h_px } => {
                 self.display_px = Some((w_px, h_px));
                 Vec::new()
@@ -1539,7 +1544,10 @@ impl TerminalView {
         }
         self.zoom = zoom;
         let (w, h) = self.size_px;
-        self.resize(state, w, h, self.scale)
+        // Zoom re-grids as the driver for now; gating zoom on drivership is its own
+        // slice (its shortcut path enters through `key`, where drivership isn't yet in
+        // scope). See the "one model, many views" plan.
+        self.resize(state, w, h, self.scale, true)
     }
 
     /// Render the current state to a single terminal scene. The canvas is the whole
@@ -1904,12 +1912,30 @@ impl TerminalView {
         }
     }
 
-    fn resize(&mut self, state: &mut SessionState, w_px: u32, h_px: u32, scale: f32) -> Vec<Cmd> {
+    /// Resize this view to a new window size. `driving` marks the one window that
+    /// owns the session's grid: only it re-grids the shared emulator and SIGWINCHes
+    /// the child. An observer view (a second window onto the same session) follows its
+    /// own window geometry — it renders the driver's grid at its size — but must never
+    /// author the shared grid, or two windows would fight the child's dimensions.
+    pub(crate) fn resize(
+        &mut self,
+        state: &mut SessionState,
+        w_px: u32,
+        h_px: u32,
+        scale: f32,
+        driving: bool,
+    ) -> Vec<Cmd> {
         self.size_px = (w_px, h_px);
         // A non-positive scale (never sent by winit) would break the grid math;
         // ignore it and keep the last good value, as the Fleet/Root models do.
         if scale > 0.0 {
             self.scale = scale;
+        }
+        // An observer never re-grids the shared session: its window geometry changed,
+        // the emulator's grid did not. Repaint at the new size and stop here — the
+        // selection and scroll stay valid (nothing reflowed).
+        if !driving {
+            return vec![Cmd::Redraw];
         }
         let m = self.effective_metrics();
         // The grid fills the window *inset by the padding* on each side; the border is
