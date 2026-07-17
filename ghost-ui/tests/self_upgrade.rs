@@ -361,8 +361,20 @@ fn a_self_upgrade_replaces_the_host_in_place_and_keeps_its_child_alive() {
     let mut s = Session::attach_path(&sock(xdg, "upgrademe"), "upgrademe", 80, 24)
         .expect("attach after upgrade");
     s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
-    s.send_input(b"PONG-AFTER-UPGRADE\n").unwrap();
     let mut screen = Screen::new(80, 24, 100);
+
+    // The pre-upgrade SCREEN survives the swap: the new host rebuilt it from a
+    // checkpoint carried across the exec, so attaching resyncs the `CHILD=…`
+    // line the old host had rendered — not a blank screen.
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "CHILD="),
+        "the pre-upgrade screen did not survive the upgrade; saw:\n{}",
+        screen.text().join("\n")
+    );
+
+    // …and the child is live: it still echoes what we type, below the survived
+    // screen (proving `cat` was adopted, not restarted).
+    s.send_input(b"PONG-AFTER-UPGRADE\n").unwrap();
     assert!(
         wait_for_screen(&mut s, &mut screen, "PONG-AFTER-UPGRADE"),
         "the adopted child did not echo input after the upgrade; saw:\n{}",

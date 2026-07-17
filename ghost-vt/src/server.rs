@@ -187,7 +187,10 @@ impl Client {
 /// (the old image is gone), so a self-upgrade must **probe the target's version
 /// before the exec** and refuse on mismatch (see [`self_upgrade`]). BUMP this on
 /// any change to `HostArgs`/`Adopt`/`SpawnOpts` layout.
-pub const HANDOFF_VERSION: u32 = 1;
+///
+/// - v1: child pid + PTY master fd.
+/// - v2: adds the screen checkpoint fd (screen survives the swap).
+pub const HANDOFF_VERSION: u32 = 2;
 
 /// The host's startup state, serialized onto argv across the re-exec.
 #[derive(Serialize, Deserialize)]
@@ -218,6 +221,11 @@ struct Adopt {
     /// The PTY master fd, kept open across the exec (CLOEXEC cleared) so the
     /// new host reads/writes the same terminal the child is attached to.
     pty_master_fd: RawFd,
+    /// A checkpoint of the pre-upgrade screen, as a standalone one-frame
+    /// recording on an unlinked temp file kept open across the exec (CLOEXEC
+    /// cleared). The new host reads it once, rebuilds the screen (so the swap
+    /// isn't visible as a blank repaint), then closes it — freeing the inode.
+    checkpoint_fd: RawFd,
 }
 
 /// Start a session in the background.
@@ -481,6 +489,45 @@ fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
         .map_err(|_| io::Error::other("upgrade target returned an unparseable handoff version"))
 }
 
+/// Serialize the current screen into an unlinked temp file as a standalone
+/// one-checkpoint recording, so a self-upgrade can hand its successor the live
+/// screen across the exec (the fd is carried; the successor reads it once and
+/// closes it — an unlinked file, so the inode is then freed). Reversible: on any
+/// failure the caller refuses the upgrade and the temp file drops harmlessly.
+fn write_checkpoint_tempfile(screen: &Screen, command: &[String]) -> io::Result<std::fs::File> {
+    use std::io::Seek;
+    let (cols, rows) = screen.dimensions();
+    let dump = screen.dump_without_images();
+    let images = screen.graphics_images();
+    let mut file = tempfile::tempfile()?;
+    {
+        // `&mut File` is a `Write`; the recorder writes the header + one
+        // checkpoint frame, then its `Drop` flushes — leaving `file` owned.
+        let mut rec = crate::record::Recorder::new(&mut file, cols, rows, command)?;
+        rec.checkpoint_with_images(cols, rows, &dump, &images)?;
+        rec.flush()?;
+    }
+    // Rewind so the successor reads from the start.
+    file.rewind()?;
+    Ok(file)
+}
+
+/// Rebuild a screen from the checkpoint our predecessor left on `fd` (see
+/// [`write_checkpoint_tempfile`]). Best-effort: a blank screen if the checkpoint
+/// is unreadable, so a decode hiccup degrades to Step-3 behavior (blank until the
+/// child repaints) rather than failing the adopt. Consumes the fd (closes it).
+fn read_checkpoint(fd: RawFd, scrollback: usize) -> Option<Screen> {
+    use std::io::{Read, Seek};
+    // SAFETY: an fd our predecessor handed us with CLOEXEC cleared; we own it now
+    // and close it when this `File` drops.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.rewind().ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let rec = crate::record::read_bytes(&bytes).ok()?;
+    Some(Screen::from_recording(&rec, scrollback))
+}
+
 /// Re-exec THIS process in place — same pid, no fork — onto the host at `exe`,
 /// adopting the running `child_pid` on the carried PTY master. Only the code
 /// image is replaced; the listener, the liveness lock, the PTY, and the child
@@ -492,11 +539,13 @@ fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
 /// never exit. Every step here is therefore reversible: on any error the live
 /// host is left exactly as it was, save the CLOEXEC flags we cleared (harmless)
 /// and the signal block, which we lift before returning.
+#[allow(clippy::too_many_arguments)] // the whole exec handoff, threaded once
 fn self_upgrade(
     listener: &UnixListener,
     lock_fd: RawFd,
     pty: &pty_process::blocking::Pty,
     child_pid: u32,
+    screen: &Screen,
     opts: &SpawnOpts,
     launch_dir: Option<&std::path::Path>,
     path: Option<&str>,
@@ -526,11 +575,19 @@ fn self_upgrade(
         )));
     }
 
-    // Keep the listener, the lock, and the PTY master open across the exec.
+    // Checkpoint the current screen onto an unlinked temp file to carry it across
+    // the exec (reversible: a throwaway file dropped on any later failure). Built
+    // before we touch fd flags so nothing is half-applied if it fails.
+    let checkpoint = write_checkpoint_tempfile(screen, &opts.command)?;
+
+    // Keep the listener, the lock, the PTY master, and the checkpoint open across
+    // the exec.
     clear_cloexec(listener)?;
     clear_cloexec_raw(lock_fd)?;
     let master_fd = pty.as_raw_fd();
     clear_cloexec_raw(master_fd)?;
+    let checkpoint_fd = checkpoint.as_raw_fd();
+    clear_cloexec_raw(checkpoint_fd)?;
 
     let host_args = HostArgs {
         handoff_version: HANDOFF_VERSION,
@@ -539,6 +596,7 @@ fn self_upgrade(
         adopt: Some(Adopt {
             child_pid,
             pty_master_fd: master_fd,
+            checkpoint_fd,
         }),
     };
     let blob = encode_host_args(&host_args);
@@ -765,21 +823,25 @@ fn host_main(
     }
 
     // Authoritative screen state, fed every byte the child writes so a late
-    // attach can be repainted to the current state. A seeded spawn (a
-    // recreate) starts from its predecessor's recording instead of blank:
-    // read it NOW, before the recorder below truncates the (typically same)
-    // path, and reflow the restored state to this session's grid. A self-upgrade
-    // starts blank for now — carrying the emulator state across the exec is
-    // Phase 2 Step 4 (a checkpoint memfd); the child's next output repaints it.
-    let mut screen = match opts
-        .seed_from
-        .as_ref()
-        .filter(|_| adopt.is_none())
-        .and_then(|p| {
+    // attach can be repainted to the current state. Its initial contents depend
+    // on how this host started:
+    // - A self-upgrade rebuilds the pre-upgrade screen from the checkpoint its
+    //   predecessor handed us on `checkpoint_fd`, so the swap isn't a blank
+    //   repaint; the child's live PTY continues below it.
+    // - A seeded spawn (a recreate) starts from its predecessor's recording:
+    //   read it NOW, before the recorder below truncates the (typically same)
+    //   path.
+    // - Otherwise blank.
+    // Either restored state is reflowed to this session's grid.
+    let restored = match &adopt {
+        Some(a) => read_checkpoint(a.checkpoint_fd, opts.scrollback),
+        None => opts.seed_from.as_ref().and_then(|p| {
             crate::record::read(p)
                 .map(|rec| Screen::from_recording(&rec, opts.scrollback))
                 .ok()
-        }) {
+        }),
+    };
+    let mut screen = match restored {
         Some(mut seeded) => {
             seeded.resize(cols, rows);
             seeded
@@ -1380,6 +1442,7 @@ fn host_main(
                 lock_fd,
                 &pty,
                 pid,
+                &screen,
                 opts,
                 launch_dir,
                 path.as_deref(),
