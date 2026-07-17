@@ -2446,7 +2446,7 @@ impl App {
                             // the history (W1, hoisted out of the core so it fires
                             // exactly when a resync is coming, never on an adopt).
                             self.states.resize_observed(&id, cols, rows);
-                            self.sessions.insert(id.clone(), s);
+                            self.drive_with_client(&id, s);
                         }
                     }
                     // This window (`wid`) now drives `id`. Only one window may own a
@@ -2656,7 +2656,7 @@ impl App {
                         let (cols, rows) = w.root.grid();
                         let identity = w.root.client_identity();
                         if let Ok(s) = attach(&name, cols, rows, &identity) {
-                            self.sessions.insert(name, s);
+                            self.drive_with_client(&name, s);
                         }
                     }
                 }
@@ -3095,7 +3095,7 @@ impl App {
                 // Fresh transport → a resync (screen + scrollback) is inbound: rebuild
                 // the shared mirror first so the replay lands clean (W1).
                 self.states.resize_observed(name, cols, rows);
-                self.sessions.insert(name.to_string(), s);
+                self.drive_with_client(name, s);
                 true
             }
             Err(e) => {
@@ -3119,7 +3119,7 @@ impl App {
         match attach_over_ssh(cmd, name, cols, rows, &identity) {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
-                self.sessions.insert(name.to_string(), s);
+                self.drive_with_client(name, s);
                 true
             }
             Err(e) => {
@@ -4055,6 +4055,21 @@ impl App {
         }
     }
 
+    /// Install `s` as the driving client for `id`, first dropping any read-only
+    /// observer of the same session. A client is the authoritative feed source; an
+    /// observer left in place would be a SECOND source into the one shared emulator —
+    /// the finding-#7 double-feed the per-wake pump asserts against, which aborts the
+    /// app on the next `wake`. This is the observed→driven UPGRADE, the mirror of the
+    /// driven→observed downgrade in [`reconcile_source`](Self::reconcile_source): every
+    /// path that gives this process a client for a session (attach, take-over, spawn,
+    /// remote reconnect, window construction) routes the insert through here so the
+    /// dedup can never be forgotten at one site. The observer's `Subscriber` drops with
+    /// it, closing its transport.
+    fn drive_with_client(&mut self, id: &str, s: Session) {
+        self.observers.remove(id);
+        self.sessions.insert(id.to_string(), s);
+    }
+
     /// Drop shared states nothing references any more — a session that vanished (killed
     /// from another process, its tile gone) leaving no view and no feed source. The
     /// process-wide replacement for the fleet's old per-window `sessions.retain`, which
@@ -4293,7 +4308,11 @@ impl App {
         apply_anim_ms(&mut root);
         // The process holds exactly one client per session; this window drives it.
         // If one already exists (a second window onto a live session), keep it and
-        // drop the extra attach rather than double-driving the one emulator.
+        // drop the extra attach rather than double-driving the one emulator. Either
+        // way this window DRIVES `name`, so drop any read-only observer of it first —
+        // a client plus an observer is the finding-#7 double-feed (see
+        // [`drive_with_client`](Self::drive_with_client), the upgrade this open mirrors).
+        self.observers.remove(name);
         self.sessions.entry(name.to_string()).or_insert(session);
         self.windows.insert(
             wid,
@@ -6129,6 +6148,81 @@ mod tests {
             assert!(
                 downgraded,
                 "the previewed driverless session is downgraded to a read-only observer"
+            );
+        });
+    }
+
+    /// The reverse handoff: a session PREVIEWED first (a read-only observer) then
+    /// DRIVEN. Attaching a client is the observed→driven UPGRADE — it must REPLACE the
+    /// observer, never coexist with it. Two live feed sources into the one shared
+    /// emulator is the finding-#7 double-feed the per-wake pump asserts against
+    /// (`observers ∩ sessions = ∅`); leaving the observer in place aborts the app on the
+    /// next `wake` (the intermittent macOS restore/connect crash — whichever of the
+    /// preview-observe and the driver-attach won the race decided whether it fired).
+    #[test]
+    fn driving_a_previewed_session_replaces_its_observer_no_double_source() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "preview-then-drive";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'MARK\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+
+            // B previews X first, while NOTHING drives it → opens a read-only observer.
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            let observed_first = app.observers.contains_key(name);
+            let undriven_first = !app.sessions.contains_key(name);
+
+            // A now drives X (open_single_window attaches a client). The upgrade must
+            // drop B's observer so the session has exactly one source: A's client,
+            // fanned to B's tile from the shared state.
+            let ga = app.mint_group();
+            let a = app.open_single_window(&fe, name, ga, None);
+            let driven = app.sessions.contains_key(name);
+            let both = app.observers.contains_key(name) && app.sessions.contains_key(name);
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(observed_first, "precondition: B previews X as an observer");
+            assert!(undriven_first, "precondition: nobody drives X yet");
+            assert!(a.is_some(), "A attaches X");
+            assert!(driven, "A drives X after the attach");
+            assert!(
+                !both,
+                "driving a previewed session must drop its observer — a session both \
+                 driven and observed is the finding-#7 double-feed that aborts on wake"
             );
         });
     }
