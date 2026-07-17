@@ -2282,10 +2282,10 @@ impl RootModel {
         if matches!(key, Key::Named(NamedKey::Escape)) {
             return None;
         }
-        let is_char = |want: &str| {
-            !mods.ctrl && !mods.sup && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(want))
-        };
-        let enter = matches!(key, Key::Named(NamedKey::Enter));
+        let unchorded = !mods.ctrl && !mods.sup;
+        let is_char =
+            |want: &str| unchorded && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(want));
+        let enter = unchorded && matches!(key, Key::Named(NamedKey::Enter));
         if (is_char("r") || enter) && retryable {
             Some(self.resubmit_connect())
         } else if is_char("p") {

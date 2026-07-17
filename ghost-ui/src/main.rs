@@ -3809,11 +3809,14 @@ impl App {
             .ok()
             .and_then(|m| m.get(target).cloned())?;
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
-        // Gate the Observe verb on the RUNNING host's level, not the staged
-        // binary's: an older host that predates observation refuses cleanly here
-        // (the preview stays a cold tile) instead of being dropped mid-connect.
-        let proto = host.remote.session_proto(&host.remote_ghost, real);
-        Subscriber::observe_ssh(cmd, proto).ok()
+        // Unlike an attach (which sends `Policy` and would be DROPPED by an older
+        // host), an observe gains nothing from reading the host's real level: a host
+        // that predates observation (`proto < PROTO_OBSERVE`) yields a cold preview
+        // either way — refused locally if we pass its real level, or dropped by the
+        // host if we pass ours. So skip the per-tile `__proto` round trip (this runs
+        // once per remote tile as a fleet opens) and pass our own level; the visible
+        // outcome is identical and the fleet-open stall stays flat.
+        Subscriber::observe_ssh(cmd, ghost_vt::protocol::PROTO_LEVEL).ok()
     }
 
     /// Kill remote session `real` on `target` over its host's transport, off the

@@ -31,6 +31,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// [`RemoteSsh::master_alive`] confirms with this bounded round-trip; a healthy
 /// master answers in milliseconds.
 const WEDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a `__proto` read (a tiny forced command over the shared master) may run
+/// before we give up and fall back. A healthy master answers in milliseconds; this
+/// only bites if the master silently wedged, and a caller runs it on the event loop.
+const PROTO_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wait for `child`, killing it (and returning `None`) if it outruns `timeout`.
 /// Polls rather than blocking so a wedged ssh can't hang the caller forever. Used
@@ -718,16 +722,28 @@ impl RemoteSsh {
     /// subcommand), which leaves today's optimistic assumption in place rather than
     /// silently disabling features against a genuinely-current host; the read only
     /// changes behavior where it succeeds and reports a *lower* level.
+    ///
+    /// Bounded ([`PROTO_READ_TIMEOUT`]): a caller runs this on the event loop, and a
+    /// silently-dead master (reboot/partition, no FIN/RST) would otherwise hang the
+    /// tiny read until ssh's keepalive gives up (~45s), freezing every window — the
+    /// same bound [`probe`](Self::probe)/[`negotiate`](Self::negotiate) apply. A
+    /// timeout is a failed read, so it falls back to `PROTO_LEVEL`.
     pub fn session_proto(&self, remote_ghost: &str, name: &str) -> u32 {
         let level = || -> Option<u32> {
-            let out = self
+            let mut child = self
                 .command(&[remote_ghost, "__proto", name])
-                .output()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
                 .ok()?;
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
-                .flatten()
+            if !matches!(wait_bounded(&mut child, PROTO_READ_TIMEOUT), Some(s) if s.success()) {
+                return None;
+            }
+            use std::io::Read as _;
+            let mut buf = String::new();
+            child.stdout.take()?.read_to_string(&mut buf).ok()?;
+            buf.trim().parse().ok()
         };
         level().unwrap_or(crate::protocol::PROTO_LEVEL)
     }
