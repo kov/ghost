@@ -506,6 +506,11 @@ enum ConnectPhase {
     Password { prompt: String },
     /// Auth failed; `message` is shown and Enter returns to the host field.
     Error { message: String },
+    /// The transport couldn't put a protocol-matched ghost on the remote (so the
+    /// connect would degrade to a plain `ssh <host>` child). `reason` says why;
+    /// the user picks — Retry (only when `retryable`, a transient failure), fall
+    /// back to a plain ssh child, or Cancel — instead of a silent downgrade.
+    Fallback { reason: String, retryable: bool },
 }
 
 /// What the [`Connecting`](ConnectPhase::Connecting) phase is currently doing.
@@ -1185,6 +1190,19 @@ impl RootModel {
         if let Some(p) = &mut self.connect {
             p.phase = ConnectPhase::Error { message };
             // A fresh failure clears any lingering flash from a prior copy.
+            p.copied = None;
+        }
+    }
+
+    /// The connect couldn't put a protocol-matched ghost on the remote (`reason`
+    /// says why): stop on the fallback choice screen instead of silently degrading
+    /// to a plain `ssh <host>` child. `retryable` (from the failure's own
+    /// classification) decides whether Retry is offered — a transient failure is
+    /// worth another try, a structural one (no binary for the platform) is not.
+    /// The shell holds the pending spec/name so the plain-ssh choice can use them.
+    pub fn connect_offer_fallback(&mut self, reason: String, retryable: bool) {
+        if let Some(p) = &mut self.connect {
+            p.phase = ConnectPhase::Fallback { reason, retryable };
             p.copied = None;
         }
     }
@@ -2057,7 +2075,9 @@ impl RootModel {
             match p.phase {
                 ConnectPhase::Host => Some(&mut p.host),
                 ConnectPhase::Password { .. } => Some(&mut p.password),
-                ConnectPhase::Connecting { .. } | ConnectPhase::Error { .. } => None,
+                ConnectPhase::Connecting { .. }
+                | ConnectPhase::Error { .. }
+                | ConnectPhase::Fallback { .. } => None,
             }
         }
         match ev {
@@ -2076,6 +2096,12 @@ impl RootModel {
                     && let Some(msg) = self.connect_error_message()
                 {
                     return self.copy_error(msg);
+                }
+                // The transport-fallback screen takes its own choice keys (Retry /
+                // Plain ssh / Cancel), not text entry, so route it before the
+                // per-field handling below.
+                if let Some(cmds) = self.connect_fallback_key(&key) {
+                    return cmds;
                 }
                 match key {
                     Key::Char(s) if !mods.ctrl && !mods.sup => {
@@ -2164,40 +2190,103 @@ impl RootModel {
 
     /// Enter in the connect prompt, by phase: submit the host (→ begin auth),
     /// submit the password (→ feed the in-flight auth), or retry from an error.
+    /// (The fallback screen's Enter is intercepted earlier, in
+    /// [`connect_fallback_key`](Self::connect_fallback_key).)
     fn connect_submit(&mut self) -> Vec<Cmd> {
-        let Some(p) = &mut self.connect else {
-            return Vec::new();
+        // Decide the action without holding the `self.connect` borrow, so the Host
+        // case can delegate to `resubmit_connect` (which needs `&mut self`).
+        enum Submit {
+            Host,
+            Password(String),
+            Error,
+            Ignore,
+        }
+        let action = match &self.connect {
+            Some(p) => match &p.phase {
+                ConnectPhase::Host => Submit::Host,
+                ConnectPhase::Password { .. } => Submit::Password(p.password.text().to_string()),
+                ConnectPhase::Error { .. } => Submit::Error,
+                ConnectPhase::Connecting { .. } | ConnectPhase::Fallback { .. } => Submit::Ignore,
+            },
+            None => return Vec::new(),
         };
-        match &p.phase {
-            ConnectPhase::Host => match ConnectionSpec::parse_target(p.host.text()) {
-                Some(spec) => {
-                    let target = p.target;
+        match action {
+            Submit::Host => self.resubmit_connect(),
+            Submit::Password(password) => {
+                if let Some(p) = &mut self.connect {
                     p.phase = ConnectPhase::Connecting {
                         status: ConnectStatus::Working,
                     };
-                    // A new-window connect makes the window an ssh group; a
-                    // new-session connect adopts a tab into this window instead.
-                    match target {
-                        ConnectTarget::Window => vec![Cmd::ConnectSshWindow { spec }],
-                        ConnectTarget::Session => vec![Cmd::ConnectSshSession { spec }],
-                    }
                 }
-                // Empty or unparseable host: stay in the prompt.
-                None => vec![Cmd::Redraw],
-            },
-            ConnectPhase::Password { .. } => {
-                let password = p.password.text().to_string();
-                p.phase = ConnectPhase::Connecting {
-                    status: ConnectStatus::Working,
-                };
                 vec![Cmd::ConnectPassword(password)]
             }
             // Retry: back to the host field (its text is preserved).
-            ConnectPhase::Error { .. } => {
-                p.phase = ConnectPhase::Host;
+            Submit::Error => {
+                if let Some(p) = &mut self.connect {
+                    p.phase = ConnectPhase::Host;
+                }
                 vec![Cmd::Redraw]
             }
-            ConnectPhase::Connecting { .. } => Vec::new(),
+            Submit::Ignore => Vec::new(),
+        }
+    }
+
+    /// Begin (or re-begin) the transport connect for the host in the field: parse
+    /// it, enter the [`Connecting`](ConnectPhase::Connecting) phase, and emit the
+    /// connect command for this prompt's target. Shared by the initial Host submit
+    /// and the fallback screen's Retry — a Retry re-runs the whole warm-up (its
+    /// ControlMaster may have expired while the user weighed the choice), which is
+    /// exactly the Host submit, so they must not drift.
+    fn resubmit_connect(&mut self) -> Vec<Cmd> {
+        let Some(p) = &mut self.connect else {
+            return Vec::new();
+        };
+        match ConnectionSpec::parse_target(p.host.text()) {
+            Some(spec) => {
+                let target = p.target;
+                p.phase = ConnectPhase::Connecting {
+                    status: ConnectStatus::Working,
+                };
+                // A new-window connect makes the window an ssh group; a new-session
+                // connect adopts a tab into this window instead.
+                match target {
+                    ConnectTarget::Window => vec![Cmd::ConnectSshWindow { spec }],
+                    ConnectTarget::Session => vec![Cmd::ConnectSshSession { spec }],
+                }
+            }
+            // Empty or unparseable host: stay in the prompt.
+            None => vec![Cmd::Redraw],
+        }
+    }
+
+    /// Choice keys for the transport-fallback screen
+    /// ([`Fallback`](ConnectPhase::Fallback)): Retry (`r`, or Enter when the reason
+    /// is retryable), Plain ssh (`p`, or Enter when Retry isn't offered), and — by
+    /// returning `None` for Escape — the shared cancel/close path. Returns `None`
+    /// when the prompt isn't on that screen (so the caller's per-field key handling
+    /// runs); a `Some` (possibly empty, to swallow the key) when it is.
+    fn connect_fallback_key(&mut self, key: &Key) -> Option<Vec<Cmd>> {
+        let retryable = match &self.connect {
+            Some(ConnectPrompt {
+                phase: ConnectPhase::Fallback { retryable, .. },
+                ..
+            }) => *retryable,
+            _ => return None,
+        };
+        // Escape backs out through the shared prompt cancel/close handling.
+        if matches!(key, Key::Named(NamedKey::Escape)) {
+            return None;
+        }
+        let is_char = |want: &str| matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(want));
+        let enter = matches!(key, Key::Named(NamedKey::Enter));
+        if (is_char("r") || enter) && retryable {
+            Some(self.resubmit_connect())
+        } else if is_char("p") || enter {
+            // `p`, or Enter when no Retry is offered (the only forward action).
+            Some(vec![Cmd::UsePlainSshFallback])
+        } else {
+            // Swallow any other key so the choice screen never leaks to a field.
+            Some(Vec::new())
         }
     }
 
@@ -2460,6 +2549,18 @@ impl RootModel {
                     items.push(line(flash_y, "✓ Copied", OK));
                 }
                 (flash_y + m.line_height, CONNECT_ERROR_HINT)
+            }
+            ConnectPhase::Fallback { reason, retryable } => {
+                items.push(line(by, &format!("Can't use the transport: {reason}"), ERR));
+                // The choices, derived from the reason: Retry only when the failure
+                // is transient (a structural one would only waste the click), plus
+                // the always-available plain-ssh fallback and cancel.
+                let hint = if *retryable {
+                    "r retry over the transport · p use plain ssh · Esc cancel"
+                } else {
+                    "p use plain ssh · Esc cancel"
+                };
+                (by + m.line_height, hint)
             }
         };
 
@@ -4394,6 +4495,68 @@ mod tests {
             scene_has(&r, "Connecting"),
             "back to connecting after submit"
         );
+    }
+
+    #[test]
+    fn a_transport_fallback_offers_a_choice_instead_of_silently_degrading() {
+        let (mut r, _) = fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE); // → Connecting
+
+        // The worker reports the transport couldn't be used (a retryable reason).
+        // The prompt STOPS on a choice screen — it does not silently degrade.
+        r.connect_offer_fallback("staging ghost to the remote failed: disk full".into(), true);
+        assert!(
+            r.is_connecting(),
+            "the prompt stays up on the choice screen"
+        );
+        assert!(scene_has(&r, "disk full"), "it shows the reason");
+        assert!(
+            scene_has(&r, "plain ssh"),
+            "it offers the plain-ssh fallback as an explicit choice"
+        );
+
+        // Choosing plain ssh (`p`) emits the fallback Cmd — the shell then spawns
+        // the local ssh child it had queued. Nothing happened until this choice.
+        let cmds = key(&mut r, Key::Char("p".into()), Mods::NONE);
+        assert_eq!(cmds, vec![Cmd::UsePlainSshFallback]);
+    }
+
+    #[test]
+    fn a_transport_fallback_retry_reconnects_over_the_transport() {
+        let (mut r, _) = fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        r.connect_offer_fallback("couldn't read the remote's home directory".into(), true);
+
+        // Retry (`r`) re-runs the connect over the transport with the same host —
+        // a fresh warm-up, since the ControlMaster may have expired while pondering.
+        let cmds = key(&mut r, Key::Char("r".into()), Mods::NONE);
+        let spec = ghost_vt::connection::ConnectionSpec::parse_target("dev@example").unwrap();
+        assert_eq!(cmds, vec![Cmd::ConnectSshWindow { spec }]);
+        assert!(r.is_connecting());
+    }
+
+    #[test]
+    fn a_structural_fallback_hides_retry_and_enter_takes_plain_ssh() {
+        let (mut r, _) = fleet(METRICS, SIZE, 1.0);
+        r.begin_connect();
+        typed(&mut r, "dev@example");
+        key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        // NoPrebuilt-style: re-running negotiation is futile, so no Retry is shown.
+        r.connect_offer_fallback(
+            "no prebuilt ghost for the remote's platform (linux-riscv64)".into(),
+            false,
+        );
+        assert!(
+            !scene_has(&r, "retry"),
+            "a structural failure offers no Retry (it would only waste a click)"
+        );
+        // Enter takes the only forward action — plain ssh — when Retry is absent.
+        let cmds = key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+        assert_eq!(cmds, vec![Cmd::UsePlainSshFallback]);
     }
 
     #[test]

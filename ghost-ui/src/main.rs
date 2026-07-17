@@ -1952,6 +1952,11 @@ struct WindowState {
     /// during staging drops (and kills) the now-unwanted remote session instead of
     /// adopting it.
     connect_gen: u64,
+    /// The (spec, name) a connect had prepared, held while the prompt shows the
+    /// transport-fallback choice screen: if the user picks plain ssh
+    /// ([`Cmd::UsePlainSshFallback`]) the shell spawns that local `ssh <host>`
+    /// child. Cleared on Retry (a fresh connect supersedes it) or Cancel.
+    pending_fallback: Option<(ConnectionSpec, String)>,
 }
 
 impl WindowState {
@@ -2690,9 +2695,11 @@ impl App {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.connect = None;
                         w.connect_gen = w.connect_gen.wrapping_add(1);
+                        w.pending_fallback = None;
                         w.request_redraw();
                     }
                 }
+                Cmd::UsePlainSshFallback => self.use_plain_ssh_fallback(wid, event_loop),
                 Cmd::CloseWindow => {
                     self.close_window(wid);
                     if self.windows.is_empty() {
@@ -3148,9 +3155,11 @@ impl App {
     /// [`finish_connect`]: App::finish_connect
     fn connect_ssh_window(&mut self, wid: WindowId, spec: ConnectionSpec) {
         // Mark the window's group an ssh group first, so a later adopt's registry
-        // save persists the connection (sessions in it inherit it).
+        // save persists the connection (sessions in it inherit it). A fresh connect
+        // supersedes any held fallback choice (this may be a Retry off that screen).
         if let Some(w) = self.windows.get_mut(&wid) {
             w.root.set_group_connection(Some(spec.clone()));
+            w.pending_fallback = None;
         }
         let name = self.unique_session_name();
 
@@ -3175,6 +3184,10 @@ impl App {
     /// ([`pump_connect`](Self::pump_connect) → [`finish_connect`](Self::finish_connect))
     /// attaches and adopts the session.
     fn connect_ssh_session(&mut self, wid: WindowId, spec: ConnectionSpec) {
+        // A fresh connect supersedes any held fallback choice (this may be a Retry).
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.pending_fallback = None;
+        }
         let name = self.unique_session_name();
         let remote = match ghost_vt::remote::RemoteSsh::new(spec.clone()) {
             Ok(r) => r,
@@ -3365,21 +3378,48 @@ impl App {
                     self.connect_fail(wid, "could not attach to the remote session".into());
                 }
             }
-            // The remote can't host ghost: fall back to a local ssh child (it runs
-            // in its own PTY view and prompts for the password there). Step 0 logs the
-            // reason so the degrade is no longer silent; Phase 1 turns this into a
-            // prompt choice (`RootModel`'s connect state machine).
+            // The remote can't host a protocol-matched ghost. Rather than silently
+            // degrade to a local ssh child, stop the prompt on a choice screen that
+            // names the reason and lets the user Retry, accept plain ssh
+            // (`Cmd::UsePlainSshFallback` → [`use_plain_ssh_fallback`]), or Cancel.
+            // The (spec, name) is held so the plain-ssh choice can spawn exactly the
+            // session this connect had prepared.
+            //
+            // [`use_plain_ssh_fallback`]: App::use_plain_ssh_fallback
             ConnectOutcome::Fallback(why) => {
-                eprintln!("ghost: {why}; using plain ssh for '{name}'");
+                let retryable = why.retryable();
                 if let Some(w) = self.windows.get_mut(&wid) {
-                    w.root.end_connect();
-                }
-                spawn_session(&name, vec![], Some(spec));
-                if self.attach_into(wid, &name) {
-                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    w.pending_fallback = Some((spec, name));
+                    w.root.connect_offer_fallback(why.to_string(), retryable);
+                    w.request_redraw();
                 }
             }
             ConnectOutcome::Error(msg) => self.connect_fail(wid, msg),
+        }
+    }
+
+    /// The user chose plain ssh on the transport-fallback screen: spawn the local
+    /// `ssh <host>` child this connect had prepared (held in `pending_fallback`)
+    /// and adopt it into the window, dismissing the prompt. Mirrors what the old
+    /// silent fallback did — only now it's an explicit choice. A no-op if the
+    /// pending context is gone (e.g. the window closed underneath the choice).
+    fn use_plain_ssh_fallback(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
+        let Some((spec, name)) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|w| w.pending_fallback.take())
+        else {
+            return;
+        };
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.root.end_connect();
+        }
+        // The descriptor carries the `ConnectionSpec`, so the session is marked a
+        // plain-ssh session by derivation (`foreground_connection`) — no stored
+        // "is fallback" flag.
+        spawn_session(&name, vec![], Some(spec));
+        if self.attach_into(wid, &name) {
+            self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
         }
     }
 
@@ -3949,6 +3989,7 @@ impl App {
                 occluded: false,
                 connect: None,
                 connect_gen: 0,
+                pending_fallback: None,
             },
         );
         // Size the model to the surface, then run the fleet's initial enumeration.
@@ -4348,6 +4389,7 @@ impl App {
                 occluded: false,
                 connect: None,
                 connect_gen: 0,
+                pending_fallback: None,
             },
         );
         // Sync the model's viewport to the real surface size *and* device scale

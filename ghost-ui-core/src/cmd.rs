@@ -125,6 +125,12 @@ pub enum Cmd {
     /// child) and returns to the window's existing session. The window-flow Escape
     /// uses [`CloseWindow`](Cmd::CloseWindow) instead, which drops the whole window.
     CancelConnect,
+    /// From the connect prompt's transport-fallback choice screen: the user chose
+    /// to fall back to a plain `ssh <host>` child (the remote couldn't host a
+    /// protocol-matched ghost). The shell spawns the local ssh-child session it had
+    /// queued for this connect and adopts it. Carries nothing — the shell still
+    /// holds the pending connect's spec and session name.
+    UsePlainSshFallback,
     /// Close the window this command came from. The shell detaches the window's
     /// sessions (they keep running) — the "close = detach" default.
     CloseWindow,
