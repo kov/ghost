@@ -4009,9 +4009,10 @@ impl App {
     ///   plus an observer would double-feed the one emulator, finding #7).
     /// - viewed but driven nowhere → the source must be a read-only mirror: if a client
     ///   lingers (its driver just left/closed) detach it and downgrade to an observer so
-    ///   previewers keep updating; open one if none exists yet. (Remote sessions are
-    ///   re-observed by the fleet reconcile instead; they'd need `observe_remote`, so
-    ///   here they just hold their last frame until then.)
+    ///   previewers keep updating; open one if none exists yet. A remote session downgrades
+    ///   to an observer over its host's transport (`observe_remote`), not a local socket —
+    ///   the fleet's own reconcile can't heal it (it optimistically believes it already
+    ///   observes a session it deduped away), so this is the one seam that re-sources it.
     fn reconcile_source(&mut self, id: &str) {
         let driven = self.windows.values().any(|w| w.root.drives(id));
         let viewed = self.windows.values().any(|w| w.root.views(id));
@@ -4027,11 +4028,19 @@ impl App {
             return;
         }
         let had_client = self.sessions.remove(id).is_some();
-        if (had_client || !self.observers.contains_key(id))
-            && !is_remote_id(id)
-            && let Ok(sub) = Subscriber::observe(id)
-        {
-            self.observers.insert(id.to_string(), sub);
+        if had_client || !self.observers.contains_key(id) {
+            let sub = if let Some((target, real)) = self.remote_index.get(id).cloned() {
+                self.observe_remote(&target, &real)
+            } else if !is_remote_id(id) {
+                Subscriber::observe(id).ok()
+            } else {
+                // A remote id with no live index entry (its host dropped): nothing to
+                // observe over. Leave the last frame; a later reconnect re-sources it.
+                None
+            };
+            if let Some(sub) = sub {
+                self.observers.insert(id.to_string(), sub);
+            }
         }
     }
 
@@ -6107,6 +6116,114 @@ mod tests {
             assert!(
                 downgraded,
                 "the previewed driverless session is downgraded to a read-only observer"
+            );
+        });
+    }
+
+    /// The REMOTE twin of the driver-close downgrade (5c item 2): window A drives a
+    /// remote session (a composite `<host>␟<name>` id over the ssh transport) and window
+    /// B previews it in its fleet, sharing A's one client (no second mirror). When A
+    /// closes, the shared remote client is orphaned — but B still previews it, so the
+    /// shell downgrades the source to a read-only REMOTE observer (over the host's
+    /// transport, not a bogus local socket) and keeps the host connected so that
+    /// observer's stream stays live. `reconcile_source` used to skip remote ids here
+    /// entirely, freezing the preview with no self-heal.
+    #[test]
+    fn closing_the_driver_of_a_remote_preview_downgrades_it_to_a_remote_observer() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+
+            // Window A is an ssh group for the host; spawn a session on it and drive it.
+            let ga = app.mint_group();
+            let a = app.open_fleet_window(&fe, ga, None);
+            app.windows
+                .get_mut(&a)
+                .unwrap()
+                .root
+                .set_group_connection(Some(spec.clone()));
+            let name = "rp-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                a,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            assert!(
+                app.sessions.contains_key(&composite),
+                "precondition: A drives the remote session over the transport"
+            );
+
+            // Window B previews it: a fleet reconciling the host's listing (as the watcher
+            // pushes it) mints a foreign tile and rides A's one client — deduped, no mirror.
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let listed = namespace_remote_infos("kov@box", vec![info(name, true)]);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+            assert!(
+                app.windows[&b].root.views(&composite),
+                "precondition: B previews the remote session"
+            );
+            assert_eq!(
+                app.observers.len(),
+                0,
+                "precondition: B shares A's client — no second mirror"
+            );
+
+            // A closes. B still previews the now-driverless remote session.
+            app.close_window(a);
+
+            let downgraded = app.observers.contains_key(&composite);
+            let host_kept = app
+                .remotes
+                .lock()
+                .map(|m| m.contains_key("kov@box"))
+                .unwrap_or(false);
+            let state_alive = app.states.text_of(&composite).is_some();
+
+            // Tear the real (shimmed-local) session down and restore PATH before asserting.
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(
+                downgraded,
+                "a previewed driverless REMOTE session downgrades to a remote observer"
+            );
+            assert!(
+                host_kept,
+                "its host stays connected so the observer's transport keeps feeding"
+            );
+            assert!(
+                state_alive,
+                "the shared state survives the remote driver leaving"
             );
         });
     }
