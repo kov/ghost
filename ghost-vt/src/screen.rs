@@ -354,6 +354,18 @@ impl Screen {
         !self.pending.is_empty()
     }
 
+    /// Whether the byte stream is at a **clean handoff boundary**: the VT parser is
+    /// in its ground state (no escape/OSC/DCS/APC partially consumed) AND no
+    /// incomplete UTF-8 tail is buffered. Only here may a host self-upgrade re-exec
+    /// hand the live PTY to a fresh process — a mid-sequence or mid-codepoint
+    /// handoff would strand bytes whose leading part the old parser already ate.
+    /// Stricter than `!has_pending()`, which sees only the UTF-8 tail, not a
+    /// half-read escape sequence (its bytes are valid UTF-8 and leave `pending`
+    /// empty).
+    pub fn at_boundary(&self) -> bool {
+        self.pending.is_empty() && self.vt.parser_at_ground()
+    }
+
     /// The current screen as text lines (scrollback + viewport).
     pub fn text(&self) -> Vec<String> {
         self.vt.text()
@@ -390,6 +402,37 @@ mod tests {
         let mut s = Screen::new(20, 4, 100);
         s.feed(b"hello world");
         assert!(screen_text(&s)[0].starts_with("hello world"));
+    }
+
+    #[test]
+    fn at_boundary_is_false_mid_escape_and_mid_utf8() {
+        // A clean handoff boundary: the VT parser is in its ground state AND no
+        // incomplete UTF-8 tail is buffered. A self-upgrade re-exec may only fire
+        // here, or the new host's fresh parser inherits a half-consumed sequence.
+        let mut s = Screen::new(20, 4, 100);
+        assert!(s.at_boundary(), "a fresh screen is at a clean boundary");
+
+        // Mid-escape: the parser consumed `ESC [` but not the final byte. `pending`
+        // is empty (all bytes were valid UTF-8), so `has_pending()` alone would miss
+        // this — only the parser state catches it.
+        s.feed(b"\x1b[");
+        assert!(!s.has_pending(), "the escape bytes are not a UTF-8 tail");
+        assert!(!s.at_boundary(), "mid CSI is not a boundary");
+        s.feed(b"31m");
+        assert!(s.at_boundary(), "the completed CSI returns to a boundary");
+
+        // Mid-UTF-8: a lead byte whose continuation hasn't arrived, buffered in
+        // `pending`. The parser is at ground, so `has_pending()` is what catches it.
+        s.feed(&[0xe2, 0x82]); // first two bytes of U+20AC €
+        assert!(
+            !s.at_boundary(),
+            "an incomplete UTF-8 tail is not a boundary"
+        );
+        s.feed(&[0xac]);
+        assert!(
+            s.at_boundary(),
+            "the completed codepoint returns to a boundary"
+        );
     }
 
     #[test]

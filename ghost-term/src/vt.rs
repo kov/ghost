@@ -54,6 +54,15 @@ impl Vt {
         self.terminal.size()
     }
 
+    /// Whether the escape-sequence parser is in its ground state — no CSI/OSC/DCS/
+    /// APC (or bare `ESC`) partially consumed. A byte stream can be safely handed to
+    /// a fresh parser only at ground: otherwise the sequence already half-read here
+    /// (its opening bytes gone) would be misread by the new parser as literal text.
+    /// Used by the host self-upgrade quiesce gate (with a no-pending-UTF-8 check).
+    pub fn parser_at_ground(&self) -> bool {
+        self.parser.state == parser::State::Ground
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) -> Changes<'_> {
         self.terminal.resize(cols, rows);
 
