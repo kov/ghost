@@ -23,7 +23,7 @@ use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetat
 use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A programmatic attach connection to a session host — the engine behind the
 /// terminal [`attach`] client and any GUI front-end.
@@ -640,20 +640,21 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     conn.send(&ClientMsg::Upgrade { path })?;
     // The host performs the upgrade at its next clean handoff boundary, then
     // re-execs — closing this control connection, whose fd does not cross the
-    // exec. Wait (bounded) for that EOF as confirmation the request was taken; a
-    // host whose child never quiesces holds the connection open, so time out and
-    // report delivery rather than hang forever.
-    conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // exec. Wait for that EOF as confirmation the request was taken. But the host
+    // may also REFUSE (a too-old target, a never-quiescing child) and hold the
+    // connection open indefinitely, so bound the wait with our own deadline:
+    // `Conn::recv` reports a read timeout as `Ok(Some(vec![]))` (not an error),
+    // so we must clock the deadline ourselves rather than wait on a recv error.
+    // Either way the request was delivered; the host's own result channel is a
+    // later refinement (there is none yet).
+    conn.set_read_timeout(Some(Duration::from_millis(250)))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match conn.recv::<ServerMsg>() {
-            Ok(None) => return Ok(()), // re-exec'd (or closed): request delivered
-            Ok(Some(_)) => {}          // drain any late output frames, keep waiting
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Ok(()); // delivered; the boundary is just slow to arrive
-            }
-            Err(e) => return Err(e),
+        // `None` is EOF — the host re-exec'd (or closed): the request was taken.
+        // `Some(_)` is an empty read-timeout batch (or late frames); keep waiting
+        // until our own deadline, since a refusal holds the connection open.
+        if conn.recv::<ServerMsg>()?.is_none() || Instant::now() >= deadline {
+            return Ok(()); // delivered (or the boundary is slow / it was refused)
         }
     }
 }

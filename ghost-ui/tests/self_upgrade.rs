@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ghost_vt::client::Session;
+use ghost_vt::client::{Session, Subscriber};
+use ghost_vt::protocol::SessionEvent;
 use ghost_vt::screen::Screen;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
@@ -82,6 +83,191 @@ fn wait_for_screen(session: &mut Session, screen: &mut Screen, needle: &str) -> 
         }
         screen.text().join("\n").contains(needle)
     })
+}
+
+/// Observe a session (read-only — never resizes its PTY) and return the grid it
+/// reports plus its display name, so a test can read the post-upgrade geometry
+/// and identity without an attach's resize perturbing them.
+fn observe_grid_and_name(xdg: &Path, name: &str) -> (Option<(u16, u16)>, String) {
+    let mut sub = Subscriber::observe_path(&sock(xdg, name)).expect("observe session");
+    let mut grid = None;
+    let mut display = String::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) && grid.is_none() {
+        let p = sub.pump().unwrap_or_default();
+        if let Some(state) = p.snapshot {
+            display = state.display_name;
+        }
+        for e in p.events {
+            if let SessionEvent::Resized { cols, rows } = e {
+                grid = Some((cols, rows));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    (grid, display)
+}
+
+/// An upgrade must keep the session the SAME session: the child's terminal
+/// geometry (the old code reverted it to the stale spawn-time `opts.size`) and
+/// the durable identity — the rename label, the creation time — must survive.
+#[test]
+fn a_self_upgrade_preserves_terminal_geometry_and_session_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    // Spawn at the default 80x24.
+    let out = ghost(xdg)
+        .args(["new", "geo", "-d", "--", "sh", "-c", "echo READY; exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop { xdg, name: "geo" };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("geo")),
+        "session not listed"
+    );
+
+    // Attach at a DIFFERENT size (resizing the PTY + host screen to 120x40), then
+    // detach — the child is now on a 120x40 terminal, not the spawn-time 80x24.
+    {
+        let mut s =
+            Session::attach_path(&sock(xdg, "geo"), "geo", 120, 40).expect("attach at 120x40");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(120, 40, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "READY"),
+            "child output never arrived; saw:\n{}",
+            screen.text().join("\n")
+        );
+    }
+    // Give it a durable label distinct from the id.
+    let out = ghost(xdg)
+        .args(["rename", "geo", "My Session"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost rename` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Upgrade in place.
+    let out = ghost(xdg).args(["__upgrade", "geo"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Observe (no resize): the new host reports the live 120x40 grid and keeps
+    // the rename label — not the spawn-time 80x24 / empty label a fresh-meta,
+    // stale-size adopt would show.
+    let (grid, name) = observe_grid_and_name(xdg, "geo");
+    assert_eq!(
+        grid,
+        Some((120, 40)),
+        "the terminal geometry reverted across the upgrade"
+    );
+    assert_eq!(
+        name, "My Session",
+        "the session's rename label was lost across the upgrade"
+    );
+}
+
+/// The pre-exec probe must REFUSE a target that can't speak our handoff format
+/// (here `/bin/true`, which has no `__handoff` subcommand) rather than exec into
+/// it — an exec into an incompatible binary would misdecode the handoff and kill
+/// the child. A refusal leaves the running host and its child untouched.
+#[test]
+fn a_self_upgrade_refuses_a_target_that_cannot_speak_the_handoff_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    let out = ghost(xdg)
+        .args([
+            "new",
+            "refuseup",
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD=$$; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "refuseup",
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("refuseup")),
+        "session not listed"
+    );
+
+    let child_pid;
+    {
+        let mut s = Session::attach_path(&sock(xdg, "refuseup"), "refuseup", 80, 24)
+            .expect("attach before refused upgrade");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "CHILD="),
+            "child pid never printed; saw:\n{}",
+            screen.text().join("\n")
+        );
+        let text = screen.text().join("\n");
+        child_pid = text
+            .split("CHILD=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("CHILD=<pid> on screen")
+            .to_string();
+    }
+    let before_host = host_pid(xdg, "refuseup").expect("host pid before refused upgrade");
+
+    // `/bin/true` exits 0 with no output, so the handoff-version probe finds
+    // nothing to parse and the host refuses. (Delivery still succeeds — the
+    // request reached the host, which declined it internally.)
+    let out = ghost(xdg)
+        .args(["__upgrade", "refuseup", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` delivery failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The host never exec'd: same pid, child still alive, still interactive.
+    assert_eq!(
+        host_pid(xdg, "refuseup").as_deref(),
+        Some(before_host.as_str()),
+        "host pid changed — a refused upgrade must not exec"
+    );
+    assert!(
+        alive(&child_pid),
+        "the child (pid {child_pid}) died — a refused upgrade must leave it running"
+    );
+    let mut s = Session::attach_path(&sock(xdg, "refuseup"), "refuseup", 80, 24)
+        .expect("attach after refused upgrade");
+    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    s.send_input(b"STILL-ALIVE\n").unwrap();
+    let mut screen = Screen::new(80, 24, 100);
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "STILL-ALIVE"),
+        "the child stopped echoing after a refused upgrade; saw:\n{}",
+        screen.text().join("\n")
+    );
 }
 
 #[test]

@@ -195,11 +195,19 @@ enum Command {
     Upgrade {
         /// Immutable id of the session to upgrade.
         name: String,
-        /// Target binary to re-exec onto; omitted means the host's own current
-        /// executable (upgrade to self — proves the mechanism, or re-execs an
-        /// on-disk-replaced binary at the same path).
+        /// Target binary to re-exec onto. Omitted means the host's own current
+        /// executable — upgrade to *self*, which just proves the mechanism: a
+        /// rebuild replaces the binary by rename, so `current_exe` then resolves
+        /// to the unlinked old inode ("(deleted)") and the exec fails cleanly.
+        /// To pick up a newer/staged binary, pass its path explicitly.
         path: Option<String>,
     },
+    /// Print this binary's exec-handoff format version and exit. A host about to
+    /// self-upgrade runs `<target> __handoff` to check the target speaks its
+    /// handoff format before exec'ing onto it (a mismatch or a target too old to
+    /// answer is refused). An internal plumbing command; not for direct use.
+    #[command(name = "__handoff", hide = true)]
+    Handoff,
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -472,6 +480,7 @@ fn dispatch(command: Command) {
                 fail(&e.to_string());
             }
         }
+        Command::Handoff => println!("{}", ghost_vt::server::HANDOFF_VERSION),
     }
 }
 

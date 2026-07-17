@@ -111,6 +111,11 @@ const OBSERVER_MAX_PENDING: usize = 256 * 1024;
 /// and recognized by [`run_host_if_invoked`].
 const HOST_ARG: &str = "__host";
 
+/// The hidden subcommand a self-upgrade runs on its target to read that binary's
+/// [`HANDOFF_VERSION`] before exec'ing onto it (see [`probe_handoff_version`]).
+/// Kept in sync with the `__handoff` clap subcommand in `ghost-cli`.
+pub const HANDOFF_ARG: &str = "__handoff";
+
 /// A single attached client connection: the framed [`Conn`] plus a little
 /// attach state.
 struct Client {
@@ -172,9 +177,26 @@ impl Client {
     }
 }
 
+/// The exec-handoff blob format version — the wire between an old host and the
+/// new binary it re-execs onto (the `HostArgs` layout below). SEPARATE from
+/// [`crate::protocol::PROTO_LEVEL`], which versions the *client* protocol: this
+/// versions the argv blob, and the two move independently. Postcard is
+/// positional and NON-self-describing — it silently ignores trailing bytes and
+/// misreads a changed layout — so a mismatched blob cannot be safely decoded.
+/// The decode happens AFTER the `execv`, where a failure is unrecoverable
+/// (the old image is gone), so a self-upgrade must **probe the target's version
+/// before the exec** and refuse on mismatch (see [`self_upgrade`]). BUMP this on
+/// any change to `HostArgs`/`Adopt`/`SpawnOpts` layout.
+pub const HANDOFF_VERSION: u32 = 1;
+
 /// The host's startup state, serialized onto argv across the re-exec.
 #[derive(Serialize, Deserialize)]
 struct HostArgs {
+    /// The blob format version ([`HANDOFF_VERSION`]) — FIRST field so it decodes
+    /// unambiguously before any layout-sensitive field. A decode that finds an
+    /// unexpected value here is a version skew a self-upgrade's pre-exec probe
+    /// should already have refused; the check in [`run_host`] is a backstop.
+    handoff_version: u32,
     opts: SpawnOpts,
     /// The directory the session was launched from, applied to the child (like
     /// dtach) since the daemon itself `chdir`s to `/`.
@@ -183,7 +205,6 @@ struct HostArgs {
     /// `docs/host-self-upgrade.md`): the new host adopts an already-running
     /// child on its existing PTY instead of opening a PTY and spawning. `None`
     /// for an ordinary spawn.
-    #[serde(default)]
     adopt: Option<Adopt>,
 }
 
@@ -270,6 +291,7 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     let lock_fd = lock.as_raw_fd();
 
     let host_args = HostArgs {
+        handoff_version: HANDOFF_VERSION,
         launch_dir: std::env::current_dir().ok(),
         opts,
         adopt: None,
@@ -326,6 +348,14 @@ fn run_host(
     let Some((listener_fd, lock_fd, host_args)) = parsed else {
         return 127; // malformed __host handoff — an internal bug
     };
+    // Backstop: a blob whose format version isn't ours cannot be trusted (its
+    // layout may differ from what we decoded above). A self-upgrade's pre-exec
+    // probe should already have refused this skew; reaching it here means the
+    // probe was bypassed or wrong, and there is no recovery post-`execv`, so bail
+    // rather than adopt a possibly-misdecoded child/fd handoff.
+    if host_args.handoff_version != HANDOFF_VERSION {
+        return 127;
+    }
     // Hold the inherited liveness lock for our whole life. The parent took the
     // flock before forking and it survived the exec; keeping this fd open keeps
     // the lock held, and the kernel frees it when we exit or crash — which is how
@@ -335,6 +365,7 @@ fn run_host(
     // SAFETY: the listening socket the parent bound and passed with CLOEXEC cleared.
     let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
     let HostArgs {
+        handoff_version: _, // already checked against HANDOFF_VERSION above
         opts,
         launch_dir,
         adopt,
@@ -428,6 +459,28 @@ fn unblock_upgrade_signals() {
     unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
 }
 
+/// Ask the target binary which exec-handoff format it speaks, by running its
+/// `ghost __handoff` subcommand and parsing the [`HANDOFF_VERSION`] it prints.
+/// A binary predating the mechanism has no such subcommand, so this errors —
+/// which the caller treats as "refuse the upgrade". Cheap and reversible (a
+/// short-lived child that only prints a number), so it is safe to run before any
+/// of the exec's irreversible-looking steps.
+fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
+    let out = std::process::Command::new(exe)
+        .arg(HANDOFF_ARG)
+        .output()
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot probe upgrade target: {e}")))?;
+    if !out.status.success() {
+        return Err(io::Error::other(
+            "upgrade target did not answer the handoff-version probe (too old?)",
+        ));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("upgrade target returned an unparseable handoff version"))
+}
+
 /// Re-exec THIS process in place — same pid, no fork — onto the host at `exe`,
 /// adopting the running `child_pid` on the carried PTY master. Only the code
 /// image is replaced; the listener, the liveness lock, the PTY, and the child
@@ -455,6 +508,24 @@ fn self_upgrade(
     let exe_c = CString::new(exe.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
 
+    // PROBE BEFORE THE EXEC. The blob we are about to hand the target is in OUR
+    // format ([`HANDOFF_VERSION`]); a target speaking a different version would
+    // misdecode it (postcard is positional and ignores trailing bytes, so the
+    // miss can be SILENT — a wrong-layout adopt that spawns a duplicate child and
+    // orphans the real one). The decode is post-`execv`, where failure is
+    // unrecoverable, so we must catch the skew here, while a refusal simply
+    // leaves the host running. A target that predates the mechanism has no
+    // `__handoff` subcommand, so the probe errors and we refuse — never exec into
+    // it. (Fuller target validation — regular file, our UID, `proto >=` ours — is
+    // Step 5; this is its skeleton.)
+    let target_version = probe_handoff_version(&exe)?;
+    if target_version != HANDOFF_VERSION {
+        return Err(io::Error::other(format!(
+            "refusing to upgrade: target speaks handoff version {target_version}, we speak \
+             {HANDOFF_VERSION} — restart the session instead"
+        )));
+    }
+
     // Keep the listener, the lock, and the PTY master open across the exec.
     clear_cloexec(listener)?;
     clear_cloexec_raw(lock_fd)?;
@@ -462,6 +533,7 @@ fn self_upgrade(
     clear_cloexec_raw(master_fd)?;
 
     let host_args = HostArgs {
+        handoff_version: HANDOFF_VERSION,
         opts: opts.clone(),
         launch_dir: launch_dir.map(Into::into),
         adopt: Some(Adopt {
@@ -561,25 +633,43 @@ fn host_main(
     // the self-pipe here instead of killing us. Idempotent for an ordinary spawn,
     // whose mask is already empty. See `docs/host-self-upgrade.md`.
     unblock_upgrade_signals();
+    // A self-upgrade must republish the protocol level: `spawn` wrote the OLD
+    // host's level before binding the socket, and the exec path never revisits
+    // `spawn`, so without this the marker would keep naming the predecessor's
+    // level and every `session_proto` gate would stay shut — the upgrade would
+    // adopt no new protocol at all. Only on the adopt path: a fresh spawn already
+    // wrote it atomically (before the socket bound), and rewriting it here would
+    // race anything that reads or overwrites the marker between spawn and now.
+    if adopt.is_some() {
+        let _ = std::fs::write(
+            paths::proto_path(current_name),
+            crate::protocol::PROTO_LEVEL.to_string(),
+        );
+    }
     std::fs::write(
         paths::pid_path(current_name),
         std::process::id().to_string(),
     )?;
     listener.set_nonblocking(true)?;
 
-    let (cols, rows) = opts.size;
-    // PTY and child. An ordinary spawn opens a fresh PTY and (eagerly or on the
-    // first attach) spawns the child itself. A self-upgrade instead ADOPTS the
-    // running child on its existing PTY master, carried across the `execv`: no
-    // new PTY, no spawn — the same terminal, the same live process. Non-blocking
-    // master either way: writes into the child are queued and drained under
-    // POLLOUT (see `pty_out`), never with a blocking `write_all`, which would
-    // wedge this single-threaded loop the moment the child stopped reading.
+    // PTY, child, and the grid to build state at. An ordinary spawn opens a fresh
+    // PTY, sizes it to `opts.size`, and (eagerly or on the first attach) spawns
+    // the child itself. A self-upgrade instead ADOPTS the running child on its
+    // existing PTY master, carried across the `execv`: no new PTY, no spawn — the
+    // same terminal, the same live process. Its grid is whatever the child is
+    // *currently* on (read from the carried master, whose kernel winsize survives
+    // the exec), NOT the stale spawn-time `opts.size`: resizing it back would fire
+    // a spurious SIGWINCH and corrupt a full-screen TUI. Non-blocking master
+    // either way: writes into the child are queued and drained under POLLOUT (see
+    // `pty_out`), never with a blocking `write_all`, which would wedge this
+    // single-threaded loop the moment the child stopped reading.
     #[allow(clippy::type_complexity)] // a one-off setup tuple, named right below
-    let (pty, mut pts, mut child): (
+    let (pty, mut pts, mut child, cols, rows): (
         pty_process::blocking::Pty,
         Option<pty_process::blocking::Pts>,
         Option<crate::child::Child>,
+        u16,
+        u16,
     ) = match &adopt {
         Some(a) => {
             // SAFETY: the master fd our predecessor handed us with CLOEXEC
@@ -588,16 +678,24 @@ fn host_main(
                 pty_process::blocking::Pty::from_fd(OwnedFd::from_raw_fd(a.pty_master_fd))
             };
             set_pty_nonblocking(&pty)?;
-            (pty, None, Some(crate::child::Child::from_pid(a.child_pid)))
+            let ws = rustix::termios::tcgetwinsize(pty.as_fd()).map_err(io::Error::from)?;
+            (
+                pty,
+                None,
+                Some(crate::child::Child::from_pid(a.child_pid)),
+                ws.ws_col,
+                ws.ws_row,
+            )
         }
         None => {
             let (pty, pts) = open().map_err(io::Error::other)?;
             set_pty_nonblocking(&pty)?;
-            (pty, Some(pts), None)
+            let (cols, rows) = opts.size;
+            pty.resize(Size::new(rows, cols))
+                .map_err(io::Error::other)?;
+            (pty, Some(pts), None, cols, rows)
         }
     };
-    pty.resize(Size::new(rows, cols))
-        .map_err(io::Error::other)?;
 
     // The child argv, resolved once: a connection spec derives the launcher
     // (`ssh …`), otherwise the literal command. Rejects a spec + command clash
@@ -618,20 +716,32 @@ fn host_main(
         .map(|d| d.policy)
         .or_else(|| crate::meta::read(&paths::meta_path(current_name)).map(|m| m.policy))
         .unwrap_or_default();
-    let mut meta = crate::meta::Meta {
-        // Milliseconds, not seconds: this is the fleet's spatial sort key, so
-        // sub-second resolution keeps sessions spawned in the same second in their
-        // true creation order rather than tie-breaking by name.
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
-        command: opts.command.clone(),
-        title: String::new(),
-        display_name: String::new(),
-        size: opts.size,
-        connection: opts.connection.clone(),
-        policy: inherited_policy,
+    // A self-upgrade keeps the SAME session — its identity must survive the swap.
+    // Reuse the running host's on-disk `meta` (creation time — the fleet's sort
+    // key — display-name label, title, size) rather than minting a fresh one that
+    // would reorder the session in the fleet and drop its rename. A fresh spawn
+    // (or the rare missing-meta case) builds one from scratch.
+    let mut meta = match adopt
+        .is_some()
+        .then(|| crate::meta::read(&paths::meta_path(current_name)))
+        .flatten()
+    {
+        Some(existing) => existing,
+        None => crate::meta::Meta {
+            // Milliseconds, not seconds: this is the fleet's spatial sort key, so
+            // sub-second resolution keeps sessions spawned in the same second in
+            // their true creation order rather than tie-breaking by name.
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            command: opts.command.clone(),
+            title: String::new(),
+            display_name: String::new(),
+            size: opts.size,
+            connection: opts.connection.clone(),
+            policy: inherited_policy,
+        },
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
 
@@ -1260,6 +1370,7 @@ fn host_main(
         // structural failure can't spin re-exec every turn) and run on as a
         // fully-working host. See `docs/host-self-upgrade.md`.
         if pending_upgrade.is_some()
+            && pty_out.is_empty()
             && screen.at_boundary()
             && let Some(pid) = child.as_ref().map(|c| c.id())
         {
