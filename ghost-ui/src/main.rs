@@ -5879,6 +5879,200 @@ mod tests {
         });
     }
 
+    /// Guard for the shared-state killer: A drives X, B previews it in its fleet
+    /// (sharing A's one emulator). The host echoes a `Resized` to every subscriber
+    /// whenever the display client resizes — so B, which merely previews an
+    /// in-process-driven session, receives one. The per-window fleet arm used to
+    /// rebuild the shared state on that echo, blanking the session A drives with no
+    /// resync coming. It must not any more: only the shell rebuilds, and only for a
+    /// genuine observer stream.
+    #[test]
+    fn an_echoed_resize_does_not_blank_a_session_a_second_window_drives() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "share-resize";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'SHARED-MARKER\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let ga = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, ga, None)
+                .expect("window A attaches");
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            let sees = |app: &App| {
+                app.states
+                    .text_of(name)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
+            };
+            let mut spun = 0;
+            while !sees(&app) && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let precondition = sees(&app);
+
+            // The host's Resized echo lands on B (the app-wide subscription fan). Its
+            // fleet believes it observes X (it emitted an Observe the shell deduped),
+            // so pre-fix this rebuilt and blanked the shared emulator.
+            app.dispatch(
+                b,
+                ghost_ui_core::UiEvent::SessionPush {
+                    name: name.to_string(),
+                    push: ghost_ui_core::SessionPush::Event(
+                        ghost_vt::protocol::SessionEvent::Resized { cols: 30, rows: 10 },
+                    ),
+                },
+                &fe,
+            );
+            app.wake(&fe);
+            let survived = sees(&app);
+            let observers_len = app.observers.len();
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(
+                precondition,
+                "precondition: the shared state holds the marker"
+            );
+            assert!(
+                survived,
+                "B's echoed Resized must not blank the session A drives"
+            );
+            assert_eq!(
+                observers_len, 0,
+                "still one shared source, no second mirror"
+            );
+        });
+    }
+
+    /// Guard for the driver-close handoff: A drives X, B previews it sharing A's one
+    /// emulator (no mirror). When A closes, X keeps running under its host and B still
+    /// previews it — so the shared state must NOT be deleted (last-viewer prune only
+    /// drops what nothing views), A's now-orphaned client is dropped, and because B
+    /// previews a now-driverless local session the shell downgrades the source to a
+    /// read-only observer so the preview keeps updating.
+    #[test]
+    fn closing_the_driver_keeps_a_previewed_session_and_downgrades_to_an_observer() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "share-close";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'SHARED-MARKER\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let ga = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, ga, None)
+                .expect("window A attaches");
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            let sees = |app: &App| {
+                app.states
+                    .text_of(name)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
+            };
+            let mut spun = 0;
+            while !sees(&app) && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(
+                sees(&app),
+                "precondition: the shared state holds the marker"
+            );
+            assert_eq!(app.observers.len(), 0, "precondition: no second mirror");
+            assert!(app.sessions.contains_key(name), "precondition: A drives it");
+
+            // A closes. B still previews X in its fleet.
+            app.close_window(a);
+
+            let survived = sees(&app);
+            let dropped_client = !app.sessions.contains_key(name);
+            let downgraded = app.observers.contains_key(name);
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(
+                survived,
+                "closing the driver must not delete a session another window previews"
+            );
+            assert!(
+                dropped_client,
+                "the driver's now-orphaned client is dropped (close = detach)"
+            );
+            assert!(
+                downgraded,
+                "the previewed driverless session is downgraded to a read-only observer"
+            );
+        });
+    }
+
     #[test]
     fn a_driven_remote_session_stays_indexed_across_another_hosts_rebuild() {
         // `rebuild_remote_index` rebuilds from the watcher's listings. A freshly
