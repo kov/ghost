@@ -906,6 +906,16 @@ impl RootModel {
         matches!(&self.mode, Mode::Fleet(f) if f.has_tile(name))
     }
 
+    /// The text of a fleet tile's cached preview frame — what the overview renders
+    /// for `name`, as opposed to the live emulator screen. For assertions on whether
+    /// a preview is seeded. `None` unless this window is in fleet mode with that tile.
+    pub fn tile_frame_text(&self, name: &str) -> Option<Vec<String>> {
+        match &self.mode {
+            Mode::Fleet(f) => f.tile_frame_text(name),
+            _ => None,
+        }
+    }
+
     /// Whether `name` is this window's Single-view *foreground* (not merely warm or a
     /// fleet tile). The shell prefers a foregrounding window when it must pick the one
     /// driver of a session two windows transiently claim during a take-over steal, so

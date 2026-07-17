@@ -880,6 +880,22 @@ impl FleetModel {
             .map(|s| s.screen().text())
     }
 
+    /// The text of a tile's *cached preview frame* — what the fleet actually
+    /// renders, as opposed to [`Self::tile_text`] which reads the live emulator
+    /// screen. They diverge exactly when the frame is stale or unbuilt (a blank
+    /// preview over a live session), so this is the observable for the
+    /// idle-preview seed. `None` when the tile is absent or its frame is unbuilt.
+    pub fn tile_frame_text(&self, id: &str) -> Option<Vec<String>> {
+        let frame = self.tiles.iter().find(|t| t.id == id)?.frame.as_ref()?;
+        Some(
+            frame
+                .rows_layout
+                .iter()
+                .map(|row| row.runs.iter().map(|r| r.text.as_str()).collect())
+                .collect(),
+        )
+    }
+
     pub fn locality_of(&self, id: &str) -> Option<Locality> {
         self.tiles.iter().find(|t| t.id == id).map(|t| t.locality)
     }

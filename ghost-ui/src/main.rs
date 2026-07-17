@@ -6096,6 +6096,103 @@ mod tests {
         });
     }
 
+    /// The idle-preview seed (5c item 1): window A drives session X, which then goes
+    /// IDLE holding content. LONG AFTER X's last output, window B opens its fleet and
+    /// previews X. Under the shared registry B's tile borrows A's one live emulator,
+    /// and the reconcile's frame refresh builds the tile's *preview frame* straight
+    /// from that live state — so the overview shows X's content immediately, with NO
+    /// further output byte. (A blank-until-next-byte preview was the fear under the old
+    /// per-window states, where B's own mirror started empty and only filled on a feed.)
+    /// The assertion reads the tile's cached preview FRAME, not the shared screen, and
+    /// takes no `wake` after B's `SessionList` — so the content can only have come from
+    /// the reconcile seeding off the shared state, never from a feed.
+    #[test]
+    fn a_fleet_opened_over_an_idle_shared_session_previews_it_without_new_output() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "idle-seed";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'IDLE-MARKER\\n'; exec cat",
+                ])
+                .status()
+                .expect("spawn `ghost new -d`")
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(listed(), "the session came up");
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+
+            // Window A drives X and pumps until the marker lands; then X is idle (cat).
+            let ga = app.mint_group();
+            let _a = app
+                .open_single_window(&fe, name, ga, None)
+                .expect("window A attaches");
+            let a_has_marker = |app: &App| {
+                app.states
+                    .text_of(name)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains("IDLE-MARKER")))
+            };
+            let mut spun = 0;
+            while !a_has_marker(&app) && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            assert!(
+                a_has_marker(&app),
+                "precondition: A's shared state holds the idle marker"
+            );
+
+            // B opens its fleet AFTER the fact. `open_fleet_window` runs the initial
+            // `ListSessions` → reconcile → frame refresh synchronously before it returns,
+            // so the preview is built on the open with NO further event and NO wake — the
+            // strongest statement of the seed: the content can only have come from the
+            // reconcile reading the shared state, never from a feed.
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+
+            let preview = app.windows[&b].root.tile_frame_text(name);
+            let observers_len = app.observers.len();
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            // A missing frame (`None`) is the real regression — it must panic as
+            // "unbuilt", never read as "marker absent".
+            let preview =
+                preview.expect("B's fleet built a preview frame for the shared idle session");
+            assert!(
+                preview.iter().any(|l| l.contains("IDLE-MARKER")),
+                "B's fleet preview shows the idle session's content immediately: {preview:?}"
+            );
+            assert_eq!(
+                observers_len, 0,
+                "B previews A's same-process session with NO second mirror"
+            );
+        });
+    }
+
     #[test]
     fn a_driven_remote_session_stays_indexed_across_another_hosts_rebuild() {
         // `rebuild_remote_index` rebuilds from the watcher's listings. A freshly
