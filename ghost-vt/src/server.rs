@@ -17,7 +17,7 @@ use crate::transport::Conn;
 use nix::sys::signal::Signal;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, open};
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -25,7 +25,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Options for starting a session.
 #[derive(Clone, Serialize, Deserialize)]
@@ -181,6 +181,23 @@ impl Client {
     /// Write as much of the pending output as the socket will accept.
     fn flush(&mut self) -> io::Result<()> {
         self.conn.flush()
+    }
+}
+
+/// Queue a [`ServerMsg::UpgradeResult`] refusal to every connection still
+/// awaiting an upgrade verdict, and clear its flag. The requester is a control
+/// connection in `pending` (or, if an attached terminal asked, the display
+/// `client`); either way it is flushed on a following turn. Used for both a
+/// refusal at the boundary and a give-up when no boundary arrives.
+fn notify_upgrade_refused(pending: &mut [Client], client: &mut Option<Client>, message: &str) {
+    for c in pending.iter_mut().chain(client.as_mut()) {
+        if c.awaiting_upgrade {
+            c.queue(&ServerMsg::UpgradeResult {
+                ok: false,
+                message: message.to_string(),
+            });
+            c.awaiting_upgrade = false;
+        }
     }
 }
 
@@ -480,6 +497,22 @@ fn unblock_upgrade_signals() {
 /// wrapper script) must not hang it forever — [`wait_bounded`] kills it at the
 /// deadline.
 const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the host waits for the terminal to reach a clean handoff boundary
+/// after an upgrade is requested before giving up. A child that never quiesces
+/// (continuous output, or a program that leaves the parser stuck mid-escape and
+/// idles) would otherwise hold the request — and the requester waiting on it —
+/// indefinitely. Kept below `upgrade_session`'s client-side deadline so the
+/// give-up refusal reaches the caller before it stops listening.
+const UPGRADE_BOUNDARY_WINDOW: Duration = Duration::from_secs(5);
+
+/// A pending in-place self-upgrade: the target `path` (`None` = our own current
+/// exe) and the `deadline` past which the host abandons it if no clean handoff
+/// boundary has arrived.
+struct PendingUpgrade {
+    path: Option<String>,
+    deadline: Instant,
+}
 
 /// What the target reports about itself via `ghost __handoff`: the exec-handoff
 /// blob format it speaks ([`HANDOFF_VERSION`]) and the client protocol level it
@@ -1048,11 +1081,10 @@ fn host_main(
     // queries answer with it. Ghost's default scheme until someone attaches.
     let mut last_theme = crate::query::ThemeColors::default();
     // A requested in-place self-upgrade (`ClientMsg::Upgrade`), held until the
-    // screen reaches a clean handoff boundary and the child exists to adopt.
-    // `Some(path)` = pending, where `path` names the target binary (or `None`
-    // for our own current exe). See the boundary trigger at the loop's tail and
-    // `docs/host-self-upgrade.md`.
-    let mut pending_upgrade: Option<Option<String>> = None;
+    // screen reaches a clean handoff boundary and the child exists to adopt, or
+    // until its deadline lapses (a child that never quiesces). See the boundary
+    // trigger at the loop's tail and `docs/host-self-upgrade.md`.
+    let mut pending_upgrade: Option<PendingUpgrade> = None;
 
     loop {
         // Build the poll set: fixed fds first, then the display client (if any),
@@ -1092,7 +1124,18 @@ fn host_main(
             }
             fds.push(PollFd::from_borrowed_fd(s.conn.as_fd(), flags));
         }
-        match poll(&mut fds, None) {
+        // Normally block until an fd is ready. But a pending upgrade is decided
+        // by wall clock (its boundary window can lapse with the child idle and no
+        // fd ever waking us), so while one is pending, cap the wait at the time
+        // left until its deadline — the loop tail re-checks it every wake.
+        let poll_timeout: Option<Timespec> = pending_upgrade.as_ref().map(|p| {
+            let left = p.deadline.saturating_duration_since(Instant::now());
+            Timespec {
+                tv_sec: left.as_secs() as i64,
+                tv_nsec: left.subsec_nanos() as i64,
+            }
+        });
+        match poll(&mut fds, poll_timeout.as_ref()) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
@@ -1548,7 +1591,7 @@ fn host_main(
             && screen.at_boundary()
             && let Some(pid) = child.as_ref().map(|c| c.id())
         {
-            let path = pending_upgrade.take().flatten();
+            let path = pending_upgrade.take().and_then(|p| p.path);
             // Flush the recorder's buffered frame to disk BEFORE the exec so the
             // successor appends after COMPLETE data (it reopens the file to
             // continue it). If the flush fails (a full or erroring disk), the tail
@@ -1580,20 +1623,27 @@ fn host_main(
                 .map_err(|e| e.to_string())
             });
             // Report a refusal to whoever asked so `ghost __upgrade` fails loudly
-            // instead of waiting out its own deadline on a silent hold. The
-            // requester is a control connection in `pending` (or, if an attached
-            // terminal asked, the display `client`); flushed to it next turn.
+            // instead of waiting out its own deadline on a silent hold.
             if let Err(message) = outcome {
-                for c in pending.iter_mut().chain(client.as_mut()) {
-                    if c.awaiting_upgrade {
-                        c.queue(&ServerMsg::UpgradeResult {
-                            ok: false,
-                            message: message.clone(),
-                        });
-                        c.awaiting_upgrade = false;
-                    }
-                }
+                notify_upgrade_refused(&mut pending, &mut client, &message);
             }
+        }
+
+        // Bounded patience: if the request never reached a boundary within its
+        // window (a child producing continuous output, or one that left the
+        // parser stuck mid-escape and idled), abandon it and report why, rather
+        // than hold the request — and the requester — indefinitely.
+        if pending_upgrade
+            .as_ref()
+            .is_some_and(|p| Instant::now() >= p.deadline)
+        {
+            pending_upgrade = None;
+            notify_upgrade_refused(
+                &mut pending,
+                &mut client,
+                "the session never reached a clean upgrade boundary in time \
+                 (a program producing continuous output, or stuck mid-escape?)",
+            );
         }
 
         // Reconcile the attach marker with the display client's presence. All the
@@ -1771,7 +1821,7 @@ fn service_display_client(
     last_theme: &mut crate::query::ThemeColors,
     attached_info: &Option<crate::protocol::AttachInfo>,
     bell_marked: bool,
-    pending_upgrade: &mut Option<Option<String>>,
+    pending_upgrade: &mut Option<PendingUpgrade>,
 ) -> io::Result<Disposition> {
     let Some(c) = client.as_mut() else {
         return Ok(Disposition::Keep);
@@ -1817,7 +1867,7 @@ fn handle_client_messages(
     last_theme: &mut crate::query::ThemeColors,
     attached_info: &Option<crate::protocol::AttachInfo>,
     bell_marked: bool,
-    pending_upgrade: &mut Option<Option<String>>,
+    pending_upgrade: &mut Option<PendingUpgrade>,
 ) -> io::Result<Disposition> {
     for msg in msgs {
         match msg {
@@ -1935,7 +1985,10 @@ fn handle_client_messages(
             // screen is at a clean handoff boundary and a child exists to adopt.
             // The last request wins if several arrive before a boundary.
             ClientMsg::Upgrade { path } if !c.subscribed && !c.observing => {
-                *pending_upgrade = Some(path);
+                *pending_upgrade = Some(PendingUpgrade {
+                    path,
+                    deadline: Instant::now() + UPGRADE_BOUNDARY_WINDOW,
+                });
                 // Remember to answer THIS connection: on a refusal the loop tail
                 // queues a `UpgradeResult` to every awaiting client (success
                 // never returns to answer).

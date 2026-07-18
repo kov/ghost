@@ -483,6 +483,96 @@ fn a_self_upgrade_refuses_a_target_that_hangs_on_the_probe() {
     );
 }
 
+/// A child that never returns the parser to a clean boundary (here it emits an
+/// unterminated CSI, then idles as `cat`) would leave a requested upgrade
+/// pending forever — and the requester blocked on it. The host gives the
+/// boundary a bounded window and then ABANDONS the request, reporting why, so
+/// `ghost __upgrade` fails instead of hanging. The child is left running.
+#[test]
+fn a_self_upgrade_gives_up_when_no_boundary_arrives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    // `printf %s <ESC>[38;2` writes an incomplete CSI (ESC [ 3 8 ; 2), leaving
+    // the host's parser mid-sequence; `cat` then idles, so it never returns to
+    // Ground and no clean boundary ever arrives. The ESC is a real 0x1B byte in
+    // the command string (portable — no reliance on the shell's octal escapes).
+    let out = ghost(xdg)
+        .args([
+            "new",
+            "noboundary",
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD=$$; printf %s '\x1b[38;2'; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "noboundary",
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("noboundary")),
+        "session not listed"
+    );
+
+    let child_pid;
+    {
+        let mut s = Session::attach_path(&sock(xdg, "noboundary"), "noboundary", 80, 24)
+            .expect("attach before give-up upgrade");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        // The CHILD= line rendered before the incomplete CSI, so it is readable.
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "CHILD="),
+            "child pid never printed; saw:\n{}",
+            screen.text().join("\n")
+        );
+        let text = screen.text().join("\n");
+        child_pid = text
+            .split("CHILD=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("CHILD=<pid> on screen")
+            .to_string();
+    }
+    let before_host = host_pid(xdg, "noboundary").expect("host pid before give-up upgrade");
+
+    // A valid target (our own binary) — the refusal is purely that no boundary
+    // arrives. `ghost __upgrade` must return non-zero naming the give-up.
+    let out = ghost(xdg)
+        .args(["__upgrade", "noboundary"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "`ghost __upgrade` should have reported the give-up, but it succeeded"
+    );
+    assert!(
+        stderr.contains("boundary"),
+        "give-up message did not mention the boundary; saw:\n{stderr}"
+    );
+
+    // The host never exec'd and the child is still alive.
+    assert_eq!(
+        host_pid(xdg, "noboundary").as_deref(),
+        Some(before_host.as_str()),
+        "host pid changed — a give-up must not exec"
+    );
+    assert!(
+        alive(&child_pid),
+        "the child (pid {child_pid}) died — a give-up must leave it running"
+    );
+}
+
 #[test]
 fn a_self_upgrade_replaces_the_host_in_place_and_keeps_its_child_alive() {
     let tmp = tempfile::tempdir().unwrap();

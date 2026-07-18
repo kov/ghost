@@ -649,10 +649,11 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     // now serves. A refusal instead comes back as `ServerMsg::UpgradeResult`
     // (the host holds the connection open to answer). `Conn::recv` reports a read
     // timeout as `Ok(Some(vec![]))` (not an error), so we clock our own deadline:
-    // set it past the host's probe timeout so even a slow refusal (a target that
-    // hangs the probe) is reported rather than timed out as a silent "delivered".
+    // set it past both host-side deadlines — the probe timeout AND the
+    // never-reaches-a-boundary give-up window — so even a slow refusal is
+    // reported rather than timed out here as a silent "delivered".
     conn.set_read_timeout(Some(Duration::from_millis(250)))?;
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match conn.recv::<ServerMsg>()? {
             // EOF: the host re-exec'd (or the connection closed) — the upgrade
