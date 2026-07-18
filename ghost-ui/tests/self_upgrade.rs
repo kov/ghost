@@ -109,11 +109,13 @@ fn observe_grid_and_name(xdg: &Path, name: &str) -> (Option<(u16, u16)>, String)
 }
 
 /// Spawn a `cat` session, point `__upgrade` at `target`, and assert the host
-/// REFUSED it: the host kept its pid (no exec), the child is still alive, and
-/// the host is responsive again (it echoes fresh input). Used by the
+/// REFUSED it: `ghost __upgrade` exits non-zero with a message containing
+/// `expect` (the host's result channel surfaced the reason, not a silent
+/// timeout), the host kept its pid (no exec), the child is still alive, and the
+/// host is responsive again (it echoes fresh input). Used by the
 /// target-validation refusal tests, which each hand a differently-untrustworthy
-/// target and expect the same "declined, still serving" outcome.
-fn assert_target_refused(name: &str, target: &Path) {
+/// target and expect the same "declined, still serving, reported why" outcome.
+fn assert_target_refused(name: &str, target: &Path, expect: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
 
@@ -165,10 +167,14 @@ fn assert_target_refused(name: &str, target: &Path) {
         .args(["__upgrade", name, target.to_str().unwrap()])
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success(),
-        "`ghost __upgrade` delivery failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "`ghost __upgrade` should have reported the refusal, but it succeeded"
+    );
+    assert!(
+        stderr.contains(expect),
+        "refusal message did not mention {expect:?}; saw:\n{stderr}"
     );
 
     assert_eq!(
@@ -213,7 +219,7 @@ fn a_self_upgrade_refuses_a_world_writable_target() {
     // Reports a valid handoff+proto (so only the mode can disqualify it), but is
     // writable by everyone.
     let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 6\n", 0o777);
-    assert_target_refused("wwup", &target);
+    assert_target_refused("wwup", &target, "writable by group or other");
 }
 
 /// A self-upgrade must not silently DOWNGRADE the session: a target that speaks
@@ -224,7 +230,7 @@ fn a_self_upgrade_refuses_a_world_writable_target() {
 fn a_self_upgrade_refuses_a_protocol_downgrade() {
     let tmp = tempfile::tempdir().unwrap();
     let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 5\n", 0o755);
-    assert_target_refused("downup", &target);
+    assert_target_refused("downup", &target, "downgrade");
 }
 
 /// An upgrade must keep the session the SAME session: the child's terminal
@@ -301,92 +307,11 @@ fn a_self_upgrade_preserves_terminal_geometry_and_session_identity() {
 /// The pre-exec probe must REFUSE a target that can't speak our handoff format
 /// (here `/bin/true`, which has no `__handoff` subcommand) rather than exec into
 /// it — an exec into an incompatible binary would misdecode the handoff and kill
-/// the child. A refusal leaves the running host and its child untouched.
+/// the child. A refusal leaves the running host and its child untouched, and the
+/// host reports why (`/bin/true` answers the probe with no version to parse).
 #[test]
 fn a_self_upgrade_refuses_a_target_that_cannot_speak_the_handoff_format() {
-    let tmp = tempfile::tempdir().unwrap();
-    let xdg = tmp.path();
-
-    let out = ghost(xdg)
-        .args([
-            "new",
-            "refuseup",
-            "-d",
-            "--",
-            "sh",
-            "-c",
-            "echo CHILD=$$; exec cat",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "`ghost new` failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _guard = KillOnDrop {
-        xdg,
-        name: "refuseup",
-    };
-    assert!(
-        wait_until(Duration::from_secs(5), || ls(xdg).contains("refuseup")),
-        "session not listed"
-    );
-
-    let child_pid;
-    {
-        let mut s = Session::attach_path(&sock(xdg, "refuseup"), "refuseup", 80, 24)
-            .expect("attach before refused upgrade");
-        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
-        let mut screen = Screen::new(80, 24, 100);
-        assert!(
-            wait_for_screen(&mut s, &mut screen, "CHILD="),
-            "child pid never printed; saw:\n{}",
-            screen.text().join("\n")
-        );
-        let text = screen.text().join("\n");
-        child_pid = text
-            .split("CHILD=")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .expect("CHILD=<pid> on screen")
-            .to_string();
-    }
-    let before_host = host_pid(xdg, "refuseup").expect("host pid before refused upgrade");
-
-    // `/bin/true` exits 0 with no output, so the handoff-version probe finds
-    // nothing to parse and the host refuses. (Delivery still succeeds — the
-    // request reached the host, which declined it internally.)
-    let out = ghost(xdg)
-        .args(["__upgrade", "refuseup", "/bin/true"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "`ghost __upgrade` delivery failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // The host never exec'd: same pid, child still alive, still interactive.
-    assert_eq!(
-        host_pid(xdg, "refuseup").as_deref(),
-        Some(before_host.as_str()),
-        "host pid changed — a refused upgrade must not exec"
-    );
-    assert!(
-        alive(&child_pid),
-        "the child (pid {child_pid}) died — a refused upgrade must leave it running"
-    );
-    let mut s = Session::attach_path(&sock(xdg, "refuseup"), "refuseup", 80, 24)
-        .expect("attach after refused upgrade");
-    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
-    s.send_input(b"STILL-ALIVE\n").unwrap();
-    let mut screen = Screen::new(80, 24, 100);
-    assert!(
-        wait_for_screen(&mut s, &mut screen, "STILL-ALIVE"),
-        "the child stopped echoing after a refused upgrade; saw:\n{}",
-        screen.text().join("\n")
-    );
+    assert_target_refused("refuseup", Path::new("/bin/true"), "handoff version");
 }
 
 /// The recording must CONTINUE across an upgrade, not restart: the successor
@@ -524,16 +449,15 @@ fn a_self_upgrade_refuses_a_target_that_hangs_on_the_probe() {
     let before_host = host_pid(xdg, "hangup").expect("host pid before hung upgrade");
 
     // Trigger the upgrade against the hanging target. The probe times out (~5s)
-    // and the host refuses; delivery still succeeds.
-    let out = ghost(xdg)
+    // and the host refuses. Whether the refusal is *reported* to the CLI or the
+    // CLI's own deadline fires first is a timing race under load — this test's
+    // job is only that the host survives the hung probe — so we don't assert on
+    // the exit code here (the deterministic result-channel reporting is covered
+    // by the other refusal tests). We only require the command returned.
+    let _ = ghost(xdg)
         .args(["__upgrade", "hangup", hang.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "`ghost __upgrade` delivery failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
     // The host never exec'd, the child is still alive, and — the crux — the host
     // is RESPONSIVE again: it echoes fresh input, proving the hung probe did not

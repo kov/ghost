@@ -157,6 +157,14 @@ pub enum ServerMsg {
     Snapshot(SessionState),
     /// A state change, pushed to subscribers.
     Event(SessionEvent),
+    /// Result of a [`ClientMsg::Upgrade`] the host DECLINED: `message` says why
+    /// (an untrusted or incompatible target, a downgrade, a failed pre-exec
+    /// step). On SUCCESS the host re-execs and the connection simply EOFs — the
+    /// requester reads that as "taken" — so this is only ever sent with
+    /// `ok: false`; the field exists to keep the shape uniform with
+    /// [`Self::RenameResult`]. Rides the existing [`PROTO_UPGRADE`] exchange (no
+    /// new level: only a client that sent `Upgrade` awaits it).
+    UpgradeResult { ok: bool, message: String },
 }
 
 /// The protocol feature level this binary speaks. The host writes it to the
@@ -389,6 +397,13 @@ mod tests {
         );
         assert_eq!(wire_tag(&ServerMsg::Snapshot(SessionState::default())), 3);
         assert_eq!(wire_tag(&ServerMsg::Event(SessionEvent::Bell)), 4);
+        assert_eq!(
+            wire_tag(&ServerMsg::UpgradeResult {
+                ok: false,
+                message: String::new()
+            }),
+            5,
+        );
 
         // SessionEvent::Resized was appended after PROTO_SUBSCRIBE shipped; it must
         // stay at the tail so level-3 subscribers keep skipping only it.
@@ -410,6 +425,10 @@ mod tests {
             ServerMsg::RenameResult {
                 ok: true,
                 message: "ok".to_string(),
+            },
+            ServerMsg::UpgradeResult {
+                ok: false,
+                message: "refused".to_string(),
             },
         ] {
             let mut r = FrameReader::new();

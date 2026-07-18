@@ -142,6 +142,12 @@ struct Client {
     /// The connection's self-reported identity (`ClientMsg::Hello`), surfaced
     /// through [`AttachInfo`] when this connection holds the display.
     hello: Option<String>,
+    /// Set when this connection asked for a self-upgrade (`ClientMsg::Upgrade`)
+    /// and is waiting on the verdict. The upgrade is deferred to the next clean
+    /// boundary, so a refusal can't be answered inline; the loop tail queues a
+    /// [`ServerMsg::UpgradeResult`] here instead (on SUCCESS the exec drops the
+    /// connection and the requester reads that EOF as "taken").
+    awaiting_upgrade: bool,
 }
 
 impl Client {
@@ -155,6 +161,7 @@ impl Client {
             observing: false,
             lagged: false,
             hello: None,
+            awaiting_upgrade: false,
         })
     }
 
@@ -1550,12 +1557,17 @@ fn host_main(
             // the next read. So refuse the upgrade on a flush error — the request
             // is already taken (one-shot), so it just doesn't happen and the host
             // runs on unchanged.
-            let flushed = match &mut recorder {
-                Some(r) => r.flush().is_ok(),
-                None => true,
-            };
-            if flushed {
-                let _ = self_upgrade(
+            let outcome: Result<(), String> = match &mut recorder {
+                Some(r) => r.flush().map_err(|e| {
+                    format!("cannot flush the recording before upgrading (refused): {e}")
+                }),
+                None => Ok(()),
+            }
+            .and_then(|()| {
+                // On SUCCESS this never returns (the image is replaced); an `Err`
+                // is a refusal — a bad/incompatible target, a downgrade, a failed
+                // reversible prep. Either way the host runs on.
+                self_upgrade(
                     listener,
                     lock_fd,
                     &pty,
@@ -1564,7 +1576,23 @@ fn host_main(
                     opts,
                     launch_dir,
                     path.as_deref(),
-                );
+                )
+                .map_err(|e| e.to_string())
+            });
+            // Report a refusal to whoever asked so `ghost __upgrade` fails loudly
+            // instead of waiting out its own deadline on a silent hold. The
+            // requester is a control connection in `pending` (or, if an attached
+            // terminal asked, the display `client`); flushed to it next turn.
+            if let Err(message) = outcome {
+                for c in pending.iter_mut().chain(client.as_mut()) {
+                    if c.awaiting_upgrade {
+                        c.queue(&ServerMsg::UpgradeResult {
+                            ok: false,
+                            message: message.clone(),
+                        });
+                        c.awaiting_upgrade = false;
+                    }
+                }
             }
         }
 
@@ -1908,6 +1936,10 @@ fn handle_client_messages(
             // The last request wins if several arrive before a boundary.
             ClientMsg::Upgrade { path } if !c.subscribed && !c.observing => {
                 *pending_upgrade = Some(path);
+                // Remember to answer THIS connection: on a refusal the loop tail
+                // queues a `UpgradeResult` to every awaiting client (success
+                // never returns to answer).
+                c.awaiting_upgrade = true;
             }
             ClientMsg::Upgrade { .. } => {}
         }

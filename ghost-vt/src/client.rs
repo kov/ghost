@@ -253,7 +253,9 @@ impl Subscriber {
                         // Mirrored output (observe connections only; a plain
                         // subscription never receives it).
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
-                        ServerMsg::Exited(_) | ServerMsg::RenameResult { .. } => {}
+                        ServerMsg::Exited(_)
+                        | ServerMsg::RenameResult { .. }
+                        | ServerMsg::UpgradeResult { .. } => {}
                     }
                 }
             }
@@ -468,7 +470,7 @@ impl Session {
                     match msg {
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
                         ServerMsg::Exited(_code) => pump.ended = true,
-                        ServerMsg::RenameResult { .. } => {}
+                        ServerMsg::RenameResult { .. } | ServerMsg::UpgradeResult { .. } => {}
                         // Pushed subscription state; a display client is not a
                         // subscriber, so nothing to do.
                         ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
@@ -592,6 +594,9 @@ fn run_attach(mut client: Client) -> io::Result<()> {
                     ServerMsg::RenameResult { ok, message } => {
                         rename_result(ok, &message, &mut prompt, &mut client, stdin)?;
                     }
+                    // An interactive attach doesn't drive upgrades (only the
+                    // `ghost __upgrade` control path awaits this), so ignore it.
+                    ServerMsg::UpgradeResult { .. } => {}
                     // Pushed subscription state; a display client is not a
                     // subscriber, so nothing to do.
                     ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
@@ -640,21 +645,36 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     conn.send(&ClientMsg::Upgrade { path })?;
     // The host performs the upgrade at its next clean handoff boundary, then
     // re-execs — closing this control connection, whose fd does not cross the
-    // exec. Wait for that EOF as confirmation the request was taken. But the host
-    // may also REFUSE (a too-old target, a never-quiescing child) and hold the
-    // connection open indefinitely, so bound the wait with our own deadline:
-    // `Conn::recv` reports a read timeout as `Ok(Some(vec![]))` (not an error),
-    // so we must clock the deadline ourselves rather than wait on a recv error.
-    // Either way the request was delivered; the host's own result channel is a
-    // later refinement (there is none yet).
+    // exec. So EOF is our SUCCESS signal: the request was taken and the successor
+    // now serves. A refusal instead comes back as `ServerMsg::UpgradeResult`
+    // (the host holds the connection open to answer). `Conn::recv` reports a read
+    // timeout as `Ok(Some(vec![]))` (not an error), so we clock our own deadline:
+    // set it past the host's probe timeout so even a slow refusal (a target that
+    // hangs the probe) is reported rather than timed out as a silent "delivered".
     conn.set_read_timeout(Some(Duration::from_millis(250)))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        // `None` is EOF — the host re-exec'd (or closed): the request was taken.
-        // `Some(_)` is an empty read-timeout batch (or late frames); keep waiting
-        // until our own deadline, since a refusal holds the connection open.
-        if conn.recv::<ServerMsg>()?.is_none() || Instant::now() >= deadline {
-            return Ok(()); // delivered (or the boundary is slow / it was refused)
+        match conn.recv::<ServerMsg>()? {
+            // EOF: the host re-exec'd (or the connection closed) — the upgrade
+            // was taken.
+            None => return Ok(()),
+            Some(msgs) => {
+                for msg in msgs {
+                    if let ServerMsg::UpgradeResult { ok, message } = msg {
+                        return if ok {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other(message))
+                        };
+                    }
+                }
+                // An empty read-timeout batch (or unrelated late frames): keep
+                // waiting until the deadline, past which we call it delivered (the
+                // boundary is slow — the request stands and will still fire).
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+            }
         }
     }
 }
