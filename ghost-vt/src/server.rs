@@ -736,21 +736,32 @@ fn self_upgrade(
     // drop the client observes strictly follows this write — it will read the
     // advanced marker and know this was a re-exec, not a take-over, and reconnect.
     // We are single-threaded and past every fallible step, so this is the last
-    // thing before the exec; on the (near-impossible) exec failure below we rewind
-    // it so a later take-over of a client that attached before this attempt can't
-    // misread the stale bump as a re-exec.
+    // thing before the exec. The write is ATOMIC (temp + rename): a plain
+    // truncate-then-write is briefly empty on disk, and a client whose connect-time
+    // read landed in that window would record 0 and, on a later take-over, misread
+    // the true generation as an advance and reconnect (re-opening the inversion).
+    // If we cannot publish the bump we REFUSE rather than exec with a stale marker —
+    // otherwise every attached client would read no advance and exit instead of
+    // reconnecting across the swap.
     let gen_path = paths::gen_path(current_name);
     let prev_gen = read_gen_marker(&gen_path);
-    let _ = std::fs::write(&gen_path, (prev_gen + 1).to_string());
+    if let Err(e) = write_gen_marker(&gen_path, prev_gen + 1) {
+        unblock_upgrade_signals();
+        return UpgradeOutcome::Refused(format!(
+            "cannot record the upgrade generation ({e}); refusing so attached clients \
+             can still reconnect across the swap"
+        ));
+    }
     // SAFETY: `argv` is NUL-terminated and its pointers (into `prepared.argv_owned`,
     // held alive until the call returns) stay valid; `execv` only returns on failure.
     let err = unsafe {
         libc::execv(prepared.argv_owned[0].as_ptr(), argv.as_ptr());
         io::Error::last_os_error()
     };
-    // Only here on failure: rewind the generation bump, lift the block, and
-    // report. The host keeps running on its old image at its old generation.
-    let _ = std::fs::write(&gen_path, prev_gen.to_string());
+    // Only here on failure: rewind the generation bump (best-effort — we are
+    // refusing regardless), lift the block, and report. The host keeps running on
+    // its old image at its old generation.
+    let _ = write_gen_marker(&gen_path, prev_gen);
     unblock_upgrade_signals();
     UpgradeOutcome::Refused(err.to_string())
 }
@@ -763,6 +774,17 @@ fn read_gen_marker(path: &std::path::Path) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// Write a session's exec-generation marker ATOMICALLY: a reader (a client's
+/// connect-time `gen_at`) must never observe the file mid-write, which a plain
+/// truncate-then-write leaves momentarily empty. Write a sibling temp file and
+/// `rename` it over the marker — the rename is atomic within the directory, so a
+/// concurrent read sees either the old value or the new one, never nothing.
+fn write_gen_marker(path: &std::path::Path, value: u64) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, value.to_string())?;
+    std::fs::rename(&tmp, path)
 }
 
 /// The owned values a [`self_upgrade`] `execv` needs kept alive until it runs:

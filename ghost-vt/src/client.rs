@@ -58,6 +58,13 @@ impl Client {
 
     /// Connect to a session whose control socket is at `sock`.
     pub fn connect_path(sock: &Path) -> io::Result<Self> {
+        // Field order is load-bearing: `generation` is read AFTER `Conn::connect`
+        // succeeds, so a connect that races a self-upgrade records the marker only
+        // once we are on the socket. That biases every such race toward YIELD (a gen
+        // read late enough to see the bump means we reconnect correctly; one read a
+        // hair early records a value no larger than the successor's, so we exit) —
+        // never toward a spurious reconnect that would re-open the take-over war.
+        // Do not reorder these below `conn`.
         Ok(Client {
             conn: Conn::connect(sock)?,
             proto: proto_at(sock),
