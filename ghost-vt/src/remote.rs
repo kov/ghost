@@ -53,7 +53,13 @@ pub(crate) fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitS
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => return None,
+            // A `try_wait` error leaves the child in an unknown state; kill and
+            // reap it so it can't linger as a zombie, then report "no status".
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
 }

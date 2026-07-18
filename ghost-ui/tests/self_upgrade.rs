@@ -14,8 +14,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ghost_vt::client::{Session, Subscriber};
-use ghost_vt::protocol::SessionEvent;
+use ghost_vt::protocol::{PROTO_LEVEL, SessionEvent};
 use ghost_vt::screen::Screen;
+use ghost_vt::server::HANDOFF_VERSION;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
 
@@ -213,23 +214,41 @@ fn write_fake_ghost(dir: &Path, body: &str, mode: u32) -> PathBuf {
 /// anyone else can rewrite must be refused before either — even when it reports
 /// a perfectly valid handoff. Here a world-writable script that answers the
 /// probe with our own `<handoff> <proto>` is still declined on its mode.
+///
+/// The script also `touch`es a sentinel: because validation runs BEFORE the
+/// probe, the target must never be executed, so the sentinel must not appear.
+/// That pins the vet-before-probe ordering — reorder the check and the probe
+/// would run this script (creating the sentinel) even though it is ultimately
+/// refused on mode.
 #[test]
 fn a_self_upgrade_refuses_a_world_writable_target() {
     let tmp = tempfile::tempdir().unwrap();
+    let sentinel = tmp.path().join("EXECUTED");
     // Reports a valid handoff+proto (so only the mode can disqualify it), but is
-    // writable by everyone.
-    let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 6\n", 0o777);
+    // writable by everyone — and records if it is ever run.
+    let body = format!(
+        "#!/bin/sh\ntouch '{}'\necho {} {}\n",
+        sentinel.display(),
+        HANDOFF_VERSION,
+        PROTO_LEVEL
+    );
+    let target = write_fake_ghost(tmp.path(), &body, 0o777);
     assert_target_refused("wwup", &target, "writable by group or other");
+    assert!(
+        !sentinel.exists(),
+        "the untrusted target was executed — validation must precede the probe"
+    );
 }
 
 /// A self-upgrade must not silently DOWNGRADE the session: a target that speaks
 /// a lower protocol level than we serve is refused (rolling back is `__restart`
-/// territory, not an in-place adopt). Here the target reports handoff 2 / proto
-/// 5 while we serve proto 6.
+/// territory, not an in-place adopt).
 #[test]
 fn a_self_upgrade_refuses_a_protocol_downgrade() {
     let tmp = tempfile::tempdir().unwrap();
-    let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 5\n", 0o755);
+    // Valid handoff, but one proto level below ours.
+    let body = format!("#!/bin/sh\necho {} {}\n", HANDOFF_VERSION, PROTO_LEVEL - 1);
+    let target = write_fake_ghost(tmp.path(), &body, 0o755);
     assert_target_refused("downup", &target, "downgrade");
 }
 

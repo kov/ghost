@@ -648,16 +648,22 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     // exec. So EOF is our SUCCESS signal: the request was taken and the successor
     // now serves. A refusal instead comes back as `ServerMsg::UpgradeResult`
     // (the host holds the connection open to answer). `Conn::recv` reports a read
-    // timeout as `Ok(Some(vec![]))` (not an error), so we clock our own deadline:
-    // set it past both host-side deadlines — the probe timeout AND the
-    // never-reaches-a-boundary give-up window — so even a slow refusal is
-    // reported rather than timed out here as a silent "delivered".
+    // timeout as `Ok(Some(vec![]))` (not an error), so we clock our own deadline.
+    // The host's two costs are SEQUENTIAL in the worst case — wait out the
+    // boundary window, then probe — so size the deadline as their sum plus slack,
+    // or a slow-but-genuine refusal would land after we stopped listening and be
+    // misreported as success. Post-Step-5 a healthy host ALWAYS answers (EOF on
+    // success, an `UpgradeResult` on refusal), so hitting this deadline means the
+    // host is wedged or overloaded — an error, not a silent "delivered".
     conn.set_read_timeout(Some(Duration::from_millis(250)))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now()
+        + crate::server::UPGRADE_BOUNDARY_WINDOW
+        + crate::server::HANDOFF_PROBE_TIMEOUT
+        + Duration::from_secs(5);
     loop {
         match conn.recv::<ServerMsg>()? {
-            // EOF: the host re-exec'd (or the connection closed) — the upgrade
-            // was taken.
+            // EOF: the host re-exec'd (its control-connection fd is CLOEXEC, so
+            // the exec closes it) — the upgrade was taken.
             None => return Ok(()),
             Some(msgs) => {
                 for msg in msgs {
@@ -670,10 +676,12 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
                     }
                 }
                 // An empty read-timeout batch (or unrelated late frames): keep
-                // waiting until the deadline, past which we call it delivered (the
-                // boundary is slow — the request stands and will still fire).
+                // waiting until the deadline.
                 if Instant::now() >= deadline {
-                    return Ok(());
+                    return Err(io::Error::other(
+                        "the upgrade request was delivered but the host did not confirm it in \
+                         time (it may be wedged or overloaded) — check the session before retrying",
+                    ));
                 }
             }
         }

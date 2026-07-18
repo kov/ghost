@@ -496,15 +496,17 @@ fn unblock_upgrade_signals() {
 /// loop, so a target that ignores its argv and blocks (a wrong path, a wedged
 /// wrapper script) must not hang it forever — [`wait_bounded`] kills it at the
 /// deadline.
-const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the host waits for the terminal to reach a clean handoff boundary
 /// after an upgrade is requested before giving up. A child that never quiesces
 /// (continuous output, or a program that leaves the parser stuck mid-escape and
 /// idles) would otherwise hold the request — and the requester waiting on it —
-/// indefinitely. Kept below `upgrade_session`'s client-side deadline so the
-/// give-up refusal reaches the caller before it stops listening.
-const UPGRADE_BOUNDARY_WINDOW: Duration = Duration::from_secs(5);
+/// indefinitely. The two host-side costs are SEQUENTIAL in the worst case (wait
+/// out this window for a boundary, THEN probe for up to [`HANDOFF_PROBE_TIMEOUT`]
+/// once one arrives), so `upgrade_session`'s client deadline is sized as their
+/// sum plus slack — see there.
+pub(crate) const UPGRADE_BOUNDARY_WINDOW: Duration = Duration::from_secs(5);
 
 /// A pending in-place self-upgrade: the target `path` (`None` = our own current
 /// exe) and the `deadline` past which the host abandons it if no clean handoff
@@ -544,13 +546,21 @@ fn probe_target(exe: &std::path::Path) -> io::Result<ProbedTarget> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("cannot probe upgrade target: {e}")))?;
-    if !matches!(
-        crate::remote::wait_bounded(&mut child, HANDOFF_PROBE_TIMEOUT),
-        Some(s) if s.success()
-    ) {
-        return Err(io::Error::other(
-            "upgrade target did not answer the handoff-version probe in time (hung or too old?)",
-        ));
+    match crate::remote::wait_bounded(&mut child, HANDOFF_PROBE_TIMEOUT) {
+        Some(s) if s.success() => {}
+        // Exited non-zero (or was signalled): a binary too old to have a
+        // `__handoff` subcommand fails its arg parse this way.
+        Some(_) => {
+            return Err(io::Error::other(
+                "upgrade target rejected the handoff-version probe (too old to answer __handoff?)",
+            ));
+        }
+        // Killed at the deadline: it never answered.
+        None => {
+            return Err(io::Error::other(
+                "upgrade target did not answer the handoff-version probe in time (hung?)",
+            ));
+        }
     }
     let mut buf = String::new();
     child
