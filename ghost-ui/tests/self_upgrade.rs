@@ -797,10 +797,11 @@ fn a_kill_after_a_self_upgrade_cleanly_ends_the_session_and_child() {
 /// cleanly: the child is never ORPHANED (host gone, child still running) and the
 /// session is never left half-torn. We force the race with SIGSTOP — freeze the
 /// host, queue an upgrade request AND a SIGTERM against the frozen process, then
-/// SIGCONT — so both are pending together when it resumes. The host must honor
-/// the kill and tear down cleanly; the signals it blocks across the exec can't
-/// leak through as a default-disposition terminate, and the tail's signal
-/// handling is not preempted by the pending upgrade.
+/// SIGCONT — so both are pending together when it resumes. Whichever wins, the
+/// kill is honored (drained off the self-pipe before the exec, or handled by the
+/// successor once it unblocks) and the teardown is clean. This asserts the
+/// observable outcome; the mechanisms behind it (the pre-exec signal drain, and
+/// `kill_session` refusing to prune a still-live host) are what make it hold.
 #[test]
 fn a_kill_racing_a_self_upgrade_never_orphans_the_child() {
     let tmp = tempfile::tempdir().unwrap();
@@ -835,6 +836,59 @@ fn a_kill_racing_a_self_upgrade_never_orphans_the_child() {
         alive(&host),
         alive(&child_pid),
         ls(xdg).contains("raceup")
+    );
+
+    let _ = up.kill();
+    let _ = up.wait();
+}
+
+/// A kill that lands while the host is INSIDE the handoff probe (a real window —
+/// the probe can take seconds) must still be honored, not lost across the exec.
+/// The target here is a valid but SLOW shim (`sleep`, then `exec` the real
+/// ghost), so the host sits in the probe for ~1s; a `ghost kill` mid-probe must
+/// tear the session down cleanly rather than exec into the (successful) upgrade
+/// and drop the kill on the floor. Guards the pre-exec self-pipe drain.
+#[test]
+fn a_kill_during_the_upgrade_probe_is_honored_not_lost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let child_pid = spawn_cat_and_child_pid(xdg, "probekill");
+    let _guard = KillOnDrop {
+        xdg,
+        name: "probekill",
+    };
+    let host = host_pid(xdg, "probekill").expect("host pid");
+
+    // A VALID upgrade target (it execs the real ghost, so absent a kill the
+    // upgrade would succeed and the session would survive) whose `__handoff`
+    // probe is slow — giving a wide window for a kill to land mid-prep.
+    let body = format!("#!/bin/sh\nsleep 1\nexec {GHOST} \"$@\"\n");
+    let target = write_fake_ghost(tmp.path(), &body, 0o755);
+
+    // Trigger the upgrade (background — it blocks awaiting the outcome), then kill
+    // the host while it is in the ~1s probe.
+    let mut up = ghost(xdg)
+        .args(["__upgrade", "probekill", target.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let out = ghost(xdg).args(["kill", "probekill"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost kill` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The kill was honored: host gone, child gone, session pruned — NOT upgraded
+    // with the kill lost, and never a live host with its files pruned away.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !alive(&host) && !alive(&child_pid) && !ls(xdg).contains("probekill")
+        }),
+        "a kill during the probe was not honored (host alive={}, child alive={}, listed={})",
+        alive(&host),
+        alive(&child_pid),
+        ls(xdg).contains("probekill")
     );
 
     let _ = up.kill();

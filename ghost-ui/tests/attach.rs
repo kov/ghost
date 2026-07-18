@@ -364,6 +364,60 @@ fn attach_survives_a_host_self_upgrade() {
     );
 }
 
+/// Two local attaches to the same session must not FIGHT over the display. When
+/// a second `ghost attach` takes over, the first is told it was superseded and
+/// exits cleanly — it must NOT mistake that drop for a self-upgrade re-exec and
+/// reconnect, which would steal the display straight back, forever. (Regression
+/// guard for the reconnect-across-upgrade feature.)
+#[test]
+fn a_second_attach_supersedes_the_first_without_a_takeover_war() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-takeover";
+    let _guard = KillOnDrop { xdg, name };
+
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // First attach: confirm it is the live interactive display client.
+    let mut first = Attached::new(xdg, name, 80, 24);
+    first.send(b"first-live\n");
+    assert!(
+        first.wait_for_screen(Duration::from_secs(5), screen_contains("first-live")),
+        "first attach not interactive; got: {:?}",
+        first.screen()
+    );
+
+    // Second attach takes over the display.
+    let second = Attached::new(xdg, name, 80, 24);
+
+    // The FIRST attach must exit (it was superseded) rather than spinning to
+    // reclaim the display.
+    assert!(
+        first.wait_exit(Duration::from_secs(5)),
+        "the superseded first attach did not exit — it is fighting for the display"
+    );
+
+    // The second attach owns the session and is interactive.
+    second.send(b"second-live\n");
+    assert!(
+        second.wait_for_screen(Duration::from_secs(5), screen_contains("second-live")),
+        "second attach not interactive after take-over; got: {:?}",
+        second.screen()
+    );
+}
+
 #[test]
 fn resize_propagates_to_session_child() {
     let tmp = tempfile::tempdir().unwrap();

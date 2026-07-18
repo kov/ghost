@@ -659,17 +659,30 @@ fn read_checkpoint(fd: RawFd, scrollback: usize) -> Option<Screen> {
     Some(Screen::from_recording(&rec, scrollback))
 }
 
+/// How [`self_upgrade`] can come back — it never returns on success (the `execv`
+/// replaces this image).
+enum UpgradeOutcome {
+    /// The upgrade was declined; the host runs on. `String` is the human reason
+    /// routed back to the requester.
+    Refused(String),
+    /// A terminating signal (SIGTERM/SIGINT) arrived during the (possibly slow)
+    /// upgrade prep. The caller must HONOR the kill — the signal was pulled off
+    /// the self-pipe (whose fd would not cross the exec), so it will not be
+    /// delivered again; running on would drop it.
+    Terminated,
+}
+
 /// Re-exec THIS process in place — same pid, no fork — onto the host at `exe`,
 /// adopting the running `child_pid` on the carried PTY master. Only the code
 /// image is replaced; the listener, the liveness lock, the PTY, and the child
 /// all survive.
 ///
-/// Returns `Err` on failure and NEVER `Ok`: on success `execv` never returns.
-/// A failure return is not fatal — this process still holds the PTY master, the
-/// child, and the flock, so the caller MUST keep running (refuse the upgrade),
-/// never exit. Every step here is therefore reversible: on any error the live
-/// host is left exactly as it was, save the CLOEXEC flags we cleared (harmless)
-/// and the signal block, which we lift before returning.
+/// Never returns on success (`execv` replaces the image); a return is a
+/// [`UpgradeOutcome`] the caller acts on. A `Refused` return is not fatal — this
+/// process still holds the PTY master, the child, and the flock, so the caller
+/// MUST keep running, never exit. Every step here is therefore reversible: on
+/// any error the live host is left exactly as it was, save the CLOEXEC flags we
+/// cleared (harmless) and the signal block, which we lift before returning.
 #[allow(clippy::too_many_arguments)] // the whole exec handoff, threaded once
 fn self_upgrade(
     listener: &UnixListener,
@@ -680,7 +693,71 @@ fn self_upgrade(
     opts: &SpawnOpts,
     launch_dir: Option<&std::path::Path>,
     path: Option<&str>,
-) -> io::Result<()> {
+    sigfd: &crate::signals::Signals,
+) -> UpgradeOutcome {
+    // All the reversible prep (validate, probe, checkpoint, clear CLOEXEC, build
+    // the argv) that can fail with a reason — an `Err` here means "refuse and run
+    // on", nothing has been committed. The owned `exe_c`/`argv` must outlive the
+    // `execv`, so they come back in `Prepared`.
+    let prepared = match prepare_upgrade(
+        listener, lock_fd, pty, child_pid, screen, opts, launch_dir, path,
+    ) {
+        Ok(p) => p,
+        Err(e) => return UpgradeOutcome::Refused(e.to_string()),
+    };
+    let mut argv: Vec<*const libc::c_char> =
+        prepared.argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // Block the terminating signals immediately before the exec, so the window
+    // they guard is as small as possible. If the exec fails we unblock below.
+    if let Err(e) = block_upgrade_signals() {
+        return UpgradeOutcome::Refused(e.to_string());
+    }
+    // Now that new deliveries are blocked, drain the self-pipe for a terminating
+    // signal that arrived DURING the prep above (the target probe alone can take
+    // seconds). Its fd is CLOEXEC and would not cross the exec, so a SIGTERM/INT
+    // sitting there would be lost — worse, `kill_session` would then prune a host
+    // that is alive as the successor. Honor it here instead. (A signal arriving
+    // AFTER the block is OS-pending, survives the exec, and the successor
+    // unblocks and handles it — so nothing is dropped either way.)
+    if drained_terminating_signal(sigfd) {
+        unblock_upgrade_signals();
+        return UpgradeOutcome::Terminated;
+    }
+    // SAFETY: `argv` is NUL-terminated and its pointers (into `prepared.argv_owned`,
+    // held alive until the call returns) stay valid; `execv` only returns on failure.
+    let err = unsafe {
+        libc::execv(prepared.argv_owned[0].as_ptr(), argv.as_ptr());
+        io::Error::last_os_error()
+    };
+    // Only here on failure: lift the block and report. The host keeps running.
+    unblock_upgrade_signals();
+    UpgradeOutcome::Refused(err.to_string())
+}
+
+/// The owned values a [`self_upgrade`] `execv` needs kept alive until it runs:
+/// the argv `CString`s (`argv_owned[0]` is the exe path) and the checkpoint
+/// tempfile whose fd is carried across the exec.
+struct Prepared {
+    argv_owned: [CString; 5],
+    _checkpoint: std::fs::File,
+}
+
+/// The reversible half of [`self_upgrade`]: everything that can fail cleanly,
+/// leaving the live host exactly as it was (save the harmless CLOEXEC flags we
+/// clear). An `Err` is a refusal reason.
+#[allow(clippy::too_many_arguments)] // the whole exec handoff, threaded once
+fn prepare_upgrade(
+    listener: &UnixListener,
+    lock_fd: RawFd,
+    pty: &pty_process::blocking::Pty,
+    child_pid: u32,
+    screen: &Screen,
+    opts: &SpawnOpts,
+    launch_dir: Option<&std::path::Path>,
+    path: Option<&str>,
+) -> io::Result<Prepared> {
     let exe = match path {
         Some(p) => std::path::PathBuf::from(p),
         None => std::env::current_exe()?,
@@ -749,28 +826,27 @@ fn self_upgrade(
     };
     let blob = encode_host_args(&host_args);
     let argv_owned = [
-        exe_c.clone(),
+        exe_c,
         CString::new(HOST_ARG).expect("HOST_ARG has no NUL"),
         CString::new(listener.as_raw_fd().to_string()).expect("fd digits have no NUL"),
         CString::new(lock_fd.to_string()).expect("fd digits have no NUL"),
         CString::new(blob).expect("hex blob has no NUL"),
     ];
-    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
-    argv.push(std::ptr::null());
+    Ok(Prepared {
+        argv_owned,
+        _checkpoint: checkpoint,
+    })
+}
 
-    // Block the terminating signals LAST, immediately before the exec, so the
-    // window they guard is as small as possible. If the exec fails we unblock
-    // again below.
-    block_upgrade_signals()?;
-    // SAFETY: `argv` is NUL-terminated and its pointers (and `exe_c`) live until
-    // the call returns; `execv` only returns on failure.
-    let err = unsafe {
-        libc::execv(exe_c.as_ptr(), argv.as_ptr());
-        io::Error::last_os_error()
-    };
-    // Only here on failure: lift the block and report. The host keeps running.
-    unblock_upgrade_signals();
-    Err(err)
+/// Drain the signal self-pipe and report whether a terminating signal
+/// (SIGTERM/SIGINT) was among what it held. Consumes every buffered signal;
+/// SIGCHLD is a no-op (child exit is driven by PTY EOF, not this pipe), so
+/// swallowing one here is harmless.
+fn drained_terminating_signal(sigfd: &crate::signals::Signals) -> bool {
+    crate::signals::drain(sigfd)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|s| s == libc::SIGTERM || s == libc::SIGINT)
 }
 
 /// Serialize the host's startup state to a NUL-free, argv-safe hex string.
@@ -1528,7 +1604,20 @@ fn host_main(
                     Disposition::Keep => {
                         let _ = p.flush();
                         if p.resynced {
-                            client = Some(p); // attach handshake done -> display client
+                            // Attach handshake done -> promote to display client,
+                            // taking over from any current one. Tell the outgoing
+                            // client it was superseded FIRST: a bare EOF is
+                            // ambiguous (a self-upgrade re-exec looks identical),
+                            // and a local attach now reconnects on that ambiguity,
+                            // so without this the dropped client would take the
+                            // display straight back — an endless take-over war.
+                            // Blocking flush so the tiny message lands before the
+                            // connection closes.
+                            if let Some(mut old) = client.take() {
+                                let _ = old.conn.set_nonblocking(false);
+                                let _ = old.conn.send(&ServerMsg::Superseded);
+                            }
+                            client = Some(p);
                         } else if p.subscribed {
                             subscribers.push(p); // state observer, kept for pushes
                         } else {
@@ -1599,12 +1688,12 @@ fn host_main(
         if pending_upgrade.is_some()
             && pty_out.is_empty()
             && screen.at_boundary()
-            // Don't upgrade with a terminating signal already pending this turn:
-            // signals are handled at the loop's tail, so firing the upgrade first
-            // would exec past a SIGTERM/SIGINT — losing it (the self-pipe fd does
-            // not cross the exec), and a racing `ghost kill` would then poll a
-            // pid that is alive as the NEW host and prune it out from under
-            // itself. Defer one turn so the tail honors the kill instead.
+            // Don't start an upgrade with a terminating signal already visible
+            // this turn: honor it PROMPTLY at the tail instead of first running
+            // the (probe-bearing, up-to-5s) prep and only catching it in
+            // `self_upgrade`'s pre-exec drain. That drain is the completeness
+            // guarantee — a kill landing DURING the prep is still honored — this
+            // is just the fast path for one already sitting in the pipe.
             && !sig_re.contains(PollFlags::IN)
             && let Some(pid) = child.as_ref().map(|c| c.id())
         {
@@ -1617,16 +1706,18 @@ fn host_main(
             // the next read. So refuse the upgrade on a flush error — the request
             // is already taken (one-shot), so it just doesn't happen and the host
             // runs on unchanged.
-            let outcome: Result<(), String> = match &mut recorder {
-                Some(r) => r.flush().map_err(|e| {
-                    format!("cannot flush the recording before upgrading (refused): {e}")
+            let outcome = match &mut recorder {
+                Some(r) => r.flush().err().map(|e| {
+                    UpgradeOutcome::Refused(format!(
+                        "cannot flush the recording before upgrading (refused): {e}"
+                    ))
                 }),
-                None => Ok(()),
+                None => None,
             }
-            .and_then(|()| {
-                // On SUCCESS this never returns (the image is replaced); an `Err`
-                // is a refusal — a bad/incompatible target, a downgrade, a failed
-                // reversible prep. Either way the host runs on.
+            // On SUCCESS `self_upgrade` never returns (the image is replaced); a
+            // return is a refusal (bad/incompatible target, downgrade, failed
+            // reversible prep) or a kill that landed during the prep.
+            .unwrap_or_else(|| {
                 self_upgrade(
                     listener,
                     lock_fd,
@@ -1636,13 +1727,22 @@ fn host_main(
                     opts,
                     launch_dir,
                     path.as_deref(),
+                    &sfd,
                 )
-                .map_err(|e| e.to_string())
             });
-            // Report a refusal to whoever asked so `ghost __upgrade` fails loudly
-            // instead of waiting out its own deadline on a silent hold.
-            if let Err(message) = outcome {
-                notify_upgrade_refused(&mut pending, &mut client, &message);
+            match outcome {
+                // Report the refusal to whoever asked so `ghost __upgrade` fails
+                // loudly instead of waiting out its own deadline on a silent hold.
+                UpgradeOutcome::Refused(message) => {
+                    notify_upgrade_refused(&mut pending, &mut client, &message);
+                }
+                // A kill raced the prep and was pulled off the self-pipe — honor
+                // it now, exactly as the loop's tail signal handler would.
+                UpgradeOutcome::Terminated => {
+                    kill_child(&mut child);
+                    notify_exit(&mut client, 0);
+                    return Ok(0);
+                }
             }
         }
 

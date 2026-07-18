@@ -240,6 +240,18 @@ pub fn kill_session(name: &str) -> io::Result<bool> {
     while pid_alive(pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // Only prune if the host actually died. If it is STILL alive, the SIGTERM
+    // did not take — a wedged teardown, or the rare lost-signal race where a kill
+    // lands while the host is mid self-upgrade (the self-pipe fd doesn't cross
+    // the exec). Pruning now would delete a LIVE host's socket, lock and
+    // recording out from under it, stranding a session no `ghost` command can
+    // reach. Report the failure instead so the caller can retry.
+    if pid_alive(pid) {
+        return Err(io::Error::other(format!(
+            "session '{name}' did not exit after SIGTERM (still running as pid {pid}); \
+             left intact — try again"
+        )));
+    }
     prune(name);
     discard(name);
     Ok(true)

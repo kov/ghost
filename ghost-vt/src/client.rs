@@ -255,7 +255,8 @@ impl Subscriber {
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
                         ServerMsg::Exited(_)
                         | ServerMsg::RenameResult { .. }
-                        | ServerMsg::UpgradeResult { .. } => {}
+                        | ServerMsg::UpgradeResult { .. }
+                        | ServerMsg::Superseded => {}
                     }
                 }
             }
@@ -470,7 +471,13 @@ impl Session {
                     match msg {
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
                         ServerMsg::Exited(_code) => pump.ended = true,
-                        ServerMsg::RenameResult { .. } | ServerMsg::UpgradeResult { .. } => {}
+                        // `Superseded` is ignored here: the GUI's take-over is
+                        // coordinated through the shared model, and the drop that
+                        // follows surfaces via the usual EOF path — unchanged from
+                        // before this message existed.
+                        ServerMsg::RenameResult { .. }
+                        | ServerMsg::UpgradeResult { .. }
+                        | ServerMsg::Superseded => {}
                         // Pushed subscription state; a display client is not a
                         // subscriber, so nothing to do.
                         ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
@@ -529,6 +536,44 @@ fn try_reconnect(name: &str) -> Option<Client> {
     }
 }
 
+/// Whether an I/O error is a dropped connection (the peer closed) rather than a
+/// real failure — the class that, for a local attach, might be a self-upgrade
+/// re-exec worth reconnecting across.
+fn is_disconnect(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Re-attach `client` in place after its connection dropped (a local
+/// self-upgrade re-exec keeps the lock, socket and child). Drops any in-flight
+/// rename prompt — its reply died with the old connection, so leaving it up
+/// would wedge the client swallowing all input — and re-handshakes with a resize
+/// so the successor resyncs the screen. `Ok(true)` = reconnected (caller
+/// continues); `Ok(false)` = nothing to reconnect to (a remote pipe, or the host
+/// is really gone) so the caller should exit.
+fn reconnect_in_place(
+    client: &mut Client,
+    reconnect: Option<&str>,
+    stdin: BorrowedFd<'_>,
+    prompt: &mut Option<RenamePrompt>,
+) -> io::Result<bool> {
+    let Some(name) = reconnect else {
+        return Ok(false);
+    };
+    let Some(new) = try_reconnect(name) else {
+        return Ok(false);
+    };
+    *client = new;
+    *prompt = None;
+    send_resize(client, stdin)?;
+    Ok(true)
+}
+
 /// The raw-mode terminal pipe shared by [`attach`] and [`attach_ssh`]: forward
 /// stdin<->host until the user detaches or the session ends. `reconnect` is the
 /// session name for a LOCAL attach (enabling by-name re-attach across a host
@@ -581,8 +626,21 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                             // bytes typed after it on this same read to it.
                             if prompt.is_some() {
                                 prompt_input(&bytes, &mut prompt, &mut client, stdin)?;
-                            } else {
-                                client.send(&ClientMsg::Input(bytes))?;
+                            } else if let Err(e) = client.send(&ClientMsg::Input(bytes)) {
+                                // The host may have re-exec'd out from under this
+                                // send (a local self-upgrade). Reconnect and drop
+                                // the keystroke rather than exit; otherwise
+                                // propagate the real error.
+                                if !(is_disconnect(&e)
+                                    && reconnect_in_place(
+                                        &mut client,
+                                        reconnect,
+                                        stdin,
+                                        &mut prompt,
+                                    )?)
+                                {
+                                    return Err(e);
+                                }
                             }
                         }
                         Action::Detach => {
@@ -608,13 +666,10 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                 // The connection dropped without a clean `Exited`. For a local
                 // attach this can be a self-upgrade (the host re-exec'd in place,
                 // keeping its lock, socket and child) rather than the session
-                // ending — reconnect if the host still holds its lock, and
-                // re-handshake (a resize) to become its display client again.
-                if let Some(name) = reconnect
-                    && let Some(new_client) = try_reconnect(name)
-                {
-                    client = new_client;
-                    send_resize(&mut client, stdin)?;
+                // ending — reconnect if the host still holds its lock. Take-over
+                // is NOT this path: the host sends `Superseded` first, handled
+                // below, so we never mistake it for a re-exec.
+                if reconnect_in_place(&mut client, reconnect, stdin, &mut prompt)? {
                     continue;
                 }
                 eprint!("\r\n[ghost: session closed]\r\n");
@@ -642,6 +697,14 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                     // An interactive attach doesn't drive upgrades (only the
                     // `ghost __upgrade` control path awaits this), so ignore it.
                     ServerMsg::UpgradeResult { .. } => {}
+                    // Another client took over the display. Exit cleanly — this is
+                    // NOT the ambiguous EOF the reconnect path handles, so we must
+                    // not reconnect (that would fight the new client for the
+                    // display forever).
+                    ServerMsg::Superseded => {
+                        eprint!("\r\n[ghost: another terminal took over this session]\r\n");
+                        return Ok(());
+                    }
                     // Pushed subscription state; a display client is not a
                     // subscriber, so nothing to do.
                     ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
@@ -652,7 +715,15 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
         // terminal resize -> host
         if sig_re.contains(PollFlags::IN) {
             signals::drain(&sfd)?;
-            send_resize(&mut client, stdin)?;
+            if let Err(e) = send_resize(&mut client, stdin) {
+                // A resize racing a self-upgrade re-exec: reconnect (the resize
+                // is re-sent as the reconnect handshake) rather than exit.
+                if !(is_disconnect(&e)
+                    && reconnect_in_place(&mut client, reconnect, stdin, &mut prompt)?)
+                {
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(())

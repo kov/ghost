@@ -165,6 +165,14 @@ pub enum ServerMsg {
     /// [`Self::RenameResult`]. Rides the existing [`PROTO_UPGRADE`] exchange (no
     /// new level: only a client that sent `Upgrade` awaits it).
     UpgradeResult { ok: bool, message: String },
+    /// The host is dropping THIS display client because another client took over
+    /// the display (a fresh attach completed its handshake). Sent just before the
+    /// connection closes so the client exits cleanly instead of mistaking the
+    /// bare EOF for a self-upgrade re-exec — which a local attach RECONNECTS
+    /// across, so without this signal a superseded attach would take the display
+    /// straight back, in an endless take-over war. To the current display client
+    /// only.
+    Superseded,
 }
 
 /// The protocol feature level this binary speaks. The host writes it to the
@@ -404,6 +412,7 @@ mod tests {
             }),
             5,
         );
+        assert_eq!(wire_tag(&ServerMsg::Superseded), 6);
 
         // SessionEvent::Resized was appended after PROTO_SUBSCRIBE shipped; it must
         // stay at the tail so level-3 subscribers keep skipping only it.
@@ -430,6 +439,7 @@ mod tests {
                 ok: false,
                 message: "refused".to_string(),
             },
+            ServerMsg::Superseded,
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));
