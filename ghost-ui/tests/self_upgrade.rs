@@ -334,6 +334,112 @@ fn a_self_upgrade_continues_the_recording_instead_of_truncating_it() {
     );
 }
 
+/// A target that HANGS on the handoff-version probe (a wedged wrapper, a broken
+/// binary, a wrong path that happens to be an executable that never exits) must
+/// not wedge the host with it. The probe is spawned under a timeout: it is
+/// killed at the deadline and the upgrade is refused, so the host — which is
+/// blocked in the probe while it runs — comes back and keeps serving its child.
+/// Without the timeout the probe's `.output()` would block the host loop for as
+/// long as the target runs (here effectively forever), and the child would go
+/// dark.
+#[test]
+fn a_self_upgrade_refuses_a_target_that_hangs_on_the_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    // A stand-in "ghost" that ignores its argv and just blocks for far longer
+    // than the probe's deadline. `exec` so the script process *is* the sleep,
+    // and the probe's kill takes the whole thing down (no orphaned sleep).
+    let hang = xdg.join("hang.sh");
+    std::fs::write(&hang, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = ghost(xdg)
+        .args([
+            "new",
+            "hangup",
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD=$$; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "hangup",
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("hangup")),
+        "session not listed"
+    );
+
+    let child_pid;
+    {
+        let mut s = Session::attach_path(&sock(xdg, "hangup"), "hangup", 80, 24)
+            .expect("attach before hung upgrade");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "CHILD="),
+            "child pid never printed; saw:\n{}",
+            screen.text().join("\n")
+        );
+        let text = screen.text().join("\n");
+        child_pid = text
+            .split("CHILD=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("CHILD=<pid> on screen")
+            .to_string();
+    }
+    let before_host = host_pid(xdg, "hangup").expect("host pid before hung upgrade");
+
+    // Trigger the upgrade against the hanging target. The probe times out (~5s)
+    // and the host refuses; delivery still succeeds.
+    let out = ghost(xdg)
+        .args(["__upgrade", "hangup", hang.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` delivery failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The host never exec'd, the child is still alive, and — the crux — the host
+    // is RESPONSIVE again: it echoes fresh input, proving the hung probe did not
+    // wedge the loop.
+    assert_eq!(
+        host_pid(xdg, "hangup").as_deref(),
+        Some(before_host.as_str()),
+        "host pid changed — a hung-probe upgrade must not exec"
+    );
+    assert!(
+        alive(&child_pid),
+        "the child (pid {child_pid}) died — a hung-probe upgrade must leave it running"
+    );
+    let mut s = Session::attach_path(&sock(xdg, "hangup"), "hangup", 80, 24)
+        .expect("attach after hung upgrade");
+    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    s.send_input(b"UNWEDGED\n").unwrap();
+    let mut screen = Screen::new(80, 24, 100);
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "UNWEDGED"),
+        "the host never came back after a hung probe; saw:\n{}",
+        screen.text().join("\n")
+    );
+}
+
 #[test]
 fn a_self_upgrade_replaces_the_host_in_place_and_keeps_its_child_alive() {
     let tmp = tempfile::tempdir().unwrap();

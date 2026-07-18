@@ -40,7 +40,7 @@ const PROTO_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Polls rather than blocking so a wedged ssh can't hang the caller forever. Used
 /// only where the child produces little output (a control command, a probe line), so
 /// its pipe never fills while we poll.
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+pub(crate) fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {

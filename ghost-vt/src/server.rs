@@ -25,7 +25,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Options for starting a session.
 #[derive(Clone, Serialize, Deserialize)]
@@ -467,24 +467,47 @@ fn unblock_upgrade_signals() {
     unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
 }
 
+/// How long the handoff-version probe waits for the target to answer before
+/// giving up and refusing the upgrade. The host runs this on its single event
+/// loop, so a target that ignores its argv and blocks (a wrong path, a wedged
+/// wrapper script) must not hang it forever — [`wait_bounded`] kills it at the
+/// deadline.
+const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Ask the target binary which exec-handoff format it speaks, by running its
 /// `ghost __handoff` subcommand and parsing the [`HANDOFF_VERSION`] it prints.
 /// A binary predating the mechanism has no such subcommand, so this errors —
-/// which the caller treats as "refuse the upgrade". Cheap and reversible (a
+/// which the caller treats as "refuse the upgrade". Bounded ([`wait_bounded`]):
+/// a hung target is killed at the deadline and the upgrade refused, rather than
+/// wedging the host loop on a blocking `output()`. Cheap and reversible (a
 /// short-lived child that only prints a number), so it is safe to run before any
 /// of the exec's irreversible-looking steps.
 fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
-    let out = std::process::Command::new(exe)
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(exe)
         .arg(HANDOFF_ARG)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("cannot probe upgrade target: {e}")))?;
-    if !out.status.success() {
+    if !matches!(
+        crate::remote::wait_bounded(&mut child, HANDOFF_PROBE_TIMEOUT),
+        Some(s) if s.success()
+    ) {
         return Err(io::Error::other(
-            "upgrade target did not answer the handoff-version probe (too old?)",
+            "upgrade target did not answer the handoff-version probe in time (hung or too old?)",
         ));
     }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
+    let mut buf = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("handoff probe produced no output"))?
+        .read_to_string(&mut buf)
+        .map_err(|e| io::Error::new(e.kind(), format!("reading handoff probe output: {e}")))?;
+    buf.trim()
         .parse::<u32>()
         .map_err(|_| io::Error::other("upgrade target returned an unparseable handoff version"))
 }
