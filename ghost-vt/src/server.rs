@@ -303,6 +303,11 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
         paths::proto_path(&opts.name),
         crate::protocol::PROTO_LEVEL.to_string(),
     )?;
+    // The exec generation starts at 0. A self-upgrade bumps it just before its
+    // `execv`, so a local attach can tell a re-exec (marker advanced) from a
+    // take-over (marker unchanged) when its connection drops. Written before the
+    // socket binds, like the proto marker, so no client attaches without it.
+    std::fs::write(paths::gen_path(&opts.name), "0")?;
 
     let sock = paths::socket_path(&opts.name);
     // Clear any stale socket left by a dead host, then claim the name.
@@ -694,6 +699,7 @@ fn self_upgrade(
     launch_dir: Option<&std::path::Path>,
     path: Option<&str>,
     sigfd: &crate::signals::Signals,
+    current_name: &str,
 ) -> UpgradeOutcome {
     // All the reversible prep (validate, probe, checkpoint, clear CLOEXEC, build
     // the argv) that can fail with a reason — an `Err` here means "refuse and run
@@ -725,15 +731,38 @@ fn self_upgrade(
         unblock_upgrade_signals();
         return UpgradeOutcome::Terminated;
     }
+    // Publish the new exec generation BEFORE handing off. The `execv` is what
+    // closes each display client's connection (their fds are CLOEXEC), so the
+    // drop the client observes strictly follows this write — it will read the
+    // advanced marker and know this was a re-exec, not a take-over, and reconnect.
+    // We are single-threaded and past every fallible step, so this is the last
+    // thing before the exec; on the (near-impossible) exec failure below we rewind
+    // it so a later take-over of a client that attached before this attempt can't
+    // misread the stale bump as a re-exec.
+    let gen_path = paths::gen_path(current_name);
+    let prev_gen = read_gen_marker(&gen_path);
+    let _ = std::fs::write(&gen_path, (prev_gen + 1).to_string());
     // SAFETY: `argv` is NUL-terminated and its pointers (into `prepared.argv_owned`,
     // held alive until the call returns) stay valid; `execv` only returns on failure.
     let err = unsafe {
         libc::execv(prepared.argv_owned[0].as_ptr(), argv.as_ptr());
         io::Error::last_os_error()
     };
-    // Only here on failure: lift the block and report. The host keeps running.
+    // Only here on failure: rewind the generation bump, lift the block, and
+    // report. The host keeps running on its old image at its old generation.
+    let _ = std::fs::write(&gen_path, prev_gen.to_string());
     unblock_upgrade_signals();
     UpgradeOutcome::Refused(err.to_string())
+}
+
+/// Read a session's exec-generation marker (see [`paths::gen_path`]); `0` when
+/// absent or unparsable — the value a fresh spawn writes and the floor a
+/// self-upgrade bumps from.
+fn read_gen_marker(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// The owned values a [`self_upgrade`] `execv` needs kept alive until it runs:
@@ -1737,6 +1766,7 @@ fn host_main(
                     launch_dir,
                     path.as_deref(),
                     &sfd,
+                    current_name,
                 )
             });
             match outcome {

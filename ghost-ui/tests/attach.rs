@@ -487,6 +487,85 @@ fn a_takeover_from_a_stalled_client_does_not_wedge_the_host() {
     );
 }
 
+/// A take-over from a STALLED, FLOODING client must not INVERT: the newcomer keeps
+/// the display and the stalled incumbent yields. When the incumbent's socket
+/// buffers are full its `Superseded` farewell is dropped (best-effort,
+/// non-blocking — see the wedge test), so the incumbent sees only a bare EOF,
+/// indistinguishable BY LIVENESS ALONE from a self-upgrade re-exec. It must not
+/// reconnect on that: the host publishes an exec-generation marker that only a
+/// real re-exec bumps, so a generation unchanged since attach means "you were
+/// taken over — yield", not "re-exec — reconnect". Without the generation check
+/// the stalled incumbent reconnects and steals the display straight back,
+/// inverting the take-over (the flood-inversion regression guard).
+#[test]
+fn a_flooded_takeover_does_not_invert_when_the_farewell_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "invert";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Same flood as the wedge test, so a stopped client's send buffers fill fast.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "while :; do echo flood; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // Incumbent attaches, receives the flood, then FREEZES: its socket send
+    // buffers fill, so the farewell the host later pushes will WouldBlock and be
+    // dropped — the incumbent will see a bare EOF, not a `Superseded`.
+    let mut first = Attached::new(xdg, name, 80, 24);
+    assert!(
+        first.wait_for_screen(Duration::from_secs(5), screen_contains("flood")),
+        "incumbent never saw output; got: {:?}",
+        first.screen()
+    );
+    let first_pid = first.child.id().to_string();
+    signal_pid(&first_pid, "STOP");
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Newcomer takes over the display and becomes the live client.
+    let mut second = Attached::new(xdg, name, 80, 24);
+    assert!(
+        second.wait_for_screen(Duration::from_secs(5), screen_contains("flood")),
+        "newcomer never became the display client; got: {:?}",
+        second.screen()
+    );
+
+    // Resume the incumbent so it can act on its bare EOF.
+    signal_pid(&first_pid, "CONT");
+
+    // The crux: the incumbent must YIELD (exit), NOT reconnect and steal the
+    // display back — the generation it attached at is unchanged, so this is a
+    // take-over, not a re-exec.
+    assert!(
+        first.wait_exit(Duration::from_secs(5)),
+        "the flooded incumbent did not exit — it reconnected and inverted the take-over"
+    );
+    // …and the newcomer still owns the session (it did not lose the display to a
+    // reconnecting incumbent).
+    assert!(
+        !second.wait_exit(Duration::from_secs(1)),
+        "the newcomer lost the display to the reconnecting incumbent"
+    );
+}
+
 /// Send signal `sig` to `pid` via `kill(1)`.
 fn signal_pid(pid: &str, sig: &str) {
     let _ = Command::new("kill")

@@ -108,6 +108,18 @@ pub fn proto_path(name: &str) -> PathBuf {
     session_dir(name).join("proto")
 }
 
+/// Path of the exec-generation marker for the named session. A fresh spawn
+/// writes `0` here; each in-place self-upgrade bumps it by one just before the
+/// `execv`. A local attach records the value it connected at and, on a bare
+/// connection drop, reconnects ONLY if the marker has since advanced — the
+/// signature of a re-exec. An unchanged generation means the drop was a take-over
+/// (whose `Superseded` farewell can be lost under back-pressure), so the client
+/// yields instead of fighting for the display. Absent for hosts built before the
+/// marker existed, read as `0`.
+pub fn gen_path(name: &str) -> PathBuf {
+    session_dir(name).join("gen")
+}
+
 /// The durable data directory (`$XDG_DATA_HOME/ghost`, falling back to
 /// `~/.local/share/ghost`). Unlike [`runtime_dir`], this survives reboot — it
 /// holds recordings, which are archival.

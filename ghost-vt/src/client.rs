@@ -40,6 +40,12 @@ pub struct Client {
     /// marker existed). Optional messages are gated on it: an old host treats
     /// a message it cannot decode as a connection error and drops us.
     proto: u32,
+    /// The host's exec generation at connect time, read from the session dir's
+    /// `gen` marker (0 when absent). A local attach uses it to tell a re-exec
+    /// (marker advanced) from a take-over (marker unchanged) when its connection
+    /// drops — see [`try_reconnect`]. Not meaningful for a remote (SSH) client,
+    /// which never reconnects by name; left 0 there.
+    generation: u64,
 }
 
 impl Client {
@@ -55,6 +61,7 @@ impl Client {
         Ok(Client {
             conn: Conn::connect(sock)?,
             proto: proto_at(sock),
+            generation: gen_at(sock),
         })
     }
 
@@ -71,6 +78,9 @@ impl Client {
         Ok(Client {
             conn: Conn::connect_ssh(cmd)?,
             proto,
+            // A remote pipe never reconnects by name (its liveness lock is on the
+            // far host), so the generation is unused here.
+            generation: 0,
         })
     }
 
@@ -91,6 +101,16 @@ impl Client {
 fn proto_at(sock: &Path) -> u32 {
     sock.parent()
         .and_then(|dir| std::fs::read_to_string(dir.join("proto")).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The exec generation of the host whose socket is at `sock`, read from the
+/// session dir's `gen` marker (0 when absent — a fresh spawn's value, and a
+/// pre-marker host's). See [`paths::gen_path`](crate::paths::gen_path).
+fn gen_at(sock: &Path) -> u64 {
+    sock.parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("gen")).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
@@ -511,19 +531,30 @@ pub fn attach_ssh(cmd: std::process::Command, proto: u32) -> io::Result<()> {
     run_attach(Client::connect_ssh(cmd, proto)?, None)
 }
 
-/// After a local attach's connection drops, decide whether the host is still
-/// there and, if so, reconnect. A self-upgrade re-execs the host in place — same
-/// pid, same lock, same listener socket — so the drop is not the session ending;
-/// the lock is still held and the socket still accepts. Retries briefly because
-/// we may notice the drop a hair before the successor is serving again (in
-/// practice the listener fd survives the exec so it accepts immediately; the
-/// grace just covers a slow successor). Returns `None` when the host is really
-/// gone (lock free) so the caller exits.
-fn try_reconnect(name: &str) -> Option<Client> {
+/// After a local attach's connection drops, decide whether it was a self-upgrade
+/// re-exec worth reconnecting across — and if so, reconnect. A self-upgrade
+/// re-execs the host in place (same pid, lock, listener socket) and, crucially,
+/// bumps the session's exec-generation marker *before* the `execv` that closes
+/// our connection — so a generation now past `attached_gen` is the unambiguous
+/// signature of a re-exec. An unchanged generation means the drop was a take-over
+/// (whose `Superseded` farewell can be lost under back-pressure) or the session
+/// dying, NOT a re-exec: we must yield, not reconnect, or we would fight the new
+/// display client (and, for a flooded take-over, invert it). Retries briefly only
+/// while a re-exec is in flight — the listener fd survives the exec so the
+/// successor usually accepts at once; the grace just covers a slow successor.
+/// Returns `None` (caller exits) when the host is gone, taken over, or a genuine
+/// reconnect never lands in time.
+fn try_reconnect(name: &str, attached_gen: u64) -> Option<Client> {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         // Lock free ⇒ the host is genuinely gone; don't wait, just exit.
         if !crate::session::host_is_live(name) {
+            return None;
+        }
+        // Generation unchanged ⇒ no re-exec happened (the marker is bumped before
+        // the exec that dropped us, so by now it would already show the advance).
+        // This is a take-over — yield the display rather than reconnect and fight.
+        if gen_at(&paths::socket_path(name)) <= attached_gen {
             return None;
         }
         if let Ok(c) = Client::connect(name) {
@@ -565,7 +596,7 @@ fn reconnect_in_place(
     let Some(name) = reconnect else {
         return Ok(false);
     };
-    let Some(new) = try_reconnect(name) else {
+    let Some(new) = try_reconnect(name, client.generation) else {
         return Ok(false);
     };
     *client = new;
@@ -1023,6 +1054,7 @@ mod tests {
             client: Client {
                 conn: Conn::new(AnyTransport::Unix(cli)),
                 proto: crate::protocol::PROTO_LEVEL,
+                generation: 0,
             },
         };
         (host, session)
@@ -1063,6 +1095,7 @@ mod tests {
             client: Client {
                 conn: Conn::new(AnyTransport::Unix(cli)),
                 proto: crate::protocol::PROTO_LEVEL,
+                generation: 0,
             },
         };
         (host, sub)
