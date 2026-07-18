@@ -76,6 +76,13 @@ fn alive(pid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Send signal `sig` (e.g. "TERM", "STOP", "CONT") to `pid` via `kill(1)`.
+fn signal(pid: &str, sig: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{sig}").as_str(), pid])
+        .status();
+}
+
 /// Attach and pump until `needle` renders (or a short deadline passes).
 fn wait_for_screen(session: &mut Session, screen: &mut Screen, needle: &str) -> bool {
     wait_until(Duration::from_secs(5), || {
@@ -702,4 +709,134 @@ fn a_self_upgrade_replaces_the_host_in_place_and_keeps_its_child_alive() {
         "the adopted child did not echo input after the upgrade; saw:\n{}",
         screen.text().join("\n")
     );
+}
+
+/// Spawn a detached `cat` session named `name` whose child prints its own pid
+/// (then `exec`s `cat`, inheriting it), attach briefly to read that pid off the
+/// screen, and return it. The session stays alive for the caller to act on.
+fn spawn_cat_and_child_pid(xdg: &Path, name: &str) -> String {
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD=$$; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+    let mut s =
+        Session::attach_path(&sock(xdg, name), name, 80, 24).expect("attach to read child pid");
+    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    let mut screen = Screen::new(80, 24, 100);
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "CHILD="),
+        "child pid never printed; saw:\n{}",
+        screen.text().join("\n")
+    );
+    let text = screen.text().join("\n");
+    text.split("CHILD=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("CHILD=<pid> on screen")
+        .to_string()
+}
+
+/// After a self-upgrade, a `ghost kill` (a SIGTERM to the host) must still
+/// cleanly end the session and its adopted child. This proves the successor
+/// REINSTALLED its terminating-signal handler and UNBLOCKED the signals the exec
+/// had blocked: without that, the kill would be ignored (the child lingers) or
+/// hit the default disposition and orphan the child. The signal half of the
+/// re-exec contract.
+#[test]
+fn a_kill_after_a_self_upgrade_cleanly_ends_the_session_and_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let child_pid = spawn_cat_and_child_pid(xdg, "killup");
+    let _guard = KillOnDrop {
+        xdg,
+        name: "killup",
+    };
+
+    let out = ghost(xdg).args(["__upgrade", "killup"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The child was adopted across the exec.
+    assert!(alive(&child_pid), "child did not survive the upgrade");
+
+    // A kill now goes to the successor (same pid — an in-place exec).
+    let out = ghost(xdg).args(["kill", "killup"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost kill` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || !alive(&child_pid)
+            && !ls(xdg).contains("killup")),
+        "a kill after the upgrade left the child (pid {child_pid}) or the session behind"
+    );
+}
+
+/// A `ghost kill` (a raw SIGTERM) racing an in-flight self-upgrade must resolve
+/// cleanly: the child is never ORPHANED (host gone, child still running) and the
+/// session is never left half-torn. We force the race with SIGSTOP — freeze the
+/// host, queue an upgrade request AND a SIGTERM against the frozen process, then
+/// SIGCONT — so both are pending together when it resumes. The host must honor
+/// the kill and tear down cleanly; the signals it blocks across the exec can't
+/// leak through as a default-disposition terminate, and the tail's signal
+/// handling is not preempted by the pending upgrade.
+#[test]
+fn a_kill_racing_a_self_upgrade_never_orphans_the_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let child_pid = spawn_cat_and_child_pid(xdg, "raceup");
+    let _guard = KillOnDrop {
+        xdg,
+        name: "raceup",
+    };
+    let host = host_pid(xdg, "raceup").expect("host pid");
+
+    // Freeze the host so the upgrade request and the SIGTERM both land while it
+    // can't act, guaranteeing they are pending together when it resumes.
+    signal(&host, "STOP");
+    // Queue an upgrade: the client connects and writes its request into the
+    // socket buffer even though the frozen host hasn't read it. Background — it
+    // blocks on the reply until the host resumes.
+    let mut up = ghost(xdg).args(["__upgrade", "raceup"]).spawn().unwrap();
+    // No observable predicate for "the request is queued in the kernel", so give
+    // the client a brief moment to connect and send before we deliver the kill.
+    std::thread::sleep(Duration::from_millis(300));
+    signal(&host, "TERM"); // pending on the stopped host
+    signal(&host, "CONT"); // resume: the kill wins, the upgrade doesn't leak past it
+
+    // Clean outcome: the host is gone, the child is gone with it (never
+    // orphaned), and the dead session is pruned from the listing.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !alive(&host) && !alive(&child_pid) && !ls(xdg).contains("raceup")
+        }),
+        "a kill racing the upgrade left a bad state (host alive={}, child alive={}, listed={})",
+        alive(&host),
+        alive(&child_pid),
+        ls(xdg).contains("raceup")
+    );
+
+    let _ = up.kill();
+    let _ = up.wait();
 }

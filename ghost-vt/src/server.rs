@@ -1599,6 +1599,13 @@ fn host_main(
         if pending_upgrade.is_some()
             && pty_out.is_empty()
             && screen.at_boundary()
+            // Don't upgrade with a terminating signal already pending this turn:
+            // signals are handled at the loop's tail, so firing the upgrade first
+            // would exec past a SIGTERM/SIGINT — losing it (the self-pipe fd does
+            // not cross the exec), and a racing `ghost kill` would then poll a
+            // pid that is alive as the NEW host and prune it out from under
+            // itself. Defer one turn so the tail honors the kill instead.
+            && !sig_re.contains(PollFlags::IN)
             && let Some(pid) = child.as_ref().map(|c| c.id())
         {
             let path = pending_upgrade.take().and_then(|p| p.path);
