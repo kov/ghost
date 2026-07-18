@@ -193,6 +193,14 @@ impl<T: Transport> Conn<T> {
         !self.outbuf.is_empty()
     }
 
+    /// Discard everything queued-but-unwritten. For a connection we are about to
+    /// drop: its backlog is worthless, and clearing it lets a final tiny control
+    /// frame be sent without first pushing a (possibly huge, possibly stalled)
+    /// backlog through the socket.
+    pub fn discard_queued(&mut self) {
+        self.outbuf.clear();
+    }
+
     /// How many buffered bytes are still waiting to be written — the peer's
     /// backlog, for callers that bound what they queue to a slow reader.
     pub fn pending(&self) -> usize {

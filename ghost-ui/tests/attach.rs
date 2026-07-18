@@ -418,6 +418,82 @@ fn a_second_attach_supersedes_the_first_without_a_takeover_war() {
     );
 }
 
+/// Taking over the display from a STALLED client must not wedge the host. The
+/// outgoing client is told it was superseded, but if it has frozen (a stopped
+/// process / Ctrl-S — the usual reason the user is attaching from elsewhere) and
+/// its socket buffers are full, that farewell must be best-effort and
+/// non-blocking: a blocking flush would block the whole host inside the write,
+/// unrecoverably (SIGTERM can't interrupt it). We assert the host stays
+/// responsive by requiring `ghost kill` to still succeed after such a take-over.
+#[test]
+fn a_takeover_from_a_stalled_client_does_not_wedge_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "wedge";
+    let _guard = KillOnDrop { xdg, name };
+
+    // A child that floods output, so a stopped display client's send buffers
+    // fill quickly.
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "while :; do echo flood; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    // First attach receives the flood, then we FREEZE it (stop the process): it
+    // stops draining its socket, so the host's send buffers to it fill up.
+    let first = Attached::new(xdg, name, 80, 24);
+    assert!(
+        first.wait_for_screen(Duration::from_secs(5), screen_contains("flood")),
+        "first attach never saw output; got: {:?}",
+        first.screen()
+    );
+    let first_pid = first.child.id().to_string();
+    signal_pid(&first_pid, "STOP");
+    // Let the flood fill the stalled client's outbuf + kernel send buffer.
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Second attach takes over the display from the stalled first.
+    let _second = Attached::new(xdg, name, 80, 24);
+
+    // The crux: the host is NOT wedged in a blocking send — `ghost kill` (a
+    // SIGTERM) still lands and tears the session down.
+    let out = ghost(xdg).args(["kill", name]).output().unwrap();
+    signal_pid(&first_pid, "CONT"); // let the frozen attach resume so it can exit
+    assert!(
+        out.status.success(),
+        "`ghost kill` failed after a stalled-client take-over — the host is wedged: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || !ls(xdg).contains(name)),
+        "session not gone after kill"
+    );
+}
+
+/// Send signal `sig` to `pid` via `kill(1)`.
+fn signal_pid(pid: &str, sig: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{sig}").as_str(), pid])
+        .status();
+}
+
 #[test]
 fn resize_propagates_to_session_child() {
     let tmp = tempfile::tempdir().unwrap();

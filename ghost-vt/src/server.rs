@@ -1611,10 +1611,19 @@ fn host_main(
                             // and a local attach now reconnects on that ambiguity,
                             // so without this the dropped client would take the
                             // display straight back — an endless take-over war.
-                            // Blocking flush so the tiny message lands before the
-                            // connection closes.
+                            //
+                            // Best-effort and NON-blocking: drop the outgoing
+                            // client's (worthless, being-discarded) output backlog
+                            // and send only the tiny farewell. A blocking flush
+                            // here would WEDGE the whole host on a stalled display
+                            // client (a frozen terminal / Ctrl-S — the usual reason
+                            // the user is attaching from elsewhere), unrecoverably
+                            // (SIGTERM can't interrupt the write). If the farewell
+                            // can't land (the client's receive buffer is also
+                            // full), that client reconnects once on resume and is
+                            // superseded again — bounded, not a war.
                             if let Some(mut old) = client.take() {
-                                let _ = old.conn.set_nonblocking(false);
+                                old.conn.discard_queued();
                                 let _ = old.conn.send(&ServerMsg::Superseded);
                             }
                             client = Some(p);

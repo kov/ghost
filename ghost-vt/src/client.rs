@@ -628,9 +628,11 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                                 prompt_input(&bytes, &mut prompt, &mut client, stdin)?;
                             } else if let Err(e) = client.send(&ClientMsg::Input(bytes)) {
                                 // The host may have re-exec'd out from under this
-                                // send (a local self-upgrade). Reconnect and drop
-                                // the keystroke rather than exit; otherwise
-                                // propagate the real error.
+                                // send (a local self-upgrade). Reconnect rather
+                                // than exit; otherwise propagate the real error.
+                                // The unsent `bytes` (this read — up to a whole
+                                // paste chunk) are dropped, an accepted loss in
+                                // the narrow window where a send races the exec.
                                 if !(is_disconnect(&e)
                                     && reconnect_in_place(
                                         &mut client,
