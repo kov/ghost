@@ -202,10 +202,12 @@ enum Command {
         /// To pick up a newer/staged binary, pass its path explicitly.
         path: Option<String>,
     },
-    /// Print this binary's exec-handoff format version and exit. A host about to
-    /// self-upgrade runs `<target> __handoff` to check the target speaks its
-    /// handoff format before exec'ing onto it (a mismatch or a target too old to
-    /// answer is refused). An internal plumbing command; not for direct use.
+    /// Print this binary's exec-handoff format version and protocol level
+    /// (`<handoff> <proto>`) and exit. A host about to self-upgrade runs
+    /// `<target> __handoff` to check the target speaks its handoff format and
+    /// won't downgrade its protocol before exec'ing onto it (a handoff mismatch,
+    /// a lower proto level, or a target too old to answer is refused). An
+    /// internal plumbing command; not for direct use.
     #[command(name = "__handoff", hide = true)]
     Handoff,
 }
@@ -480,7 +482,11 @@ fn dispatch(command: Command) {
                 fail(&e.to_string());
             }
         }
-        Command::Handoff => println!("{}", ghost_vt::server::HANDOFF_VERSION),
+        Command::Handoff => println!(
+            "{} {}",
+            ghost_vt::server::HANDOFF_VERSION,
+            ghost_vt::protocol::PROTO_LEVEL
+        ),
     }
 }
 

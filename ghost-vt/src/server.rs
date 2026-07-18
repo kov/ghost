@@ -474,15 +474,27 @@ fn unblock_upgrade_signals() {
 /// deadline.
 const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Ask the target binary which exec-handoff format it speaks, by running its
-/// `ghost __handoff` subcommand and parsing the [`HANDOFF_VERSION`] it prints.
+/// What the target reports about itself via `ghost __handoff`: the exec-handoff
+/// blob format it speaks ([`HANDOFF_VERSION`]) and the client protocol level it
+/// serves ([`crate::protocol::PROTO_LEVEL`]). Both gate the upgrade — a handoff
+/// mismatch would misdecode the blob, and a lower proto level would silently
+/// downgrade the session's capabilities.
+struct ProbedTarget {
+    handoff: u32,
+    proto: u32,
+}
+
+/// Ask the target binary what it speaks, by running its `ghost __handoff`
+/// subcommand and parsing the `<handoff_version> <proto_level>` line it prints.
 /// A binary predating the mechanism has no such subcommand, so this errors —
 /// which the caller treats as "refuse the upgrade". Bounded ([`wait_bounded`]):
 /// a hung target is killed at the deadline and the upgrade refused, rather than
 /// wedging the host loop on a blocking `output()`. Cheap and reversible (a
-/// short-lived child that only prints a number), so it is safe to run before any
-/// of the exec's irreversible-looking steps.
-fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
+/// short-lived child that only prints two numbers), so it is safe to run before
+/// any of the exec's irreversible-looking steps — but it DOES run the target, so
+/// [`validate_upgrade_target`] must vet it first. Extra trailing tokens are
+/// ignored, so a future binary may append fields without breaking this parse.
+fn probe_target(exe: &std::path::Path) -> io::Result<ProbedTarget> {
     use std::io::Read as _;
     use std::process::Stdio;
     let mut child = std::process::Command::new(exe)
@@ -507,9 +519,55 @@ fn probe_handoff_version(exe: &std::path::Path) -> io::Result<u32> {
         .ok_or_else(|| io::Error::other("handoff probe produced no output"))?
         .read_to_string(&mut buf)
         .map_err(|e| io::Error::new(e.kind(), format!("reading handoff probe output: {e}")))?;
-    buf.trim()
-        .parse::<u32>()
-        .map_err(|_| io::Error::other("upgrade target returned an unparseable handoff version"))
+    let mut toks = buf.split_whitespace();
+    let handoff = toks.next().and_then(|t| t.parse().ok()).ok_or_else(|| {
+        io::Error::other("upgrade target returned an unparseable handoff version")
+    })?;
+    let proto = toks
+        .next()
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(|| io::Error::other("upgrade target did not report a protocol level"))?;
+    Ok(ProbedTarget { handoff, proto })
+}
+
+/// Vet a target binary before we probe or exec it. The probe RUNS the target
+/// and the exec hands it our whole process — so a target we do not trust must be
+/// rejected here, ahead of both. We require a regular file owned by us or root
+/// (a system install) and not writable by group or other: a path someone else
+/// can rewrite could be swapped for a hostile binary. This is inherently a
+/// check-then-use (the file could still change between here and the exec), and
+/// this is a local action (`ghost __upgrade <name> <path>`), so the bar is "not
+/// obviously tamperable", not a full trust chain — enough to reject the easy
+/// footguns (a world-writable drop, someone else's file).
+fn validate_upgrade_target(exe: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(exe).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot stat upgrade target {}: {e}", exe.display()),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(io::Error::other(format!(
+            "refusing to upgrade: target {} is not a regular file",
+            exe.display()
+        )));
+    }
+    let us = rustix::process::getuid().as_raw();
+    if meta.uid() != 0 && meta.uid() != us {
+        return Err(io::Error::other(format!(
+            "refusing to upgrade: target {} is owned by uid {} (neither us nor root)",
+            exe.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other(format!(
+            "refusing to upgrade: target {} is writable by group or other",
+            exe.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Serialize the current screen into an unlinked temp file as a standalone
@@ -580,21 +638,38 @@ fn self_upgrade(
     let exe_c = CString::new(exe.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
 
-    // PROBE BEFORE THE EXEC. The blob we are about to hand the target is in OUR
-    // format ([`HANDOFF_VERSION`]); a target speaking a different version would
+    // VET, THEN PROBE, BOTH BEFORE THE EXEC. `validate_upgrade_target` runs
+    // first because the probe RUNS the target: we won't exec (nor even probe) a
+    // file we don't trust (foreign-owned, group/world-writable, not a regular
+    // file).
+    validate_upgrade_target(&exe)?;
+    // The blob we are about to hand the target is in OUR format
+    // ([`HANDOFF_VERSION`]); a target speaking a different version would
     // misdecode it (postcard is positional and ignores trailing bytes, so the
     // miss can be SILENT — a wrong-layout adopt that spawns a duplicate child and
     // orphans the real one). The decode is post-`execv`, where failure is
     // unrecoverable, so we must catch the skew here, while a refusal simply
     // leaves the host running. A target that predates the mechanism has no
     // `__handoff` subcommand, so the probe errors and we refuse — never exec into
-    // it. (Fuller target validation — regular file, our UID, `proto >=` ours — is
-    // Step 5; this is its skeleton.)
-    let target_version = probe_handoff_version(&exe)?;
-    if target_version != HANDOFF_VERSION {
+    // it.
+    let probed = probe_target(&exe)?;
+    if probed.handoff != HANDOFF_VERSION {
         return Err(io::Error::other(format!(
-            "refusing to upgrade: target speaks handoff version {target_version}, we speak \
-             {HANDOFF_VERSION} — restart the session instead"
+            "refusing to upgrade: target speaks handoff version {}, we speak {HANDOFF_VERSION} — \
+             restart the session instead",
+            probed.handoff
+        )));
+    }
+    // Refuse an in-place DOWNGRADE. All attached clients are dropped by the exec
+    // and reconnect to the successor, renegotiating at its proto level; a target
+    // below ours would silently lower what the session can do. Rolling back to an
+    // older binary is `__restart` territory (a fresh respawn), not a self-upgrade.
+    if probed.proto < crate::protocol::PROTO_LEVEL {
+        return Err(io::Error::other(format!(
+            "refusing to upgrade: target serves protocol level {} but we serve {} — an in-place \
+             downgrade would silently lower the session's capabilities; restart to roll back",
+            probed.proto,
+            crate::protocol::PROTO_LEVEL
         )));
     }
 

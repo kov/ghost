@@ -108,6 +108,125 @@ fn observe_grid_and_name(xdg: &Path, name: &str) -> (Option<(u16, u16)>, String)
     (grid, display)
 }
 
+/// Spawn a `cat` session, point `__upgrade` at `target`, and assert the host
+/// REFUSED it: the host kept its pid (no exec), the child is still alive, and
+/// the host is responsive again (it echoes fresh input). Used by the
+/// target-validation refusal tests, which each hand a differently-untrustworthy
+/// target and expect the same "declined, still serving" outcome.
+fn assert_target_refused(name: &str, target: &Path) {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD=$$; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop { xdg, name };
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let child_pid;
+    {
+        let mut s = Session::attach_path(&sock(xdg, name), name, 80, 24)
+            .expect("attach before refused upgrade");
+        s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut screen = Screen::new(80, 24, 100);
+        assert!(
+            wait_for_screen(&mut s, &mut screen, "CHILD="),
+            "child pid never printed; saw:\n{}",
+            screen.text().join("\n")
+        );
+        let text = screen.text().join("\n");
+        child_pid = text
+            .split("CHILD=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("CHILD=<pid> on screen")
+            .to_string();
+    }
+    let before_host = host_pid(xdg, name).expect("host pid before refused upgrade");
+
+    let out = ghost(xdg)
+        .args(["__upgrade", name, target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` delivery failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        host_pid(xdg, name).as_deref(),
+        Some(before_host.as_str()),
+        "host pid changed — a refused upgrade must not exec"
+    );
+    assert!(
+        alive(&child_pid),
+        "the child (pid {child_pid}) died — a refused upgrade must leave it running"
+    );
+    let mut s =
+        Session::attach_path(&sock(xdg, name), name, 80, 24).expect("attach after refused upgrade");
+    s.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    s.send_input(b"STILL-ALIVE\n").unwrap();
+    let mut screen = Screen::new(80, 24, 100);
+    assert!(
+        wait_for_screen(&mut s, &mut screen, "STILL-ALIVE"),
+        "the child stopped echoing after a refused upgrade; saw:\n{}",
+        screen.text().join("\n")
+    );
+}
+
+/// Write `body` to `dir/fake-ghost`, mark it executable-plus-`extra` mode bits,
+/// and return its path — a stand-in `ghost` whose `__handoff` output the test
+/// controls.
+fn write_fake_ghost(dir: &Path, body: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let target = dir.join("fake-ghost");
+    std::fs::write(&target, body).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+    target
+}
+
+/// The probe RUNS the target and the exec hands it our process, so a target
+/// anyone else can rewrite must be refused before either — even when it reports
+/// a perfectly valid handoff. Here a world-writable script that answers the
+/// probe with our own `<handoff> <proto>` is still declined on its mode.
+#[test]
+fn a_self_upgrade_refuses_a_world_writable_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Reports a valid handoff+proto (so only the mode can disqualify it), but is
+    // writable by everyone.
+    let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 6\n", 0o777);
+    assert_target_refused("wwup", &target);
+}
+
+/// A self-upgrade must not silently DOWNGRADE the session: a target that speaks
+/// a lower protocol level than we serve is refused (rolling back is `__restart`
+/// territory, not an in-place adopt). Here the target reports handoff 2 / proto
+/// 5 while we serve proto 6.
+#[test]
+fn a_self_upgrade_refuses_a_protocol_downgrade() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = write_fake_ghost(tmp.path(), "#!/bin/sh\necho 2 5\n", 0o755);
+    assert_target_refused("downup", &target);
+}
+
 /// An upgrade must keep the session the SAME session: the child's terminal
 /// geometry (the old code reverted it to the stale spawn-time `opts.size`) and
 /// the durable identity — the rename label, the creation time — must survive.
