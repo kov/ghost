@@ -1445,21 +1445,29 @@ fn host_main(
         {
             let path = pending_upgrade.take().flatten();
             // Flush the recorder's buffered frame to disk BEFORE the exec so the
-            // successor appends after complete data (it reopens the file to
-            // continue it). Harmless if the upgrade is then refused.
-            if let Some(r) = &mut recorder {
-                let _ = r.flush();
+            // successor appends after COMPLETE data (it reopens the file to
+            // continue it). If the flush fails (a full or erroring disk), the tail
+            // may be a torn frame; appending past it would bury the tear mid-file
+            // and the successor's whole recording would be silently discarded on
+            // the next read. So refuse the upgrade on a flush error — the request
+            // is already taken (one-shot), so it just doesn't happen and the host
+            // runs on unchanged.
+            let flushed = match &mut recorder {
+                Some(r) => r.flush().is_ok(),
+                None => true,
+            };
+            if flushed {
+                let _ = self_upgrade(
+                    listener,
+                    lock_fd,
+                    &pty,
+                    pid,
+                    &screen,
+                    opts,
+                    launch_dir,
+                    path.as_deref(),
+                );
             }
-            let _ = self_upgrade(
-                listener,
-                lock_fd,
-                &pty,
-                pid,
-                &screen,
-                opts,
-                launch_dir,
-                path.as_deref(),
-            );
         }
 
         // Reconcile the attach marker with the display client's presence. All the

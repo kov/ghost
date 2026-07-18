@@ -145,9 +145,13 @@ pub struct CheckpointImage<'a> {
     pub pixels: &'a [u8],
 }
 
-/// Content hash of an image, over its dimensions and pixels. Only ever compared
-/// against other hashes read back from the same recording, so the algorithm need
-/// only be deterministic, not stable across versions.
+/// Content hash of an image, over its dimensions and pixels. Compared only
+/// against other hashes of images in the same recording, so the algorithm need
+/// only be deterministic within one run, not stable across versions. (A
+/// self-upgrade's [`FileRecorder::open_append`] rehydrates hashes computed by
+/// the *predecessor* binary; a hasher difference there is safe in the only
+/// direction that matters — an unrecognized image is simply re-stored as a new
+/// blob rather than aliased to a stale reference.)
 ///
 /// The 64-bit hash is the dedup key without a byte re-check, so a collision
 /// between two genuinely distinct images would alias them (the second is never
@@ -254,6 +258,14 @@ impl FileRecorder {
     /// back to a fresh recording) if the file is missing or unreadable.
     pub fn open_append(path: &Path, max_bytes: Option<usize>) -> io::Result<Self> {
         let existing = std::fs::read(path)?;
+        // Only continue a recording we can actually DECODE. Appending blind to a
+        // corrupt or future-format file would either strand `base_ms` at 0
+        // (backward timestamps) or, on a format-version bump, make the whole file
+        // unreadable. A decode failure here makes the caller fall back to
+        // `create` (a fresh recording) — losing pre-upgrade history, but never
+        // corrupting the file. (`read_bytes` tolerates a torn TRAILING frame, so
+        // a clean recording still opens; the pre-exec flush guards the tail.)
+        read_bytes(&existing).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let written_hashes = stored_image_hashes(&existing);
         let base_ms = last_t_ms(&existing);
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
