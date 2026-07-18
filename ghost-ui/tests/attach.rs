@@ -297,6 +297,73 @@ fn detach_keeps_session_alive_then_reattach() {
     );
 }
 
+/// A local `ghost attach` must SURVIVE a host self-upgrade. The host re-execs in
+/// place — same pid, same liveness lock, same listener socket, same child — so
+/// the attach's connection drops but the session is NOT over. The client must
+/// reconnect by name (the lock is still held) and stay interactive, not print
+/// "session closed" and exit.
+#[test]
+fn attach_survives_a_host_self_upgrade() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-upgrade";
+    let _guard = KillOnDrop { xdg, name };
+
+    let out = ghost(xdg)
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "echo READYtag; exec cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let mut term = Attached::new(xdg, name, 80, 24);
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("READYtag")),
+        "session not attached; got: {:?}",
+        term.screen()
+    );
+
+    // Upgrade the host in place (to itself — proving the mechanism needs no newer
+    // binary). Delivered over a separate control connection; the attached client
+    // is the display client whose connection the exec drops.
+    let out = ghost(xdg).args(["__upgrade", name]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost __upgrade` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The client must NOT have exited: it reconnected across the re-exec.
+    assert!(
+        !term.wait_exit(Duration::from_secs(2)),
+        "the attach exited on the self-upgrade instead of reconnecting"
+    );
+
+    // …and it is still a live pipe to the SAME adopted child: typed input still
+    // echoes back through `cat`.
+    term.send(b"AFTER-UPGRADE\n");
+    assert!(
+        term.wait_for_screen(Duration::from_secs(5), screen_contains("AFTER-UPGRADE")),
+        "reconnected attach did not echo input after the upgrade; got: {:?}",
+        term.screen()
+    );
+}
+
 #[test]
 fn resize_propagates_to_session_child() {
     let tmp = tempfile::tempdir().unwrap();

@@ -485,7 +485,10 @@ impl Session {
 /// Attach to the named session, returning when the user detaches or the session
 /// ends.
 pub fn attach(name: &str) -> io::Result<()> {
-    run_attach(Client::connect(name)?)
+    // A local attach can reconnect by name: if the connection drops but the
+    // host still holds its lock (a self-upgrade re-execs in place), re-attach
+    // instead of exiting.
+    run_attach(Client::connect(name)?, Some(name))
 }
 
 /// Attach to a *remote* session over the SSH transport: `cmd` is the
@@ -495,12 +498,42 @@ pub fn attach(name: &str) -> io::Result<()> {
 /// attach sends only Resize/Input/Kill so it never trips the gate, but it carries
 /// the real level for consistency with the GUI paths.
 pub fn attach_ssh(cmd: std::process::Command, proto: u32) -> io::Result<()> {
-    run_attach(Client::connect_ssh(cmd, proto)?)
+    // No by-name reconnect for a remote pipe: the liveness lock lives on the
+    // remote host, which we can't flock from here — the GUI's remote path rides
+    // its own `disconnected` reconnect (see [`Session::pump`]) instead.
+    run_attach(Client::connect_ssh(cmd, proto)?, None)
+}
+
+/// After a local attach's connection drops, decide whether the host is still
+/// there and, if so, reconnect. A self-upgrade re-execs the host in place — same
+/// pid, same lock, same listener socket — so the drop is not the session ending;
+/// the lock is still held and the socket still accepts. Retries briefly because
+/// we may notice the drop a hair before the successor is serving again (in
+/// practice the listener fd survives the exec so it accepts immediately; the
+/// grace just covers a slow successor). Returns `None` when the host is really
+/// gone (lock free) so the caller exits.
+fn try_reconnect(name: &str) -> Option<Client> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        // Lock free ⇒ the host is genuinely gone; don't wait, just exit.
+        if !crate::session::host_is_live(name) {
+            return None;
+        }
+        if let Ok(c) = Client::connect(name) {
+            return Some(c);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// The raw-mode terminal pipe shared by [`attach`] and [`attach_ssh`]: forward
-/// stdin<->host until the user detaches or the session ends.
-fn run_attach(mut client: Client) -> io::Result<()> {
+/// stdin<->host until the user detaches or the session ends. `reconnect` is the
+/// session name for a LOCAL attach (enabling by-name re-attach across a host
+/// self-upgrade) or `None` for a remote pipe.
+fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
     let stdin = rustix::stdio::stdin();
 
     // Raw mode, restored on return via the guard's Drop.
@@ -572,6 +605,18 @@ fn run_attach(mut client: Client) -> io::Result<()> {
         // host -> stdout
         if sock_re.intersects(PollFlags::IN | PollFlags::HUP) {
             let Some(msgs) = client.recv_ready()? else {
+                // The connection dropped without a clean `Exited`. For a local
+                // attach this can be a self-upgrade (the host re-exec'd in place,
+                // keeping its lock, socket and child) rather than the session
+                // ending — reconnect if the host still holds its lock, and
+                // re-handshake (a resize) to become its display client again.
+                if let Some(name) = reconnect
+                    && let Some(new_client) = try_reconnect(name)
+                {
+                    client = new_client;
+                    send_resize(&mut client, stdin)?;
+                    continue;
+                }
                 eprint!("\r\n[ghost: session closed]\r\n");
                 return Ok(());
             };

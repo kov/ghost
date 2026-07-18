@@ -148,6 +148,21 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
     Ok(out)
 }
 
+/// Whether a host still holds `name`'s liveness lock — i.e. the session's host
+/// process is alive. A host that self-upgrades re-execs in place while holding
+/// the lock, so across the swap the lock stays taken even though the old
+/// connection dropped; a local attach uses this to tell "the host re-exec'd,
+/// reconnect" from "the host is really gone, exit". A session still coming up
+/// (no lock file yet) counts as live so a reconnecting attach waits for it
+/// rather than giving up. Nonblocking and side-effect-free (any lock briefly
+/// acquired is released as the handle drops).
+pub fn host_is_live(name: &str) -> bool {
+    !matches!(
+        host_state(&crate::paths::session_dir(name)),
+        HostState::Dead
+    )
+}
+
 /// Read a session directory's liveness from its lock file. Trying to take the
 /// lock non-blocking tells us whether a host still holds it: failure (would
 /// block) means a host is alive, success means the lock is free and the session
