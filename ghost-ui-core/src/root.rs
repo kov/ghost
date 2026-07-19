@@ -1581,7 +1581,7 @@ impl RootModel {
             }
             cmds.extend(self.drive(sessions, ev));
             self.mirror_fleet_identity();
-            self.release_detached(sessions, &cmds);
+            self.release_detached(&cmds);
             if let Some(p) = self.pending_dive.take() {
                 cmds.extend(self.launch_dive_out(sessions, &p));
             }
@@ -1603,7 +1603,7 @@ impl RootModel {
             } if !self.focused_win && self.mine.contains(name.as_str()));
         let mut cmds = self.drive(sessions, ev);
         self.mirror_fleet_identity();
-        self.release_detached(sessions, &cmds);
+        self.release_detached(&cmds);
         if bell_attention {
             cmds.push(Cmd::RequestAttention);
         }
@@ -1652,19 +1652,19 @@ impl RootModel {
     /// bell reaction, Ctrl-Tab, and the next fleet all see it as not ours.
     /// In the single view the released session also leaves this window's
     /// group (an open fleet syncs the registry itself), appending the save.
-    fn release_detached(&mut self, sessions: &mut Sessions, cmds: &[Cmd]) {
+    fn release_detached(&mut self, cmds: &[Cmd]) {
         // Ownership only: the window stops driving the session, but its
         // group membership stays — detaching is not ungrouping, so the
         // member just goes cold in its block.
         for c in cmds {
             if let Cmd::Detach(id) = c {
                 self.mine.remove(id);
-                // Its only view in this window is the warm mirror; dropping that
-                // drops the last viewer, so the session state goes too. (In the
-                // fleet the tile owns the state, warm is empty, and this no-ops.)
-                if self.warm.remove(id).is_some() {
-                    sessions.remove(id);
-                }
+                // Drop this window's warm view too, but NOT the shared `SessionState`:
+                // under the process-wide registry another window may still show it, so
+                // the shell's `Cmd::Detach` executor reconciles the source (view-checked
+                // across every window). Reaping it here deleted a state another window
+                // was foregrounding.
+                self.warm.remove(id);
             }
         }
     }
@@ -1723,10 +1723,14 @@ impl RootModel {
             }
         };
         if ended {
-            // A dead background session is no longer ours: drop its mirror, its
-            // state, and our ownership so Ctrl-Tab and the fleet never land on it.
+            // A dead background session is no longer ours: drop this window's mirror
+            // and ownership so Ctrl-Tab and the fleet never land on it. The shared
+            // `SessionState` is NOT removed here — under the process-wide registry it
+            // may still be another window's live foreground, and the last-viewer prune
+            // (view-checked across every window) is the shell's to make, not one core
+            // view's. Removing it here reaped a session another window was showing,
+            // leaving that window `Single` on a state that no longer exists.
             self.warm.remove(&name);
-            sessions.remove(&name);
             self.mine.remove(&name);
         }
         cmds
@@ -2938,6 +2942,59 @@ mod tests {
             }],
             "an observer's keystroke reaches the shared session by id"
         );
+    }
+
+    /// The reaper behind the macOS "window randomly drops its foreground session then
+    /// aborts on Cmd-`" crash. Under the process-wide registry a session can be one
+    /// window's live foreground AND another window's warm background mirror (it drove
+    /// the session, then Ctrl-Tabbed away — a second view onto the one shared state).
+    /// When that background mirror's child ends, the window must drop its OWN mirror and
+    /// ownership but must NOT delete the shared `SessionState`: another window is still
+    /// showing it, and the last-viewer prune is the shell's to make (view-checked across
+    /// every window), never a single core view's. `feed_warm`'s process-wide
+    /// `sessions.remove` (a pre-shared-registry leftover) did exactly that, leaving the
+    /// other window `Single` on a reaped session — which then hit
+    /// `expect("foreground session state present")` on the next focus/paint.
+    #[test]
+    fn an_ended_background_mirror_never_reaps_a_session_another_window_shows() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint("beta", 80, 24);
+
+        // Window A: a live single view of alpha (it drives + foregrounds it).
+        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        a.mine.insert("alpha".into());
+
+        // Window B: foregrounds beta, but still holds alpha as a warm background mirror
+        // (drove alpha, then Ctrl-Tabbed to beta) — a second view onto shared alpha.
+        let mut b = RootModel::viewing("beta", 80, 24, METRICS, SIZE);
+        b.mine.insert("beta".into());
+        b.mine.insert("alpha".into());
+        b.warm
+            .insert("alpha".into(), TerminalView::new(METRICS, 80, 24));
+
+        // alpha's child exits: the shell fans the end to B's warm mirror.
+        let _ = b.update(
+            &mut sessions,
+            UiEvent::SessionData {
+                name: "alpha".into(),
+                bytes: Vec::new(),
+                ended: true,
+            },
+        );
+
+        assert!(!b.warm.contains_key("alpha"), "B drops its own dead mirror");
+        assert!(
+            !b.mine.contains("alpha"),
+            "B releases its ownership of alpha"
+        );
+        assert!(
+            sessions.contains("alpha"),
+            "alpha's shared state survives — window A still foregrounds it"
+        );
+        // A, still `Single{alpha}`, focuses (Cmd-`) without tripping the invariant guard.
+        let _ = a.update(&mut sessions, UiEvent::Focus(true));
+        let _ = a.view(&sessions);
     }
 
     /// Grid ownership is a driving-view privilege: an observer window's resize follows
