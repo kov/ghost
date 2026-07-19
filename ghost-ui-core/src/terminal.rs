@@ -407,6 +407,14 @@ pub struct TermTrace {
 #[derive(Clone, PartialEq)]
 struct Presented {
     scroll: usize,
+    /// Total lines the session has scrolled off the top (`lines_scrolled_off`) at the
+    /// present. While scrolled back the viewport is anchored to the *live bottom*, so a
+    /// feed that scrolls new lines off shifts what a FIXED `scroll` offset shows even
+    /// though the offset number is unchanged — a `scroll`-only compare can't see it (the
+    /// offset round-trips to the bottom and back between presents, so it matches). Diffed
+    /// in [`Self::damage`], gated on `scroll_offset > 0`: at the live bottom the shift is
+    /// the ordinary feed the row hint already covers.
+    scrolled_off: usize,
     selection: Option<Selection>,
     size: (u32, u32),
     zoom: f32,
@@ -1318,6 +1326,13 @@ impl TerminalView {
                 None => true,
                 Some(p) => {
                     p.scroll != self.scroll_offset
+                        // Scrolled back, the viewport is pinned to the live bottom: new
+                        // lines scrolling off shift the whole visible window under a
+                        // fixed offset, so the content changed even though `scroll` did
+                        // not. At the bottom (offset 0) this is the ordinary live feed
+                        // the row hint covers, so gate it on being scrolled away.
+                        || (self.scroll_offset > 0
+                            && p.scrolled_off != state.screen.vt().lines_scrolled_off())
                         || p.selection != self.selection
                         || p.size != self.size_px
                         || p.zoom != self.zoom
@@ -1384,6 +1399,7 @@ impl TerminalView {
     pub(crate) fn mark_presented(&mut self, state: &SessionState) {
         self.presented = Some(Presented {
             scroll: self.scroll_offset,
+            scrolled_off: state.screen.vt().lines_scrolled_off(),
             selection: self.selection,
             size: self.size_px,
             zoom: self.zoom,
@@ -6338,6 +6354,67 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// A regression pin for the scroll-anchor damage hole the property test above
+        /// found only rarely (its `ScrollUp`/`ScrollDown` are no-ops until there's real
+        /// scrollback, so the shrinker seldom kept the exact ordering). While scrolled
+        /// back, the viewport is anchored to the live bottom, so a feed that scrolls new
+        /// lines off shifts every visible row even though the offset number is unchanged.
+        /// The sequence: scroll up a page, present, scroll back down, feed a line (it
+        /// scrolls off at the bottom), scroll up a page again — the offset returns to the
+        /// same value it was presented at, but `lines_scrolled_off` grew, so the content
+        /// shifted. `damage` used to compare only the offset and report a one-row band,
+        /// leaving the rest of the re-scrolled viewport stale.
+        #[test]
+        fn a_feed_that_scrolled_off_while_at_bottom_repaints_the_rescrolled_view() {
+            let mut m = model();
+            // Real scrollback so the page scrolls aren't no-ops.
+            for i in 0..60 {
+                m.update(UiEvent::SessionData {
+                    name: "alpha".into(),
+                    bytes: format!("line{i:03}\r\n").into_bytes(),
+                    ended: false,
+                });
+            }
+            let (mut last_present, _) = frame_and_damage(&m);
+            m.mark_presented();
+
+            let up = |m: &mut super::TerminalModel| {
+                key(m, Key::Named(NamedKey::PageUp), Mods::SHIFT);
+            };
+            let down = |m: &mut super::TerminalModel| {
+                key(m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+            };
+            let present = |m: &mut super::TerminalModel, last: &mut Rc<Frame>| {
+                let (cur, dmg) = frame_and_damage(m);
+                if cur != *last {
+                    assert!(
+                        !matches!(dmg, TermDamage::None),
+                        "the frame changed since the last present but damage is None"
+                    );
+                    if let TermDamage::Rows { lo, hi } = dmg {
+                        assert!(
+                            rows_differ_outside(last, &cur, Some((lo, hi))).is_none(),
+                            "a Rows({lo},{hi}) band left a changed row unrepainted"
+                        );
+                    }
+                }
+                m.mark_presented();
+                *last = cur;
+            };
+
+            up(&mut m); // scroll a page into history
+            present(&mut m, &mut last_present);
+            down(&mut m); // back to the live bottom
+            // A line scrolls off the top at the bottom — `lines_scrolled_off` grows.
+            m.update(UiEvent::SessionData {
+                name: "alpha".into(),
+                bytes: b"\r\n".to_vec(),
+                ended: false,
+            });
+            up(&mut m); // same offset as the earlier present, but shifted content
+            present(&mut m, &mut last_present);
         }
 
         /// Lay out the CURRENT session state directly, BYPASSING the view's frame
