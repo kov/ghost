@@ -2338,6 +2338,30 @@ impl App {
         // A handled event may have changed a window's foreground, view, grid, or
         // membership; mark the workspace for the loop's once-per-wake flush.
         self.workspace_dirty = true;
+        self.assert_foreground_states_present("after dispatch");
+    }
+
+    /// Every window in the single view must have its foreground `SessionState` present
+    /// in the process-wide registry: `RootModel::drive`/`live_scene` index it by id and
+    /// abort (`expect("foreground session state present")`) on a miss — the crash a
+    /// stray mouse-move or Cmd-` surfaces long after the fact. This catches a
+    /// cross-window reaper (a shared state removed while another window still
+    /// foregrounds it) AT THE MUTATION that caused it, naming the window and session,
+    /// instead of at the eventual input event in an unrelated window. Debug-only, but
+    /// the macOS dev build ships with debug-assertions on, so it runs where the crash
+    /// was seen. `ctx` says which pass tripped it.
+    fn assert_foreground_states_present(&self, ctx: &str) {
+        #[cfg(debug_assertions)]
+        for (wid, w) in &self.windows {
+            if let Some(fg) = w.root.single_foreground() {
+                debug_assert!(
+                    self.states.contains(fg),
+                    "window {wid:?} is Single on '{fg}' but its shared state is gone ({ctx}) \
+                     — a cross-window reaper deleted a foregrounded session's state"
+                );
+            }
+        }
+        let _ = ctx;
     }
 
     fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
@@ -5496,6 +5520,7 @@ impl App {
                 );
             }
         }
+        self.assert_foreground_states_present("after wake");
         fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
     }
 }

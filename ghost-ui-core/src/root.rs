@@ -108,21 +108,19 @@ impl Sessions {
         self.map.insert(id, state);
     }
 
-    pub(crate) fn remove(&mut self, id: &str) -> Option<SessionState> {
-        self.map.remove(id)
-    }
-
     /// Drop `id`'s shared state — the shell's last-viewer prune, run once no window
-    /// views the session any more. Public twin of the crate-internal [`remove`](
-    /// Self::remove) (the core's own lifecycle sweeps): under the process-wide
-    /// registry the shell owns the "removed once the last view lets go" rule, so a
-    /// window closing can't delete a state another window still renders.
+    /// views the session any more. The ONLY way a session state is removed: under the
+    /// process-wide registry the shell owns the "removed once the last view lets go"
+    /// rule (`reconcile_source`/`prune_orphan_states`), so a single core view — a
+    /// window closing, a fleet diving out, a background mirror ending — can never
+    /// delete a state another window still renders. The core has no `remove` of its
+    /// own; every path that used to reap here reaped a foregrounded session.
     pub fn discard(&mut self, id: &str) {
         self.map.remove(id);
     }
 
     /// Whether this window holds a state for `id`.
-    pub(crate) fn contains(&self, id: &str) -> bool {
+    pub fn contains(&self, id: &str) -> bool {
         self.map.contains_key(id)
     }
 
@@ -935,6 +933,17 @@ impl RootModel {
     /// the geometry/query-answer source is stable across wakes.
     pub fn foregrounds(&self, name: &str) -> bool {
         matches!(&self.mode, Mode::Single { id, .. } if id == name)
+    }
+
+    /// This window's `Single`-view foreground session id, or `None` in the fleet. The
+    /// shell asserts a present shared state for exactly these (a `Single` window whose
+    /// foreground state was reaped aborts in `drive`); a fleet window borrows its tiles'
+    /// states through the fan and has no single foreground to guard.
+    pub fn single_foreground(&self) -> Option<&SessionId> {
+        match &self.mode {
+            Mode::Single { id, .. } => Some(id),
+            Mode::Fleet(_) => None,
+        }
     }
 
     /// The driving geometry to ingest `name`'s feed against — the grid/pixels/focus of

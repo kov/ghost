@@ -1093,9 +1093,11 @@ impl FleetModel {
 
     /// Consume the fleet, returning `keep`'s view (or a freshly-minted one named
     /// `fresh`) with its id, every other *driven* (this-window) session's view to
-    /// keep warm, and the resize commands sizing them all to the window. The states
-    /// stay in `sessions`; a foreign preview's state — no longer shown by any view —
-    /// is removed, so the window's theme/policy broadcast never reaches a ghost.
+    /// keep warm, and the resize commands sizing them all to the window. Every state
+    /// stays in `sessions`: a foreign preview's view is dropped with its tile, but its
+    /// shared state is NOT — under the process-wide registry that state may be another
+    /// window's live foreground, and the last-viewer prune is the shell's (via the
+    /// `Unobserve` emitted here + `prune_orphan_states`), never a diving window's.
     fn extract(
         self,
         sessions: &mut Sessions,
@@ -1111,7 +1113,6 @@ impl FleetModel {
         let mut cmds: Vec<Cmd> = self.observing.iter().cloned().map(Cmd::Unobserve).collect();
         let mut kept: Option<(SessionId, TerminalView)> = None;
         let mut warm = Vec::new();
-        let mut dropped = Vec::new();
         for tile in self.tiles {
             if Some(&tile.id) == keep.as_ref() {
                 // Adopting a session as the foreground claims it into this
@@ -1129,12 +1130,16 @@ impl FleetModel {
                 kept = Some((tile.id, tile.view));
             } else if tile.locality == Locality::ThisWindow {
                 warm.push((tile.id, tile.view)); // a driven session: keep it warm
-            } else {
-                dropped.push(tile.id); // a foreign preview: its state goes too
             }
-        }
-        for id in dropped {
-            sessions.remove(&id);
+            // Else a foreign preview: this window stops showing it, so its `tile.view`
+            // is dropped here — but NOT its shared `SessionState`. Under the process-
+            // wide registry a "foreign"/Elsewhere tile is a session another window is
+            // *driving in the foreground*, so removing its state here reaped that
+            // window's live foreground (leaving it `Single` on a gone session, which
+            // aborts on the next input). The shell owns the last-viewer prune: the
+            // `Unobserve` emitted above drops this window's observer, and
+            // `prune_orphan_states`/`reconcile_source` reap the state only once no
+            // window views it.
         }
         let resize = UiEvent::Resize {
             w_px: size_px.0.max(1),
@@ -4301,6 +4306,20 @@ mod tests {
         fn into_single_adopting(self, id: SessionId, size_px: (u32, u32), scale: f32) -> Extracted {
             let Fleet { m, mut s, mine: _ } = self;
             m.into_single_adopting(&mut s, id, size_px, scale)
+        }
+
+        /// Like [`into_single_adopting`](Self::into_single_adopting), but also hands back
+        /// the shared `Sessions` so a test can assert which states survived the dive
+        /// (a foreign preview's state must NOT be reaped — another window may drive it).
+        fn into_single_adopting_with_sessions(
+            self,
+            id: SessionId,
+            size_px: (u32, u32),
+            scale: f32,
+        ) -> (Extracted, Sessions) {
+            let Fleet { m, mut s, mine: _ } = self;
+            let extracted = m.into_single_adopting(&mut s, id, size_px, scale);
+            (extracted, s)
         }
 
         /// The session state behind a tile — for the assertions that once read it off
@@ -8470,6 +8489,45 @@ mod tests {
         );
         // Proof the guard is satisfied: extracting it as the foreground no longer panics.
         let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
+    }
+
+    /// The fleet-dive reaper behind the macOS "window drops its foreground session
+    /// then aborts on a mouse-move" crash. This window owns "alpha" and also previews a
+    /// foreign "beta" — a session attached (foregrounded) in ANOTHER window, its one
+    /// shared `SessionState` living in the process-wide registry. Diving this window
+    /// out of the fleet back into "alpha" must drop only the foreign tile's VIEW, never
+    /// beta's shared state: reaping it here left the other window `Single` on a gone
+    /// session, which aborted at `drive`'s `expect` on its next input.
+    #[test]
+    fn diving_out_of_the_fleet_never_reaps_a_foreign_session_another_window_drives() {
+        let mine = HashSet::from(["alpha".to_string()]);
+        let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
+        f.update(UiEvent::SessionList(vec![
+            info("alpha"),
+            sinfo("beta", true),
+        ]));
+        assert_eq!(
+            f.locality_of("beta"),
+            Some(Locality::Elsewhere),
+            "beta is attached in another window"
+        );
+        // Model the shared registry: beta's state exists because the OTHER window
+        // drives it in its foreground.
+        f.s.get_or_mint("beta", 80, 24);
+
+        // Dive back into our own "alpha", dropping the foreign beta tile.
+        let (_extracted, sessions) =
+            f.into_single_adopting_with_sessions("alpha".to_string(), SIZE, 1.0);
+
+        assert!(
+            sessions.contains("alpha"),
+            "the adopted foreground survives"
+        );
+        assert!(
+            sessions.contains("beta"),
+            "beta's shared state survives — the other window still foregrounds it"
+        );
     }
 
     #[test]
