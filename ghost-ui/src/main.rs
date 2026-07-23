@@ -708,19 +708,46 @@ fn client_identity() -> String {
 fn session_set_watcher(
     flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<notify::RecommendedWatcher> {
+    session_set_watcher_in(&ghost_vt::paths::runtime_dir(), flag)
+}
+
+/// [`session_set_watcher`] over an explicit `dir`, so tests can drive it against
+/// a tempdir without touching the real XDG location.
+fn session_set_watcher_in(
+    dir: &std::path::Path,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher;
-    let dir = ghost_vt::paths::runtime_dir();
     // The dir may not exist before the first session; create it so the watch
     // can bind now (hosts create it on demand anyway).
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
     let mut w = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if res.is_ok() {
+        if let Ok(ev) = res
+            && fs_event_is_a_change(&ev)
+        {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     })
     .ok()?;
-    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
+    w.watch(dir, notify::RecursiveMode::NonRecursive).ok()?;
     Some(w)
+}
+
+/// Whether a filesystem notification reports the watched content actually
+/// *changing* (create/write/rename/remove), as opposed to merely being *read*.
+///
+/// Access (read) events MUST not count as changes: the reaction to a change is
+/// to re-read the watched thing (re-enumerate the session dir, reload the
+/// config file), and on inotify that read itself raises `IN_ACCESS` — so
+/// treating a read as a change turns one trigger into a self-sustaining loop
+/// that re-fires at event-loop frequency forever. The config reload loop wiped
+/// every cached session surface each iteration (`Renderer::set_theme`), which
+/// blanked all terminal content for the whole length of any dive/slide — the
+/// animation's deferred-raster path has no cached surface left to blit. macOS
+/// was immune (FSEvents reports no reads), which is why the blank looked
+/// Linux-specific. Same gotcha as the host-side `__watch` Access filter.
+fn fs_event_is_a_change(ev: &notify::Event) -> bool {
+    !matches!(ev.kind, notify::EventKind::Access(_))
 }
 
 /// Watch the config dir and raise `flag` when `ui.toml` may have changed — the
@@ -731,11 +758,21 @@ fn session_set_watcher(
 /// backends — falls through as a change, since a reload is cheap and
 /// idempotent). `None` (no dir, no backend) leaves the config launch-only.
 fn config_watcher(flag: Arc<std::sync::atomic::AtomicBool>) -> Option<notify::RecommendedWatcher> {
+    config_watcher_in(&ghost_vt::paths::config_dir(), flag)
+}
+
+/// [`config_watcher`] over an explicit `dir`, so tests can drive it against a
+/// tempdir without touching the real XDG location.
+fn config_watcher_in(
+    dir: &std::path::Path,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher;
-    let dir = ghost_vt::paths::config_dir();
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
     let mut w = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(ev) = res {
+        if let Ok(ev) = res
+            && fs_event_is_a_change(&ev)
+        {
             let touches_config = ev.paths.is_empty()
                 || ev
                     .paths
@@ -747,7 +784,7 @@ fn config_watcher(flag: Arc<std::sync::atomic::AtomicBool>) -> Option<notify::Re
         }
     })
     .ok()?;
-    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
+    w.watch(dir, notify::RecursiveMode::NonRecursive).ok()?;
     Some(w)
 }
 
@@ -5539,6 +5576,7 @@ mod tests {
     use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
     use std::collections::HashSet;
+    use std::time::Instant;
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
@@ -5561,6 +5599,79 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
         }
         f()
+    }
+
+    /// Poll `flag` until it reads `true` or ~2s elapse; returns its final state.
+    fn flag_within(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>, ms: u64) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn reading_the_config_does_not_trigger_a_reload() {
+        // The reload path itself READS ui.toml, and on inotify a read raises an
+        // Access event on the watched dir. If the watcher counted reads as
+        // changes, one reload would re-arm the flag and the shell would reload
+        // forever at event-loop frequency — each iteration wiping every cached
+        // session surface (`Renderer::set_theme`), which blanked all terminal
+        // content for the whole length of any dive/slide animation.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("ui.toml");
+        std::fs::write(&cfg, "[window]\npadding = 4.0\n").unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = super::config_watcher_in(tmp.path(), flag.clone());
+        if watcher.is_none() {
+            return; // no notify backend on this platform/runner: nothing to guard
+        }
+        // Give the watch a beat to bind, then do what a reload does: read the file.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = std::fs::read(&cfg).unwrap();
+        assert!(
+            !flag_within(&flag, 400),
+            "a read of ui.toml must not count as a config change"
+        );
+        // A real edit still triggers (the sanity half that keeps this test honest).
+        std::fs::write(&cfg, "[window]\npadding = 9.0\n").unwrap();
+        assert!(
+            flag_within(&flag, 2000),
+            "an actual write to ui.toml must trigger the reload flag"
+        );
+    }
+
+    #[test]
+    fn reading_the_session_dir_does_not_trigger_reenumeration() {
+        // Session re-enumeration READS the runtime dir (opendir/readdir raises
+        // Access on inotify) and each session's meta files. Counting those reads
+        // as set-changes turns one reconcile into a permanent self-sustaining
+        // churn loop, re-listing sessions at event-loop frequency.
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("some-session");
+        std::fs::write(&entry, "x").unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = super::session_set_watcher_in(tmp.path(), flag.clone());
+        if watcher.is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // What an enumeration does: list the dir, read an entry.
+        let _ = std::fs::read_dir(tmp.path()).unwrap().count();
+        let _ = std::fs::read(&entry).unwrap();
+        assert!(
+            !flag_within(&flag, 400),
+            "reading the session dir must not count as a set change"
+        );
+        // A session appearing still triggers.
+        std::fs::write(tmp.path().join("new-session"), "x").unwrap();
+        assert!(
+            flag_within(&flag, 2000),
+            "a new entry in the session dir must trigger the flag"
+        );
     }
 
     #[test]
