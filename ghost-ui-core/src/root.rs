@@ -1521,14 +1521,24 @@ impl RootModel {
             return cmds;
         }
         if let UiEvent::Resize { w_px, h_px, scale } = ev {
+            let size_changed = (w_px, h_px) != self.size_px;
+            let scale_changed = scale > 0.0 && (scale as f32) != self.scale;
             self.size_px = (w_px, h_px);
             if scale > 0.0 {
                 self.scale = scale as f32;
             }
-            // An animation's frozen scenes are sized to the old window; drop it so
-            // the live view re-renders at the new size rather than animating stale
-            // frames (a slide would shear; a dive would zoom the wrong geometry).
-            self.anim = None;
+            // An animation's frozen scenes are sized to the old window; on a REAL
+            // geometry change drop it so the live view re-renders at the new size
+            // rather than animating stale frames (a slide would shear; a dive would
+            // zoom the wrong geometry). A no-op resize must NOT cancel it, though: the
+            // platform (notably Wayland) and a live session's own size report deliver
+            // same-size/scale echoes, and with a continuously feeding session one
+            // always lands within a frame of a dive/slide starting — cancelling on it
+            // snapped the animation straight to its settled frame. The frozen scenes
+            // are still valid when nothing changed, so keep animating.
+            if size_changed || scale_changed {
+                self.anim = None;
+            }
             // Resize the foreground and every warm background mirror, so a
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
@@ -4035,6 +4045,43 @@ mod tests {
         assert!(
             !done.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. })),
             "a completed animation stops scheduling frames: {done:?}"
+        );
+    }
+
+    #[test]
+    fn a_no_op_resize_does_not_cancel_an_in_flight_animation() {
+        // A same-size, same-scale Resize — a configure/scale echo the platform can
+        // deliver (notably Wayland), or a live session's own size report — must NOT
+        // cancel an in-flight dive/slide. The handler used to drop `self.anim` on ANY
+        // resize; with a continuously feeding session (which drives such no-op resizes)
+        // an animation snapped straight to its settled frame the instant one landed.
+        let mut r = root();
+        r.update(UiEvent::Resize {
+            w_px: 1000,
+            h_px: 700,
+            scale: 1.0,
+        });
+        dive_out(&mut r, &[sess("alpha", true, 1)]);
+        assert!(r.is_animating(), "the dive is in flight");
+        // A no-op resize (identical size AND scale) must leave it running.
+        r.update(UiEvent::Resize {
+            w_px: 1000,
+            h_px: 700,
+            scale: 1.0,
+        });
+        assert!(
+            r.is_animating(),
+            "a no-op resize must not cancel the animation"
+        );
+        // A genuine size change still cancels it — the frozen scenes are now stale.
+        r.update(UiEvent::Resize {
+            w_px: 1200,
+            h_px: 700,
+            scale: 1.0,
+        });
+        assert!(
+            !r.is_animating(),
+            "a real resize still cancels the animation"
         );
     }
 
