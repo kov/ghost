@@ -925,10 +925,12 @@ impl FleetModel {
         let preview = self.preview_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
         let (cols, rows) = tile.grid;
-        let (fw, fh) = (
-            cols as f32 * self.metrics.advance,
-            rows as f32 * self.metrics.line_height,
-        );
+        // Physical (scale-multiplied) metrics: the preview rect and the whole fleet are
+        // laid out in physical px, so the native size we contain-fit against must be too.
+        // Raw logical metrics here halved the target on a HiDPI display, collapsing the
+        // dive zoom (see `the_dive_zoom_is_the_same_at_every_device_scale`).
+        let m = self.effective_metrics();
+        let (fw, fh) = (cols as f32 * m.advance, rows as f32 * m.line_height);
         if fw <= 0.0 || fh <= 0.0 {
             return Some(preview);
         }
@@ -952,11 +954,14 @@ impl FleetModel {
         let from = self.dive_target_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
         let (cols, rows) = tile.grid;
+        // Native size in physical px (matching `from`, which is physical) — see
+        // `dive_target_rect` for why raw logical metrics break the HiDPI zoom.
+        let m = self.effective_metrics();
         let to = RectPx {
             x: 0.0,
             y: 0.0,
-            w: cols as f32 * self.metrics.advance,
-            h: rows as f32 * self.metrics.line_height,
+            w: cols as f32 * m.advance,
+            h: rows as f32 * m.line_height,
         };
         Some(Transform::map_rect(from, to))
     }
@@ -7030,6 +7035,35 @@ mod tests {
                 && target.w <= preview.w + 0.5
                 && target.h <= preview.h + 0.5,
             "the target is the contain-fit sub-rect of the preview box"
+        );
+    }
+
+    #[test]
+    fn the_dive_zoom_is_the_same_at_every_device_scale() {
+        // The dive's zoom is a VISUAL amount — a small fleet tile growing to fill the
+        // window — so it must not depend on the device scale factor. The tiles are laid
+        // out in physical (scale-multiplied) pixels, but the camera's native-size target
+        // used raw LOGICAL metrics; on a HiDPI display (scale 2) that made the target
+        // half the tile's physical size, so the zoom collapsed toward 1x — the dive
+        // "didn't resize, just slid". The camera scale must be scale-invariant.
+        let camera_scale = |win: (u32, u32), scale: f32| -> f32 {
+            let mut primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+            primary.update(UiEvent::Resize {
+                w_px: win.0,
+                h_px: win.1,
+                scale: f64::from(scale),
+            });
+            let mine = HashSet::from(["alpha".to_string()]);
+            let (f, _) = Fleet::adopting(primary, Vec::new(), METRICS, win, scale, mine);
+            f.dive_camera("alpha").expect("the tile is present").scale
+        };
+        // Same logical window (1400x900), rendered at 1x and at 2x (HiDPI doubles the
+        // physical size and the cell size together, so the logical grid is identical).
+        let s1 = camera_scale((1400, 900), 1.0);
+        let s2 = camera_scale((2800, 1800), 2.0);
+        assert!(
+            (s1 - s2).abs() < 0.05,
+            "the dive zoom must be scale-invariant: 1x gave {s1}, 2x gave {s2}"
         );
     }
 
