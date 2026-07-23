@@ -514,6 +514,70 @@ fn a_translucent_lone_terminal_composites_see_through() {
     );
 }
 
+#[test]
+fn a_translucent_animation_stays_see_through() {
+    // A slide/dive — any scene showing more than one terminal — composites through
+    // `encode_scene`: a translucent glass clear with each session's Surface blitted OVER
+    // it, rather than the lone view's REPLACE blit. Blending a translucent Surface (which
+    // already carries the glass) over the translucent clear used to STACK alpha toward
+    // opaque (bg_alpha -> bg_alpha·(2-bg_alpha)), so the whole window flashed nearly solid
+    // for the length of the animation — jarring against the steady view's translucency.
+    // The composite must keep the same ~half alpha the single view shows: the glass is
+    // deposited once, not twice.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[44mA");
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let (w, h) = (40 * 9, 18);
+    let full = |x: f32| RectPx {
+        x,
+        y: 0.0,
+        w: w as f32,
+        h: h as f32,
+    };
+    let term = |sess: &str, rect: RectPx| SceneItem::Terminal {
+        id: SceneId::Root,
+        session: session_key(sess),
+        rect,
+        frame: frame.clone(),
+        selection: None,
+        dim: false,
+        damage: TermDamage::All,
+    };
+    // Two full-window sides => a multi-terminal scene => the animation composite path.
+    // The incoming side sits at identity (fully on screen); the outgoing has slid off to
+    // the left (culled). Same probe coordinates as the lone-terminal test, so only the
+    // compositing path differs.
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![
+            Layer::new(0, vec![term("out", full(-(w as f32)))]),
+            Layer::new(1, vec![term("in", full(0.0))]),
+        ],
+    };
+    let theme = Theme {
+        bg_alpha: 0.5,
+        ..Theme::default()
+    };
+    let img = Renderer::headless(theme).present_offscreen(&scene, font, 15.0);
+
+    // Same probe as the lone test: a blank default-background pixel must stay ~half
+    // transparent, not stack toward opaque.
+    let blank = px(&img, 94, 9);
+    assert!(
+        (100..=160).contains(&(blank[3] as u32)),
+        "an animation frame should keep the default background ~half transparent, got alpha {}",
+        blank[3]
+    );
+    // The blue-background cell (col 0) stays fully opaque.
+    let colored = px(&img, 4, 9);
+    assert_eq!(
+        colored[3], 255,
+        "an SGR background must stay opaque through the animation path, got alpha {}",
+        colored[3]
+    );
+}
+
 /// The blank default-background strip on row 9 (x past the col-0 glyph/blue cell)
 /// used to probe the frost fill. Shared by the frost tests below.
 const FROST_STRIP: std::ops::Range<u32> = 20..350;

@@ -4090,7 +4090,18 @@ impl Renderer {
                         else {
                             continue; // texture evicted/missing: skip rather than err
                         };
-                        pass.set_pipeline(&self.blit_pipeline);
+                        // REPLACE, not blend-over: a Surface already carries the theme
+                        // glass (it's cleared to `clear_color` before its content), and so
+                        // does the pass clear below. Blending translucent-over-translucent
+                        // stacked the glass twice (bg_alpha -> bg_alpha·(2-bg_alpha)), so an
+                        // animation frame — the only time this path runs — flashed toward
+                        // opaque. Overwriting the covered region with the Surface's own
+                        // premultiplied texels deposits the glass exactly once, matching the
+                        // lone view's `encode_surface_blit`. Surfaces are never faded by
+                        // layer opacity (see `apply_layer`) and don't overlap each other, so
+                        // REPLACE loses no cross-fade; the glass clear still fills the gaps
+                        // between tiles, and chrome/dim overlays draw over the Surface after.
+                        pass.set_pipeline(&self.blit_replace_pipeline);
                         pass.set_bind_group(0, &cached.bind_group, &[]);
                         pass.set_vertex_buffer(0, buf.slice(..));
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
