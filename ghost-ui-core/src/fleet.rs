@@ -963,7 +963,34 @@ impl FleetModel {
             w: cols as f32 * m.advance,
             h: rows as f32 * m.line_height,
         };
-        Some(Transform::map_rect(from, to))
+        let t = Transform::map_rect(from, to);
+        // TEMP (GHOST_SCALE_DEBUG): dump the decisive HiDPI dive-zoom inputs so mac and
+        // Linux can be compared at the same device scale. Both platforms run this exact
+        // code, yet at scale 2.0 Linux under-zoomed while the mac built-in looked right —
+        // so the divergence must be in the *inputs* (are `metrics` logical or physical?
+        // is `size_px` physical?), not the math. This prints them all. Remove once the
+        // platform difference is understood.
+        if std::env::var_os("GHOST_SCALE_DEBUG").is_some() {
+            eprintln!(
+                "[scale-debug] dive_camera id={id} size_px={:?} scale={:.4} \
+                 raw_metrics=({:.3},{:.3}) eff_metrics=({:.3},{:.3}) grid={cols}x{rows} \
+                 target_rect={:.1}x{:.1} native_to={:.1}x{:.1} camera.scale={:.4} \
+                 (native_to.w/size_px.w={:.3} — ~1.0 means the zoomed session fills the window)",
+                self.size_px,
+                self.scale,
+                self.metrics.advance,
+                self.metrics.line_height,
+                m.advance,
+                m.line_height,
+                from.w,
+                from.h,
+                to.w,
+                to.h,
+                t.scale,
+                to.w / self.size_px.0.max(1) as f32,
+            );
+        }
+        Some(t)
     }
 
     /// Whether `id`'s tile is showing a live preview (it has had output fed in).
