@@ -578,6 +578,56 @@ fn a_translucent_animation_stays_see_through() {
     );
 }
 
+#[test]
+fn the_lone_present_path_matches_the_inline_composite() {
+    // `present_scene`'s lone branch composites a full-window terminal through the
+    // Surface encoder; `render_offscreen_scene` composites the SAME lone scene through
+    // the inline encoder. They are one session renderer and must produce identical
+    // pixels — opaque AND translucent. This pins the lone composite so the two encoders
+    // can't drift apart on blend/clear (the divergence that flashed animations opaque).
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut vt = Vt::new(20, 3);
+    vt.feed_str("\x1b[?25l\x1b[44mhello\x1b[0m world\r\nsecond line\r\nthird");
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    let (w, h) = (20 * 9, 3 * 18);
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("a"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: w as f32,
+                    h: h as f32,
+                },
+                frame: frame.clone(),
+                selection: None,
+                dim: false,
+                damage: TermDamage::All,
+            }],
+        )],
+    };
+    for bg_alpha in [1.0_f32, 0.5] {
+        let theme = Theme {
+            bg_alpha,
+            ..Theme::default()
+        };
+        let present = Renderer::headless(theme)
+            .present_offscreen(&scene, font, 15.0)
+            .rgba;
+        let inline = Renderer::headless(theme)
+            .render_offscreen_scene(&scene, font, 15.0)
+            .rgba;
+        assert_eq!(
+            present, inline,
+            "the lone present path diverged from the inline composite at bg_alpha {bg_alpha}"
+        );
+    }
+}
+
 /// The blank default-background strip on row 9 (x past the col-0 glyph/blue cell)
 /// used to probe the frost fill. Shared by the frost tests below.
 const FROST_STRIP: std::ops::Range<u32> = 20..350;

@@ -1395,8 +1395,6 @@ pub struct Renderer {
     /// opaque window) and leaves this `false`; the next banded present then re-renders
     /// the Surface fully before resuming cheap band updates.
     foreground_valid: bool,
-    /// The fullscreen quad that blits the foreground Surface onto the swapchain, reused.
-    blit_quad: Option<wgpu::Buffer>,
     /// Instances built + uploaded by the last per-Surface band update — 0 for a full
     /// Surface render. Lets a test prove the steady path builds only the band's rows.
     band_instances: u32,
@@ -1998,7 +1996,6 @@ impl Renderer {
             parallel_shaping: true,
             bench_target: None,
             foreground_valid: false,
-            blit_quad: None,
             band_instances: 0,
             pack_x: 1,
             pack_y: 0,
@@ -4096,8 +4093,9 @@ impl Renderer {
                         // stacked the glass twice (bg_alpha -> bg_alpha·(2-bg_alpha)), so an
                         // animation frame — the only time this path runs — flashed toward
                         // opaque. Overwriting the covered region with the Surface's own
-                        // premultiplied texels deposits the glass exactly once, matching the
-                        // lone view's `encode_surface_blit`. Surfaces are never faded by
+                        // premultiplied texels deposits the glass exactly once. This is the
+                        // ONE surface-onto-swapchain composite — the lone steady view routes
+                        // through here too (see `present_scene`). Surfaces are never faded by
                         // layer opacity (see `apply_layer`) and don't overlap each other, so
                         // REPLACE loses no cross-fade; the glass clear still fills the gaps
                         // between tiles, and chrome/dim overlays draw over the Surface after.
@@ -4188,83 +4186,6 @@ impl Renderer {
         }
     }
 
-    /// Point the shared uniform at `w`×`h` and (re)build the fullscreen quad that
-    /// blits the foreground Surface onto the swapchain.
-    /// Prepare the quad that blits the foreground Surface onto the swapchain: `dst` is
-    /// where the Surface lands (the full window when unpadded, an inset rect when
-    /// padded), `surf` the swapchain size the vertex shader maps pixels against.
-    fn prepare_blit_quad(&mut self, dst: RectPx, surf: (u32, u32)) {
-        let uniforms = Uniforms {
-            viewport: [surf.0 as f32, surf.1 as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.gpu
-            .queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
-        let quad = [Instance {
-            rect: [dst.x, dst.y, dst.w, dst.h],
-            uv: [0.0, 0.0, 1.0, 1.0],
-            color: [1.0, 1.0, 1.0, 1.0],
-        }];
-        Self::upload_instances(
-            &self.gpu.device,
-            &self.gpu.queue,
-            &mut self.blit_quad,
-            &mut self.buffer_allocs,
-            "surface blit",
-            &quad,
-        );
-    }
-
-    /// Clear `view` to the session's background and blit the foreground Surface (sampled
-    /// by `bind_group`) into its inset rect with REPLACE blending. The clear fills the
-    /// padding border with the frame's own background — the app-set OSC 11 color when it
-    /// carries one, else the theme's — at its true alpha (a translucent theme stays
-    /// see-through), so the border always blends with the terminal it surrounds; REPLACE
-    /// overwrites the inset with the Surface's own premultiplied pixels rather than
-    /// blending over the clear, so a translucent background isn't double-counted. With no
-    /// padding the quad covers the whole window, so this is byte-identical to clearing
-    /// transparent and blitting the Surface "over". Every pixel is written, so the
-    /// swapchain holds a complete frame regardless of the acquired image's prior contents.
-    fn encode_surface_blit(
-        &self,
-        view: &wgpu::TextureView,
-        bind_group: &wgpu::BindGroup,
-        frame: &Frame,
-    ) -> wgpu::CommandBuffer {
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("surface blit"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("surface blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color(frame)),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some(buf) = &self.blit_quad {
-                pass.set_pipeline(&self.blit_replace_pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..6, 0..1);
-            }
-        }
-        encoder.finish()
-    }
-
     /// Composite the frosted-glass grain onto `view`, if the theme asks for it —
     /// the theme is translucent (`bg_alpha < 1`) AND `frost > 0`. A single
     /// fullscreen dest-over pass that loads the just-composited frame and admits a
@@ -4335,7 +4256,8 @@ impl Renderer {
     /// the last complete frame) and the Surface is blitted onto the swapchain at the
     /// terminal's scene rect: the whole window when unpadded, or an inset rect when the
     /// window padding leaves a background-filled border (the blit clears the swapchain to
-    /// the theme bg first, then REPLACEs the inset — see [`Self::encode_surface_blit`]).
+    /// the frame's bg first, then REPLACEs the inset — the lone branch below composites it
+    /// through [`Self::encode_scene`], the SAME encoder the fleet/animation paths use).
     /// `ensure_surface` diffs the new frame against the Surface's held frame and re-rasters
     /// only the changed rows, so steady typing touches a few rows while bulk output
     /// re-rasters the screen; either way the blit is 1:1 and, unpadded, the composited
@@ -4396,13 +4318,35 @@ impl Renderer {
         let _ = self.ensure_surface(session, frame, selection, damage, src, font, size_px, false);
         self.foreground_valid = true;
         self.foreground_session = Some(session);
-        // Blit the Surface onto the swapchain at its inset rect (resets the uniform, which
-        // the render above set to the texture size, to the surface size so `dst` maps to
-        // the right pixels). The clear inside fills the padding border with the frame's
-        // background (app-set OSC 11, else the theme's), so the border tracks the terminal.
-        self.prepare_blit_quad(dst, surf);
-        if let Some(s) = self.surfaces.get(&win_key) {
-            let cb = self.encode_surface_blit(view, &s.bind_group, frame);
+        // Composite the Surface onto the swapchain through the SAME encoder the fleet and
+        // animation paths use — a single `Draw::Surface` over a clear painted in the frame's
+        // own background — rather than a second bespoke encoder. This makes it structurally
+        // impossible for the lone and multi paths to disagree on the clear or the blit's
+        // blend mode: the divergence that once flashed animations toward opaque cannot recur.
+        // `scene_bg` matches the clear to the frame's background (app-set OSC 11 else theme,
+        // premultiplied at `bg_alpha`), so the padding border tracks the terminal; the single
+        // quad lands the Surface at its inset `dst` and REPLACEs the inset. Images already
+        // live inside the Surface texture, so drop any stale image draws before encoding.
+        self.scene_bg = Some(self.frame_theme(frame).bg);
+        self.build_surface_quads(&[dst]);
+        self.image_draws.clear();
+        self.image_instances = None;
+        // `ensure_surface` above repointed the shared viewport uniform to the texture size;
+        // reset it to the swapchain size so `dst` maps to the right pixels.
+        let uniforms = Uniforms {
+            viewport: [surf.0 as f32, surf.1 as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        if self.surfaces.contains_key(&win_key) {
+            let draws = [Draw::Surface {
+                scissor: [0, 0, surf.0, surf.1],
+                quad: 0,
+                key: win_key,
+            }];
+            let cb = self.encode_scene(view, &draws);
             self.gpu.queue.submit([cb]);
         }
         self.apply_frost(view);
