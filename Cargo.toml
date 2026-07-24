@@ -17,8 +17,9 @@ members = [
     "ghost-shot",
     "xtask",
 ]
-# The vendored winit (see the patch below) is its own package, not a member.
-exclude = ["vendor/winit"]
+# The vendored winit and wgpu-core (see the patches below) are their own
+# packages, not members.
+exclude = ["vendor/winit", "vendor/wgpu-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,5 +41,16 @@ debug = true
 #   Character Viewer / Ctrl-Cmd-Space emoji palette, dictation), which the
 #   marked-text-only gate silently dropped — see
 #   vendor/winit/.../macos/view.rs (upstream winit#3342, milestoned 0.31).
+#
+# Vendored wgpu-core 29.0.3 carrying one local patch, to be reported upstream
+# and then dropped:
+# - `surface_get_current_texture` allocated the texture id *before* the
+#   acquire and leaked the index when the acquire failed or returned no
+#   texture (Timeout/Occluded/Outdated). Each leaked index later becomes a
+#   permanent 24-byte `Vacant` slot in the textures registry — a render loop
+#   retrying an unacquirable surface leaks without bound (observed: 300M+
+#   burned ids, ~8GB, in one overnight session). The id is now allocated only
+#   once there is a texture to assign — see vendor/wgpu-core/src/present.rs.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
+wgpu-core = { path = "vendor/wgpu-core" }
