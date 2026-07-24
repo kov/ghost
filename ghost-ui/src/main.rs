@@ -1969,15 +1969,17 @@ struct WindowState {
     needs_surface_sync: bool,
     /// Whether this window has ever presented a frame. Until it has, its drawable may
     /// not be ready — `get_current_texture` returns nothing and the present is silently
-    /// dropped — so [`about_to_wait`](App::about_to_wait) keeps requesting redraws every
-    /// pass (not the pacer's single request) until one lands. Otherwise a window created
-    /// mid-run comes up blank (only its title bar) until an unrelated event forces a
-    /// redraw. Set once, on the first successful present.
+    /// dropped — so [`release_repaint_due`](WindowState::release_repaint_due) keeps the
+    /// repaint armed and the pacer retries (at its budget cadence) until one lands.
+    /// Otherwise a window created mid-run comes up blank (only its title bar) until an
+    /// unrelated event forces a redraw. Set once, on the first successful present.
     presented_ok: bool,
     /// Whether the platform has told us this window is occluded (fully hidden: another
-    /// Space, minimized, behind an opaque window). Tracked from `WindowEvent::Occluded`
-    /// so the foreground render-stall watchdog can skip it — an occluded surface can't
-    /// present, so its "stall" is the platform withholding the drawable, not our bug.
+    /// Space, minimized, behind an opaque window). Tracked from `WindowEvent::Occluded`.
+    /// An occluded surface can't present, so the window is parked: no repaint releases
+    /// at all ([`release_repaint_due`](WindowState::release_repaint_due)), and the
+    /// render-stall watchdog skips it — its "stall" is the platform withholding the
+    /// drawable, not our bug. `Occluded(false)` forces a fresh full frame.
     occluded: bool,
     /// A GUI ssh connect in flight (the window is showing the connect prompt).
     /// Present from the `Cmd::ConnectSshWindow` handler until auth resolves; its
@@ -2004,6 +2006,29 @@ impl WindowState {
         if let Some(gfx) = &self.gfx {
             gfx.window.request_redraw();
         }
+    }
+
+    /// The once-per-pass repaint decision: should `about_to_wait` request a
+    /// redraw for this window now?
+    ///
+    /// Until the opening frame lands the repaint stays armed — macOS can drop
+    /// redraws while it finishes compositing a new window, and the pacer's
+    /// release keeps retrying (paced) until [`FramePacer::painted`] confirms
+    /// one. An occluded window is parked outright: its surface cannot be
+    /// acquired, so a release would only spin render→acquire-fail→retry —
+    /// the `Occluded(false)` handler re-arms a forced repaint the moment the
+    /// window can present again. Both gates exist because their absence was a
+    /// self-sustaining event-loop spin (each failed redraw wakes the loop,
+    /// which released the still-pending repaint again): ~5k failed surface
+    /// acquires/sec, ~70% of a core, and a leaked wgpu texture id each.
+    fn release_repaint_due(&mut self, now_ms: u64) -> bool {
+        if !self.presented_ok {
+            self.pacer.request();
+        }
+        if self.occluded {
+            return false;
+        }
+        self.pacer.release(now_ms)
     }
 
     /// Click count for a press of `button` at the current pointer position: a
@@ -4980,9 +5005,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             FrameOutcome::Lost => {
                                 // The surface wasn't acquirable, so nothing was presented.
-                                // Re-arm the repaint so `about_to_wait` retries until a
-                                // frame lands — this is what recovers a window whose
-                                // redraws the platform dropped while it was occluded.
+                                // Re-arm the repaint so `about_to_wait` retries (paced to
+                                // the frame budget, parked while occluded) until a frame
+                                // lands — this is what recovers a window whose redraws
+                                // the platform dropped.
                                 win.pacer.request();
                                 let core = win.root.foreground_trace(&self.states);
                                 let pending = win.pacer.pending();
@@ -5511,14 +5537,7 @@ impl App {
         // paint is always re-checked and fires within a frame of becoming due;
         // a keystroke's repaint, handled in this same pass, paints at once.
         for (id, w) in self.windows.iter_mut() {
-            if !w.presented_ok {
-                // The opening frame hasn't landed yet: a window created mid-run can drop
-                // its first present(s) while macOS finishes compositing it (the drawable
-                // isn't acquirable, so the present is silently skipped). Keep asking every
-                // pass until one lands, rather than trusting the pacer's single request —
-                // else the window sits blank (title bar only) until an unrelated event.
-                w.request_redraw();
-            } else if w.pacer.release(now_ms) {
+            if w.release_repaint_due(now_ms) {
                 w.render_trace.saw_release(now_ms);
                 w.request_redraw();
             }
@@ -5672,6 +5691,91 @@ mod tests {
             flag_within(&flag, 2000),
             "a new entry in the session dir must trigger the flag"
         );
+    }
+
+    #[test]
+    fn an_occluded_window_releases_no_repaints() {
+        // While macOS reports a window occluded (another Space, minimized, the
+        // lock screen) its surface cannot be acquired, so releasing repaints
+        // just spins render→acquire-fail→retry. The per-pass decision must
+        // park the window: the repaint stays pending, nothing is released, and
+        // becoming visible again releases it at once.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let win = app.windows.get_mut(&wid).expect("window exists");
+            win.presented_ok = true; // a live window that has presented before
+            win.pacer.request(); // streaming output wants a repaint...
+            win.occluded = true; // ...but the window is on another Space
+            for t in 0..10u64 {
+                assert!(
+                    !win.release_repaint_due(t * 160),
+                    "parked while occluded (t={t})"
+                );
+            }
+            assert!(win.pacer.pending(), "the repaint stays pending, not lost");
+            win.occluded = false; // WindowEvent::Occluded(false)
+            assert!(
+                win.release_repaint_due(1600),
+                "the parked repaint releases as soon as the window is visible"
+            );
+        });
+    }
+
+    #[test]
+    fn a_window_awaiting_its_opening_frame_retries_at_the_paced_cadence() {
+        // Until the opening frame lands, the repaint must stay armed (macOS can
+        // drop redraws while it finishes compositing a new window). But the
+        // retries go out at the pacer's budget — the old every-pass retry
+        // self-sustained: each failed redraw woke the loop, which requested
+        // another redraw, ~5k acquire attempts/sec against an unacquirable
+        // surface.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let win = app.windows.get_mut(&wid).expect("window exists");
+            assert!(!win.presented_ok, "a fresh window has not presented yet");
+            assert!(
+                win.release_repaint_due(0),
+                "the first bootstrap attempt is immediate"
+            );
+            assert!(
+                !win.release_repaint_due(0),
+                "the pass a failed redraw wakes must not re-release"
+            );
+            assert!(!win.release_repaint_due(8), "a sub-budget pass holds");
+            assert!(
+                win.release_repaint_due(16),
+                "retries continue each budget until a frame lands"
+            );
+        });
+    }
+
+    #[test]
+    fn an_occluded_never_presented_window_is_fully_parked() {
+        // The compounding of the two cases above is the one that hurt: a window
+        // that never presented AND is occluded (created on / moved to another
+        // Space and left there) must do nothing at all — its bootstrap retries
+        // would fail forever, each one burning CPU and leaking a wgpu texture
+        // id. Overnight that was ~300M failed acquires and 14GB of heap.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let win = app.windows.get_mut(&wid).expect("window exists");
+            win.occluded = true;
+            for t in 0..100u64 {
+                assert!(
+                    !win.release_repaint_due(t * 16),
+                    "no bootstrap retry while occluded (t={t})"
+                );
+            }
+        });
     }
 
     #[test]

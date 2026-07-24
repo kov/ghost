@@ -35,6 +35,11 @@ pub enum Pace {
 pub struct FramePacer {
     budget_ms: u64,
     last_paint_ms: Option<u64>,
+    /// When [`release`](Self::release) last let a redraw request out, painted or
+    /// not. Paces the *retries* of a repaint that never lands (an unacquirable
+    /// surface): without it, each failed redraw wakes the loop and releases the
+    /// still-pending repaint again — a self-sustaining spin at CPU speed.
+    last_release_ms: Option<u64>,
     pending: bool,
 }
 
@@ -43,6 +48,7 @@ impl FramePacer {
         Self {
             budget_ms,
             last_paint_ms: None,
+            last_release_ms: None,
             pending: false,
         }
     }
@@ -106,10 +112,23 @@ impl FramePacer {
     /// `window.request_redraw()` now? Does NOT mark anything painted — that
     /// happens only when the resulting `RedrawRequested` is actually handled
     /// (see [`painted`](Self::painted)) — so an unconfirmed release keeps
-    /// releasing every pass until a frame lands. `request_redraw` coalesces,
-    /// so the retries are free while the platform is dropping them.
+    /// retrying until a frame lands. The retries themselves are paced to the
+    /// frame budget: a redraw whose surface acquire *fails* wakes the loop
+    /// right back into this decision, and releasing again on that pass would
+    /// spin render→fail→release at CPU speed for as long as the surface stays
+    /// unacquirable (an occluded window left overnight burned ~70% of a core
+    /// and hundreds of millions of wgpu surface acquires this way).
     pub fn release(&mut self, now_ms: u64) -> bool {
-        self.poll(now_ms) == Pace::PaintNow
+        if self.poll(now_ms) != Pace::PaintNow {
+            return false;
+        }
+        if let Some(last) = self.last_release_ms
+            && now_ms.saturating_sub(last) < self.budget_ms
+        {
+            return false;
+        }
+        self.last_release_ms = Some(now_ms);
+        true
     }
 }
 
@@ -211,6 +230,26 @@ mod tests {
         );
         p.settle(true, 16); // a later attempt landed
         assert!(!p.pending(), "a landed frame clears the pending repaint");
+    }
+
+    #[test]
+    fn an_unlanded_repaint_releases_at_most_once_per_budget() {
+        // A window whose surface can't be acquired (occluded, mid-creation,
+        // swapchain in flux) never confirms a paint — and each failed redraw
+        // wakes the event loop again, so an unpaced `release` becomes a
+        // self-sustaining spin: render→acquire-fail→release→render, thousands
+        // of times a second, for as long as the surface stays unacquirable.
+        // Retry *attempts* must be paced to the frame budget like paints are.
+        let mut p = FramePacer::new(16);
+        p.request();
+        assert!(p.release(0), "the first attempt goes through");
+        // The attempt did not land (no painted()): the immediately following
+        // pass — the one the failed redraw itself woke — must not release.
+        assert!(!p.release(0), "a same-instant retry must wait");
+        assert!(!p.release(8), "a sub-budget retry must wait");
+        assert!(p.release(16), "the retry goes out once the budget elapses");
+        assert!(!p.release(24), "and the retry is itself paced");
+        assert!(p.release(32), "still retrying at the paced cadence");
     }
 
     #[test]
