@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sctk::reexports::client::protocol::wl_display::WlDisplay;
@@ -31,6 +31,7 @@ use crate::window::{
 use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
 use super::state::WinitState;
+use super::types::background_effect::{self, BackgroundEffectManager};
 use super::types::xdg_activation::XdgActivationTokenData;
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
@@ -76,6 +77,19 @@ pub struct Window {
 
     /// The event sink to deliver synthetic events.
     window_events_sink: Arc<Mutex<EventSink>>,
+
+    /// Live `ext_background_effect_v1` capability bits, when the compositor
+    /// offers that protocol. Held directly (rather than read back out of
+    /// `window_state`) so [`blur_supported`](Self::blur_supported) is a lock-free
+    /// load: a caller deciding each frame whether to draw its own fallback glass
+    /// must not have to contend for the window-state mutex to do it.
+    /// [vendored addition]
+    background_effect_capabilities: Option<Arc<AtomicU32>>,
+
+    /// Whether the compositor offers KDE's blur protocol. Fixed for the session
+    /// — unlike the capability above, a bound global does not come and go.
+    /// [vendored addition]
+    kwin_blur_available: bool,
 }
 
 impl Window {
@@ -90,6 +104,12 @@ impl Window {
 
         let surface = state.compositor_state.create_surface(&queue_handle);
         let compositor = state.compositor_state.clone();
+
+        // Snapshot how this compositor can blur, so `blur_supported` can answer
+        // without reaching back into `WinitState`. [vendored addition]
+        let background_effect_capabilities =
+            state.background_effect_manager.as_ref().map(BackgroundEffectManager::capabilities);
+        let kwin_blur_available = state.kwin_blur_manager.is_some();
         let xdg_activation =
             state.xdg_activation.as_ref().map(|activation_state| activation_state.global().clone());
         let display = event_loop_window_target.connection.display();
@@ -229,11 +249,34 @@ impl Window {
             event_loop_awakener,
             window_requests,
             window_events_sink,
+            background_effect_capabilities,
+            kwin_blur_available,
         })
     }
 
     pub(crate) fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
         NonNull::new(self.window.xdg_toplevel().id().as_ptr().cast())
+    }
+
+    /// Whether [`set_blur`](Self::set_blur) can actually blur this window's
+    /// backdrop right now.
+    ///
+    /// Blur is the compositor's to give, and most don't: the answer lets a client
+    /// fall back to drawing its own translucency treatment instead of asking for
+    /// glass and silently getting flat alpha. It resolves support exactly the way
+    /// `set_blur` picks a protocol — the cross-desktop capability where that
+    /// protocol is offered, KDE's global otherwise — so the two can never
+    /// disagree.
+    ///
+    /// Not a constant: `ext_background_effect_v1` re-sends its capabilities
+    /// whenever they change, so a desktop effect switched off mid-session turns
+    /// this to `false` while the window is up. Poll it rather than caching it.
+    /// [vendored addition]
+    pub fn blur_supported(&self) -> bool {
+        match &self.background_effect_capabilities {
+            Some(capabilities) => background_effect::blur_supported(capabilities),
+            None => self.kwin_blur_available,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! File-only UI configuration: a small, hand-editable TOML read once at launch
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
-//! a persisted font zoom (`[zoom]`), the background opacity, compositor blur and
-//! self-drawn frost, initial grid size, and inner padding (`[window]`), the base
+//! a persisted font zoom (`[zoom]`), the background opacity, the fallback frost
+//! density, initial grid size, and inner padding (`[window]`), the base
 //! font size + family (`[font]`), and how the macOS Option key behaves
 //! (`[input] option_as_meta`).
 //!
@@ -166,16 +166,13 @@ struct Window {
     /// Background opacity, 0.0..=1.0 (clamped on apply). Only the default
     /// background goes translucent; SGR-coloured cells stay opaque. 1.0 = solid.
     opacity: f32,
-    /// Request compositor backdrop-blur behind the translucent background
-    /// ("frosted glass"). Honoured on KDE/KWin (and other `org_kde_kwin_blur`
-    /// compositors) and macOS; a no-op elsewhere. Only meaningful when `opacity`
-    /// is below 1.0. Off by default.
-    blur: bool,
-    /// Frosted-glass density, 0.0..=1.0 (clamped on apply). Above 0, a smooth
-    /// tinted glass fill is rendered into the see-through default-background areas
-    /// — a self-drawn frosting that shows even where the compositor can't `blur`,
-    /// dimming what's behind so it reads as glass. Only meaningful when `opacity`
-    /// is below 1.0. Off (0.0) by default.
+    /// Frosted-glass density, 0.0..=1.0 (clamped on apply), used where the
+    /// compositor can't blur. Above 0, a smooth tinted glass fill is rendered into
+    /// the see-through default-background areas, dimming what's behind so it reads
+    /// as glass. A translucent window asks its compositor for a real backdrop blur
+    /// first and only frosts when that is refused — the two are the same intent,
+    /// so they never both apply. Only meaningful when `opacity` is below 1.0. Off
+    /// (0.0) by default.
     frost: f32,
     /// Frost glass colour as a hex string (`"#rrggbb"`). Overrides the default,
     /// which derives the tint from the scheme background (dark scheme → dark glass).
@@ -194,7 +191,6 @@ impl Default for Window {
     fn default() -> Self {
         Window {
             opacity: 1.0,
-            blur: false,
             frost: 0.0,
             frost_tint: None,
             columns: DEFAULT_COLUMNS,
@@ -301,12 +297,6 @@ impl UiConfig {
         // ignored (`None` → the renderer derives the tint from the background).
         theme.frost_tint = self.window.frost_tint.as_deref().and_then(parse_hex_rgb);
         theme
-    }
-
-    /// Whether to request compositor backdrop-blur behind the translucent
-    /// background. Off by default; a no-op on compositors without blur support.
-    pub fn blur(&self) -> bool {
-        self.window.blur
     }
 
     /// The persisted font zoom (raw; the model clamps it to its bounds). 1.0
@@ -535,21 +525,14 @@ mod tests {
     }
 
     #[test]
-    fn window_blur_parses_and_defaults_off() {
-        // Default, empty, and a present-but-empty [window] table request no blur.
-        assert!(!UiConfig::default().blur());
-        assert!(!UiConfig::parse("").unwrap().blur());
-        assert!(!UiConfig::parse("[window]\n").unwrap().blur());
-        // An explicit opt-in asks the compositor for backdrop blur.
-        assert!(UiConfig::parse("[window]\nblur = true\n").unwrap().blur());
-        assert!(!UiConfig::parse("[window]\nblur = false\n").unwrap().blur());
-        // Blur coexists with the rest of the [window] table (it's meaningful
-        // only alongside a translucent opacity, but parses independently).
-        let both =
-            UiConfig::parse("[window]\nopacity = 0.8\nblur = true\ncolumns = 120\n").unwrap();
-        assert!(both.blur());
-        assert_eq!(both.theme().bg_alpha, 0.8);
-        assert_eq!(both.columns(), 120);
+    fn a_retired_blur_key_is_ignored_rather_than_rejected() {
+        // `blur` used to be an opt-in; a translucent window now asks its
+        // compositor for one unconditionally, so the key is gone. Someone's
+        // existing ui.toml still carries it, and must keep loading — with every
+        // other setting in the same table intact, not just the parse surviving.
+        let cfg = UiConfig::parse("[window]\nopacity = 0.8\nblur = true\ncolumns = 120\n").unwrap();
+        assert_eq!(cfg.theme().bg_alpha, 0.8);
+        assert_eq!(cfg.columns(), 120);
     }
 
     #[test]
@@ -585,10 +568,11 @@ mod tests {
         let c = UiConfig::parse("[window]\nfrost = nan\n").unwrap();
         assert!(c.theme().frost.is_finite());
         assert_eq!(c.theme().frost, 0.0);
-        // Frost coexists with opacity/blur in the same table.
-        let all = UiConfig::parse("[window]\nopacity = 0.8\nblur = true\nfrost = 0.2\n").unwrap();
+        // Frost coexists with opacity in the same table. The config carries the
+        // configured density unconditionally; whether the window actually frosts
+        // is settled later, against what the compositor can blur.
+        let all = UiConfig::parse("[window]\nopacity = 0.8\nfrost = 0.2\n").unwrap();
         assert_eq!(all.theme().bg_alpha, 0.8);
-        assert!(all.blur());
         assert_eq!(all.theme().frost, 0.2);
     }
 

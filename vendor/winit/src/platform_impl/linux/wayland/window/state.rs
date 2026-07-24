@@ -35,6 +35,9 @@ use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, S
 use crate::error::{ExternalError, NotSupportedError};
 use crate::platform_impl::wayland::logical_to_physical_rounded;
 use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
+use crate::platform_impl::wayland::types::background_effect::{
+    BackgroundEffectManager, ExtBackgroundEffectSurfaceV1, WHOLE_SURFACE,
+};
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
 use crate::platform_impl::{PlatformCustomCursor, WindowId};
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
@@ -146,6 +149,12 @@ pub struct WindowState {
     blur: Option<OrgKdeKwinBlur>,
     blur_manager: Option<KWinBlurManager>,
 
+    /// The cross-desktop background-effect object and its manager, used in
+    /// preference to the KDE pair above — see [`set_blur`](Self::set_blur).
+    /// [vendored addition]
+    background_effect: Option<ExtBackgroundEffectSurfaceV1>,
+    background_effect_manager: Option<BackgroundEffectManager>,
+
     /// Whether the client side decorations have pending move operations.
     ///
     /// The value is the serial of the event triggered moved.
@@ -186,6 +195,8 @@ impl WindowState {
         Self {
             blur: None,
             blur_manager: winit_state.kwin_blur_manager.clone(),
+            background_effect: None,
+            background_effect_manager: winit_state.background_effect_manager.clone(),
             compositor,
             connection,
             csd_fails: false,
@@ -1093,7 +1104,65 @@ impl WindowState {
 
     /// Make window background blurred
     #[inline]
+    /// Ask the compositor to blur what shows through the window.
+    ///
+    /// Two protocols can do this and the window uses exactly one of them: the
+    /// cross-desktop `ext_background_effect_v1` where the compositor offers it,
+    /// KDE's older `org_kde_kwin_blur` otherwise. Preferring on the *manager*
+    /// rather than on the live capability keeps the choice stable for the life of
+    /// the window — a compositor that offers both (KWin does) must not end up
+    /// with two blurs stacked on one surface because a capability blinked.
+    /// [`Window::blur_supported`] resolves support the same way, so what it
+    /// reports is what this method will actually use. [vendored addition]
+    ///
+    /// [`Window::blur_supported`]: super::Window::blur_supported
     pub fn set_blur(&mut self, blurred: bool) {
+        if let Some(manager) = self.background_effect_manager.clone() {
+            self.set_background_effect_blur(&manager, blurred);
+        } else {
+            self.set_kwin_blur(blurred);
+        }
+    }
+
+    /// Blur through `ext_background_effect_v1`, where the region *is* the effect:
+    /// it starts empty and a NULL region removes it, so turning blur on means
+    /// handing over a region and turning it off means dropping the object.
+    /// [vendored addition]
+    fn set_background_effect_blur(&mut self, manager: &BackgroundEffectManager, blurred: bool) {
+        if !blurred {
+            if let Some(effect) = self.background_effect.take() {
+                effect.destroy();
+            }
+            return;
+        }
+        let effect = match self.background_effect {
+            Some(ref effect) => effect,
+            None => self
+                .background_effect
+                .insert(manager.effect(self.window.wl_surface(), &self.queue_handle)),
+        };
+        let region = match Region::new(&*self.compositor) {
+            Ok(region) => region,
+            Err(err) => {
+                warn!("Failed to create the blur region: {err}");
+                return;
+            },
+        };
+        // The compositor clips this to the surface, so it covers the window at
+        // every size. `set_blur_region` copies, hence dropping the region here.
+        region.add(0, 0, WHOLE_SURFACE, WHOLE_SURFACE);
+        effect.set_blur_region(Some(region.wl_region()));
+        // The region is double-buffered surface state. Before the initial
+        // configure the caller's own first commit will carry it; after, nothing
+        // else is guaranteed to commit soon enough, so flush it now.
+        if self.is_configured() {
+            self.window.wl_surface().commit();
+        }
+    }
+
+    /// Blur through KDE's `org_kde_kwin_blur`, for compositors that offer only
+    /// that. [vendored addition: extracted from `set_blur`]
+    fn set_kwin_blur(&mut self, blurred: bool) {
         if blurred && self.blur.is_none() {
             if let Some(blur_manager) = self.blur_manager.as_ref() {
                 let blur = blur_manager.blur(self.window.wl_surface(), &self.queue_handle);

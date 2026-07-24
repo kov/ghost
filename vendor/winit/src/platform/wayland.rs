@@ -81,6 +81,22 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// Whether [`Window::set_blur`] can actually blur this window's backdrop
+    /// right now; always `false` for an X11 window.
+    ///
+    /// Backdrop blur is the compositor's to give and most don't offer it, so
+    /// asking for it is a request, not a guarantee. This reports whether the
+    /// request will be honoured, which is what a client needs in order to fall
+    /// back to drawing its own translucency treatment rather than silently
+    /// getting flat alpha where it expected glass.
+    ///
+    /// Not a constant: the compositor re-advertises its capabilities whenever
+    /// they change, so a blur effect switched off mid-session turns this to
+    /// `false` while the window is up. Poll it rather than caching it.
+    ///
+    /// [`Window::set_blur`]: crate::window::Window::set_blur
+    fn blur_supported(&self) -> bool;
 }
 
 impl WindowExtWayland for Window {
@@ -92,6 +108,17 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => None,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
+        }
+    }
+
+    #[inline]
+    fn blur_supported(&self) -> bool {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => false,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.blur_supported(),
         }
     }
 }

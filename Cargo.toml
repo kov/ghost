@@ -41,6 +41,11 @@ debug = true
 #   Character Viewer / Ctrl-Cmd-Space emoji palette, dictation), which the
 #   marked-text-only gate silently dropped — see
 #   vendor/winit/.../macos/view.rs (upstream winit#3342, milestoned 0.31).
+# - Wayland backdrop blur only spoke KDE's `org_kde_kwin_blur`. Added the
+#   cross-desktop `ext_background_effect_v1` (preferred where offered, KDE's
+#   otherwise) plus `WindowExtWayland::blur_supported`, so a client can tell
+#   whether its blur request was actually honoured and draw its own fallback
+#   glass when it wasn't — see vendor/winit/.../wayland/types/background_effect.rs.
 #
 # Vendored wgpu-core 29.0.3 carrying one local patch, to be reported upstream
 # and then dropped:

@@ -101,8 +101,7 @@ scheme = "tango-dark"   # gnome-dark|light, tango-dark|light, solarized-dark|lig
 
 [window]
 opacity = 0.95          # 0.0..=1.0; only the default background goes translucent
-blur    = true          # blur the desktop behind the window (KDE/KWin & macOS; ignored elsewhere)
-frost   = 0.2           # 0.0..=1.0; self-drawn glass density for compositors without blur
+frost   = 0.2           # 0.0..=1.0; self-drawn glass density, for compositors that can't blur
 frost_tint = "#202024"  # optional glass colour; default derives from the scheme background
 columns = 100
 rows    = 30
@@ -119,16 +118,23 @@ option_as_meta = true   # macOS: treat Option as Meta
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
 ```
 
-`blur` and `frost` are two different things. `blur` asks the compositor to blur
-the desktop *behind* the window — the real frosted-glass look — but only KDE/KWin
-and macOS support it. `frost` is a self-drawn tinted-glass fill that works
-everywhere: it can't blur the backdrop (no client can), so instead it dims and
-obscures it to read as glass. Use `blur` where you can; reach for `frost` on
-GNOME/sway. They stack.
+A translucent window is glass, and ghost picks how to render it rather than
+asking you to. It first asks the compositor for a real backdrop blur — the
+frosted-glass look, where the desktop *behind* the window is genuinely blurred —
+via `ext_background_effect_v1`, KDE's older `org_kde_kwin_blur`, or macOS's own
+window blur, whichever the platform offers. Only where the answer is no (GNOME,
+sway, X11, Windows) does it fall back to `frost`: a self-drawn tinted fill that
+can't blur the backdrop — no client can — but dims and obscures it enough to read
+as glass. The two never stack; `frost` is purely the fallback's density, and it
+is ignored on a compositor that blurs.
+
+The choice is live, not a launch-time decision: a compositor that withdraws blur
+mid-session (you switched the desktop effect off) hands the window back to frost,
+and switching it on takes it away again.
 
 Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
-blur, frost, and padding to every open window without a restart. Font and the
-initial grid size (`columns`/`rows`) apply only to newly opened windows.
+frost, and padding to every open window without a restart. Font and the initial
+grid size (`columns`/`rows`) apply only to newly opened windows.
 
 ## The CLI
 

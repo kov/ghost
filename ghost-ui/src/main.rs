@@ -1487,12 +1487,67 @@ fn choose_alpha_mode(
     modes[0]
 }
 
-/// Whether to request compositor backdrop-blur for a window. Blur is only
-/// meaningful behind a translucent surface (the compositor blurs what shows
-/// through), so it rides on the same `want_transparent` gate as the window's
-/// alpha — an opaque window never asks for it, even if the config opts in.
-fn want_blur(want_transparent: bool, cfg_blur: bool) -> bool {
-    want_transparent && cfg_blur
+/// How a window realizes its glass: compositor backdrop-blur where the platform
+/// offers it, self-drawn frost where it doesn't. See [`glass`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Glass {
+    /// Ask the compositor to blur what's behind the window.
+    blur: bool,
+    /// Self-drawn frost density to bake into the renderer theme; 0.0 = none.
+    frost: f32,
+}
+
+/// Resolve a window's glass treatment.
+///
+/// Blur and frost are one intent — make the translucent background read as glass
+/// — with two realizations, so ghost picks between them rather than asking the
+/// user to. A real backdrop blur already diffuses and dims what's behind, so
+/// frosting on top of it only muddies: frost is the fallback for the compositors
+/// that can't blur (X11, Windows, a Wayland compositor with neither
+/// `ext_background_effect_v1` nor `org_kde_kwin_blur`), not a companion to it.
+///
+/// Both ride the same translucency gate as the window's alpha: behind an opaque
+/// window there is no backdrop to blur and nothing shows through to frost.
+///
+/// The blur *request* does not depend on `blur_active`, because it can't: on
+/// Wayland the answer is per-window and only arrives after the surface exists,
+/// and asking a platform that can't blur is a documented no-op. `blur_active` is
+/// what the platform came back with, and it only decides whether to frost.
+fn glass(translucent: bool, blur_supported: bool, cfg_frost: f32) -> Glass {
+    Glass {
+        blur: translucent,
+        frost: if translucent && !blur_supported {
+            cfg_frost
+        } else {
+            0.0
+        },
+    }
+}
+
+/// Whether the platform will really blur behind `window` — the answer [`glass`]
+/// needs to choose between compositor glass and self-drawn frost.
+///
+/// Polled rather than cached: on Wayland the compositor re-advertises its
+/// capabilities whenever they change, so a desktop blur effect switched off
+/// mid-session has to take the frost fallback with it.
+#[cfg(target_os = "macos")]
+fn backdrop_blur_supported(_window: &Window) -> bool {
+    // macOS blurs behind any window that asks.
+    true
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn backdrop_blur_supported(window: &Window) -> bool {
+    // Wayland: `ext_background_effect_v1`'s live capability, or KDE's blur
+    // global. X11 has no backdrop blur and always answers `false`.
+    use winit::platform::wayland::WindowExtWayland;
+    window.blur_supported()
+}
+
+#[cfg(not(unix))]
+fn backdrop_blur_supported(_window: &Window) -> bool {
+    // No backdrop blur on Windows.
+    false
 }
 
 /// Pick the surface (swapchain) format. Our shader writes colours that are
@@ -1541,9 +1596,8 @@ struct Graphics {
 impl Graphics {
     fn new(event_loop: &ActiveEventLoop, spec: WindowSpec) -> Self {
         let WindowSpec {
-            theme,
+            mut theme,
             option_as_meta,
-            blur,
             cols,
             rows,
             pad,
@@ -1565,16 +1619,27 @@ impl Graphics {
         // Bench mode measures the render path at a realistic size, so open maximized
         // (the small default grid would understate per-frame raster cost).
         let maximized = std::env::var_os("GHOST_BENCH").is_some();
-        // Ask the compositor for backdrop-blur only when the window is both
-        // translucent and configured for it — blur without transparency is a
-        // no-op state (see `want_blur`), and honoured only on KWin/macOS anyway.
+        // Ask the compositor for backdrop-blur whenever the window is translucent:
+        // blur behind an opaque window is a no-op state, and where the compositor
+        // can't blur the request is ignored (see `glass`). The other half of the
+        // glass decision — the self-drawn frost that stands in for blur — can only
+        // be settled once the window exists and the platform can be asked whether
+        // the request took, so it happens just below.
         let attrs = Window::default_attributes()
             .with_title("ghost")
             .with_inner_size(size)
             .with_maximized(maximized)
             .with_transparent(want_transparent)
-            .with_blur(want_blur(want_transparent, blur));
+            .with_blur(glass(want_transparent, false, 0.0).blur);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // `theme.frost` arrives holding the configured density; keep it only where
+        // the compositor isn't blurring for us, so glass is never drawn twice.
+        theme.frost = glass(
+            want_transparent,
+            backdrop_blur_supported(&window),
+            theme.frost,
+        )
+        .frost;
         window.set_ime_allowed(true);
         // On macOS, optionally treat Option as Meta (ESC-prefix) rather than
         // letting it compose accented characters — the terminal-standard
@@ -1714,11 +1779,10 @@ impl Graphics {
 
 /// What a new window should open as, handed to [`Frontend::open_window`].
 struct WindowSpec {
+    /// The renderer theme. Its `frost` is the *configured* density; the realized
+    /// window keeps it only where the compositor won't blur for us (see [`glass`]).
     theme: ghost_renderer::Theme,
     option_as_meta: bool,
-    /// Request compositor backdrop-blur ("frosted glass") behind the translucent
-    /// background. Inert unless the theme is translucent; see [`want_blur`].
-    blur: bool,
     cols: u16,
     rows: u16,
     pad: f32,
@@ -1981,6 +2045,13 @@ struct WindowState {
     /// render-stall watchdog skips it — its "stall" is the platform withholding the
     /// drawable, not our bug. `Occluded(false)` forces a fresh full frame.
     occluded: bool,
+    /// The platform's last-seen answer to "will you blur behind this window?",
+    /// which is what decides whether ghost draws its own frost instead (see
+    /// [`glass`]). Tracked because the answer can change while the window is up —
+    /// a compositor's blur effect switched off mid-session withdraws the
+    /// capability — and the window would otherwise sit there with neither
+    /// treatment, showing bare alpha where it had glass.
+    blur_supported: bool,
     /// A GUI ssh connect in flight (the window is showing the connect prompt).
     /// Present from the `Cmd::ConnectSshWindow` handler until auth resolves; its
     /// PTY is pumped each `about_to_wait` pass.
@@ -2345,7 +2416,6 @@ impl App {
         let theme = cfg.theme();
         let colors = theme_colors(&theme);
         let pad = cfg.padding();
-        let blur = want_blur(theme.bg_alpha < 1.0, cfg.blur());
         let wids: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in wids {
             let cmds = {
@@ -2363,9 +2433,17 @@ impl App {
                 // identical scene would be skipped as unchanged and nothing would
                 // repaint.
                 if let Some(gfx) = w.gfx.as_mut() {
+                    // Re-decide the glass per window: whether the compositor is
+                    // blurring is its answer to give, not the config's, and it can
+                    // differ from what it was when the window opened.
+                    let blur_supported = backdrop_blur_supported(&gfx.window);
+                    let g = glass(theme.bg_alpha < 1.0, blur_supported, theme.frost);
+                    w.blur_supported = blur_supported;
+                    let mut theme = theme;
+                    theme.frost = g.frost;
                     gfx.renderer.set_theme(theme);
                     gfx.scene_cache.invalidate();
-                    gfx.window.set_blur(blur);
+                    gfx.window.set_blur(g.blur);
                     gfx.window.request_redraw();
                 }
                 cmds
@@ -4102,11 +4180,15 @@ impl App {
         } = event_loop.open_window(WindowSpec {
             theme: cfg.theme(),
             option_as_meta: cfg.option_as_meta(),
-            blur: cfg.blur(),
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
         });
+        // Ask the realized window whether its compositor blurs; a headless window
+        // has nothing to ask and needs no glass either way.
+        let blur_supported = gfx
+            .as_ref()
+            .is_some_and(|g| backdrop_blur_supported(&g.window));
         let (mut root, states, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         // A fresh fleet owns no session, so its minted registry is empty; fold it in
         // for symmetry and stamp the shared registry so later mints take this theme.
@@ -4143,6 +4225,7 @@ impl App {
                 needs_surface_sync: true,
                 presented_ok: false,
                 occluded: false,
+                blur_supported,
                 connect: None,
                 connect_gen: 0,
                 pending_fallback: None,
@@ -4478,11 +4561,15 @@ impl App {
         } = event_loop.open_window(WindowSpec {
             theme: cfg.theme(),
             option_as_meta: cfg.option_as_meta(),
-            blur: cfg.blur(),
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
         });
+        // Ask the realized window whether its compositor blurs; a headless window
+        // has nothing to ask and needs no glass either way.
+        let blur_supported = gfx
+            .as_ref()
+            .is_some_and(|g| backdrop_blur_supported(&g.window));
         let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
         // The window's group identity — reclaimed for a restored window, freshly
         // minted otherwise — so the very first attach reports the right group.
@@ -4550,6 +4637,7 @@ impl App {
                 needs_surface_sync: true,
                 presented_ok: false,
                 occluded: false,
+                blur_supported,
                 connect: None,
                 connect_gen: 0,
                 pending_fallback: None,
@@ -5478,10 +5566,23 @@ impl App {
         // A changed `ui.toml` (config-dir watch) hot-reloads the live-reloadable
         // settings into every window — the compositor blur, opacity, frost, color
         // scheme, and padding.
-        if self
+        // The compositor can also change the answer out from under us: a Wayland
+        // blur effect switched off mid-session withdraws the capability, and the
+        // frost fallback has to take over (and hand back) with it. The check is a
+        // lock-free load per window; re-applying the whole config on a change is
+        // fine because a change happens when a human toggles a desktop setting.
+        let blur_changed = self.windows.values().any(|w| {
+            w.gfx
+                .as_ref()
+                .is_some_and(|g| backdrop_blur_supported(&g.window) != w.blur_supported)
+        });
+        // Both flags are read every pass — `swap` must not be short-circuited away
+        // by a blur change, or the pending config edit would be re-applied again
+        // on the next pass instead of being consumed here.
+        let config_changed = self
             .config_changed
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if blur_changed || config_changed {
             self.reload_config(&config::UiConfig::load(), fe);
         }
         // Fire any per-window ticks that are now due.
@@ -5585,11 +5686,11 @@ impl App {
 mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
-        App, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice, auth_error_message,
-        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, home_launch_dir,
-        inherited_connection, namespace_remote_infos, new_window_choice, password_prompt,
-        remote_spawn_target, respawn_opts, restore_plan, should_restore, startup_choice,
-        theme_colors, want_blur,
+        App, Glass, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice,
+        auth_error_message, choose_alpha_mode, choose_surface_format, config,
+        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
+        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
+        respawn_opts, restore_plan, should_restore, startup_choice, theme_colors,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
@@ -7832,14 +7933,59 @@ mod tests {
     }
 
     #[test]
-    fn blur_requested_only_when_translucent_and_configured() {
-        // Blur rides on transparency: it's requested only when the window is
-        // both translucent AND the config opts in. The full 2×2 truth table
-        // pins the AND against a future edit that drops the transparency gate.
-        assert!(want_blur(true, true));
-        assert!(!want_blur(true, false));
-        assert!(!want_blur(false, true));
-        assert!(!want_blur(false, false));
+    fn glass_prefers_compositor_blur_and_frosts_only_where_it_cannot() {
+        // Blur and frost are one intent — make the translucent background read as
+        // glass — with two realizations, and they must never both apply: a real
+        // backdrop blur already diffuses what's behind, so self-drawn frost on top
+        // of it only muddies. Ask the compositor first; frost only where the answer
+        // is no.
+        assert_eq!(
+            glass(true, true, 0.4),
+            Glass {
+                blur: true,
+                frost: 0.0
+            },
+            "a blurring compositor makes frost redundant"
+        );
+        assert_eq!(
+            glass(true, false, 0.4),
+            Glass {
+                blur: true,
+                frost: 0.4
+            },
+            "no compositor blur — self-draw the glass at the configured density"
+        );
+        // Neither means anything behind an opaque window: there is no backdrop to
+        // blur and nothing shows through to frost. The request rides the same
+        // translucency gate as the window's alpha.
+        assert_eq!(
+            glass(false, true, 0.4),
+            Glass {
+                blur: false,
+                frost: 0.0
+            }
+        );
+        assert_eq!(
+            glass(false, false, 0.4),
+            Glass {
+                blur: false,
+                frost: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn glass_conjures_no_frost_that_was_not_configured() {
+        // Falling back to frost is a fallback, not an invention: a window with
+        // `frost = 0` (the default) that lands on a blurless compositor stays plain
+        // translucent rather than being frosted on its behalf.
+        assert_eq!(
+            glass(true, false, 0.0),
+            Glass {
+                blur: true,
+                frost: 0.0
+            }
+        );
     }
 
     #[test]
