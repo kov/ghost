@@ -7,6 +7,7 @@
 //! with a timeout, never fixed sleeps.
 
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -337,6 +338,14 @@ fn attach_survives_a_host_self_upgrade() {
         "session not attached; got: {:?}",
         term.screen()
     );
+
+    // A self-upgrade refuses a target that is writable by group or other (it execs
+    // that binary, so anyone able to write it could take over the session) — and
+    // cargo links this test's binary under the developer's umask, which on a
+    // permissive one (0000) leaves it 0777. Tighten it here so the test exercises
+    // the upgrade rather than the guard; a real install is never world-writable.
+    let mode = std::fs::metadata(GHOST).unwrap().permissions().mode();
+    std::fs::set_permissions(GHOST, std::fs::Permissions::from_mode(mode & !0o022)).unwrap();
 
     // Upgrade the host in place (to itself — proving the mechanism needs no newer
     // binary). Delivered over a separate control connection; the attached client

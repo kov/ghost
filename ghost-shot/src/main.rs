@@ -929,6 +929,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
             display_name: String::new(),
             command: vec!["psql".to_string(), "prod".to_string()],
             cwd: Some("~/ops".to_string()),
+            state: ghost_ui_core::DeadState::Exited,
         }]),
     );
     feed(

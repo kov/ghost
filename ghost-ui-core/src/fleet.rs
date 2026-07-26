@@ -464,6 +464,13 @@ struct Tile {
     /// and activating it recreates the session. Never observed or attached;
     /// revived by a listing that names it again.
     dead: bool,
+    /// This tile is dead only because **its host is unreachable** — the target it
+    /// is waiting for (see [`crate::DeadState::AwaitingHost`]). The session may
+    /// still be running there, so the card offers no relaunch: it says what it is
+    /// waiting for, and the shell keeps reconnecting until the host answers, at
+    /// which point the listing either revives the tile or (the host rebooted and
+    /// lost it) leaves it plainly dead and relaunchable.
+    awaiting_host: Option<String>,
     /// The group of the window holding this session, parsed from the display
     /// client's pushed identity ([`crate::group::holder_group`]). Live truth
     /// for bucketing an Elsewhere tile under its window's block; `None`
@@ -830,6 +837,7 @@ impl FleetModel {
             cwd: None,
             host: None,
             dead: false,
+            awaiting_host: None,
             holder: None,
             pending_rename: None,
         });
@@ -1409,8 +1417,10 @@ impl FleetModel {
                     // so it warrants a repaint just like locality/metadata changes.
                     dirty = true;
                 }
-                // A listing naming a dead tile revives it (a recreate landed).
+                // A listing naming a dead tile revives it (a recreate landed, or a
+                // remote host came back and still has the session).
                 tile.dead = false;
+                tile.awaiting_host = None;
                 tile.bell = info.bell;
                 tile.locality = locality;
                 // The marker is a bare bool: it can't say who holds the
@@ -1559,12 +1569,24 @@ impl FleetModel {
             if !self.groups.iter().any(|g| g.members.contains(&d.name)) {
                 continue;
             }
+            let awaiting = match &d.state {
+                crate::DeadState::AwaitingHost(target) => Some(target.clone()),
+                crate::DeadState::Exited => None,
+            };
             if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == d.name) {
                 if tile.dead && tile.display_name != d.display_name {
                     if let Some(state) = sessions.get_mut(&tile.id) {
                         state.set_display_name(d.display_name.clone());
                     }
                     tile.display_name = d.display_name;
+                    dirty = true;
+                }
+                // A reachable-again host that no longer has the session flips a
+                // waiting card into a relaunchable one (and the reverse when the
+                // host goes away again), so what the card offers stays truthful.
+                if tile.awaiting_host != awaiting {
+                    tile.awaiting_host = awaiting;
+                    tile.frame_dirty = true;
                     dirty = true;
                 }
             } else {
@@ -1584,6 +1606,7 @@ impl FleetModel {
                 );
                 let t = self.tiles.last_mut().expect("just pushed");
                 t.dead = true;
+                t.awaiting_host = awaiting;
                 t.cwd = d.cwd;
                 dirty = true;
             }
@@ -2576,12 +2599,20 @@ impl FleetModel {
 
     /// Group `gid`'s members whose tiles are dead — what the relaunch chip
     /// brings back.
+    /// Members that are gone and **relaunchable**. A member merely waiting for an
+    /// unreachable host is excluded: it is probably still running there, so there is
+    /// nothing to relaunch, and offering it would invite abandoning live work (see
+    /// [`crate::DeadState::AwaitingHost`]).
     fn dead_members(&self, gid: &str) -> Vec<SessionId> {
         self.group(gid)
             .map(|g| {
                 g.members
                     .iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
+                    .filter(|id| {
+                        self.tiles
+                            .iter()
+                            .any(|t| &t.id == *id && t.dead && t.awaiting_host.is_none())
+                    })
                     .cloned()
                     .collect()
             })
@@ -3831,6 +3862,19 @@ impl FleetModel {
                     let (before, after) = r.buffer.halves();
                     format!("{before}\u{2588}{after}")
                 }
+                // A card waiting for its host says so: the session may still be
+                // running there, so "exited" would be a lie.
+                None if tile.awaiting_host.is_some() => format!(
+                    "{} \u{b7} host away",
+                    card_meta(
+                        tile.display(),
+                        &tile.command,
+                        0,
+                        tile.cwd.clone(),
+                        None,
+                        tile.host.as_deref(),
+                    )
+                ),
                 // A dead card states its fate where the pid would be; a stale
                 // pid or progress report would only pretend it still runs.
                 None if tile.dead => format!(
@@ -3901,10 +3945,14 @@ impl FleetModel {
                     color: PLACEHOLDER_BG,
                     radius: 3.0,
                 });
-                let hint = if tile.dead {
-                    "exited \u{b7} \u{21b5} relaunches"
-                } else {
-                    placeholder_hint(tile.locality)
+                let waiting = tile
+                    .awaiting_host
+                    .as_deref()
+                    .map(|t| format!("waiting for {t}\u{2026}"));
+                let hint = match (&waiting, tile.dead) {
+                    (Some(w), _) => w.as_str(),
+                    (None, true) => "exited \u{b7} \u{21b5} relaunches",
+                    (None, false) => placeholder_hint(tile.locality),
                 };
                 out.push(SceneItem::Text {
                     id: SceneId::Badge(handle),
@@ -3918,8 +3966,13 @@ impl FleetModel {
 
             // Action buttons — a centred label on its own inset chip. A dead
             // card replaces them with one full-width relaunch chip (kill/
-            // detach/rename have no live session to act on).
-            if tile.dead {
+            // detach/rename have no live session to act on). A card waiting for
+            // its host shows no chip: relaunching would abandon a session that is
+            // probably still running there, and the reconnect needs no decision
+            // from the user (see [`crate::DeadState::AwaitingHost`]).
+            if tile.awaiting_host.is_some() {
+                // Nothing to offer while the host is away.
+            } else if tile.dead {
                 let footer = RectPx {
                     x: buttons[0].1.x,
                     y: buttons[0].1.y,
@@ -5184,7 +5237,104 @@ mod tests {
             display_name: display.to_string(),
             command: command.iter().map(|s| s.to_string()).collect(),
             cwd: None,
+            state: crate::event::DeadState::Exited,
         }
+    }
+
+    /// A remembered member on a host we cannot reach (see
+    /// [`crate::DeadState::AwaitingHost`]).
+    fn awaiting_info(name: &str, target: &str) -> crate::event::DeadSession {
+        crate::event::DeadSession {
+            name: name.to_string(),
+            display_name: String::new(),
+            command: Vec::new(),
+            cwd: None,
+            state: crate::event::DeadState::AwaitingHost(target.to_string()),
+        }
+    }
+
+    /// A member on a host we cannot reach is NOT a corpse: the session is very
+    /// likely still running there, and the window's job is to wait. So the card
+    /// says what it is waiting for and offers no relaunch — offering one would
+    /// invite the user to abandon live work — while the shell keeps reconnecting.
+    /// Before this, such a member had no tile at all, which is what a remote
+    /// reboot looked like: an empty fleet and sessions apparently lost.
+    #[test]
+    fn a_member_awaiting_its_host_is_drawn_waiting_and_offers_no_relaunch() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        let composite = format!("kov@box{}work", crate::REMOTE_ID_SEP);
+        seed_group(&mut m, "w9", "blue", &[&composite]);
+        m.update(UiEvent::DeadSessions(vec![awaiting_info(
+            &composite, "kov@box",
+        )]));
+
+        let tile = m
+            .tiles
+            .iter()
+            .find(|t| t.id == composite)
+            .expect("a remembered remote member gets a tile even with its host away");
+        assert!(tile.dead, "there is no live session to attach to");
+        assert_eq!(tile.awaiting_host.as_deref(), Some("kov@box"));
+        assert!(
+            m.layout().iter().any(|(_, id, _)| *id == composite),
+            "and it is laid out, or the fleet is empty to the user"
+        );
+
+        let texts: Vec<String> = m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => Some(runs[0].text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("waiting for kov@box")),
+            "the card names the host it waits for: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "relaunch"),
+            "nothing to relaunch while the host is away: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("exited")),
+            "and it must not claim the session exited: {texts:?}"
+        );
+    }
+
+    /// The other side of the same coin: once the host answers and does not have the
+    /// session (it rebooted), the very same tile becomes plainly dead, and the user
+    /// gets the explicit relaunch — resurrection is never automatic.
+    #[test]
+    fn a_host_that_returns_without_the_session_makes_its_tile_relaunchable() {
+        let mut m = my_fleet(&[]);
+        widen(&mut m);
+        let composite = format!("kov@box{}work", crate::REMOTE_ID_SEP);
+        seed_group(&mut m, "w9", "blue", &[&composite]);
+        m.update(UiEvent::DeadSessions(vec![awaiting_info(
+            &composite, "kov@box",
+        )]));
+        // The host is back; its listing does not carry `work`.
+        m.update(UiEvent::DeadSessions(vec![dead_info(&composite, "", &[])]));
+
+        let tile = m.tiles.iter().find(|t| t.id == composite).expect("tile");
+        assert_eq!(
+            tile.awaiting_host, None,
+            "the wait is over — the host answered"
+        );
+        let texts: Vec<String> = m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => Some(runs[0].text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "relaunch"),
+            "a session the host no longer has is relaunchable: {texts:?}"
+        );
     }
 
     #[test]

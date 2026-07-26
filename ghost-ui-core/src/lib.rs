@@ -23,7 +23,9 @@ pub mod text_input;
 pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};
-pub use event::{DeadSession, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent};
+pub use event::{
+    DeadSession, DeadState, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent,
+};
 pub use fleet::{FleetModel, Locality};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
 pub use ghost_vt::query::ThemeColors;

@@ -149,3 +149,203 @@ fn a_new_window_opens_the_fleet_when_a_session_is_detached() {
         );
     });
 }
+
+/// A group remembering a session on a **remote host that is away** must show it: the
+/// window is supposed to be waiting for that host to come back, and the tile is
+/// where the wait is visible (and where a reconnect lands). Nothing local can stand
+/// in for it — a remote member has no local descriptor and no local recording, so
+/// the dead-member sweep never names it, which is why this needs its own coverage.
+#[test]
+fn a_remembered_remote_member_whose_host_is_away_is_drawn_as_waiting() {
+    with_isolated_xdg(|_tmp| {
+        // A group from a window that had a remote session on another host; the host is
+        // not connected (rebooting, asleep, off the network).
+        let dir = ghost_vt::paths::data_dir();
+        std::fs::create_dir_all(&dir).expect("data dir");
+        // The separator is a control character: TOML forbids it raw, and ghost's own
+        // writer escapes it — as the real `windows.toml`/`groups.toml` show.
+        std::fs::write(
+            dir.join("groups.toml"),
+            "[[group]]\nid = \"win-old-0\"\nname = \"blue\"\ncolor = 0\n\
+             members = [\"kov@couve\\u001Fwork\"]\n",
+        )
+        .expect("write groups.toml");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        for _ in 0..3 {
+            reconcile(&mut app, wid, &fe);
+            app.wake(&fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        assert!(
+            sees_tile(&scene, "work"),
+            "a remembered remote member must be drawn while its host is away — \
+             otherwise the fleet a launch sends us to is empty and the sessions look \
+             lost; it shows: {:?}",
+            visible_text(&scene)
+        );
+        assert!(
+            sees_text(&scene, "waiting for kov@couve"),
+            "and it must say what it is waiting for: {:?}",
+            visible_text(&scene)
+        );
+        assert!(
+            !sees_text(&scene, "relaunch"),
+            "the session is probably still running there: offering a relaunch would \
+             invite abandoning it: {:?}",
+            visible_text(&scene)
+        );
+    });
+}
+
+/// Restoring at startup while the hosts are away — the daily shape of a laptop that
+/// drives its work over ssh: every window's members are remote, and the hosts are
+/// asleep, rebooting, or off the network.
+///
+/// The window must come back showing those sessions and waiting for their hosts. This
+/// is the same defect as the empty fleet above, reached the other way: a restored
+/// window's members come from `windows.toml`, so they are remembered before anything
+/// has written a group registry — and a wait that only lives in a running process
+/// would not survive the quit-and-relaunch this test performs.
+#[test]
+fn a_restored_window_waits_for_its_remote_sessions_when_the_host_is_away() {
+    with_isolated_xdg(|_tmp| {
+        let dir = ghost_vt::paths::data_dir();
+        std::fs::create_dir_all(&dir).expect("data dir");
+        // A window of two sessions on a host reached over ssh (couve's real shape:
+        // an ssh group whose members are all `<target>␟<real>` composites).
+        std::fs::write(
+            dir.join("groups.toml"),
+            "[[group]]\nid = \"win-1-0\"\nname = \"blue\"\ncolor = 0\n\
+             members = [\"jabuticaba\\u001Fwork-1\", \"jabuticaba\\u001Fwork-2\"]\n\n\
+             [group.connection]\nhost = \"jabuticaba\"\nextra = []\nkind = \"ssh\"\n",
+        )
+        .expect("write groups.toml");
+        std::fs::write(
+            dir.join("windows.toml"),
+            "[[window]]\ngroup_id = \"win-1-0\"\ncols = 120\nrows = 40\nfleet = false\n\
+             foreground = \"jabuticaba\\u001Fwork-1\"\n\
+             attached = [\"jabuticaba\\u001Fwork-1\", \"jabuticaba\\u001Fwork-2\"]\n",
+        )
+        .expect("write windows.toml");
+
+        let records = App::saved_workspace();
+        assert_eq!(
+            records.len(),
+            1,
+            "the saved window is readable: {records:?}"
+        );
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        app.restore_workspace(&fe, records);
+
+        let wid = *app
+            .window_ids()
+            .first()
+            .expect("the saved window is restored, not dropped for want of a live host");
+        let shown = wait_until(Duration::from_secs(2), || {
+            reconcile(&mut app, wid, &fe);
+            app.wake(&fe);
+            let scene = app.root(wid).expect("window").view(app.states());
+            sees_tile(&scene, "work-1") && sees_tile(&scene, "work-2")
+        });
+        let scene = app.root(wid).expect("window").view(app.states());
+        assert!(
+            shown,
+            "a restored window must show the remote sessions it is waiting for, not \
+             an empty fleet; it shows: {:?}",
+            visible_text(&scene)
+        );
+        assert!(
+            sees_text(&scene, "waiting for jabuticaba"),
+            "and name the host it is waiting for: {:?}",
+            visible_text(&scene)
+        );
+    });
+}
+
+/// Stealing a session that is another window's foreground must move it, not clone it.
+/// Two windows in one process, the second takes over the first's session: the first
+/// has to stop showing it (it drops to the fleet, having nothing else), because a
+/// session lives in exactly one view. Before this, the loser kept the session on
+/// screen and typeable while the fleet already listed it as attached elsewhere.
+#[test]
+fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
+    with_isolated_xdg(|_tmp| {
+        // A live (printing) session: the dive into a taken-over session lands on its
+        // next frame.
+        support::spawn_chatty_session("shared-1");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+
+        // Window A drives the session as its foreground.
+        let g1 = app.mint_group();
+        let a = app
+            .open_single_window(&fe, "shared-1", g1, None)
+            .expect("first window");
+        app.wake(&fe);
+        assert!(
+            app.root(a).expect("A").foregrounds("shared-1"),
+            "precondition: A shows the session"
+        );
+
+        // Window B takes it over from its fleet — the same-process adopt-in-place.
+        let g2 = app.mint_group();
+        let b = app.open_fleet_window(&fe, g2, None);
+        reconcile(&mut app, b, &fe);
+        // Sessions held by other windows hide behind a band ("N attached elsewhere ·
+        // show"), so reveal them first — the same two clicks the user makes.
+        let scene = app.root(b).expect("B").view(app.states());
+        let (sx, sy) = support::button_center(&scene, "show")
+            .unwrap_or_else(|| panic!("no reveal band: {:?}", visible_text(&scene)));
+        for ev in support::click_events(sx, sy) {
+            app.dispatch(b, ev, &fe);
+        }
+        // Click its card, exactly where the user sees it, then confirm the "steal
+        // this session" modal — the real gesture, not a synthesized command.
+        let scene = app.root(b).expect("B").view(app.states());
+        let (x, y) = support::tile_center(&scene, "shared-1").unwrap_or_else(|| {
+            panic!(
+                "B's fleet draws no card for the session: {:?}",
+                visible_text(&scene)
+            )
+        });
+        for ev in support::click_events(x, y) {
+            app.dispatch(b, ev, &fe);
+        }
+        let scene = app.root(b).expect("B").view(app.states());
+        let (cx, cy) = support::button_center(&scene, "Take over").unwrap_or_else(|| {
+            panic!(
+                "no take-over confirmation offered: {:?}",
+                visible_text(&scene)
+            )
+        });
+        for ev in support::click_events(cx, cy) {
+            app.dispatch(b, ev, &fe);
+        }
+        // The dive into a taken-over session animates and completes on its first
+        // output, so let the loop run as it would live.
+        let landed = wait_until(Duration::from_secs(5), || {
+            app.wake(&fe);
+            app.root(b).expect("B").foregrounds("shared-1")
+        });
+        assert!(
+            landed,
+            "B must end up showing the session it took over; it shows: {:?}",
+            visible_text(&app.root(b).expect("B").view(app.states()))
+        );
+        assert!(
+            !app.root(a).expect("A").foregrounds("shared-1"),
+            "A must not still show a session B now owns: {:?}",
+            visible_text(&app.root(a).expect("A").view(app.states()))
+        );
+        assert!(
+            app.root(a).expect("A").is_fleet(),
+            "with nothing else to show, A falls back to the fleet"
+        );
+        support::kill_session("shared-1");
+    });
+}

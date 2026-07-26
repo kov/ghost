@@ -660,10 +660,17 @@ pub fn feed_shared(
     // once. The `&mut` borrow ends here; the applies below re-borrow immutably.
     let (mut driver_cmds, outcome) = state.ingest(bytes, &geom, ended);
     driver_cmds.extend(driver.apply_shared_feed(sessions, name, &outcome, true));
-    let obs_cmds = observers
+    let mut obs_cmds: Vec<Vec<Cmd>> = observers
         .iter_mut()
         .map(|w| w.apply_shared_feed(sessions, name, &outcome, false))
         .collect();
+    // This feed may be the frame a deferred take-over was waiting for (see
+    // [`RootModel::complete_pending_dive`]); the applies above hold only `&Sessions`,
+    // so the dive is completed here, once the shared ingest's borrow is done.
+    driver_cmds.extend(driver.complete_pending_dive(sessions, name));
+    for (w, cmds) in observers.iter_mut().zip(obs_cmds.iter_mut()) {
+        cmds.extend(w.complete_pending_dive(sessions, name));
+    }
     (driver_cmds, obs_cmds)
 }
 
@@ -702,10 +709,16 @@ pub fn feed_observed(
     // ops) — DROPPED: a mirror never speaks for the program it observes (see above).
     let geom = DrivingGeometry::nominal();
     let (_dropped_child_effects, outcome) = state.ingest(bytes, &geom, ended);
-    viewers
+    let mut per: Vec<Vec<Cmd>> = viewers
         .iter_mut()
         .map(|w| w.apply_shared_feed(sessions, name, &outcome, false))
-        .collect()
+        .collect();
+    // A take-over of an observed tile waits for exactly this frame; see
+    // [`RootModel::complete_pending_dive`].
+    for (w, cmds) in viewers.iter_mut().zip(per.iter_mut()) {
+        cmds.extend(w.complete_pending_dive(sessions, name));
+    }
+    per
 }
 
 /// F9 toggles the fleet overview.
@@ -1014,6 +1027,30 @@ impl RootModel {
             },
             None => Vec::new(),
         }
+    }
+
+    /// Finish a take-over that was waiting for its session's next frame.
+    ///
+    /// Opening a tile whose preview isn't live yet holds in the fleet
+    /// ([`Self::adopt`] parks the id in `pending_dive_in`) and dives once the session
+    /// produces output, so the descent starts from a full-size, content-bearing card.
+    /// The frame that releases it arrives through the shared fan
+    /// ([`feed_shared`]/[`feed_observed`]) — whose per-window apply holds only
+    /// `&Sessions` and so cannot adopt — hence this second step, called by the fan
+    /// with the mutable registry.
+    ///
+    /// Without it a take-over of a session that isn't currently printing left the
+    /// window parked in the fleet forever: it had claimed the session, but never
+    /// showed it.
+    pub fn complete_pending_dive(&mut self, sessions: &mut Sessions, name: &str) -> Vec<Cmd> {
+        if self.pending_dive_in.as_deref() != Some(name) {
+            return Vec::new();
+        }
+        if !matches!(&self.mode, Mode::Fleet(f) if f.tile_fed(name)) {
+            return Vec::new();
+        }
+        self.pending_dive_in = None;
+        self.adopt(sessions, name.to_string())
     }
 
     /// Apply `ev` to the active view — the foreground view against its state, or the
@@ -1403,13 +1440,26 @@ impl RootModel {
             };
         }
         // Another window in this process took over a session this one drives (an
-        // in-process adopt-in-place of an already-driven session). Relinquish grid
-        // ownership so only the new owner re-grids the one shared child — the view and
-        // input stay, since drivership gates only grid mutation (see `drives`). The shell
-        // fans this exactly to the prior driver(s) at the take-over, so no group/predicate
-        // guesswork: it is an unambiguous "you no longer own the grid" signal.
+        // in-process adopt-in-place of an already-driven session). The shell fans this
+        // exactly to the prior driver(s) at the take-over, so there is no group or
+        // predicate guesswork: it is an unambiguous "this session is someone else's
+        // now" signal, and this window lets go of it completely.
+        //
+        // A session shows in exactly ONE place. So if it was our foreground we switch
+        // away — to another session of ours, or to the fleet — reusing the same path a
+        // session ending takes; a warm background mirror of it is dropped. Keeping it
+        // on screen would leave two windows displaying and typing into one session
+        // while the fleet already showed it as attached elsewhere.
         if let UiEvent::DriverLost { name } = &ev {
-            let existed = self.mine.remove(name);
+            let name = name.clone();
+            if matches!(&self.mode, Mode::Single { id, .. } if *id == name) {
+                // Ownership must go before the switch: `foreground_ended` picks the
+                // next session out of `mine`, and this one is no longer ours.
+                self.mine.remove(&name);
+                return self.foreground_ended(sessions);
+            }
+            let existed = self.mine.remove(&name);
+            self.warm.remove(&name);
             return if existed {
                 vec![Cmd::Redraw]
             } else {
@@ -3125,13 +3175,70 @@ mod tests {
         );
     }
 
+    /// Taking over a session that is another window's **foreground** must move it: the
+    /// window that lost it switches to another of its sessions, or drops to the fleet
+    /// when it has none. A session shows in exactly one place, so leaving the loser
+    /// displaying it — live and typeable, while the fleet correctly shows it as
+    /// attached elsewhere — is two foregrounds for one session.
+    #[test]
+    fn losing_the_foreground_to_another_window_switches_this_one_away() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint("beta", 80, 24);
+        // A shows alpha and also drives beta as a warm background mirror.
+        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        a.mine.insert("alpha".into());
+        a.mine.insert("beta".into());
+        a.warm
+            .insert("beta".into(), TerminalView::new(METRICS, 80, 24));
+        assert_eq!(a.single_foreground().map(String::as_str), Some("alpha"));
+
+        // Another window takes alpha over; the shell fans the loss.
+        a.update(
+            &mut sessions,
+            UiEvent::DriverLost {
+                name: "alpha".into(),
+            },
+        );
+
+        assert_eq!(
+            a.single_foreground().map(String::as_str),
+            Some("beta"),
+            "the loser switches to its remaining session"
+        );
+        assert!(
+            !a.views("alpha"),
+            "and stops showing the session it no longer holds"
+        );
+    }
+
+    /// The same handoff with nothing left to show: the window drops to the fleet
+    /// rather than sitting on a session another window now owns.
+    #[test]
+    fn losing_its_only_session_drops_the_window_to_the_fleet() {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint("alpha", 80, 24);
+        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        a.mine.insert("alpha".into());
+
+        a.update(
+            &mut sessions,
+            UiEvent::DriverLost {
+                name: "alpha".into(),
+            },
+        );
+
+        assert!(
+            a.is_fleet(),
+            "with its only session taken over, the window shows the fleet"
+        );
+    }
+
     /// The take-over handoff (5c item 3): a window driving a session, told via the fanned
     /// [`DriverLost`](UiEvent::DriverLost) that another window took it over in-process,
     /// relinquishes grid ownership of it — its resize no longer re-grids the one shared
-    /// child. It keeps the session in view and keeps typing to it (drivership gates only
-    /// grid mutation; see [`only_the_driving_window_re_grids_the_shared_session_on_resize`]
-    /// and [`an_observer_windows_input_still_reaches_the_shared_session`]). The signal is
-    /// scoped to the one named session: a window's *other* driven sessions are untouched.
+    /// child. The signal is scoped to the one named session: a window's *other* driven
+    /// sessions are untouched.
     #[test]
     fn a_driver_relinquishes_grid_ownership_when_told_another_window_took_over() {
         let mut sessions = Sessions::new();

@@ -58,8 +58,21 @@ pub fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
 /// executable, and this test binary is not a ghost host. The child inherits our
 /// (isolated) environment, so the session lands in the test's runtime dir.
 pub fn spawn_session(name: &str) {
+    // A banner then `cat`: a session with content on its screen, like a real one.
+    spawn_session_running(name, &format!("echo {name} ready; exec cat"));
+}
+
+/// A session that keeps printing — a live session, the way a log tail or a build is.
+/// Paths that complete only on a session's next frame (a fleet dive lands on one)
+/// need this; a quiet session would leave them pending forever.
+pub fn spawn_chatty_session(name: &str) {
+    spawn_session_running(name, "while :; do echo tick; sleep 0.2; done");
+}
+
+/// Spawn a detached session running `script` under `sh -c`.
+pub fn spawn_session_running(name: &str, script: &str) {
     let ok = std::process::Command::new(GHOST)
-        .args(["new", name, "-d", "--", "cat"])
+        .args(["new", name, "-d", "--", "sh", "-c", script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -164,6 +177,76 @@ pub fn sees_tile(scene: &ghost_render::Scene, name: &str) -> bool {
             }
             _ => false,
         })
+}
+
+/// Where the user would click to hit session `name`'s card: the centre of its drawn
+/// preview. `None` if nothing for it is on screen — so a test clicks only what is
+/// actually visible, as the user can.
+pub fn tile_center(scene: &ghost_render::Scene, name: &str) -> Option<(f64, f64)> {
+    let key = ghost_render::scene::session_key(name);
+    let rect = scene
+        .layers
+        .iter()
+        .flat_map(|l| &l.items)
+        .find_map(|item| {
+            match item {
+                ghost_render::SceneItem::Terminal { session, rect, .. } if *session == key => {
+                    Some(*rect)
+                }
+                // A dead/waiting card draws no terminal; its title labels the card.
+                ghost_render::SceneItem::Text { id, runs, rect, .. }
+                    if matches!(id, ghost_render::SceneId::Label(_))
+                        && runs
+                            .iter()
+                            .map(|r| r.text.as_str())
+                            .collect::<String>()
+                            .starts_with(name) =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            }
+        })?;
+    Some((
+        f64::from(rect.x + rect.w / 2.0),
+        f64::from(rect.y + rect.h / 2.0),
+    ))
+}
+
+/// Where the user would click to hit the button labelled exactly `label`.
+pub fn button_center(scene: &ghost_render::Scene, label: &str) -> Option<(f64, f64)> {
+    let rect = scene
+        .layers
+        .iter()
+        .flat_map(|l| &l.items)
+        .find_map(|item| match item {
+            ghost_render::SceneItem::Text { runs, rect, .. }
+                if runs.iter().map(|r| r.text.as_str()).collect::<String>() == label =>
+            {
+                Some(*rect)
+            }
+            _ => None,
+        })?;
+    Some((
+        f64::from(rect.x + rect.w / 2.0),
+        f64::from(rect.y + rect.h / 2.0),
+    ))
+}
+
+/// A full click (press then release) at `(x, y)` — clicks complete on release.
+pub fn click_events(x: f64, y: f64) -> [ghost_ui_core::UiEvent; 2] {
+    let ev = |phase| ghost_ui_core::UiEvent::Pointer {
+        phase,
+        button: Some(ghost_ui_core::PointerButton::Left),
+        pos: ghost_ui_core::PointPx { x, y },
+        mods: ghost_ui_core::Mods::default(),
+        wheel_dy: 0.0,
+        clicks: 1,
+    };
+    [
+        ev(ghost_ui_core::PointerPhase::Press),
+        ev(ghost_ui_core::PointerPhase::Release),
+    ]
 }
 
 /// Which of `candidates` the user can currently see a card for.

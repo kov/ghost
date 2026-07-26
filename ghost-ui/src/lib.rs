@@ -576,32 +576,63 @@ fn spawn_connect_worker(
     });
 }
 
-/// Reconnect to `spec`'s host in the background for a startup restore: open the
-/// ControlMaster non-interactively (key/agent auth only — a password or
-/// unreachable host fails fast and is simply given up on, its tiles staying cold),
-/// negotiate a usable remote ghost, then post [`UserEvent::RemoteReconnected`] so
-/// the main loop re-adopts the host's remembered sessions. No PTY, no prompt.
+/// Reconnect to `spec`'s host in the background, **retrying until it answers**:
+/// open the ControlMaster non-interactively (key/agent auth only, no PTY and no
+/// prompt), negotiate a usable remote ghost, then post
+/// [`UserEvent::RemoteReconnected`] so the main loop re-adopts the host's
+/// remembered sessions.
+///
+/// The retry is the point. A host that is rebooting, asleep, or off the network is
+/// not a host that has lost its sessions — they are still there when it comes
+/// back. So this waits, with the same capped backoff a dropped session's probe
+/// uses (1s doubling to 30s: a drop of seconds or of days recovers), until `stop`
+/// is set — which happens when nothing remembers a session on that host any more
+/// (see [`App::retry_remembered_hosts`]). A password-only host never succeeds
+/// under `BatchMode`; its tiles keep waiting, and the user can connect explicitly.
 fn spawn_remote_reconnect(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     spec: ConnectionSpec,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
-        let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) else {
-            return;
-        };
-        if !remote.open_master_batch() {
-            return; // password/unreachable — deferred, degrade to cold tiles
-        }
-        match remote.negotiate() {
-            Ok(remote_ghost) => {
-                let _ = proxy.send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+        let mut backoff = RECONNECT_BACKOFF;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
             }
-            // A restore reconnect that can't use the transport degrades to cold tiles;
-            // log why so this path stops failing even more silently than a fresh connect.
-            Err(why) => eprintln!(
-                "ghost: restoring {} over ssh: {why}; leaving its sessions cold",
-                spec.target()
-            ),
+            if let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) {
+                // A silent partition leaves a wedged master behind, and only a fresh
+                // probe can tell the host is back (see `spawn_reconnect_probe`).
+                remote.reap_wedged_master();
+                if remote.open_master_batch() {
+                    match remote.negotiate() {
+                        Ok(remote_ghost) => {
+                            let _ = proxy
+                                .send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+                            return;
+                        }
+                        // Reachable but unusable as a transport (no remote ghost, a
+                        // staging failure). Say so once per round and keep waiting:
+                        // the host may finish booting into a usable state.
+                        Err(why) => eprintln!(
+                            "ghost: reconnecting {} over ssh: {why}; still waiting",
+                            spec.target()
+                        ),
+                    }
+                }
+            }
+            // Sleep the backoff in short chunks so a stop is noticed promptly.
+            let mut slept = Duration::ZERO;
+            while slept < backoff {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let chunk = Duration::from_millis(250).min(backoff - slept);
+                std::thread::sleep(chunk);
+                slept += chunk;
+            }
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
         }
     });
 }
@@ -1463,6 +1494,7 @@ fn interactive(fresh: bool) {
         remote_watchers: HashMap::new(),
         pending_remote_restores: HashMap::new(),
         reconnecting: HashMap::new(),
+        remote_retries: HashMap::new(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -1955,6 +1987,7 @@ impl App {
             remote_watchers: HashMap::new(),
             pending_remote_restores: HashMap::new(),
             reconnecting: HashMap::new(),
+            remote_retries: HashMap::new(),
             subs: HashMap::new(),
             // From the (test-isolated) data dir, as `interactive` does — a shell test
             // that seeds `groups.toml` gets the registry the real launch would read.
@@ -2258,6 +2291,16 @@ pub struct App {
     /// dedupes — a repeated drop won't start a second probe. See
     /// [`begin_reconnect`](App::begin_reconnect) / [`finish_reattach`](App::finish_reattach).
     reconnecting: HashMap<(WindowId, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Remote **hosts** a group still remembers a session on but which we are not
+    /// connected to, each with the stop flag of the background worker retrying it
+    /// forever (see [`App::retry_remembered_hosts`]). Presence dedupes, so one
+    /// worker per host no matter how many members or windows want it.
+    ///
+    /// This is what makes waiting durable: the hold outlives the drop that started
+    /// it, and — because the members are remembered in `groups.toml` — a ghost that
+    /// is quit and relaunched while the host is still down picks the wait back up
+    /// instead of forgetting the sessions.
+    remote_retries: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -2307,12 +2350,164 @@ impl App {
         }
     }
 
+    /// `wid` now holds `id`: tell every OTHER window that was driving it to let it go
+    /// (`UiEvent::DriverLost`). A session shows in exactly one place, so the loser
+    /// switches its foreground away — or drops to the fleet — rather than keeping a
+    /// live view of a session it no longer owns; only the new holder re-grids the one
+    /// shared child.
+    ///
+    /// A fresh attach (no prior driver) finds no losers; only a real cross-window
+    /// take-over does. Both take-over routes must call this: `Cmd::Attach`, and the
+    /// adopt-in-place branch of `Cmd::TakeOver` that skips attaching because this
+    /// process already holds the client.
+    fn hand_over(&mut self, wid: WindowId, id: &str, event_loop: &dyn Frontend) {
+        let losers: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(owid, w)| **owid != wid && w.root.drives(id))
+            .map(|(owid, _)| *owid)
+            .collect();
+        for owid in losers {
+            self.dispatch(
+                owid,
+                UiEvent::DriverLost {
+                    name: id.to_string(),
+                },
+                event_loop,
+            );
+        }
+    }
+
+    /// Keep one background reconnect running for every remote host a group still
+    /// remembers a session on and that we are not connected to, and stop the ones
+    /// nothing wants any more. Idempotent and cheap — called from the loop's
+    /// once-per-wake pass, where it also covers a host that goes away mid-run.
+    ///
+    /// This is the durable half of "a remote reboot must not lose my sessions". The
+    /// per-session probe ([`Self::begin_reconnect`]) only exists while a window
+    /// holds a dropped client, and dies with the process; this one is keyed to what
+    /// `groups.toml` remembers, so it survives the drop, the window closing, and
+    /// ghost being quit and relaunched. The spec comes from the group's stored
+    /// connection when it has one (port, identity, options), falling back to
+    /// parsing the target.
+    fn retry_remembered_hosts(&mut self) {
+        use std::sync::atomic::Ordering;
+        let Some(proxy) = self.proxy.clone() else {
+            return; // no event loop to post the result back to (a headless test)
+        };
+        let connected: HashSet<String> = self
+            .remotes
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut wanted: HashSet<String> = HashSet::new();
+        let remembered = self.groups.iter().flat_map(|g| &g.members).chain(
+            self.pending_remote_restores
+                .values()
+                .flatten()
+                .map(|p| &p.composite),
+        );
+        for member in remembered {
+            if let Some((target, _)) = remote_id_parts(member)
+                && !connected.contains(target)
+            {
+                wanted.insert(target.to_string());
+            }
+        }
+        // Stop retrying a host nothing remembers any more (its group was dissolved,
+        // or it answered and is now connected).
+        self.remote_retries.retain(|target, stop| {
+            let keep = wanted.contains(target);
+            if !keep {
+                stop.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
+        for target in wanted {
+            if self.remote_retries.contains_key(&target) {
+                continue;
+            }
+            let spec = self
+                .groups
+                .iter()
+                .filter_map(|g| g.connection.clone())
+                .find(|c| c.target() == target)
+                .or_else(|| ConnectionSpec::parse_target(&target));
+            let Some(spec) = spec else { continue };
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.remote_retries.insert(target, stop.clone());
+            spawn_remote_reconnect(proxy.clone(), spec, stop);
+        }
+    }
+
+    /// Every remembered **remote** member that no host is currently serving, and
+    /// why — the remote half of the dead sweep.
+    ///
+    /// A remote member (`<target>␟<real>`) has no local descriptor and no local
+    /// recording, so the local sweep can never name it. Without this it had no tile
+    /// at all whenever its host was unreachable: the window that was driving it
+    /// showed an empty fleet, which is what "a remote reboot loses my sessions"
+    /// actually looked like. Two cases, and the difference is what the card offers:
+    ///
+    /// - the host is **not connected**: it may still be running there, so the tile
+    ///   waits ([`ghost_ui_core::DeadState::AwaitingHost`]) while
+    ///   [`Self::retry_remembered_hosts`] keeps reconnecting.
+    /// - the host **is** connected and does not list it: it is genuinely gone (the
+    ///   host rebooted), so the tile becomes relaunchable — an explicit act, since
+    ///   relaunching cannot bring back what was running.
+    fn remembered_remotes(&self) -> Vec<ghost_ui_core::DeadSession> {
+        let mut out: Vec<ghost_ui_core::DeadSession> = Vec::new();
+        // Group members, plus what a startup restore is still waiting to re-adopt:
+        // a restored window's members come from `windows.toml` and reach the group
+        // registry only once something saves it, so a bare launch whose hosts are
+        // all away would otherwise open with nothing on screen.
+        let remembered = self.groups.iter().flat_map(|g| &g.members).chain(
+            self.pending_remote_restores
+                .values()
+                .flatten()
+                .map(|p| &p.composite),
+        );
+        for member in remembered {
+            let Some((target, real)) = remote_id_parts(member) else {
+                continue;
+            };
+            if out.iter().any(|d| &d.name == member) {
+                continue;
+            }
+            match self.remote_infos.get(target) {
+                // Connected and serving it: it is live, not remembered — the
+                // listing carries it and the fleet has a real tile.
+                Some(infos) if infos.iter().any(|i| &i.name == member) => continue,
+                Some(_) => out.push(ghost_ui_core::DeadSession {
+                    name: member.clone(),
+                    display_name: real.to_string(),
+                    command: Vec::new(),
+                    cwd: None,
+                    state: ghost_ui_core::DeadState::Exited,
+                }),
+                None => out.push(ghost_ui_core::DeadSession {
+                    name: member.clone(),
+                    display_name: real.to_string(),
+                    command: Vec::new(),
+                    cwd: None,
+                    state: ghost_ui_core::DeadState::AwaitingHost(target.to_string()),
+                }),
+            }
+        }
+        out
+    }
+
     /// The descriptor sweep that runs with every session listing: tell the
     /// window which group members are dead-but-remembered (its fleet shows
     /// them as dead tiles), play each one's recording into its tile once (the
     /// last screen, via the ordinary Resized-push + output path), and prune
     /// descriptors nothing references any more — not live, in no group — so
     /// the data dir doesn't keep one per session ever spawned.
+    ///
+    /// `live` is the LOCAL listing (descriptors, recordings and the prune are all
+    /// local notions). Remembered **remote** members are swept separately below,
+    /// against their host's listing: they have no local descriptor, so judging them
+    /// by this scan would leave them with no tile at all.
     fn sync_dead_sessions(
         &mut self,
         wid: WindowId,
@@ -2320,9 +2515,12 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let live_names: HashSet<&str> = live.iter().map(|i| i.name.as_str()).collect();
-        let mut dead: Vec<ghost_ui_core::DeadSession> = Vec::new();
+        let mut dead: Vec<ghost_ui_core::DeadSession> = self.remembered_remotes();
         for name in self.groups.iter().flat_map(|g| &g.members) {
-            if live_names.contains(name.as_str()) || dead.iter().any(|d| &d.name == name) {
+            if live_names.contains(name.as_str())
+                || is_remote_id(name)
+                || dead.iter().any(|d| &d.name == name)
+            {
                 continue;
             }
             // The descriptor is the resurrection ticket: a member without one
@@ -2337,6 +2535,7 @@ impl App {
                 display_name: d.display_name,
                 command: d.command,
                 cwd: d.cwd.as_deref().map(session::display_path),
+                state: ghost_ui_core::DeadState::Exited,
             });
         }
         self.dispatch(wid, UiEvent::DeadSessions(dead.clone()), event_loop);
@@ -2546,7 +2745,7 @@ impl App {
         let _ = ctx;
     }
 
-    fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
+    pub fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
         let now_ms = self.now_ms();
         for cmd in cmds {
             match cmd {
@@ -2669,21 +2868,7 @@ impl App {
                             self.drive_with_client(&id, s);
                         }
                     }
-                    // This window (`wid`) now drives `id`. Only one window may own a
-                    // shared session's grid, so any OTHER window that still drives it has
-                    // just been taken over in-process — tell it to relinquish grid
-                    // ownership. A fresh attach (no prior driver) finds no losers; only a
-                    // real cross-window take-over does. This is the unambiguous handoff
-                    // signal (another window drives it), free of any group guesswork.
-                    let losers: Vec<WindowId> = self
-                        .windows
-                        .iter()
-                        .filter(|(owid, w)| **owid != wid && w.root.drives(&id))
-                        .map(|(owid, _)| *owid)
-                        .collect();
-                    for owid in losers {
-                        self.dispatch(owid, UiEvent::DriverLost { name: id.clone() }, event_loop);
-                    }
+                    self.hand_over(wid, &id, event_loop);
                 }
                 Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
                     // Live remote preview: observe the session over its host's
@@ -2960,7 +3145,12 @@ impl App {
                         // transport), the same-process take-over the shared map enables.
                         let held = self.sessions.contains_key(&id);
                         if held || self.attach_into(wid, &id) {
-                            self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
+                            self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
+                            // The adopt-in-place branch never went through `Cmd::Attach`,
+                            // so without this the window that HAD the session kept
+                            // showing it: taking over another window's foreground left
+                            // two windows on one session.
+                            self.hand_over(wid, &id, event_loop);
                         }
                     }
                 }
@@ -3664,28 +3854,14 @@ impl App {
         }
     }
 
-    /// Eagerly reconnect every host a startup restore is waiting on (the targets
-    /// queued in `pending_remote_restores`), one background worker each. The full
-    /// spec comes from a matching ssh-group `connection`, else is reconstructed
-    /// from the target (`user@host`); a per-target spec sidecar would also carry a
-    /// custom port/identity for a Cmd+G tab whose host isn't an ssh group — a
-    /// deferred refinement. A no-op under a headless frontend (no proxy to post
+    /// Eagerly reconnect every host a startup restore is waiting on. The workers are
+    /// the same never-give-up ones the loop keeps for any remembered host
+    /// ([`Self::retry_remembered_hosts`]) — a restore just wants them started now
+    /// rather than at the first wake, and the targets it queues are remembered
+    /// members by construction. A no-op under a headless frontend (no proxy to post
     /// back on).
-    fn reconnect_restored_remotes(&self) {
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        for target in self.pending_remote_restores.keys() {
-            let spec = self
-                .groups
-                .iter()
-                .filter_map(|g| g.connection.clone())
-                .find(|c| &c.target() == target)
-                .or_else(|| ConnectionSpec::parse_target(target));
-            if let Some(spec) = spec {
-                spawn_remote_reconnect(proxy.clone(), spec);
-            }
-        }
+    fn reconnect_restored_remotes(&mut self) {
+        self.retry_remembered_hosts();
     }
 
     /// A background restore reconnect reached `spec`'s host: register it (starting
@@ -4614,6 +4790,11 @@ impl App {
         &self.groups
     }
 
+    /// The saved workspace on disk — what a bare launch restores.
+    pub fn saved_workspace() -> Vec<ghost_ui_core::WindowRecord> {
+        windows::load()
+    }
+
     /// Session ids this process holds a live client for (the driven set).
     pub fn driven_ids(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
@@ -4750,7 +4931,7 @@ impl App {
     /// Recreate the saved workspace: one window per restorable record. Falls back
     /// to a normal launch if nothing could be restored (every group was pruned, or
     /// an empty workspace slipped through), so the app never comes up windowless.
-    fn restore_workspace(
+    pub fn restore_workspace(
         &mut self,
         event_loop: &dyn Frontend,
         records: Vec<ghost_ui_core::WindowRecord>,
@@ -5519,6 +5700,9 @@ impl App {
         if self.workspace_dirty {
             self.save_workspace();
         }
+        // Keep waiting on every remote host a group still remembers a session on:
+        // starts a worker for one that just went away, stops one nothing wants.
+        self.retry_remembered_hosts();
         // Pump the process's session clients once each — one client per session no
         // matter how many windows view it — and fan each one's output into the ONE
         // shared emulator and out to every window showing it (the driven half of the

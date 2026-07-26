@@ -21,6 +21,27 @@ pub struct DeadSession {
     pub command: Vec<String>,
     /// Its last known working directory (display form, `~`-abbreviated).
     pub cwd: Option<String>,
+    /// Why it isn't running here.
+    pub state: DeadState,
+}
+
+/// Why a remembered session has no live host — which decides what its tile
+/// offers the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeadState {
+    /// It is gone for good: relaunchable from its descriptor and recording
+    /// (`$SHELL` seeded with the old scrollback). The tile offers that.
+    Exited,
+    /// A session on a **remote host we cannot currently reach**. It may well
+    /// still be running there, so there is nothing to relaunch and nothing to
+    /// decide: the window waits, reconnecting until the host comes back, and the
+    /// tile is where that wait is visible. Carries the host it is waiting for.
+    ///
+    /// Without this state such a member had no tile at all — no local descriptor
+    /// and no local recording means the descriptor sweep never named it — so a
+    /// window whose remote host rebooted showed an empty fleet and the sessions
+    /// looked lost.
+    AwaitingHost(String),
 }
 
 /// What a session subscription pushed: the one starting snapshot, or a delta
