@@ -186,16 +186,27 @@ impl RealRemote {
     /// does: the peer stops responding with **no FIN/RST**, so the local
     /// ControlMaster can't tell the connection died — it wedges (TCP dead, process
     /// kept alive by `ControlPersist`), which is the bug's trigger. `SIGSTOP` the
-    /// per-connection `sshd` children to freeze the server side without closing the
+    /// per-connection `sshd` processes to freeze the server side without closing the
     /// socket (a plain kill would RST and let the master exit cleanly — the case
     /// ghost already handles). The listener stays up, so the host is still
     /// reachable for a *fresh* connection; but ghost keeps multiplexing onto the
     /// wedged master until it reaps it. Also clears the tmpfs runtime dir, as a
     /// reboot would (session sockets vanish; persistent data survives).
+    ///
+    /// **Freeze the whole subtree, not the listener's direct children.** OpenSSH
+    /// privilege-separates: the listener's child is `sshd-session: user [priv]`, the
+    /// monitor, and the process that actually owns the socket and answers the
+    /// protocol — including `ServerAlive` keepalives — is *its* child,
+    /// `sshd-session: user@notty`. Stopping only the direct children leaves that
+    /// worker replying, so the peer is not silent at all and the client's keepalive
+    /// never times out: measured, `ssh` survived >140s, and a shell test waiting for
+    /// the loss to be noticed looked like a ghost bug when the fixture was the one
+    /// lying. With the subtree frozen, `ssh` reports "server not responding" and
+    /// exits in ~45s (`ServerAliveInterval=15` × `ServerAliveCountMax=3`).
     pub fn reboot(&mut self) {
-        let _ = Command::new("pkill")
-            .args(["-STOP", "-P", &self.sshd.id().to_string()])
-            .status();
+        for pid in descendants(self.sshd.id()) {
+            signal(pid, "STOP");
+        }
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
     }
@@ -203,12 +214,63 @@ impl RealRemote {
 
 impl Drop for RealRemote {
     fn drop(&mut self) {
-        let _ = Command::new("pkill")
-            .args(["-9", "-P", &self.sshd.id().to_string()])
-            .status();
+        // Deepest first, so a frozen monitor cannot outlive its worker, and SIGCONT
+        // after the kill so anything stopped can actually die.
+        for pid in descendants(self.sshd.id()).into_iter().rev() {
+            signal(pid, "KILL");
+            signal(pid, "CONT");
+        }
         let _ = self.sshd.kill();
         let _ = self.sshd.wait();
     }
+}
+
+/// Every descendant of `pid`, parents before children, read out of `/proc`.
+///
+/// Deliberately not `pkill`/`pgrep -f`: those match process *names* across the whole
+/// machine and have killed live sessions here before. This walks the real parent
+/// links down from one pid we spawned, so nothing outside that subtree can match.
+fn descendants(root: u32) -> Vec<u32> {
+    let mut kids: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // /proc/<pid>/stat: `pid (comm) state ppid …`; comm can hold spaces and
+        // parens, so read the ppid after the LAST ')'.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            continue;
+        };
+        if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|p| p.parse().ok()) {
+            kids.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut out = Vec::new();
+    let mut frontier = kids.get(&root).cloned().unwrap_or_default();
+    while !frontier.is_empty() {
+        out.extend_from_slice(&frontier);
+        frontier = frontier
+            .iter()
+            .flat_map(|p| kids.get(p).cloned().unwrap_or_default())
+            .collect();
+    }
+    out
+}
+
+/// Signal one pid we walked to. `kill` by explicit pid only — never by pattern.
+fn signal(pid: u32, sig: &str) {
+    let _ = Command::new("/bin/kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn keygen(path: &Path) {

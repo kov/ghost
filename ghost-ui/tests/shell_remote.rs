@@ -59,26 +59,11 @@ fn pump_until(
 /// did take the session with it, offers the explicit relaunch. What it must never do
 /// is quietly forget the session, which is what "a remote reboot loses my windows"
 /// was: with no tile and no memory of it, there was nothing left to recover.
-/// STATUS 2026-07-26: **fails at the first step, and that is the finding.** The
-/// window never notices the host is gone: measured at 240s after the reboot, the
-/// session was still drawn undimmed (`drawn=Some(false)`), so the hold — and
-/// therefore every recovery step behind it — never begins. ghost does pass
-/// `ServerAliveInterval=15`/`ServerAliveCountMax=3`, which should surface a silent
-/// peer in ~45s, so the drop is not reaching the shell's pump at all; that is the
-/// next thing to fix, and this test is its reproduction. Ignored so the suite stays
-/// green and fast (it also costs minutes by nature); run it explicitly:
-///
-/// ```text
-/// cargo test -p ghost-ui --test shell_remote -- --ignored --nocapture
-/// ```
-///
-/// What it already establishes: the fixture works end to end — a real host, a real
-/// session discovered over the transport, adopted into a window by clicking its
-/// card, and a real silent reboot — with the shell's background workers running for
-/// real. The tile and the group membership DO survive the outage (the empty-fleet
-/// defect this session fixed); what is missing is the window reacting to the loss.
+/// **Slow by nature (~60s):** the loss is noticed by ssh's keepalive, so the hold
+/// cannot begin before `ServerAliveInterval=15` × `ServerAliveCountMax=3`. Left in
+/// the default suite regardless — an `#[ignore]`d test rots, and this one covers the
+/// exact failure the user reported ("a remote reboot loses my sessions").
 #[test]
-#[ignore = "reproduces an unfixed defect: the shell never sees a silently dead host"]
 fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable() {
     let Some(mut remote) = RealRemote::start() else {
         eprintln!("shell_remote: no sshd available; skipping");
@@ -195,8 +180,14 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
             app.groups()
         );
 
-        // Going to the fleet (F9) shows it too, naming the host it waits for —
-        // rather than the empty fleet this used to be.
+        // Going to the fleet (F9) shows it there too — rather than the empty fleet
+        // this used to be — and offers the way forward. Which affordance that is
+        // depends on how far the recovery has got, and both are correct: "waiting
+        // for <host>" with nothing to click while the host is still unreachable, and
+        // an explicit `relaunch` once ghost's own retry has reconnected and found the
+        // session really did go down with the host. The fixture's listener never
+        // stopped accepting, so it lands on the latter within seconds; `shell.rs`
+        // pins the waiting wording deterministically.
         app.dispatch(
             wid,
             UiEvent::Key {
@@ -207,14 +198,41 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
             },
             &fe,
         );
-        let in_fleet = pump_until(&mut app, &fe, &q, Duration::from_secs(30), |app| {
+        let in_fleet = pump_until(&mut app, &fe, &q, Duration::from_secs(60), |app| {
             app.dispatch(wid, UiEvent::SessionsChanged, &fe);
             let scene = app.root(wid).expect("window").view(app.states());
-            sees_tile(&scene, "work") && sees_text(&scene, "waiting for")
+            sees_tile(&scene, "work")
+                && (sees_text(&scene, "waiting for") || sees_text(&scene, "relaunch"))
         });
         assert!(
             in_fleet,
-            "the fleet must show the session waiting for its host, not nothing: {:?}",
+            "the fleet must show the session, waiting or relaunchable, not nothing: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        // And "recoverable" has to mean it: click the relaunch the fleet offered and
+        // the session comes back on the host — a live preview where the dead card was.
+        // (This is the resurrection being explicit, per the locked decision: ghost
+        // never brings a session back on its own.)
+        let scene = app.root(wid).expect("window").view(app.states());
+        let Some((rx, ry)) = support::button_center(&scene, "relaunch") else {
+            panic!(
+                "expected a relaunch to click once the host was back: {:?}",
+                visible_text(&scene)
+            );
+        };
+        for ev in support::click_events(rx, ry) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let revived = pump_until(&mut app, &fe, &q, Duration::from_secs(60), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            let scene = app.root(wid).expect("window").view(app.states());
+            // A live tile draws a terminal preview; a dead card draws none.
+            support::session_dimmed(&scene, &composite).is_some() && !sees_text(&scene, "relaunch")
+        });
+        assert!(
+            revived,
+            "relaunch must bring the session back on the host: {:?}",
             visible_text(&app.root(wid).expect("window").view(app.states()))
         );
     });
