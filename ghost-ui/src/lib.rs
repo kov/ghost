@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
 use ghost_ui_core::{
     CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
-    RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WindowRecord,
+    RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WheelDelta, WindowRecord,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -5569,7 +5569,7 @@ impl ApplicationHandler<UserEvent> for App {
                         button: None,
                         pos,
                         mods,
-                        wheel_dy: 0.0,
+                        wheel: WheelDelta::NONE,
                         clicks: 1,
                     },
                     &fe,
@@ -5597,7 +5597,7 @@ impl ApplicationHandler<UserEvent> for App {
                             button: Some(b),
                             pos,
                             mods,
-                            wheel_dy: 0.0,
+                            wheel: WheelDelta::NONE,
                             clicks,
                         },
                         &fe,
@@ -5606,9 +5606,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.note_input(id);
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y,
+                // Keep the device's unit: a wheel click is a discrete notch, a
+                // trackpad reports smooth pixel travel — the core paces each.
+                let wheel = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => WheelDelta::Notches(y as f64),
+                    MouseScrollDelta::PixelDelta(p) => WheelDelta::Pixels(p.y),
                 };
                 let Some((pos, mods)) = self
                     .windows
@@ -5624,7 +5626,7 @@ impl ApplicationHandler<UserEvent> for App {
                         button: None,
                         pos,
                         mods,
-                        wheel_dy: dy,
+                        wheel,
                         clicks: 1,
                     },
                     &fe,

@@ -75,6 +75,33 @@ pub enum PointerPhase {
     Wheel,
 }
 
+/// A vertical wheel step in the device's native unit, positive = up (into
+/// history). Kept distinct so views can pace each correctly: a `Notches` step
+/// is a discrete click of a mouse wheel worth several lines, while `Pixels`
+/// is a smooth trackpad delta that arrives as a rapid burst of small values
+/// and must be converted through the view's own geometry — collapsing the two
+/// into one number is what made a trackpad flick race (each tiny delta was
+/// treated as a whole notch).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WheelDelta {
+    /// Discrete wheel clicks (winit `LineDelta`); magnitude is in notches.
+    Notches(f64),
+    /// Smooth per-pixel travel (winit `PixelDelta`, trackpads).
+    Pixels(f64),
+}
+
+impl WheelDelta {
+    /// The no-scroll placeholder non-wheel pointer phases carry.
+    pub const NONE: WheelDelta = WheelDelta::Notches(0.0);
+
+    /// The raw signed magnitude, unit-blind — for zero/direction checks only.
+    pub fn raw(self) -> f64 {
+        match self {
+            WheelDelta::Notches(v) | WheelDelta::Pixels(v) => v,
+        }
+    }
+}
+
 /// Everything that can drive the UI core. Input from the user, plus the replies
 /// to the core's own read-requests (see [`Cmd`](crate::Cmd)) and the injected
 /// clock — so `update` never touches the world directly.
@@ -103,7 +130,7 @@ pub enum UiEvent {
         button: Option<PointerButton>,
         pos: PointPx,
         mods: Mods,
-        wheel_dy: f64,
+        wheel: WheelDelta,
         /// Click count for a `Press` (1 = single, 2 = double, 3 = triple); 1 for
         /// other phases. Drives word/line selection.
         clicks: u8,

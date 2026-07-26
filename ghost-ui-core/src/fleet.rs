@@ -31,7 +31,7 @@ use crate::group::{Group, GroupId};
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{FeedOutcome, TerminalView};
 use crate::text_input::TextInput;
-use crate::{Cmd, PointPx, PointerPhase, SessionId, Sessions, UiEvent};
+use crate::{Cmd, PointPx, PointerPhase, SessionId, Sessions, UiEvent, WheelDelta};
 
 const GAP: f32 = 10.0;
 const FOCUS_BORDER: f32 = 2.0;
@@ -2056,16 +2056,22 @@ impl FleetModel {
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
     }
 
-    /// Scroll a mouse-wheel notch. Sign only (magnitude ignored, like the
-    /// terminal's scrollback); wheel up reveals tiles above. Returns a redraw iff
-    /// the offset actually moved.
-    fn wheel(&mut self, dy: f64) -> Vec<Cmd> {
-        if dy == 0.0 {
+    /// Scroll the grid: a wheel click moves a [`SCROLL_LINES`] step, trackpad
+    /// pixels track the finger 1:1 (`scroll_y` is already in pixels, so no
+    /// sub-step remainder to carry). Wheel up reveals tiles above. Returns a
+    /// redraw iff the offset actually moved.
+    fn wheel(&mut self, wheel: WheelDelta) -> Vec<Cmd> {
+        let travel = match wheel {
+            WheelDelta::Notches(n) => {
+                n as f32 * SCROLL_LINES * self.effective_metrics().line_height
+            }
+            WheelDelta::Pixels(p) => p as f32,
+        };
+        if travel == 0.0 {
             return Vec::new();
         }
-        let step = SCROLL_LINES * self.effective_metrics().line_height;
         let before = self.scroll_y;
-        self.scroll_y += if dy > 0.0 { -step } else { step };
+        self.scroll_y -= travel;
         self.clamp_scroll();
         if self.scroll_y == before {
             Vec::new()
@@ -2502,9 +2508,9 @@ impl FleetModel {
             }
             UiEvent::Pointer {
                 phase: PointerPhase::Wheel,
-                wheel_dy,
+                wheel,
                 ..
-            } => self.wheel(wheel_dy),
+            } => self.wheel(wheel),
             UiEvent::Pointer {
                 phase, pos, mods, ..
             } => self.pointer(phase, pos, mods.ctrl),
@@ -4482,7 +4488,19 @@ mod tests {
             button: None,
             pos: PointPx { x: 0.0, y: 0.0 },
             mods: crate::Mods::NONE,
-            wheel_dy: dy,
+            wheel: WheelDelta::Notches(dy),
+            clicks: 1,
+        })
+    }
+
+    /// A smooth trackpad wheel event of `dy` physical pixels (positive = up).
+    fn wheel_px(m: &mut Fleet, dy: f64) -> Vec<Cmd> {
+        m.update(UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 0.0, y: 0.0 },
+            mods: crate::Mods::NONE,
+            wheel: WheelDelta::Pixels(dy),
             clicks: 1,
         })
     }
@@ -4565,7 +4583,7 @@ mod tests {
                 ctrl: true,
                 ..Mods::NONE
             },
-            wheel_dy: 0.0,
+            wheel: WheelDelta::NONE,
             clicks: 1,
         })
     }
@@ -7485,7 +7503,7 @@ mod tests {
                 y: y as f64,
             },
             mods: crate::Mods::NONE,
-            wheel_dy: 0.0,
+            wheel: WheelDelta::NONE,
             clicks: 1,
         })
     }
@@ -8518,6 +8536,18 @@ mod tests {
             wheel(&mut m, 1.0);
         }
         assert_eq!(m.scroll_y, 0.0, "returns to the top");
+    }
+
+    #[test]
+    fn trackpad_pixels_scroll_the_grid_one_to_one() {
+        // A trackpad delta is finger travel in pixels: the grid follows it
+        // exactly, instead of leaping a 3-line notch per micro-event.
+        let mut m = fleet();
+        list_many(&mut m, 6); // overflows the 400x200 viewport
+        assert_eq!(wheel_px(&mut m, -25.0), vec![Cmd::Redraw]);
+        assert_eq!(m.scroll_y, 25.0, "25px of travel scrolls 25px");
+        wheel_px(&mut m, 10.0);
+        assert_eq!(m.scroll_y, 15.0, "and 10px back up returns 10px");
     }
 
     #[test]

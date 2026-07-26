@@ -254,7 +254,7 @@ pub fn click_events(x: f64, y: f64) -> [ghost_ui_core::UiEvent; 2] {
         button: Some(ghost_ui_core::PointerButton::Left),
         pos: ghost_ui_core::PointPx { x, y },
         mods: ghost_ui_core::Mods::default(),
-        wheel_dy: 0.0,
+        wheel: ghost_ui_core::WheelDelta::NONE,
         clicks: 1,
     };
     [

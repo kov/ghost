@@ -3401,7 +3401,7 @@ mod tests {
                 y: y as f64,
             },
             mods: Mods::NONE,
-            wheel_dy: 0.0,
+            wheel: crate::WheelDelta::NONE,
             clicks: 1,
         })
     }

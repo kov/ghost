@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerIcon, PointerPhase, SessionId, UiEvent,
-    encode, mouse,
+    WheelDelta, encode, mouse,
 };
 
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
@@ -294,6 +294,10 @@ pub struct TerminalView {
     autoscroll: i64,
     /// Lines scrolled up into history; 0 = pinned to the live bottom.
     scroll_offset: usize,
+    /// Sub-step wheel remainder carried between events, in the device's native
+    /// unit (see [`Self::wheel_steps`]) — a trackpad burst of tiny pixel deltas
+    /// must add up to motion instead of each counting as a whole notch.
+    wheel_pending: WheelDelta,
     /// In-progress IME composition string; non-empty means composing, during
     /// which raw key input is suppressed.
     preedit: String,
@@ -1301,6 +1305,7 @@ impl TerminalView {
             selection: None,
             autoscroll: 0,
             scroll_offset: 0,
+            wheel_pending: WheelDelta::NONE,
             preedit: String::new(),
             last_title: String::new(),
             uploaded_images: HashMap::new(),
@@ -1497,9 +1502,9 @@ impl TerminalView {
                 button,
                 pos,
                 mods,
-                wheel_dy,
+                wheel,
                 clicks,
-            } => self.pointer(state, phase, button, pos, mods, wheel_dy, clicks),
+            } => self.pointer(state, phase, button, pos, mods, wheel, clicks),
             UiEvent::Focus(focused) => self.focus(state, focused),
             // The multi-window Resize path routes through `resize_model` (which calls
             // `resize` directly with real drivership); a lone `TerminalModel` reaching
@@ -2521,6 +2526,27 @@ impl TerminalView {
         }
     }
 
+    /// Fold a wheel delta into the pending sub-step remainder and return the
+    /// whole steps now due: wheel clicks for [`WheelDelta::Notches`], and
+    /// line-heights of finger travel for [`WheelDelta::Pixels`] — so trackpad
+    /// scrolling is 1:1 with the content instead of a notch per micro-event.
+    /// The remainder keeps its native unit; switching devices drops it (it is
+    /// less than one step, invisible).
+    fn wheel_steps(&mut self, wheel: WheelDelta, line_height: f64) -> i64 {
+        let (total, step) = match (wheel, self.wheel_pending) {
+            (WheelDelta::Notches(n), WheelDelta::Notches(rem)) => (n + rem, 1.0),
+            (WheelDelta::Notches(n), _) => (n, 1.0),
+            (WheelDelta::Pixels(p), WheelDelta::Pixels(rem)) => (p + rem, line_height),
+            (WheelDelta::Pixels(p), _) => (p, line_height),
+        };
+        let whole = (total / step).trunc();
+        self.wheel_pending = match wheel {
+            WheelDelta::Notches(_) => WheelDelta::Notches(total - whole),
+            WheelDelta::Pixels(_) => WheelDelta::Pixels(total - whole * step),
+        };
+        whole as i64
+    }
+
     // Threading `state` pushes this one param past clippy's arg limit; the
     // signature is otherwise the pre-split pointer reducer.
     #[allow(clippy::too_many_arguments)]
@@ -2531,7 +2557,7 @@ impl TerminalView {
         button: Option<PointerButton>,
         pos: PointPx,
         mods: Mods,
-        wheel_dy: f64,
+        wheel: WheelDelta,
         clicks: u8,
     ) -> Vec<Cmd> {
         match phase {
@@ -2657,34 +2683,42 @@ impl TerminalView {
                 cmds
             }
             PointerPhase::Wheel => {
-                if wheel_dy == 0.0 {
+                let line_height = f64::from(self.effective_metrics().line_height);
+                let steps = self.wheel_steps(wheel, line_height);
+                if steps == 0 {
                     return Vec::new();
                 }
                 if self.report_to_app(state, mods) {
-                    // The child grabbed the mouse: report the wheel as a button.
-                    let b = if wheel_dy > 0.0 {
+                    // The child grabbed the mouse: report each whole step as a
+                    // wheel-button press, paced by the same accumulation (one
+                    // per click, or per line-height of trackpad travel).
+                    let b = if steps > 0 {
                         mouse::Button::WheelUp
                     } else {
                         mouse::Button::WheelDown
                     };
                     let cell = self.cursor_cell.unwrap_or((1, 1));
-                    self.mouse_report(
-                        state,
-                        mouse::Kind::Press,
-                        Some(b),
-                        self.held.is_some(),
-                        cell,
-                        mods,
-                    )
+                    let mut cmds = Vec::new();
+                    for _ in 0..steps.unsigned_abs() {
+                        cmds.extend(self.mouse_report(
+                            state,
+                            mouse::Kind::Press,
+                            Some(b),
+                            self.held.is_some(),
+                            cell,
+                            mods,
+                        ));
+                    }
+                    cmds
                 } else {
-                    // Scroll local scrollback (up = into history). Mid-drag
-                    // this is fine — the selection lives in absolute line
-                    // space — it just re-extends to the content now under the
-                    // pointer.
-                    let delta = if wheel_dy > 0.0 {
-                        SCROLL_LINES
-                    } else {
-                        -SCROLL_LINES
+                    // Scroll local scrollback (up = into history): a wheel
+                    // click jumps SCROLL_LINES, trackpad travel tracks the
+                    // finger line for line. Mid-drag this is fine — the
+                    // selection lives in absolute line space — it just
+                    // re-extends to the content now under the pointer.
+                    let delta = match wheel {
+                        WheelDelta::Notches(_) => steps * SCROLL_LINES,
+                        WheelDelta::Pixels(_) => steps,
                     };
                     let cmds = self.scroll_by(state, delta);
                     self.re_extend(state);
@@ -3069,7 +3103,7 @@ mod tests {
             button,
             pos: PointPx { x, y },
             mods: Mods::NONE,
-            wheel_dy: 0.0,
+            wheel: WheelDelta::NONE,
             clicks: 1,
         }
     }
@@ -3081,7 +3115,7 @@ mod tests {
             button: Some(PointerButton::Left),
             pos: PointPx { x, y },
             mods: Mods::NONE,
-            wheel_dy: 0.0,
+            wheel: WheelDelta::NONE,
             clicks,
         }
     }
@@ -3093,15 +3127,27 @@ mod tests {
         }
     }
 
-    /// A wheel event with vertical delta `dy` (positive = scroll up / into
-    /// history), mouse reporting off.
+    /// A discrete wheel-notch event with vertical delta `dy` (positive = scroll
+    /// up / into history), mouse reporting off.
     fn wheel(dy: f64) -> UiEvent {
         UiEvent::Pointer {
             phase: PointerPhase::Wheel,
             button: None,
             pos: PointPx { x: 1.0, y: 1.0 },
             mods: Mods::NONE,
-            wheel_dy: dy,
+            wheel: WheelDelta::Notches(dy),
+            clicks: 1,
+        }
+    }
+
+    /// A smooth trackpad wheel event of `dy` physical pixels (positive = up).
+    fn wheel_px(dy: f64) -> UiEvent {
+        UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 1.0, y: 1.0 },
+            mods: Mods::NONE,
+            wheel: WheelDelta::Pixels(dy),
             clicks: 1,
         }
     }
@@ -4475,7 +4521,7 @@ mod tests {
                 y: (row as f64 + 0.5) * f64::from(METRICS.line_height),
             },
             mods,
-            wheel_dy: 0.0,
+            wheel: WheelDelta::NONE,
             clicks: 1,
         }
     }
@@ -4495,7 +4541,7 @@ mod tests {
                 button: None,
                 pos: PointPx { x, y },
                 mods,
-                wheel_dy: 0.0,
+                wheel: WheelDelta::NONE,
                 clicks: 1,
             })
         };
@@ -5455,6 +5501,65 @@ mod tests {
     }
 
     #[test]
+    fn a_trackpad_flick_scrolls_by_finger_travel_not_per_event() {
+        // A trackpad gesture arrives as a rapid burst of small pixel deltas.
+        // Ten 6px events are 60px of finger travel = 60/18 ≈ 3.3 line-heights,
+        // so the viewport moves 3 lines — NOT a whole notch (3 lines) per
+        // event, which would race 30 lines up on a light flick.
+        let mut m = model();
+        feed_lines(&mut m, 100); // viewport L76..L99
+        for _ in 0..10 {
+            m.update(wheel_px(6.0));
+        }
+        assert_eq!(
+            top_row_text(&m),
+            "L73",
+            "60px of travel over an 18px line-height is 3 lines"
+        );
+    }
+
+    #[test]
+    fn trackpad_fractions_carry_across_events() {
+        // Two half-line (9px) deltas: nothing moves on the first — the
+        // fraction is carried, not dropped — and the pair scrolls one line.
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(9.0));
+        assert_eq!(top_row_text(&m), "L76", "half a line-height doesn't move");
+        m.update(wheel_px(9.0));
+        assert_eq!(top_row_text(&m), "L75", "the carried halves add to a line");
+    }
+
+    #[test]
+    fn trackpad_scrolls_back_down_at_the_same_rate() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(36.0)); // two line-heights up -> L74
+        assert_eq!(top_row_text(&m), "L74");
+        m.update(wheel_px(-18.0)); // one line-height back down
+        assert_eq!(top_row_text(&m), "L75");
+    }
+
+    #[test]
+    fn mouse_grab_paces_trackpad_wheel_reports_by_line_height() {
+        // With the child holding the mouse, each wheel event used to become a
+        // button-4 report — a trackpad burst flooded the app. Reports must be
+        // paced like the local scrollback: one per line-height of travel.
+        let mut m = model();
+        feed(&mut m, b"\x1b[?1000h\x1b[?1006h");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0)); // cell (1,1)
+        let mut reports = 0;
+        for _ in 0..6 {
+            let cmds = m.update(wheel_px(6.0)); // 36px total = 2 line-heights
+            reports += cmds
+                .iter()
+                .filter(|c| matches!(c, Cmd::SendInput { .. }))
+                .count();
+        }
+        assert_eq!(reports, 2, "36px over an 18px line-height is 2 notches");
+    }
+
+    #[test]
     fn ctrl_shift_arrows_jump_between_prompts() {
         const CTRL_SHIFT: Mods = Mods {
             shift: true,
@@ -6080,9 +6185,10 @@ mod tests {
             1.0,
             1.0,
         ));
-        // Wheel up during the drag: the viewport scrolls and the selection
-        // follows the pointer over the revealed content instead of being stuck.
-        let cmds = m.update(wheel(3.0));
+        // One wheel notch up during the drag: the viewport scrolls and the
+        // selection follows the pointer over the revealed content instead of
+        // being stuck.
+        let cmds = m.update(wheel(1.0));
         assert!(
             cmds.contains(&Cmd::Redraw),
             "the wheel scrolls mid-drag: {cmds:?}"

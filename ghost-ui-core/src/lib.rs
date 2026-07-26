@@ -24,7 +24,7 @@ pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};
 pub use event::{
-    DeadSession, DeadState, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent,
+    DeadSession, DeadState, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent, WheelDelta,
 };
 pub use fleet::{FleetModel, Locality};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
