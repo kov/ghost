@@ -10,11 +10,17 @@ publish = false
 # alone, so bare `cargo build`/`cargo test` still cover every crate.
 default-run = "ghost"
 
+# The shell is a library so `tests/` can drive the real `App` end-to-end (see the
+# crate docs); the binary below is a one-line shim over `ghost_ui::run()`.
+[lib]
+name = "ghost_ui"
+path = "src/lib.rs"
+
 # The headline binary: `ghost` with no subcommand opens the GUI; with a subcommand
 # (ls/attach/new/…, via ghost-cli) it runs that and exits.
 [[bin]]
 name = "ghost"
-path = "src/main.rs"
+path = "src/bin/ghost.rs"
 
 [dependencies]
 ghost-cli = { path = "../ghost-cli" }

@@ -1,5 +1,14 @@
 //! ghost's windowed GPU terminal frontend.
 //!
+//! This is a **library** whose [`run`] entry point is the whole program; the
+//! `ghost` binary (`src/bin/ghost.rs`) is a one-line shim over it. The split
+//! exists for testing: an integration test in `tests/` can drive the real shell
+//! ([`App`]) against real sessions and real remote hosts, with only winit and the
+//! GPU replaced ([`HeadlessFrontend`]). A binary crate's internals are reachable
+//! only from its own `#[cfg(test)]` module, which cannot use `CARGO_BIN_EXE_ghost`
+//! — so shell-level behaviour (window startup choices, remote reconnects) had no
+//! end-to-end coverage at all before the split.
+//!
 //! A winit window backed by a wgpu surface that is a real ghost client. The
 //! shell here is deliberately thin: it owns the I/O (the session socket, the
 //! clipboard, the clock, the window) and nothing else. All behavior lives in a
@@ -122,7 +131,9 @@ fn cycle_index(count: usize, current: Option<usize>, forward: bool) -> Option<us
     })
 }
 
-fn main() {
+/// The whole program, behind a library entry point so the shell stays testable
+/// (see the crate docs). `src/bin/ghost.rs` is just `ghost_ui::run()`.
+pub fn run() {
     // MUST be first: re-execs into the session host when invoked as one.
     server::run_host_if_invoked();
 
@@ -1145,24 +1156,39 @@ enum StartupChoice {
     Fleet,
 }
 
-/// Decide how to start: honour an explicit `$GHOST_SESSION` request; otherwise
-/// open the fleet whenever there is something to return to — a detached live
-/// session, or a group remembering a session that is no longer running (its
-/// closed block relaunches it) — and only spawn a fresh session when there is
-/// nothing to reconnect. Launching must not pile new sessions on top of
-/// forgotten ones.
+/// Decide how to start: honour an explicit `$GHOST_SESSION` request; otherwise open
+/// the fleet only when it has something the user can **return to**, and spawn a
+/// fresh session otherwise.
+///
+/// "Return to" means a session that still exists and would be handed back with its
+/// state: one that is live but detached (local or remote), or a remembered *remote*
+/// member whose host is currently unreachable — that one reconnects when the host
+/// comes back, so the fleet is where you wait for it.
+///
+/// A remembered **dead local** member deliberately does not count, though the fleet
+/// does show it as a relaunchable tile (see
+/// `a_remembered_dead_member_still_shows_a_tile_in_the_fleet`). Relaunching one
+/// spawns `$SHELL` seeded with the old scrollback — no command is re-run — so it
+/// offers nothing a new session doesn't, and it is *permanent*: every window that
+/// ever ran leaves an auto-group in `groups.toml`, and detaching keeps membership,
+/// so one long-dead member used to send every later launch and every Alt-N into a
+/// fleet whose only other content was sessions held by other windows. Those are
+/// reachable from a session view with F9 whenever the user actually wants them.
 fn startup_choice(
     requested: Option<String>,
     sessions: &[session::SessionInfo],
     groups: &[ghost_ui_core::Group],
 ) -> StartupChoice {
-    let remembered_dead = groups
+    let listed = |name: &String| sessions.iter().any(|s| &s.name == name);
+    // A remote member nothing lists right now: its host is away, and the tile holds
+    // (and reconnects) rather than relaunching. See [`App::begin_reconnect`].
+    let awaiting_remote = groups
         .iter()
         .flat_map(|g| &g.members)
-        .any(|m| !sessions.iter().any(|s| &s.name == m));
+        .any(|m| is_remote_id(m) && !listed(m));
     match requested {
         Some(name) => StartupChoice::Attach(name),
-        None if sessions.iter().any(|s| !s.attached) || remembered_dead => StartupChoice::Fleet,
+        None if sessions.iter().any(|s| !s.attached) || awaiting_remote => StartupChoice::Fleet,
         None => StartupChoice::Spawn,
     }
 }
@@ -1578,7 +1604,7 @@ fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat
 /// Per-window GPU state, valid only once the window (and surface) exist. The frame
 /// production itself lives in [`Target`] (shared with the headless harness); this
 /// just owns the window, the surface target, and the per-window render state.
-struct Graphics {
+pub struct Graphics {
     window: Arc<Window>,
     /// The window's swapchain surface, wrapped as a swappable render target.
     target: Target,
@@ -1778,7 +1804,7 @@ impl Graphics {
 }
 
 /// What a new window should open as, handed to [`Frontend::open_window`].
-struct WindowSpec {
+pub struct WindowSpec {
     /// The renderer theme. Its `frost` is the *configured* density; the realized
     /// window keeps it only where the compositor won't blur for us (see [`glass`]).
     theme: ghost_renderer::Theme,
@@ -1791,7 +1817,7 @@ struct WindowSpec {
 /// A realized window handed back by the [`Frontend`]: its id, physical size, and
 /// scale (enough to size a model), plus its GPU graphics — `None` when the
 /// frontend is headless (a behaviour-only window with no surface).
-struct NewWindow {
+pub struct NewWindow {
     id: WindowId,
     gfx: Option<Graphics>,
     size_px: (u32, u32),
@@ -1804,7 +1830,7 @@ struct NewWindow {
 /// windows so `App` logic (sessions, remotes, the fleet) is exercised offscreen
 /// and deterministically. The App threads `&dyn Frontend` where it used to thread
 /// `&ActiveEventLoop`.
-trait Frontend {
+pub trait Frontend {
     /// Realize a new window (a real OS window + GPU surface, or a headless stub).
     fn open_window(&self, spec: WindowSpec) -> NewWindow;
     /// Leave the event loop (quit).
@@ -1845,25 +1871,39 @@ impl Frontend for WinitFrontend<'_> {
 /// A headless [`Frontend`] for tests: mints surface-less windows so the App's
 /// behaviour runs offscreen and deterministically, and records a quit so a test
 /// can assert on it. No winit, no GPU.
-#[cfg(test)]
-struct HeadlessFrontend {
+///
+/// Not `#[cfg(test)]`: the shell's end-to-end tests live in `tests/`, which link
+/// the library as an ordinary dependency (that is the point of the lib/bin split
+/// — only an integration test can reach `CARGO_BIN_EXE_ghost` and stand up real
+/// session hosts). The cost in the shipped binary is this struct and a
+/// constructor.
+pub struct HeadlessFrontend {
     /// Mints distinct synthetic [`WindowId`]s for the surface-less windows.
     next_id: std::cell::Cell<u64>,
     /// Set when the App asks to quit ([`Frontend::exit`]).
     exited: std::cell::Cell<bool>,
 }
 
-#[cfg(test)]
 impl HeadlessFrontend {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             next_id: std::cell::Cell::new(1),
             exited: std::cell::Cell::new(false),
         }
     }
+
+    /// Whether the App asked to quit.
+    pub fn exited(&self) -> bool {
+        self.exited.get()
+    }
 }
 
-#[cfg(test)]
+impl Default for HeadlessFrontend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Frontend for HeadlessFrontend {
     fn open_window(&self, spec: WindowSpec) -> NewWindow {
         let id = self.next_id.get();
@@ -1888,12 +1928,12 @@ impl Frontend for HeadlessFrontend {
     fn set_control_flow(&self, _flow: ControlFlow) {}
 }
 
-#[cfg(test)]
 impl App {
     /// A behaviour-only App: no event loop, GPU, watcher, or watcher — the seam a
     /// [`HeadlessFrontend`] plugs into. Drive it with the App's own methods
-    /// (`open_fleet_window`, `dispatch`, `on_*`) and assert on its state.
-    fn headless() -> Self {
+    /// (`open_fleet_window`, `dispatch`, `on_*`) and assert on its state. Reachable
+    /// from `tests/` for the same reason as [`HeadlessFrontend`].
+    pub fn headless() -> Self {
         App {
             windows: HashMap::new(),
             states: Sessions::new(),
@@ -1916,12 +1956,14 @@ impl App {
             pending_remote_restores: HashMap::new(),
             reconnecting: HashMap::new(),
             subs: HashMap::new(),
-            groups: Vec::new(),
+            // From the (test-isolated) data dir, as `interactive` does — a shell test
+            // that seeds `groups.toml` gets the registry the real launch would read.
+            groups: groups::load(),
             _watcher: None,
             sessions_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _config_watcher: None,
             config_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_workspace: Vec::new(),
+            last_workspace: windows::load(),
             workspace_dirty: false,
         }
     }
@@ -2129,7 +2171,7 @@ impl WindowState {
 /// The thin imperative shell: owns the world (live windows, the clipboard, the
 /// clock), holds the pure models, and shuttles `UiEvent`s in and `Cmd`s out.
 /// Each window owns its own session clients (see [`WindowState::sessions`]).
-struct App {
+pub struct App {
     /// Live windows by id; each owns its GPU surface and pure model.
     windows: HashMap<WindowId, WindowState>,
     /// The one emulator/terminal state per session in this process (the "one model,
@@ -2469,7 +2511,7 @@ impl App {
     }
 
     /// Feed an event to window `wid`'s model and execute the effects it returns.
-    fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
+    pub fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
             None => return,
@@ -3096,7 +3138,7 @@ impl App {
 
     /// Mint a new window's group identity: a process-unique durable id and
     /// the next palette color (whose name it carries until renamed).
-    fn mint_group(&mut self) -> ghost_ui_core::Group {
+    pub fn mint_group(&mut self) -> ghost_ui_core::Group {
         let seq = self.next_group_seq;
         self.next_group_seq += 1;
         let color = self.next_group_color;
@@ -4164,7 +4206,7 @@ impl App {
     /// Open a new window in the fleet overview (owning no session yet), carrying
     /// `group` as its identity and opening at `size` cells (its configured default
     /// when `None`). The user spawns or takes over a session from there.
-    fn open_fleet_window(
+    pub fn open_fleet_window(
         &mut self,
         event_loop: &dyn Frontend,
         group: ghost_ui_core::Group,
@@ -4280,12 +4322,19 @@ impl App {
     }
 
     /// Open a new window that behaves exactly like a fresh launch (File > New Window
-    /// / Cmd-N): reconnect through the fleet when any session is detached or a group
-    /// remembers a dead one, otherwise spawn a fresh session and show it as a single
-    /// view. Runs in this same process, so the new window shares the clipboard,
-    /// clock, and menu with the others.
-    fn open_launch_window(&mut self, event_loop: &dyn Frontend) {
-        let sessions = session::list().unwrap_or_default();
+    /// / Cmd-N): reconnect through the fleet when it has a session to return to,
+    /// otherwise spawn a fresh session and show it as a single view (see
+    /// [`startup_choice`]). Runs in this same process, so the new window shares the
+    /// clipboard, clock, and menu with the others.
+    pub fn open_launch_window(&mut self, event_loop: &dyn Frontend) {
+        // The listing a fleet window would reconcile against — local sessions plus
+        // every connected host's — so a detached session on a remote host counts as
+        // something to return to, and a remote member of a host we ARE connected to
+        // isn't mistaken for one that is away.
+        let mut sessions = session::list().unwrap_or_default();
+        for r in self.remote_infos.values() {
+            sessions.extend(r.iter().cloned());
+        }
         match new_window_choice(&sessions, &self.groups) {
             StartupChoice::Fleet => {
                 let group = self.mint_group();
@@ -4494,7 +4543,7 @@ impl App {
     /// changed. Idempotent and cheap (a dirty flag flushes it once per loop
     /// wake). Skips bench runs, whose synthetic sessions must never overwrite
     /// the real workspace.
-    fn save_workspace(&mut self) {
+    pub fn save_workspace(&mut self) {
         self.workspace_dirty = false;
         if self.bench.is_some() {
             return;
@@ -4539,12 +4588,44 @@ impl App {
     }
 }
 
+/// Read-only views into the shell's state, for the end-to-end tests in `tests/`
+/// (see the crate docs on the lib/bin split). Assertions belong on observable
+/// window behaviour — what mode a window is in, what it shows, what it drives —
+/// so these hand out the window's model, never its internals.
+impl App {
+    /// Every open window, in unspecified order.
+    pub fn window_ids(&self) -> Vec<WindowId> {
+        self.windows.keys().copied().collect()
+    }
+
+    /// A window's model — the thing that decides what the window shows.
+    pub fn root(&self, wid: WindowId) -> Option<&RootModel> {
+        self.windows.get(&wid).map(|w| &w.root)
+    }
+
+    /// The one shared session-state registry (one emulator per session, fanned to
+    /// every viewing window), for rendering a window's `Scene` in a test.
+    pub fn states(&self) -> &Sessions {
+        &self.states
+    }
+
+    /// The session-group registry as the shell currently holds it.
+    pub fn groups(&self) -> &[ghost_ui_core::Group] {
+        &self.groups
+    }
+
+    /// Session ids this process holds a live client for (the driven set).
+    pub fn driven_ids(&self) -> Vec<String> {
+        self.sessions.keys().cloned().collect()
+    }
+}
+
 impl App {
     /// Open a single-session view attached to `name`, carrying `group` as the
     /// window's identity and opening at `size` cells (its configured default when
     /// `None`; a restored window passes the grid it was last sized to). Returns
     /// the new window's id, or `None` if the attach fails.
-    fn open_single_window(
+    pub fn open_single_window(
         &mut self,
         event_loop: &dyn Frontend,
         name: &str,
@@ -5432,7 +5513,7 @@ impl App {
     /// live loop runs, with no window server. Pump each session's one client and each
     /// read-only observer, fan the output into every viewing window, fan pushed
     /// session state, fire due ticks, and release paced repaints.
-    fn wake(&mut self, fe: &dyn Frontend) {
+    pub fn wake(&mut self, fe: &dyn Frontend) {
         // Flush the workspace snapshot once per wake if a handled event or a
         // window open/close marked it dirty (write-on-change guards the disk).
         if self.workspace_dirty {
@@ -7848,14 +7929,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_opens_the_fleet_when_a_group_remembers_a_dead_session() {
-        // No live sessions, but the registry remembers a group whose member
-        // is gone: launch into the fleet, where the group renders as a
-        // reopenable block — not a fresh session piled on top of it.
+    fn startup_ignores_a_group_remembering_a_dead_local_session() {
+        // A remembered dead LOCAL member is not something to return to: relaunching
+        // it runs `$SHELL` with the old scrollback, which is what spawning would give
+        // anyway, and the memory is permanent — every window that ever ran leaves an
+        // auto-group behind, so counting it sent every launch into the fleet forever.
+        // The fleet still shows the tile; it just doesn't hijack a launch.
         let remembered = [group("g1", &["gone"])];
         assert!(matches!(
             startup_choice(None, &[], &remembered),
-            StartupChoice::Fleet
+            StartupChoice::Spawn
         ));
         // A group whose members are all live and attached remembers nothing
         // reconnectable — a plain launch still spawns.
@@ -7863,6 +7946,25 @@ mod tests {
         let live = [group("g1", &["a"])];
         assert!(matches!(
             startup_choice(None, &sessions, &live),
+            StartupChoice::Spawn
+        ));
+    }
+
+    #[test]
+    fn startup_opens_the_fleet_for_a_remembered_remote_member_whose_host_is_away() {
+        // A remote member nothing lists is waiting on its host, not dead: it comes
+        // back with its state when the host returns, so the fleet — where the tile
+        // holds and reconnects — is the right place to land.
+        let away = [group("g1", &[&format!("kov@box{REMOTE_ID_SEP}work")])];
+        assert!(matches!(
+            startup_choice(None, &[], &away),
+            StartupChoice::Fleet
+        ));
+        // ...but not once that host is connected and the session is listed and held:
+        // then it is an ordinary attached-elsewhere session.
+        let listed = [info(&format!("kov@box{REMOTE_ID_SEP}work"), true)];
+        assert!(matches!(
+            startup_choice(None, &listed, &away),
             StartupChoice::Spawn
         ));
     }
@@ -7885,9 +7987,8 @@ mod tests {
     fn new_window_mirrors_a_plain_launch() {
         // File > New Window / Cmd-N opens a window that "acts like the first one":
         // it carries no `$GHOST_SESSION` request, so it always takes the plain-launch
-        // decision — the fleet when anything is detached (reconnect) or remembered
-        // (a closed group), a fresh session otherwise — and never attaches to one
-        // specific session.
+        // decision — the fleet when there is a session to return to, a fresh session
+        // otherwise — and never attaches to one specific session.
         assert!(matches!(
             new_window_choice(&[info("a", false)], &[]),
             StartupChoice::Fleet
@@ -7897,9 +7998,11 @@ mod tests {
             new_window_choice(&[info("a", true)], &[]),
             StartupChoice::Spawn
         ));
+        // An old window's remembered dead member must not turn every Alt-N into a
+        // fleet: this is the regression `tests/shell.rs` reproduces end-to-end.
         assert!(matches!(
             new_window_choice(&[], &[group("g1", &["gone"])]),
-            StartupChoice::Fleet
+            StartupChoice::Spawn
         ));
     }
 
