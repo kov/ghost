@@ -66,9 +66,12 @@ const PREVIEW_COMPACT_SCALE: f32 = 0.5;
 /// short window (rather than one card filling the screen). Only binds when the
 /// window is short; tall windows are capped by native size instead.
 const MAX_CARD_VIEWPORT_FRAC: f32 = 0.45;
-/// Lines of vertical scroll per mouse-wheel notch (sign only, like the terminal's
-/// scrollback — magnitude is ignored so a touchpad and a notched wheel agree).
+/// Lines of vertical scroll per mouse-wheel notch (trackpads scroll by pixel
+/// travel instead — see [`FleetModel::wheel`]).
 const SCROLL_LINES: f32 = 3.0;
+/// Fraction of the OS's post-flick momentum travel that is applied, matching
+/// the terminal scrollback's damping so a flick settles near the target.
+const MOMENTUM_DAMPING: f32 = 0.25;
 /// Card chrome colours (metadata header, button footer).
 const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
 const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
@@ -2058,14 +2061,16 @@ impl FleetModel {
 
     /// Scroll the grid: a wheel click moves a [`SCROLL_LINES`] step, trackpad
     /// pixels track the finger 1:1 (`scroll_y` is already in pixels, so no
-    /// sub-step remainder to carry). Wheel up reveals tiles above. Returns a
-    /// redraw iff the offset actually moved.
+    /// sub-step remainder to carry), and post-flick coasting is damped by
+    /// [`MOMENTUM_DAMPING`]. Wheel up reveals tiles above. Returns a redraw
+    /// iff the offset actually moved.
     fn wheel(&mut self, wheel: WheelDelta) -> Vec<Cmd> {
         let travel = match wheel {
             WheelDelta::Notches(n) => {
                 n as f32 * SCROLL_LINES * self.effective_metrics().line_height
             }
             WheelDelta::Pixels(p) => p as f32,
+            WheelDelta::Momentum(p) => p as f32 * MOMENTUM_DAMPING,
         };
         if travel == 0.0 {
             return Vec::new();
@@ -8548,6 +8553,23 @@ mod tests {
         assert_eq!(m.scroll_y, 25.0, "25px of travel scrolls 25px");
         wheel_px(&mut m, 10.0);
         assert_eq!(m.scroll_y, 15.0, "and 10px back up returns 10px");
+    }
+
+    #[test]
+    fn a_flicks_glide_is_damped_in_the_grid_too() {
+        // Post-flick OS coasting lands at a quarter of its raw travel, like
+        // the terminal's scrollback, so a flick settles near the target.
+        let mut m = fleet();
+        list_many(&mut m, 6); // overflows the 400x200 viewport
+        m.update(UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 0.0, y: 0.0 },
+            mods: crate::Mods::NONE,
+            wheel: WheelDelta::Momentum(-80.0),
+            clicks: 1,
+        });
+        assert_eq!(m.scroll_y, 20.0, "80px of coasting lands 20px");
     }
 
     #[test]

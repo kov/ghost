@@ -5604,12 +5604,17 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel {
+                delta, momentum, ..
+            } => {
                 self.note_input(id);
                 // Keep the device's unit: a wheel click is a discrete notch, a
                 // trackpad reports smooth pixel travel — the core paces each.
+                // The OS's post-flick coasting is marked so the core can damp
+                // it (our vendored-winit `momentum` patch).
                 let wheel = match delta {
                     MouseScrollDelta::LineDelta(_, y) => WheelDelta::Notches(y as f64),
+                    MouseScrollDelta::PixelDelta(p) if momentum => WheelDelta::Momentum(p.y),
                     MouseScrollDelta::PixelDelta(p) => WheelDelta::Pixels(p.y),
                 };
                 let Some((pos, mods)) = self

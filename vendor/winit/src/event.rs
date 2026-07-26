@@ -272,7 +272,11 @@ pub enum WindowEvent {
     CursorLeft { device_id: DeviceId },
 
     /// A mouse wheel movement or touchpad scroll occurred.
-    MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase },
+    ///
+    /// `momentum` is `true` while the OS is coasting after a trackpad flick
+    /// (macOS's momentum phase) rather than reporting finger travel; always
+    /// `false` on platforms that don't distinguish (ghost patch).
+    MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase, momentum: bool },
 
     /// An mouse button press has been received.
     MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
@@ -1055,6 +1059,7 @@ mod tests {
                     device_id: did,
                     delta: event::MouseScrollDelta::LineDelta(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    momentum: false,
                 });
                 with_window_event(MouseInput {
                     device_id: did,

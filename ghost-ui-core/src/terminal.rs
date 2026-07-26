@@ -34,6 +34,14 @@ use crate::{
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
 const SCROLL_LINES: i64 = 3;
 
+/// Fraction of the OS's post-flick momentum travel that is applied. The finger
+/// tracks 1:1, but the coasting macOS generates after a flick is sized for
+/// pixel-smooth views (Safari, Terminal.app); stepping whole lines through the
+/// full glide reads as leaping far past the target. A quarter keeps the OS's
+/// decay shape — ease a little further, slow, stop — over a settling distance
+/// (pinned by `a_flicks_momentum_glide_is_damped_so_it_settles_nearby`).
+const MOMENTUM_DAMPING: f64 = 0.25;
+
 /// Cadence of selection-autoscroll steps while a drag hovers past a grid edge.
 const AUTOSCROLL_MS: u64 = 30;
 /// Fastest selection autoscroll, in lines per step (reached a few line-heights
@@ -2533,16 +2541,25 @@ impl TerminalView {
     /// The remainder keeps its native unit; switching devices drops it (it is
     /// less than one step, invisible).
     fn wheel_steps(&mut self, wheel: WheelDelta, line_height: f64) -> i64 {
-        let (total, step) = match (wheel, self.wheel_pending) {
-            (WheelDelta::Notches(n), WheelDelta::Notches(rem)) => (n + rem, 1.0),
-            (WheelDelta::Notches(n), _) => (n, 1.0),
-            (WheelDelta::Pixels(p), WheelDelta::Pixels(rem)) => (p + rem, line_height),
-            (WheelDelta::Pixels(p), _) => (p, line_height),
+        // Momentum is finger-unit pixels too (damped — see MOMENTUM_DAMPING),
+        // so it shares the Pixels remainder: the flick→glide boundary must
+        // not drop the fraction.
+        let delta = match wheel {
+            WheelDelta::Notches(n) => n,
+            WheelDelta::Pixels(p) => p,
+            WheelDelta::Momentum(p) => p * MOMENTUM_DAMPING,
         };
+        let (rem, step) = match (wheel, self.wheel_pending) {
+            (WheelDelta::Notches(_), WheelDelta::Notches(rem)) => (rem, 1.0),
+            (WheelDelta::Notches(_), _) => (0.0, 1.0),
+            (_, WheelDelta::Pixels(rem)) => (rem, line_height),
+            (_, _) => (0.0, line_height),
+        };
+        let total = delta + rem;
         let whole = (total / step).trunc();
         self.wheel_pending = match wheel {
             WheelDelta::Notches(_) => WheelDelta::Notches(total - whole),
-            WheelDelta::Pixels(_) => WheelDelta::Pixels(total - whole * step),
+            _ => WheelDelta::Pixels(total - whole * step),
         };
         whole as i64
     }
@@ -2718,7 +2735,7 @@ impl TerminalView {
                     // re-extends to the content now under the pointer.
                     let delta = match wheel {
                         WheelDelta::Notches(_) => steps * SCROLL_LINES,
-                        WheelDelta::Pixels(_) => steps,
+                        WheelDelta::Pixels(_) | WheelDelta::Momentum(_) => steps,
                     };
                     let cmds = self.scroll_by(state, delta);
                     self.re_extend(state);
@@ -3148,6 +3165,18 @@ mod tests {
             pos: PointPx { x: 1.0, y: 1.0 },
             mods: Mods::NONE,
             wheel: WheelDelta::Pixels(dy),
+            clicks: 1,
+        }
+    }
+
+    /// An OS momentum (post-flick coasting) wheel event of `dy` pixels.
+    fn wheel_momentum(dy: f64) -> UiEvent {
+        UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: PointPx { x: 1.0, y: 1.0 },
+            mods: Mods::NONE,
+            wheel: WheelDelta::Momentum(dy),
             clicks: 1,
         }
     }
@@ -5538,6 +5567,53 @@ mod tests {
         assert_eq!(top_row_text(&m), "L74");
         m.update(wheel_px(-18.0)); // one line-height back down
         assert_eq!(top_row_text(&m), "L75");
+    }
+
+    #[test]
+    fn a_flicks_momentum_glide_is_damped_so_it_settles_nearby() {
+        // After the fingers lift, the OS keeps coasting (momentum events).
+        // Applied 1:1 to a whole-line viewport that glide leaps far past the
+        // target; damped to a quarter it eases a little further and stops.
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(18.0)); // the finger itself scrolled one line
+        assert_eq!(top_row_text(&m), "L75");
+        for _ in 0..8 {
+            m.update(wheel_momentum(18.0)); // 144px of coasting…
+        }
+        assert_eq!(
+            top_row_text(&m),
+            "L73",
+            "…lands 2 lines on (144px/4 = 36px), not 8 more lines"
+        );
+    }
+
+    #[test]
+    fn the_glide_keeps_the_fingers_leftover_fraction() {
+        // The finger leaves half a line pending; the glide's damped travel
+        // adds to that remainder instead of restarting from zero.
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(9.0)); // half a line-height: pending, no motion
+        assert_eq!(top_row_text(&m), "L76");
+        m.update(wheel_momentum(36.0)); // damped to 9px -> 18px total
+        assert_eq!(top_row_text(&m), "L75", "the halves add up to one line");
+    }
+
+    #[test]
+    fn momentum_reports_to_the_app_are_damped_like_the_scrollback() {
+        let mut m = model();
+        feed(&mut m, b"\x1b[?1000h\x1b[?1006h");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0)); // cell (1,1)
+        let mut reports = 0;
+        for _ in 0..8 {
+            let cmds = m.update(wheel_momentum(18.0)); // 144px of coasting
+            reports += cmds
+                .iter()
+                .filter(|c| matches!(c, Cmd::SendInput { .. }))
+                .count();
+        }
+        assert_eq!(reports, 2, "the damped glide is 2 notches, not 8");
     }
 
     #[test]

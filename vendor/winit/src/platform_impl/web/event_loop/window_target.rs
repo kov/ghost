@@ -507,6 +507,7 @@ impl ActiveEventLoop {
                         device_id: RootDeviceId(DeviceId(pointer_id)),
                         delta,
                         phase: TouchPhase::Moved,
+                        momentum: false,
                     },
                 },
             )));

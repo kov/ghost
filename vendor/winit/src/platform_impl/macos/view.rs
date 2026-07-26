@@ -725,6 +725,10 @@ declare_class!(
                 },
             };
 
+            // Whether the OS is coasting after a flick (fingers already lifted)
+            // rather than reporting live finger travel (ghost patch).
+            let momentum = unsafe { event.momentumPhase() } != NSEventPhase::None;
+
             self.update_modifiers(event, false);
 
             self.ivars().app_delegate.maybe_queue_device_event(DeviceEvent::MouseWheel { delta });
@@ -732,6 +736,7 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
+                momentum,
             });
         }
 

@@ -88,6 +88,12 @@ pub enum WheelDelta {
     Notches(f64),
     /// Smooth per-pixel travel (winit `PixelDelta`, trackpads).
     Pixels(f64),
+    /// The OS coasting after a flick (macOS momentum phase): pixels like
+    /// [`Pixels`](WheelDelta::Pixels), but the fingers have already lifted.
+    /// Kept apart so views can damp the glide — applied 1:1 to a viewport that
+    /// steps in whole lines, the full OS glide reads as leaping far past
+    /// where you were looking.
+    Momentum(f64),
 }
 
 impl WheelDelta {
@@ -97,7 +103,7 @@ impl WheelDelta {
     /// The raw signed magnitude, unit-blind — for zero/direction checks only.
     pub fn raw(self) -> f64 {
         match self {
-            WheelDelta::Notches(v) | WheelDelta::Pixels(v) => v,
+            WheelDelta::Notches(v) | WheelDelta::Pixels(v) | WheelDelta::Momentum(v) => v,
         }
     }
 }
