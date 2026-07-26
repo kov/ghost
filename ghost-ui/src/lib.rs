@@ -33,7 +33,7 @@ mod font;
 mod from_winit;
 mod groups;
 mod instance;
-mod menu;
+pub mod menu;
 mod pacer;
 mod rendertrace;
 mod resize;
@@ -383,6 +383,54 @@ fn namespace_remote_infos(
         .collect()
 }
 
+/// Where a background worker posts its result for the main loop to apply.
+///
+/// Everything ghost does off the event loop — watching a host's session set,
+/// connecting, reconnecting, reattaching, spawning a remote session — is a thread
+/// that ends by posting a [`UserEvent`]. In the real app that is winit's event-loop
+/// proxy; behind this trait it can also be a queue a test drains
+/// ([`QueuedEvents`]), which is what lets those workers — the whole of ghost's
+/// remote recovery — be driven against a real host without a window server.
+pub trait EventSink: Send + Sync + 'static {
+    /// Post `event`, returning whether it will be delivered. A closed event loop
+    /// (the app is exiting) answers `false`, which is a worker's cue to stop.
+    fn post(&self, event: UserEvent) -> bool;
+}
+
+impl EventSink for winit::event_loop::EventLoopProxy<UserEvent> {
+    fn post(&self, event: UserEvent) -> bool {
+        self.send_event(event).is_ok()
+    }
+}
+
+/// An [`EventSink`] that collects what the workers post, for tests: real threads
+/// doing real work, with the main loop's `on_user_event` driven by the test instead
+/// of by winit. [`take`](QueuedEvents::take) drains what has arrived so far.
+#[derive(Default)]
+pub struct QueuedEvents(std::sync::Mutex<Vec<UserEvent>>);
+
+impl QueuedEvents {
+    /// Everything posted since the last drain, in order.
+    pub fn take(&self) -> Vec<UserEvent> {
+        self.0
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+}
+
+impl EventSink for QueuedEvents {
+    fn post(&self, event: UserEvent) -> bool {
+        match self.0.lock() {
+            Ok(mut q) => {
+                q.push(event);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// A live pushed session-set watch for one connected host: a background thread
 /// runs `ghost __watch` over the (already-authenticated) transport and streams
 /// each listing back as a [`UserEvent::RemoteSessions`], so the fleet updates the
@@ -415,7 +463,7 @@ impl Drop for RemoteWatcher {
 fn start_remote_watcher(
     target: String,
     host: RemoteHost,
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 ) -> RemoteWatcher {
     use std::sync::atomic::Ordering::Relaxed;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -424,7 +472,7 @@ fn start_remote_watcher(
     std::thread::spawn(move || {
         let mut failures: u32 = 0;
         while !t_stop.load(Relaxed) {
-            let pushed = watch_stream_once(&target, &host, &proxy, &t_stop, &t_child);
+            let pushed = watch_stream_once(&target, &host, &sink, &t_stop, &t_child);
             if t_stop.load(Relaxed) {
                 break;
             }
@@ -434,12 +482,10 @@ fn start_remote_watcher(
                 failures = failures.saturating_add(1);
                 // Unreachable for a grace period: clear the host's stale tiles.
                 if failures >= REMOTE_WATCH_MAX_FAILURES
-                    && proxy
-                        .send_event(UserEvent::RemoteSessions {
-                            target: target.clone(),
-                            infos: Vec::new(),
-                        })
-                        .is_err()
+                    && !sink.post(UserEvent::RemoteSessions {
+                        target: target.clone(),
+                        infos: Vec::new(),
+                    })
                 {
                     break; // the event loop closed
                 }
@@ -457,7 +503,7 @@ fn start_remote_watcher(
 fn watch_stream_once(
     target: &str,
     host: &RemoteHost,
-    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    sink: &Arc<dyn EventSink>,
     stop: &std::sync::atomic::AtomicBool,
     child_slot: &std::sync::Mutex<Option<std::process::Child>>,
 ) -> bool {
@@ -501,13 +547,10 @@ fn watch_stream_once(
         };
         pushed = true;
         let infos = namespace_remote_infos(target, infos);
-        if proxy
-            .send_event(UserEvent::RemoteSessions {
-                target: target.to_string(),
-                infos,
-            })
-            .is_err()
-        {
+        if !sink.post(UserEvent::RemoteSessions {
+            target: target.to_string(),
+            infos,
+        }) {
             stop.store(true, Relaxed); // event loop gone: end the whole watcher
             break;
         }
@@ -537,7 +580,7 @@ fn connect_outcome_wanted(current_gen: Option<u64>, finished_gen: u64) -> bool {
 /// post the [`ConnectOutcome`] back so the main loop attaches. Runs on its own
 /// thread so the window stays responsive throughout (it shows "Connecting…").
 fn spawn_connect_worker(
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
     wid: WindowId,
     generation: u64,
     spec: ConnectionSpec,
@@ -548,7 +591,7 @@ fn spawn_connect_worker(
             Ok(remote) => {
                 // Forward staging byte-progress to the connect prompt's bar.
                 let mut on_progress = |p: ghost_vt::remote::StageProgress| {
-                    let _ = proxy.send_event(UserEvent::ConnectProgress {
+                    let _ = sink.post(UserEvent::ConnectProgress {
                         wid,
                         sent: p.sent,
                         total: p.total,
@@ -566,7 +609,7 @@ fn spawn_connect_worker(
             }
             Err(e) => ConnectOutcome::Error(format!("could not open the ssh connection: {e}")),
         };
-        let _ = proxy.send_event(UserEvent::ConnectFinished {
+        let _ = sink.post(UserEvent::ConnectFinished {
             wid,
             generation,
             spec,
@@ -590,7 +633,7 @@ fn spawn_connect_worker(
 /// (see [`App::retry_remembered_hosts`]). A password-only host never succeeds
 /// under `BatchMode`; its tiles keep waiting, and the user can connect explicitly.
 fn spawn_remote_reconnect(
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
     spec: ConnectionSpec,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -608,8 +651,7 @@ fn spawn_remote_reconnect(
                 if remote.open_master_batch() {
                     match remote.negotiate() {
                         Ok(remote_ghost) => {
-                            let _ = proxy
-                                .send_event(UserEvent::RemoteReconnected { spec, remote_ghost });
+                            sink.post(UserEvent::RemoteReconnected { spec, remote_ghost });
                             return;
                         }
                         // Reachable but unusable as a transport (no remote ghost, a
@@ -651,7 +693,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// `stop` is set (the window closed or the session was reattached elsewhere). The
 /// blocking `ssh` (which can hang on an unreachable host) must stay off the loop.
 fn spawn_reconnect_probe(
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
     host: RemoteHost,
     wid: WindowId,
     name: String,
@@ -669,7 +711,7 @@ fn spawn_reconnect_probe(
             match host.remote.list_sessions(&host.remote_ghost) {
                 // Host reachable and the session survived: re-attach and resync.
                 Ok(list) if list.iter().any(|i| i.name == real) => {
-                    let _ = proxy.send_event(UserEvent::RemoteReattachReady { wid, name });
+                    let _ = sink.post(UserEvent::RemoteReattachReady { wid, name });
                     return;
                 }
                 // Host reachable but the session is GONE — the host rebooted and
@@ -677,7 +719,7 @@ fn spawn_reconnect_probe(
                 // bring it back, so end the hold; the tile falls to the fleet, where
                 // the dead session can be relaunched.
                 Ok(_) => {
-                    let _ = proxy.send_event(UserEvent::RemoteSessionGone { wid, name });
+                    let _ = sink.post(UserEvent::RemoteSessionGone { wid, name });
                     return;
                 }
                 // Unreachable (still partitioned): keep waiting — this is the
@@ -1463,10 +1505,11 @@ fn interactive(fresh: bool) {
     let proxy = event_loop.create_proxy();
     // As the owner, accept new-window requests forwarded by later launches and
     // turn each into a fresh window (like File > New Window) on the event loop.
+    let sink: Arc<dyn EventSink> = Arc::new(proxy.clone());
     if let Some(listener) = instance_listener {
-        let proxy = proxy.clone();
+        let sink = sink.clone();
         instance::serve(listener, move || {
-            let _ = proxy.send_event(UserEvent::OpenWindow);
+            sink.post(UserEvent::OpenWindow);
         });
     }
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
@@ -1487,6 +1530,7 @@ fn interactive(fresh: bool) {
         next_group_color,
         bench: harness,
         focused: None,
+        sink: Some(sink.clone()),
         proxy: Some(proxy),
         remotes,
         remote_infos: HashMap::new(),
@@ -1965,6 +2009,10 @@ impl App {
     /// [`HeadlessFrontend`] plugs into. Drive it with the App's own methods
     /// (`open_fleet_window`, `dispatch`, `on_*`) and assert on its state. Reachable
     /// from `tests/` for the same reason as [`HeadlessFrontend`].
+    ///
+    /// It does no off-loop work: with no [`EventSink`] the background workers are
+    /// never started. Use [`headless_with_sink`](App::headless_with_sink) to run them
+    /// for real (against a real remote host) and drain their results yourself.
     pub fn headless() -> Self {
         App {
             windows: HashMap::new(),
@@ -1980,6 +2028,7 @@ impl App {
             next_group_color: 0,
             bench: None,
             focused: None,
+            sink: None,
             proxy: None,
             remotes: Arc::default(),
             remote_infos: HashMap::new(),
@@ -1999,6 +2048,31 @@ impl App {
             last_workspace: windows::load(),
             workspace_dirty: false,
         }
+    }
+
+    /// A headless App that **does** run its background workers, posting into `sink`.
+    ///
+    /// This is what makes ghost's remote recovery testable: the watcher, the connect
+    /// and reconnect workers, the reattach probe and the remote spawn all run for
+    /// real — real `ssh`, a real host — and the test plays the event loop, draining
+    /// [`QueuedEvents`] into [`on_user_event`](App::on_user_event) as winit would.
+    pub fn headless_with_sink(sink: Arc<dyn EventSink>) -> Self {
+        App {
+            sink: Some(sink),
+            ..App::headless()
+        }
+    }
+
+    /// Register a connected remote host, exactly as a finished connect does: starts
+    /// its watcher and re-adopts anything a restore queued for it. A test that
+    /// negotiated a real transport itself hands the result in here.
+    pub fn adopt_remote_host(
+        &mut self,
+        spec: ConnectionSpec,
+        remote_ghost: String,
+        fe: &dyn Frontend,
+    ) {
+        self.finish_remote_reconnect(spec, remote_ghost, fe);
     }
 }
 
@@ -2254,10 +2328,16 @@ pub struct App {
     /// "the current window" (New Session, Copy, Paste, Zoom, Toggle Fleet). Kept
     /// across focus loss; a stale id is filtered out at use (see `focused_window`).
     focused: Option<WindowId>,
-    /// Proxy for posting messages into the event loop from another thread: native
-    /// menu selections (AppKit's main thread, macOS) and the remote-fleet watcher's
-    /// listings ([`UserEvent::RemoteSessions`]). `None` under a headless
-    /// [`Frontend`], where no threads post back into the loop.
+    /// Where background workers post their results for the main loop to apply (see
+    /// [`EventSink`]): the watcher's listings, connect/reconnect outcomes, reattach
+    /// readiness, remote spawns. `None` leaves this App unable to do off-loop work at
+    /// all; a test supplies [`QueuedEvents`] and drains it into
+    /// [`on_user_event`](App::on_user_event), which is how the remote-recovery
+    /// workers are driven against a real host without a window server.
+    sink: Option<Arc<dyn EventSink>>,
+    /// The winit proxy itself, needed by the native macOS menu (AppKit posts from its
+    /// own thread and wants winit's own handle). `None` under a headless frontend.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
     /// Remote hosts reached over the ssh transport, keyed by target — retained
     /// after a successful connect and shared with the watcher thread that lists
@@ -2392,8 +2472,8 @@ impl App {
     /// parsing the target.
     fn retry_remembered_hosts(&mut self) {
         use std::sync::atomic::Ordering;
-        let Some(proxy) = self.proxy.clone() else {
-            return; // no event loop to post the result back to (a headless test)
+        let Some(sink) = self.sink.clone() else {
+            return; // nowhere to post the result (an App with no sink at all)
         };
         let connected: HashSet<String> = self
             .remotes
@@ -2436,7 +2516,7 @@ impl App {
             let Some(spec) = spec else { continue };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.remote_retries.insert(target, stop.clone());
-            spawn_remote_reconnect(proxy.clone(), spec, stop);
+            spawn_remote_reconnect(sink.clone(), spec, stop);
         }
     }
 
@@ -3433,12 +3513,12 @@ impl App {
             .lock()
             .ok()
             .and_then(|m| m.get(&target).cloned());
-        let (Some(host), Some(proxy)) = (host, self.proxy.clone()) else {
+        let (Some(host), Some(sink)) = (host, self.sink.clone()) else {
             return;
         };
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.reconnecting.insert((wid, name.clone()), stop.clone());
-        spawn_reconnect_probe(proxy, host, wid, name, real, stop);
+        spawn_reconnect_probe(sink, host, wid, name, real, stop);
     }
 
     /// The probe says a reconnecting session's host is back and the session still
@@ -3475,9 +3555,9 @@ impl App {
         if self.attach_ssh_into(wid, &name, cmd, proto) {
             self.reconnecting.remove(&(wid, name.clone()));
             self.dispatch(wid, UiEvent::SessionReattached { name }, event_loop);
-        } else if let Some(proxy) = self.proxy.clone() {
+        } else if let Some(sink) = self.sink.clone() {
             // Raced: keep the hold, probe again from the floor.
-            spawn_reconnect_probe(proxy, host, wid, name, real, stop);
+            spawn_reconnect_probe(sink, host, wid, name, real, stop);
         }
     }
 
@@ -3736,11 +3816,11 @@ impl App {
                 // `finish_connect` attaches on the main thread. The prompt stays in
                 // its "Connecting" phase meanwhile.
                 let generation = self.windows.get(&wid).map(|w| w.connect_gen).unwrap_or(0);
-                if let Some(proxy) = self.proxy.clone()
+                if let Some(sink) = self.sink.clone()
                     && let Some(setup) = self.windows.get_mut(&wid).and_then(|w| w.connect.take())
                 {
                     spawn_connect_worker(
-                        proxy,
+                        sink,
                         wid,
                         generation,
                         setup.spec.clone(),
@@ -4021,7 +4101,7 @@ impl App {
     /// the push that keeps its fleet tiles fresh. A no-op without an event-loop
     /// proxy (a headless test posts `RemoteSessions` itself).
     fn ensure_remote_watcher(&mut self, target: &str) {
-        let Some(proxy) = self.proxy.clone() else {
+        let Some(sink) = self.sink.clone() else {
             return;
         };
         if self.remote_watchers.contains_key(target) {
@@ -4035,7 +4115,7 @@ impl App {
         let Some(host) = host else {
             return;
         };
-        let watcher = start_remote_watcher(target.to_string(), host, proxy);
+        let watcher = start_remote_watcher(target.to_string(), host, sink);
         self.remote_watchers.insert(target.to_string(), watcher);
     }
 
@@ -4122,9 +4202,8 @@ impl App {
             eprintln!("ghost: no live connection to {target} to open a session on");
             return;
         };
-        let Some(proxy) = self.proxy.clone() else {
-            // No event-loop proxy (a headless/behaviour-only App): nothing to post
-            // the worker's result back to. A live GUI always has one.
+        let Some(sink) = self.sink.clone() else {
+            // Nothing to post the worker's result back to (an App with no sink).
             return;
         };
         let (target, name) = (target.to_string(), name.to_string());
@@ -4137,7 +4216,7 @@ impl App {
                 .remote
                 .spawn_host(&host.remote_ghost, &name)
                 .map_err(|e| e.to_string());
-            let _ = proxy.send_event(UserEvent::RemoteSessionSpawned {
+            sink.post(UserEvent::RemoteSessionSpawned {
                 wid,
                 target,
                 name,
@@ -5041,7 +5120,7 @@ impl App {
     /// effect a keystroke would have produced, keeping the pure core the single
     /// source of truth — see [`menu::menu_intent`]), a remote host's latest listing
     /// from the watcher, or a connect worker's result.
-    fn on_user_event(&mut self, fe: &dyn Frontend, event: UserEvent) {
+    pub fn on_user_event(&mut self, fe: &dyn Frontend, event: UserEvent) {
         let action = match event {
             UserEvent::Menu(action) => action,
             // The watcher thread delivered a remote host's latest listing: stash it
