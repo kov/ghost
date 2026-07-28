@@ -14,7 +14,7 @@
 //! (`query_replies`, `bracket_paste`, `selection_text`) live here too.
 
 use ghost_render::{
-    Frame, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at,
+    Frame, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at_px,
 };
 use ghost_term::{
     ActionPolicy, ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp,
@@ -302,6 +302,13 @@ pub struct TerminalView {
     autoscroll: i64,
     /// Lines scrolled up into history; 0 = pinned to the live bottom.
     scroll_offset: usize,
+    /// Sub-line scroll, in physical pixels past [`scroll_offset`] (`0.0` =
+    /// row-aligned). Trackpad scrolling is pixel-exact: the view rests between
+    /// rows, rendered via the frame's [`Frame::scroll_frac_px`]. Always
+    /// `< line_height`, and only ever non-zero with more history above.
+    /// Line-quantized motions (wheel notches, Shift+navigation, autoscroll)
+    /// snap it back to zero.
+    scroll_frac: f32,
     /// Sub-step wheel remainder carried between events, in the device's native
     /// unit (see [`Self::wheel_steps`]) — a trackpad burst of tiny pixel deltas
     /// must add up to motion instead of each counting as a whole notch.
@@ -382,7 +389,7 @@ pub struct TerminalView {
 /// [`TerminalView`]'s frame memo. Two views/presents with an equal key produce a
 /// byte-identical frame, so the memo can hand back the same `Rc` and let
 /// `Rc::ptr_eq` stand in for a content compare.
-type FrameKey = (u64, CellMetrics, usize);
+type FrameKey = (u64, CellMetrics, usize, f32);
 
 /// How long a synchronized-output hold may last before the scheduled tick
 /// releases it anyway. Generous for an atomic repaint burst, short enough that
@@ -419,6 +426,9 @@ pub struct TermTrace {
 #[derive(Clone, PartialEq)]
 struct Presented {
     scroll: usize,
+    /// Sub-line scroll pixels at the present (see [`TerminalView::scroll_frac`]);
+    /// a fraction-only movement is still a whole-view repaint.
+    scroll_frac: f32,
     /// Total lines the session has scrolled off the top (`lines_scrolled_off`) at the
     /// present. While scrolled back the viewport is anchored to the *live bottom*, so a
     /// feed that scrolls new lines off shifts what a FIXED `scroll` offset shows even
@@ -1313,6 +1323,7 @@ impl TerminalView {
             selection: None,
             autoscroll: 0,
             scroll_offset: 0,
+            scroll_frac: 0.0,
             wheel_pending: WheelDelta::NONE,
             preedit: String::new(),
             last_title: String::new(),
@@ -1339,12 +1350,13 @@ impl TerminalView {
                 None => true,
                 Some(p) => {
                     p.scroll != self.scroll_offset
+                        || p.scroll_frac != self.scroll_frac
                         // Scrolled back, the viewport is pinned to the live bottom: new
                         // lines scrolling off shift the whole visible window under a
                         // fixed offset, so the content changed even though `scroll` did
-                        // not. At the bottom (offset 0) this is the ordinary live feed
-                        // the row hint covers, so gate it on being scrolled away.
-                        || (self.scroll_offset > 0
+                        // not. At the bottom (offset 0, no fraction) this is the ordinary
+                        // live feed the row hint covers, so gate it on being scrolled away.
+                        || ((self.scroll_offset > 0 || self.scroll_frac > 0.0)
                             && p.scrolled_off != state.screen.vt().lines_scrolled_off())
                         || p.selection != self.selection
                         || p.size != self.size_px
@@ -1356,6 +1368,16 @@ impl TerminalView {
             };
         if moved {
             TermDamage::All
+        } else if self.scroll_frac != 0.0 {
+            // Parked between rows, the frame's rows sit a fraction off the
+            // texture's row grid, so the banded row math below doesn't apply:
+            // any accumulated feed damage goes whole-view. (The cursor isn't
+            // drawn here, so feed rows are the only source.)
+            if self.feed_dirty.is_some() {
+                TermDamage::All
+            } else {
+                TermDamage::None
+            }
         } else {
             let rows = state.rows as usize;
             // `feed_dirty` rows are live-viewport rows, but the renderer bands
@@ -1395,7 +1417,7 @@ impl TerminalView {
     /// the live cursor is off screen. Snapshotted into [`Presented`] and diffed in
     /// [`Self::damage`]; the row is clamped so a shrink can't point past the bottom.
     fn drawn_cursor(&self, state: &SessionState) -> Option<(usize, usize, u8)> {
-        if self.scroll_offset != 0 {
+        if self.scroll_offset != 0 || self.scroll_frac != 0.0 {
             return None;
         }
         let c = state.screen.vt().cursor();
@@ -1412,6 +1434,7 @@ impl TerminalView {
     pub(crate) fn mark_presented(&mut self, state: &SessionState) {
         self.presented = Some(Presented {
             scroll: self.scroll_offset,
+            scroll_frac: self.scroll_frac,
             scrolled_off: state.screen.vt().lines_scrolled_off(),
             selection: self.selection,
             size: self.size_px,
@@ -1448,7 +1471,7 @@ impl TerminalView {
     pub(crate) fn selection(&self, state: &SessionState) -> Option<Selection> {
         let s = self.selection?;
         let top = self.abs_top(state);
-        let rows = state.rows as usize;
+        let rows = state.rows as usize + self.win_extra();
         if s.end.0 < top || s.start.0 >= top + rows {
             return None;
         }
@@ -1465,10 +1488,32 @@ impl TerminalView {
         Some(Selection { start, end })
     }
 
-    /// The first viewport row's absolute line index — the monotonic
-    /// lines-ever-scrolled-off space selections are anchored in.
+    /// Rows the rendered window extends above the viewport: 1 while parked
+    /// between rows (the slid `rows + 1` window with a line peeking in on
+    /// top — see [`Frame::scroll_frac_px`]), else 0.
+    fn win_extra(&self) -> usize {
+        (self.scroll_frac > 0.0) as usize
+    }
+
+    /// The rendered window's first row as an absolute line index — the
+    /// monotonic lines-ever-scrolled-off space selections are anchored in.
+    /// While parked between rows the window starts one line further up.
     fn abs_top(&self, state: &SessionState) -> usize {
-        state.screen.vt().lines_scrolled_off() - self.scroll_offset
+        (state.screen.vt().lines_scrolled_off() - self.scroll_offset)
+            .saturating_sub(self.win_extra())
+    }
+
+    /// The window row under grid row `r`. Parked between rows, each grid cell
+    /// shows parts of two lines — pick the one covering the majority of the
+    /// cell, matching what the eye sees. Clamped to the window.
+    fn grid_to_win_row(&self, state: &SessionState, r: usize) -> usize {
+        let half = self.effective_metrics().line_height * 0.5;
+        let k = if self.scroll_frac > 0.0 && self.scroll_frac <= half {
+            r + 1
+        } else {
+            r
+        };
+        k.min((state.rows as usize + self.win_extra()).saturating_sub(1))
     }
 
     /// Lift a viewport cell into absolute line space.
@@ -1617,7 +1662,7 @@ impl TerminalView {
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
     /// window. `None` while scrolled into history (no live cursor is shown).
     pub(crate) fn ime_cursor_area(&self, state: &SessionState) -> Option<RectPx> {
-        if self.scroll_offset != 0 {
+        if self.scroll_offset != 0 || self.scroll_frac != 0.0 {
             return None;
         }
         let (col1, row1) = state.screen.cursor();
@@ -1657,6 +1702,7 @@ impl TerminalView {
             state.content_gen(),
             self.effective_metrics(),
             self.scroll_offset,
+            self.scroll_frac,
         );
         let mut memo = self.frame_memo.borrow_mut();
         if let Some((k, frame)) = memo.as_ref()
@@ -1664,10 +1710,11 @@ impl TerminalView {
         {
             return Rc::clone(frame);
         }
-        let frame = Rc::new(layout_frame_at(
+        let frame = Rc::new(layout_frame_at_px(
             state.screen.vt(),
             self.effective_metrics(),
             self.scroll_offset,
+            self.scroll_frac,
         ));
         *memo = Some((key, Rc::clone(&frame)));
         frame
@@ -1712,13 +1759,21 @@ impl TerminalView {
             f32::from(b) / 255.0,
             0.9,
         ];
+        // Parked between rows, the underlines shift with the slid window so
+        // they stay glued to the (fractionally offset) rendered text.
+        let extra = self.win_extra();
+        let dy = if extra == 1 {
+            self.scroll_frac - m.line_height
+        } else {
+            0.0
+        };
         let mut items = Vec::new();
         for (row, line) in state
             .screen
             .vt()
-            .view_at(self.scroll_offset)
+            .view_at(self.scroll_offset + extra)
             .enumerate()
-            .take(state.rows as usize)
+            .take(state.rows as usize + extra)
         {
             let cells = line.cells();
             let mut col = 0;
@@ -1735,7 +1790,7 @@ impl TerminalView {
                     id: SceneId::Root,
                     rect: RectPx {
                         x: start as f32 * m.advance,
-                        y: (row + 1) as f32 * m.line_height - 2.0,
+                        y: (row + 1) as f32 * m.line_height - 2.0 + dy,
                         w: (col - start) as f32 * m.advance,
                         h: 1.5,
                     },
@@ -1755,12 +1810,14 @@ impl TerminalView {
         });
     }
 
-    /// Clamp `offset` to the retained history and apply it; returns whether the
-    /// view actually moved.
+    /// Clamp `offset` to the retained history and apply it, snapping any
+    /// sub-row fraction back to the row grid (every line-quantized motion
+    /// lands aligned); returns whether the view actually moved.
     fn set_scroll(&mut self, state: &SessionState, offset: usize) -> bool {
         let offset = offset.min(state.max_scroll());
-        let changed = offset != self.scroll_offset;
+        let changed = offset != self.scroll_offset || self.scroll_frac != 0.0;
         self.scroll_offset = offset;
+        self.scroll_frac = 0.0;
         changed
     }
 
@@ -1768,6 +1825,28 @@ impl TerminalView {
     fn scroll_by(&mut self, state: &SessionState, delta: i64) -> Vec<Cmd> {
         let target = (self.scroll_offset as i64 + delta).max(0) as usize;
         if self.set_scroll(state, target) {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Scroll by `dpx` pixels (positive = up, into history), pixel-exact: the
+    /// view may come to rest between rows ([`Self::scroll_frac`]), which is
+    /// what makes trackpad scrolling track the finger smoothly instead of
+    /// stepping a row at a time. `Redraw` if the position moved.
+    fn scroll_by_px(&mut self, state: &SessionState, dpx: f64) -> Vec<Cmd> {
+        let lh = f64::from(self.effective_metrics().line_height);
+        let max_px = state.max_scroll() as f64 * lh;
+        let cur = self.scroll_offset as f64 * lh + f64::from(self.scroll_frac);
+        let target = (cur + dpx).clamp(0.0, max_px);
+        let offset = (target / lh).floor().min(state.max_scroll() as f64);
+        let frac = (target - offset * lh) as f32;
+        let offset = offset as usize;
+        let changed = offset != self.scroll_offset || frac != self.scroll_frac;
+        self.scroll_offset = offset;
+        self.scroll_frac = frac;
+        if changed {
             vec![Cmd::Redraw]
         } else {
             Vec::new()
@@ -2058,6 +2137,7 @@ impl TerminalView {
         self.selection = None;
         self.sel_anchor = None;
         self.scroll_offset = 0;
+        self.scroll_frac = 0.0;
         vec![
             Cmd::Resize {
                 session: state.session.clone(),
@@ -2123,6 +2203,7 @@ impl TerminalView {
                 self.selection = None;
                 self.sel_anchor = None;
                 self.scroll_offset = 0;
+                self.scroll_frac = 0.0;
                 self.view_slid = true;
                 if driving && let Some(px) = outcome.new_size_px {
                     self.size_px = px;
@@ -2134,13 +2215,18 @@ impl TerminalView {
             // output. At the scrollback cap the offset can't grow to stay pinned, so
             // the evicted lines slide the whole visible window while the offset stays
             // put — force a full repaint the way a scroll does (see [`Self::damage`]).
-            if self.scroll_offset > 0 {
+            if self.scroll_offset > 0 || self.scroll_frac > 0.0 {
                 let desired = self.scroll_offset + outcome.scrolled_off;
                 let capped = desired.min(state.max_scroll());
                 if capped < desired {
                     self.view_slid = true;
                 }
                 self.scroll_offset = capped;
+                // A sub-row fraction needs one more line above to slide in;
+                // at the cap there is none, so snap to the row grid.
+                if self.scroll_frac > 0.0 && self.scroll_offset >= state.max_scroll() {
+                    self.scroll_frac = 0.0;
+                }
             }
             // At the live bottom, new output replaces the viewport, so a
             // viewport-relative selection no longer maps — drop it (unless a drag is
@@ -2148,7 +2234,7 @@ impl TerminalView {
             // so the selection stays valid and is preserved. Dropping a visible
             // highlight is itself a repaint even if no row's text changed.
             let had_selection = self.selection.is_some();
-            if self.held.is_none() && self.scroll_offset == 0 {
+            if self.held.is_none() && self.scroll_offset == 0 && self.scroll_frac == 0.0 {
                 self.selection = None;
                 self.sel_anchor = None;
             }
@@ -2189,7 +2275,7 @@ impl TerminalView {
             // cursor's move (the row it left + entered, in the outcome); fold that in —
             // but only at the live bottom, since scrolled into history the cursor isn't
             // drawn (and a scroll is already a full repaint).
-            let cursor_redrawn = if self.scroll_offset == 0 {
+            let cursor_redrawn = if self.scroll_offset == 0 && self.scroll_frac == 0.0 {
                 if let Some(r) = outcome.cursor.left {
                     self.accumulate_dirty(r, r);
                 }
@@ -2338,10 +2424,12 @@ impl TerminalView {
     /// disallowed schemes.
     fn link_at(&self, state: &SessionState, pos: PointPx) -> Option<(u16, String)> {
         let (col1, row1) = self.point_to_cell(pos);
-        let row = usize::from(row1.saturating_sub(1)).min((state.rows as usize).saturating_sub(1));
+        let grid_row =
+            usize::from(row1.saturating_sub(1)).min((state.rows as usize).saturating_sub(1));
+        let row = self.grid_to_win_row(state, grid_row);
         let col = usize::from(col1.saturating_sub(1)).min((state.cols as usize).saturating_sub(1));
         let vt = state.screen.vt();
-        let line = vt.view_at(self.scroll_offset).nth(row)?;
+        let line = self.window_line(state, row)?;
         let id = line.cells().get(col)?.pen().link_id()?;
         let uri = vt.hyperlink(id)?;
         // Only schemes whose handlers are safe to invoke on a click; anything
@@ -2378,13 +2466,15 @@ impl TerminalView {
         vec![Cmd::PointerIcon(icon), Cmd::Redraw]
     }
 
-    /// 0-based `(row, col)` cell under the pointer, clamped to the grid.
+    /// 0-based `(window row, col)` cell under the pointer, clamped to the
+    /// rendered window (which slides one line up while parked between rows —
+    /// see [`Self::grid_to_win_row`]).
     fn pointer_cell0(&self, state: &SessionState) -> (usize, usize) {
         let (col1, row1) = self.cursor_cell.unwrap_or((1, 1));
         let row0 = usize::from(row1.saturating_sub(1));
         let col0 = usize::from(col1.saturating_sub(1));
         (
-            row0.min((state.rows as usize).saturating_sub(1)),
+            self.grid_to_win_row(state, row0.min((state.rows as usize).saturating_sub(1))),
             col0.min((state.cols as usize).saturating_sub(1)),
         )
     }
@@ -2485,8 +2575,8 @@ impl TerminalView {
     /// scrolled-back view by cell (not `screen.text()`, whose char indices don't
     /// line up with cell columns once a wide character is present).
     fn word_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
-        let window: Vec<&Line> = state.screen.vt().view_at(self.scroll_offset).collect();
-        let cells = window.get(row)?.cells();
+        let line = self.window_line(state, row)?;
+        let cells = line.cells();
         // A word cell is one holding a word character, or the (zero-width) tail
         // of a wide character, which continues whatever head precedes it.
         let word = |i: usize| {
@@ -2511,10 +2601,24 @@ impl TerminalView {
     /// The line at viewport `row`: column 0 through its last non-blank cell (the
     /// whole row when blank), as an inclusive selection.
     fn line_at(&self, state: &SessionState, row: usize) -> Option<Selection> {
-        let window: Vec<&Line> = state.screen.vt().view_at(self.scroll_offset).collect();
-        let cells = window.get(row)?.cells();
+        let line = self.window_line(state, row)?;
+        let cells = line.cells();
         let last = cells.iter().rposition(|c| !c.is_default()).unwrap_or(0);
         Some(Selection::new((row, 0), (row, last)))
+    }
+
+    /// The rendered window's `row`-th line (the frame's row space: slid one
+    /// line up while parked between rows). Row `0` while slid is the partial
+    /// line peeking in at the top; the last row is fetched from the unslid
+    /// view, whose bottom line the slid `view_at` no longer yields.
+    fn window_line<'a>(&self, state: &'a SessionState, row: usize) -> Option<&'a Line> {
+        let vt = state.screen.vt();
+        let extra = self.win_extra();
+        let rows = state.rows as usize;
+        if extra == 1 && row == rows {
+            return vt.view_at(self.scroll_offset).nth(rows - 1);
+        }
+        vt.view_at(self.scroll_offset + extra).nth(row)
     }
 
     fn mouse_report(
@@ -2701,14 +2805,14 @@ impl TerminalView {
             }
             PointerPhase::Wheel => {
                 let line_height = f64::from(self.effective_metrics().line_height);
-                let steps = self.wheel_steps(wheel, line_height);
-                if steps == 0 {
-                    return Vec::new();
-                }
                 if self.report_to_app(state, mods) {
                     // The child grabbed the mouse: report each whole step as a
-                    // wheel-button press, paced by the same accumulation (one
-                    // per click, or per line-height of trackpad travel).
+                    // wheel-button press, paced by the accumulated remainder
+                    // (one per click, or per line-height of trackpad travel).
+                    let steps = self.wheel_steps(wheel, line_height);
+                    if steps == 0 {
+                        return Vec::new();
+                    }
                     let b = if steps > 0 {
                         mouse::Button::WheelUp
                     } else {
@@ -2729,15 +2833,23 @@ impl TerminalView {
                     cmds
                 } else {
                     // Scroll local scrollback (up = into history): a wheel
-                    // click jumps SCROLL_LINES, trackpad travel tracks the
-                    // finger line for line. Mid-drag this is fine — the
-                    // selection lives in absolute line space — it just
-                    // re-extends to the content now under the pointer.
-                    let delta = match wheel {
-                        WheelDelta::Notches(_) => steps * SCROLL_LINES,
-                        WheelDelta::Pixels(_) | WheelDelta::Momentum(_) => steps,
+                    // click jumps SCROLL_LINES whole rows, trackpad travel is
+                    // pixel-exact — the content tracks the finger, resting
+                    // between rows, and the OS's post-flick glide follows
+                    // damped. Mid-drag this is fine — the selection lives in
+                    // absolute line space — it just re-extends to the content
+                    // now under the pointer.
+                    let cmds = match wheel {
+                        WheelDelta::Notches(_) => {
+                            let steps = self.wheel_steps(wheel, line_height);
+                            if steps == 0 {
+                                return Vec::new();
+                            }
+                            self.scroll_by(state, steps * SCROLL_LINES)
+                        }
+                        WheelDelta::Pixels(p) => self.scroll_by_px(state, p),
+                        WheelDelta::Momentum(p) => self.scroll_by_px(state, p * MOMENTUM_DAMPING),
                     };
-                    let cmds = self.scroll_by(state, delta);
                     self.re_extend(state);
                     cmds
                 }
@@ -5532,31 +5644,31 @@ mod tests {
     #[test]
     fn a_trackpad_flick_scrolls_by_finger_travel_not_per_event() {
         // A trackpad gesture arrives as a rapid burst of small pixel deltas.
-        // Ten 6px events are 60px of finger travel = 60/18 ≈ 3.3 line-heights,
-        // so the viewport moves 3 lines — NOT a whole notch (3 lines) per
-        // event, which would race 30 lines up on a light flick.
+        // Ten 6px events are 60px of finger travel = 3 rows + 6px, and the
+        // view lands exactly there — NOT a whole notch (3 rows) per event,
+        // which would race 30 rows up on a light flick.
         let mut m = model();
         feed_lines(&mut m, 100); // viewport L76..L99
         for _ in 0..10 {
             m.update(wheel_px(6.0));
         }
         assert_eq!(
-            top_row_text(&m),
-            "L73",
-            "60px of travel over an 18px line-height is 3 lines"
+            frame_shape(&m),
+            (6.0, 25, "L72".into()),
+            "60px of travel is 3 rows + 6px, not 30 rows"
         );
     }
 
     #[test]
     fn trackpad_fractions_carry_across_events() {
-        // Two half-line (9px) deltas: nothing moves on the first — the
-        // fraction is carried, not dropped — and the pair scrolls one line.
+        // Two half-row (9px) deltas: the first already moves the view half a
+        // row (pixel-exact), and the pair lands exactly one row up, aligned.
         let mut m = model();
         feed_lines(&mut m, 100);
         m.update(wheel_px(9.0));
-        assert_eq!(top_row_text(&m), "L76", "half a line-height doesn't move");
+        assert_eq!(frame_shape(&m), (9.0, 25, "L75".into()));
         m.update(wheel_px(9.0));
-        assert_eq!(top_row_text(&m), "L75", "the carried halves add to a line");
+        assert_eq!(frame_shape(&m), (0.0, 24, "L75".into()));
     }
 
     #[test]
@@ -5590,14 +5702,106 @@ mod tests {
 
     #[test]
     fn the_glide_keeps_the_fingers_leftover_fraction() {
-        // The finger leaves half a line pending; the glide's damped travel
-        // adds to that remainder instead of restarting from zero.
+        // The finger parks the view half a row up; the damped glide continues
+        // from that exact position instead of restarting on the row grid.
         let mut m = model();
         feed_lines(&mut m, 100);
-        m.update(wheel_px(9.0)); // half a line-height: pending, no motion
-        assert_eq!(top_row_text(&m), "L76");
-        m.update(wheel_momentum(36.0)); // damped to 9px -> 18px total
-        assert_eq!(top_row_text(&m), "L75", "the halves add up to one line");
+        m.update(wheel_px(9.0)); // half a row, pixel-exact
+        assert_eq!(frame_shape(&m), (9.0, 25, "L75".into()));
+        m.update(wheel_momentum(36.0)); // damped to 9px -> exactly one row
+        assert_eq!(frame_shape(&m), (0.0, 24, "L75".into()));
+    }
+
+    /// The rendered frame's smooth-scroll shape: `(scroll_frac_px, window rows,
+    /// text of the first — possibly partial — window row)`.
+    fn frame_shape(m: &TerminalModel) -> (f32, usize, String) {
+        let scene = m.view();
+        match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { frame, .. } => (
+                frame.scroll_frac_px,
+                frame.rows_layout.len(),
+                frame
+                    .rows_layout
+                    .first()
+                    .and_then(|r| r.runs.first())
+                    .map(|run| run.text.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn trackpad_pixels_slide_the_view_between_rows() {
+        // 5px of finger travel moves the view 5px: the frame parks between
+        // rows (frac 5), its window slides one line up so the next history
+        // line can peek in at the top — no waiting for a whole-row threshold.
+        let mut m = model();
+        feed_lines(&mut m, 100); // viewport L76..L99
+        let cmds = m.update(wheel_px(5.0));
+        assert!(cmds.contains(&Cmd::Redraw), "5px of travel repaints");
+        assert_eq!(frame_shape(&m), (5.0, 25, "L75".into()));
+    }
+
+    #[test]
+    fn sub_line_scroll_accumulates_smoothly() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        for _ in 0..4 {
+            m.update(wheel_px(5.0)); // 20px = one row + 2px
+        }
+        assert_eq!(frame_shape(&m), (2.0, 25, "L74".into()));
+        // 2px back down lands exactly on the row grid: an aligned 24-row frame.
+        m.update(wheel_px(-2.0));
+        assert_eq!(frame_shape(&m), (0.0, 24, "L75".into()));
+    }
+
+    #[test]
+    fn a_wheel_notch_snaps_the_fraction_to_the_row_grid() {
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(5.0)); // parked 5px between rows
+        m.update(wheel(1.0)); // a discrete click: whole rows again
+        assert_eq!(frame_shape(&m), (0.0, 24, "L73".into()));
+    }
+
+    #[test]
+    fn feeds_while_parked_between_rows_repaint_fully() {
+        // Between rows the frame sits a fraction off the texture's row grid,
+        // so banded row updates can't apply — a feed is whole-view damage.
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(5.0));
+        m.mark_presented();
+        feed(&mut m, b"\r\nX");
+        assert!(
+            matches!(view_damage(&m), TermDamage::All),
+            "a feed while parked mid-row is a full repaint, got {:?}",
+            view_damage(&m)
+        );
+    }
+
+    #[test]
+    fn selection_between_rows_picks_the_majority_line() {
+        // Parked 12px down (more than half a row), the top grid cell mostly
+        // shows the slid-in history line — a click there selects THAT line,
+        // matching what the eye sees, not the row-aligned one underneath.
+        let mut m = model();
+        feed_lines(&mut m, 100);
+        m.update(wheel_px(12.0));
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(press_n(1.0, 1.0, 3)); // triple-click: line select
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        let copied = cmds.iter().find_map(|c| match c {
+            Cmd::WritePrimary(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some("L75"));
     }
 
     #[test]
@@ -6373,7 +6577,7 @@ mod tests {
         use super::{key, model};
         use crate::input::{Key, Mods, NamedKey};
         use crate::{Cmd, UiEvent};
-        use ghost_render::{Frame, SceneItem, TermDamage, layout_frame_at, rows_differ_outside};
+        use ghost_render::{Frame, SceneItem, TermDamage, rows_differ_outside};
         use proptest::prelude::*;
         use std::rc::Rc;
 
@@ -6436,7 +6640,14 @@ mod tests {
             Tick,
             ScrollUp,
             ScrollDown,
-            Resize { w_px: u32, h_px: u32 },
+            /// A trackpad delta in pixels — lands the view between rows
+            /// (fractional scroll), where the stale-frame/missed-repaint
+            /// gates are easiest to get wrong.
+            WheelPx(i8),
+            Resize {
+                w_px: u32,
+                h_px: u32,
+            },
         }
 
         fn op() -> impl Strategy<Value = Op> {
@@ -6446,6 +6657,7 @@ mod tests {
                 1 => Just(Op::Tick),
                 1 => Just(Op::ScrollUp),
                 1 => Just(Op::ScrollDown),
+                2 => (-25i8..=25).prop_map(Op::WheelPx),
                 1 => (120u32..=1600, 60u32..=1200)
                     .prop_map(|(w_px, h_px)| Op::Resize { w_px, h_px }),
             ]
@@ -6494,6 +6706,9 @@ mod tests {
                         }
                         Op::ScrollDown => {
                             key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+                        }
+                        Op::WheelPx(dpx) => {
+                            m.update(super::wheel_px(f64::from(dpx)));
                         }
                         Op::Resize { w_px, h_px } => {
                             m.update(UiEvent::Resize {
@@ -6602,10 +6817,11 @@ mod tests {
         /// Lay out the CURRENT session state directly, BYPASSING the view's frame
         /// memo — the ground truth the memoized frame must always equal.
         fn fresh_frame(m: &super::TerminalModel) -> Frame {
-            layout_frame_at(
+            ghost_render::layout_frame_at_px(
                 m.state.screen().vt(),
                 m.view.effective_metrics(),
                 m.view.scroll_offset,
+                m.view.scroll_frac,
             )
         }
 
@@ -6642,6 +6858,9 @@ mod tests {
                         }
                         Op::ScrollDown => {
                             key(&mut m, Key::Named(NamedKey::PageDown), Mods::SHIFT);
+                        }
+                        Op::WheelPx(dpx) => {
+                            m.update(super::wheel_px(f64::from(dpx)));
                         }
                         Op::Resize { w_px, h_px } => {
                             m.update(UiEvent::Resize { w_px, h_px, scale: 1.0 });

@@ -2178,6 +2178,13 @@ impl Renderer {
         out: &mut Vec<ImageDraw>,
     ) {
         let m = frame.metrics;
+        // Mid-scroll frames shift their images with the rows (same snap as
+        // `build_instances`' dy) so pictures stay glued to their text.
+        let dy = if frame.scroll_frac_px > 0.0 {
+            (frame.scroll_frac_px - m.line_height).round()
+        } else {
+            0.0
+        };
         for img in &frame.images {
             let key = (session, img.image_id);
             if !self.image_bind_groups.contains_key(&key) {
@@ -2187,7 +2194,7 @@ impl Renderer {
                 image: key,
                 rect: [
                     ox + img.col as f32 * m.advance * scale,
-                    oy + img.row as f32 * m.line_height * scale,
+                    oy + (img.row as f32 * m.line_height + dy) * scale,
                     img.cols as f32 * m.advance * scale,
                     img.rows as f32 * m.line_height * scale,
                 ],
@@ -3233,6 +3240,15 @@ impl Renderer {
         let cursor = frame.cursor;
         let n = frame.rows_layout.len();
         let rows = rows.start.min(n)..rows.end.min(n);
+        // A mid-scroll frame (see [`Frame::scroll_frac_px`]) draws its slid
+        // rows-plus-one window shifted so a partial line peeks in at the top
+        // and the bottom line runs off the texture edge. Snapped to a whole
+        // pixel so glyphs stay on the device grid (the atlas samples Nearest).
+        let dy = if frame.scroll_frac_px > 0.0 {
+            (frame.scroll_frac_px - metrics.line_height).round()
+        } else {
+            0.0
+        };
 
         // Shape this build's not-yet-cached distinct runs up front, in parallel, so the
         // per-run loop below hits the cache single-threaded. This only bites on a cold
@@ -3260,7 +3276,7 @@ impl Renderer {
                     selection_rects.push(Instance {
                         rect: [
                             c0 as f32 * metrics.advance,
-                            row as f32 * metrics.line_height,
+                            row as f32 * metrics.line_height + dy,
                             (c1 - c0) as f32 * metrics.advance,
                             metrics.line_height,
                         ],
@@ -3275,7 +3291,7 @@ impl Renderer {
         let mut col_of_byte: Vec<u16> = Vec::new();
         for row in rows.clone() {
             let layout = &frame.rows_layout[row];
-            let row_y = row as f32 * metrics.line_height;
+            let row_y = row as f32 * metrics.line_height + dy;
             let baseline_y = row_y + baseline;
             for run in &layout.runs {
                 let cursor_here = cursor.filter(|c| c.row == row && c.col == run.start_col);
@@ -4629,6 +4645,30 @@ mod tests {
 
     fn is_blue(p: [u8; 4]) -> bool {
         p[0] < 0x20 && p[1] < 0x20 && p[2] > 0x60
+    }
+
+    /// A mid-scroll frame ([`Frame::scroll_frac_px`]) draws its slid window
+    /// shifted by `frac - line_height`: the slid-in history line's tail fills
+    /// the top fraction, and the rest follows a fraction lower — the renderer
+    /// half of pixel-smooth trackpad scrolling.
+    #[test]
+    fn a_mid_scroll_frame_draws_rows_shifted_by_the_fraction() {
+        // A 2-row terminal fed three lines of bg-colored spaces (no glyph
+        // strokes to dodge when sampling, truecolor so no theme dependence):
+        // red is in scrollback, green/blue live.
+        let mut v = Vt::new(4, 2);
+        v.feed_str("\x1b[48;2;255;0;0m    \r\n\x1b[48;2;0;255;0m    \r\n\x1b[48;2;0;0;255m    ");
+        let f = ghost_render::layout_frame_at_px(&v, TM, 0, 9.0);
+        assert_eq!(f.scroll_frac_px, 9.0);
+        assert_eq!(f.rows_layout.len(), 3, "the slid window is rows + 1");
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let img = Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX);
+        // Window [red|green|blue] at dy = 9 - 18 = -9: the top 9px show the
+        // red history row's tail, green sits a fraction down, blue's head
+        // still shows at the bottom.
+        assert!(is_red(px(&img, 2, 4)), "history tail on top");
+        assert!(is_green(px(&img, 2, 18)), "top live row a fraction down");
+        assert!(is_blue(px(&img, 2, 31)), "bottom row's head still visible");
     }
 
     /// Kitty image ids are the *program's* to choose (`i=`), and every session hands

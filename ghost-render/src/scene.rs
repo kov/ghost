@@ -403,6 +403,7 @@ mod tests {
                     advance: 1.0,
                     line_height: 1.0,
                 },
+                scroll_frac_px: 0.0,
                 rows_layout: vec![],
                 cursor: None,
                 images: vec![],

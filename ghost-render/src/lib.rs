@@ -186,6 +186,14 @@ pub struct Frame {
     pub cols: usize,
     pub rows: usize,
     pub metrics: CellMetrics,
+    /// Sub-line scroll position, in pixels (`0.0` = row-aligned, the normal
+    /// case). When positive (always `< line_height`), the frame is a smooth
+    /// mid-scroll snapshot: [`rows_layout`](Self::rows_layout) holds `rows + 1`
+    /// lines — the window one line further into history plus the line below —
+    /// and the renderer draws every element shifted down by
+    /// `scroll_frac_px - line_height`, so a partial line peeks in at the top
+    /// and the bottom line slides off, clipped by the viewport bounds.
+    pub scroll_frac_px: f32,
     pub rows_layout: Vec<RowLayout>,
     /// `None` when the cursor is hidden (DECTCEM `?25l`).
     pub cursor: Option<CursorLayout>,
@@ -297,17 +305,55 @@ pub fn layout_frame(vt: &Vt, metrics: CellMetrics) -> Frame {
 /// the view shows past output, not the edit point, so a cursor block there would
 /// be misleading (and the historical row keeps its full run grouping).
 pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> Frame {
+    layout_frame_at_px(vt, metrics, scroll_offset, 0.0)
+}
+
+/// [`layout_frame_at`] at a pixel-precise scroll position: `scroll_offset`
+/// whole lines plus `frac_px` sub-line pixels further into history (a smooth
+/// trackpad scroll rests between rows). With `frac_px > 0` the laid-out window
+/// slides one line up (`view_at(offset + 1)`, `rows + 1` lines) and the frame
+/// records [`scroll_frac_px`](Frame::scroll_frac_px) for the renderer to shift
+/// by; the cursor is hidden as at any scrolled-back position. `frac_px` is
+/// clamped off when there is no further history to slide into.
+pub fn layout_frame_at_px(
+    vt: &Vt,
+    metrics: CellMetrics,
+    scroll_offset: usize,
+    frac_px: f32,
+) -> Frame {
     let (cols, rows) = vt.size();
     let offset = scroll_offset.min(vt.scrollback_len());
+    // The slid window needs one more history line above; without it, stay aligned.
+    let frac = if frac_px > 0.0 && offset < vt.scrollback_len() {
+        frac_px
+    } else {
+        0.0
+    };
+    let (win_offset, win_rows) = if frac > 0.0 {
+        (offset + 1, rows + 1)
+    } else {
+        (offset, rows)
+    };
     let cursor = vt.cursor();
-    let cursor_layout = (offset == 0 && cursor.visible).then_some(CursorLayout {
+    let cursor_layout = (offset == 0 && frac == 0.0 && cursor.visible).then_some(CursorLayout {
         col: cursor.col,
         row: cursor.row,
         shape: cursor.shape,
     });
 
-    let rows_layout = vt
-        .view_at(offset)
+    // The window's lines: `view_at` yields exactly `rows`, so the slid window
+    // (one line further up) chains the unslid view's bottom line back on to
+    // reach its `rows + 1`.
+    let win_lines: Vec<&Line> = if frac > 0.0 {
+        vt.view_at(win_offset)
+            .chain(vt.view_at(offset).skip(rows.saturating_sub(1)))
+            .collect()
+    } else {
+        vt.view_at(offset).collect()
+    };
+    let rows_layout = win_lines
+        .into_iter()
+        .take(win_rows)
         .enumerate()
         .map(|(row, line)| {
             let cursor_col = match cursor_layout {
@@ -320,14 +366,15 @@ pub fn layout_frame_at(vt: &Vt, metrics: CellMetrics, scroll_offset: usize) -> F
 
     // Both directly-placed images and Unicode-placeholder blocks draw through the
     // same image layer; concatenate, keeping ascending z (placeholders are z 0).
-    let mut images = layout_image_placements(vt, metrics, offset, rows);
-    images.extend(layout_placeholder_placements(vt, offset, rows));
+    let mut images = layout_image_placements(vt, metrics, win_offset, win_rows);
+    images.extend(layout_placeholder_placements(vt, win_offset, win_rows));
     images.sort_by_key(|i| i.z);
 
     Frame {
         cols,
         rows,
         metrics,
+        scroll_frac_px: frac,
         rows_layout,
         cursor: cursor_layout,
         images,
@@ -773,6 +820,32 @@ mod tests {
         assert_eq!(up.cursor, None, "no live cursor while viewing history");
         // Offsets past the history clamp.
         assert_eq!(layout_frame_at(&v, M, 99), up);
+    }
+
+    #[test]
+    fn layout_frame_at_px_slides_the_window_one_line_up() {
+        // 2x2 terminal fed 4 lines: scrollback holds "aa", "bb"; live = cc/dd.
+        let v = feed(2, 2, "aa\r\nbb\r\ncc\r\ndd");
+        // Parked 3px between rows at offset 0: the window slides one line up
+        // (rows + 1 lines, "bb" peeking in on top), records the fraction, and
+        // hides the cursor like any scrolled-back view.
+        let f = layout_frame_at_px(&v, M, 0, 3.0);
+        assert_eq!(f.scroll_frac_px, 3.0);
+        assert_eq!(f.rows, 2, "the grid stays the viewport size");
+        let texts: Vec<&str> = f
+            .rows_layout
+            .iter()
+            .map(|r| r.runs.first().map_or("", |run| run.text.as_str()))
+            .collect();
+        assert_eq!(texts, ["bb", "cc", "dd"]);
+        assert_eq!(f.cursor, None, "no live cursor while parked mid-scroll");
+        // A zero fraction is exactly the aligned frame.
+        assert_eq!(layout_frame_at_px(&v, M, 1, 0.0), layout_frame_at(&v, M, 1));
+        // At the top of history there is no further line to slide in: the
+        // fraction clamps off rather than referencing a line that isn't there.
+        let top = layout_frame_at_px(&v, M, 2, 5.0);
+        assert_eq!(top.scroll_frac_px, 0.0);
+        assert_eq!(top, layout_frame_at(&v, M, 2));
     }
 
     #[test]
