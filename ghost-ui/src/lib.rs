@@ -715,6 +715,102 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// master, so a false suspicion is cheap.
 const SUSPEND_PROBE_GAP: Duration = Duration::from_secs(10);
 
+/// How long input may sit in a session's queue before it counts as a real stall
+/// rather than a frame of backpressure. A paste larger than the socket buffer
+/// queues briefly and drains; below this, say nothing.
+const INPUT_STALL_GRACE: Duration = Duration::from_millis(250);
+
+/// How long a session's input queue may make NO progress at all before we stop
+/// believing its write path. Keystrokes are a handful of bytes: a transport that
+/// cannot take them in this long is not slow, it is wedged — and the user is
+/// typing into a void with nothing on screen to say so.
+const INPUT_STALL_PROBE: Duration = Duration::from_secs(3);
+
+/// What [`InputStall::observe`] concluded about a session's input queue.
+#[derive(Debug, PartialEq, Eq)]
+enum StallEvent {
+    /// The queue has not moved for [`INPUT_STALL_PROBE`]: the write path has
+    /// stopped taking bytes. `bytes` is the backlog, `waited` how long it has sat.
+    Wedged { bytes: usize, waited: Duration },
+    /// The queue emptied after a wait worth reporting. `bytes` is the deepest the
+    /// backlog got, `waited` the whole episode.
+    Drained { bytes: usize, waited: Duration },
+}
+
+/// One session's view of input that [`Session::send_input`] accepted but the
+/// transport has not written yet.
+///
+/// `Conn::send` queues whatever a non-blocking write refuses and reports success,
+/// so from above a wedged write path is indistinguishable from a healthy one: the
+/// tile renders, the keys vanish, and nothing says so. This watches the queue for
+/// *progress* — a slow link keeps draining and is left alone; one that has stopped
+/// entirely is named, and its transport probed (see [`App::note_input_queue`]).
+#[derive(Debug, Default)]
+struct InputStall {
+    episode: Option<Episode>,
+}
+
+/// A single run of non-empty queue, from the first byte left unwritten to the
+/// moment the backlog clears.
+#[derive(Debug)]
+struct Episode {
+    /// When the queue first went non-empty — what the drain report accounts for.
+    opened_at: Instant,
+    /// When the backlog last got *smaller*. Progress restarts the wedged clock,
+    /// so a slow transport is never mistaken for a stopped one.
+    progress_at: Instant,
+    /// The smallest backlog seen since `progress_at`: the yardstick for progress.
+    low_water: usize,
+    /// The deepest the backlog got, for the drain report.
+    peak: usize,
+    /// Whether this episode was already reported wedged — the pump observes every
+    /// 8ms, and one stall is one line, not hundreds.
+    named: bool,
+}
+
+impl InputStall {
+    /// Fold this pump's queue depth in, and say whether it changed the verdict.
+    fn observe(&mut self, pending: usize, now: Instant) -> Option<StallEvent> {
+        let Some(ep) = &mut self.episode else {
+            if pending > 0 {
+                self.episode = Some(Episode {
+                    opened_at: now,
+                    progress_at: now,
+                    low_water: pending,
+                    peak: pending,
+                    named: false,
+                });
+            }
+            return None;
+        };
+        if pending == 0 {
+            let ep = self.episode.take()?;
+            let waited = now.saturating_duration_since(ep.opened_at);
+            // A queue that cleared inside the grace was backpressure, not a stall;
+            // one we called wedged is always accounted for, however it ended.
+            return (ep.named || waited >= INPUT_STALL_GRACE).then_some(StallEvent::Drained {
+                bytes: ep.peak,
+                waited,
+            });
+        }
+        ep.peak = ep.peak.max(pending);
+        if pending < ep.low_water {
+            ep.progress_at = now;
+            ep.low_water = pending;
+            return None;
+        }
+        let waited = now.saturating_duration_since(ep.progress_at);
+        if ep.named || waited < INPUT_STALL_PROBE {
+            return None;
+        }
+        ep.named = true;
+        Some(StallEvent::Wedged {
+            bytes: pending,
+            waited,
+        })
+    }
+}
+
 /// Probe a dropped remote session's host in the background until it is reachable
 /// again and the session `real` still exists, then post
 /// [`UserEvent::RemoteReattachReady`] so the main loop re-attaches at the current
@@ -1570,6 +1666,7 @@ fn interactive(fresh: bool) {
         remote_watchers: HashMap::new(),
         pending_remote_restores: HashMap::new(),
         reconnecting: HashMap::new(),
+        input_stalls: HashMap::new(),
         remote_retries: HashMap::new(),
         probing_remotes: Arc::default(),
         last_wake_at: Instant::now(),
@@ -2071,6 +2168,7 @@ impl App {
             remote_watchers: HashMap::new(),
             pending_remote_restores: HashMap::new(),
             reconnecting: HashMap::new(),
+            input_stalls: HashMap::new(),
             remote_retries: HashMap::new(),
             probing_remotes: Arc::default(),
             last_wake_at: Instant::now(),
@@ -2415,6 +2513,11 @@ pub struct App {
     /// dedupes — a repeated drop won't start a second probe. See
     /// [`begin_reconnect`](App::begin_reconnect) / [`finish_reattach`](App::finish_reattach).
     reconnecting: HashMap<(WindowId, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-session watch on input that was accepted but not yet written (see
+    /// [`InputStall`]). Kept here rather than on the `Session` so the verdict is
+    /// the shell's — it is the shell that can name it and probe the transport.
+    /// Pruned with the sessions themselves each wake.
+    input_stalls: HashMap<String, InputStall>,
     /// Remote **hosts** a group still remembers a session on but which we are not
     /// connected to, each with the stop flag of the background worker retrying it
     /// forever (see [`App::retry_remembered_hosts`]). Presence dedupes, so one
@@ -3608,6 +3711,52 @@ impl App {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Fold one session's queued-input depth into its [`InputStall`], and act on
+    /// the verdict: name a wedged write path in the focus trace, and — for a
+    /// remote — probe its transport, which reaps a wedged master and hands the
+    /// session to the ordinary drop→hold→reconnect path.
+    ///
+    /// This is the difference between a stall of seconds and a stall of minutes.
+    /// `send_input` reports success for bytes it only queued, so before this
+    /// nothing at any layer noticed that a session had stopped accepting input:
+    /// the tile kept rendering, the keystrokes kept "succeeding", and recovery
+    /// waited on whatever happened to clear the path (ssh's own keepalive, the
+    /// user quitting). A probe here is cheap, deduped, and off-loop, and its worst
+    /// case is a reconnect that resyncs the same screen.
+    fn note_input_queue(&mut self, name: &str, pending: usize, now: Instant) {
+        let Some(event) = self
+            .input_stalls
+            .entry(name.to_string())
+            .or_default()
+            .observe(pending, now)
+        else {
+            return;
+        };
+        match event {
+            StallEvent::Wedged { bytes, waited } => {
+                ghost_ui_core::focus_trace::log(
+                    name,
+                    format_args!(
+                        "input STALLED {bytes} bytes unwritten for {:.1}s -> probing transport",
+                        waited.as_secs_f32()
+                    ),
+                );
+                if is_remote_id(name) {
+                    self.probe_remote_transports();
+                }
+            }
+            StallEvent::Drained { bytes, waited } => {
+                ghost_ui_core::focus_trace::log(
+                    name,
+                    format_args!(
+                        "input DRAINED {bytes} bytes after {:.1}s",
+                        waited.as_secs_f32()
+                    ),
+                );
+            }
         }
     }
 
@@ -5988,10 +6137,17 @@ impl App {
         let mut dropped: Vec<(String, Vec<u8>)> = Vec::new();
         let mut ended_driven: Vec<String> = Vec::new();
         for name in driven {
-            let (bytes, end) = match self.sessions.get_mut(&name) {
-                Some(s) => pump(s, 32),
+            // The pump is also where a `flush_pending` retries input the transport
+            // refused, so the depth AFTER it is what is really stuck (see
+            // `note_input_queue`).
+            let (bytes, end, queued) = match self.sessions.get_mut(&name) {
+                Some(s) => {
+                    let (bytes, end) = pump(s, 32);
+                    (bytes, end, s.pending_input())
+                }
                 None => continue,
             };
+            self.note_input_queue(&name, queued, now);
             // A REMOTE session whose transport dropped is held and reconnected, not
             // torn down — its session may still be alive on the far side. A local EOF
             // (the host process is gone) is a genuine end, as before.
@@ -6016,6 +6172,12 @@ impl App {
             if ended {
                 ended_driven.push(name);
             }
+        }
+        // A session that ended or dropped takes its input watch with it: the next
+        // client for that id starts from an empty queue, not a stale episode.
+        if !self.input_stalls.is_empty() {
+            let live = &self.sessions;
+            self.input_stalls.retain(|name, _| live.contains_key(name));
         }
         // Fan the ended lifecycle: the final frame already rendered in every view via
         // the feed above; now switch each foreground away / drop each warm mirror, and
@@ -6232,17 +6394,18 @@ impl App {
 mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
-        App, Glass, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice,
-        auth_error_message, choose_alpha_mode, choose_surface_format, config,
-        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
-        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, should_restore, startup_choice, theme_colors,
+        App, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
+        PendingRemote, REMOTE_ID_SEP, StallEvent, StartupChoice, auth_error_message,
+        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, glass,
+        home_launch_dir, inherited_connection, namespace_remote_infos, new_window_choice,
+        password_prompt, remote_spawn_target, respawn_opts, restore_plan, should_restore,
+        startup_choice, theme_colors,
     };
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
     use std::collections::HashSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
@@ -6277,6 +6440,108 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_briefly_queued_write_is_ordinary_backpressure() {
+        // A paste bigger than the socket buffer queues for a frame or two and
+        // drains. That is the transport working, not failing — it must not cost a
+        // line in the trace, or the real thing drowns in noise.
+        let t0 = Instant::now();
+        let mut s = InputStall::default();
+        assert!(s.observe(64 * 1024, t0).is_none());
+        assert!(
+            s.observe(8 * 1024, t0 + Duration::from_millis(20))
+                .is_none()
+        );
+        assert!(
+            s.observe(0, t0 + INPUT_STALL_GRACE - Duration::from_millis(1))
+                .is_none(),
+            "a queue that clears within the grace is never reported"
+        );
+    }
+
+    #[test]
+    fn an_input_queue_that_never_moves_is_called_wedged_once_and_reports_its_drain() {
+        // The incident: 34 bytes of typing accepted, none written, for 24s. The
+        // depth never falls, so there is no progress to wait for — say so at the
+        // threshold, say it ONCE (the pump observes every 8ms), and account for
+        // the whole wait when it finally clears.
+        let t0 = Instant::now();
+        let mut s = InputStall::default();
+        assert!(s.observe(34, t0).is_none());
+        assert!(s.observe(34, t0 + Duration::from_secs(1)).is_none());
+        let ev = s.observe(34, t0 + INPUT_STALL_PROBE);
+        assert!(
+            matches!(ev, Some(StallEvent::Wedged { bytes: 34, waited }) if waited >= INPUT_STALL_PROBE),
+            "no progress for the threshold is a wedged write path, got {ev:?}"
+        );
+        assert!(
+            s.observe(34, t0 + Duration::from_secs(6)).is_none(),
+            "a wedged queue is named once per episode, not once per pump"
+        );
+        let ev = s.observe(0, t0 + Duration::from_secs(24));
+        assert!(
+            matches!(ev, Some(StallEvent::Drained { bytes: 34, waited }) if waited >= Duration::from_secs(24)),
+            "the drain reports the whole episode, got {ev:?}"
+        );
+        assert!(
+            s.observe(0, t0 + Duration::from_secs(25)).is_none(),
+            "the episode is over"
+        );
+    }
+
+    #[test]
+    fn an_input_queue_that_keeps_draining_is_never_called_wedged() {
+        // A slow link (a big paste over a thin ssh hop) keeps making progress.
+        // Progress restarts the clock, so a transport that is merely slow is
+        // never mistaken for one that has stopped.
+        let t0 = Instant::now();
+        let mut s = InputStall::default();
+        assert!(s.observe(90_000, t0).is_none());
+        for (i, left) in [60_000usize, 30_000, 10_000].into_iter().enumerate() {
+            let at = t0 + INPUT_STALL_PROBE * (i as u32 + 1) - Duration::from_millis(1);
+            assert!(
+                s.observe(left, at).is_none(),
+                "still draining at {left} bytes is not wedged"
+            );
+        }
+        assert!(matches!(
+            s.observe(0, t0 + INPUT_STALL_PROBE * 4),
+            Some(StallEvent::Drained { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wedged_input_queue_names_itself_in_the_focus_trace() {
+        // What the next incident should read like without any reconstruction:
+        // one line when the write path stops taking bytes, one when it resumes.
+        let log = with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("focus-trace.log");
+            // SAFETY: the suite serializes every env-touching App test on the
+            // lock `with_isolated_xdg` holds; the trace re-reads the var per event.
+            unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
+            let mut app = App::headless();
+            let t0 = Instant::now();
+            app.note_input_queue("s1", 34, t0);
+            app.note_input_queue("s1", 34, t0 + INPUT_STALL_PROBE);
+            app.note_input_queue("s1", 0, t0 + Duration::from_secs(24));
+            unsafe { std::env::remove_var("GHOST_FOCUS_TRACE") };
+            std::fs::read_to_string(&path).unwrap_or_default()
+        });
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "one line each way, got: {log}");
+        assert!(
+            lines[0].contains("s1 input STALLED 34 bytes unwritten"),
+            "the stall names the session and the backlog: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("s1 input DRAINED 34 bytes after 24"),
+            "the drain accounts for the whole wait: {}",
+            lines[1]
+        );
     }
 
     #[test]

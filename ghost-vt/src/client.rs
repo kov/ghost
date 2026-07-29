@@ -137,6 +137,12 @@ impl Client {
         self.conn.send(msg)
     }
 
+    /// Bytes queued by an earlier [`send`](Client::send) that the transport has
+    /// not accepted yet (see [`flush_pending`](Client::flush_pending)).
+    pub fn pending(&self) -> usize {
+        self.conn.pending()
+    }
+
     /// Flush any output an earlier [`send`](Client::send) left buffered when the
     /// transport was not writable — [`Conn::flush`] stops on `WouldBlock` and
     /// [`Conn::send`] swallows it, so bytes can linger in the outbuf. A caller that
@@ -423,8 +429,24 @@ impl Session {
 
     /// Send user input (keystrokes, mouse reports, paste, query replies) to the
     /// session's child.
+    ///
+    /// Reports success for input a non-blocking write only *queued* — see
+    /// [`pending_input`](Session::pending_input), which is how a caller tells
+    /// "delivered" from "accepted".
     pub fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.client.send(&ClientMsg::Input(bytes.to_vec()))
+    }
+
+    /// Bytes an earlier [`send_input`](Session::send_input) accepted but the
+    /// transport has not taken yet. Non-zero means keystrokes are sitting in this
+    /// process, not on their way to the child: `send` reports success for whatever
+    /// a non-blocking write refuses (it queues the rest for the next
+    /// [`flush_pending`](Client::flush_pending), which [`pump`](Session::pump)
+    /// calls), so from above a wedged write path looks exactly like a healthy one.
+    /// A caller that watches this can tell the user their typing is not landing
+    /// instead of leaving them to guess.
+    pub fn pending_input(&self) -> usize {
+        self.client.pending()
     }
 
     /// Tell the session the display was resized.

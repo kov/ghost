@@ -312,6 +312,48 @@ mod tests {
     use crate::protocol::{ClientMsg, ServerMsg};
 
     #[test]
+    fn an_unwritable_transport_queues_input_and_still_reports_success() {
+        // The shape of a real incident: a session's write path stopped taking
+        // bytes, `send_input` returned Ok for every keystroke anyway, and the
+        // whole minute of typing arrived at the child at once when the path
+        // cleared. Nothing is lost here — but nothing is delivered either, and
+        // the only thing that says so is `pending`, which is why the shell
+        // watches it (see `InputStall` in ghost-ui).
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut ca = Conn::new(a);
+
+        // Fill the peer's receive buffer. Every send reports success; the bytes
+        // the write refused are queued, invisible to the caller.
+        let mut sends = 0;
+        while ca.pending() == 0 {
+            ca.send(&ClientMsg::Input(vec![b'x'; 4096])).unwrap();
+            sends += 1;
+            assert!(sends < 4096, "the socket buffer never filled");
+        }
+        assert!(ca.wants_write(), "the refused bytes are queued, not lost");
+
+        // The path clears: the whole backlog arrives at once, in order, intact.
+        let mut cb = Conn::new(b);
+        let mut got: Vec<ClientMsg> = Vec::new();
+        loop {
+            got.extend(cb.recv::<ClientMsg>().unwrap().unwrap_or_default());
+            if ca.pending() == 0 && got.len() == sends {
+                break;
+            }
+            ca.flush().unwrap();
+            assert!(got.len() <= sends, "no message arrived twice");
+        }
+        assert_eq!(ca.pending(), 0, "the queue emptied once writes were taken");
+        assert!(
+            got.iter()
+                .all(|m| matches!(m, ClientMsg::Input(b) if b.len() == 4096 && b.iter().all(|&c| c == b'x'))),
+            "every queued keystroke arrived, whole and in order"
+        );
+    }
+
+    #[test]
     fn conn_round_trips_framed_messages_and_signals_eof() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut ca = Conn::new(a);
