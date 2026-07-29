@@ -169,12 +169,15 @@ const CLOSED_GROUP_ALPHA: f32 = 0.55;
 /// keyed from this base up.
 const GROUP_SECTION_RANK_BASE: u8 = 3;
 
-/// A per-card action button.
+/// A per-card action button. The first three belong to live cards; `Discard`
+/// is the dead card's second chip (beside its relaunch) — the explicit "don't
+/// want it back", which throws the remembered corpse away like a kill does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Button {
     Kill,
     Detach,
     Rename,
+    Discard,
 }
 
 impl Button {
@@ -183,6 +186,7 @@ impl Button {
             Button::Kill => "kill",
             Button::Detach => "detach",
             Button::Rename => "rename",
+            Button::Discard => "discard",
         }
     }
 }
@@ -618,6 +622,23 @@ fn card_layout(rect: RectPx, band: f32) -> (RectPx, RectPx, [(Button, RectPx); 3
         button(2.0, Button::Rename),
     ];
     (header, preview, buttons)
+}
+
+/// A dead (relaunchable) card's footer, split into its two half-width chips:
+/// relaunch on the left, discard on the right — shared by `view` and pointer
+/// hit-testing so the chips land exactly where they are drawn. (A live card's
+/// footer is `card_layout`'s three buttons instead; a waiting card has none.)
+fn dead_footer(rect: RectPx, band: f32) -> [RectPx; 2] {
+    let footer_h = band.min((rect.h - band.min(rect.h)).max(0.0));
+    let footer_y = rect.y + rect.h - footer_h;
+    let half = rect.w / 2.0;
+    let chip = |i: f32| RectPx {
+        x: rect.x + i * half,
+        y: footer_y,
+        w: half,
+        h: footer_h,
+    };
+    [chip(0.0), chip(1.0)]
 }
 
 /// A navigation action: a 2-D arrow direction over the grid, or a linear Tab
@@ -2972,6 +2993,21 @@ impl FleetModel {
                 });
                 vec![Cmd::Redraw]
             }
+            Button::Discard => {
+                // The dead card's second chip. Discarding IS a kill of a corpse
+                // (the shell's kill of an already-dead session prunes its
+                // durable traces), so it arms the same confirmed flow — the
+                // confirm reads "Discard" when its targets are all corpses.
+                if !self.tiles.iter().any(|t| t.id == id && t.dead) {
+                    return Vec::new();
+                }
+                self.pending = Some(Pending {
+                    target: PendingTarget::Session(id),
+                    action: PendingAction::Kill,
+                    selected: Choice::Cancel,
+                });
+                vec![Cmd::Redraw]
+            }
             Button::Rename => {
                 // Edit the human-facing display name, starting from what the card
                 // shows; the id stays the immutable routing key.
@@ -3136,6 +3172,13 @@ impl FleetModel {
 
     /// The confirm modal's message and confirm-button label, naming the
     /// session as the user knows it (its display name) — or the group.
+    /// Whether `id`'s tile is a remembered corpse — dead, nothing running. A
+    /// kill of one is a *discard* (throwing away the saved screen), and the
+    /// confirm should say so instead of claiming something will be killed.
+    fn is_corpse(&self, id: &str) -> bool {
+        self.tiles.iter().any(|t| t.id == id && t.dead)
+    }
+
     fn confirm_texts(&self, p: &Pending) -> (String, &'static str) {
         let id = match &p.target {
             PendingTarget::Session(id) => id,
@@ -3143,7 +3186,23 @@ impl FleetModel {
                 return match p.action {
                     PendingAction::Kill => {
                         let n = ids.len();
-                        if n == 1 {
+                        if ids.iter().all(|id| self.is_corpse(id)) {
+                            if n == 1 {
+                                (
+                                    "Discard 1 exited session? (its saved screen is lost)"
+                                        .to_string(),
+                                    "Discard",
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "Discard {n} exited sessions? (their saved screens \
+                                         are lost)"
+                                    ),
+                                    "Discard",
+                                )
+                            }
+                        } else if n == 1 {
                             ("Kill 1 session?".to_string(), "Kill")
                         } else {
                             (format!("Kill {n} sessions?"), "Kill")
@@ -3216,6 +3275,10 @@ impl FleetModel {
             .map(|t| t.display().to_string())
             .unwrap_or_else(|| id.clone());
         match p.action {
+            PendingAction::Kill if self.is_corpse(id) => (
+                format!("Discard {shown}? (its saved screen is lost)"),
+                "Discard",
+            ),
             PendingAction::Kill => (format!("Kill {shown}?"), "Kill"),
             PendingAction::TakeOver => (
                 format!("{shown} is open in another window \u{2014} take it over?"),
@@ -3556,11 +3619,19 @@ impl FleetModel {
             self.toggle_mark(&id);
             return vec![Cmd::Redraw];
         }
-        // A dead card has no live-session buttons — its whole footer is the
-        // relaunch chip, and activation IS the relaunch.
-        let dead = self.tiles.iter().any(|t| t.id == id && t.dead);
+        // A dead card has no live-session buttons — its footer is the
+        // relaunch | discard pair, and activation (anywhere else on the card,
+        // the relaunch half included) IS the relaunch. A card still waiting for
+        // its host offers neither. See [`dead_footer`].
+        let (dead, waiting) = self
+            .tiles
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| (t.dead, t.awaiting_host.is_some()))
+            .unwrap_or((false, false));
         let button = if dead {
-            None
+            let [_, discard] = dead_footer(rect, band);
+            (!waiting && discard.contains(px, py)).then_some(Button::Discard)
         } else {
             let (_, _, buttons) = card_layout(rect, band);
             buttons
@@ -3976,35 +4047,36 @@ impl FleetModel {
             }
 
             // Action buttons — a centred label on its own inset chip. A dead
-            // card replaces them with one full-width relaunch chip (kill/
-            // detach/rename have no live session to act on). A card waiting for
+            // card replaces them with a relaunch | discard pair (kill/
+            // detach/rename have no live session to act on; discard is the
+            // explicit "don't want it back"). A card waiting for
             // its host shows no chip: relaunching would abandon a session that is
-            // probably still running there, and the reconnect needs no decision
+            // probably still running there, discarding would forget one that may
+            // come back, and the reconnect needs no decision
             // from the user (see [`crate::DeadState::AwaitingHost`]).
             if tile.awaiting_host.is_some() {
                 // Nothing to offer while the host is away.
             } else if tile.dead {
-                let footer = RectPx {
-                    x: buttons[0].1.x,
-                    y: buttons[0].1.y,
-                    w: rect.w,
-                    h: buttons[0].1.h,
-                };
-                let chip = inset(footer, 3.0);
-                out.push(SceneItem::Rect {
-                    id: SceneId::Tile(handle),
-                    rect: chip,
-                    color: BUTTON_BG,
-                    radius: 3.0,
-                });
-                out.push(SceneItem::Text {
-                    id: SceneId::Label(handle),
-                    rect: centered_line(chip, metrics, "relaunch"),
-                    runs: vec![label_run("relaunch")],
-                    metrics,
-                    color: BUTTON_FG,
-                    scale: 1.0,
-                });
+                for (label, half) in ["relaunch", "discard"]
+                    .into_iter()
+                    .zip(dead_footer(rect, band))
+                {
+                    let chip = inset(half, 3.0);
+                    out.push(SceneItem::Rect {
+                        id: SceneId::Tile(handle),
+                        rect: chip,
+                        color: BUTTON_BG,
+                        radius: 3.0,
+                    });
+                    out.push(SceneItem::Text {
+                        id: SceneId::Label(handle),
+                        rect: centered_line(chip, metrics, label),
+                        runs: vec![label_run(label)],
+                        metrics,
+                        color: BUTTON_FG,
+                        scale: 1.0,
+                    });
+                }
             } else {
                 for (button, brect) in buttons {
                     let chip = inset(brect, 3.0);
@@ -5321,6 +5393,10 @@ mod tests {
             "nothing to relaunch while the host is away: {texts:?}"
         );
         assert!(
+            !texts.iter().any(|t| t == "discard"),
+            "and nothing to discard: the session is probably still running there: {texts:?}"
+        );
+        assert!(
             !texts.iter().any(|t| t.contains("exited")),
             "and it must not claim the session exited: {texts:?}"
         );
@@ -5520,6 +5596,104 @@ mod tests {
         assert!(
             labels.contains(&"relaunch"),
             "the dead card offers relaunch"
+        );
+    }
+
+    /// The centre of the drawn chip labelled `label` on the scene — where the
+    /// user would click. Panics if it isn't drawn.
+    fn chip_centre(m: &Fleet, label: &str) -> (f32, f32) {
+        let scene = m.view();
+        let rect = scene.layers[0]
+            .items
+            .iter()
+            .find_map(|it| match it {
+                SceneItem::Text { runs, rect, .. } if runs[0].text == label => Some(*rect),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no `{label}` chip drawn"));
+        (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
+    }
+
+    #[test]
+    fn a_dead_tile_offers_a_discard_chip_beside_relaunch() {
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        list(&mut m, &["a"]); // c dies -> a dead tile in my block
+        let scene = m.view();
+        let labels: Vec<&str> = scene.layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => Some(runs[0].text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"relaunch"), "the corpse offers relaunch");
+        assert!(
+            labels.contains(&"discard"),
+            "and the explicit way to NOT want it back: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_discard_chip_confirms_then_forgets_the_corpse() {
+        let mut m = my_fleet(&["a", "c"]);
+        widen(&mut m);
+        m.update(UiEvent::SessionList(vec![
+            sinfo("a", true),
+            sinfo("c", true),
+        ]));
+        list(&mut m, &["a"]); // c dies
+        let (x, y) = chip_centre(&m, "discard");
+        let cmds = press_at(&mut m, x, y);
+        assert!(
+            m.modal_open(),
+            "throwing away the saved screen is confirmed first: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Recreate(_))),
+            "the discard press must not fall through to the relaunch: {cmds:?}"
+        );
+        // The confirm speaks corpse: there is nothing running left to kill.
+        let scene = m.view();
+        let texts: Vec<&str> = scene.layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, .. } => Some(runs[0].text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("Discard")),
+            "the confirm is worded as a discard, not a kill: {texts:?}"
+        );
+        let cmds = key(&mut m, Key::Named(NamedKey::Space));
+        assert!(
+            cmds.contains(&Cmd::Kill("c".into())),
+            "the shell discards the durable traces (kill of a corpse): {cmds:?}"
+        );
+        assert!(
+            !m.tiles.iter().any(|t| t.id == "c"),
+            "the corpse's tile goes"
+        );
+        assert_eq!(
+            saved_members(&cmds, "w1"),
+            Some(vec!["a".to_string()]),
+            "its membership is persisted away: {cmds:?}"
+        );
+        // The other half of the footer still relaunches.
+        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        list(&mut m, &[]); // a dies too
+        let (x, y) = chip_centre(&m, "relaunch");
+        let cmds = press_at(&mut m, x, y);
+        assert!(
+            cmds.contains(&Cmd::Recreate("a".into())),
+            "the relaunch chip still relaunches: {cmds:?}"
         );
     }
 
