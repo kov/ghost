@@ -303,10 +303,14 @@ pub fn probe_line() -> String {
 /// least our own, so every frame we may send is one the remote can decode.
 ///
 /// A remote *below* our level — or one too old to print `proto=` at all — is
-/// rejected even though it answered, so [`negotiate`](RemoteSsh::negotiate) skips
-/// it and stages a version-matched copy rather than preferring a stale `ghost` on
-/// the remote `PATH` that would mis-decode our newer frames (postcard tags enum
+/// rejected even though it answered, so [`negotiate`](RemoteSsh::negotiate) won't
+/// speak to a `ghost` that would mis-decode our newer frames (postcard tags enum
 /// variants positionally; see [`crate::protocol`]).
+///
+/// This is a *floor*, not a match: everything at or above our level passes, so a
+/// binary far behind ours is indistinguishable here from our own. That is why
+/// [`negotiate_with_progress`](RemoteSsh::negotiate_with_progress) provisions this
+/// build first and only falls back to a binary that merely clears the floor.
 fn probe_reply_speaks_our_protocol(reply: &str) -> bool {
     if !reply.contains(PROBE_MARKER) {
         return false;
@@ -542,12 +546,30 @@ impl RemoteSsh {
     ///
     /// 1. `GHOST_REMOTE_GHOST` — used as-is (no staging), or `None` if it doesn't
     ///    answer.
-    /// 2. `ghost` on the remote `PATH`.
-    /// 3. an already-staged, version-stamped copy in the remote cache.
-    /// 4. staging: copy our own binary over (OS+arch permitting), then re-probe.
+    /// 2. [`provision`](Self::provision): *this* build, on the remote — an
+    ///    already-staged copy of it, else staged now (OS+arch permitting).
+    /// 3. `ghost` on the remote `PATH`, if provisioning couldn't put ours there.
     ///
-    /// `on_progress` is called during staging (step 4) with the running byte count,
-    /// so a GUI can show a copy progress bar; it's a no-op for the other steps.
+    /// **Provisioning outranks the remote's own `ghost`** because the two are not
+    /// equally good. A staged copy is byte-for-byte this build, so every frame and
+    /// feature lines up; the remote's `ghost` is accepted on
+    /// [`proto >= ours`](probe_reply_speaks_our_protocol) alone, and *staleness is
+    /// invisible to that check* — an install months behind us clears the floor and
+    /// would then win every negotiation forever, so connecting to that host could
+    /// never bring it up to date (measured: a remote pinned to a month-old `ghost`
+    /// kept serving from it, bug for bug, across every reconnect). So it is the
+    /// fallback, taken only when we have nothing to send: an unmapped platform, no
+    /// prebuilt for it, or a copy that failed or wouldn't run. Settling is a
+    /// degradation, so the reason we couldn't provision goes to stderr rather than
+    /// being swallowed.
+    ///
+    /// The cost of the inversion is a stage where there used to be none, on a remote
+    /// that already had ghost. That is bounded by the content stamp: the copy is
+    /// reused until this binary's bytes change, so it's one upload per build per
+    /// host, not per connect.
+    ///
+    /// `on_progress` is called during staging with the running byte count, so a GUI
+    /// can show a copy progress bar; it's a no-op for the other steps.
     pub fn negotiate_with_progress(
         &self,
         on_progress: &mut dyn FnMut(StageProgress),
@@ -562,9 +584,30 @@ impl RemoteSsh {
                 .then_some(path)
                 .ok_or(F::EnvOverrideUnusable);
         }
-        if self.probe("ghost") {
-            return Ok("ghost".to_string());
+        match self.provision(on_progress) {
+            Ok(staged) => Ok(staged),
+            Err(why) => {
+                if self.probe("ghost") {
+                    eprintln!(
+                        "ghost: using the remote's own ghost on {} — {why}",
+                        self.spec.target(),
+                    );
+                    return Ok("ghost".to_string());
+                }
+                Err(why)
+            }
         }
+    }
+
+    /// Put *this* build's ghost on the remote and answer with its absolute path:
+    /// the already-staged copy for this exact binary if it still runs there, else a
+    /// fresh copy. The stamped path is what makes the reuse safe — a changed build
+    /// hashes differently, so it never adopts a stale copy (see [`staged_path`]).
+    fn provision(
+        &self,
+        on_progress: &mut dyn FnMut(StageProgress),
+    ) -> Result<String, NegotiateFailure> {
+        use NegotiateFailure as F;
         // Staging needs the remote home (for an absolute path) and its platform
         // (to pick the binary — our own exe for a matching host, else a prebuilt).
         let home = self.remote_home().ok_or(F::RemoteUnready)?;

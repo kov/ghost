@@ -545,6 +545,165 @@ fn staging_prunes_older_cached_binaries_keeping_the_newest_few() {
     );
 }
 
+/// A directory holding a `ghost` for the *remote's* `PATH`: a wrapper that runs
+/// the real binary — so it answers `__probe` at our own protocol level, i.e. it is
+/// "new enough" and negotiation is allowed to accept it — and appends its argv to
+/// `$GHOST_PATH_LOG`, so a test can tell whether negotiation consulted it at all.
+fn ghost_on_remote_path() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let ghost = dir.path().join("ghost");
+    std::fs::write(
+        &ghost,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$GHOST_PATH_LOG\"\n\
+             exec \"{GHOST}\" \"$@\"\n",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ghost, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// The remote's own `ghost` is the *last* resort, not the first: a binary that
+/// merely clears our protocol floor is not the same build we're speaking from, so
+/// negotiation provisions our own — an exact match, feature for feature — and only
+/// settles for the remote's when it cannot upload one.
+///
+/// This is the inversion of the original order (PATH first), which made a
+/// stale-but-compatible `ghost` on the remote win forever: it is accepted on
+/// `proto >= ours` alone, and staleness is invisible to that check, so a remote
+/// pinned to an old install could never be updated by connecting to it.
+#[test]
+fn ghost_ssh_provisions_its_own_build_over_a_good_enough_ghost_on_the_remote_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let shim = shim_ssh();
+    let on_path = ghost_on_remote_path();
+    let log = tmp.path().join("path-ghost.log");
+
+    // A perfectly usable `ghost` sits on the remote's PATH (it IS this binary, so
+    // it answers the probe at our exact protocol level). Nothing is staged yet.
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        shim.path().display(),
+        on_path.path().display()
+    );
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env("GHOST_PATH_LOG", &log)
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+
+    // Our own build was copied over even though the remote had one…
+    let bin_dir = home.path().join(".cache/ghost/bin");
+    assert!(
+        std::fs::read_dir(&bin_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("ghost-")),
+        "nothing was staged: a `ghost` on the remote PATH still wins over provisioning"
+    );
+    // …and the remote's own binary was never even asked, so a connect to a host
+    // with ghost installed costs no extra round trip on the way to staging.
+    let consulted = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        consulted.is_empty(),
+        "the remote's PATH ghost should not be consulted when we can provision our own, but it ran: {consulted}"
+    );
+    // The session is live over the transport (a plain host, no recorded connection).
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("ssh-example")),
+        "the remote host was never created"
+    );
+    assert!(
+        descriptor(xdg, "ssh-example").connection.is_none(),
+        "a transport session is a plain host, not an ssh child"
+    );
+}
+
+/// The other half of the inversion: when we *cannot* provision (here, a foreign
+/// platform with no prebuilt to send), a new-enough `ghost` already on the remote
+/// still beats degrading to a plain ssh child — and the reason we settled for it is
+/// reported rather than swallowed.
+#[test]
+fn ghost_ssh_settles_for_the_remotes_own_ghost_when_nothing_can_be_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let home = tempfile::tempdir().unwrap();
+    let prebuilt = tempfile::tempdir().unwrap(); // empty: nothing to send anywhere
+    let shim = shim_ssh_faking_uname();
+    let on_path = ghost_on_remote_path();
+    let log = tmp.path().join("path-ghost.log");
+
+    let (fake_uname, _) = foreign_platform();
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        shim.path().display(),
+        on_path.path().display()
+    );
+    let out = Command::new(GHOST)
+        .args(["ssh", "dev@example", "-d"])
+        .env("XDG_RUNTIME_DIR", xdg.join("run"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env("GHOST_FAKE_UNAME", &fake_uname)
+        .env("GHOST_PREBUILT_DIR", prebuilt.path())
+        .env("GHOST_PATH_LOG", &log)
+        .env_remove("GHOST_REMOTE_GHOST")
+        .output()
+        .expect("run `ghost ssh`");
+    assert!(
+        out.status.success(),
+        "`ghost ssh` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop {
+        xdg,
+        name: "ssh-example",
+    };
+
+    // The remote's own ghost was used — the transport is up (a plain host, no
+    // recorded connection), rather than the ssh-child fallback.
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains("ssh-example")),
+        "the remote host was never created from the remote's own ghost"
+    );
+    assert!(
+        descriptor(xdg, "ssh-example").connection.is_none(),
+        "a usable remote ghost must beat the ssh child, even unprovisioned"
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("__probe"),
+        "the remote's own ghost was never probed, so it can't be what is serving us"
+    );
+    // Settling is a degradation (that binary is not this build), so say why.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no prebuilt"),
+        "settling for the remote's ghost must surface why we couldn't provision: {stderr}"
+    );
+}
+
 #[test]
 fn ghost_ssh_falls_back_to_the_ssh_child_when_no_transport_is_possible() {
     let tmp = tempfile::tempdir().unwrap();
