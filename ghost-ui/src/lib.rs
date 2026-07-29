@@ -684,6 +684,15 @@ fn spawn_remote_reconnect(
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// A wake-to-wake gap in the event loop long enough to mean the process — or the
+/// whole machine — was parked (a slept laptop, a SIGSTOP). Sleep kills remote TCP
+/// with no FIN/RST reaching the local ssh master, so on such a resume the remote
+/// transports are probed ([`App::probe_remote_transports`]) instead of letting the
+/// user type into a dead pipe until ssh's ~45s keepalive notices. An idle-but-awake
+/// loop can also park this long; the probe is bounded and a no-op on a healthy
+/// master, so a false suspicion is cheap.
+const SUSPEND_PROBE_GAP: Duration = Duration::from_secs(10);
+
 /// Probe a dropped remote session's host in the background until it is reachable
 /// again and the session `real` still exists, then post
 /// [`UserEvent::RemoteReattachReady`] so the main loop re-attaches at the current
@@ -1539,6 +1548,8 @@ fn interactive(fresh: bool) {
         pending_remote_restores: HashMap::new(),
         reconnecting: HashMap::new(),
         remote_retries: HashMap::new(),
+        probing_remotes: Arc::default(),
+        last_wake_at: Instant::now(),
         subs: HashMap::new(),
         groups,
         _watcher: session_set_watcher(sessions_changed.clone()),
@@ -2037,6 +2048,8 @@ impl App {
             pending_remote_restores: HashMap::new(),
             reconnecting: HashMap::new(),
             remote_retries: HashMap::new(),
+            probing_remotes: Arc::default(),
+            last_wake_at: Instant::now(),
             subs: HashMap::new(),
             // From the (test-isolated) data dir, as `interactive` does — a shell test
             // that seeds `groups.toml` gets the registry the real launch would read.
@@ -2381,6 +2394,14 @@ pub struct App {
     /// is quit and relaunched while the host is still down picks the wait back up
     /// instead of forgetting the sessions.
     remote_retries: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Remote targets with a transport health probe in flight
+    /// ([`App::probe_remote_transports`]). Presence dedupes — one prober per host
+    /// no matter how many wake suspicions fire — and the prober thread clears its
+    /// own entry when done.
+    probing_remotes: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// When the event loop last ran, to spot a suspend: a wake-to-wake gap over
+    /// [`SUSPEND_PROBE_GAP`] triggers a probe of the remote transports.
+    last_wake_at: Instant,
     /// App-wide state subscriptions, one per session whose host serves them
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
@@ -3490,6 +3511,39 @@ impl App {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Health-check every remote host's shared connection, off-thread, and reap
+    /// the ones whose peer died *silently* — the laptop slept, the network moved
+    /// underneath us — so the loss is noticed NOW rather than when ssh's ~45s
+    /// keepalive gives up. Reaping a wedged master kills every channel multiplexed
+    /// over it, so each driven session's pipe EOFs within a pump and the ordinary
+    /// drop→hold→reconnect path (and the watcher's own retry) takes over; no
+    /// session state is touched here. A healthy master answers the bounded probe
+    /// in milliseconds, so a false suspicion costs a couple of ssh control
+    /// commands. One prober per host at a time (`probing_remotes` dedupes).
+    pub fn probe_remote_transports(&mut self) {
+        let hosts: Vec<(String, RemoteHost)> = match self.remotes.lock() {
+            Ok(m) => m.iter().map(|(t, h)| (t.clone(), h.clone())).collect(),
+            Err(_) => return,
+        };
+        for (target, host) in hosts {
+            {
+                let Ok(mut probing) = self.probing_remotes.lock() else {
+                    return;
+                };
+                if !probing.insert(target.clone()) {
+                    continue;
+                }
+            }
+            let probing = Arc::clone(&self.probing_remotes);
+            std::thread::spawn(move || {
+                host.remote.reap_wedged_master();
+                if let Ok(mut probing) = probing.lock() {
+                    probing.remove(&target);
+                }
+            });
         }
     }
 
@@ -5781,6 +5835,15 @@ impl App {
     /// read-only observer, fan the output into every viewing window, fan pushed
     /// session state, fire due ticks, and release paced repaints.
     pub fn wake(&mut self, fe: &dyn Frontend) {
+        // A long wake-to-wake gap means we were parked — a slept laptop kills
+        // remote TCP with nothing reaching the local master — so probe the
+        // transports rather than letting keystrokes die in a dead pipe until
+        // ssh's ~45s keepalive notices (see `SUSPEND_PROBE_GAP`).
+        let now = Instant::now();
+        if now.duration_since(self.last_wake_at) >= SUSPEND_PROBE_GAP {
+            self.probe_remote_transports();
+        }
+        self.last_wake_at = now;
         // Flush the workspace snapshot once per wake if a handled event or a
         // window open/close marked it dirty (write-on-change guards the disk).
         if self.workspace_dirty {

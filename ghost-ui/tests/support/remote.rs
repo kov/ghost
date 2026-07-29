@@ -112,6 +112,13 @@ pub struct RealRemote {
 impl RealRemote {
     /// Stand up the fixture, or `None` if no `sshd` is available (skip the test).
     pub fn start() -> Option<RealRemote> {
+        // The reboot/partition levers freeze or kill the per-connection `sshd`
+        // subtree via /proc; without it (macOS) the fixture cannot do the one
+        // thing it exists for, and every test asserting on a freeze that never
+        // happened fails. Skip cleanly instead, like a host with no sshd.
+        if !Path::new("/proc").exists() {
+            return None;
+        }
         let sshd_bin = find_sshd()?;
         let keys = tempfile::tempdir().ok()?;
         let kp = keys.path();
@@ -209,6 +216,33 @@ impl RealRemote {
         }
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
+    }
+
+    /// Sever every live connection by killing the per-connection `sshd` subtree —
+    /// the peer closes, so the local side (master and mux channels alike) notices
+    /// the loss IMMEDIATELY, unlike [`reboot`](Self::reboot)'s silent freeze that
+    /// only ssh's ~45s keepalive catches. The listener keeps accepting and the
+    /// runtime dir is untouched: the remote's session hosts (daemonized, so not in
+    /// this subtree) keep running. A mid-session network drop, not a reboot.
+    pub fn sever_connections(&mut self) {
+        // Deepest first, with a CONT chaser, mirroring `Drop` — so a monitor can't
+        // outlive its worker and anything stopped can actually die.
+        for pid in descendants(self.sshd.id()).into_iter().rev() {
+            signal(pid, "KILL");
+            signal(pid, "CONT");
+        }
+    }
+
+    /// The peer goes silent WITHOUT losing anything: freeze the `sshd` subtree
+    /// exactly as [`reboot`](Self::reboot) does (no FIN/RST — the local master
+    /// wedges, only ssh's keepalive would ever notice) but leave the runtime dir
+    /// alone, so the remote's sessions all survive. A laptop sleep or a network
+    /// partition, not a reboot. The listener keeps accepting, so a *fresh*
+    /// connection works immediately.
+    pub fn silent_partition(&mut self) {
+        for pid in descendants(self.sshd.id()) {
+            signal(pid, "STOP");
+        }
     }
 }
 

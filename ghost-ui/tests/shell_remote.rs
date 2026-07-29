@@ -237,3 +237,217 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         );
     });
 }
+
+/// How many times `needle` is rendered on session `id`'s screen.
+fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
+    app.states()
+        .text_of(id)
+        .map(|lines| lines.join("\n").matches(needle).count())
+        .unwrap_or(0)
+}
+
+/// The shell driving one remote session whose child subscribed to focus
+/// reporting — the stage both focus-recovery tests walk onto.
+struct FocusRig {
+    app: App,
+    fe: HeadlessFrontend,
+    q: Arc<QueuedEvents>,
+    wid: winit::window::WindowId,
+    /// The composite id (`<target>\u{241f}focus`) the window knows the session by.
+    composite: String,
+}
+
+/// Stand up the shell driving remote session "focus", whose child has enabled
+/// focus reporting (DEC ?1004) and echoes every byte it receives visibly
+/// (`cat -v`: ESC renders as `^[`), with the first `^[[I` — the rising-edge
+/// focus report — already on its screen. Every later focus report the child
+/// hears becomes another visible `^[[I`.
+fn rig_focus_child(remote: &RealRemote) -> FocusRig {
+    let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+    let remote_ghost =
+        retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+    r.spawn_host(&remote_ghost, "focus")
+        .expect("spawn remote session");
+    assert!(
+        wait_until(Duration::from_secs(5), || r
+            .list_sessions(&remote_ghost)
+            .map(|s| s.iter().any(|i| i.name == "focus"))
+            .unwrap_or(false)),
+        "the session never came up on the remote"
+    );
+
+    let q: Arc<QueuedEvents> = Arc::default();
+    let sink: Arc<dyn EventSink> = q.clone();
+    let mut app = App::headless_with_sink(sink);
+    let fe = HeadlessFrontend::new();
+    let group = app.mint_group();
+    let wid = app.open_fleet_window(&fe, group, None);
+    app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+
+    let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+        app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+        let root = app.root(wid).expect("window");
+        sees_tile(&root.view(app.states()), "focus")
+    });
+    assert!(
+        discovered,
+        "the remote session never appeared in the fleet: {:?}",
+        visible_text(&app.root(wid).expect("window").view(app.states()))
+    );
+
+    // Drive it, the way the user does: click the card.
+    let scene = app.root(wid).expect("window").view(app.states());
+    let (x, y) = support::tile_center(&scene, "focus")
+        .unwrap_or_else(|| panic!("no card to click: {:?}", visible_text(&scene)));
+    for ev in support::click_events(x, y) {
+        app.dispatch(wid, ev, &fe);
+    }
+    let scene = app.root(wid).expect("window").view(app.states());
+    if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+        for ev in support::click_events(cx, cy) {
+            app.dispatch(wid, ev, &fe);
+        }
+    }
+    let attached = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+        !app.root(wid).expect("window").is_fleet()
+    });
+    assert!(
+        attached,
+        "the window never opened the remote session: {:?}",
+        visible_text(&app.root(wid).expect("window").view(app.states()))
+    );
+
+    let composite = app
+        .groups()
+        .iter()
+        .flat_map(|g| &g.members)
+        .find(|m| m.ends_with("focus"))
+        .expect("the window remembers its remote session")
+        .clone();
+
+    // The child subscribes to focus reporting and then echoes every byte it is
+    // sent, control bytes rendered visibly. Typed once; the pty buffers it even
+    // if the shell is still starting up.
+    app.dispatch(
+        wid,
+        UiEvent::Text("printf '\\033[?1004h'; exec cat -v\r".into()),
+        &fe,
+    );
+
+    // The ?1004 rising edge reports the current focus state to the child —
+    // the already-fixed baseline, proven across the ssh transport.
+    let baseline = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+        rendered_count(app, &composite, "^[[I") >= 1
+    });
+    assert!(
+        baseline,
+        "enabling ?1004 never reported focus to the remote child: {:?}",
+        app.states().text_of(&composite)
+    );
+
+    FocusRig {
+        app,
+        fe,
+        q,
+        wid,
+        composite,
+    }
+}
+
+/// Wait until the child's screen shows `want` focus reports, logging the
+/// reconnect hold's dim transitions for diagnosis. On timeout, types a marker
+/// to distinguish "never reattached" from "reattached but never re-told".
+fn wait_for_focus_reports(rig: &mut FocusRig, want: usize, timeout: Duration) {
+    let FocusRig {
+        app,
+        fe,
+        q,
+        wid,
+        composite,
+    } = rig;
+    let mut last_dim = None;
+    let retold = pump_until(app, fe, q, timeout, |app| {
+        let scene = app.root(*wid).expect("window").view(app.states());
+        let dim = support::session_dimmed(&scene, composite);
+        if dim != last_dim {
+            eprintln!("shell_remote: dim {last_dim:?} -> {dim:?}");
+            last_dim = dim;
+        }
+        rendered_count(app, composite, "^[[I") >= want
+    });
+    if !retold {
+        // A marker renders only if the transport is live again.
+        app.dispatch(*wid, UiEvent::Text("PING\r".into()), fe);
+        let alive = pump_until(app, fe, q, Duration::from_secs(10), |app| {
+            rendered_count(app, composite, "PING") >= 1
+        });
+        panic!(
+            "the child was never (re-)told the focus state (want {want} reports; \
+             transport live again: {alive}): {:?}",
+            app.states().text_of(composite)
+        );
+    }
+}
+
+/// An app that subscribes to focus reporting (DEC ?1004) and then loses its
+/// transport mid-session must be RE-TOLD the terminal's focus state once the
+/// connection is back — Claude Code's question prompt swallows keys while it
+/// believes the terminal is unfocused, and any focus event sent during the
+/// outage died in the dead pipe (`send_input` on a dropped transport is a
+/// silent no-op). The reattach resync replays the host's `?1004h`, so the
+/// local rising edge fires again and delivers the current state to the child:
+/// a second visible `^[[I`.
+#[test]
+fn a_reattached_remote_session_retells_the_child_the_focus_state() {
+    let Some(mut remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        let mut rig = rig_focus_child(&remote);
+
+        // Mid-session, the connection dies FAST (the peer closes — no keepalive
+        // wait). The session keeps running on the remote; ghost notices,
+        // reattaches, and resyncs on its own. The hold can be sub-poll brief,
+        // so the wait is on the outcome, not on observing the dim.
+        remote.sever_connections();
+        wait_for_focus_reports(&mut rig, 2, Duration::from_secs(90));
+    });
+}
+
+/// A transport that dies SILENTLY — no FIN/RST reaches the local master when a
+/// laptop sleeps or the network moves underneath it — leaves every keystroke
+/// dying in the dead pipe until ssh's keepalive gives up (~45s of a Claude
+/// question that "won't accept input"). The shell must not sit out that window
+/// when it has reason to suspect a suspend: probing the remote transports
+/// reaps the wedged master, the mux'd session pipes EOF at once, and the
+/// ordinary drop→hold→reattach→resync path re-tells the child its focus state
+/// within seconds.
+#[test]
+fn a_probed_wedged_transport_reconnects_without_waiting_for_the_keepalive() {
+    let Some(mut remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        let mut rig = rig_focus_child(&remote);
+
+        // The peer goes silent; nothing EOFs, nothing RSTs. Only a probe (or
+        // the ~45s keepalive) can notice.
+        remote.silent_partition();
+
+        // What the suspend hook runs on a wake suspicion. The 25s bound is
+        // generous CI slop but well under the keepalive window — reaching the
+        // second report inside it proves the probe did the detecting.
+        rig.app.probe_remote_transports();
+        wait_for_focus_reports(&mut rig, 2, Duration::from_secs(25));
+    });
+}
