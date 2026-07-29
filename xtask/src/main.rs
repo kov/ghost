@@ -341,12 +341,7 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
         triples.len()
     );
     if !failed.is_empty() {
-        return Err(format!(
-            "could not build {} — for a cross-OS target (e.g. macOS from Linux) set \
-             GHOST_ZIGBUILD=1, or install that target's toolchain",
-            failed.join(", ")
-        )
-        .into());
+        return Err(failure_hint(&failed, std::env::consts::OS).into());
     }
     Ok(())
 }
@@ -395,6 +390,38 @@ fn default_triples_for(host: Option<&str>) -> Vec<String> {
 /// [`default_triples_for`] against this machine's own rustc host triple.
 fn default_triples() -> Vec<String> {
     default_triples_for(host_triple().as_deref())
+}
+
+/// Why `failed` could not be built, and what to do about it.
+///
+/// A macOS target from a non-Mac is the case worth spelling out. `cargo zigbuild`
+/// supplies a linker and libSystem, so `GHOST_ZIGBUILD=1` looks like the answer —
+/// but zig does not carry Apple's *frameworks*, and the link dies on `unable to
+/// find framework 'CoreFoundation'`. That needs a real macOS SDK.
+///
+/// So the hint leads with the cheaper answer: a prebuilt is a plain file with no
+/// install step, so one built where it is native — a Mac, or a CI runner — can be
+/// dropped straight into the prebuilt directory. Cross-building it here is the
+/// fallback, not the expectation.
+fn failure_hint(failed: &[String], host_os: &str) -> String {
+    let wants_apple_sdk = host_os != "macos" && failed.iter().any(|t| t.contains("darwin"));
+    let mut hint = format!("could not build {}", failed.join(", "));
+    if wants_apple_sdk {
+        hint.push_str(
+            " — a macOS target needs Apple's SDK for its frameworks, which zig does not \
+             carry (the link fails on `unable to find framework 'CoreFoundation'`). \
+             Easiest: don't cross-build it. A prebuilt is a plain file, so drop one \
+             built on a Mac — or downloaded from CI — into the prebuilt dir and it is \
+             ready to stage. To build it here anyway, point SDKROOT at a MacOSX.sdk \
+             and set GHOST_ZIGBUILD=1",
+        );
+    } else {
+        hint.push_str(
+            " — install that target's toolchain (`rustup target add <triple>`), or set \
+             GHOST_ZIGBUILD=1 to link it with zig",
+        );
+    }
+    hint
 }
 
 /// Map a Rust target triple to the `ghost-<os>-<arch>` prebuilt filename staging's
@@ -516,6 +543,37 @@ fn copy_dir(src: &Path, dst: &Path) -> R<()> {
 #[cfg(test)]
 mod prebuilt_tests {
     use super::*;
+
+    #[test]
+    fn a_failed_macos_target_names_the_sdk_and_the_way_around_it() {
+        // The old hint said "set GHOST_ZIGBUILD=1", which is what you have already
+        // done by the time you see this — zig supplies libSystem but NOT Apple's
+        // frameworks, so the link dies on `unable to find framework
+        // 'CoreFoundation'`. Name the actual requirement, and the escape hatch:
+        // prebuilts are plain files, so one built on a Mac can simply be copied.
+        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux");
+        assert!(hint.contains("SDK"), "names the real blocker: {hint}");
+        assert!(
+            hint.contains("SDKROOT"),
+            "names the variable that fixes it: {hint}"
+        );
+        assert!(
+            hint.contains("prebuilt"),
+            "offers copying the artifact instead: {hint}"
+        );
+
+        // A Linux target failing is a toolchain problem, not an SDK one — don't
+        // send someone hunting for an Xcode SDK they never needed.
+        let hint = failure_hint(&["x86_64-unknown-linux-musl".to_string()], "macos");
+        assert!(
+            !hint.contains("SDK"),
+            "a musl target needs no Apple SDK: {hint}"
+        );
+        assert!(
+            hint.contains("rustup target add"),
+            "names what to install: {hint}"
+        );
+    }
 
     #[test]
     fn the_defaults_cover_every_platform_except_the_one_we_build_on() {
