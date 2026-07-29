@@ -2423,8 +2423,22 @@ unsafe fn daemonize_and_exec(exe: &CStr, argv: &[*const libc::c_char]) -> io::Re
             0 => {}
             _ => libc::_exit(0),
         }
+        // Don't pin the launching directory: a host outlives the shell that
+        // started it, and holding its cwd would keep a deleted or unmounted
+        // directory alive. Safe to do here and nowhere near the same hazard as
+        // the umask below, because a child's working directory is always passed
+        // explicitly (`spawn_child`'s `launch_dir`), never inherited from us.
         libc::chdir(c"/".as_ptr());
-        libc::umask(0);
+        // NOT `umask(0)`, though the daemon dance calls for it. A session host is
+        // not an ordinary daemon: it spawns the USER'S SHELL, so whatever umask we
+        // exec with is inherited by every process in every session. Clearing it
+        // made everything created from a ghost terminal world-writable — the
+        // user's own builds, and ghost's own recordings and session files — and
+        // defeated the exec-safety guard in `check_upgrade_target`, which refuses
+        // a group/other-writable binary that was world-writable only because
+        // ghost had cleared the umask of the shell that built it. Ghost's own
+        // files that need an exact mode set it explicitly; the umask is the
+        // user's, and it is passed through untouched.
         let nfd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if nfd >= 0 {
             libc::dup2(nfd, 0);

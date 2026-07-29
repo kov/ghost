@@ -331,13 +331,19 @@ fn a_self_upgrade_preserves_terminal_geometry_and_session_identity() {
 }
 
 /// The pre-exec probe must REFUSE a target that can't speak our handoff format
-/// (here `/bin/true`, which has no `__handoff` subcommand) rather than exec into
-/// it — an exec into an incompatible binary would misdecode the handoff and kill
-/// the child. A refusal leaves the running host and its child untouched, and the
-/// host reports why (`/bin/true` answers the probe with no version to parse).
+/// (one with no `__handoff` subcommand) rather than exec into it — an exec into
+/// an incompatible binary would misdecode the handoff and kill the child. A
+/// refusal leaves the running host and its child untouched, and the host reports
+/// why (the target answers the probe with no version to parse).
+///
+/// The stand-in is written here rather than borrowed from the system: `/bin/true`
+/// exists on Linux but not on macOS, where it lives in `/usr/bin`, and a target
+/// that cannot be stat'ed is refused for the wrong reason.
 #[test]
 fn a_self_upgrade_refuses_a_target_that_cannot_speak_the_handoff_format() {
-    assert_target_refused("refuseup", Path::new("/bin/true"), "handoff version");
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_fake_ghost(dir.path(), "#!/bin/sh\nexit 0\n", 0o755);
+    assert_target_refused("refuseup", &target, "handoff version");
 }
 
 /// The recording must CONTINUE across an upgrade, not restart: the successor
