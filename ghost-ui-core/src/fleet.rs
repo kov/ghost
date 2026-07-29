@@ -1562,16 +1562,15 @@ impl FleetModel {
             .collect();
         for g in &mut self.groups {
             let before = g.members.len();
-            // A remote member (<target>␟<real>) is transport-governed, not swept: the
-            // local descriptor scan never names it, so judging it by that scan would
-            // evict it the moment its host went unreachable (its tile goes dead → not
-            // `live`, never `named`) and dissolve the group over a passing network
-            // blip. Keep it; the watcher marks it cold and revives it on reconnect.
-            g.members.retain(|m| {
-                crate::group::is_remote_id(m)
-                    || live.contains(m.as_str())
-                    || named.contains(m.as_str())
-            });
+            // Remote members (<target>␟<real>) live by the same rule: the
+            // shell's remote sweep names them in every state worth keeping —
+            // waiting while the host is unreachable, relaunchable while the
+            // connected host still remembers them (or while its remembered-set
+            // is unknown) — so a passing network blip never leaves one unnamed.
+            // An unnamed remote member means its connected host neither lists
+            // nor remembers it (the user ended it there): forget it here too.
+            g.members
+                .retain(|m| live.contains(m.as_str()) || named.contains(m.as_str()));
             dirty |= g.members.len() != before;
         }
         self.groups
@@ -6416,13 +6415,17 @@ mod tests {
     }
 
     #[test]
-    fn the_dead_sweep_keeps_a_remote_member_it_cannot_see() {
-        // A remote session (<target>␟<real>) has NO local descriptor, so the shell's
-        // dead-descriptor sweep never names it. It must not be evicted for that: its
-        // liveness is the transport's business (a cold tile while its host is
-        // unreachable, live again on reconnect). A transient network drop must NOT
-        // dissolve its group — the twin of `the_dead_sweep_forgets_members_it_no_longer_names`
-        // for a member the local sweep has no authority over.
+    fn a_remote_member_stays_while_named_and_goes_when_its_host_forgot_it() {
+        // The shell's remote sweep names a remote member in EVERY state worth
+        // keeping: waiting while its host is unreachable, relaunchable while
+        // the connected host still remembers it (and while the remembered-set
+        // is simply unknown). So absence from the sweep is evidence for remote
+        // members exactly as for local ones: the connected host neither lists
+        // it nor remembers it — the user ended it there — and keeping the
+        // membership would resurrect the stale relaunchable corpse this used
+        // to leave behind. The twin of
+        // `the_dead_sweep_forgets_members_it_no_longer_names`, on the other
+        // side of the transport.
         let mut m = my_fleet(&[]);
         widen(&mut m);
         let remote = format!("box{}work", crate::group::REMOTE_ID_SEP);
@@ -6433,26 +6436,44 @@ mod tests {
             m.tiles.iter().any(|t| t.id == remote && !t.dead),
             "precondition: the remote session is live"
         );
-        // Host unreachable: the watcher posts an empty listing, so its grouped tile
-        // goes dead-but-remembered.
+        // The host stops listing it; its grouped tile goes dead-but-remembered.
         list(&mut m, &[]);
         assert!(
             m.tiles.iter().any(|t| t.id == remote && t.dead),
-            "unreachable → a cold, remembered tile"
+            "not listed → a cold, remembered tile"
         );
-        // The local dead sweep runs and, as always, does not (cannot) name a remote
-        // session. It must be left alone.
-        m.update(UiEvent::DeadSessions(Vec::new()));
+        // A transient outage must not dissolve the group: the sweep keeps
+        // naming the member (waiting) for as long as the host is unreachable…
+        m.update(UiEvent::DeadSessions(vec![awaiting_info(&remote, "box")]));
         assert!(
             m.groups()
                 .iter()
                 .any(|g| g.id == "g-remote" && g.members.contains(&remote)),
-            "the remote member survives a sweep that cannot see it: {:?}",
+            "a member named waiting survives the outage: {:?}",
+            m.groups()
+        );
+        // …and (relaunchable) while the connected host still remembers it.
+        m.update(UiEvent::DeadSessions(vec![dead_info(&remote, "", &[])]));
+        assert!(
+            m.tiles.iter().any(|t| t.id == remote && t.dead),
+            "a member the host remembers keeps its relaunchable tile"
+        );
+        // The connected host no longer remembers it — it exited cleanly there.
+        // The sweep stops naming it, and everything about it goes.
+        let cmds = m.update(UiEvent::DeadSessions(Vec::new()));
+        assert!(
+            !m.tiles.iter().any(|t| t.id == remote),
+            "the forgotten member's tile goes"
+        );
+        assert!(
+            m.groups().iter().all(|g| g.id != "g-remote"),
+            "and its membership with it: {:?}",
             m.groups()
         );
         assert!(
-            m.tiles.iter().any(|t| t.id == remote),
-            "its cold tile is kept, ready to go live again on reconnect"
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SaveGroups(gs) if gs.iter().all(|g| g.id != "g-remote"))),
+            "the forgetting persists: {cmds:?}"
         );
     }
 
