@@ -14,6 +14,7 @@ pub mod cmd;
 pub mod encode;
 pub mod event;
 pub mod fleet;
+pub mod focus_trace;
 pub mod group;
 pub mod input;
 pub mod mouse;

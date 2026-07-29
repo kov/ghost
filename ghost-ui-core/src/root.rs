@@ -1820,7 +1820,13 @@ impl RootModel {
             Mode::Fleet(_) => false,
         };
         match self.foreground_mut(sessions) {
-            Some((view, state)) => view.update(state, UiEvent::Focus(focused), driving),
+            Some((view, state)) => {
+                crate::focus_trace::log(
+                    state.session(),
+                    format_args!("promotion reassert focused_win={focused}"),
+                );
+                view.update(state, UiEvent::Focus(focused), driving)
+            }
             None => Vec::new(),
         }
     }

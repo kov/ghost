@@ -947,6 +947,19 @@ impl PumpEnd {
     }
 }
 
+/// The focus report an input payload carries, if any — `"I"`/`"O"` for the
+/// focus-trace's wire log. Reports are sent alone or alongside query replies,
+/// so scan rather than compare.
+fn focus_report_in(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.windows(3).any(|w| w == b"\x1b[I") {
+        Some("I")
+    } else if bytes.windows(3).any(|w| w == b"\x1b[O") {
+        Some("O")
+    } else {
+        None
+    }
+}
+
 /// Drain up to `max` pending reads off a session, returning the accumulated output
 /// and how it ended. A read error is a transport failure, i.e. `Disconnected`.
 fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd) {
@@ -2851,9 +2864,39 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
+                    // For the focus trace: what a focus report actually did on the
+                    // wire — sent, failed, or dropped for want of a client.
+                    let report = if ghost_ui_core::focus_trace::enabled() {
+                        focus_report_in(&bytes)
+                    } else {
+                        None
+                    };
                     // Input from any viewing window reaches the one process-wide client.
-                    if let Some(s) = self.sessions.get_mut(&session) {
-                        let _ = s.send_input(&bytes);
+                    match self.sessions.get_mut(&session) {
+                        Some(s) => {
+                            let res = s.send_input(&bytes);
+                            if let Some(which) = report {
+                                match &res {
+                                    Ok(()) => ghost_ui_core::focus_trace::log(
+                                        &session,
+                                        format_args!("wire {which} ok"),
+                                    ),
+                                    Err(e) => ghost_ui_core::focus_trace::log(
+                                        &session,
+                                        format_args!("wire {which} WRITE FAILED: {e}"),
+                                    ),
+                                }
+                            }
+                            let _ = res;
+                        }
+                        None => {
+                            if let Some(which) = report {
+                                ghost_ui_core::focus_trace::log(
+                                    &session,
+                                    format_args!("wire {which} DROPPED (no client)"),
+                                );
+                            }
+                        }
                     }
                 }
                 Cmd::Resize {
@@ -3607,6 +3650,10 @@ impl App {
         // A pre-existing session that dropped: honor its running host's level.
         let proto = host.remote.session_proto(&host.remote_ghost, &real);
         if self.attach_ssh_into(wid, &name, cmd, proto) {
+            ghost_ui_core::focus_trace::log(
+                &name,
+                format_args!("transport REATTACHED (fresh emulator, resync inbound)"),
+            );
             self.reconnecting.remove(&(wid, name.clone()));
             self.dispatch(wid, UiEvent::SessionReattached { name }, event_loop);
         } else if let Some(sink) = self.sink.clone() {
@@ -5840,7 +5887,15 @@ impl App {
         // transports rather than letting keystrokes die in a dead pipe until
         // ssh's ~45s keepalive notices (see `SUSPEND_PROBE_GAP`).
         let now = Instant::now();
-        if now.duration_since(self.last_wake_at) >= SUSPEND_PROBE_GAP {
+        let parked = now.duration_since(self.last_wake_at);
+        if parked >= SUSPEND_PROBE_GAP {
+            ghost_ui_core::focus_trace::log(
+                "*",
+                format_args!(
+                    "suspend gap {}s -> probing remote transports",
+                    parked.as_secs()
+                ),
+            );
             self.probe_remote_transports();
         }
         self.last_wake_at = now;
@@ -5868,6 +5923,10 @@ impl App {
             // torn down — its session may still be alive on the far side. A local EOF
             // (the host process is gone) is a genuine end, as before.
             if end == PumpEnd::Disconnected && is_remote_id(&name) {
+                ghost_ui_core::focus_trace::log(
+                    &name,
+                    format_args!("transport DISCONNECTED (holding for reconnect)"),
+                );
                 self.sessions.remove(&name);
                 dropped.push((name, bytes));
                 continue;
@@ -6102,7 +6161,7 @@ mod tests {
     use super::{
         App, Glass, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice,
         auth_error_message, choose_alpha_mode, choose_surface_format, config,
-        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
+        connect_outcome_wanted, focus_report_in, glass, home_launch_dir, inherited_connection,
         namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
         respawn_opts, restore_plan, should_restore, startup_choice, theme_colors,
     };
@@ -6115,6 +6174,17 @@ mod tests {
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
+
+    #[test]
+    fn focus_reports_are_spotted_inside_input_payloads() {
+        // A report alone, and one riding along with other input (the ingest can
+        // batch a query reply and the rising-edge report into one payload).
+        assert_eq!(focus_report_in(b"\x1b[I"), Some("I"));
+        assert_eq!(focus_report_in(b"\x1b[0n\x1b[O"), Some("O"));
+        // Ordinary keys — including a plain CSI arrow — are not reports.
+        assert_eq!(focus_report_in(b"hello"), None);
+        assert_eq!(focus_report_in(b"\x1b[A"), None);
+    }
 
     /// Run `f` with `$XDG_*` redirected to a throwaway dir, serialized against
     /// other App tests (the env is process-global). So the shell's disk writes

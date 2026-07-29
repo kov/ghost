@@ -1112,7 +1112,22 @@ impl SessionState {
             // *change*, so an app that enables focus reporting while the window
             // already holds focus never learns it does — Claude Code's prompt does
             // exactly this and then swallows input until a focus change arrives.
-            if self.screen.vt().focus_report() && !focus_report_before {
+            let focus_report_now = self.screen.vt().focus_report();
+            if focus_report_now != focus_report_before {
+                crate::focus_trace::log(
+                    &self.session,
+                    format_args!("mode 1004 {}", if focus_report_now { "ON" } else { "OFF" }),
+                );
+            }
+            if focus_report_now && !focus_report_before {
+                crate::focus_trace::log(
+                    &self.session,
+                    format_args!(
+                        "rising edge -> report {} (view focused={})",
+                        if geom.focused { "I" } else { "O" },
+                        geom.focused
+                    ),
+                );
                 cmds.push(Cmd::SendInput {
                     session: self.session.clone(),
                     bytes: if geom.focused {
@@ -2081,12 +2096,23 @@ impl TerminalView {
             self.preedit.clear();
         }
         if state.screen.vt().focus_report() {
+            crate::focus_trace::log(
+                state.session(),
+                format_args!(
+                    "focus-event focused={focused} -> report {}",
+                    if focused { "I" } else { "O" }
+                ),
+            );
             state.send(if focused {
                 b"\x1b[I".to_vec()
             } else {
                 b"\x1b[O".to_vec()
             })
         } else {
+            crate::focus_trace::log(
+                state.session(),
+                format_args!("focus-event focused={focused} MUTED (1004 off)"),
+            );
             Vec::new()
         }
     }
@@ -4311,6 +4337,36 @@ mod tests {
             !cmds.contains(&sent("alpha", b"\x1b[I")),
             "no ?1004 edge, so no focus report, got {cmds:?}"
         );
+    }
+
+    #[test]
+    fn focus_trace_records_the_focus_conversation() {
+        let path =
+            std::env::temp_dir().join(format!("ghost-focus-trace-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: process-global. Only this test reads the var; concurrent tests
+        // exercising focus paths merely append lines the asserts don't look for.
+        unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
+
+        let mut m = model();
+        m.update(UiEvent::Focus(true));
+        feed(&mut m, b"\x1b[?1004h"); // rising edge: mode ON + report I
+        m.update(UiEvent::Focus(false)); // report O
+        feed(&mut m, b"\x1b[?1004l"); // mode OFF
+        m.update(UiEvent::Focus(false)); // muted: the mode is off
+
+        unsafe { std::env::remove_var("GHOST_FOCUS_TRACE") };
+        let log = std::fs::read_to_string(&path).expect("trace file written");
+        let _ = std::fs::remove_file(&path);
+        for needle in [
+            "alpha mode 1004 ON",
+            "alpha rising edge -> report I",
+            "alpha focus-event focused=false -> report O",
+            "alpha mode 1004 OFF",
+            "alpha focus-event focused=false MUTED (1004 off)",
+        ] {
+            assert!(log.contains(needle), "missing {needle:?} in trace:\n{log}");
+        }
     }
 
     #[test]
