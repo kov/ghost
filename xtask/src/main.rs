@@ -360,20 +360,41 @@ fn host_triple() -> Option<String> {
         .find_map(|l| l.strip_prefix("host: ").map(|s| s.trim().to_string()))
 }
 
-/// This host OS's two arches. Linux uses the **musl** targets: they link
+/// Every platform ghost can stage to. Linux uses the **musl** targets: they link
 /// self-contained with the bundled `rust-lld` (so `rustup target add` is the only
-/// setup — no C toolchain or sysroot) and produce a static binary that runs on any
-/// remote regardless of its glibc — ideal for staging. macOS uses the native
-/// darwin targets (Apple's toolchain cross-builds both arches). Cross-OS targets
-/// must be named explicitly (and generally want `GHOST_ZIGBUILD=1`).
+/// setup — no C toolchain, no sysroot) and produce a static binary that runs on
+/// any remote regardless of its glibc. macOS uses the native darwin targets;
+/// Apple's toolchain cross-builds both arches, and reaching them from Linux wants
+/// `GHOST_ZIGBUILD=1`.
+const SUPPORTED_TRIPLES: [&str; 4] = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+];
+
+/// The triples to build when none are named: every supported platform *except*
+/// the one we are building on.
+///
+/// Staging resolves the local platform from `current_exe` and only ever consults
+/// a prebuilt for a platform that differs (see `resolve_for` in ghost-vt), so the
+/// local triple is the one target that can never be needed — and the cross-OS
+/// ones, which used to require naming a triple by hand, are the whole reason
+/// prebuilts exist. `host` is matched by os+arch rather than by triple, so a
+/// distro rustc reporting `…-linux-gnu` still counts as covering the musl target
+/// for that same platform.
+fn default_triples_for(host: Option<&str>) -> Vec<String> {
+    let local = host.and_then(triple_to_name);
+    SUPPORTED_TRIPLES
+        .iter()
+        .filter(|t| local.is_none() || triple_to_name(t) != local)
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
+/// [`default_triples_for`] against this machine's own rustc host triple.
 fn default_triples() -> Vec<String> {
-    match std::env::consts::OS {
-        "macos" => vec!["aarch64-apple-darwin".into(), "x86_64-apple-darwin".into()],
-        _ => vec![
-            "x86_64-unknown-linux-musl".into(),
-            "aarch64-unknown-linux-musl".into(),
-        ],
-    }
+    default_triples_for(host_triple().as_deref())
 }
 
 /// Map a Rust target triple to the `ghost-<os>-<arch>` prebuilt filename staging's
@@ -495,6 +516,52 @@ fn copy_dir(src: &Path, dst: &Path) -> R<()> {
 #[cfg(test)]
 mod prebuilt_tests {
     use super::*;
+
+    #[test]
+    fn the_defaults_cover_every_platform_except_the_one_we_build_on() {
+        // Staging serves the LOCAL platform from `current_exe`; a prebuilt is only
+        // ever consulted for a platform that differs. Defaulting to the host's own
+        // OS was therefore backwards: on a Mac it produced two macOS binaries and
+        // no Linux one, so a Mac could never stage to a Linux host — the case
+        // prebuilts exist for. (The host is excluded by os+arch, not by triple, so
+        // a gnu host still counts as covering the musl target for its platform.)
+        let mac = default_triples_for(Some("aarch64-apple-darwin"));
+        assert!(
+            mac.iter().any(|t| t == "aarch64-unknown-linux-musl"),
+            "a Mac must build the Linux prebuilts: {mac:?}"
+        );
+        assert!(
+            mac.iter().any(|t| t == "x86_64-unknown-linux-musl"),
+            "a Mac must build the Linux prebuilts: {mac:?}"
+        );
+        assert!(
+            mac.iter().any(|t| t == "x86_64-apple-darwin"),
+            "an Intel Mac remote needs a prebuilt too — same OS, different arch: {mac:?}"
+        );
+        assert!(
+            !mac.iter().any(|t| t == "aarch64-apple-darwin"),
+            "the local platform is `current_exe`, never a prebuilt: {mac:?}"
+        );
+
+        // The mirror case, and the reason the host is matched by os+arch: a distro
+        // rustc reports a *gnu* triple, but the Linux prebuilt we build is *musl*.
+        let linux = default_triples_for(Some("aarch64-unknown-linux-gnu"));
+        assert!(
+            linux.iter().any(|t| t == "aarch64-apple-darwin"),
+            "a Linux box must build the macOS prebuilts: {linux:?}"
+        );
+        assert!(
+            linux.iter().any(|t| t == "x86_64-unknown-linux-musl"),
+            "the other Linux arch still needs one: {linux:?}"
+        );
+        assert!(
+            !linux.iter().any(|t| t == "aarch64-unknown-linux-musl"),
+            "gnu host covers its own os+arch, so its musl twin is not needed: {linux:?}"
+        );
+
+        // No rustc to ask: build everything rather than silently skipping one.
+        assert_eq!(default_triples_for(None).len(), 4);
+    }
 
     #[test]
     fn triple_to_name_maps_supported_targets_and_rejects_others() {
