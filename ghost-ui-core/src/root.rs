@@ -708,7 +708,25 @@ pub fn feed_observed(
     // effects (query replies, focus report, graphics acks, clipboard writes, window
     // ops) — DROPPED: a mirror never speaks for the program it observes (see above).
     let geom = DrivingGeometry::nominal();
-    let (_dropped_child_effects, outcome) = state.ingest(bytes, &geom, ended);
+    let (dropped_child_effects, outcome) = state.ingest(bytes, &geom, ended);
+    // The focus trace must account for every report it announced. The ingest logs a
+    // DEC ?1004 rising-edge report before it can know this feed will swallow it — and
+    // logs it against `nominal`'s `focused: false`, which is a stand-in, not a window
+    // that was really unfocused. So name the drop in the same `wire` vocabulary the
+    // shell uses (ok / WRITE FAILED / DROPPED), or the log shows a focus-out that
+    // never left the process, right where a focus incident gets read.
+    if crate::focus_trace::enabled() {
+        for c in &dropped_child_effects {
+            if let Cmd::SendInput { session, bytes } = c
+                && let Some(which) = crate::focus_trace::report_in(bytes)
+            {
+                crate::focus_trace::log(
+                    session,
+                    format_args!("wire {which} DROPPED (observed mirror)"),
+                );
+            }
+        }
+    }
     let mut per: Vec<Vec<Cmd>> = viewers
         .iter_mut()
         .map(|w| w.apply_shared_feed(sessions, name, &outcome, false))
@@ -3301,6 +3319,49 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Cmd::Resize { session, .. } if session == "alpha")),
             "the relinquished session's child is not SIGWINCHed: {cmds:?}"
+        );
+    }
+
+    /// The trace half of the mirror's silence: the dropped session-once effects include
+    /// the DEC ?1004 rising-edge focus report, and the ingest announces that report
+    /// before it can know a mirror will swallow it. Left unaccounted, the log shows a
+    /// focus-out that never went out — printed with [`DrivingGeometry::nominal`]'s
+    /// `focused=false` as though some window had really been unfocused — which is a
+    /// phantom sitting exactly where a focus incident gets read. Every announced report
+    /// owes the trace a verdict, so the drop says so in the same `wire` vocabulary the
+    /// shell uses for a send, a failure, and a clientless session.
+    #[test]
+    fn an_observed_mirror_names_the_focus_report_it_drops() {
+        let log = crate::focus_trace::capture(|| {
+            let mut sessions = Sessions::new();
+            sessions.set_policy(SessionPolicy::allow_all());
+            let (mut w, _, _) = RootModel::fleet(METRICS, SIZE, 1.0);
+            w.update(
+                &mut sessions,
+                UiEvent::SessionList(vec![sess("x", false, 1)]),
+            );
+            // The previewed program subscribes to focus events: a rising edge, so the
+            // ingest produces a report — which this feed has no write path for.
+            let outs = feed_observed(&mut sessions, &mut [&mut w], "x", b"\x1b[?1004h", false);
+            let sends: usize = outs
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c, Cmd::SendInput { .. }))
+                .count();
+            assert_eq!(sends, 0, "precondition: the report is dropped, not fanned");
+        });
+        assert!(
+            log.contains("x mode 1004 ON"),
+            "the mode flip is traced:\n{log}"
+        );
+        assert!(
+            log.contains("x rising edge -> report O"),
+            "the ingest announces a report:\n{log}"
+        );
+        assert!(
+            log.contains("x wire O DROPPED (observed mirror)"),
+            "...and the trace must say it never went out, or the log claims a \
+             focus-out that never happened:\n{log}"
         );
     }
 

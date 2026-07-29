@@ -4341,23 +4341,14 @@ mod tests {
 
     #[test]
     fn focus_trace_records_the_focus_conversation() {
-        let path =
-            std::env::temp_dir().join(format!("ghost-focus-trace-{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        // SAFETY: process-global. Only this test reads the var; concurrent tests
-        // exercising focus paths merely append lines the asserts don't look for.
-        unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
-
-        let mut m = model();
-        m.update(UiEvent::Focus(true));
-        feed(&mut m, b"\x1b[?1004h"); // rising edge: mode ON + report I
-        m.update(UiEvent::Focus(false)); // report O
-        feed(&mut m, b"\x1b[?1004l"); // mode OFF
-        m.update(UiEvent::Focus(false)); // muted: the mode is off
-
-        unsafe { std::env::remove_var("GHOST_FOCUS_TRACE") };
-        let log = std::fs::read_to_string(&path).expect("trace file written");
-        let _ = std::fs::remove_file(&path);
+        let log = crate::focus_trace::capture(|| {
+            let mut m = model();
+            m.update(UiEvent::Focus(true));
+            feed(&mut m, b"\x1b[?1004h"); // rising edge: mode ON + report I
+            m.update(UiEvent::Focus(false)); // report O
+            feed(&mut m, b"\x1b[?1004l"); // mode OFF
+            m.update(UiEvent::Focus(false)); // muted: the mode is off
+        });
         for needle in [
             "alpha mode 1004 ON",
             "alpha rising edge -> report I",

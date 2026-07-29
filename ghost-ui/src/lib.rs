@@ -969,19 +969,6 @@ impl PumpEnd {
     }
 }
 
-/// The focus report an input payload carries, if any — `"I"`/`"O"` for the
-/// focus-trace's wire log. Reports are sent alone or alongside query replies,
-/// so scan rather than compare.
-fn focus_report_in(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.windows(3).any(|w| w == b"\x1b[I") {
-        Some("I")
-    } else if bytes.windows(3).any(|w| w == b"\x1b[O") {
-        Some("O")
-    } else {
-        None
-    }
-}
-
 /// Drain up to `max` pending reads off a session, returning the accumulated output
 /// and how it ended. A read error is a transport failure, i.e. `Disconnected`.
 fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd) {
@@ -2873,6 +2860,25 @@ impl App {
 
     /// Feed an event to window `wid`'s model and execute the effects it returns.
     pub fn dispatch(&mut self, wid: WindowId, ev: UiEvent, event_loop: &dyn Frontend) {
+        // Name the window an OS focus event reached, and what it shows. The
+        // per-session lines below can't: a swap between two windows logs an out for
+        // one session and an in for another, with nothing tying either to a window,
+        // and a window in the fleet has no session to report at all — so the swap
+        // reads as a bare focus-out. This is the line that says whether the window
+        // you focused is the one that got the focus.
+        if let UiEvent::Focus(focused) = &ev
+            && ghost_ui_core::focus_trace::enabled()
+            && let Some(w) = self.windows.get(&wid)
+        {
+            let (mode, fg) = match w.root.single_foreground() {
+                Some(fg) => ("single", fg.as_str()),
+                None => ("fleet", "-"),
+            };
+            ghost_ui_core::focus_trace::log(
+                fg,
+                format_args!("os-focus win={wid:?} focused={focused} mode={mode}"),
+            );
+        }
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
             None => return,
@@ -2915,7 +2921,7 @@ impl App {
                     // For the focus trace: what a focus report actually did on the
                     // wire — sent, failed, or dropped for want of a client.
                     let report = if ghost_ui_core::focus_trace::enabled() {
-                        focus_report_in(&bytes)
+                        ghost_ui_core::focus_trace::report_in(&bytes)
                     } else {
                         None
                     };
@@ -6228,7 +6234,7 @@ mod tests {
     use super::{
         App, Glass, HeadlessFrontend, PendingRemote, REMOTE_ID_SEP, StartupChoice,
         auth_error_message, choose_alpha_mode, choose_surface_format, config,
-        connect_outcome_wanted, focus_report_in, glass, home_launch_dir, inherited_connection,
+        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
         namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
         respawn_opts, restore_plan, should_restore, startup_choice, theme_colors,
     };
@@ -6241,17 +6247,6 @@ mod tests {
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
-
-    #[test]
-    fn focus_reports_are_spotted_inside_input_payloads() {
-        // A report alone, and one riding along with other input (the ingest can
-        // batch a query reply and the rising-edge report into one payload).
-        assert_eq!(focus_report_in(b"\x1b[I"), Some("I"));
-        assert_eq!(focus_report_in(b"\x1b[0n\x1b[O"), Some("O"));
-        // Ordinary keys — including a plain CSI arrow — are not reports.
-        assert_eq!(focus_report_in(b"hello"), None);
-        assert_eq!(focus_report_in(b"\x1b[A"), None);
-    }
 
     /// Run `f` with `$XDG_*` redirected to a throwaway dir, serialized against
     /// other App tests (the env is process-global). So the shell's disk writes

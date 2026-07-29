@@ -21,6 +21,19 @@ pub fn enabled() -> bool {
     std::env::var_os(VAR).is_some()
 }
 
+/// The focus report an input payload carries, if any — `"I"`/`"O"` for the wire
+/// log. Reports are sent alone or alongside query replies, so scan rather than
+/// compare.
+pub fn report_in(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.windows(3).any(|w| w == b"\x1b[I") {
+        Some("I")
+    } else if bytes.windows(3).any(|w| w == b"\x1b[O") {
+        Some("O")
+    } else {
+        None
+    }
+}
+
 /// Append one `<unix-ms> <hh:mm:ss.mmm>Z <session> <event>` line. `session` is
 /// the id the event concerns, or `"*"` for app-wide events. The clock is UTC.
 pub fn log(session: &str, event: std::fmt::Arguments<'_>) {
@@ -46,4 +59,45 @@ pub fn log(session: &str, event: std::fmt::Arguments<'_>) {
         ms % 1000,
     );
     let _ = file.write_all(line.as_bytes());
+}
+
+/// Test-only: run `f` with the trace pointed at a fresh file, and return every line
+/// it wrote. Serialized process-wide — the destination is an env var, so two
+/// capturing tests running at once would write into each other's file (and each
+/// other's assertions).
+#[cfg(test)]
+pub(crate) fn capture(f: impl FnOnce()) -> String {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LOCK: Mutex<()> = Mutex::new(());
+    static NTH: AtomicU32 = AtomicU32::new(0);
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::temp_dir().join(format!(
+        "ghost-focus-trace-{}-{}.log",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    // SAFETY: the var is process-global, but every test that sets or reads it holds
+    // the lock above, and `log` re-reads it per event (no latched state to poison).
+    unsafe { std::env::set_var(VAR, &path) };
+    f();
+    unsafe { std::env::remove_var(VAR) };
+    let out = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn focus_reports_are_spotted_inside_input_payloads() {
+        // A report alone, and one riding along with other input (the ingest can
+        // batch a query reply and the rising-edge report into one payload).
+        assert_eq!(super::report_in(b"\x1b[I"), Some("I"));
+        assert_eq!(super::report_in(b"\x1b[0n\x1b[O"), Some("O"));
+        // Ordinary keys — including a plain CSI arrow — are not reports.
+        assert_eq!(super::report_in(b"hello"), None);
+        assert_eq!(super::report_in(b"\x1b[A"), None);
+    }
 }

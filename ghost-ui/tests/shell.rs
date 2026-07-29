@@ -91,6 +91,71 @@ fn a_member_whose_descriptor_is_gone_is_forgotten_not_shown() {
     });
 }
 
+/// The focus trace exists to settle one question in an incident — "did the window I
+/// just focused actually get the focus, and what was it showing?" — and per-session
+/// lines can't answer it. Two windows swapping focus log a focus-out for one session
+/// and a focus-in for another, with nothing saying which window either belongs to,
+/// and a window sitting in the fleet reports nothing at all (no session to tell), so
+/// the pair reads as a stray focus-out with no matching focus-in. Every OS focus
+/// event names its window and what that window shows, in both modes.
+#[test]
+fn an_os_focus_event_names_its_window_in_the_trace() {
+    with_isolated_xdg(|tmp| {
+        support::spawn_session_running("focus-1", "echo focus-1 ready; exec cat");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let single = app
+            .open_single_window(&fe, "focus-1", group, None)
+            .expect("window");
+        let fleet_group = app.mint_group();
+        let fleet = app.open_fleet_window(&fe, fleet_group, None);
+        app.wake(&fe);
+
+        // Focus leaves the session window for the fleet one — the shape that reads as
+        // a bare focus-out today.
+        let path = tmp.join("focus-trace.log");
+        // SAFETY: `with_isolated_xdg` holds the suite's env lock, so no other test
+        // reads or writes the environment concurrently; `focus_trace` re-reads the
+        // var per event, so there is no latched state to leave behind.
+        unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
+        app.dispatch(single, UiEvent::Focus(false), &fe);
+        app.dispatch(fleet, UiEvent::Focus(true), &fe);
+        unsafe { std::env::remove_var("GHOST_FOCUS_TRACE") };
+
+        let log = std::fs::read_to_string(&path).expect("the trace file was written");
+        let named: Vec<&str> = log.lines().filter(|l| l.contains("os-focus")).collect();
+        assert_eq!(named.len(), 2, "one line per OS focus event, got:\n{log}");
+        assert!(
+            named[0].contains("focus-1") && named[0].contains("focused=false"),
+            "the blur names the window's foreground session:\n{log}"
+        );
+        assert!(
+            named[0].contains("mode=single"),
+            "...and what mode that window is in:\n{log}"
+        );
+        assert!(
+            named[1].contains("focused=true") && named[1].contains("mode=fleet"),
+            "a fleet window's focus is traced too, or its half of a swap is invisible:\n{log}"
+        );
+        let win_of = |line: &str| {
+            line.split("win=")
+                .nth(1)
+                .expect("the line names a window")
+                .split_whitespace()
+                .next()
+                .expect("a window id")
+                .to_string()
+        };
+        assert_ne!(
+            win_of(named[0]),
+            win_of(named[1]),
+            "the two events must be attributable to DIFFERENT windows — that is the \
+             whole point of naming them:\n{log}"
+        );
+    });
+}
+
 /// Typing `exit` / Ctrl-D ends a session for good: the child exits of its own
 /// accord, the host discards the durable traces on its way out, and nothing may
 /// keep offering to relaunch it — not the fleet the window falls back to, and
