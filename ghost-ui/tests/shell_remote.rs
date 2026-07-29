@@ -238,6 +238,124 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
     });
 }
 
+/// The counterpart to the reboot test above, and the line between them is the
+/// whole point: a session the user ENDS (typing `exit`) is discarded on its
+/// host, and the window must forget it — no relaunchable corpse, no membership
+/// — while a session a reboot KILLS stays remembered and relaunchable. The
+/// host-side discard happens where the local descriptor sweep cannot see, so
+/// this is the watcher's remembered-set fetch proving itself over a real
+/// transport: listing gone + descriptor gone there ⇒ forgotten here.
+#[test]
+fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
+    let Some(remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: process-global, held under SERIAL for the duration.
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+        let remote_ghost =
+            retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+        r.spawn_host(&remote_ghost, "ephemeral")
+            .expect("spawn remote session");
+        assert!(
+            wait_until(Duration::from_secs(5), || r
+                .list_sessions(&remote_ghost)
+                .map(|s| s.iter().any(|i| i.name == "ephemeral"))
+                .unwrap_or(false)),
+            "the session never came up on the remote"
+        );
+
+        let q: Arc<QueuedEvents> = Arc::default();
+        let sink: Arc<dyn EventSink> = q.clone();
+        let mut app = App::headless_with_sink(sink);
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+
+        let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            let root = app.root(wid).expect("window");
+            sees_tile(&root.view(app.states()), "ephemeral")
+        });
+        assert!(
+            discovered,
+            "the remote session never appeared in the fleet: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        // Drive it: click the card, so the window's group remembers it — the
+        // state in which a stale corpse used to linger.
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::tile_center(&scene, "ephemeral")
+            .unwrap_or_else(|| panic!("no card to click: {:?}", visible_text(&scene)));
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+            for ev in support::click_events(cx, cy) {
+                app.dispatch(wid, ev, &fe);
+            }
+        }
+        let attached = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            !app.root(wid).expect("window").is_fleet()
+        });
+        assert!(
+            attached,
+            "the window never opened the remote session: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+        assert!(
+            app.groups()
+                .iter()
+                .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral"))),
+            "driving it makes it the window's own: {:?}",
+            app.groups()
+        );
+
+        // THE USER ENDS IT: `exit` into the remote shell. The child exits of
+        // its own accord and the remote host discards the durable traces.
+        app.dispatch(wid, UiEvent::Text("exit\r".into()), &fe);
+
+        // The host really does forget it (this also drives `__remembered` over
+        // the real transport: the discard must be visible in the fetch).
+        assert!(
+            wait_until(Duration::from_secs(30), || r
+                .remembered_sessions(&remote_ghost)
+                .map(|names| !names.contains("ephemeral"))
+                .unwrap_or(false)),
+            "the remote descriptor must be discarded by the clean exit"
+        );
+
+        // And so must the window: back in the fleet with no corpse to relaunch
+        // and no lingering membership — a clean exit leaves nothing behind.
+        let forgotten = pump_until(&mut app, &fe, &q, Duration::from_secs(60), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            let root = app.root(wid).expect("window");
+            let scene = root.view(app.states());
+            root.is_fleet()
+                && !sees_tile(&scene, "ephemeral")
+                && !sees_text(&scene, "relaunch")
+                && !app
+                    .groups()
+                    .iter()
+                    .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral")))
+        });
+        assert!(
+            forgotten,
+            "a cleanly-exited remote session must be forgotten, not offered for \
+             relaunch; groups={:?} shows={:?}",
+            app.groups(),
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+    });
+}
+
 /// How many times `needle` is rendered on session `id`'s screen.
 fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
     app.states()

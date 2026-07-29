@@ -716,6 +716,27 @@ impl RemoteSsh {
         serde_json::from_slice(&out.stdout).map_err(io::Error::other)
     }
 
+    /// The session names the remote host still holds a descriptor for — its
+    /// resurrection tickets (`<remote_ghost> __remembered`), over the shared
+    /// connection. Live sessions are included (they have descriptors too); the
+    /// caller cares about the dead ones: a remembered name relaunches, a member
+    /// the host no longer remembers exited cleanly there and must be forgotten.
+    /// Errors on a non-zero exit (an older remote ghost has no `__remembered`)
+    /// or unparseable output — the caller treats both as "unknown".
+    pub fn remembered_sessions(
+        &self,
+        remote_ghost: &str,
+    ) -> io::Result<std::collections::HashSet<String>> {
+        let out = self.command(&[remote_ghost, "__remembered"]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost __remembered` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        serde_json::from_slice(&out.stdout).map_err(io::Error::other)
+    }
+
     /// The protocol level of the *running host* serving remote session `name`
     /// (`<remote_ghost> __proto <name>`), read from that session's `proto` marker
     /// over the shared connection. A staged binary can be newer than a host still
@@ -930,6 +951,15 @@ mod tests {
         assert_eq!(
             &r.argv(&["ghost", "__watch"])[13..],
             &["kov@box", "'ghost'", "'__watch'"]
+        );
+    }
+
+    #[test]
+    fn remembered_sessions_runs_ghost_remembered_over_the_shared_connection() {
+        let r = remote("kov@box");
+        assert_eq!(
+            &r.argv(&["ghost", "__remembered"])[13..],
+            &["kov@box", "'ghost'", "'__remembered'"]
         );
     }
 

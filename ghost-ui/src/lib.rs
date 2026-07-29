@@ -480,12 +480,17 @@ fn start_remote_watcher(
                 failures = 0;
             } else {
                 failures = failures.saturating_add(1);
-                // Unreachable for a grace period: clear the host's stale tiles.
+                // Unreachable for a grace period: clear the host's stale tiles,
+                // and its remembered-set with them — judging members by a stale
+                // set could forget one whose descriptor outlived the fetch.
                 if failures >= REMOTE_WATCH_MAX_FAILURES
-                    && !sink.post(UserEvent::RemoteSessions {
+                    && (!sink.post(UserEvent::RemoteSessions {
                         target: target.clone(),
                         infos: Vec::new(),
-                    })
+                    }) || !sink.post(UserEvent::RemoteRemembered {
+                        target: target.clone(),
+                        names: None,
+                    }))
                 {
                     break; // the event loop closed
                 }
@@ -524,6 +529,7 @@ fn watch_stream_once(
     }
     let mut pushed = false;
     let mut warned_parse = false;
+    let mut last_line: Option<String> = None;
     for line in std::io::BufReader::new(stdout).lines() {
         if stop.load(Relaxed) {
             break;
@@ -546,12 +552,28 @@ fn watch_stream_once(
             }
         };
         pushed = true;
+        // A *changed* listing may mean a session ended — refresh the host's
+        // remembered-set (its descriptor names) so the dead-member sweep can
+        // tell a clean exit (forget) from an unclean one (relaunchable). The
+        // heartbeat re-emits of an unchanged listing skip the extra round trip.
+        // A failed fetch posts `None`: unknown, never stale.
+        let changed = last_line.as_deref() != Some(line.as_str());
+        last_line = Some(line);
         let infos = namespace_remote_infos(target, infos);
         if !sink.post(UserEvent::RemoteSessions {
             target: target.to_string(),
             infos,
         }) {
             stop.store(true, Relaxed); // event loop gone: end the whole watcher
+            break;
+        }
+        if changed
+            && !sink.post(UserEvent::RemoteRemembered {
+                target: target.to_string(),
+                names: host.remote.remembered_sessions(&host.remote_ghost).ok(),
+            })
+        {
+            stop.store(true, Relaxed);
             break;
         }
     }
@@ -1556,6 +1578,7 @@ fn interactive(fresh: bool) {
         proxy: Some(proxy),
         remotes,
         remote_infos: HashMap::new(),
+        remote_remembered: HashMap::new(),
         remote_index: HashMap::new(),
         remote_watchers: HashMap::new(),
         pending_remote_restores: HashMap::new(),
@@ -2056,6 +2079,7 @@ impl App {
             proxy: None,
             remotes: Arc::default(),
             remote_infos: HashMap::new(),
+            remote_remembered: HashMap::new(),
             remote_index: HashMap::new(),
             remote_watchers: HashMap::new(),
             pending_remote_restores: HashMap::new(),
@@ -2372,6 +2396,13 @@ pub struct App {
     /// The latest remote listing per host (fleet-namespaced ids), delivered by the
     /// watcher and merged into every `Cmd::ListSessions` reply.
     remote_infos: HashMap<String, Vec<ghost_vt::session::SessionInfo>>,
+    /// The session names each connected host still holds a descriptor for (bare,
+    /// un-namespaced) — its resurrection tickets, fetched by the watcher thread
+    /// alongside each listing. `remembered_remotes` consults it to tell a member
+    /// that exited cleanly on its host from one a reboot took down. No entry
+    /// means "unknown" (an older remote ghost, or the fetch hasn't landed), and
+    /// the sweep stays conservative: not-listed members remain relaunchable.
+    remote_remembered: HashMap<String, HashSet<String>>,
     /// Maps a namespaced remote fleet id back to `(target, real id)`, so a
     /// take-over/observe of a remote tile reaches the right host and session.
     /// Rebuilt whenever `remote_infos` changes.
@@ -2592,13 +2623,30 @@ impl App {
                 // Connected and serving it: it is live, not remembered — the
                 // listing carries it and the fleet has a real tile.
                 Some(infos) if infos.iter().any(|i| &i.name == member) => continue,
-                Some(_) => out.push(ghost_ui_core::DeadSession {
-                    name: member.clone(),
-                    display_name: real.to_string(),
-                    command: Vec::new(),
-                    cwd: None,
-                    state: ghost_ui_core::DeadState::Exited,
-                }),
+                // Connected and NOT serving it. The host's remembered-set (its
+                // descriptor names) tells the two dead cases apart: still
+                // remembered means an unclean death (a reboot) — relaunchable;
+                // no longer remembered means it exited cleanly (or was killed)
+                // THERE, so it must be forgotten HERE too — not naming it is
+                // what makes the sweep drop its membership and tile. With no
+                // remembered-set (an older remote ghost, or the fetch hasn't
+                // landed) stay conservative: relaunchable, as before.
+                Some(_) => {
+                    if self
+                        .remote_remembered
+                        .get(target)
+                        .is_some_and(|names| !names.contains(real))
+                    {
+                        continue;
+                    }
+                    out.push(ghost_ui_core::DeadSession {
+                        name: member.clone(),
+                        display_name: real.to_string(),
+                        command: Vec::new(),
+                        cwd: None,
+                        state: ghost_ui_core::DeadState::Exited,
+                    })
+                }
                 None => out.push(ghost_ui_core::DeadSession {
                     name: member.clone(),
                     display_name: real.to_string(),
@@ -4882,6 +4930,7 @@ impl App {
             m.retain(|t, _| in_use.contains(t));
         }
         self.remote_infos.retain(|t, _| in_use.contains(t));
+        self.remote_remembered.retain(|t, _| in_use.contains(t));
         // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
         self.remote_watchers.retain(|t, _| in_use.contains(t));
         self.rebuild_remote_index();
@@ -5229,6 +5278,24 @@ impl App {
             UserEvent::RemoteSessions { target, infos } => {
                 self.remote_infos.insert(target, infos);
                 self.rebuild_remote_index();
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            // The watcher also fetched the host's descriptor names: stash them and
+            // re-sweep, so a member the host no longer remembers (a clean remote
+            // exit) drops its relaunchable tile without any user action. A failed
+            // fetch (`None`) clears the cache — unknown, not stale — and the
+            // sweep stays conservative.
+            UserEvent::RemoteRemembered { target, names } => {
+                match names {
+                    Some(names) => {
+                        self.remote_remembered.insert(target, names);
+                    }
+                    None => {
+                        self.remote_remembered.remove(&target);
+                    }
+                }
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -6534,6 +6601,102 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_member_its_connected_host_no_longer_remembers_is_forgotten() {
+        // Typing `exit` in a remote session discards its descriptor ON ITS HOST —
+        // but the local sweep cannot read remote descriptors, so it used to treat
+        // every not-listed member of a connected host as "lost to a reboot" and
+        // offer a relaunch forever. The host's remembered-set (its descriptor
+        // names, fetched over the transport) is what tells the two apart.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            app.groups = vec![ghost_ui_core::Group {
+                id: "w1".into(),
+                name: "blue".into(),
+                color: 0,
+                members: vec![composite.clone()],
+                connection: None,
+            }];
+            // The host is connected and its listing does not name the member.
+            app.remote_infos.insert("kov@box".to_string(), Vec::new());
+
+            // Until the host's remembered-set is known (an older remote ghost, or
+            // the fetch hasn't landed), stay conservative: relaunchable, as before.
+            let dead = app.remembered_remotes();
+            assert_eq!(
+                dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+                vec![composite.as_str()],
+                "with no remembered-set, a not-listed member stays relaunchable"
+            );
+            assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
+
+            // The host reports it remembers nothing: the session exited cleanly
+            // there (or was killed) — there is nothing to resurrect, so the
+            // sweep must not name it and its membership goes.
+            app.remote_remembered
+                .insert("kov@box".to_string(), std::collections::HashSet::new());
+            assert!(
+                app.remembered_remotes().is_empty(),
+                "a member its connected host no longer remembers must be forgotten"
+            );
+
+            // A host that still holds the descriptor (a reboot killed the host
+            // uncleanly) is the case that stays relaunchable.
+            app.remote_remembered.insert(
+                "kov@box".to_string(),
+                std::iter::once("work".to_string()).collect(),
+            );
+            let dead = app.remembered_remotes();
+            assert_eq!(
+                dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+                vec![composite.as_str()],
+                "a member the host still remembers is relaunchable"
+            );
+            assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
+        });
+    }
+
+    #[test]
+    fn a_remembered_set_delivery_is_stashed_and_hints_a_reenumeration() {
+        // The watcher thread fetches the host's descriptor names alongside each
+        // listing push; the shell stashes them and re-sweeps, so a remote clean
+        // exit drops its tile without any user action.
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        app.on_user_event(
+            &fe,
+            UserEvent::RemoteRemembered {
+                target: "kov@box".to_string(),
+                names: Some(std::iter::once("work".to_string()).collect()),
+            },
+        );
+        assert_eq!(
+            app.remote_remembered.get("kov@box"),
+            Some(&std::iter::once("work".to_string()).collect()),
+            "the host's remembered-set is stashed"
+        );
+        assert!(
+            app.sessions_changed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a re-enumeration is hinted so the sweep re-judges remembered members"
+        );
+
+        // A failed fetch (older remote ghost, dropped transport) clears the
+        // cache: unknown must never be judged by a stale set.
+        app.on_user_event(
+            &fe,
+            UserEvent::RemoteRemembered {
+                target: "kov@box".to_string(),
+                names: None,
+            },
+        );
+        assert!(
+            !app.remote_remembered.contains_key("kov@box"),
+            "an unknown remembered-set clears the cached one"
+        );
+    }
+
+    #[test]
     fn prune_remotes_drops_hosts_no_live_window_references() {
         // Closing the window onto a host must stop polling it. Drive the real shell:
         // two connected hosts, one referenced by an ssh-group window, the other by
@@ -6548,6 +6711,10 @@ mod tests {
             app.register_remote(&b, "ghost");
             app.remote_infos.insert("kov@a".to_string(), Vec::new());
             app.remote_infos.insert("kov@b".to_string(), Vec::new());
+            app.remote_remembered
+                .insert("kov@a".to_string(), std::collections::HashSet::new());
+            app.remote_remembered
+                .insert("kov@b".to_string(), std::collections::HashSet::new());
 
             // A window that is an ssh group for host A references it; B is orphaned.
             let group = app.mint_group();
@@ -6570,6 +6737,11 @@ mod tests {
             assert!(
                 !app.remote_infos.contains_key("kov@b"),
                 "its cached listing is dropped too"
+            );
+            assert!(app.remote_remembered.contains_key("kov@a"));
+            assert!(
+                !app.remote_remembered.contains_key("kov@b"),
+                "its cached remembered-set is dropped too"
             );
         });
     }

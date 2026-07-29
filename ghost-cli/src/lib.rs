@@ -167,6 +167,14 @@ enum Command {
     /// runs it over ssh to decide transport-vs-ssh-child. Internal.
     #[command(name = "__probe", hide = true)]
     Probe,
+    /// Print the session names this machine still holds a descriptor for (one
+    /// JSON array) — its resurrection tickets, live sessions included. A remote
+    /// fleet fetches it alongside each listing to tell a session that exited
+    /// cleanly here (descriptor discarded: forget it) from one an unclean death
+    /// left resurrectable (descriptor kept: offer a relaunch). Run over ssh as
+    /// `ssh <host> -- ghost __remembered`. Internal; not for direct use.
+    #[command(name = "__remembered", hide = true)]
+    Remembered,
     /// Print the named session's protocol feature level (its `proto` marker), run
     /// over ssh as `ssh <host> -- ghost __proto <name>` so an initiator learns the
     /// level of the *running* host serving that session — which can predate the
@@ -468,6 +476,10 @@ fn dispatch(command: Command) {
             }
         }
         Command::Probe => println!("{}", ghost_vt::remote::probe_line()),
+        Command::Remembered => match serde_json::to_string(&ghost_vt::descriptor::all_names()) {
+            Ok(names) => println!("{names}"),
+            Err(e) => fail(&e.to_string()),
+        },
         // Addressed by immutable id, like `__pipe` — no display-name resolution.
         Command::Proto { name } => println!("{}", ghost_vt::client::session_proto(&name)),
         // Immutable id, like `__pipe`.

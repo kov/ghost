@@ -229,6 +229,49 @@ fn a_clean_child_exit_discards_the_sessions_durable_traces() {
     );
 }
 
+/// `ghost __remembered` — the machine-readable list of session names with a
+/// descriptor on disk (live and dead alike). A remote fleet fetches it over ssh
+/// to tell a session that exited cleanly on this host (discarded: absent here)
+/// from one an unclean death left resurrectable (still present).
+#[test]
+fn remembered_lists_descriptor_names_and_drops_a_killed_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let remembered = |xdg: &Path| -> Vec<String> {
+        let out = ghost(xdg)
+            .arg("__remembered")
+            .output()
+            .expect("run `ghost __remembered`");
+        assert!(
+            out.status.success(),
+            "`ghost __remembered` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("one JSON array of names")
+    };
+
+    assert_eq!(
+        remembered(xdg),
+        Vec::<String>::new(),
+        "an empty data dir remembers nothing"
+    );
+    spawn_and_settle(xdg, "alive", &["sh", "-c", "sleep 600"]);
+    let _guard = KillOnDrop { xdg, name: "alive" };
+    assert_eq!(
+        remembered(xdg),
+        vec!["alive".to_string()],
+        "a live session's descriptor is listed too"
+    );
+    // A kill discards the descriptor — the name must drop out.
+    let out = ghost(xdg).args(["kill", "alive"]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        remembered(xdg),
+        Vec::<String>::new(),
+        "a killed session is no longer remembered"
+    );
+}
+
 #[test]
 fn an_explicit_cwd_starts_the_child_there_not_where_the_spawner_ran() {
     let tmp = tempfile::tempdir().unwrap();

@@ -91,6 +91,71 @@ fn a_member_whose_descriptor_is_gone_is_forgotten_not_shown() {
     });
 }
 
+/// Typing `exit` / Ctrl-D ends a session for good: the child exits of its own
+/// accord, the host discards the durable traces on its way out, and nothing may
+/// keep offering to relaunch it — not the fleet the window falls back to, and
+/// not a later launch. (An *unclean* death — logout, reboot, crash — is the
+/// case that stays relaunchable; this is the clean one.)
+#[test]
+fn a_cleanly_exited_session_is_not_offered_for_relaunch() {
+    with_isolated_xdg(|_tmp| {
+        // `exec cat`: the child is `cat`, and the user's Ctrl-D is EOF — it
+        // exits 0, of its own accord, exactly like a shell quit by `exit`.
+        support::spawn_session_running("done-1", "echo done-1 ready; exec cat");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "done-1", group, None)
+            .expect("window");
+        app.wake(&fe);
+        assert!(
+            app.root(wid).expect("window").foregrounds("done-1"),
+            "precondition: the window drives the session"
+        );
+
+        // The user ends it from the keyboard.
+        app.dispatch(wid, UiEvent::Text("\u{4}".into()), &fe);
+
+        // With nothing else to show, the window falls back to the fleet.
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                app.wake(&fe);
+                app.root(wid).expect("window").is_fleet()
+            }),
+            "the window must fall back to the fleet once its only session exits; it shows: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        // And that fleet must not remember the session as a relaunchable corpse.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                reconcile(&mut app, wid, &fe);
+                app.wake(&fe);
+                let scene = app.root(wid).expect("window").view(app.states());
+                !sees_tile(&scene, "done-1") && !sees_text(&scene, "relaunch")
+            }),
+            "a cleanly-exited session must not be offered for relaunch; the fleet shows: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+        assert!(
+            !app.groups()
+                .iter()
+                .any(|g| g.members.iter().any(|m| m == "done-1")),
+            "its membership goes with it: {:?}",
+            app.groups()
+        );
+        assert!(
+            ghost_vt::descriptor::read("done-1").is_none(),
+            "a cleanly-exited session leaves no descriptor"
+        );
+        assert!(
+            !ghost_vt::paths::recording_path("done-1").exists(),
+            "a cleanly-exited session leaves no recording"
+        );
+    });
+}
+
 /// Alt-N / File > New Window with nothing detached must open a **new session**, not
 /// a fleet whose only content is sessions attached in other windows (whose only
 /// action is stealing them). The trigger in the wild is an old auto-group: a window

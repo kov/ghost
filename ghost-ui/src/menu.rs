@@ -40,6 +40,19 @@ pub enum UserEvent {
         target: String,
         infos: Vec<ghost_vt::session::SessionInfo>,
     },
+    /// The session names a remote host still holds a descriptor for (bare,
+    /// un-namespaced) — its resurrection tickets, fetched by the watcher thread
+    /// alongside each listing. The dead-member sweep uses it to tell a session
+    /// that exited cleanly on its host (forgotten there; forget it here too)
+    /// from one a reboot took down uncleanly (still remembered; relaunchable).
+    /// `None` means the set is UNKNOWN — the fetch failed (an older remote
+    /// ghost, a dropped transport) — and clears any cached set, so the sweep
+    /// falls back to conservative (not-listed members stay relaunchable) rather
+    /// than judging by a stale one.
+    RemoteRemembered {
+        target: String,
+        names: Option<std::collections::HashSet<String>>,
+    },
     /// The background half of an ssh connect finished (negotiate/stage/spawn ran
     /// off the event loop): the main loop attaches the window over the result.
     ConnectFinished {
