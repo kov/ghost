@@ -5688,6 +5688,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // the first-present retry loop below can stop.
                                 win.pacer.painted(now_ms);
                                 win.presented_ok = true;
+                                tracing::trace!(target: "ghost::present", window = ?id, showing = ?win.root.showing(), t = now_ms, "presented");
                                 // The foreground was just composited: reset its per-session
                                 // damage baseline so the next `view` measures change from
                                 // here (a Lost frame leaves the pending damage to fold into
@@ -5746,6 +5747,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // baseline, so a Clean loop over a stale frame stays visible
                                 // to the self-heal.
                                 win.pacer.painted(now_ms);
+                                tracing::trace!(target: "ghost::present", window = ?id, t = now_ms, "clean");
                                 let core = win.root.foreground_trace(&self.states);
                                 let pending = win.pacer.pending();
                                 win.render_trace.saw_outcome(
@@ -6167,6 +6169,7 @@ impl App {
                 self.sessions.remove(&name);
             }
             if !bytes.is_empty() || ended {
+                tracing::trace!(target: "ghost::present", session = %name, n = bytes.len(), "feed");
                 self.feed_driven_to_windows(&name, &bytes, ended, fe);
             }
             if ended {
@@ -6348,6 +6351,7 @@ impl App {
         for (id, w) in self.windows.iter_mut() {
             if w.release_repaint_due(now_ms) {
                 w.render_trace.saw_release(now_ms);
+                tracing::trace!(target: "ghost::present", window = ?id, t = now_ms, "release");
                 w.request_redraw();
             }
             // Once per pass, fold the foreground gate state and classify. Runs always

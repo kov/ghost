@@ -2708,6 +2708,16 @@ impl RootModel {
         }
     }
 
+    /// What this window is showing: the foreground session's id, or `None` in the
+    /// fleet overview. The label the shell's present/render traces need to say WHICH
+    /// window a line is about — a bare `WindowId` names nothing a human can act on.
+    pub fn showing(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Single { id, .. } => Some(id.as_str()),
+            Mode::Fleet(_) => None,
+        }
+    }
+
     /// Combined render scale (device × zoom) of the active view, so the shell
     /// rasterizes glyphs at the size the current scene was laid out for.
     pub fn render_scale(&self) -> f32 {
@@ -3410,6 +3420,32 @@ mod tests {
         // The previewing window still reacts to the one shared outcome (its tile is stale).
         assert_eq!(outs.len(), 1, "one command list per viewer");
         assert!(outs[0].contains(&Cmd::Redraw), "the preview repaints");
+    }
+
+    /// The label the shell's present/render traces hang a window's identity on. A
+    /// trace line that names only a `WindowId` tells a human nothing about WHICH
+    /// window is repainting — chasing a repaint storm across four windows meant
+    /// guessing which id was which from creation order. `showing` follows the mode:
+    /// the foreground session in a single view, `None` in the fleet overview, where
+    /// no one session owns the window.
+    #[test]
+    fn showing_names_the_foreground_session_and_nothing_in_the_fleet() {
+        let mut r = root(); // single view of alpha
+        assert_eq!(r.showing(), Some("alpha"));
+
+        // It tracks the mode rather than being set once: a child exit drops the
+        // window to the fleet, where there is no single foreground to name.
+        r.update(UiEvent::SessionData {
+            name: "alpha".to_string(),
+            bytes: Vec::new(),
+            ended: true,
+        });
+        assert!(r.is_fleet());
+        assert_eq!(
+            r.showing(),
+            None,
+            "the fleet overview has no single foreground to name"
+        );
     }
 
     #[test]
