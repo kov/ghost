@@ -659,7 +659,7 @@ fn new_window(
         if attrs.transparent {
             window.setOpaque(false);
             // See `set_transparent` for details on why we do this.
-            window.setBackgroundColor(unsafe { Some(&NSColor::clearColor()) });
+            window.setBackgroundColor(Some(&transparent_background_color()));
         }
 
         // register for drag and drop operations.
@@ -670,6 +670,33 @@ fn new_window(
 
         Some(window)
     })
+}
+
+/// The background colour a transparent window gets: see-through, but with a
+/// deliberately non-zero alpha.
+///
+/// Upstream uses `clearColor` (alpha 0), which is the obvious choice and is
+/// wrong: WindowServer recomposites a zero-alpha-background window CONTINUOUSLY
+/// for as long as it exists, even while the window draws nothing at all. One
+/// idle ghost window that had rendered a single frame roughly doubled this
+/// machine's idle GPU utilisation, and Quartz Debug showed it flashing without
+/// pause. Bisected to a bare AppKit window — no winit, no wgpu, no Metal layer,
+/// an event loop that never woke — which reproduced it from `backgroundColor`
+/// alone; the same window at alpha 0.001 was quiet. It is the zero, not
+/// `clearColor` itself: an explicit `colorWithWhite:0 alpha:0` reproduces it.
+///
+/// kitty carries the same workaround, arrived at independently for a cosmetic
+/// reason (`glfw/cocoa_window.m`: "prevent blurring of shadows at window corners
+/// with desktop background", `colorWithWhite:0 alpha:0.001`) — which is why a
+/// translucent kitty window cost a fraction of what ours did.
+///
+/// 0.001 is imperceptible: it sits behind window content that is already doing
+/// the real translucency, so what shows through changes by 0.1%.
+///
+/// Guarded by `ghost-ui/tests/window_macos.rs`, which asserts a translucent
+/// window's background alpha is never 0.
+fn transparent_background_color() -> Retained<NSColor> {
+    unsafe { NSColor::colorWithWhite_alpha(0.0, 0.001) }
 }
 
 impl WindowDelegate {
@@ -886,7 +913,7 @@ impl WindowDelegate {
         // the background color. As such, to allow the window to be transparent, we must also set
         // the background color to one with an empty alpha channel.
         let color = if transparent {
-            unsafe { NSColor::clearColor() }
+            transparent_background_color()
         } else {
             unsafe { NSColor::windowBackgroundColor() }
         };

@@ -166,6 +166,16 @@ pub fn run() {
         return;
     }
 
+    // `GHOST_WINDOW_DUMP` verifies how a TRANSLUCENT window is configured: open
+    // one the way the app does, print the compositing-relevant NSWindow state,
+    // and exit. A native window's state can't be read from the test process, so
+    // this is how it is asserted end-to-end (see `window_macos.rs`).
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("GHOST_WINDOW_DUMP").is_some() {
+        window_dump();
+        return;
+    }
+
     // `GHOST_ESCTEST` runs the terminal-conformance harness headlessly: spawn
     // the esctest child, drive the model over the PTY, and exit. See
     // [`esctest_host`] and `conformance/run.sh`.
@@ -179,6 +189,52 @@ pub fn run() {
     } else {
         interactive(fresh);
     }
+}
+
+/// Open one translucent window and print the NSWindow state that decides what
+/// the compositor has to do with it (the `GHOST_WINDOW_DUMP` probe), then exit.
+/// No session, no renderer, nothing drawn.
+///
+/// The load-bearing line is `bg_alpha`. A translucent window whose NSWindow
+/// background is `clearColor` — or ANY colour with alpha 0 — is recomposited by
+/// WindowServer continuously, forever, even while the window draws nothing:
+/// measured at roughly double this machine's idle GPU utilisation for a single
+/// idle window, and visible in Quartz Debug as a window that never stops
+/// flashing. Any non-zero alpha avoids it. kitty carries the same workaround for
+/// its own reasons (`glfw/cocoa_window.m`: `colorWithWhite:0 alpha:0.001`).
+#[cfg(target_os = "macos")]
+fn window_dump() {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSView, NSWindow};
+    struct DumpApp;
+    impl ApplicationHandler for DumpApp {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            // Created exactly as a translucent app window is — `with_transparent`
+            // is what pulls in the background colour we are asserting about.
+            let window = event_loop
+                .create_window(Window::default_attributes().with_transparent(true))
+                .expect("create window");
+            let ns: Retained<NSWindow> = {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let handle = window.window_handle().expect("window handle");
+                let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+                    panic!("not an AppKit window");
+                };
+                // SAFETY: on macOS the AppKit handle's `ns_view` is a live NSView
+                // owned by the window we just created.
+                let view: &NSView = unsafe { &*h.ns_view.as_ptr().cast::<NSView>() };
+                view.window().expect("the view is in a window")
+            };
+            let (opaque, bg_alpha) =
+                unsafe { (ns.isOpaque(), ns.backgroundColor().alphaComponent()) };
+            println!("opaque={opaque}");
+            println!("bg_alpha={bg_alpha}");
+            event_loop.exit();
+        }
+        fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    }
+    let event_loop = EventLoop::new().expect("event loop");
+    let _ = event_loop.run_app(&mut DumpApp);
 }
 
 /// Drive a minimal event loop just far enough to install and print the native
