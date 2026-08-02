@@ -101,7 +101,10 @@ impl Screen {
                     screen.feed(data);
                 }
                 Item::Resize { cols, rows, .. } => screen.resize(*cols, *rows),
-                Item::Checkpoint { .. } => {}
+                // Input is archived, never replayed: what the user typed is not
+                // what the terminal drew, and feeding it here would paint the
+                // keystrokes over the screen they were meant to drive.
+                Item::Input { .. } | Item::Checkpoint { .. } => {}
             }
         }
         screen

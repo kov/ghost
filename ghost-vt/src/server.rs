@@ -2028,6 +2028,26 @@ fn service_display_client(
     Ok(disposition)
 }
 
+/// Whether the child is sitting at a *hidden* prompt: canonical mode with echo
+/// off, the shape `sudo`, `ssh` and `read -s` use to ask for a password. Those
+/// keystrokes reach no screen, so they have never appeared in a recording, and
+/// recording input must not be what puts them there.
+///
+/// A full-screen program is unaffected — raw mode clears `ICANON`, so a TUI's
+/// input is recorded in full, which is the case the input recording exists for.
+/// When the mode cannot be read at all we assume the worst and stay quiet: a
+/// leaked password is silent and permanent, while a recording that is missing
+/// its input is caught by the end-to-end test on the next run.
+fn hidden_prompt(pty: &pty_process::blocking::Pty) -> bool {
+    use rustix::termios::LocalModes;
+    match rustix::termios::tcgetattr(pty.as_fd()) {
+        Ok(t) => {
+            t.local_modes.contains(LocalModes::ICANON) && !t.local_modes.contains(LocalModes::ECHO)
+        }
+        Err(_) => true,
+    }
+}
+
 /// Process a batch of decoded client messages: write input to the PTY, apply
 /// resizes, handle renames and repaints. A Resize sets `c.resynced` (and queues
 /// the repaint), which is how the caller knows the connection is an attach client
@@ -2050,6 +2070,11 @@ fn handle_client_messages(
     for msg in msgs {
         match msg {
             ClientMsg::Input(bytes) => {
+                if let Some(r) = recorder
+                    && !hidden_prompt(pty)
+                {
+                    let _ = r.input(&bytes);
+                }
                 pty_out.extend_from_slice(&bytes);
             }
             ClientMsg::Resize { cols, rows } => {

@@ -352,3 +352,146 @@ fn export_produces_valid_asciicast() {
         "exported asciicast missing the output; got:\n{cast}"
     );
 }
+
+/// A `ghost` command wired to the temp XDG dirs.
+fn ghost_cmd(run: &Path, data: &Path) -> Command {
+    let mut c = Command::new(GHOST);
+    c.env("XDG_RUNTIME_DIR", run).env("XDG_DATA_HOME", data);
+    c
+}
+
+/// Start a detached session running `script` under `sh -c`.
+fn spawn_recorded(run: &Path, data: &Path, name: &str, script: &str) {
+    let out = ghost_cmd(run, data)
+        .args(["new", name, "-d", "--", "sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Attach a display client straight to the session's socket, so it ignores this
+/// test process's own environment.
+fn attach_to(run: &Path, name: &str) -> ghost_vt::client::Session {
+    let sock = run.join("ghost").join(name).join("sock");
+    assert!(
+        wait_until(Duration::from_secs(15), || sock.exists()),
+        "{name}: control socket never appeared at {}",
+        sock.display()
+    );
+    let s = ghost_vt::client::Session::attach_path(&sock, name, 80, 24).expect("attach a client");
+    s.set_nonblocking(true).expect("non-blocking session");
+    s
+}
+
+/// Read live output until it shows `needle` — read-until-predicate, never a
+/// sleep. The child's own print is the only sound signal that it has reached the
+/// line we care about (the recording is buffered, so it cannot answer this).
+fn wait_for_live_output(s: &mut ghost_vt::client::Session, needle: &str) -> bool {
+    let mut seen = String::new();
+    wait_until(Duration::from_secs(15), || {
+        if let Ok(p) = s.pump() {
+            seen.push_str(&String::from_utf8_lossy(&p.output));
+        }
+        seen.contains(needle)
+    })
+}
+
+/// The exported asciicast for `name`.
+fn export_cast(run: &Path, data: &Path, name: &str) -> String {
+    let out = ghost_cmd(run, data)
+        .args(["export", name])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost export` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The payloads of the asciicast's `"i"` (input) events, in order.
+fn input_events(cast: &str) -> Vec<String> {
+    cast.lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|ev| ev[1] == "i")
+        .filter_map(|ev| ev[2].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A recording holds what the terminal *drew*, which is only half of an
+/// incident: when a session stops responding to the keyboard, the question is
+/// what we sent it, and today the only way to answer that is to strace the host
+/// while it is still wedged. Record the input beside the output it caused.
+#[test]
+fn input_sent_to_the_child_is_recorded() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-input";
+
+    spawn_recorded(
+        run.path(),
+        data.path(),
+        name,
+        "read -r x; echo RECORDED-MARKER; kill -TERM $$",
+    );
+    let mut s = attach_to(run.path(), name);
+    s.send_input(b"KEYSTROKE-MARKER\n").expect("send input");
+    let _ = s.pump();
+
+    assert!(
+        wait_for_recording_marker(&recording_path(data.path(), name), "RECORDED-MARKER"),
+        "session never ran to completion"
+    );
+    drop(s);
+
+    let cast = export_cast(run.path(), data.path(), name);
+    assert!(
+        input_events(&cast)
+            .iter()
+            .any(|d| d.contains("KEYSTROKE-MARKER")),
+        "no `i` event carrying what we typed; export was:\n{cast}"
+    );
+}
+
+/// ...but never a password. At a hidden prompt — canonical mode with echo off —
+/// the keystrokes reach no screen today, so recording them would put secrets in
+/// a file that has never held them. A TUI (raw mode, echo off but canonical off
+/// too) is unaffected, which is the case the input recording exists for.
+#[test]
+fn input_at_a_hidden_prompt_stays_out_of_the_recording() {
+    let run = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let name = "rec-secret";
+
+    spawn_recorded(
+        run.path(),
+        data.path(),
+        name,
+        "stty -echo; echo READY; read -r secret; stty echo; echo RECORDED-MARKER; kill -TERM $$",
+    );
+    let mut s = attach_to(run.path(), name);
+    assert!(
+        wait_for_live_output(&mut s, "READY"),
+        "child never disabled echo"
+    );
+    s.send_input(b"hunter2-SECRET\n").expect("send input");
+    let _ = s.pump();
+
+    assert!(
+        wait_for_recording_marker(&recording_path(data.path(), name), "RECORDED-MARKER"),
+        "session never ran to completion"
+    );
+    drop(s);
+
+    let cast = export_cast(run.path(), data.path(), name);
+    assert!(
+        !cast.contains("hunter2-SECRET"),
+        "a password typed at a hidden prompt reached the recording:\n{cast}"
+    );
+}

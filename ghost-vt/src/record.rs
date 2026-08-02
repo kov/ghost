@@ -10,6 +10,13 @@
 //! distinct roles that share this format: a checkpoint is the emulator's
 //! serialized state, and the frames between checkpoints are the raw output.
 //!
+//! Events carry both directions. Output is what the child drew; [`Item::Input`]
+//! is what we sent it — the keystrokes, mouse reports and query replies that
+//! caused the drawing. Only output replays (see [`Recording::output_bytes`]);
+//! input is archived so an incident can be read after the fact instead of
+//! needing a live `strace` on the host while it is still misbehaving. Input
+//! typed at a hidden prompt is never recorded — see `server::hidden_prompt`.
+//!
 //! ## Layout
 //!
 //! ```text
@@ -107,6 +114,10 @@ enum EventBody {
     Output(Vec<u8>),
     /// A window-size change.
     Resize { cols: u16, rows: u16 },
+    /// Bytes we sent *into* the child: keystrokes, mouse reports, paste, query
+    /// replies. New variants go last — postcard identifies a variant by its
+    /// index, so appending keeps every recording written before this readable.
+    Input(Vec<u8>),
 }
 
 /// A single timed event (on-wire).
@@ -189,6 +200,11 @@ struct Checkpoint {
 pub enum Item {
     /// Bytes the terminal emitted, at `t_ms` since session start.
     Output { t_ms: u64, data: Vec<u8> },
+    /// Bytes sent *into* the child — what the keyboard, mouse and paste actually
+    /// delivered. Deliberately excluded from [`Recording::output_bytes`] and so
+    /// from every replay: feeding these to the emulator would paint the
+    /// keystrokes onto the reconstructed screen.
+    Input { t_ms: u64, data: Vec<u8> },
     /// A window-size change.
     Resize { t_ms: u64, cols: u16, rows: u16 },
     /// A full-state checkpoint: a safe point to start replay from.
@@ -281,6 +297,11 @@ impl FileRecorder {
         self.inner.output(bytes)
     }
 
+    /// Record a chunk of input sent to the child.
+    pub fn input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.input(bytes)
+    }
+
     /// Record a window-size change.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.inner.resize(cols, rows)
@@ -368,6 +389,7 @@ fn last_t_ms(bytes: &[u8]) -> u64 {
                 .iter()
                 .map(|i| match i {
                     Item::Output { t_ms, .. }
+                    | Item::Input { t_ms, .. }
                     | Item::Resize { t_ms, .. }
                     | Item::Checkpoint { t_ms, .. } => *t_ms,
                 })
@@ -458,6 +480,21 @@ impl<W: Write> Recorder<W> {
         self.pending.push(Event {
             t_ms: self.elapsed_ms(),
             body: EventBody::Output(bytes.to_vec()),
+        });
+        self.pending_bytes += bytes.len();
+        if self.pending_bytes >= FLUSH_THRESHOLD {
+            self.flush_frame()?;
+        }
+        Ok(())
+    }
+
+    /// Record a chunk of input sent to the child. Counts toward the same frame
+    /// budget as output: input is tiny beside what it makes the child draw, so
+    /// it rides along in whatever frame is open rather than forcing its own.
+    pub fn input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.pending.push(Event {
+            t_ms: self.elapsed_ms(),
+            body: EventBody::Input(bytes.to_vec()),
         });
         self.pending_bytes += bytes.len();
         if self.pending_bytes >= FLUSH_THRESHOLD {
@@ -645,6 +682,7 @@ pub fn read_bytes(bytes: &[u8]) -> io::Result<Recording> {
                 for e in frame {
                     items.push(match e.body {
                         EventBody::Output(data) => Item::Output { t_ms: e.t_ms, data },
+                        EventBody::Input(data) => Item::Input { t_ms: e.t_ms, data },
                         EventBody::Resize { cols, rows } => Item::Resize {
                             t_ms: e.t_ms,
                             cols,
@@ -834,6 +872,7 @@ pub fn write_asciicast<W: Write>(rec: &Recording, out: &mut W) -> io::Result<()>
     for (i, item) in rec.items.iter().enumerate() {
         let (t_ms, kind, data) = match item {
             Item::Output { t_ms, data } => (*t_ms, "o", String::from_utf8_lossy(data).into_owned()),
+            Item::Input { t_ms, data } => (*t_ms, "i", String::from_utf8_lossy(data).into_owned()),
             Item::Resize { t_ms, cols, rows } => (*t_ms, "r", format!("{cols}x{rows}")),
             // A leading checkpoint reconstructs the starting screen; emit its
             // dump as the first output. Mid-stream ones add nothing playable.
@@ -940,6 +979,7 @@ mod tests {
             .iter()
             .map(|i| match i {
                 Item::Output { data, .. } => ("o", data.clone(), 0, 0),
+                Item::Input { data, .. } => ("i", data.clone(), 0, 0),
                 Item::Resize { cols, rows, .. } => ("r", Vec::new(), *cols, *rows),
                 Item::Checkpoint { .. } => ("c", Vec::new(), 0, 0),
             })
@@ -958,6 +998,7 @@ mod tests {
     fn item_t_ms(i: &Item) -> u64 {
         match i {
             Item::Output { t_ms, .. }
+            | Item::Input { t_ms, .. }
             | Item::Resize { t_ms, .. }
             | Item::Checkpoint { t_ms, .. } => *t_ms,
         }
