@@ -76,6 +76,9 @@ pub enum UserEvent {
     /// instead of starting a rival process — posted from the single-instance
     /// listener thread (see [`crate::instance`]).
     OpenWindow,
+    /// Same, but the launch was `ghost --ssh-window` (the desktop entry's "New SSH
+    /// Window" action): the owner opens a window showing the connect prompt.
+    OpenSshWindow,
     /// A background restore reconnect reached a remote host (its ControlMaster is
     /// open and `remote_ghost` is usable) — posted by the reconnect worker thread
     /// so the main loop registers the host and re-adopts its remembered sessions

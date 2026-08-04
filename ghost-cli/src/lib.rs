@@ -26,6 +26,11 @@ struct Cli {
     /// for a bare launch (with a subcommand there is nothing to restore).
     #[arg(long, global = true)]
     fresh: bool,
+    /// Open the "connect to a host" prompt in the new window — the windowed UI's
+    /// new-ssh-window shortcut (Alt+S / Cmd+S) as a launch option, so a desktop
+    /// entry's action can ask for it. Only meaningful for a bare launch.
+    #[arg(long)]
+    ssh_window: bool,
 }
 
 #[derive(Subcommand)]
@@ -225,8 +230,9 @@ pub enum Launch {
     /// A subcommand ran to completion; the process should exit.
     Handled,
     /// No subcommand — launch the windowed UI. `fresh` skips restoring the
-    /// windows open at last quit.
-    Gui { fresh: bool },
+    /// windows open at last quit; `ssh_window` opens the connect prompt instead
+    /// of a normal window.
+    Gui { fresh: bool, ssh_window: bool },
 }
 
 /// Parse the command line; if it names a subcommand, run it and return
@@ -241,7 +247,10 @@ pub fn run_subcommand() -> Launch {
             dispatch(command);
             Launch::Handled
         }
-        None => Launch::Gui { fresh: cli.fresh },
+        None => Launch::Gui {
+            fresh: cli.fresh,
+            ssh_window: cli.ssh_window,
+        },
     }
 }
 
@@ -606,6 +615,18 @@ mod tests {
         let cli = Cli::try_parse_from(["ghost", "--fresh"]).unwrap();
         assert!(cli.command.is_none(), "--fresh is not a subcommand");
         assert!(cli.fresh);
+    }
+
+    #[test]
+    fn a_bare_ssh_window_flag_asks_the_gui_for_the_connect_prompt() {
+        // The desktop entry's "New SSH Window" action launches `ghost --ssh-window`,
+        // which must behave like the in-app shortcut (Alt+S): a windowed launch that
+        // opens the connect prompt, not a subcommand.
+        let cli = Cli::try_parse_from(["ghost", "--ssh-window"]).unwrap();
+        assert!(cli.command.is_none(), "--ssh-window is not a subcommand");
+        assert!(cli.ssh_window);
+        // And a plain bare launch leaves it off.
+        assert!(!Cli::try_parse_from(["ghost"]).unwrap().ssh_window);
     }
 
     #[test]

@@ -17,9 +17,33 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-/// The request a later launch sends the owner. A single byte — its arrival is
-/// the whole message ("open a new window"); the content is reserved for later.
-const NEW_WINDOW: &[u8] = b"w";
+/// What a later launch asks the owner to open. Sent as the single byte the
+/// protocol has always carried, so an older owner reading `w` still opens a
+/// window; an unknown byte degrades to a plain window rather than nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Request {
+    /// A bare `ghost`: open a new window like File > New Window.
+    NewWindow,
+    /// `ghost --ssh-window` (the desktop entry's action, the Alt+S shortcut):
+    /// open a window showing the "connect to a host" prompt.
+    NewSshWindow,
+}
+
+impl Request {
+    fn byte(self) -> u8 {
+        match self {
+            Request::NewWindow => b'w',
+            Request::NewSshWindow => b's',
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        match b {
+            b's' => Request::NewSshWindow,
+            _ => Request::NewWindow,
+        }
+    }
+}
 
 /// This process's role in the single-instance protocol, decided at launch by
 /// [`acquire`].
@@ -37,14 +61,15 @@ pub enum Role {
     Secondary,
 }
 
-/// Decide this process's [`Role`] against the real runtime dir.
-pub fn acquire() -> Role {
-    acquire_in(&ghost_vt::paths::runtime_dir())
+/// Decide this process's [`Role`] against the real runtime dir. `want` is what
+/// this launch asked for, forwarded to the owner when there already is one.
+pub fn acquire(want: Request) -> Role {
+    acquire_in(&ghost_vt::paths::runtime_dir(), want)
 }
 
 /// [`acquire`] over an explicit runtime `dir`, so it can be tested against a
 /// tempdir without touching the process's real XDG location or env.
-fn acquire_in(dir: &Path) -> Role {
+fn acquire_in(dir: &Path, want: Request) -> Role {
     let _ = std::fs::create_dir_all(dir);
     let lock_path = dir.join("ui.lock");
     let sock_path = dir.join("ui.sock");
@@ -78,7 +103,7 @@ fn acquire_in(dir: &Path) -> Role {
         }
         // Held by a live owner: forward a new-window request and step aside.
         Err(rustix::io::Errno::WOULDBLOCK) => {
-            forward(&sock_path);
+            forward(&sock_path, want);
             Role::Secondary
         }
         // An odd lock error: run standalone rather than risk exiting silently.
@@ -89,12 +114,13 @@ fn acquire_in(dir: &Path) -> Role {
     }
 }
 
-/// Ask the running owner to open a new window. Best effort, with a short retry to
-/// cover the sliver between the owner taking the lock and binding the socket.
-fn forward(sock_path: &Path) {
+/// Ask the running owner to open a window of the kind this launch wanted. Best
+/// effort, with a short retry to cover the sliver between the owner taking the
+/// lock and binding the socket.
+fn forward(sock_path: &Path, want: Request) {
     for attempt in 0..10 {
         if let Ok(mut s) = UnixStream::connect(sock_path) {
-            let _ = s.write_all(NEW_WINDOW);
+            let _ = s.write_all(&[want.byte()]);
             return;
         }
         if attempt < 9 {
@@ -103,19 +129,25 @@ fn forward(sock_path: &Path) {
     }
 }
 
-/// Spawn the owner's accept loop: run `on_request` once per forwarded request.
-/// Consumes `listener` and runs until the process exits.
+/// Spawn the owner's accept loop: run `on_request` once per forwarded request,
+/// with the kind of window it asked for. Consumes `listener` and runs until the
+/// process exits.
 pub fn serve<F>(listener: UnixListener, on_request: F)
 where
-    F: Fn() + Send + 'static,
+    F: Fn(Request) + Send + 'static,
 {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            // Drain the tiny request; its arrival is the signal.
+            // Read the tiny request; a short/failed read still means "a launch
+            // happened", so fall back to a plain window rather than dropping it.
             let mut buf = [0u8; 8];
-            let _ = conn.read(&mut buf);
-            on_request();
+            let n = conn.read(&mut buf).unwrap_or(0);
+            on_request(if n > 0 {
+                Request::from_byte(buf[0])
+            } else {
+                Request::NewWindow
+            });
         }
     });
 }
@@ -133,24 +165,63 @@ mod tests {
     }
 
     #[test]
+    fn a_forwarded_launch_carries_which_kind_of_window_was_asked_for() {
+        // The desktop entry's "New SSH Window" action runs `ghost --ssh-window`
+        // against an already-running ghost, so what reaches the owner must say
+        // *connect prompt*, not just "a window".
+        let dir = scratch("kind");
+        let Role::Primary {
+            listener: Some(listener),
+            _lock,
+        } = acquire_in(&dir, Request::NewWindow)
+        else {
+            panic!("the first launch should be the owner");
+        };
+        let (tx, rx) = mpsc::channel();
+        serve(listener, move |req| {
+            let _ = tx.send(req);
+        });
+        assert!(matches!(
+            acquire_in(&dir, Request::NewSshWindow),
+            Role::Secondary
+        ));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Request::NewSshWindow,
+            "the owner is told to open a connect window"
+        );
+        assert!(matches!(
+            acquire_in(&dir, Request::NewWindow),
+            Role::Secondary
+        ));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Request::NewWindow,
+            "a plain launch still asks for a plain window"
+        );
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_second_launch_steps_aside_and_forwards_a_new_window_request() {
         let dir = scratch("forward");
         // The first launch owns the runtime dir.
         let Role::Primary {
             listener: Some(listener),
             _lock,
-        } = acquire_in(&dir)
+        } = acquire_in(&dir, Request::NewWindow)
         else {
             panic!("the first launch should be the owner");
         };
         let (tx, rx) = mpsc::channel();
-        serve(listener, move || {
+        serve(listener, move |_| {
             let _ = tx.send(());
         });
         // A second launch against the same dir can't take the lock: it becomes a
         // secondary and forwards a new-window request to the owner.
         assert!(
-            matches!(acquire_in(&dir), Role::Secondary),
+            matches!(acquire_in(&dir, Request::NewWindow), Role::Secondary),
             "the second launch steps aside"
         );
         assert!(
@@ -166,10 +237,13 @@ mod tests {
         let dir = scratch("reclaim");
         // Own it, then drop the guard at the end of this statement — modelling the
         // previous instance exiting, which releases the lock.
-        assert!(matches!(acquire_in(&dir), Role::Primary { .. }));
+        assert!(matches!(
+            acquire_in(&dir, Request::NewWindow),
+            Role::Primary { .. }
+        ));
         // A later launch reclaims ownership rather than becoming a secondary.
         assert!(
-            matches!(acquire_in(&dir), Role::Primary { .. }),
+            matches!(acquire_in(&dir, Request::NewWindow), Role::Primary { .. }),
             "the freed lock is reclaimed by the next launch"
         );
         let _ = std::fs::remove_dir_all(&dir);

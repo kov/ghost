@@ -131,6 +131,13 @@ fn cycle_index(count: usize, current: Option<usize>, forward: bool) -> Option<us
     })
 }
 
+/// ghost's application identity: the macOS bundle's `CFBundleIdentifier`, the
+/// freedesktop `.desktop` entry's file name, and the app id / WM_CLASS every
+/// window carries — one string, so a platform can tie the running window back to
+/// the installed application (icon, dock grouping, desktop actions). Packaging
+/// lives in `xtask`, whose `APP_ID` must stay equal to this.
+pub const APP_ID: &str = "dev.ghost.Terminal";
+
 /// The whole program, behind a library entry point so the shell stays testable
 /// (see the crate docs). `src/bin/ghost.rs` is just `ghost_ui::run()`.
 pub fn run() {
@@ -140,9 +147,9 @@ pub fn run() {
     // `ghost <subcommand>` (ls/attach/new/…) is the CLI; it runs and exits. A bare
     // `ghost` has no subcommand and falls through to the windowed UI below, carrying
     // the `--fresh` flag (skip restoring the last-quit windows) into it.
-    let fresh = match ghost_cli::run_subcommand() {
+    let (fresh, ssh_window) = match ghost_cli::run_subcommand() {
         ghost_cli::Launch::Handled => return,
-        ghost_cli::Launch::Gui { fresh } => fresh,
+        ghost_cli::Launch::Gui { fresh, ssh_window } => (fresh, ssh_window),
     };
 
     // A bundled launch (Finder/launchd) lands us at `/`; point new GUI sessions at
@@ -187,7 +194,7 @@ pub fn run() {
     if let Some(path) = std::env::var_os("GHOST_CAPTURE") {
         capture(PathBuf::from(path));
     } else {
-        interactive(fresh);
+        interactive(fresh, ssh_window);
     }
 }
 
@@ -1518,6 +1525,9 @@ enum Startup {
     Single(String),
     /// Open the fleet overview — something to reconnect to, or nothing saved.
     Fleet,
+    /// Open the "connect to a host" prompt (`ghost --ssh-window`): the launch-time
+    /// twin of the new-ssh-window shortcut.
+    Connect,
 }
 
 /// Turn the saved workspace into a per-window restore plan. A record whose group
@@ -1623,7 +1633,7 @@ fn spawn_dead(id: &str) -> bool {
     }
 }
 
-fn interactive(fresh: bool) {
+fn interactive(fresh: bool, ssh_window: bool) {
     // Route instrumentation (cache stats, ...) to stderr under `RUST_LOG`. Off unless
     // asked — e.g. `RUST_LOG=ghost::cache=trace` watches cache hit-rates live — so the
     // instrumented code stays free in normal runs.
@@ -1645,7 +1655,12 @@ fn interactive(fresh: bool) {
     let (_instance_lock, instance_listener) = if harness.is_some() {
         (None, None)
     } else {
-        match instance::acquire() {
+        let want = if ssh_window {
+            instance::Request::NewSshWindow
+        } else {
+            instance::Request::NewWindow
+        };
+        match instance::acquire(want) {
             instance::Role::Secondary => return,
             instance::Role::Primary { _lock, listener } => (_lock, listener),
         }
@@ -1654,6 +1669,10 @@ fn interactive(fresh: bool) {
     let workspace = windows::load();
     let startup = if harness.is_some() {
         Startup::Fleet // the harness populates and dives it
+    } else if ssh_window {
+        // `--ssh-window` is an explicit ask: skip the restore/reconnect choice and
+        // open the connect prompt, exactly like the in-app shortcut.
+        Startup::Connect
     } else {
         let requested = std::env::var("GHOST_SESSION").ok();
         let sessions = session::list().unwrap_or_default();
@@ -1691,8 +1710,11 @@ fn interactive(fresh: bool) {
     let sink: Arc<dyn EventSink> = Arc::new(proxy.clone());
     if let Some(listener) = instance_listener {
         let sink = sink.clone();
-        instance::serve(listener, move || {
-            sink.post(UserEvent::OpenWindow);
+        instance::serve(listener, move |req| {
+            sink.post(match req {
+                instance::Request::NewWindow => UserEvent::OpenWindow,
+                instance::Request::NewSshWindow => UserEvent::OpenSshWindow,
+            });
         });
     }
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
@@ -1920,6 +1942,16 @@ impl Graphics {
             .with_maximized(maximized)
             .with_transparent(want_transparent)
             .with_blur(glass(want_transparent, false, 0.0).blur);
+        // Freedesktop platforms match a window to its `.desktop` entry (icon, dock
+        // grouping, the entry's actions) by app id / WM_CLASS, so it must be
+        // [`APP_ID`] — the name the installed entry is filed under.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "ghost");
+            WindowAttributesExtX11::with_name(attrs, APP_ID, "ghost")
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // `theme.frost` arrives holding the configured density; keep it only where
         // the compositor isn't blurring for us, so glass is never drawn twice.
@@ -4910,6 +4942,32 @@ impl App {
     /// Ctrl+Shift+S): a fresh fleet window on its own group, flipped into the
     /// connect state so it captures a `[user@]host` and, on submit, becomes an
     /// ssh window (see the `Cmd::ConnectSshWindow` handler).
+    /// Open the windows this launch asked for (consuming [`App::startup`]).
+    /// Returns whether anything opened — `false` means there is nothing to show
+    /// and the process should exit.
+    pub fn open_startup_windows(&mut self, event_loop: &dyn Frontend) -> bool {
+        // Consumed once (the caller's guard keeps this from re-running); the
+        // placeholder is never used.
+        match std::mem::replace(&mut self.startup, Startup::Fleet) {
+            Startup::Restore(records) => self.restore_workspace(event_loop, records),
+            Startup::Fleet => {
+                let group = self.mint_group();
+                self.open_fleet_window(event_loop, group, None);
+            }
+            Startup::Connect => self.open_connect_window(event_loop),
+            Startup::Single(name) => {
+                let group = self.mint_group();
+                if self
+                    .open_single_window(event_loop, &name, group, None)
+                    .is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn open_connect_window(&mut self, event_loop: &dyn Frontend) {
         let group = self.mint_group();
         let wid = self.open_fleet_window(event_loop, group, None);
@@ -5539,6 +5597,13 @@ impl App {
                 menu::activate();
                 return;
             }
+            // Same, for a launch that asked for an ssh window (`ghost --ssh-window`,
+            // the desktop entry's action): open the connect prompt in a new window.
+            UserEvent::OpenSshWindow => {
+                self.open_connect_window(fe);
+                menu::activate();
+                return;
+            }
             // A startup restore reconnect reached a host: register it and re-adopt
             // its remembered sessions into their restored windows.
             UserEvent::RemoteReconnected { spec, remote_ghost } => {
@@ -5606,21 +5671,9 @@ impl ApplicationHandler<UserEvent> for App {
         if !self.windows.is_empty() {
             return;
         }
-        // Consumed once (this guard keeps `resumed` from re-running); the
-        // placeholder is never used.
-        match std::mem::replace(&mut self.startup, Startup::Fleet) {
-            Startup::Restore(records) => self.restore_workspace(&fe, records),
-            Startup::Fleet => {
-                let group = self.mint_group();
-                self.open_fleet_window(&fe, group, None);
-            }
-            Startup::Single(name) => {
-                let group = self.mint_group();
-                if self.open_single_window(&fe, &name, group, None).is_none() {
-                    fe.exit();
-                    return;
-                }
-            }
+        if !self.open_startup_windows(&fe) {
+            fe.exit();
+            return;
         }
         // Install the native macOS menu bar once the app is running (it appends
         // ghost's File / Edit / View / Window submenus to the App submenu winit
@@ -6829,6 +6882,52 @@ mod tests {
         assert_ne!(first, second);
         // The legacy hardcoded prefix is gone.
         assert!(!first.starts_with("ghost-ui-"));
+    }
+
+    #[test]
+    fn launching_for_an_ssh_window_opens_the_connect_prompt() {
+        // `ghost --ssh-window` (the desktop entry's "New SSH Window" action) with no
+        // ghost running: the first window it opens is the connect prompt.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            app.startup = crate::Startup::Connect;
+            let fe = HeadlessFrontend::new();
+            assert!(app.open_startup_windows(&fe));
+            let wid = *app.windows.keys().next().expect("a window opened");
+            assert!(
+                app.windows[&wid].root.is_connecting(),
+                "the launch lands on the connect prompt"
+            );
+        });
+    }
+
+    #[test]
+    fn a_forwarded_ssh_window_request_opens_the_connect_prompt() {
+        // With a ghost already running, the action's launch forwards its request to
+        // the owner instead — which must open a *connect* window, not a plain one.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let existing = app.open_fleet_window(&fe, group, None);
+
+            app.on_user_event(&fe, UserEvent::OpenSshWindow);
+
+            assert_eq!(app.windows.len(), 2, "the request opens a new window");
+            let wid = *app
+                .windows
+                .keys()
+                .find(|w| **w != existing)
+                .expect("the new window");
+            assert!(
+                app.windows[&wid].root.is_connecting(),
+                "the forwarded ssh request opens the connect prompt"
+            );
+            assert!(
+                !app.windows[&existing].root.is_connecting(),
+                "the window that was already open is left alone"
+            );
+        });
     }
 
     #[test]
