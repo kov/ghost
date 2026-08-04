@@ -34,6 +34,22 @@ cargo build --release          # binary at target/release/ghost
 The one `ghost` binary is both halves: a bare `ghost` opens the windowed GPU
 terminal; `ghost <subcommand>` runs the CLI and exits.
 
+### Install
+
+```sh
+cargo xtask install                  # macOS: build + /Applications/ghost.app
+cargo xtask install                  # elsewhere: freedesktop install into ~/.local
+cargo xtask install --prefix /usr    # …or any prefix ($GHOST_PREFIX works too)
+```
+
+A freedesktop install drops `bin/ghost`, `share/applications/dev.ghost.Terminal.desktop`
+and `share/icons/hicolor/scalable/apps/dev.ghost.Terminal.svg` (the same artwork the
+macOS `.icns` is rendered from) under the prefix. The desktop entry carries a **New
+SSH Window** action — the launcher/dock twin of `Alt-S` — which starts `ghost
+--ssh-window`: with a ghost already running, that hands the request to it instead of
+starting a rival process. Windows carry `dev.ghost.Terminal` as their app id, so the
+compositor ties them back to the entry.
+
 ## The window (bare `ghost`)
 
 Launch `ghost` with no arguments and you get a native, GPU-rendered terminal

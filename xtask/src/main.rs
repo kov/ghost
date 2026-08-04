@@ -2,7 +2,10 @@
 //!
 //! * `cargo xtask bundle`  — build `ghost` in release and assemble
 //!   `target/release/ghost.app`.
-//! * `cargo xtask install` — bundle, then copy the `.app` into `/Applications`.
+//! * `cargo xtask install` — on macOS, bundle and copy the `.app` into
+//!   `/Applications`; elsewhere a freedesktop install into `--prefix <dir>`
+//!   (default `$HOME/.local`): `bin/ghost`, the `.desktop` entry in
+//!   `share/applications`, and the icon in the hicolor theme.
 //! * `cargo xtask icon`    — regenerate `assets/ghost.icns` from the SVG.
 //! * `cargo xtask prebuilt [<triple>…]` — cross-build the headless `ghost-host`
 //!   for each target and drop it in the prebuilt dir as `ghost-<os>-<arch>`, where
@@ -25,12 +28,22 @@ type R<T> = Result<T, Box<dyn Error>>;
 
 /// `<bundle>.app` directory name.
 const BUNDLE_NAME: &str = "ghost.app";
-/// Must match `APP_ID` in `ghost`'s `main.rs`.
+/// Must match `ghost_ui::APP_ID` (the app id every window carries).
 const APP_ID: &str = "dev.ghost.Terminal";
 /// The bundle executable (`CFBundleExecutable`) — the real `ghost` binary.
 const EXECUTABLE: &str = "ghost";
 /// Basename of the icon inside the bundle (and the `CFBundleIconFile` value).
 const ICON_NAME: &str = "ghost.icns";
+/// Freedesktop icon name — the app id, so a `.desktop` file named after the id
+/// and a window carrying it as its app id both resolve to the same artwork.
+const ICON_ID: &str = APP_ID;
+
+/// The `.desktop` entry shipped in `assets/`, installed verbatim.
+fn desktop_asset() -> PathBuf {
+    manifest_dir()
+        .join("assets")
+        .join(format!("{APP_ID}.desktop"))
+}
 
 /// Everything `assemble_bundle` needs, with no I/O of its own to discover — so
 /// it stays a pure, testable transform from inputs to an on-disk bundle.
@@ -62,7 +75,9 @@ fn run() -> R<()> {
             let app = bundle()?;
             println!("built {}", app.display());
         }
-        Some("install") => {
+        // macOS installs the `.app`; everywhere else it is a freedesktop install
+        // (binary on PATH + `.desktop` entry + hicolor icon).
+        Some("install") if cfg!(target_os = "macos") => {
             let app = bundle()?;
             let dest = Path::new("/Applications").join(BUNDLE_NAME);
             if dest.exists() {
@@ -70,6 +85,18 @@ fn run() -> R<()> {
             }
             copy_dir(&app, &dest)?;
             println!("installed {}", dest.display());
+        }
+        Some("install") => {
+            let prefix = install_prefix(&std::env::args().skip(2).collect::<Vec<_>>())?;
+            let binary = build_release(&workspace_dir())?;
+            install_freedesktop(&binary, &prefix)?;
+            println!("installed into {}", prefix.display());
+            if !on_path(&prefix.join("bin")) {
+                println!(
+                    "note: {} is not on your PATH — the desktop entry runs `ghost`",
+                    prefix.join("bin").display()
+                );
+            }
         }
         Some("icon") => {
             let icns = generate_icon()?;
@@ -103,6 +130,58 @@ fn bundle() -> R<PathBuf> {
         icon: icon.exists().then_some(icon),
     };
     assemble_bundle(&opts)
+}
+
+/// Where a freedesktop install goes: `--prefix <dir>` if given, else `$GHOST_PREFIX`,
+/// else `$HOME/.local` — a user install that needs no root.
+fn install_prefix(args: &[String]) -> R<PathBuf> {
+    match args {
+        [] => {}
+        [flag, dir] if flag == "--prefix" => return Ok(PathBuf::from(dir)),
+        _ => return Err("usage: cargo xtask install [--prefix <dir>]".into()),
+    }
+    if let Some(p) = std::env::var_os("GHOST_PREFIX") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME").ok_or("neither --prefix nor $HOME to install into")?;
+    Ok(PathBuf::from(home).join(".local"))
+}
+
+/// Install `binary` under `prefix` the freedesktop way: the executable in
+/// `bin/`, the `.desktop` entry in `share/applications/`, and the same SVG the
+/// macOS `.icns` is rendered from in the hicolor theme's scalable app icons.
+///
+/// The binary is written to a temporary name and renamed into place, so
+/// re-installing while a ghost is running replaces the file rather than writing
+/// through the inode the running process is executing (which would fail with
+/// `ETXTBSY`, or worse, corrupt it).
+fn install_freedesktop(binary: &Path, prefix: &Path) -> R<()> {
+    let bin_dir = prefix.join("bin");
+    let apps = prefix.join("share/applications");
+    let icons = prefix.join("share/icons/hicolor/scalable/apps");
+    for dir in [&bin_dir, &apps, &icons] {
+        fs::create_dir_all(dir)?;
+    }
+
+    let staged = bin_dir.join(".ghost.new");
+    fs::copy(binary, &staged)?;
+    set_executable(&staged)?;
+    fs::rename(&staged, bin_dir.join(EXECUTABLE))?;
+
+    fs::copy(desktop_asset(), apps.join(format!("{APP_ID}.desktop")))?;
+    fs::copy(
+        manifest_dir().join("assets").join("ghost-icon.svg"),
+        icons.join(format!("{ICON_ID}.svg")),
+    )?;
+    Ok(())
+}
+
+/// Whether `dir` is on this shell's `PATH` — used only to warn, since the
+/// desktop entry's `Exec=ghost` needs it to be.
+fn on_path(dir: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d == dir))
+        .unwrap_or(false)
 }
 
 /// Compile ghost's vendored terminfo entry (`ghost-vt/assets`) into a fresh
@@ -647,6 +726,135 @@ mod prebuilt_tests {
         // Unsupported arch or OS ⇒ no mapping.
         assert_eq!(triple_to_name("riscv64gc-unknown-linux-gnu"), None);
         assert_eq!(triple_to_name("x86_64-pc-windows-msvc"), None);
+    }
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ghost-xtask-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The value of `key` in `section` ("Desktop Entry", "Desktop Action foo", …).
+    fn entry(text: &str, section: &str, key: &str) -> Option<String> {
+        let mut here = false;
+        for line in text.lines() {
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                here = name == section;
+            } else if here && let Some(v) = line.strip_prefix(&format!("{key}=")) {
+                return Some(v.to_string());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_desktop_entry_launches_ghost_and_offers_a_new_ssh_window() {
+        let text = fs::read_to_string(desktop_asset()).expect("the desktop entry ships in assets");
+        assert_eq!(
+            entry(&text, "Desktop Entry", "Exec").as_deref(),
+            Some("ghost")
+        );
+        assert_eq!(
+            entry(&text, "Desktop Entry", "Icon").as_deref(),
+            Some(ICON_ID),
+            "the icon name is the app id, so the file dropped in hicolor is found"
+        );
+        assert!(
+            entry(&text, "Desktop Entry", "Categories")
+                .unwrap_or_default()
+                .contains("TerminalEmulator"),
+            "ghost lists itself as a terminal"
+        );
+        // The right-click / dock action asked for: same thing as Alt+S.
+        assert_eq!(
+            entry(&text, "Desktop Action new-ssh-window", "Name").as_deref(),
+            Some("New SSH Window")
+        );
+        assert_eq!(
+            entry(&text, "Desktop Action new-ssh-window", "Exec").as_deref(),
+            Some("ghost --ssh-window"),
+            "the action must use the flag the GUI parses"
+        );
+        assert!(
+            entry(&text, "Desktop Entry", "Actions")
+                .unwrap_or_default()
+                .contains("new-ssh-window"),
+            "an action nobody lists is an action nobody sees"
+        );
+        // The file's name is what the compositor matches against the window's
+        // app id, so it must be the app id itself.
+        assert_eq!(
+            desktop_asset().file_name().unwrap().to_string_lossy(),
+            format!("{APP_ID}.desktop")
+        );
+    }
+
+    #[test]
+    fn the_desktop_entry_passes_desktop_file_validate() {
+        // The freedesktop validator is the authority on the format; skip where it
+        // isn't installed rather than assert a hand-rolled subset of the spec.
+        let Ok(out) = Command::new("desktop-file-validate")
+            .arg(desktop_asset())
+            .output()
+        else {
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "desktop-file-validate: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_freedesktop_install_lands_the_binary_the_entry_and_the_icon() {
+        let dir = scratch("fdo");
+        let stub = dir.join("ghost");
+        fs::write(&stub, b"#!/bin/sh\necho stub\n").unwrap();
+        set_executable(&stub).unwrap();
+        let prefix = dir.join("prefix");
+
+        install_freedesktop(&stub, &prefix).unwrap();
+
+        let bin = prefix.join("bin/ghost");
+        assert!(bin.is_file(), "the binary is installed on PATH as `ghost`");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&bin).unwrap().permissions().mode() & 0o111,
+                0o111
+            );
+        }
+        let desktop = prefix.join(format!("share/applications/{APP_ID}.desktop"));
+        assert!(desktop.is_file(), "the desktop entry is installed");
+        assert_eq!(
+            fs::read_to_string(&desktop).unwrap(),
+            fs::read_to_string(desktop_asset()).unwrap(),
+            "installed verbatim — the asset is the source of truth"
+        );
+        // The same artwork the macOS bundle's `.icns` is generated from, dropped
+        // where the icon theme spec looks for a scalable app icon.
+        let icon = prefix.join(format!("share/icons/hicolor/scalable/apps/{ICON_ID}.svg"));
+        assert!(icon.is_file(), "the icon is installed as {ICON_ID}.svg");
+        assert_eq!(
+            fs::read(&icon).unwrap(),
+            fs::read(manifest_dir().join("assets/ghost-icon.svg")).unwrap(),
+            "the same source the .icns is rendered from"
+        );
+
+        // Re-installing over an existing prefix succeeds (and replaces the binary
+        // by rename, so a running ghost's inode is never written through).
+        install_freedesktop(&stub, &prefix).unwrap();
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
 

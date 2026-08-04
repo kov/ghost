@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=ghost
+GenericName=Terminal
+Comment=Run terminals in the background and reattach without losing state
+Exec=ghost
+Icon=dev.ghost.Terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;terminal;ssh;session;
+StartupNotify=true
+Actions=new-window;new-ssh-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=ghost
+
+[Desktop Action new-ssh-window]
+Name=New SSH Window
+Exec=ghost --ssh-window
