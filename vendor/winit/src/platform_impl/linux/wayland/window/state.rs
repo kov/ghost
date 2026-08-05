@@ -1310,10 +1310,13 @@ impl WindowState {
     /// rounded shape is in force, since the square one is size-independent.
     /// [vendored addition]
     pub fn reapply_blur_shape(&mut self) {
-        if (self.blur_top_radius, self.blur_bottom_radius) == (0, 0)
-            && self.decoration_margins.is_none()
-            || self.background_effect.is_none()
-        {
+        // Unconditional while an effect exists. The square shape used to be
+        // size-independent — one oversized rect, never needing respecifying —
+        // but a shape can now be OFFSET as well as rounded, and a window that
+        // drops its margins and its rounding together (maximizing, snapping)
+        // would otherwise keep the inset shape it had when it was floating, and
+        // wear a blur-less band all round where its own shadow used to be.
+        if self.background_effect.is_none() {
             return;
         }
         if let Some(manager) = self.background_effect_manager.clone() {
