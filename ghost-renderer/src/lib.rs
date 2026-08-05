@@ -826,7 +826,9 @@ struct EdgeUniforms {
     /// arc to the corner it replaces. The far end of `shadow`.
     notch: f32,
     outline: f32,
-    _pad: f32,
+    /// How wide the outer border's ring is, in device pixels — one *logical*
+    /// pixel, the width the frame draws its own border column at.
+    outline_width: f32,
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
@@ -845,7 +847,7 @@ struct EdgeU {
     band: f32,
     notch: f32,
     outline: f32,
-    pad: f32,
+    outline_width: f32,
     shadow: array<vec4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
@@ -920,12 +922,15 @@ fn corner_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 
-// The share of a pixel the outer border covers: one pixel wide, hugging the
-// outside of the shape — peaking half a pixel out and gone by one and a half, so
-// it lands on exactly the pixels the cut emptied, in line with the frame's own
-// border column one pixel outside the straight edges.
+// The share of a pixel the outer border covers: the band `outline_width` deep
+// just outside the shape, which is exactly where the frame paints its own border
+// column along the straight edges — so the ring carries that same line around the
+// arc, at the same weight. A *logical* pixel wide, not a device one: at a
+// fractional scale the frame's column is 1.25 device pixels and a hairline of
+// one device pixel would visibly thin out where the two meet.
 fn outline_ring(d: f32) -> f32 {
-    return clamp(0.5 - d, 0.0, 1.0) * clamp(d + 1.5, 0.0, 1.0);
+    let w = max(u.outline_width, 0.0);
+    return clamp(min(0.0, d + 0.5) - max(-w, d - 0.5), 0.0, 1.0);
 }
 
 // Premultiplied black, added: the window's outer border, carried around the arc
@@ -4610,7 +4615,7 @@ impl Renderer {
             band,
             notch,
             outline: edge.outline.clamp(0.0, 1.0),
-            _pad: 0.0,
+            outline_width: self.scale_factor.max(1.0),
             shadow,
         };
         self.gpu

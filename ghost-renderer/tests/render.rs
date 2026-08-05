@@ -1980,6 +1980,50 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
 }
 
 #[test]
+fn the_ring_is_as_wide_as_the_border_the_frame_draws() {
+    // The frame's border column is one *logical* pixel — 1.25 device pixels on a
+    // fractionally-scaled output — and the ring around the arc is the same line
+    // carried on. Drawn a device pixel wide it thins out just where it takes
+    // over, which reads as the corner being inset from the edges it joins.
+    let (frame, w, h) = edge_window();
+    let scene = frost_scene(&frame, w, h);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let render = |scale: f32, outline: f32| {
+        let mut renderer = Renderer::headless(Theme {
+            bg_alpha: 1.0,
+            ..Theme::default()
+        });
+        renderer.set_scale_factor(scale);
+        renderer.set_window_edge(ghost_renderer::WindowEdge {
+            // Kept at a fixed device size so only the ring's width varies.
+            radius: 10.0 / scale,
+            highlight: 0.0,
+            outline,
+            corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        });
+        renderer.present_offscreen(&scene, font, 15.0)
+    };
+    // All the darkness the ring adds over the bottom-left corner, and nothing
+    // else: the same corner rendered without it is the baseline.
+    let ink = |scale: f32| {
+        let (on, off) = (render(scale, 0.75), render(scale, 0.0));
+        let mut sum = 0.0;
+        for y in h - 12..h {
+            for x in 0..12 {
+                sum += (f32::from(px(&on, x, y)[3]) - f32::from(px(&off, x, y)[3])) / 255.0;
+            }
+        }
+        sum
+    };
+
+    let (thin, wide) = (ink(1.0), ink(2.0));
+    assert!(
+        wide > thin * 1.6,
+        "a ring at 2x should lay down about twice the ink of one at 1x: {thin} -> {wide}"
+    );
+}
+
+#[test]
 fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
     // An edge pixel on the arc is part window and part border, and the two
     // shares are complementary — so however the arc happens to cross it, it is
