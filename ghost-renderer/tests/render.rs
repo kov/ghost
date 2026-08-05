@@ -1830,3 +1830,135 @@ fn a_real_bold_face_is_used_instead_of_synthesizing_weight() {
         ink(&real)
     );
 }
+
+// ---- window edge --------------------------------------------------------
+
+/// A window big enough to hold a 10px corner radius, filled by one terminal.
+fn edge_window() -> (std::rc::Rc<ghost_render::Frame>, u32, u32) {
+    let mut vt = Vt::new(40, 8);
+    vt.feed_str("\x1b[?25l\x1b[44m ");
+    let frame = std::rc::Rc::new(layout_frame(&vt, METRICS));
+    (frame, 40 * 9, 8 * 18)
+}
+
+fn edge_render(edge: ghost_renderer::WindowEdge, bg_alpha: f32) -> Rendered {
+    let (frame, w, h) = edge_window();
+    let scene = frost_scene(&frame, w, h);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut renderer = Renderer::headless(Theme {
+        bg_alpha,
+        ..Theme::default()
+    });
+    renderer.set_window_edge(edge);
+    renderer.present_offscreen(&scene, font, 15.0)
+}
+
+#[test]
+fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
+    // GNOME gives us no server-side decorations, so the CSD frame draws the
+    // titlebar — it rounds the window's TOP corners itself. The bottom two are
+    // ours: the compositor has to see straight through them, or the window
+    // squares off below its own shadow.
+    let (_, w, h) = edge_window();
+    let img = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            highlight: 0.0,
+        },
+        0.5,
+    );
+    write_png("window-edge.png", &img);
+
+    assert_eq!(
+        px(&img, 0, h - 1)[3],
+        0,
+        "the bottom-left corner must be cut"
+    );
+    assert_eq!(
+        px(&img, w - 1, h - 1)[3],
+        0,
+        "the bottom-right corner must be cut"
+    );
+    assert!(
+        px(&img, 0, 0)[3] > 0 && px(&img, w - 1, 0)[3] > 0,
+        "the top corners belong to the frame's headerbar, not to us"
+    );
+    assert!(
+        px(&img, w / 2, h - 1)[3] > 0,
+        "the bottom edge between the corners stays"
+    );
+    // The arc itself: (2, h-2) sits 11.3px from the corner circle's centre, so it
+    // is cut; (9, h-9) sits 1.6px from it and survives.
+    assert_eq!(px(&img, 2, h - 2)[3], 0, "outside the arc");
+    assert!(px(&img, 9, h - 9)[3] > 0, "inside the arc");
+}
+
+#[test]
+fn a_square_window_keeps_its_corners() {
+    let (_, w, h) = edge_window();
+    let img = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 0.0,
+            highlight: 0.0,
+        },
+        0.5,
+    );
+    assert!(
+        px(&img, 0, h - 1)[3] > 0 && px(&img, w - 1, h - 1)[3] > 0,
+        "radius 0 must leave the corners alone"
+    );
+}
+
+#[test]
+fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
+    // libadwaita defines a window's edge with `outline: 1px solid
+    // rgb(255 255 255/7%)` set one pixel inside it. That hairline, not the drop
+    // shadow, is what separates a window from what is behind it.
+    let (_, w, h) = edge_window();
+    let plain = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            highlight: 0.0,
+        },
+        0.5,
+    );
+    let lit = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            highlight: 0.07,
+        },
+        0.5,
+    );
+
+    for (x, y, edge) in [
+        (0, h / 2, "left"),
+        (w - 1, h / 2, "right"),
+        (w / 2, h - 1, "bottom"),
+    ] {
+        let (before, after) = (px(&plain, x, y), px(&lit, x, y));
+        assert!(
+            after[0] > before[0] && after[3] > before[3],
+            "the {edge} edge should carry the highlight: {before:?} -> {after:?}"
+        );
+    }
+
+    // One pixel further in is untouched — it is a hairline, not a glow.
+    for (x, y, edge) in [
+        (2, h / 2, "left"),
+        (w - 3, h / 2, "right"),
+        (w / 2, h - 3, "bottom"),
+    ] {
+        assert_eq!(
+            px(&plain, x, y),
+            px(&lit, x, y),
+            "the highlight leaked inward from the {edge} edge"
+        );
+    }
+
+    // The top edge abuts the frame's headerbar, so it gets no hairline.
+    assert_eq!(
+        px(&plain, w / 2, 0),
+        px(&lit, w / 2, 0),
+        "the top edge meets the titlebar and must stay clean"
+    );
+}

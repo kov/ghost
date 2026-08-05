@@ -225,7 +225,6 @@ where
         } else {
             true
         };
-        let border_paint = colors.border_paint();
 
         // Draw the borders.
         for (idx, part) in decorations
@@ -332,9 +331,16 @@ where
                         _ => None,
                     };
 
-                    // Fill the visible border, if present.
+                    // Fill the visible border, if present. It sits over the
+                    // shadow's outermost pixel and is nearly transparent, so the
+                    // window's outside edge reads as libadwaita's does.
                     if let Some(border_rect) = border_rect {
-                        pixmap.fill_rect(border_rect, &border_paint, Transform::identity(), None);
+                        pixmap.fill_rect(
+                            border_rect,
+                            &theme::outer_border_paint(),
+                            Transform::identity(),
+                            None,
+                        );
                     }
                 }
             };

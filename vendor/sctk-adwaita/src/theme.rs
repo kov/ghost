@@ -137,3 +137,18 @@ impl ColorMap {
         }
     }
 }
+
+/// The hairline libadwaita draws around the outside of a window — the last layer
+/// of its `window.csd` box-shadow, `0 0 0 1px rgb(0 0 0/5%)`. It is the same in
+/// the light and dark stylesheets: what actually separates a window from its
+/// backdrop is the *inner* highlight (`outline: 1px solid rgb(255 255 255/7%)`),
+/// which falls on the client's own pixels, not on this frame's.
+///
+/// Kept apart from [`ColorMap::border_color`], which is the headerbar's bottom
+/// separator — a different line with a different job.
+pub(crate) fn outer_border_paint() -> Paint<'static> {
+    Paint {
+        shader: Shader::SolidColor(Color::from_rgba8(0, 0, 0, 13)),
+        ..Default::default()
+    }
+}

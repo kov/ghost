@@ -757,6 +757,105 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// How a window meets what is behind it: the radius of its bottom corners and
+/// the hairline drawn just inside its edges.
+///
+/// Only the frontend knows whether the window even has an edge to treat — on
+/// Linux the CSD frame draws the titlebar and rounds the window's *top* corners
+/// itself, leaving the bottom two and the content's outline to us; on macOS the
+/// window server owns both. So this is set by the frontend rather than inferred,
+/// and defaults to nothing at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowEdge {
+    /// Radius of the window's bottom corners in *logical* pixels. The corner
+    /// pixels outside it are cut to fully transparent so the compositor sees
+    /// through them — which only means anything on a translucent window, whose
+    /// alpha the compositor reads. 0 leaves the corners square.
+    pub radius: f32,
+    /// Alpha of the 1px inset hairline along the left, right and bottom edges —
+    /// libadwaita's `outline: 1px solid rgb(255 255 255/7%)`. 0 draws none.
+    /// The top edge is left clean: the titlebar sits against it.
+    pub highlight: f32,
+}
+
+impl WindowEdge {
+    /// Nothing to draw — no pass is encoded at all.
+    fn is_none(&self) -> bool {
+        self.radius <= 0.0 && self.highlight <= 0.0
+    }
+}
+
+/// Width of the inset hairline, in logical pixels. libadwaita's is 1px.
+const EDGE_HIGHLIGHT_WIDTH: f32 = 1.0;
+
+/// Window-edge parameters, laid out to match the WGSL `EdgeU` uniform. All
+/// distances are *device* pixels — the logical values are scaled on the way in.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct EdgeUniforms {
+    viewport: [f32; 2],
+    radius: f32,
+    highlight: f32,
+    band: f32,
+    _pad: [f32; 3],
+}
+
+/// The window edge: two fullscreen-triangle passes, each scissored down to the
+/// few hundred pixels it can touch.
+///
+/// `coverage` is the window's shape — 1 inside, feathered to 0 across the last
+/// half pixel of the rounded bottom corners. `hairline` then rides just inside
+/// that shape's left/right/bottom boundary.
+const EDGE_WGSL: &str = r#"
+struct EdgeU { viewport: vec2<f32>, radius: f32, highlight: f32, band: f32 };
+@group(0) @binding(0) var<uniform> u: EdgeU;
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(p[vi], 0.0, 1.0);
+}
+
+// Distance from `p` to the window's left/right/bottom boundary, positive inside.
+// The top is deliberately absent: the titlebar abuts it, so it is neither cut
+// nor outlined.
+fn edge_distance(p: vec2<f32>) -> f32 {
+    var d = min(min(p.x, u.viewport.x - p.x), u.viewport.y - p.y);
+    if (u.radius > 0.0) {
+        let cy = u.viewport.y - u.radius;
+        if (p.y > cy) {
+            if (p.x < u.radius) {
+                d = u.radius - length(p - vec2<f32>(u.radius, cy));
+            } else if (p.x > u.viewport.x - u.radius) {
+                d = u.radius - length(p - vec2<f32>(u.viewport.x - u.radius, cy));
+            }
+        }
+    }
+    return d;
+}
+
+// Multiplied into the destination, so the corner pixels outside the shape lose
+// both their colour and their alpha (the frame is premultiplied — dropping alpha
+// alone would leave a bright fringe).
+@fragment
+fn cut(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = clamp(edge_distance(pos.xy) + 0.5, 0.0, 1.0);
+    return vec4<f32>(c, c, c, c);
+}
+
+// Premultiplied white, source-over. Masked by the same coverage so the hairline
+// follows the corner arc round instead of running off it.
+@fragment
+fn hairline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let d = edge_distance(pos.xy);
+    let inside = clamp(d + 0.5, 0.0, 1.0);
+    let a = u.highlight * clamp(u.band - d + 0.5, 0.0, 1.0) * inside;
+    return vec4<f32>(a, a, a, a);
+}
+"#;
+
 /// Fill an `NOISE_DIM`×`NOISE_DIM` R8 tile with baked, seamlessly-tileable
 /// 2-octave value noise: a coarse mottle plus a finer grain at half amplitude.
 /// Value noise (smoothstep-interpolated lattice) reads as ground glass rather than
@@ -1336,6 +1435,14 @@ pub struct Renderer {
     frost_pipeline: wgpu::RenderPipeline,
     frost_bind_group: wgpu::BindGroup,
     frost_uniform_buf: wgpu::Buffer,
+    /// Window edge: cuts the bottom corners to the frame's radius and traces the
+    /// inset hairline. Inert until the frontend sets one. See
+    /// [`Renderer::apply_window_edge`].
+    edge_cut_pipeline: wgpu::RenderPipeline,
+    edge_hairline_pipeline: wgpu::RenderPipeline,
+    edge_bind_group: wgpu::BindGroup,
+    edge_uniform_buf: wgpu::Buffer,
+    window_edge: WindowEdge,
     /// Display scale factor (physical pixels per logical pixel), so the frost grain
     /// keeps a fixed logical size on HiDPI. Set by [`Renderer::set_scale_factor`];
     /// defaults to 1.0 (also what the headless golden path uses).
@@ -1975,6 +2082,97 @@ impl Renderer {
                 cache: None,
             });
 
+        let edge_uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("window edge uniforms"),
+            size: std::mem::size_of::<EdgeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let edge_bind_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("window edge bind layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+        let edge_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("window edge bind group"),
+            layout: &edge_bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: edge_uniform_buf.as_entire_binding(),
+            }],
+        });
+        let edge_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("window edge shader"),
+                source: wgpu::ShaderSource::Wgsl(EDGE_WGSL.into()),
+            });
+        let edge_pipeline_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("window edge pipeline layout"),
+                    bind_group_layouts: &[Some(&edge_bind_layout)],
+                    immediate_size: 0,
+                });
+        let edge_pipeline = |entry: &str, blend: wgpu::BlendState| {
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("window edge pipeline"),
+                    layout: Some(&edge_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &edge_shader,
+                        entry_point: Some("vs"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &edge_shader,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        // The cut MULTIPLIES the destination by the shape's coverage: dropping
+        // `src` entirely and scaling `dst` by it, on both colour and alpha.
+        let multiply = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::Src,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let edge_cut_pipeline = edge_pipeline(
+            "cut",
+            wgpu::BlendState {
+                color: multiply,
+                alpha: wgpu::BlendComponent {
+                    dst_factor: wgpu::BlendFactor::SrcAlpha,
+                    ..multiply
+                },
+            },
+        );
+        // The hairline is ordinary premultiplied source-over.
+        let edge_hairline_pipeline =
+            edge_pipeline("hairline", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+
         Renderer {
             gpu,
             pipeline,
@@ -1984,6 +2182,11 @@ impl Renderer {
             frost_pipeline,
             frost_bind_group,
             frost_uniform_buf,
+            edge_cut_pipeline,
+            edge_hairline_pipeline,
+            edge_bind_group,
+            edge_uniform_buf,
+            window_edge: WindowEdge::default(),
             theme,
             frame_bg: None,
             scene_bg: None,
@@ -4265,6 +4468,103 @@ impl Renderer {
         self.gpu.queue.submit([encoder.finish()]);
     }
 
+    /// How this window meets what is behind it — see [`WindowEdge`]. Set by the
+    /// frontend once it knows what the platform's frame leaves to us, and again
+    /// whenever that changes (a live opacity edit takes the corners with it: an
+    /// opaque window's alpha is ignored by the compositor, so there is no corner
+    /// to cut). Defaults to nothing, which encodes no pass at all.
+    pub fn set_window_edge(&mut self, edge: WindowEdge) {
+        self.window_edge = edge;
+    }
+
+    /// Cut the window's bottom corners and trace its inset hairline onto `view`,
+    /// `surf` pixels wide. Runs *after* [`Self::apply_frost`] — frost fills the
+    /// see-through background toward opaque, corners included, so cutting first
+    /// would just fill them back in.
+    ///
+    /// Both passes are scissored to the strips they can touch (a hairline's width
+    /// down each side, the corner radius across the bottom), so this costs a few
+    /// thousand fragments rather than a fullscreen pass. A no-op — no encoder, no
+    /// submit — when no edge is set.
+    fn apply_window_edge(&self, view: &wgpu::TextureView, surf: (u32, u32)) {
+        let edge = self.window_edge;
+        if edge.is_none() || surf.0 == 0 || surf.1 == 0 {
+            return;
+        }
+        let (w, h) = (surf.0, surf.1);
+        let radius = (edge.radius * self.scale_factor).max(0.0);
+        let band = EDGE_HIGHLIGHT_WIDTH * self.scale_factor;
+        let uniforms = EdgeUniforms {
+            viewport: [w as f32, h as f32],
+            radius,
+            highlight: edge.highlight.clamp(0.0, 1.0),
+            band,
+            _pad: [0.0; 3],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.edge_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        // The bottom strip has to be deep enough to hold whichever is taller, the
+        // corner arc or the hairline; the side strips then stop where it starts, so
+        // no pixel is drawn twice (the hairline blends, so a double draw would
+        // show).
+        let deep = radius.max(band).ceil() as u32;
+        let bottom = deep.min(h);
+        let side = band.ceil().max(1.0) as u32;
+        let sides = h - bottom;
+
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("window edge"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("window edge"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.edge_bind_group, &[]);
+            if edge.highlight > 0.0 {
+                pass.set_pipeline(&self.edge_hairline_pipeline);
+                for rect in [
+                    (0, 0, side.min(w), sides),
+                    (w.saturating_sub(side), 0, side.min(w), sides),
+                    (0, h - bottom, w, bottom),
+                ] {
+                    if rect.2 > 0 && rect.3 > 0 {
+                        pass.set_scissor_rect(rect.0, rect.1, rect.2, rect.3);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+            }
+            // Last, so the hairline is cut back to the arc along with everything
+            // else outside the shape.
+            if radius > 0.0 {
+                let r = (radius.ceil() as u32).min(w / 2).min(h);
+                pass.set_pipeline(&self.edge_cut_pipeline);
+                for x in [0, w - r] {
+                    pass.set_scissor_rect(x, h - r, r, r);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
     /// Present `scene` onto `view` (the acquired swapchain image) at `surf` pixels.
     ///
     /// A lone opaque terminal — the steady single view, and bulk output — is rendered
@@ -4302,6 +4602,7 @@ impl Renderer {
             self.render_scene_to_view(view, scene, font, size_px);
             self.foreground_valid = false;
             self.apply_frost(view);
+            self.apply_window_edge(view, surf);
             return;
         };
         // The terminal occupies its scene rect, which the model insets by the window
@@ -4366,6 +4667,7 @@ impl Renderer {
             self.gpu.queue.submit([cb]);
         }
         self.apply_frost(view);
+        self.apply_window_edge(view, surf);
     }
 
     /// Render a scene to an offscreen target and read the pixels back. For a
@@ -4564,6 +4866,7 @@ impl Renderer {
         // out until the drag commits). The snapshot is premultiplied over a
         // transparent clear, so its see-through areas keep alpha < 1 for dest-over.
         self.apply_frost(view);
+        self.apply_window_edge(view, (w, h));
     }
 
     /// Stretch-blit the captured snapshot to a fresh `w`×`h` offscreen target and
@@ -4578,6 +4881,7 @@ impl Renderer {
         let cb = self.encode_snapshot(&view);
         self.gpu.queue.submit([cb]);
         self.apply_frost(&view);
+        self.apply_window_edge(&view, (w, h));
         let rgba = read_back(&self.gpu, &target, w, h);
         Rendered {
             width: w,

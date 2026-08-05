@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ghost_renderer::{FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target};
+use ghost_renderer::{
+    FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target, WindowEdge,
+};
 use ghost_ui_core::{
     CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
     RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WheelDelta, WindowRecord,
@@ -2017,6 +2019,7 @@ impl Graphics {
         renderer.set_fallback(Box::new(font::SystemFallback::new()));
         // Keep the frost grain a fixed logical size on HiDPI.
         renderer.set_scale_factor(window.scale_factor() as f32);
+        renderer.set_window_edge(Self::window_edge(&window, !want_transparent));
 
         Graphics {
             window,
@@ -2032,6 +2035,36 @@ impl Graphics {
         }
     }
 
+    /// What the platform's window frame leaves for us to draw — see [`WindowEdge`].
+    ///
+    /// On Linux GNOME offers no server-side decorations, so sctk-adwaita's CSD frame
+    /// draws the titlebar: it rounds the window's *top* corners itself and its shadow
+    /// curves around all four, leaving the bottom two — and the hairline that separates
+    /// the content from whatever shows behind it — to us. Everywhere else the window
+    /// server owns the whole edge (on macOS our vendored winit rounds the content layer
+    /// itself), so we draw none of it.
+    ///
+    /// Only a translucent surface has a corner to cut: an opaque one's alpha never
+    /// reaches the compositor, and zeroing it would paint the corners black rather than
+    /// clear. A maximized or fullscreen window has no outside corner at all, and GNOME
+    /// drops its own rounding and outline there too. (A half-tiled window should square
+    /// off as well, but winit reports no tiling state, so it keeps its curve for now.)
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn window_edge(window: &Window, opaque: bool) -> WindowEdge {
+        let boxed_in = window.is_maximized() || window.fullscreen().is_some();
+        WindowEdge {
+            // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
+            // its titlebar starts.
+            radius: if opaque || boxed_in { 0.0 } else { 10.0 },
+            // libadwaita's `outline: 1px solid rgb(255 255 255/7%)`.
+            highlight: if boxed_in { 0.0 } else { 0.07 },
+        }
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn window_edge(_window: &Window, _opaque: bool) -> WindowEdge {
+        WindowEdge::default()
+    }
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {
@@ -2045,6 +2078,10 @@ impl Graphics {
         if let Target::Surface(s) = &mut self.target {
             s.resize(w, h);
         }
+        // Maximizing squares the window's corners off — and every state change that
+        // can do that reaches us as a resize.
+        let edge = Self::window_edge(&self.window, self.target.opaque());
+        self.renderer.set_window_edge(edge);
         // The reconfigured surface holds no drawn frame; force the next redraw.
         self.scene_cache.invalidate();
     }
