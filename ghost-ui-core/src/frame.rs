@@ -359,6 +359,41 @@ pub fn resize_edge_at(
     Some(edge)
 }
 
+/// What the pointer is over, once the frame has had its say.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameHit {
+    /// An edge or corner to drag: hand it to the compositor.
+    Resize(ResizeEdge),
+    /// The titlebar strip — chrome, which the model has no coordinate for.
+    Bar,
+    /// The content below the bar, in the model's own space.
+    Content(PointPx),
+}
+
+/// Where `pos` lands on a window of `size` whose titlebar is `bar_px` tall.
+///
+/// The single decision, because its *order* is the whole point: the resize band
+/// and the titlebar overlap along the top of the window, and the band has to
+/// win — otherwise the top edge and both top corners cannot be grabbed at all,
+/// the bar having swallowed them. Below the band the bar wins over the content,
+/// and what is left is the content, shifted up out from under the bar.
+pub fn frame_hit(
+    pos: PointPx,
+    size: (u32, u32),
+    scale: f32,
+    grab: FrameGrab,
+    bar_px: u32,
+) -> FrameHit {
+    if let Some(edge) = resize_edge_at(pos, size, scale, grab) {
+        return FrameHit::Resize(edge);
+    }
+    let y = pos.y - f64::from(bar_px);
+    if y < 0.0 {
+        return FrameHit::Bar;
+    }
+    FrameHit::Content(PointPx { x: pos.x, y })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +729,53 @@ mod tests {
         assert_eq!(
             resize_edge_at(PointPx { x: 0.0, y: 0.0 }, SIZE, 1.0, dragging),
             None
+        );
+    }
+
+    /// The top edge and both top corners lie *under* the titlebar. They are
+    /// still grabbable: the band is asked first, so the bar cannot swallow them.
+    #[test]
+    fn the_titlebar_does_not_swallow_the_top_resize_edges() {
+        const BAR: u32 = 35;
+        let hit = |x: f64, y: f64| frame_hit(PointPx { x, y }, SIZE, 1.0, grab(), BAR);
+
+        assert_eq!(hit(400.0, 1.0), FrameHit::Resize(ResizeEdge::North));
+        assert_eq!(hit(2.0, 2.0), FrameHit::Resize(ResizeEdge::NorthWest));
+        assert_eq!(hit(798.0, 2.0), FrameHit::Resize(ResizeEdge::NorthEast));
+        // Down the sides, the corner's reach still beats the bar.
+        assert_eq!(hit(1.0, 20.0), FrameHit::Resize(ResizeEdge::NorthWest));
+    }
+
+    /// Below the band the bar is chrome, and below the bar the model gets the
+    /// pointer in its own space.
+    #[test]
+    fn below_the_resize_band_the_bar_takes_the_pointer_then_the_content() {
+        const BAR: u32 = 35;
+        let hit = |x: f64, y: f64| frame_hit(PointPx { x, y }, SIZE, 1.0, grab(), BAR);
+
+        assert_eq!(hit(400.0, 20.0), FrameHit::Bar);
+        assert_eq!(hit(400.0, 34.0), FrameHit::Bar);
+        assert_eq!(
+            hit(400.0, 35.0),
+            FrameHit::Content(PointPx { x: 400.0, y: 0.0 })
+        );
+        assert_eq!(
+            hit(400.0, 100.0),
+            FrameHit::Content(PointPx { x: 400.0, y: 65.0 })
+        );
+    }
+
+    /// With the desktop's frame there is no band and no bar of ours: every
+    /// position is content, unshifted.
+    #[test]
+    fn a_system_framed_window_passes_the_pointer_straight_through() {
+        let grab = FrameGrab {
+            own_frame: false,
+            ..grab()
+        };
+        assert_eq!(
+            frame_hit(PointPx { x: 1.0, y: 1.0 }, SIZE, 1.0, grab, 0),
+            FrameHit::Content(PointPx { x: 1.0, y: 1.0 })
         );
     }
 }

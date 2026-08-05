@@ -3350,10 +3350,38 @@ impl App {
                     (w_px, h_px, g.window.scale_factor())
                 })
             {
-                self.dispatch(wid, UiEvent::Resize { w_px, h_px, scale }, event_loop);
+                self.resize_model(wid, w_px, h_px, scale, event_loop);
             }
         }
         self.workspace_dirty = true;
+    }
+
+    /// Resize window `wid`'s model to a *surface* size. The model lays out under
+    /// our titlebar, so its viewport is the surface less the bar — every caller
+    /// holding a window size (as opposed to a content size) must come through
+    /// here, or the composed scene ends up a bar taller than the swapchain.
+    fn resize_model(
+        &mut self,
+        wid: WindowId,
+        w_px: u32,
+        h_px: u32,
+        scale: f64,
+        event_loop: &dyn Frontend,
+    ) {
+        let bar = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.gfx.as_ref())
+            .map_or(0, |g| g.bar_px());
+        self.dispatch(
+            wid,
+            UiEvent::Resize {
+                w_px,
+                h_px: h_px.saturating_sub(bar).max(1),
+                scale,
+            },
+            event_loop,
+        );
     }
 
     /// Feed an event to window `wid`'s model and execute the effects it returns.
@@ -3977,44 +4005,56 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
-    /// The resize edge under the pointer, when the frame is ours to grab — see
-    /// [`ghost_ui_core::resize_edge_at`], which decides it. Reading the window's
-    /// state is all that happens here.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    fn frame_edge_under_pointer(&self, id: WindowId) -> Option<ghost_ui_core::ResizeEdge> {
-        use winit::platform::wayland::WindowExtWayland;
-        let w = self.windows.get(&id)?;
-        let gfx = w.gfx.as_ref()?;
+    /// What a window-space pointer position is over — see
+    /// [`ghost_ui_core::frame::frame_hit`], which decides it (and in what order:
+    /// the resize band lies *under* the titlebar and has to be asked first).
+    /// Reading the window's state is all that happens here.
+    fn frame_hit(&self, id: WindowId, pos: PointPx) -> ghost_ui_core::frame::FrameHit {
+        use ghost_ui_core::frame::FrameHit;
+        let Some(w) = self.windows.get(&id) else {
+            return FrameHit::Content(pos);
+        };
+        // A headless window has no surface to frame, and no bar over its model.
+        let Some(gfx) = w.gfx.as_ref() else {
+            return FrameHit::Content(pos);
+        };
         let size = gfx.window.inner_size();
-        ghost_ui_core::resize_edge_at(
-            w.pointer_pos,
-            (size.width, size.height),
-            gfx.window.scale_factor() as f32,
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let grab = {
+            use winit::platform::wayland::WindowExtWayland;
             ghost_ui_core::FrameGrab {
                 own_frame: !gfx.window.is_decorated(),
                 boxed_in: gfx.window.is_maximized()
                     || gfx.window.fullscreen().is_some()
                     || gfx.window.is_tiled(),
                 pointer_down: w.pointer_down,
-            },
+            }
+        };
+        // Elsewhere the platform frames the window and owns its edges.
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let grab = ghost_ui_core::FrameGrab {
+            own_frame: false,
+            boxed_in: true,
+            pointer_down: w.pointer_down,
+        };
+        ghost_ui_core::frame::frame_hit(
+            pos,
+            (size.width, size.height),
+            gfx.window.scale_factor() as f32,
+            grab,
+            gfx.bar_px(),
         )
     }
 
-    /// Track the frame's resize edges as the pointer moves: show the edge's own
-    /// cursor while it is over one, and put the cursor back when it leaves.
-    ///
-    /// Returns whether the motion belongs to the frame, in which case it does not
-    /// reach the model — the band lies inside the window, over the padding and the
-    /// first pixels of the grid, and a model that saw it would be selecting text
-    /// under a resize cursor.
+    /// Note the resize edge the pointer is over, showing that edge's own cursor
+    /// while it is there and putting the plain arrow back when it leaves.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn track_frame_edge(&mut self, id: WindowId) -> bool {
-        let edge = self.frame_edge_under_pointer(id);
+    fn track_frame_edge(&mut self, id: WindowId, edge: Option<ghost_ui_core::ResizeEdge>) {
         let Some(w) = self.windows.get_mut(&id) else {
-            return false;
+            return;
         };
         if w.frame_edge == edge {
-            return edge.is_some();
+            return;
         }
         w.frame_edge = edge;
         if let Some(gfx) = w.gfx.as_ref() {
@@ -4025,7 +4065,6 @@ impl App {
                 None => winit::window::CursorIcon::Default,
             });
         }
-        edge.is_some()
     }
 
     /// The titlebar strip of a window whose frame is ours, in window space.
@@ -4044,9 +4083,11 @@ impl App {
 
     /// Track which titlebar button the pointer is over, repainting when it
     /// changes — the hover circle is the only thing that says a button is there.
+    /// `pos` is the pointer in window space while it is on the bar, and `None`
+    /// once it is anywhere else, which un-hovers whatever it left.
     #[cfg(target_os = "linux")]
-    fn track_bar_hover(&mut self, id: WindowId, pos: PointPx) {
-        let hovered = self.bar_rect(id).and_then(|bar| {
+    fn track_bar_hover(&mut self, id: WindowId, pos: Option<PointPx>) {
+        let hovered = pos.zip(self.bar_rect(id)).and_then(|(pos, bar)| {
             let scale = self.windows.get(&id)?.gfx.as_ref()?.window.scale_factor() as f32;
             ghost_ui_core::frame::button_at(pos, &desktop::button_layout(), bar, scale)
         });
@@ -5360,22 +5401,7 @@ impl App {
                     event_loop,
                 );
             }
-            // The model lays out under our titlebar, so it is sized to the window
-            // less the bar — the one place the inset enters the model's world.
-            let bar = self
-                .windows
-                .get(&wid)
-                .and_then(|w| w.gfx.as_ref())
-                .map_or(0, |g| g.bar_px());
-            self.dispatch(
-                wid,
-                UiEvent::Resize {
-                    w_px: cw,
-                    h_px: ch.saturating_sub(bar).max(1),
-                    scale: cs,
-                },
-                event_loop,
-            );
+            self.resize_model(wid, cw, ch, cs, event_loop);
         }
     }
 
@@ -6578,17 +6604,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }) else {
                     return;
                 };
-                let Some(pos) = self.in_content(id, pos) else {
+                // The frame gets first refusal on the pointer: its resize band
+                // lies inside the window, over the padding and the first pixels
+                // of the grid, and a model that saw it would be selecting text
+                // under a resize cursor. Its titlebar is chrome the model has no
+                // coordinate for at all.
+                use ghost_ui_core::frame::FrameHit;
+                let hit = self.frame_hit(id, pos);
+                #[cfg(all(unix, not(target_os = "macos")))]
+                self.track_frame_edge(
+                    id,
+                    match hit {
+                        FrameHit::Resize(edge) => Some(edge),
+                        _ => None,
+                    },
+                );
+                #[cfg(target_os = "linux")]
+                self.track_bar_hover(id, matches!(hit, FrameHit::Bar).then_some(pos));
+                let FrameHit::Content(pos) = hit else {
                     return;
                 };
-                // Our own frame's resize edges lie inside the window, so they get
-                // first refusal on the pointer before the model sees it.
-                #[cfg(all(unix, not(target_os = "macos")))]
-                if self.track_frame_edge(id) {
-                    return;
-                }
-                #[cfg(target_os = "linux")]
-                self.track_bar_hover(id, pos);
                 self.dispatch(
                     id,
                     UiEvent::Pointer {
@@ -7072,15 +7107,7 @@ impl App {
             if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
                 gfx.renderer.clear_snapshot();
             }
-            self.dispatch(
-                wid,
-                UiEvent::Resize {
-                    w_px: cw,
-                    h_px: ch,
-                    scale: cs,
-                },
-                fe,
-            );
+            self.resize_model(wid, cw, ch, cs, fe);
         }
         // Release any paced repaint that the frame budget now allows. The loop
         // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
