@@ -18,15 +18,25 @@ use swash::shape::ShapeContext;
 use swash::zeno::{Angle, Format, Transform};
 
 mod colr;
+mod text;
 
 pub use swash::FontRef;
+pub use text::{TextImage, TextStyle, paint_text};
 
 /// A glyph produced by shaping: the resolved glyph id, its horizontal advance
-/// in pixels, and the byte offset of the source cluster it came from.
+/// in pixels, the positioning offset shaping gave it, and the byte offset of
+/// the source cluster it came from.
+///
+/// `x`/`y` are the GPOS offset from the pen position, y-up. On a terminal grid
+/// they are always zero — every glyph sits on its own cell — but proportional
+/// text ([`paint_text`]) needs them: they are what puts a combining accent over
+/// its base rather than on the baseline after it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapedGlyph {
     pub id: u16,
     pub advance: f32,
+    pub x: f32,
+    pub y: f32,
     pub cluster: u32,
 }
 
@@ -270,6 +280,8 @@ pub fn shape(font: FontRef, text: &str, size_px: f32) -> Vec<ShapedGlyph> {
             out.push(ShapedGlyph {
                 id: glyph.id,
                 advance: glyph.advance,
+                x: glyph.x,
+                y: glyph.y,
                 cluster: source,
             });
         }
@@ -293,11 +305,11 @@ pub struct Synthesis {
 
 /// Synthetic-oblique shear for faux italics. ~14° leans the top to the right,
 /// the usual range for synthesized italics.
-const FAUX_ITALIC_DEGREES: f32 = 14.0;
+pub(crate) const FAUX_ITALIC_DEGREES: f32 = 14.0;
 
 /// Faux-bold outline dilation, as a fraction of the em — the stroke grows by
 /// `size_px * this` in each direction, heavier ink without a bold face.
-const FAUX_BOLD_FACTOR: f32 = 0.04;
+pub(crate) const FAUX_BOLD_FACTOR: f32 = 0.04;
 
 /// Rasterize a glyph to an alpha-coverage bitmap with hinting **off**, so the
 /// output is bit-identical across platforms — the basis for deterministic glyph

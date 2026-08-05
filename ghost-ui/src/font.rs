@@ -69,6 +69,20 @@ fn load(path: &std::path::Path, idx: usize) -> Option<FontRef<'static>> {
     ghost_shaper::font_from_index(leaked, idx)
 }
 
+/// The face index fontconfig reports, as a plain index into the file.
+///
+/// For a *variable* font fontconfig packs two things into that integer: the face
+/// index within the file in the low 16 bits, and — when the match is a named
+/// instance, which is how a family with no separate Bold file offers its Bold —
+/// the 1-based instance number in the high 16 bits. Handed to a font parser
+/// whole, such a value names no face at all and the font simply fails to load.
+/// The instance is realized separately, as a variation setting (see
+/// [`style_weight`]).
+#[cfg(target_os = "linux")]
+fn face_index(reported: Option<i32>) -> usize {
+    (reported.unwrap_or(0) as u32 & 0xFFFF) as usize
+}
+
 /// The face files resolved for a family: the mandatory regular face plus the
 /// bold/italic/bold-italic slots that resolved to a *distinct* real face (a repeat
 /// means the style is absent and gets synthesized). Each entry is a file path and the
@@ -150,7 +164,7 @@ fn fontconfig_faces(family: &str) -> Option<ResolvedFaces> {
     // (file, face-index) for `family` in `style`, or None if fontconfig can't match.
     let query = |style: Option<&str>| -> Option<(PathBuf, usize)> {
         let font = fc.find(family, style).ok()?;
-        Some((font.path, font.index.unwrap_or(0) as usize))
+        Some((font.path, face_index(font.index)))
     };
 
     // Regular is the yardstick; without it, there is nothing to resolve against.
@@ -185,6 +199,42 @@ fn fontconfig_faces(family: &str) -> Option<ResolvedFaces> {
         bold,
         italic,
         bold_italic,
+    })
+}
+
+/// Resolve one face by family and style name — what window chrome wants, where
+/// the desktop names a single font (`Cantarell Bold 11`) rather than a family
+/// with four styles. `None` when fontconfig is unavailable or has no match.
+///
+/// Unlike [`resolve_faces`], the style is resolved into the face itself, so a
+/// bold title is a real bold face where the family ships one — and where it
+/// only offers the weight as a variation axis, [`style_weight`] realizes it.
+#[cfg(target_os = "linux")]
+pub fn resolve_face(family: &str, style: Option<&str>) -> Option<FontRef<'static>> {
+    let fc = fontconfig::Fontconfig::new()?;
+    let font = fc.find(family, style).ok()?;
+    load(&font.path, face_index(font.index))
+}
+
+/// The `wght` axis value a style name asks for, on the usual 100–900 scale.
+/// Applied as a variation setting, which a variable font honours and a static
+/// face ignores — so it costs nothing to pass alongside a real bold face, and
+/// is the only way to get bold out of a family that ships one variable file.
+#[cfg(target_os = "linux")]
+pub fn style_weight(style: Option<&str>) -> Option<f32> {
+    let style = style?.to_ascii_lowercase();
+    let style = style.replace(['-', ' '], "");
+    Some(match style.as_str() {
+        "thin" | "hairline" => 100.0,
+        "extralight" | "ultralight" => 200.0,
+        "light" => 300.0,
+        "regular" | "normal" | "book" => 400.0,
+        "medium" => 500.0,
+        "semibold" | "demibold" | "demi" => 600.0,
+        "bold" => 700.0,
+        "extrabold" | "ultrabold" => 800.0,
+        "black" | "heavy" => 900.0,
+        _ => return None,
     })
 }
 
@@ -374,8 +424,7 @@ impl SystemFallback {
         pat.add_charset(charset).ok()?;
         let matched = pat.font_match().ok()?;
         let path = PathBuf::from(matched.filename().ok()?);
-        let idx = matched.face_index().unwrap_or(0).max(0) as usize;
-        Some((path, idx))
+        Some((path, face_index(matched.face_index().ok())))
     }
 
     /// Resolve a face covering `ch` (uncached) through CoreText, deduplicating the

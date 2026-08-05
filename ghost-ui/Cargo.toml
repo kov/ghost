@@ -93,3 +93,8 @@ tempfile = "3"
 pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["termios"] }
 serde_json = "1.0.150"
+
+# The titlebar test drives the CSD frame's real `TitleText`, whose color type
+# is tiny-skia's. Same 0.11 line the vendored frame uses, so it is the same type
+# and no new crate is compiled.
+tiny-skia = "0.11"

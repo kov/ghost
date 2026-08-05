@@ -29,7 +29,7 @@
 
 mod bench;
 mod config;
-mod font;
+pub mod font;
 mod from_winit;
 mod groups;
 mod instance;
@@ -37,6 +37,10 @@ pub mod menu;
 mod pacer;
 mod rendertrace;
 mod resize;
+/// The CSD frame's titlebar text, drawn with ghost's own font stack. Linux
+/// only: every other platform draws its own titlebar.
+#[cfg(target_os = "linux")]
+pub mod title;
 mod windows;
 
 use std::collections::{HashMap, HashSet};
@@ -1646,6 +1650,11 @@ fn interactive(fresh: bool, ssh_window: bool) {
         )
         .with_writer(std::io::stderr)
         .try_init();
+
+    // The CSD frame builds its title renderer when the first window is created,
+    // so ghost's text stack has to be in place before that — see `title`.
+    #[cfg(target_os = "linux")]
+    title::install();
 
     // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
     // this same real path with a synthetic session list, so it opens with no host.

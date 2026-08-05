@@ -30,7 +30,7 @@ mod parts;
 mod pointer;
 pub mod shadow;
 pub mod theme;
-mod title;
+pub mod title;
 mod wl_typed;
 
 use crate::theme::{

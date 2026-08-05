@@ -63,6 +63,11 @@ debug = true
 #   peaked at ~0.21 alpha and smeared that over 43px, where a real libadwaita
 #   window peaks at ~0.30 and is gone within ~15px. Refitted against a
 #   measured GTK4 window — see vendor/sctk-adwaita/src/shadow.rs.
+# - The titlebar text is drawn from ONE font face with no shaping and no color
+#   glyphs, so any character that face lacks came out as `.notdef` or as
+#   nothing. Added a renderer seam (`title::set_title_renderer`) the application
+#   fills with its own text stack — see vendor/sctk-adwaita/src/title/hook.rs
+#   and ghost-ui/src/title.rs. Generic enough to offer upstream.
 #
 # GNOME never offers server-side decorations (mutter has no
 # `zxdg_decoration_manager_v1`), so on Linux/Wayland every ghost window is
