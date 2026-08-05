@@ -1876,6 +1876,7 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
     let img = edge_render(
         ghost_renderer::WindowEdge {
             radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
             corner_shadow: frame_shadow(true),
@@ -1936,6 +1937,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
     let bare = edge_render(
         ghost_renderer::WindowEdge {
             radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
             corner_shadow: frame_shadow(true),
@@ -1945,6 +1947,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
     let ringed = edge_render(
         ghost_renderer::WindowEdge {
             radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.75,
             corner_shadow: frame_shadow(true),
@@ -1997,6 +2000,7 @@ fn the_ring_is_as_wide_as_the_border_the_frame_draws() {
         renderer.set_window_edge(ghost_renderer::WindowEdge {
             // Kept at a fixed device size so only the ring's width varies.
             radius: 10.0 / scale,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline,
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
@@ -2034,6 +2038,7 @@ fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
     let (_, w, h) = edge_window();
     let edge = |outline| ghost_renderer::WindowEdge {
         radius: 10.0,
+        corners: ghost_renderer::Corners::default(),
         highlight: 0.0,
         outline,
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
@@ -2070,11 +2075,120 @@ fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
 }
 
 #[test]
+fn ghost_drawing_its_own_frame_rounds_all_four_corners() {
+    // With ghost's own decorations there is no CSD frame above us: the window's
+    // top edge is ours too, so the curve has to run all the way round. Half a
+    // rounded window — square on top, curved below — is what "we own the frame
+    // now" looks like when only the bottom is wired up.
+    let (_, w, h) = edge_window();
+    let img = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            corners: ghost_renderer::Corners::ALL,
+            highlight: 0.0,
+            outline: 0.0,
+            corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        },
+        0.5,
+    );
+    write_png("window-edge-own-frame.png", &img);
+
+    for (x, y, corner) in [
+        (0, 0, "top-left"),
+        (w - 1, 0, "top-right"),
+        (0, h - 1, "bottom-left"),
+        (w - 1, h - 1, "bottom-right"),
+    ] {
+        assert_eq!(
+            px(&img, x, y)[3],
+            0,
+            "the {corner} corner must be cut clear through, so the compositor sees past it"
+        );
+    }
+    // The arc, on the top corners this time: (2, 1) is outside the circle and
+    // (9, 8) inside it, mirroring the bottom-corner check above.
+    assert_eq!(px(&img, 2, 1)[3], 0, "outside the top-left arc");
+    assert!(px(&img, 9, 8)[3] > 0, "inside the top-left arc");
+    // And the straight edges between the corners are untouched.
+    assert!(px(&img, w / 2, 0)[3] > 0, "the top edge stays");
+    assert!(px(&img, w / 2, h - 1)[3] > 0, "the bottom edge stays");
+}
+
+#[test]
+fn the_outer_border_carries_on_around_the_top_corners_too() {
+    // The ring traces the whole window, and with our own frame nothing else
+    // draws any of it — so the top corners need the same stretch of border the
+    // bottom ones get, or the outline breaks where the window turns.
+    let (_, w, _) = edge_window();
+    let edge = |outline| ghost_renderer::WindowEdge {
+        radius: 10.0,
+        corners: ghost_renderer::Corners::ALL,
+        highlight: 0.0,
+        outline,
+        corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+    };
+    let bare = edge_render(edge(0.0), 1.0);
+    let ringed = edge_render(edge(0.75), 1.0);
+
+    let floor = (0.75 * 255.0) as u8;
+    let mut crossed = 0;
+    for (x0, corner) in [(0, "top-left"), (w - 10, "top-right")] {
+        for y in 0..10 {
+            for x in x0..x0 + 10 {
+                let window = px(&bare, x, y)[3];
+                if window == 0 || window == 255 {
+                    continue;
+                }
+                crossed += 1;
+                let alpha = px(&ringed, x, y)[3];
+                assert!(
+                    alpha >= floor,
+                    "the {corner} arc reads {alpha} at ({x}, {y}), lighter than the \
+                     border's {floor}"
+                );
+            }
+        }
+    }
+    assert!(
+        crossed > 10,
+        "the arc should cross more than {crossed} pixels"
+    );
+}
+
+#[test]
+fn the_frames_titlebar_still_keeps_the_top_corners_when_it_draws_them() {
+    // The other half of the same switch: while the CSD frame is still drawing
+    // the titlebar it rounds the top itself, and cutting there would take a bite
+    // out of ITS corner. Default `Corners` is the frame's arrangement.
+    let (_, w, h) = edge_window();
+    let img = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
+            highlight: 0.0,
+            outline: 0.0,
+            corner_shadow: frame_shadow(true),
+        },
+        0.5,
+    );
+    assert!(
+        px(&img, 0, 0)[3] > 0 && px(&img, w - 1, 0)[3] > 0,
+        "the top corners belong to the frame's headerbar, not to us"
+    );
+    assert_eq!(
+        &px(&img, 0, h - 1)[..3],
+        &[0, 0, 0],
+        "the bottom corner is still ours, cut and holding the frame's shadow"
+    );
+}
+
+#[test]
 fn a_square_window_keeps_its_corners() {
     let (_, w, h) = edge_window();
     let img = edge_render(
         ghost_renderer::WindowEdge {
             radius: 0.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
             corner_shadow: frame_shadow(true),
@@ -2096,6 +2210,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
     let plain = edge_render(
         ghost_renderer::WindowEdge {
             radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
             corner_shadow: frame_shadow(true),
@@ -2105,6 +2220,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
     let lit = edge_render(
         ghost_renderer::WindowEdge {
             radius: 10.0,
+            corners: ghost_renderer::Corners::default(),
             highlight: 0.07,
             outline: 0.0,
             corner_shadow: frame_shadow(true),

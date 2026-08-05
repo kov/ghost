@@ -767,11 +767,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 /// and defaults to nothing at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WindowEdge {
-    /// Radius of the window's bottom corners in *logical* pixels. The corner
+    /// Radius of the window's rounded corners in *logical* pixels. The corner
     /// pixels outside it are cut to fully transparent so the compositor sees
     /// through them — which only means anything on a translucent window, whose
     /// alpha the compositor reads. 0 leaves the corners square.
     pub radius: f32,
+    /// Which corners [`radius`](Self::radius) applies to — see [`Corners`].
+    pub corners: Corners,
     /// Alpha of the 1px inset hairline along the left, right and bottom edges —
     /// libadwaita's `outline: 1px solid rgb(255 255 255/7%)`. 0 draws none.
     /// The top edge is left clean: the titlebar sits against it.
@@ -796,6 +798,43 @@ pub struct WindowEdge {
     /// samples it from whatever actually draws the frame so the two agree (and
     /// track the window's focus, which the shadow follows).
     pub corner_shadow: [f32; EDGE_SHADOW_STEPS],
+}
+
+/// Which end of the window we round, and so which end of it we own.
+///
+/// While a CSD frame draws the titlebar it rounds the top corners itself, and
+/// its headerbar abuts our top edge — so the top is neither cut nor outlined
+/// here, or we would bite a notch out of the frame's own curve. Once ghost
+/// draws its own decorations the whole edge is ours and the curve runs all the
+/// way round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Corners {
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl Corners {
+    /// The whole window is ours: all four corners rounded.
+    pub const ALL: Corners = Corners {
+        top: true,
+        bottom: true,
+    };
+    /// Square all round — a maximized or tiled window, which has no outside
+    /// corner to cut.
+    pub const NONE: Corners = Corners {
+        top: false,
+        bottom: false,
+    };
+}
+
+impl Default for Corners {
+    /// The bottom two, the arrangement a CSD frame above us leaves.
+    fn default() -> Self {
+        Corners {
+            top: false,
+            bottom: true,
+        }
+    }
 }
 
 /// How many alphas [`WindowEdge::corner_shadow`] carries. The notch is only a few
@@ -829,6 +868,11 @@ struct EdgeUniforms {
     /// How wide the outer border's ring is, in device pixels — one *logical*
     /// pixel, the width the frame draws its own border column at.
     outline_width: f32,
+    /// [`Corners`], as 0/1 flags the shader can multiply with.
+    round_top: f32,
+    round_bottom: f32,
+    /// Pads `shadow` back onto the 16-byte stride a uniform array needs.
+    _pad: [f32; 2],
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
@@ -848,6 +892,9 @@ struct EdgeU {
     notch: f32,
     outline: f32,
     outline_width: f32,
+    round_top: f32,
+    round_bottom: f32,
+    pad: vec2<f32>,
     shadow: array<vec4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
@@ -860,18 +907,29 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(p[vi], 0.0, 1.0);
 }
 
-// Distance from `p` to the window's left/right/bottom boundary, positive inside.
-// The top is deliberately absent: the titlebar abuts it, so it is neither cut
-// nor outlined.
+// Distance from `p` to the window's boundary, positive inside. The top edge
+// counts only when we round it: while a CSD frame draws the titlebar, that bar
+// abuts our top edge, so it is neither cut nor outlined.
 fn edge_distance(p: vec2<f32>) -> f32 {
     var d = min(min(p.x, u.viewport.x - p.x), u.viewport.y - p.y);
+    if (u.round_top > 0.0) {
+        d = min(d, p.y);
+    }
     if (u.radius > 0.0) {
-        let cy = u.viewport.y - u.radius;
-        if (p.y > cy) {
-            if (p.x < u.radius) {
-                d = u.radius - length(p - vec2<f32>(u.radius, cy));
-            } else if (p.x > u.viewport.x - u.radius) {
-                d = u.radius - length(p - vec2<f32>(u.viewport.x - u.radius, cy));
+        let r = u.radius;
+        // At most one corner can claim a pixel: the strips are a radius deep and
+        // the window is far taller than two of them.
+        var cy = -1.0;
+        if (u.round_bottom > 0.0 && p.y > u.viewport.y - r) {
+            cy = u.viewport.y - r;
+        } else if (u.round_top > 0.0 && p.y < r) {
+            cy = r;
+        }
+        if (cy >= 0.0) {
+            if (p.x < r) {
+                d = r - length(p - vec2<f32>(r, cy));
+            } else if (p.x > u.viewport.x - r) {
+                d = r - length(p - vec2<f32>(u.viewport.x - r, cy));
             }
         }
     }
@@ -4632,20 +4690,30 @@ impl Renderer {
             notch,
             outline: edge.outline.clamp(0.0, 1.0),
             outline_width: self.scale_factor.max(1.0),
+            round_top: f32::from(u8::from(edge.corners.top)),
+            round_bottom: f32::from(u8::from(edge.corners.bottom)),
+            _pad: [0.0; 2],
             shadow,
         };
         self.gpu
             .queue
             .write_buffer(&self.edge_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        // The bottom strip has to be deep enough to hold whichever is taller, the
+        // An end strip has to be deep enough to hold whichever is taller, the
         // corner arc or the hairline; the side strips then stop where it starts, so
         // no pixel is drawn twice (the hairline blends, so a double draw would
         // show).
         let deep = radius.max(band).ceil() as u32;
         let bottom = deep.min(h);
+        // The top is a strip of ours only when we round it; otherwise the frame's
+        // headerbar owns it and the side strips run all the way up.
+        let top = if edge.corners.top {
+            deep.min(h - bottom)
+        } else {
+            0
+        };
         let side = band.ceil().max(1.0) as u32;
-        let sides = h - bottom;
+        let sides = h - bottom - top;
 
         let mut encoder = self
             .gpu
@@ -4674,9 +4742,10 @@ impl Renderer {
             if edge.highlight > 0.0 {
                 pass.set_pipeline(&self.edge_hairline_pipeline);
                 for rect in [
-                    (0, 0, side.min(w), sides),
-                    (w.saturating_sub(side), 0, side.min(w), sides),
+                    (0, top, side.min(w), sides),
+                    (w.saturating_sub(side), top, side.min(w), sides),
                     (0, h - bottom, w, bottom),
+                    (0, 0, w, top),
                 ] {
                     if rect.2 > 0 && rect.3 > 0 {
                         pass.set_scissor_rect(rect.0, rect.1, rect.2, rect.3);
@@ -4688,26 +4757,33 @@ impl Renderer {
             // else outside the shape.
             if radius > 0.0 {
                 let r = (radius.ceil() as u32).min(w / 2).min(h);
-                let corners = [0, w - r];
-                pass.set_pipeline(&self.edge_cut_pipeline);
-                for x in corners {
-                    pass.set_scissor_rect(x, h - r, r, r);
-                    pass.draw(0..3, 0..1);
+                // Every rounded corner's square, each holding one arc.
+                let mut squares = [(0u32, 0u32); 4];
+                let mut n = 0;
+                for (rounded, y) in [(edge.corners.bottom, h - r), (edge.corners.top, 0)] {
+                    if rounded {
+                        squares[n] = (0, y);
+                        squares[n + 1] = (w - r, y);
+                        n += 2;
+                    }
                 }
+                let squares = &squares[..n];
+                let draw = |pass: &mut wgpu::RenderPass<'_>| {
+                    for &(x, y) in squares {
+                        pass.set_scissor_rect(x, y, r, r);
+                        pass.draw(0..3, 0..1);
+                    }
+                };
+                pass.set_pipeline(&self.edge_cut_pipeline);
+                draw(&mut pass);
                 // Into the emptied notch, the shadow the frame cannot reach.
                 pass.set_pipeline(&self.edge_shadow_pipeline);
-                for x in corners {
-                    pass.set_scissor_rect(x, h - r, r, r);
-                    pass.draw(0..3, 0..1);
-                }
+                draw(&mut pass);
                 // And over that, the window's outer border, picked up where the
                 // frame's straight one left off.
                 if edge.outline > 0.0 {
                     pass.set_pipeline(&self.edge_outline_pipeline);
-                    for x in corners {
-                        pass.set_scissor_rect(x, h - r, r, r);
-                        pass.draw(0..3, 0..1);
-                    }
+                    draw(&mut pass);
                 }
             }
         }
@@ -6903,6 +6979,7 @@ mod tests {
 
         let edge = |shadow: f32| WindowEdge {
             radius: 10.0,
+            corners: Corners::default(),
             highlight: 0.0,
             outline: 0.75,
             corner_shadow: [shadow; EDGE_SHADOW_STEPS],

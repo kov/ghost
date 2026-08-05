@@ -1923,6 +1923,7 @@ impl Graphics {
             cols,
             rows,
             pad,
+            decorations,
         } = spec;
         // Open sized to `cols`x`rows` cells at the base font, plus the padding border on
         // each side, so the configured grid fits inside it (padding surrounds, not eats
@@ -1953,6 +1954,24 @@ impl Graphics {
             .with_maximized(maximized)
             .with_transparent(want_transparent)
             .with_blur(glass(want_transparent, false, 0.0).blur);
+        // `[window] decorations = "ghost"`: drop the desktop's frame and draw our
+        // own. Wayland only — there the frame is a client-side one anyway (mutter
+        // offers no server-side decorations), so taking it over changes who draws
+        // pixels we already own. On X11 the window manager's frame is real, and
+        // replacing it would mean reimplementing what it does for us.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let wayland = {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            event_loop
+                .display_handle()
+                .is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_)))
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = if decorations == config::Decorations::Ghost && wayland {
+            attrs.with_decorations(false)
+        } else {
+            attrs
+        };
         // Freedesktop platforms match a window to its `.desktop` entry (icon, dock
         // grouping, the entry's actions) by app id / WM_CLASS, so it must be
         // [`APP_ID`] — the name the installed entry is filed under.
@@ -2055,6 +2074,11 @@ impl Graphics {
     /// server owns the whole edge (on macOS our vendored winit rounds the content layer
     /// itself), so we draw none of it.
     ///
+    /// With `[window] decorations = "ghost"` there is no frame above us at all, so
+    /// the top edge is ours too and the curve runs all the way round — the window is
+    /// undecorated exactly when we asked for that, so the window itself is the source
+    /// of truth.
+    ///
     /// Only a translucent surface has a corner to cut: an opaque one's alpha never
     /// reaches the compositor, and zeroing it would paint the corners black rather than
     /// clear. A maximized or fullscreen window has no outside corner at all, and GNOME
@@ -2063,10 +2087,18 @@ impl Graphics {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn window_edge(window: &Window, opaque: bool, focused: bool) -> WindowEdge {
         // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
-        // its titlebar starts.
+        // its titlebar starts — and, once we draw the whole frame, the radius the
+        // windows beside us on this desktop wear.
         const RADIUS: f32 = 10.0;
         let boxed_in = window.is_maximized() || window.fullscreen().is_some();
         let radius = if opaque || boxed_in { 0.0 } else { RADIUS };
+        let corners = if radius <= 0.0 {
+            ghost_renderer::Corners::NONE
+        } else if window.is_decorated() {
+            ghost_renderer::Corners::default()
+        } else {
+            ghost_renderer::Corners::ALL
+        };
         // Rounding a corner cuts a notch out of the window that the frame's own
         // subsurfaces cannot reach into, so we finish its shadow ourselves —
         // sampled from the frame, at the depth this radius opens up.
@@ -2082,6 +2114,7 @@ impl Graphics {
         let outline = if boxed_in { 0.0 } else { Self::frame_outline() };
         WindowEdge {
             radius,
+            corners,
             // No inset highlight. libadwaita traces one — `outline: 1px solid
             // rgb(255 255 255/7%)` — but the windows we sit next to on this
             // desktop do not: gnome-terminal's edge is the dark ring and nothing
@@ -2219,6 +2252,8 @@ pub struct WindowSpec {
     cols: u16,
     rows: u16,
     pad: f32,
+    /// Who draws the window frame — see `ghost-ui/docs/window-decorations.md`.
+    decorations: config::Decorations,
 }
 
 /// A realized window handed back by the [`Frontend`]: its id, physical size, and
@@ -4984,6 +5019,7 @@ impl App {
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
+            decorations: cfg.decorations(),
         });
         // Ask the realized window whether its compositor blurs; a headless window
         // has nothing to ask and needs no glass either way.
@@ -5436,6 +5472,7 @@ impl App {
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
+            decorations: cfg.decorations(),
         });
         // Ask the realized window whether its compositor blurs; a headless window
         // has nothing to ask and needs no glass either way.

@@ -185,6 +185,22 @@ struct Window {
     /// Inner padding in logical px per side between the terminal grid and the window
     /// edges (clamped on apply). DPI-scaled, filled with the terminal background.
     padding: f32,
+    /// Who draws the window frame: `"system"` (the default) leaves it to the
+    /// desktop — which on GNOME means winit's CSD frame, since mutter offers no
+    /// server-side decorations — and `"ghost"` draws our own. Anything else
+    /// reads as `"system"`. See ghost-ui/docs/window-decorations.md.
+    decorations: Option<String>,
+}
+
+/// Who draws the window frame — see [`Window::decorations`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Decorations {
+    /// The desktop's own frame (a CSD frame from winit, or real server-side
+    /// decorations where a compositor offers them).
+    #[default]
+    System,
+    /// ghost's, drawn into our own surface.
+    Ghost,
 }
 
 impl Default for Window {
@@ -196,6 +212,7 @@ impl Default for Window {
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
             padding: DEFAULT_PADDING,
+            decorations: None,
         }
     }
 }
@@ -340,6 +357,15 @@ impl UiConfig {
     /// edges. Non-finite falls back to the default; otherwise clamped to a sane range
     /// (0 opts out). The shell scales this by the device factor and hands it to the
     /// model, which insets the grid and lets the terminal background fill the border.
+    /// Who draws the window frame. An unrecognized value reads as
+    /// [`Decorations::System`], so a typo never leaves a window with no frame.
+    pub fn decorations(&self) -> Decorations {
+        match self.window.decorations.as_deref() {
+            Some("ghost") => Decorations::Ghost,
+            _ => Decorations::System,
+        }
+    }
+
     pub fn padding(&self) -> f32 {
         if self.window.padding.is_finite() {
             self.window.padding.clamp(0.0, MAX_PADDING)
@@ -368,6 +394,29 @@ mod tests {
     fn absent_or_empty_config_keeps_the_default_theme() {
         assert_eq!(UiConfig::default().theme().bg, Theme::default().bg);
         assert_eq!(UiConfig::parse("").unwrap().theme().bg, Theme::default().bg);
+    }
+
+    #[test]
+    fn decorations_default_to_the_desktops_own_frame() {
+        // ghost's own frame is opt-in while it is being built, and stays a
+        // supported setting after: a compositor that offers real server-side
+        // decorations should be allowed to draw them.
+        assert_eq!(UiConfig::default().decorations(), Decorations::System);
+        assert_eq!(
+            UiConfig::parse("").unwrap().decorations(),
+            Decorations::System
+        );
+        let c = UiConfig::parse("[window]\ndecorations = \"ghost\"\n").unwrap();
+        assert_eq!(c.decorations(), Decorations::Ghost);
+        let c = UiConfig::parse("[window]\ndecorations = \"system\"\n").unwrap();
+        assert_eq!(c.decorations(), Decorations::System);
+    }
+
+    #[test]
+    fn an_unreadable_decorations_setting_keeps_the_desktops_frame() {
+        // Never fatal, and never a window with no frame at all because of a typo.
+        let c = UiConfig::parse("[window]\ndecorations = \"gost\"\n").unwrap();
+        assert_eq!(c.decorations(), Decorations::System);
     }
 
     #[test]
