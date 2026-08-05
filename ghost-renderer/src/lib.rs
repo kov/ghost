@@ -907,27 +907,32 @@ fn notch_shadow(t: f32) -> f32 {
     return mix(lo, hi, pos - floor(pos));
 }
 
-// Premultiplied black, source-over, laid into the notch the cut opened: the
-// shadow the decorations would cast here if they could reach. Runs after the
-// cut, which has already emptied these pixels, and stops at the arc — inside it
-// the window itself is drawn.
+// Premultiplied black, added into the notch the cut opened: the shadow the
+// decorations would cast here if they could reach. Runs after the cut, which
+// left each pixel holding only the window's own share of it, and takes what the
+// window and the outline between them have not claimed.
 @fragment
 fn corner_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let d = edge_distance(pos.xy);
     let outside = clamp(0.5 - d, 0.0, 1.0);
-    let a = notch_shadow(-d / max(u.notch, 0.0001)) * outside;
+    let a = notch_shadow(-d / max(u.notch, 0.0001))
+        * clamp(outside - u.outline * outline_ring(d), 0.0, 1.0);
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 
-// Premultiplied black, source-over: the window's outer border, carried around the
-// arc the frame's straight border stops short of. One pixel wide, hugging the
-// outside of the shape — its coverage peaks half a pixel out and is gone by one
-// and a half, so it lands on exactly the pixels the cut emptied.
+// The share of a pixel the outer border covers: one pixel wide, hugging the
+// outside of the shape — peaking half a pixel out and gone by one and a half, so
+// it lands on exactly the pixels the cut emptied, in line with the frame's own
+// border column one pixel outside the straight edges.
+fn outline_ring(d: f32) -> f32 {
+    return clamp(0.5 - d, 0.0, 1.0) * clamp(d + 1.5, 0.0, 1.0);
+}
+
+// Premultiplied black, added: the window's outer border, carried around the arc
+// the frame's straight border stops short of.
 @fragment
 fn corner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let d = edge_distance(pos.xy);
-    let ring = clamp(0.5 - d, 0.0, 1.0) * clamp(d + 1.5, 0.0, 1.0);
-    let a = u.outline * ring;
+    let a = u.outline * outline_ring(edge_distance(pos.xy));
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 "#;
@@ -2247,17 +2252,27 @@ impl Renderer {
                 },
             },
         );
-        // The hairline and the notch shadow are ordinary premultiplied source-over.
+        // The hairline is ordinary premultiplied source-over.
         let edge_hairline_pipeline =
             edge_pipeline("hairline", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
-        let edge_shadow_pipeline = edge_pipeline(
-            "corner_shadow",
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        );
-        let edge_outline_pipeline = edge_pipeline(
-            "corner_outline",
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        );
+        // The notch shadow and the outline ADD, because they and the cut share
+        // out one pixel between them: along the arc an edge pixel is part window,
+        // part border, part shadow, and each pass paints only its own share. Laid
+        // over each other instead, every pass but the first scales down what the
+        // ones before it put there, and the window's share of the pixel goes
+        // missing — the arc comes out lighter than the straight edges it joins,
+        // and beaded, since how the share splits swings pixel to pixel.
+        let add = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let sum = wgpu::BlendState {
+            color: add,
+            alpha: add,
+        };
+        let edge_shadow_pipeline = edge_pipeline("corner_shadow", sum);
+        let edge_outline_pipeline = edge_pipeline("corner_outline", sum);
 
         Renderer {
             gpu,

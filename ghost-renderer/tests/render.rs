@@ -1980,6 +1980,52 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
 }
 
 #[test]
+fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
+    // An edge pixel on the arc is part window and part border, and the two
+    // shares are complementary — so however the arc happens to cross it, it is
+    // at least as opaque as the fainter of the two. Composite the passes over
+    // each other instead of sharing the pixel out between them and each one
+    // scales down what the last put there: the pixels where the split is even
+    // come out lightest, which is the beading that makes a curve look ragged.
+    let (_, w, h) = edge_window();
+    let edge = |outline| ghost_renderer::WindowEdge {
+        radius: 10.0,
+        highlight: 0.0,
+        outline,
+        corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+    };
+    // Opaque, so the only thing that can lighten a pixel is the arc itself.
+    let bare = edge_render(edge(0.0), 1.0);
+    let ringed = edge_render(edge(0.75), 1.0);
+
+    let floor = (0.75 * 255.0) as u8;
+    let mut crossed = 0;
+    for (x0, corner) in [(0, "bottom-left"), (w - 10, "bottom-right")] {
+        for y in h - 10..h {
+            for x in x0..x0 + 10 {
+                // Only the pixels the arc actually runs through: part window,
+                // part not, as the unringed render shows them.
+                let window = px(&bare, x, y)[3];
+                if window == 0 || window == 255 {
+                    continue;
+                }
+                crossed += 1;
+                let alpha = px(&ringed, x, y)[3];
+                assert!(
+                    alpha >= floor,
+                    "the {corner} arc reads {alpha} at ({x}, {y}), lighter than the \
+                     border's {floor} — and the window already had {window} of it"
+                );
+            }
+        }
+    }
+    assert!(
+        crossed > 10,
+        "the arc should cross more than {crossed} pixels"
+    );
+}
+
+#[test]
 fn a_square_window_keeps_its_corners() {
     let (_, w, h) = edge_window();
     let img = edge_render(
