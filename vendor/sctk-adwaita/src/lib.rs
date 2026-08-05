@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tiny_skia::{
-    Color, FillRule, Mask, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Point, Rect,
+    Color, FillRule, Mask, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Point, Rect, Shader,
     Transform,
 };
 
@@ -306,6 +306,17 @@ where
                             Transform::identity(),
                             None,
                         );
+                    }
+
+                    // ...and hand the corners over to the client's arc without a
+                    // step, by fading out over the share of the ring that is
+                    // still in this column.
+                    for (slice, coverage) in corner_border_taper(border, rect, scale, rounded) {
+                        let mut paint = colors.outer_border_paint();
+                        if let Shader::SolidColor(color) = &mut paint.shader {
+                            color.apply_opacity(coverage);
+                        }
+                        pixmap.fill_rect(slice, &paint, Transform::identity(), None);
                     }
                 }
             };
@@ -786,14 +797,20 @@ fn swap_red_and_blue(data: &mut [u8]) {
 /// that ring is still within half a pixel of the window's edge. Cutting it at the
 /// full radius instead leaves a visible nick at each end of the bottom edge,
 /// where neither this border nor the client's arc has drawn anything.
-fn corner_inset(radius: u32) -> u32 {
-    if radius == 0 {
-        return 0;
-    }
-    let r = radius as f32;
-    // The ring at r + 1 crosses the border's own centre line (half a pixel out)
-    // at sqrt(r + 0.75) along the edge.
-    (r - (r + 0.75).sqrt()).round().max(0.) as u32
+/// How much of the frame's border column the window's outer ring still fills,
+/// `along` device pixels from where the corner's arc begins.
+///
+/// One ring runs around the whole window: the band between `radius` and
+/// `radius + 1` out from each corner's centre, which on the straight edges is
+/// exactly the column this frame paints. At the tangent the two are the same
+/// pixel and the column is full; as the arc curves away the ring slides off it
+/// and into the client's own pixels, which draw the rest. Fading the column out
+/// by the share that is still its own is what keeps the line continuous across
+/// the handover instead of ending on a step.
+fn corner_border_coverage(radius: f32, along: f32) -> f32 {
+    let outer = ((radius + 1.0).powi(2) - along * along).max(0.0).sqrt();
+    let inner = (radius * radius - along * along).max(0.0).sqrt();
+    (outer.min(radius + 1.0) - inner.max(radius)).clamp(0.0, 1.0)
 }
 
 /// The slice of the window's outer border this decoration part owns, in that
@@ -810,11 +827,7 @@ fn corner_inset(radius: u32) -> u32 {
 fn visible_border_rect(border: usize, rect: parts::Rect, scale: u32, rounded: bool) -> Option<Rect> {
     // The visible border is one pt.
     let visible_border_size = VISIBLE_BORDER_SIZE * scale;
-    let corner = if rounded {
-        corner_inset(CORNER_RADIUS * scale)
-    } else {
-        0
-    };
+    let corner = if rounded { CORNER_RADIUS * scale } else { 0 };
 
     // XXX we do all the match using integral types and then convert to f32 in the
     // end to ensure that result is finite.
@@ -854,6 +867,75 @@ fn visible_border_rect(border: usize, rect: parts::Rect, scale: u32, rounded: bo
 
     // A window barely taller than its own corners has nothing left to draw.
     rect.filter(|rect| rect.width() > 0. && rect.height() > 0.)
+}
+
+/// Where [`visible_border_rect`] stops, the border's fade into the corner: one
+/// device-pixel slice per step along the arc, with the coverage to paint it at.
+///
+/// Empty unless the window is rounded — a square corner keeps a full border all
+/// the way in.
+fn corner_border_taper(
+    border: usize,
+    rect: parts::Rect,
+    scale: u32,
+    rounded: bool,
+) -> Vec<(Rect, f32)> {
+    if !rounded {
+        return Vec::new();
+    }
+
+    let visible_border_size = (VISIBLE_BORDER_SIZE * scale) as f32;
+    let radius = (CORNER_RADIUS * scale) as f32;
+    let mut slices = Vec::new();
+
+    let mut push = |x: f32, y: f32, w: f32, h: f32, coverage: f32| {
+        if coverage > 0. {
+            if let Some(rect) = Rect::from_xywh(x, y, w, h) {
+                slices.push((rect, coverage));
+            }
+        }
+    };
+
+    match border {
+        DecorationParts::LEFT | DecorationParts::RIGHT => {
+            let x = if border == DecorationParts::LEFT {
+                (rect.x.unsigned_abs() * scale) as f32 - visible_border_size
+            } else {
+                0.
+            };
+            // The straight border ends a radius above the window's last row;
+            // from there the arc takes over, one row at a time.
+            let top = rect.height as f32 - radius;
+            if top < (rect.y.unsigned_abs() * scale) as f32 {
+                return Vec::new();
+            }
+            for step in 0..radius as u32 {
+                let along = step as f32 + 0.5;
+                push(
+                    x,
+                    top + step as f32,
+                    visible_border_size,
+                    1.,
+                    corner_border_coverage(radius, along),
+                );
+            }
+        }
+        DecorationParts::BOTTOM => {
+            // Mirror of the sides, a column at a time out towards each end.
+            let outer_left = (rect.x.unsigned_abs() * scale) as f32 - visible_border_size;
+            let outer_right = rect.width as f32 - outer_left;
+            for step in 0..radius as u32 {
+                let along = step as f32 + 0.5;
+                let coverage = corner_border_coverage(radius, along);
+                let inset = radius - 1. - step as f32;
+                push(outer_left + inset, 0., 1., visible_border_size, coverage);
+                push(outer_right - inset - 1., 0., 1., visible_border_size, coverage);
+            }
+        }
+        _ => {}
+    }
+
+    slices
 }
 
 // returns horizontal margin, logical points
@@ -1000,13 +1082,64 @@ mod visible_border_tests {
     }
 
     #[test]
-    fn a_straight_border_stops_where_the_arc_leaves_the_edge() {
-        // Not at the radius: this border is a chord of the ring one pixel outside
-        // the window, which stays flush with the edge for a few pixels after the
-        // arc's own centre line has curved away.
-        assert_eq!(corner_inset(10), 7);
-        assert_eq!(corner_inset(20), 15);
-        assert_eq!(corner_inset(0), 0);
+    fn the_border_hands_the_ring_over_to_the_arc_without_a_step() {
+        // Full at the tangent, where the column *is* the ring...
+        assert!((corner_border_coverage(10., 0.) - 1.).abs() < 1e-3);
+        // ...then only ever giving up ground as the arc curves away from it...
+        let mut previous = 1.;
+        for step in 0..10 {
+            let coverage = corner_border_coverage(10., step as f32 + 0.5);
+            assert!(
+                coverage <= previous + 1e-6,
+                "coverage rose again at {step}: {coverage} after {previous}"
+            );
+            previous = coverage;
+        }
+        // ...until the ring has left the column entirely.
+        assert_eq!(corner_border_coverage(10., 9.5), 0.);
+    }
+
+    #[test]
+    fn the_taper_takes_over_exactly_where_the_straight_border_stops() {
+        let rect = side(DecorationParts::LEFT, 400, 300, 1);
+        let straight = visible_border_rect(DecorationParts::LEFT, rect, 1, true)
+            .expect("the left border to have a rect");
+        let taper = corner_border_taper(DecorationParts::LEFT, rect, 1, true);
+
+        let first = taper.first().expect("the corner to be tapered");
+        assert_eq!(first.0.top(), straight.bottom(), "no gap, no overlap");
+        assert_eq!(first.0.left(), straight.left(), "same column");
+        assert!(first.1 > 0.9, "and starts about as dark as the border");
+
+        // Every slice is one row, none of them reaches past the window's last,
+        // and the rows the ring has left altogether are simply not drawn.
+        let last = taper.last().expect("more than one row");
+        assert!(taper.iter().all(|(r, _)| r.height() == 1.));
+        assert!(last.0.bottom() <= (HEADER_SIZE + 300) as f32);
+        assert!(last.1 < 0.5, "and it fades out rather than being cut off");
+    }
+
+    #[test]
+    fn a_square_window_is_not_tapered() {
+        let rect = side(DecorationParts::LEFT, 400, 300, 1);
+        assert!(corner_border_taper(DecorationParts::LEFT, rect, 1, false).is_empty());
+    }
+
+    #[test]
+    fn the_bottom_tapers_in_from_both_ends() {
+        let rect = bottom(400, 300, 1);
+        let straight = visible_border_rect(DecorationParts::BOTTOM, rect, 1, true)
+            .expect("the bottom border to have a rect");
+        let taper = corner_border_taper(DecorationParts::BOTTOM, rect, 1, true);
+
+        let darkest = taper
+            .iter()
+            .filter(|(_, coverage)| *coverage > 0.9)
+            .map(|(r, _)| r.left())
+            .collect::<Vec<_>>();
+        assert_eq!(darkest.len(), 2, "one column at each end");
+        assert_eq!(darkest[0] + 1., straight.left(), "meets the straight run");
+        assert_eq!(darkest[1], straight.right(), "at both of its ends");
     }
 
     #[test]
@@ -1018,7 +1151,7 @@ mod visible_border_tests {
         assert_eq!(left.top(), HEADER_SIZE as f32, "starts below the header");
         assert_eq!(
             left.bottom(),
-            (HEADER_SIZE + 300 - corner_inset(CORNER_RADIUS)) as f32,
+            (HEADER_SIZE + 300 - CORNER_RADIUS) as f32,
             "and stops a corner radius above the window's bottom"
         );
     }
@@ -1032,10 +1165,10 @@ mod visible_border_tests {
         // The part starts `BORDER_SIZE` left of the window, and the window's own
         // left edge is one visible border inside that.
         let window_left = (BORDER_SIZE - VISIBLE_BORDER_SIZE) as f32;
-        assert_eq!(b.left(), window_left + corner_inset(CORNER_RADIUS) as f32);
+        assert_eq!(b.left(), window_left + CORNER_RADIUS as f32);
         assert_eq!(
             b.width(),
-            400. + 2. * VISIBLE_BORDER_SIZE as f32 - 2. * corner_inset(CORNER_RADIUS) as f32
+            400. + 2. * VISIBLE_BORDER_SIZE as f32 - 2. * CORNER_RADIUS as f32
         );
     }
 
@@ -1062,7 +1195,7 @@ mod visible_border_tests {
         assert_eq!(left.top(), 2. * HEADER_SIZE as f32);
         assert_eq!(
             left.bottom(),
-            (2 * (HEADER_SIZE + 300) - corner_inset(2 * CORNER_RADIUS)) as f32
+            (2 * (HEADER_SIZE + 300) - 2 * CORNER_RADIUS) as f32
         );
     }
 
