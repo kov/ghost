@@ -206,6 +206,49 @@ mod tests {
         }
     }
 
+    /// The alpha the drawn shadow leaves in one column of a decoration part.
+    fn column(part_idx: usize, window: (u32, u32), x: u32) -> Vec<u8> {
+        let (width, height) = match part_idx {
+            DecorationParts::LEFT | DecorationParts::RIGHT => {
+                (theme::BORDER_SIZE, window.1 + theme::HEADER_SIZE)
+            }
+            _ => unreachable!("only the sides are asked about here"),
+        };
+        #[allow(clippy::unwrap_used)]
+        let mut pixmap = Pixmap::new(width, height).unwrap();
+        RenderedShadow::new(1, true).draw(&mut pixmap.as_mut(), 1, part_idx);
+        (0..height)
+            .map(|y| {
+                #[allow(clippy::unwrap_used)]
+                pixmap.pixel(x, y).unwrap().alpha()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_column_under_the_visible_border_is_shadowed_all_the_way_down() {
+        // The border stops a corner short of the bottom, so the client can round
+        // it — and then whatever the shadow left unpainted in that column is the
+        // one place around the window with nothing on it at all. Against the
+        // shadow on either side it reads as a bright shard poking out of the
+        // curve, which is exactly the artefact the rounded corner was supposed
+        // to remove.
+        let window = (400, 300);
+        for (part, x, side) in [
+            (DecorationParts::LEFT, theme::BORDER_SIZE - 1, "left"),
+            (DecorationParts::RIGHT, 0, "right"),
+        ] {
+            let alphas = column(part, window, x);
+            let bottom = alphas.len() - 1;
+            for (y, alpha) in alphas.iter().enumerate().skip(theme::HEADER_SIZE as usize) {
+                assert!(
+                    *alpha > 0,
+                    "the {side} border column has no shadow at row {y} of {bottom}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn erf_is_accurate_enough_for_an_8_bit_alpha() {
         // Reference values from the error function's series expansion.
@@ -396,6 +439,13 @@ impl RenderedShadow {
                     dst_height,
                 );
             }
+            // The side parts run the shadow under their own visible border
+            // column as well as beside it. Upstream stopped one pixel short
+            // there, which was invisible while the border was opaque and ran the
+            // whole height — but it stops a corner short of the bottom now, so
+            // the client can round it, and an unshadowed column is the one place
+            // around the window with nothing on it at all: a bright shard poking
+            // out of the curve.
             DecorationParts::LEFT => {
                 let top_edge_height = corner_radius;
                 let bottom_edge_height = corner_radius - visible_border_size;
@@ -403,17 +453,19 @@ impl RenderedShadow {
                     .saturating_sub(top_edge_height)
                     .saturating_sub(bottom_edge_height);
 
-                self.edges_draw(
-                    0,
-                    shadow_size as isize,
+                self.edges_draw(0, shadow_size as isize, dst_pixmap, 0, 0, dst_width, top_edge_height);
+
+                // Starting a column in means the strip's own first sample — the
+                // deepest one — lands on the border column instead of beside it.
+                // What drops off the far end is the tail, which is nothing.
+                self.side_draw(
+                    true,
+                    false,
+                    side_height,
                     dst_pixmap,
-                    0,
-                    0,
-                    dst_width.saturating_sub(visible_border_size),
+                    visible_border_size,
                     top_edge_height,
                 );
-
-                self.side_draw(true, false, side_height, dst_pixmap, 0, top_edge_height);
 
                 self.edges_draw(
                     0,
@@ -421,7 +473,7 @@ impl RenderedShadow {
                     dst_pixmap,
                     0,
                     top_edge_height + side_height,
-                    dst_width.saturating_sub(visible_border_size),
+                    dst_width,
                     bottom_edge_height,
                 );
             }
@@ -431,33 +483,22 @@ impl RenderedShadow {
                 let side_height = dst_height
                     .saturating_sub(top_edge_height)
                     .saturating_sub(bottom_edge_height);
+                // Reaching one column further left means reading one column
+                // further left as well, or the whole stretch slides over.
+                let src_x = edges_half as isize + corner_radius as isize
+                    - visible_border_size as isize;
+
+                self.edges_draw(src_x, shadow_size as isize, dst_pixmap, 0, 0, dst_width, top_edge_height);
+
+                self.side_draw(false, false, side_height, dst_pixmap, 0, top_edge_height);
 
                 self.edges_draw(
-                    edges_half as isize + corner_radius as isize,
-                    shadow_size as isize,
-                    dst_pixmap,
-                    visible_border_size,
-                    0,
-                    dst_width.saturating_sub(visible_border_size),
-                    top_edge_height,
-                );
-
-                self.side_draw(
-                    false,
-                    false,
-                    side_height,
-                    dst_pixmap,
-                    visible_border_size,
-                    top_edge_height,
-                );
-
-                self.edges_draw(
-                    edges_half as isize + corner_radius as isize,
+                    src_x,
                     edges_half as isize,
                     dst_pixmap,
-                    visible_border_size,
+                    0,
                     top_edge_height + side_height,
-                    dst_width.saturating_sub(visible_border_size),
+                    dst_width,
                     bottom_edge_height,
                 );
             }

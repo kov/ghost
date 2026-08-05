@@ -2073,11 +2073,13 @@ impl Graphics {
         let outline = if boxed_in { 0.0 } else { Self::frame_outline() };
         WindowEdge {
             radius,
-            // libadwaita traces its window edge with `outline: 1px solid
-            // rgb(255 255 255/7%)`, and we run brighter than that on purpose: it
-            // draws on an opaque window, ours is diluted by everything showing
-            // through a translucent one.
-            highlight: if boxed_in { 0.0 } else { 0.14 },
+            // No inset highlight. libadwaita traces one — `outline: 1px solid
+            // rgb(255 255 255/7%)` — but the windows we sit next to on this
+            // desktop do not: gnome-terminal's edge is the dark ring and nothing
+            // else, and measured against it ours read as glassy piping, a bright
+            // line curving round the corner where theirs has a deep one. The
+            // ring carries the edge on its own.
+            highlight: 0.0,
             outline,
             corner_shadow,
         }
