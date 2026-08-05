@@ -254,6 +254,11 @@ Verified in the vendored winit (0.30.13):
   `action-double-click-titlebar`, right-click window menu. Making the top strip
   of the terminal a drag handle before there is a bar would only take away the
   ability to select text there.
+  Known gap found while building it: `SceneItem::Rect` carries a `radius` the
+  renderer **ignores** — every rounded rect in the UI (fleet cards, the toast,
+  now the buttons' hover circle) is drawn square. Fixing it means a per-instance
+  radius and a rounded-box SDF in the glyph shader, which is the hottest one we
+  have; worth its own change with its own before/after, not a rider on this one.
 - **P4 — shadow, and the deletion.** Vendored winit gains decoration margins:
   inflate the surface, set `xdg_surface.set_window_geometry` to the content
   rect, offset pointer coordinates, set the input region to content + resize
