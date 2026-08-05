@@ -233,14 +233,27 @@ Verified in the vendored winit (0.30.13):
   corners, with our own values instead of alphas sampled off sctk's theme.
   Rounding suppressed when maximized or tiled (needs patch 1). Tested as the
   edge already is, with `ghost-shot` pixel assertions.
-- **P2 — interaction.** Resize edges/corners and the titlebar drag region become
-  `Scene` items with ids, so `Scene::hit` routes them like everything else and
-  the logic is headlessly testable in `ghost-ui-core`; the shell only maps a
-  `Cmd` onto the winit call. Per-edge cursors, double-click-to-maximize
-  honouring `action-double-click-titlebar`, right-click window menu.
-- **P3 — the bar.** Height, focus-dependent colors, title via `paint_text`, and
-  our own buttons laid out from GNOME's `button-layout` — order *and* side, both
-  of which are the classic CSD tell when wrong.
+- **P2 — resize.** The eight resize edges, per-edge cursors, and
+  `drag_resize_window`. A pure `ghost_ui_core::resize_edge_at` decides which
+  edge (if any) a point grabs; the shell only reads the window's state and makes
+  the call.
+
+  Not `Scene` items after all, as first sketched: the frame's regions are not
+  content and must always win, so they are hit-tested *before* the pointer
+  reaches the model rather than competing with it inside `Scene::hit`. This also
+  keeps invisible border items out of every scene the fleet and terminal build.
+
+  The band lies *inside* the window until P4 gives us margins, which is what
+  makes swallowing the motion necessary — it overlaps the inner padding and the
+  first pixels of the grid.
+- **P3 — the bar, and its gestures.** Height, focus-dependent colors, title via
+  `paint_text`, and our own buttons laid out from GNOME's `button-layout` —
+  order *and* side, both of which are the classic CSD tell when wrong. The
+  titlebar gestures land here rather than in P2 because they need a bar to
+  happen on: drag-to-move, double-click-to-maximize honouring
+  `action-double-click-titlebar`, right-click window menu. Making the top strip
+  of the terminal a drag handle before there is a bar would only take away the
+  ability to select text there.
 - **P4 — shadow, and the deletion.** Vendored winit gains decoration margins:
   inflate the surface, set `xdg_surface.set_window_geometry` to the content
   rect, offset pointer coordinates, set the input region to content + resize
