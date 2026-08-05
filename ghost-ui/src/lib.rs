@@ -2374,7 +2374,22 @@ impl Graphics {
     fn refresh_window_edge(&mut self, focused: bool) {
         let edge = Self::window_edge(&self.window, self.target.opaque(), focused);
         self.renderer.set_window_edge(edge);
-        Self::shape_backdrop(&self.window, edge);
+        // Changing the margins resizes the SURFACE — a maximized window drops
+        // them, a restored one takes them back — and no configure follows to
+        // tell us. Catch it here, or the swapchain and the scene stay the size
+        // the window was before the change and the window wears a band of dead
+        // surface down the two edges the difference landed on.
+        let surface = Self::shape_backdrop(&self.window, edge);
+        if let Some((w, h)) = surface
+            && (w, h) != self.size()
+            && w > 0
+            && h > 0
+        {
+            if let Target::Surface(s) = &mut self.target {
+                s.resize(w, h);
+            }
+            self.scene_cache.invalidate();
+        }
     }
 
     /// Cut the compositor's backdrop effect to the corners we round.
@@ -2390,12 +2405,13 @@ impl Graphics {
     /// titlebar it rounds the top itself and only the bottom two are ours, but
     /// with our own decorations all four are — and a top corner left square here
     /// wears exactly the same wedge the bottom ones used to.
+    /// Returns the surface's size, which the margins decide.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn shape_backdrop(window: &Window, edge: WindowEdge) {
+    fn shape_backdrop(window: &Window, edge: WindowEdge) -> Option<(u32, u32)> {
         use winit::platform::wayland::{DecorationMargins, WindowExtWayland};
         // Ask for the room the shadow needs *first*: it resizes the surface, and
         // the effect region below is spelled out against the window inside it.
-        window.set_decoration_margins(DecorationMargins {
+        let size = window.set_decoration_margins(DecorationMargins {
             top: edge.margins.top.max(0.0) as u32,
             right: edge.margins.right.max(0.0) as u32,
             bottom: edge.margins.bottom.max(0.0) as u32,
@@ -2404,10 +2420,13 @@ impl Graphics {
         let radius = edge.radius.max(0.0) as u32;
         let of = |rounded: bool| if rounded { radius } else { 0 };
         window.set_blur_corner_radii(of(edge.corners.top), of(edge.corners.bottom));
+        Some((size.width, size.height))
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn shape_backdrop(_window: &Window, _edge: WindowEdge) {}
+    fn shape_backdrop(_window: &Window, _edge: WindowEdge) -> Option<(u32, u32)> {
+        None
+    }
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {
@@ -3460,13 +3479,17 @@ impl App {
         scale: f64,
         event_loop: &dyn Frontend,
     ) {
-        let (bar, m) = self
+        let (bar, m, surface) = self
             .windows
             .get(&wid)
             .and_then(|w| w.gfx.as_ref())
-            .map_or((0, ghost_ui_core::frame::FrameInset::NONE), |g| {
-                (g.bar_px(), g.margins_px())
+            .map_or((0, ghost_ui_core::frame::FrameInset::NONE, None), |g| {
+                (g.bar_px(), g.margins_px(), Some(g.size()))
             });
+        // Taking or dropping the shadow's margins resizes the surface with no
+        // configure to announce it, so the size this event carried can already be
+        // stale — the surface itself is the truth.
+        let (w_px, h_px) = surface.filter(|s| *s != (0, 0)).unwrap_or((w_px, h_px));
         let (w_px, h_px) = m.window((w_px, h_px));
         self.dispatch(
             wid,

@@ -17,6 +17,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use crate::dpi::PhysicalSize;
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
@@ -144,8 +145,13 @@ pub trait WindowExtWayland {
     /// client has to paint; the window inside it is that less the margins.
     /// Wayland-only, and only meaningful while the client is undecorated.
     ///
+    /// Returns the surface's new size, which changes the moment the margins do.
+    /// No `Resized` event follows — like [`Window::request_inner_size`], the
+    /// caller is told by the return value.
+    ///
     /// [`Window::inner_size`]: crate::window::Window::inner_size
-    fn set_decoration_margins(&self, margins: DecorationMargins);
+    /// [`Window::request_inner_size`]: crate::window::Window::request_inner_size
+    fn set_decoration_margins(&self, margins: DecorationMargins) -> PhysicalSize<u32>;
 }
 
 impl WindowExtWayland for Window {
@@ -196,11 +202,11 @@ impl WindowExtWayland for Window {
     }
 
     #[inline]
-    fn set_decoration_margins(&self, margins: DecorationMargins) {
+    fn set_decoration_margins(&self, margins: DecorationMargins) -> PhysicalSize<u32> {
         #[allow(clippy::single_match)]
         match &self.window {
             #[cfg(x11_platform)]
-            crate::platform_impl::Window::X(_) => (),
+            crate::platform_impl::Window::X(_) => self.inner_size(),
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => {
                 window.set_decoration_margins(margins)

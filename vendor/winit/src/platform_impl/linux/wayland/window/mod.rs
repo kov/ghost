@@ -17,6 +17,7 @@ use sctk::shell::WaylandSurface;
 use tracing::warn;
 
 use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
+use crate::platform_impl::wayland::logical_to_physical_rounded;
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
 use crate::event_loop::AsyncRequestSerial;
@@ -281,8 +282,10 @@ impl Window {
 
     /// Keep `margins` logical pixels of surface outside the window proper, to
     /// draw a shadow into. [vendored addition]
-    pub fn set_decoration_margins(&self, margins: DecorationMargins) {
-        self.window_state.lock().unwrap().set_decoration_margins(margins);
+    pub fn set_decoration_margins(&self, margins: DecorationMargins) -> PhysicalSize<u32> {
+        let mut state = self.window_state.lock().unwrap();
+        let size = state.set_decoration_margins(margins);
+        logical_to_physical_rounded(size, state.scale_factor())
     }
 
     /// Round the backdrop effect's corners to `top` and `bottom` logical

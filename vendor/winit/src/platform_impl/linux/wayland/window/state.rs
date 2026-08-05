@@ -826,9 +826,9 @@ impl WindowState {
     /// Keep `margins` logical pixels of surface outside the window proper — see
     /// [`DecorationMargins`]. Re-configures immediately so the geometry and the
     /// surface agree from here on. [vendored addition]
-    pub fn set_decoration_margins(&mut self, margins: DecorationMargins) {
+    pub fn set_decoration_margins(&mut self, margins: DecorationMargins) -> LogicalSize<u32> {
         if self.decoration_margins == margins {
-            return;
+            return self.size;
         }
         // The window the compositor knows about must not move or resize under
         // the user just because we changed how much shadow we paint: hold the
@@ -836,6 +836,7 @@ impl WindowState {
         let geometry = self.decoration_margins.deflate(self.size);
         self.decoration_margins = margins;
         self.resize(margins.inflate(geometry));
+        self.size
     }
 
     /// The margins currently kept outside the window. [vendored addition]
@@ -1540,12 +1541,17 @@ fn place_blur_rect(
     if origin == (0, 0) {
         return rect;
     }
-    (
-        x + origin.0,
-        y + origin.1,
-        w.min(window.width as i32),
-        h.min(window.height as i32),
-    )
+    // Intersect with the window, held one pixel in on every side. Exactly on the
+    // boundary is not good enough: the region is logical and the edge we draw is
+    // device, so at a fractional scale they round apart and the region ends up a
+    // device pixel past the border — a bright thread of blurred backdrop running
+    // the whole edge, which is what the arc rows already step inward to avoid.
+    let (l, t) = (origin.0 + 1, origin.1 + 1);
+    let r = origin.0 + window.width as i32 - 1;
+    let b = origin.1 + window.height as i32 - 1;
+    let (x0, y0) = ((x + origin.0).max(l), (y + origin.1).max(t));
+    let (x1, y1) = ((x + origin.0 + w).min(r), (y + origin.1 + h).min(b));
+    (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
 }
 
 #[cfg(test)]
@@ -1582,13 +1588,18 @@ mod decoration_margin_tests {
         // No margins: the oversized rect is the point, and it is kept.
         assert_eq!(place_blur_rect(body, WINDOW, (0, 0)), body);
 
-        // Offset into a margin, it is clipped to the window it belongs to.
-        assert_eq!(place_blur_rect(body, WINDOW, (20, 12)), (20, 12, 800, 600));
+        // Offset into a margin, it is clipped to the window it belongs to —
+        // and held a pixel inside it, so a fractional scale cannot round the
+        // region past the border and leave a thread of blur down the edge.
+        assert_eq!(place_blur_rect(body, WINDOW, (20, 12)), (21, 13, 798, 598));
         // A rect already inside the window keeps its own size.
         assert_eq!(
             place_blur_rect((5, 7, 100, 1), WINDOW, (20, 12)),
             (25, 19, 100, 1)
         );
+        // One that would reach the far edge is pulled back off it.
+        let (x, _, w, _) = place_blur_rect((0, 7, 800, 1), WINDOW, (20, 12));
+        assert_eq!((x, x + w), (21, 819), "must stop short of the window's edge");
     }
 
     #[test]
