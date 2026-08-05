@@ -154,6 +154,12 @@ pub struct WindowState {
     /// [vendored addition]
     background_effect: Option<ExtBackgroundEffectSurfaceV1>,
     background_effect_manager: Option<BackgroundEffectManager>,
+    /// Radius, in logical pixels, of the *bottom* corners the client rounds off
+    /// its own surface — so the backdrop effect can be cut to the same shape
+    /// instead of blurring a square box behind a rounded window. 0 is square.
+    /// See [`set_blur_bottom_radius`](Self::set_blur_bottom_radius).
+    /// [vendored addition]
+    blur_bottom_radius: u32,
 
     /// Whether the client side decorations have pending move operations.
     ///
@@ -197,6 +203,7 @@ impl WindowState {
             blur_manager: winit_state.kwin_blur_manager.clone(),
             background_effect: None,
             background_effect_manager: winit_state.background_effect_manager.clone(),
+            blur_bottom_radius: 0,
             compositor,
             connection,
             csd_fails: false,
@@ -705,6 +712,10 @@ impl WindowState {
     fn resize(&mut self, inner_size: LogicalSize<u32>) {
         self.size = inner_size;
 
+        // A rounded backdrop shape is spelled out in surface coordinates, so it
+        // has to be redrawn against the new size. [vendored addition]
+        self.reapply_blur_shape();
+
         // Update the stateless (restore) size. `is_stateless` now recognises
         // partially-tiled (snapped) windows, so a snap no longer corrupts it.
         if Some(true) == self.last_configure.as_ref().map(Self::is_stateless) {
@@ -1148,15 +1159,56 @@ impl WindowState {
                 return;
             },
         };
-        // The compositor clips this to the surface, so it covers the window at
-        // every size. `set_blur_region` copies, hence dropping the region here.
-        region.add(0, 0, WHOLE_SURFACE, WHOLE_SURFACE);
+        Self::add_blur_shape(&region, self.size, self.blur_bottom_radius);
+        // `set_blur_region` copies, hence dropping the region here.
         effect.set_blur_region(Some(region.wl_region()));
         // The region is double-buffered surface state. Before the initial
         // configure the caller's own first commit will carry it; after, nothing
         // else is guaranteed to commit soon enough, so flush it now.
         if self.is_configured() {
             self.window.wl_surface().commit();
+        }
+    }
+
+    /// Fill `region` with the shape whose backdrop should be blurred.
+    ///
+    /// Square by default, and then one rect says it: the compositor clips the
+    /// region to the surface, so an oversized rect means "all of it" at every
+    /// size and never needs respecifying. A client that rounds its own bottom
+    /// corners needs the effect to stop at the same curve — otherwise the
+    /// corner it cut to transparent is where the blur shows at *full* strength,
+    /// undimmed by any content, and the window ends in a bright square wedge
+    /// poking out of its own curve. There the shape is spelled out row by row:
+    /// everything above the corners, then one rect per row across the arcs.
+    /// [vendored addition]
+    fn add_blur_shape(region: &Region, size: LogicalSize<u32>, bottom_radius: u32) {
+        for (x, y, w, h) in blur_shape_rects(size, bottom_radius) {
+            region.add(x, y, w, h);
+        }
+    }
+
+    /// Round the bottom corners of the backdrop effect by `radius` logical
+    /// pixels, matching a client that rounds those corners in its own drawing.
+    /// 0 (the default) leaves the effect square. Re-applied on resize, since
+    /// unlike the square shape this one is spelled out in surface coordinates.
+    /// [vendored addition]
+    pub fn set_blur_bottom_radius(&mut self, radius: u32) {
+        if self.blur_bottom_radius == radius {
+            return;
+        }
+        self.blur_bottom_radius = radius;
+        self.reapply_blur_shape();
+    }
+
+    /// Respecify the blur region against the current size — a no-op unless a
+    /// rounded shape is in force, since the square one is size-independent.
+    /// [vendored addition]
+    pub fn reapply_blur_shape(&mut self) {
+        if self.blur_bottom_radius == 0 || self.background_effect.is_none() {
+            return;
+        }
+        if let Some(manager) = self.background_effect_manager.clone() {
+            self.set_background_effect_blur(&manager, true);
         }
     }
 
@@ -1299,5 +1351,101 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+/// The rectangles making up the shape whose backdrop should be blurred, for a
+/// surface of `size` whose bottom corners the client rounds by `bottom_radius`
+/// logical pixels.
+///
+/// Square by default, and then one rect says it: the compositor clips the region
+/// to the surface, so an oversized rect means "all of it" at every size and never
+/// needs respecifying. A rounded shape has to be spelled out instead —
+/// everything above the corners, then one rect per row across the arcs.
+/// [vendored addition]
+fn blur_shape_rects(size: LogicalSize<u32>, bottom_radius: u32) -> Vec<(i32, i32, i32, i32)> {
+    let (w, h) = (size.width, size.height);
+    let r = bottom_radius.min(w / 2).min(h);
+    if r == 0 {
+        return vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)];
+    }
+    // Everything above the corners, overwide so the sides are never clipped short
+    // of the surface by a stale size.
+    let mut rects = vec![(0, 0, WHOLE_SURFACE, (h - r) as i32)];
+    let rf = r as f32;
+    for row in 0..r {
+        // Half-chord of the corner circle at this row's centre. Rounded *inward*
+        // (and then one more pixel), so the region always stops short of the curve
+        // the client drew: a region edge that overshoots it by even half a pixel
+        // leaves a thread of blur along the whole arc, where falling short hides
+        // under the client's own antialiasing.
+        let dy = row as f32 + 0.5;
+        let dx = (rf * rf - dy * dy).max(0.0).sqrt();
+        let x = (rf - dx).ceil() as i32 + 1;
+        let width = w as i32 - 2 * x;
+        if width > 0 {
+            rects.push((x, (h - r + row) as i32, width, 1));
+        }
+    }
+    rects
+}
+
+#[cfg(test)]
+mod blur_shape_tests {
+    use super::*;
+
+    const SIZE: LogicalSize<u32> = LogicalSize::new(800, 600);
+
+    #[test]
+    fn a_square_window_asks_for_one_oversized_rect() {
+        // Size-independent, so it survives every resize without being respecified.
+        assert_eq!(blur_shape_rects(SIZE, 0), vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)]);
+    }
+
+    #[test]
+    fn a_rounded_window_stops_short_of_its_own_curve() {
+        let r = 10u32;
+        let rects = blur_shape_rects(SIZE, r);
+        let (_, _, _, top_h) = rects[0];
+        assert_eq!(top_h, (SIZE.height - r) as i32, "the body must reach the corners");
+
+        for &(x, y, w, h) in &rects[1..] {
+            assert_eq!(h, 1);
+            let row = y - (SIZE.height - r) as i32;
+            // Inside the circle: the region's edge must not sit outside the arc,
+            // or a thread of blur shows along the curve.
+            let dy = row as f32 + 0.5;
+            let dx = ((r * r) as f32 - dy * dy).max(0.0).sqrt();
+            assert!(
+                x as f32 >= r as f32 - dx,
+                "row {row} starts at {x}, outside the arc at {}",
+                r as f32 - dx
+            );
+            assert_eq!(w, SIZE.width as i32 - 2 * x, "the two corners must match");
+            assert!(x >= 0 && x + w <= SIZE.width as i32, "row {row} leaves the surface");
+        }
+    }
+
+    #[test]
+    fn the_rows_narrow_toward_the_bottom() {
+        let rects = blur_shape_rects(SIZE, 12);
+        let widths: Vec<i32> = rects[1..].iter().map(|r| r.2).collect();
+        assert!(widths.len() > 1, "a rounded corner needs more than one row");
+        assert!(
+            widths.windows(2).all(|p| p[1] <= p[0]),
+            "the arc should close in, got {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_radius_bigger_than_the_window_cannot_escape_it() {
+        // A tiny window mid-resize must not produce rects outside the surface.
+        for (w, h) in [(20u32, 8u32), (1, 1), (40, 40)] {
+            let size = LogicalSize::new(w, h);
+            for &(x, y, rw, rh) in &blur_shape_rects(size, 100)[1..] {
+                assert!(x >= 0 && rw > 0 && x + rw <= w as i32, "{x}+{rw} outside {w}");
+                assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
+            }
+        }
     }
 }

@@ -776,7 +776,24 @@ pub struct WindowEdge {
     /// libadwaita's `outline: 1px solid rgb(255 255 255/7%)`. 0 draws none.
     /// The top edge is left clean: the titlebar sits against it.
     pub highlight: f32,
+    /// The window's own drop shadow, sampled across the notch that rounding a
+    /// corner opens: [`EDGE_SHADOW_STEPS`] alphas evenly spaced from the arc out
+    /// to the square corner it cuts away, i.e. over `radius * (sqrt(2) - 1)`
+    /// logical pixels.
+    ///
+    /// The decorations that cast that shadow live in subsurfaces *outside* the
+    /// window rectangle, so they cannot reach into the notch — which leaves it the
+    /// only place around the window with no shadow on it, reading as a bright
+    /// shard poking out of the curve. We lay it in ourselves, and the frontend
+    /// samples it from whatever actually draws the frame so the two agree (and
+    /// track the window's focus, which the shadow follows).
+    pub corner_shadow: [f32; EDGE_SHADOW_STEPS],
 }
+
+/// How many alphas [`WindowEdge::corner_shadow`] carries. The notch is only a few
+/// pixels deep — at a 10px radius it is 4.1 — so this is about one sample per
+/// device pixel at 2x, and the shader lerps between them.
+pub const EDGE_SHADOW_STEPS: usize = 8;
 
 impl WindowEdge {
     /// Nothing to draw — no pass is encoded at all.
@@ -797,7 +814,12 @@ struct EdgeUniforms {
     radius: f32,
     highlight: f32,
     band: f32,
-    _pad: [f32; 3],
+    /// How deep the notch goes: `radius * (sqrt(2) - 1)`, the distance from the
+    /// arc to the corner it replaces. The far end of `shadow`.
+    notch: f32,
+    _pad: [f32; 2],
+    /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
+    shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
 
 /// The window edge: two fullscreen-triangle passes, each scissored down to the
@@ -807,7 +829,15 @@ struct EdgeUniforms {
 /// half pixel of the rounded bottom corners. `hairline` then rides just inside
 /// that shape's left/right/bottom boundary.
 const EDGE_WGSL: &str = r#"
-struct EdgeU { viewport: vec2<f32>, radius: f32, highlight: f32, band: f32 };
+struct EdgeU {
+    viewport: vec2<f32>,
+    radius: f32,
+    highlight: f32,
+    band: f32,
+    notch: f32,
+    pad: vec2<f32>,
+    shadow: array<vec4<f32>, 2>,
+};
 @group(0) @binding(0) var<uniform> u: EdgeU;
 
 @vertex
@@ -853,6 +883,30 @@ fn hairline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let inside = clamp(d + 0.5, 0.0, 1.0);
     let a = u.highlight * clamp(u.band - d + 0.5, 0.0, 1.0) * inside;
     return vec4<f32>(a, a, a, a);
+}
+
+// The window's shadow at `t` of the way across the notch, read out of the
+// profile the frame gave us.
+fn notch_shadow(t: f32) -> f32 {
+    let steps = 8.0;
+    let pos = clamp(t, 0.0, 1.0) * (steps - 1.0);
+    let i = u32(floor(pos));
+    let j = min(i + 1u, u32(steps) - 1u);
+    let lo = u.shadow[i / 4u][i % 4u];
+    let hi = u.shadow[j / 4u][j % 4u];
+    return mix(lo, hi, pos - floor(pos));
+}
+
+// Premultiplied black, source-over, laid into the notch the cut opened: the
+// shadow the decorations would cast here if they could reach. Runs after the
+// cut, which has already emptied these pixels, and stops at the arc — inside it
+// the window itself is drawn.
+@fragment
+fn corner_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let d = edge_distance(pos.xy);
+    let outside = clamp(0.5 - d, 0.0, 1.0);
+    let a = notch_shadow(-d / max(u.notch, 0.0001)) * outside;
+    return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 "#;
 
@@ -1440,6 +1494,7 @@ pub struct Renderer {
     /// [`Renderer::apply_window_edge`].
     edge_cut_pipeline: wgpu::RenderPipeline,
     edge_hairline_pipeline: wgpu::RenderPipeline,
+    edge_shadow_pipeline: wgpu::RenderPipeline,
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
     window_edge: WindowEdge,
@@ -2169,9 +2224,13 @@ impl Renderer {
                 },
             },
         );
-        // The hairline is ordinary premultiplied source-over.
+        // The hairline and the notch shadow are ordinary premultiplied source-over.
         let edge_hairline_pipeline =
             edge_pipeline("hairline", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let edge_shadow_pipeline = edge_pipeline(
+            "corner_shadow",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
 
         Renderer {
             gpu,
@@ -2184,6 +2243,7 @@ impl Renderer {
             frost_uniform_buf,
             edge_cut_pipeline,
             edge_hairline_pipeline,
+            edge_shadow_pipeline,
             edge_bind_group,
             edge_uniform_buf,
             window_edge: WindowEdge::default(),
@@ -4494,12 +4554,20 @@ impl Renderer {
         let (w, h) = (surf.0, surf.1);
         let radius = (edge.radius * self.scale_factor).max(0.0);
         let band = EDGE_HIGHLIGHT_WIDTH * self.scale_factor;
+        // The notch is the gap between the arc and the corner it replaces.
+        let notch = radius * (std::f32::consts::SQRT_2 - 1.0);
+        let mut shadow = [[0.0f32; 4]; EDGE_SHADOW_STEPS / 4];
+        for (i, a) in edge.corner_shadow.iter().enumerate() {
+            shadow[i / 4][i % 4] = *a;
+        }
         let uniforms = EdgeUniforms {
             viewport: [w as f32, h as f32],
             radius,
             highlight: edge.highlight.clamp(0.0, 1.0),
             band,
-            _pad: [0.0; 3],
+            notch,
+            _pad: [0.0; 2],
+            shadow,
         };
         self.gpu
             .queue
@@ -4555,8 +4623,15 @@ impl Renderer {
             // else outside the shape.
             if radius > 0.0 {
                 let r = (radius.ceil() as u32).min(w / 2).min(h);
+                let corners = [0, w - r];
                 pass.set_pipeline(&self.edge_cut_pipeline);
-                for x in [0, w - r] {
+                for x in corners {
+                    pass.set_scissor_rect(x, h - r, r, r);
+                    pass.draw(0..3, 0..1);
+                }
+                // Into the emptied notch, the shadow the frame cannot reach.
+                pass.set_pipeline(&self.edge_shadow_pipeline);
+                for x in corners {
                     pass.set_scissor_rect(x, h - r, r, r);
                     pass.draw(0..3, 0..1);
                 }

@@ -97,6 +97,20 @@ pub trait WindowExtWayland {
     ///
     /// [`Window::set_blur`]: crate::window::Window::set_blur
     fn blur_supported(&self) -> bool;
+
+    /// Round the bottom corners of the backdrop effect ([`Window::set_blur`]) by
+    /// `radius` logical pixels; 0 (the default) leaves it square.
+    ///
+    /// The effect fills the surface's rectangle, so a client that rounds its own
+    /// corners — drawing them transparent — gets the blur at *full* strength in
+    /// exactly the pixels it cut away, undimmed by any content of its own: the
+    /// window ends in a bright square wedge poking out of its own curve. Setting
+    /// the same radius here cuts the effect to the same shape. Applies to
+    /// `ext_background_effect_v1`; KDE's older blur protocol takes no region
+    /// from us and is left square.
+    ///
+    /// [`Window::set_blur`]: crate::window::Window::set_blur
+    fn set_blur_bottom_radius(&self, radius: u32);
 }
 
 impl WindowExtWayland for Window {
@@ -119,6 +133,19 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => false,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.blur_supported(),
+        }
+    }
+
+    #[inline]
+    fn set_blur_bottom_radius(&self, radius: u32) {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => (),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => {
+                window.set_blur_bottom_radius(radius)
+            },
         }
     }
 }

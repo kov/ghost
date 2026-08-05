@@ -2019,7 +2019,9 @@ impl Graphics {
         renderer.set_fallback(Box::new(font::SystemFallback::new()));
         // Keep the frost grain a fixed logical size on HiDPI.
         renderer.set_scale_factor(window.scale_factor() as f32);
-        renderer.set_window_edge(Self::window_edge(&window, !want_transparent));
+        let edge = Self::window_edge(&window, !want_transparent, true);
+        renderer.set_window_edge(edge);
+        Self::shape_backdrop(&window, edge.radius);
 
         Graphics {
             window,
@@ -2050,21 +2052,59 @@ impl Graphics {
     /// drops its own rounding and outline there too. (A half-tiled window should square
     /// off as well, but winit reports no tiling state, so it keeps its curve for now.)
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn window_edge(window: &Window, opaque: bool) -> WindowEdge {
+    fn window_edge(window: &Window, opaque: bool, focused: bool) -> WindowEdge {
+        // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
+        // its titlebar starts.
+        const RADIUS: f32 = 10.0;
         let boxed_in = window.is_maximized() || window.fullscreen().is_some();
+        let radius = if opaque || boxed_in { 0.0 } else { RADIUS };
+        // Rounding a corner cuts a notch out of the window that the frame's own
+        // subsurfaces cannot reach into, so we finish its shadow ourselves —
+        // sampled from the frame, at the depth this radius opens up.
+        let reach = radius * (std::f32::consts::SQRT_2 - 1.0);
+        let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
+        for (i, a) in corner_shadow.iter_mut().enumerate() {
+            let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
+            *a = sctk_adwaita::shadow::shadow_alpha(d, focused);
+        }
         WindowEdge {
-            // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
-            // its titlebar starts.
-            radius: if opaque || boxed_in { 0.0 } else { 10.0 },
+            radius,
             // libadwaita's `outline: 1px solid rgb(255 255 255/7%)`.
             highlight: if boxed_in { 0.0 } else { 0.07 },
+            corner_shadow,
         }
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn window_edge(_window: &Window, _opaque: bool) -> WindowEdge {
+    fn window_edge(_window: &Window, _opaque: bool, _focused: bool) -> WindowEdge {
         WindowEdge::default()
     }
+
+    /// Re-decide the window edge after something it depends on moved: the window
+    /// was maximized or restored, or focus came or went (the frame's shadow
+    /// lightens in the backdrop, and the corner has to lighten with it).
+    fn refresh_window_edge(&mut self, focused: bool) {
+        let edge = Self::window_edge(&self.window, self.target.opaque(), focused);
+        self.renderer.set_window_edge(edge);
+        Self::shape_backdrop(&self.window, edge.radius);
+    }
+
+    /// Cut the compositor's backdrop effect to the corners we round.
+    ///
+    /// The effect fills the surface's rectangle, and a corner we round is a
+    /// corner we cut to fully transparent — which is precisely where the blur
+    /// then shows at full strength, with none of our own content dimming it. It
+    /// reads as a bright wedge poking out of the curve, which is the same way
+    /// this went wrong on macOS (there AppKit's own blur and shadow trace the
+    /// content layer, so clipping the layer fixed both at once).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn shape_backdrop(window: &Window, radius: f32) {
+        use winit::platform::wayland::WindowExtWayland;
+        window.set_blur_bottom_radius(radius.max(0.0) as u32);
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn shape_backdrop(_window: &Window, _radius: f32) {}
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {
@@ -2080,8 +2120,7 @@ impl Graphics {
         }
         // Maximizing squares the window's corners off — and every state change that
         // can do that reaches us as a resize.
-        let edge = Self::window_edge(&self.window, self.target.opaque());
-        self.renderer.set_window_edge(edge);
+        self.refresh_window_edge(self.window.has_focus());
         // The reconfigured surface holds no drawn frame; force the next redraw.
         self.scene_cache.invalidate();
     }
@@ -6020,6 +6059,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         w.pacer.request();
                     }
+                }
+                // The frame's shadow lightens in the backdrop, so the corner it
+                // hands us has to lighten with it.
+                if let Some(gfx) = self.windows.get_mut(&id).and_then(|w| w.gfx.as_mut()) {
+                    gfx.refresh_window_edge(focused);
                 }
                 self.dispatch(id, UiEvent::Focus(focused), &fe);
             }

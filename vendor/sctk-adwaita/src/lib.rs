@@ -28,7 +28,7 @@ mod buttons;
 mod config;
 mod parts;
 mod pointer;
-mod shadow;
+pub mod shadow;
 pub mod theme;
 mod title;
 mod wl_typed;

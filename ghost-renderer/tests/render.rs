@@ -1841,6 +1841,19 @@ fn edge_window() -> (std::rc::Rc<ghost_render::Frame>, u32, u32) {
     (frame, 40 * 9, 8 * 18)
 }
 
+/// The frame's own shadow, sampled across the notch a rounded corner opens —
+/// the same call the frontend makes, so the test pins the real profile rather
+/// than a number copied out of it.
+fn frame_shadow(focused: bool) -> [f32; ghost_renderer::EDGE_SHADOW_STEPS] {
+    let mut lut = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
+    let reach = 10.0 * (std::f32::consts::SQRT_2 - 1.0);
+    for (i, a) in lut.iter_mut().enumerate() {
+        let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
+        *a = sctk_adwaita::shadow::shadow_alpha(d, focused);
+    }
+    lut
+}
+
 fn edge_render(edge: ghost_renderer::WindowEdge, bg_alpha: f32) -> Rendered {
     let (frame, w, h) = edge_window();
     let scene = frost_scene(&frame, w, h);
@@ -1864,21 +1877,32 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.0,
+            corner_shadow: frame_shadow(true),
         },
         0.5,
     );
     write_png("window-edge.png", &img);
 
-    assert_eq!(
-        px(&img, 0, h - 1)[3],
-        0,
-        "the bottom-left corner must be cut"
-    );
-    assert_eq!(
-        px(&img, w - 1, h - 1)[3],
-        0,
-        "the bottom-right corner must be cut"
-    );
+    // The corner is cut out of the window and the window's own shadow is laid
+    // into the notch — premultiplied black at the alpha the frame would cast
+    // there. Left empty, that notch is the only place around the window with no
+    // shadow on it, and it reads as a bright shard poking out of the curve.
+    for (x, corner) in [(0, "bottom-left"), (w - 1, "bottom-right")] {
+        let got = px(&img, x, h - 1);
+        assert_eq!(
+            &got[..3],
+            &[0, 0, 0],
+            "the {corner} notch must hold shadow, not window: {got:?}"
+        );
+        // The very corner is the point furthest from the arc, so it takes the
+        // far — weakest — end of the profile.
+        let want = (frame_shadow(true)[ghost_renderer::EDGE_SHADOW_STEPS - 1] * 255.0) as i32;
+        assert!(
+            (i32::from(got[3]) - want).abs() <= 8,
+            "the {corner} notch should carry the frame's shadow (~{want}), got {}",
+            got[3]
+        );
+    }
     assert!(
         px(&img, 0, 0)[3] > 0 && px(&img, w - 1, 0)[3] > 0,
         "the top corners belong to the frame's headerbar, not to us"
@@ -1889,8 +1913,15 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
     );
     // The arc itself: (2, h-2) sits 11.3px from the corner circle's centre, so it
     // is cut; (9, h-9) sits 1.6px from it and survives.
-    assert_eq!(px(&img, 2, h - 2)[3], 0, "outside the arc");
-    assert!(px(&img, 9, h - 9)[3] > 0, "inside the arc");
+    assert_eq!(&px(&img, 2, h - 2)[..3], &[0, 0, 0], "outside the arc");
+    assert!(px(&img, 9, h - 9)[..3] != [0, 0, 0], "inside the arc");
+
+    // The shadow deepens toward the curve, as it does on every other edge.
+    let (far, near) = (px(&img, 0, h - 1)[3], px(&img, 3, h - 4)[3]);
+    assert!(
+        near > far,
+        "the notch shadow should darken toward the window: {far} at the corner, {near} by the arc"
+    );
 }
 
 #[test]
@@ -1900,11 +1931,12 @@ fn a_square_window_keeps_its_corners() {
         ghost_renderer::WindowEdge {
             radius: 0.0,
             highlight: 0.0,
+            corner_shadow: frame_shadow(true),
         },
         0.5,
     );
     assert!(
-        px(&img, 0, h - 1)[3] > 0 && px(&img, w - 1, h - 1)[3] > 0,
+        px(&img, 0, h - 1)[..3] != [0, 0, 0] && px(&img, w - 1, h - 1)[..3] != [0, 0, 0],
         "radius 0 must leave the corners alone"
     );
 }
@@ -1919,6 +1951,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.0,
+            corner_shadow: frame_shadow(true),
         },
         0.5,
     );
@@ -1926,6 +1959,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.07,
+            corner_shadow: frame_shadow(true),
         },
         0.5,
     );

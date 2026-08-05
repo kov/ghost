@@ -278,6 +278,12 @@ impl Window {
             None => self.kwin_blur_available,
         }
     }
+
+    /// Round the bottom corners of the backdrop effect to `radius` logical
+    /// pixels. [vendored addition]
+    pub fn set_blur_bottom_radius(&self, radius: u32) {
+        self.window_state.lock().unwrap().set_blur_bottom_radius(radius);
+    }
 }
 
 impl Window {

@@ -57,6 +57,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
+# The CSD frame winit draws our window with (vendored, patched — see the root
+# manifest). A direct dep so the shadow we lay into the corners we round is the
+# frame's own, asked for rather than copied.
+sctk-adwaita = "0.10"
 # Emoji_Presentation property data: chars that default to emoji presentation
 # route font fallback through fontconfig's `emoji` generic family, so they get
 # the color emoji font instead of whatever monochrome face covers them.

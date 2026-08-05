@@ -101,6 +101,19 @@ fn erf(x: f32) -> f32 {
     sign * (1.0 - poly * (-x * x).exp())
 }
 
+/// The alpha this frame's shadow casts `dist` *logical* pixels outside the
+/// window, focused or in the backdrop.
+///
+/// Public because the frame cannot draw everywhere the shadow falls: a client
+/// that rounds its own corners opens a notch *inside* the window rectangle, which
+/// no decoration subsurface reaches. Left unpainted that notch is the one place
+/// around the window with no shadow at all, and it reads as a bright shard. A
+/// client in that position paints the notch itself, and asks here so its shadow
+/// is the same shadow.
+pub fn shadow_alpha(dist: f32, active: bool) -> f32 {
+    shadow(dist, 1, active)
+}
+
 fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
     let dist = pixel_dist / scale as f32;
     let layers = if active {
