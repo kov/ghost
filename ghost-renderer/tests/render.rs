@@ -1849,7 +1849,7 @@ fn frame_shadow(focused: bool) -> [f32; ghost_renderer::EDGE_SHADOW_STEPS] {
     let reach = 10.0 * (std::f32::consts::SQRT_2 - 1.0);
     for (i, a) in lut.iter_mut().enumerate() {
         let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-        *a = sctk_adwaita::shadow::shadow_alpha(d, focused);
+        *a = sctk_adwaita::shadow::bottom_corner_alpha(d, focused);
     }
     lut
 }
@@ -1957,8 +1957,10 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
     for (x, corner) in [(2, "bottom-left"), (w - 3, "bottom-right")] {
         let (before, after) = (px(&bare, x, h - 3), px(&ringed, x, h - 3));
         assert_eq!(&after[..3], &[0, 0, 0], "the ring is black");
+        // Whatever the shadow already laid down, the ring goes over it at its
+        // own alpha — so the pixel ends up at least that opaque.
         assert!(
-            i32::from(after[3]) - i32::from(before[3]) > 120,
+            after[3] >= (0.75 * 255.0) as u8 && after[3] > before[3],
             "the {corner} arc should carry the ring: {before:?} -> {after:?}"
         );
     }

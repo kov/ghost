@@ -9,73 +9,65 @@ use tiny_skia::{Pixmap, PixmapMut, PixmapRef, Point, PremultipliedColorU8};
 /// it stays where upstream put it.
 pub const SHADOW_SIZE: u32 = 43;
 
-/// One `box-shadow` layer: the window rectangle grown by `spread` and blurred,
-/// painted in black at `alpha`.
+/// One `box-shadow` layer: the window rectangle grown by `spread`, moved down by
+/// `dy`, blurred, and painted in black at `alpha`.
 struct Layer {
     alpha: f32,
-    /// Gaussian sigma. CSS defines a blur *radius* as twice this, so a
-    /// `14px` blur is `sigma: 7.0`. Zero is a hard edge (no blur).
+    /// Gaussian sigma, in logical pixels.
+    ///
+    /// Not half the CSS blur radius, as the spec would have it: GTK3 blurs with
+    /// a box-blur approximation that spreads a shadow about twice as far as the
+    /// spec's Gaussian, and the numbers below are what a real window casts (see
+    /// the tests), not what the stylesheet arithmetic predicts.
     sigma: f32,
     spread: f32,
+    /// How far down the shadow is displaced — what makes the window look lit
+    /// from above rather than floating in even light.
+    dy: f32,
 }
 
-/// libadwaita's window shadow, transcribed from its own stylesheet
-/// (`/org/gnome/Adwaita/styles/gtk.css`, extracted from `libadwaita-1.so`):
+/// The window shadow GTK's Adwaita casts, transcribed from its own stylesheet
+/// (compiled into `libgtk-3.so.0`):
 ///
 /// ```css
-/// window.csd          { box-shadow: 0 0 14px 5px rgb(0 0 0/15%),
-///                                   0 0  5px 2px rgb(0 0 0/10%),
-///                                   0 0  0   1px rgb(0 0 0/ 5%); }
-/// window.csd:backdrop { box-shadow: 0 0 14px 5px transparent,
-///                                   0 0 10px 5px rgb(0 0 0/ 8%),
-///                                   0 0  0   1px rgb(0 0 0/ 5%); }
+/// decoration          { box-shadow: 0 3px 9px 1px rgba(0, 0, 0, 0.5),
+///                                   0 0   0   1px rgba(0, 0, 0, 0.75); }
+/// decoration:backdrop { box-shadow: 0 3px 9px 1px transparent,
+///                                   0 2px 6px 2px rgba(0, 0, 0, 0.2),
+///                                   0 0   0   1px rgba(0, 0, 0, 0.75); }
 /// ```
 ///
-/// Note there is no vertical offset — the shadow is the same on all four
-/// sides, which is what this frame draws too. (GTK's *built-in* theme does
-/// offset its shadow downwards, but a libadwaita app never wears it.)
-const ACTIVE_LAYERS: &[Layer] = &[
-    Layer {
-        alpha: 0.15,
-        sigma: 7.0,
-        spread: 5.0,
-    },
-    Layer {
-        alpha: 0.10,
-        sigma: 2.5,
-        spread: 2.0,
-    },
-    Layer {
-        alpha: 0.05,
-        sigma: 0.0,
-        spread: 1.0,
-    },
-];
-const INACTIVE_LAYERS: &[Layer] = &[
-    Layer {
-        alpha: 0.08,
-        sigma: 5.0,
-        spread: 5.0,
-    },
-    Layer {
-        alpha: 0.05,
-        sigma: 0.0,
-        spread: 1.0,
-    },
-];
+/// The `0 0 0 1px` layer is the window's outer border, which this frame draws
+/// as a border rather than as a shadow (see [`crate::theme::ColorMap`]), so only
+/// the blurred layers are here.
+///
+/// This is the shadow gnome-terminal wears, and it is deliberately not
+/// libadwaita's — libadwaita casts a soft, even `0 0 14px 5px rgb(0 0 0/15%)`
+/// with no offset at all, which reads as flat next to it.
+const ACTIVE_LAYERS: &[Layer] = &[Layer {
+    alpha: 0.5,
+    sigma: 9.0,
+    spread: 1.0,
+    dy: 3.0,
+}];
+const INACTIVE_LAYERS: &[Layer] = &[Layer {
+    alpha: 0.2,
+    sigma: 6.0,
+    spread: 2.0,
+    dy: 2.0,
+}];
 
 /// The alpha a blurred rectangle edge casts `dist` logical pixels outside
-/// itself: the Gaussian's tail past that point.
-fn layer_alpha(layer: &Layer, dist: f32) -> f32 {
+/// itself, in a direction `down` of which points downward: the Gaussian's tail
+/// past that point, with the layer's offset projected onto the direction the
+/// point lies in.
+fn layer_alpha(layer: &Layer, dist: f32, down: f32) -> f32 {
+    let spread = layer.spread + layer.dy * down;
     if layer.sigma <= 0.0 {
         // An unblurred layer is a hard step at the spread edge.
-        return if dist <= layer.spread {
-            layer.alpha
-        } else {
-            0.0
-        };
+        return if dist <= spread { layer.alpha } else { 0.0 };
     }
-    layer.alpha * normal_cdf((layer.spread - dist) / layer.sigma)
+    layer.alpha * normal_cdf((spread - dist) / layer.sigma)
 }
 
 fn normal_cdf(z: f32) -> f32 {
@@ -101,20 +93,24 @@ fn erf(x: f32) -> f32 {
     sign * (1.0 - poly * (-x * x).exp())
 }
 
-/// The alpha this frame's shadow casts `dist` *logical* pixels outside the
-/// window, focused or in the backdrop.
+/// The alpha the shadow casts `out` logical pixels beyond a *bottom* corner of
+/// the window, along the diagonal such a corner opens up.
 ///
 /// Public because the frame cannot draw everywhere the shadow falls: a client
-/// that rounds its own corners opens a notch *inside* the window rectangle, which
-/// no decoration subsurface reaches. Left unpainted that notch is the one place
-/// around the window with no shadow at all, and it reads as a bright shard. A
-/// client in that position paints the notch itself, and asks here so its shadow
-/// is the same shadow.
-pub fn shadow_alpha(dist: f32, active: bool) -> f32 {
-    shadow(dist, 1, active)
+/// that rounds its own corners opens a notch *inside* the window rectangle,
+/// which no decoration subsurface reaches. Left unpainted that notch is the one
+/// place around the window with no shadow at all, and it reads as a bright
+/// shard. A client in that position paints the notch itself, and asks here so
+/// its shadow is the same shadow — including the downward offset, which at 45°
+/// counts for its own share.
+pub fn bottom_corner_alpha(out: f32, active: bool) -> f32 {
+    shadow(out, std::f32::consts::FRAC_1_SQRT_2, 1, active)
 }
 
-fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
+/// The alpha `pixel_dist` device pixels outside the window's nearest edge, in a
+/// direction `down` of which points downward: 1 straight down, -1 straight up,
+/// 0 out to a side, and the projection in between around a corner.
+fn shadow(pixel_dist: f32, down: f32, scale: u32, active: bool) -> f32 {
     let dist = pixel_dist / scale as f32;
     let layers = if active {
         ACTIVE_LAYERS
@@ -126,7 +122,7 @@ fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
     // covered.
     1.0 - layers
         .iter()
-        .map(|layer| 1.0 - layer_alpha(layer, dist))
+        .map(|layer| 1.0 - layer_alpha(layer, dist, down))
         .product::<f32>()
 }
 
@@ -134,58 +130,114 @@ fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
 mod tests {
     use super::*;
 
-    /// What a real libadwaita window casts, read off a screenshot of a focused
-    /// `gnome-text-editor` on GNOME at scale 2: its bottom edge over the
-    /// wallpaper, with the background taken 300px further out so a wide, faint
-    /// tail could not be normalised away. `alpha = 1 - observed / background`,
-    /// distances in logical pixels out from the window edge.
+    /// What a real focused gnome-terminal casts, read off its three free edges
+    /// with the clean-plate method: screenshot the window, close it, screenshot
+    /// the bare desktop, and take `alpha = 1 - observed / plate` pixel for
+    /// pixel, so nothing in the wallpaper's own gradient or texture can be
+    /// mistaken for shadow. Distances are logical pixels out from the edge.
     ///
-    /// The wallpaper's own texture puts the noise floor around 0.02, so this
-    /// pins the shape of the falloff, not its last digit.
-    const MEASURED: &[(f32, f32)] = &[
-        (0.5, 0.214),
-        (1.0, 0.184),
-        (2.0, 0.154),
-        (4.0, 0.101),
-        (8.0, 0.055),
-        (12.0, 0.040),
+    /// The three lists together are the whole point of this shadow: at the same
+    /// distance the bottom is nearly twice the top. That is the offset, and it
+    /// is what reads as relief.
+    const MEASURED_BOTTOM: &[(f32, f32)] = &[
+        (0.5, 0.311),
+        (4.5, 0.238),
+        (8.5, 0.168),
+        (13.5, 0.089),
+        (19.5, 0.032),
+    ];
+    const MEASURED_SIDE: &[(f32, f32)] = &[
+        (0.5, 0.238),
+        (4.5, 0.170),
+        (8.5, 0.107),
+        (12.5, 0.059),
+        (16.5, 0.028),
+    ];
+    const MEASURED_TOP: &[(f32, f32)] = &[
+        (1.5, 0.168),
+        (4.5, 0.116),
+        (8.5, 0.068),
+        (11.5, 0.042),
+        (14.5, 0.023),
     ];
 
+    /// Every edge, with which way is out.
+    fn measured() -> [(&'static str, f32, &'static [(f32, f32)]); 3] {
+        [
+            ("bottom", 1.0, MEASURED_BOTTOM),
+            ("side", 0.0, MEASURED_SIDE),
+            ("top", -1.0, MEASURED_TOP),
+        ]
+    }
+
     #[test]
-    fn the_shadow_matches_a_real_libadwaita_window() {
-        for &(dist, expected) in MEASURED {
-            let got = shadow(dist, 1, true);
+    fn the_shadow_matches_a_real_gnome_terminal_window() {
+        for (edge, down, points) in measured() {
+            for &(dist, expected) in points {
+                let got = shadow(dist, down, 1, true);
+                assert!(
+                    (got - expected).abs() <= 0.03,
+                    "{edge} at {dist} logical px: we cast {got}, gnome-terminal casts {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shadow_falls_downward() {
+        // A window lit from above. Without this the shadow is the same on all
+        // four sides, which is what libadwaita does and what reads as flat.
+        for dist in [0.5, 2.0, 6.0, 12.0] {
+            let (below, beside, above) = (
+                shadow(dist, 1.0, 1, true),
+                shadow(dist, 0.0, 1, true),
+                shadow(dist, -1.0, 1, true),
+            );
             assert!(
-                (got - expected).abs() <= 0.03,
-                "at {dist} logical px we cast {got}, libadwaita casts {expected}",
+                below > beside && beside > above,
+                "at {dist}px: below {below}, beside {beside}, above {above}",
             );
         }
+        // And around a corner it is the projection, not a step: halfway between
+        // straight down and straight out lands halfway between their alphas.
+        let diagonal = shadow(4.0, std::f32::consts::FRAC_1_SQRT_2, 1, true);
+        let (below, beside) = (shadow(4.0, 1.0, 1, true), shadow(4.0, 0.0, 1, true));
+        assert!(diagonal > beside && diagonal < below);
     }
 
     #[test]
     fn the_shadow_is_concentrated_at_the_edge_not_smeared_across_the_margin() {
         // The failure this replaced: a single wide exponential that was
-        // lighter than libadwaita where the eye reads an edge and heavier
+        // lighter than the real thing where the eye reads an edge and heavier
         // everywhere else, which looks like grey haze rather than a shadow.
-        assert!(shadow(0.5, 1, true) > 0.20, "too light against the window");
-        assert!(shadow(16.0, 1, true) < 0.02, "still hazy 16px out");
+        assert!(
+            shadow(0.5, 1.0, 1, true) > 0.25,
+            "too light against the window"
+        );
 
-        let mut prev = f32::MAX;
-        for step in 0..=(SHADOW_SIZE * 4) {
-            let got = shadow(step as f32 / 4.0, 1, true);
-            assert!(got <= prev, "the falloff rises again at {step}/4 px");
-            prev = got;
+        for down in [1.0, 0.0, -1.0] {
+            let mut prev = f32::MAX;
+            for step in 0..=(SHADOW_SIZE * 4) {
+                let got = shadow(step as f32 / 4.0, down, 1, true);
+                assert!(got <= prev, "the falloff rises again at {step}/4 px");
+                prev = got;
+            }
         }
     }
 
     #[test]
     fn a_backdrop_window_recedes() {
-        for &(dist, _) in MEASURED {
-            let (active, backdrop) = (shadow(dist, 1, true), shadow(dist, 1, false));
-            assert!(
-                backdrop < active,
-                "at {dist} logical px: focused {active}, backdrop {backdrop}",
-            );
+        for (edge, down, points) in measured() {
+            for &(dist, _) in points {
+                let (active, backdrop) = (
+                    shadow(dist, down, 1, true),
+                    shadow(dist, down, 1, false),
+                );
+                assert!(
+                    backdrop < active,
+                    "{edge} at {dist} logical px: focused {active}, backdrop {backdrop}",
+                );
+            }
         }
     }
 
@@ -194,15 +246,34 @@ mod tests {
         // Past the falloff the margin is left transparent; a shadow still
         // opaque at `SHADOW_SIZE` would end in a visible hard cutoff.
         for active in [true, false] {
-            let edge = shadow(SHADOW_SIZE as f32, 1, active);
+            let edge = shadow(SHADOW_SIZE as f32, 1.0, 1, active);
             assert!(edge <= 0.002, "shadow is {edge} at the margin edge");
         }
     }
 
     #[test]
     fn scaling_stretches_the_falloff_over_more_device_pixels() {
-        for &(dist, _) in MEASURED {
-            assert_eq!(shadow(dist * 2.0, 2, true), shadow(dist, 1, true));
+        for (_, down, points) in measured() {
+            for &(dist, _) in points {
+                assert_eq!(
+                    shadow(dist * 2.0, down, 2, true),
+                    shadow(dist, down, 1, true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_notch_a_rounded_corner_opens_gets_the_corner_of_the_shadow() {
+        // What the client paints into the notch has to be what the frame would
+        // have painted there: the bottom corner's own diagonal, offset and all.
+        for out in [0.0, 1.0, 4.0] {
+            let (below, beside) = (shadow(out, 1.0, 1, true), shadow(out, 0.0, 1, true));
+            let corner = bottom_corner_alpha(out, true);
+            assert!(
+                corner > beside && corner < below,
+                "at {out}px out: corner {corner} should sit between {beside} and {below}"
+            );
         }
     }
 
@@ -223,6 +294,34 @@ mod tests {
                 pixmap.pixel(x, y).unwrap().alpha()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_drawn_parts_carry_the_offset_the_profile_describes() {
+        // The profile above knows the shadow leans downward; this is the part
+        // that has to lay the right strip against the right edge of the window.
+        let width = 400 + 2 * theme::BORDER_SIZE;
+        let mut top = Pixmap::new(width, theme::BORDER_SIZE).expect("a valid pixmap size");
+        let mut bottom = Pixmap::new(width, theme::BORDER_SIZE).expect("a valid pixmap size");
+        let rendered = RenderedShadow::new(1, true);
+        rendered.draw(&mut top.as_mut(), 1, DecorationParts::TOP);
+        rendered.draw(&mut bottom.as_mut(), 1, DecorationParts::BOTTOM);
+
+        let x = width / 2;
+        // The row each part puts against the window: the top part's last, the
+        // bottom part's first.
+        let above = top
+            .pixel(x, theme::BORDER_SIZE - 1)
+            .expect("a pixel in the top part")
+            .alpha();
+        let below = bottom
+            .pixel(x, theme::VISIBLE_BORDER_SIZE)
+            .expect("a pixel in the bottom part")
+            .alpha();
+        assert!(
+            u32::from(below) > u32::from(above) * 3 / 2,
+            "the shadow under the window ({below}) should be far deeper than over it ({above})"
+        );
     }
 
     #[test]
@@ -267,7 +366,12 @@ mod tests {
 
 #[derive(Debug)]
 struct RenderedShadow {
+    /// One strip per direction the shadow can leave the window in. They differ
+    /// now that it is offset downward: at the same distance out, the bottom is
+    /// nearly twice the top.
     side: Pixmap,
+    top: Pixmap,
+    bottom: Pixmap,
     edges: Pixmap,
 }
 
@@ -276,15 +380,19 @@ impl RenderedShadow {
         let shadow_size = SHADOW_SIZE * scale;
         let corner_radius = theme::CORNER_RADIUS * scale;
 
-        #[allow(clippy::unwrap_used)]
-        let mut side = Pixmap::new(shadow_size, 1).unwrap();
-        for x in 0..side.width() as usize {
-            let alpha = (shadow(x as f32 + 0.5, scale, active) * u8::MAX as f32).round() as u8;
-
+        let strip = |down: f32| {
             #[allow(clippy::unwrap_used)]
-            let color = PremultipliedColorU8::from_rgba(0, 0, 0, alpha).unwrap();
-            side.pixels_mut()[x] = color;
-        }
+            let mut strip = Pixmap::new(shadow_size, 1).unwrap();
+            for x in 0..strip.width() as usize {
+                let alpha =
+                    (shadow(x as f32 + 0.5, down, scale, active) * u8::MAX as f32).round() as u8;
+
+                #[allow(clippy::unwrap_used)]
+                let color = PremultipliedColorU8::from_rgba(0, 0, 0, alpha).unwrap();
+                strip.pixels_mut()[x] = color;
+            }
+            strip
+        };
 
         let edges_size = (corner_radius + shadow_size) * 2;
         #[allow(clippy::unwrap_used)]
@@ -293,9 +401,17 @@ impl RenderedShadow {
         for y in 0..edges_size as usize {
             let y_pos = y as f32 + 0.5;
             for x in 0..edges_size as usize {
-                let dist = edges_middle.distance(Point::from_xy(x as f32 + 0.5, y_pos))
-                    - corner_radius as f32;
-                let alpha = (shadow(dist, scale, active) * u8::MAX as f32).round() as u8;
+                let reach = edges_middle.distance(Point::from_xy(x as f32 + 0.5, y_pos));
+                let dist = reach - corner_radius as f32;
+                // Around a corner the way out swings from straight up to
+                // straight down, and the offset counts for whatever share of it
+                // points downward.
+                let down = if reach > 0.0 {
+                    (y_pos - edges_middle.y) / reach
+                } else {
+                    0.0
+                };
+                let alpha = (shadow(dist, down, scale, active) * u8::MAX as f32).round() as u8;
 
                 #[allow(clippy::unwrap_used)]
                 let color = PremultipliedColorU8::from_rgba(0, 0, 0, alpha).unwrap();
@@ -303,11 +419,18 @@ impl RenderedShadow {
             }
         }
 
-        RenderedShadow { side, edges }
+        RenderedShadow {
+            side: strip(0.0),
+            top: strip(-1.0),
+            bottom: strip(1.0),
+            edges,
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn side_draw(
         &self,
+        strip: &Pixmap,
         flipped: bool,
         rotated: bool,
         stack: usize,
@@ -329,27 +452,27 @@ impl RenderedShadow {
                 let dst = dst_pixels
                     .iter_mut()
                     .skip((dst_top + i) * dst_width + dst_left);
-                iter_copy(self.side.pixels().iter(), dst);
+                iter_copy(strip.pixels().iter(), dst);
             }),
             (false, true) => (0..stack).for_each(|i| {
                 let dst = dst_pixels
                     .iter_mut()
                     .skip(dst_top * dst_width + dst_left + i)
                     .step_by(dst_width);
-                iter_copy(self.side.pixels().iter(), dst);
+                iter_copy(strip.pixels().iter(), dst);
             }),
             (true, false) => (0..stack).for_each(|i| {
                 let dst = dst_pixels
                     .iter_mut()
                     .skip((dst_top + i) * dst_width + dst_left);
-                iter_copy(self.side.pixels().iter().rev(), dst);
+                iter_copy(strip.pixels().iter().rev(), dst);
             }),
             (true, true) => (0..stack).for_each(|i| {
                 let dst = dst_pixels
                     .iter_mut()
                     .skip(dst_top * dst_width + dst_left + i)
                     .step_by(dst_width);
-                iter_copy(self.side.pixels().iter().rev(), dst);
+                iter_copy(strip.pixels().iter().rev(), dst);
             }),
         }
     }
@@ -421,6 +544,7 @@ impl RenderedShadow {
                 );
 
                 self.side_draw(
+                    &self.top,
                     true,
                     true,
                     side_width,
@@ -459,6 +583,7 @@ impl RenderedShadow {
                 // deepest one — lands on the border column instead of beside it.
                 // What drops off the far end is the tail, which is nothing.
                 self.side_draw(
+                    &self.side,
                     true,
                     false,
                     side_height,
@@ -490,7 +615,7 @@ impl RenderedShadow {
 
                 self.edges_draw(src_x, shadow_size as isize, dst_pixmap, 0, 0, dst_width, top_edge_height);
 
-                self.side_draw(false, false, side_height, dst_pixmap, 0, top_edge_height);
+                self.side_draw(&self.side, false, false, side_height, dst_pixmap, 0, top_edge_height);
 
                 self.edges_draw(
                     src_x,
@@ -520,6 +645,7 @@ impl RenderedShadow {
                 );
 
                 self.side_draw(
+                    &self.bottom,
                     false,
                     true,
                     side_width,

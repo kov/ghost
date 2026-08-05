@@ -2065,7 +2065,7 @@ impl Graphics {
         let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
         for (i, a) in corner_shadow.iter_mut().enumerate() {
             let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-            *a = sctk_adwaita::shadow::shadow_alpha(d, focused);
+            *a = sctk_adwaita::shadow::bottom_corner_alpha(d, focused);
         }
         // The dark ring the frame draws around the window, which stops short of
         // the corners we round — read from the same theme the frame uses so the
