@@ -2069,8 +2069,13 @@ impl Graphics {
         }
         WindowEdge {
             radius,
-            // libadwaita's `outline: 1px solid rgb(255 255 255/7%)`.
-            highlight: if boxed_in { 0.0 } else { 0.07 },
+            // libadwaita traces its window edge with `outline: 1px solid
+            // rgb(255 255 255/7%)`, and we run brighter than that on purpose: it
+            // draws on an opaque window, ours is diluted by everything showing
+            // through a translucent one, and the frame's outer line no longer
+            // helps (it is libadwaita's near-invisible 5% black now, where it
+            // used to be an opaque grey). At 7% the edge read as nothing.
+            highlight: if boxed_in { 0.0 } else { 0.14 },
             corner_shadow,
         }
     }
