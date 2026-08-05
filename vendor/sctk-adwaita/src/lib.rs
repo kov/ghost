@@ -310,6 +310,14 @@ where
                 }
             };
 
+            // Everything above drew into a `tiny_skia` pixmap, which is RGBA in
+            // memory; the buffer under it is `Argb8888`, which on a
+            // little-endian host is BGRA. Upstream never had to care — every
+            // colour Adwaita gave this frame was a neutral grey, and a grey
+            // survives the swap — but a tinted one arrives with its red and blue
+            // exchanged.
+            swap_red_and_blue(pixmap.data_mut());
+
             if should_sync {
                 part.subsurface.set_sync();
             } else {
@@ -759,6 +767,17 @@ fn rounded_headerbar_shape(x: f32, y: f32, width: f32, height: f32, radius: f32)
     pb.finish()
 }
 
+/// Exchange the red and blue channel of every pixel in place: the one step from
+/// `tiny_skia`'s RGBA to the `Argb8888` a Wayland buffer wants.
+///
+/// Premultiplication is untouched — it scales all three colour channels alike,
+/// so swapping two of them is the same before and after.
+fn swap_red_and_blue(data: &mut [u8]) {
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
 /// How far short of a bottom corner a straight border has to stop, for a corner
 /// of `radius` device pixels.
 ///
@@ -863,9 +882,17 @@ mod header_outline_tests {
         let mut pixmap =
             Pixmap::new(window_width + 2 * margin, HEADER_SIZE).expect("a valid pixmap size");
         let theme = ColorTheme::dark();
-        draw_headerbar_bg(&mut pixmap.as_mut(), 1., &theme.active, &state)
+        let colors = theme.for_state(state.contains(WindowState::ACTIVATED));
+        draw_headerbar_bg(&mut pixmap.as_mut(), 1., colors, &state)
             .expect("the headerbar background to be drawable");
         pixmap
+    }
+
+    /// A theme colour as it lands in an opaque pixmap, to compare a drawn pixel
+    /// against without copying the number into the test.
+    fn opaque(color: theme::Color) -> (u8, u8, u8, u8) {
+        let c = color.to_color_u8();
+        (c.red(), c.green(), c.blue(), c.alpha())
     }
 
     fn rgba(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
@@ -884,8 +911,9 @@ mod header_outline_tests {
         assert_eq!(rgba(&pixmap, 0, y), (0, 0, 0, 191));
         assert_eq!(rgba(&pixmap, w - 1, y), (0, 0, 0, 191));
         // And immediately inside it, the headerbar itself.
-        assert_eq!(rgba(&pixmap, 1, y), (48, 48, 48, 255));
-        assert_eq!(rgba(&pixmap, w - 2, y), (48, 48, 48, 255));
+        let bar = opaque(ColorTheme::dark().active.headerbar);
+        assert_eq!(rgba(&pixmap, 1, y), bar);
+        assert_eq!(rgba(&pixmap, w - 2, y), bar);
     }
 
     #[test]
@@ -909,15 +937,37 @@ mod header_outline_tests {
         let (w, h) = (pixmap.width(), pixmap.height());
         // The last row is the headerbar's separator from the content, and it
         // runs the width of the *window*, leaving the outer border its columns.
-        assert_eq!(rgba(&pixmap, w / 2, h - 1), (58, 58, 58, 255));
+        assert_eq!(
+            rgba(&pixmap, w / 2, h - 1),
+            opaque(ColorTheme::dark().active.border_color)
+        );
         assert_eq!(rgba(&pixmap, 0, h - 1), (0, 0, 0, 191));
+    }
+
+    #[test]
+    fn the_headerbar_is_parted_from_the_window_by_a_shadow_not_a_highlight() {
+        // What sits under the titlebar is the line that makes it read as a bar
+        // laid on the window rather than more window. Both stylesheets draw it
+        // dark — libadwaita `inset 0 -1px rgb(0 0 6/36%)`, GTK's Adwaita a flat
+        // near-black — and drawing it lighter than the headerbar, as this frame
+        // used to, turns the relief inside out.
+        for state in [WindowState::ACTIVATED, WindowState::empty()] {
+            let pixmap = header(state);
+            let (w, h) = (pixmap.width(), pixmap.height());
+            let (bar, line) = (rgba(&pixmap, w / 2, h - 8), rgba(&pixmap, w / 2, h - 1));
+            assert!(
+                line.0 < bar.0 && line.1 < bar.1 && line.2 < bar.2,
+                "{state:?}: the separator {line:?} must be darker than the headerbar {bar:?}"
+            );
+        }
     }
 
     #[test]
     fn a_maximized_header_has_no_outline_to_draw() {
         let pixmap = header(WindowState::ACTIVATED | WindowState::MAXIMIZED);
-        assert_eq!(rgba(&pixmap, 0, 0), (48, 48, 48, 255));
-        assert_eq!(rgba(&pixmap, pixmap.width() - 1, 0), (48, 48, 48, 255));
+        let bar = opaque(ColorTheme::dark().active.headerbar);
+        assert_eq!(rgba(&pixmap, 0, 0), bar);
+        assert_eq!(rgba(&pixmap, pixmap.width() - 1, 0), bar);
     }
 }
 
@@ -1020,5 +1070,27 @@ mod visible_border_tests {
     fn a_window_shorter_than_its_own_corners_asks_for_no_border() {
         let rect = side(DecorationParts::LEFT, 400, 4, 1);
         assert!(visible_border_rect(DecorationParts::LEFT, rect, 1, true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pixel_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_tinted_colour_reaches_the_buffer_the_way_it_was_drawn() {
+        // libadwaita's headerbar is #2e2e32 — barely blue, but enough that
+        // leaving it in RGBA order paints it #322e2e instead.
+        let mut data = vec![0x2e, 0x2e, 0x32, 0xff];
+        swap_red_and_blue(&mut data);
+        assert_eq!(data, vec![0x32, 0x2e, 0x2e, 0xff], "want BGRA");
+    }
+
+    #[test]
+    fn a_grey_is_the_same_either_way() {
+        let grey = vec![0x30, 0x30, 0x30, 0xff, 0, 0, 0, 0x80];
+        let mut swapped = grey.clone();
+        swap_red_and_blue(&mut swapped);
+        assert_eq!(swapped, grey);
     }
 }

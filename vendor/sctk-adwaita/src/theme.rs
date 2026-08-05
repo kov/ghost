@@ -30,22 +30,24 @@ impl ColorTheme {
 
     /// Predefined light variant, which aims to replecate Adwaita theme.
     pub fn light() -> Self {
+        let headerbar = Color::from_rgba8(255, 255, 255, 255);
+        let backdrop = Color::from_rgba8(250, 250, 251, 255);
         Self {
             active: ColorMap {
-                headerbar: Color::from_rgba8(235, 235, 235, 255),
+                headerbar,
                 button_idle: Color::from_rgba8(216, 216, 216, 255),
                 button_hover: Color::from_rgba8(207, 207, 207, 255),
                 button_icon: Color::from_rgba8(42, 42, 42, 255),
-                border_color: Color::from_rgba8(220, 220, 220, 255),
+                border_color: shade(headerbar, LIGHT_SHADE),
                 outer_border: light_outer_border(),
                 font_color: Color::from_rgba8(47, 47, 47, 255),
             },
             inactive: ColorMap {
-                headerbar: Color::from_rgba8(250, 250, 250, 255),
+                headerbar: backdrop,
                 button_idle: Color::from_rgba8(240, 240, 240, 255),
                 button_hover: Color::from_rgba8(216, 216, 216, 255),
                 button_icon: Color::from_rgba8(148, 148, 148, 255),
-                border_color: Color::from_rgba8(220, 220, 220, 255),
+                border_color: shade(backdrop, LIGHT_SHADE),
                 outer_border: light_outer_border(),
                 font_color: Color::from_rgba8(150, 150, 150, 255),
             },
@@ -54,22 +56,24 @@ impl ColorTheme {
 
     /// Predefined dark variant, which aims to replecate Adwaita-dark theme.
     pub fn dark() -> Self {
+        let headerbar = Color::from_rgba8(46, 46, 50, 255);
+        let backdrop = Color::from_rgba8(34, 34, 38, 255);
         Self {
             active: ColorMap {
-                headerbar: Color::from_rgba8(48, 48, 48, 255),
+                headerbar,
                 button_idle: Color::from_rgba8(69, 69, 69, 255),
                 button_hover: Color::from_rgba8(79, 79, 79, 255),
                 button_icon: Color::from_rgba8(255, 255, 255, 255),
-                border_color: Color::from_rgba8(58, 58, 58, 255),
+                border_color: shade(headerbar, DARK_SHADE),
                 outer_border: dark_outer_border(),
                 font_color: Color::from_rgba8(255, 255, 255, 255),
             },
             inactive: ColorMap {
-                headerbar: Color::from_rgba8(36, 36, 36, 255),
+                headerbar: backdrop,
                 button_idle: Color::from_rgba8(47, 47, 47, 255),
                 button_hover: Color::from_rgba8(57, 57, 57, 255),
                 button_icon: Color::from_rgba8(144, 144, 144, 255),
-                border_color: Color::from_rgba8(58, 58, 58, 255),
+                border_color: shade(backdrop, DARK_SHADE),
                 outer_border: dark_outer_border(),
                 font_color: Color::from_rgba8(144, 144, 144, 255),
             },
@@ -171,4 +175,27 @@ fn dark_outer_border() -> Color {
 
 fn light_outer_border() -> Color {
     Color::from_rgba8(0, 0, 0, 59)
+}
+
+/// libadwaita's `headerbar_shade_color`, the `inset 0 -1px` line under a
+/// headerbar: `RGB(0 0 6/12%)` in the light stylesheet, `/36%` in the dark one.
+///
+/// It is what makes a titlebar read as a bar laid *on* the window instead of
+/// more window — and it is a shadow. This frame used to draw a flat light grey
+/// there, which turns the relief inside out. (GTK's Adwaita agrees on the sense
+/// if not the value: a near-black `#070707` under the active headerbar.)
+const LIGHT_SHADE: f32 = 0.12;
+const DARK_SHADE: f32 = 0.36;
+
+/// `color` with the shade laid over it, flattened to an opaque colour — the
+/// headerbar is opaque, so the line it casts on itself can be precomputed.
+fn shade(color: Color, alpha: f32) -> Color {
+    let over = |c: f32, shade: f32| c * (1.0 - alpha) + shade * alpha;
+    Color::from_rgba(
+        over(color.red(), 0.0),
+        over(color.green(), 0.0),
+        over(color.blue(), 6.0 / 255.0),
+        1.0,
+    )
+    .unwrap_or(color)
 }
