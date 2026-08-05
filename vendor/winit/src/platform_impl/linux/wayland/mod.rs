@@ -12,7 +12,7 @@ use crate::dpi::{LogicalSize, PhysicalSize};
 pub use crate::platform_impl::platform::{OsError, WindowId};
 pub use event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 pub use output::{MonitorHandle, VideoModeHandle};
-pub use window::Window;
+pub use window::{DecorationMargins, Window};
 
 mod event_loop;
 mod output;

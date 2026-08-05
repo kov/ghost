@@ -55,6 +55,57 @@ pub type WinitFrame = sctk::shell::xdg::fallback_frame::FallbackFrame<WinitState
 // Minimum window inner size.
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
+/// Logical-pixel margins a client keeps *outside* the window proper, drawn by
+/// the client itself — a drop shadow, most of the time. [vendored addition]
+///
+/// With `decorations(false)` the surface is the window: there is nowhere to cast
+/// a shadow, because every pixel the client owns is a pixel the compositor
+/// treats as window. Margins buy that space back the way GTK does it: the
+/// surface grows, and `xdg_surface.set_window_geometry` tells the compositor
+/// that only the inner rect is the window — so maximizing, snapping, tiling and
+/// the visual bounds all follow the inner rect while the client still gets to
+/// paint the ring around it.
+///
+/// The surface keeps taking input across the whole of itself, which is how a
+/// GTK window lets you grab its resize handles out in the shadow.
+///
+/// Only meaningful while the client draws its own decorations: with a frame,
+/// sctk's own subsurfaces already own the space around the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecorationMargins {
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+}
+
+impl DecorationMargins {
+    pub const NONE: Self = Self { top: 0, right: 0, bottom: 0, left: 0 };
+
+    /// Nothing outside the window — the surface *is* the window.
+    pub fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// The surface that holds a window of `geometry` size plus these margins.
+    fn inflate(&self, geometry: LogicalSize<u32>) -> LogicalSize<u32> {
+        LogicalSize::new(
+            geometry.width.saturating_add(self.left + self.right),
+            geometry.height.saturating_add(self.top + self.bottom),
+        )
+    }
+
+    /// The window inside a surface of `surface` size. Never empty: a surface
+    /// smaller than its own margins is a window mid-resize, and a zero-sized
+    /// geometry is a protocol error.
+    fn deflate(&self, surface: LogicalSize<u32>) -> LogicalSize<u32> {
+        LogicalSize::new(
+            surface.width.saturating_sub(self.left + self.right).max(1),
+            surface.height.saturating_sub(self.top + self.bottom).max(1),
+        )
+    }
+}
+
 /// The state of the window which is being updated from the [`WinitState`].
 pub struct WindowState {
     /// The connection to Wayland server.
@@ -162,6 +213,10 @@ pub struct WindowState {
     blur_top_radius: u32,
     blur_bottom_radius: u32,
 
+    /// Space the client keeps outside the window proper, to draw a shadow into.
+    /// See [`DecorationMargins`]. [vendored addition]
+    decoration_margins: DecorationMargins,
+
     /// Whether the client side decorations have pending move operations.
     ///
     /// The value is the serial of the event triggered moved.
@@ -206,6 +261,7 @@ impl WindowState {
             background_effect_manager: winit_state.background_effect_manager.clone(),
             blur_top_radius: 0,
             blur_bottom_radius: 0,
+            decoration_margins: DecorationMargins::NONE,
             compositor,
             connection,
             csd_fails: false,
@@ -345,7 +401,13 @@ impl WindowState {
             }
         } else {
             match configure.new_size {
-                (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
+                // The compositor sizes the window *geometry*, which our margins
+                // sit outside of — so the surface we have to paint is that much
+                // bigger. [vendored addition]
+                (Some(width), Some(height)) => (
+                    self.decoration_margins.inflate((width.get(), height.get()).into()),
+                    false,
+                ),
                 _ if stateless => (self.stateless_size, true),
                 _ => (self.size, true),
             }
@@ -736,7 +798,11 @@ impl WindowState {
 
             (frame.location(), frame.add_borders(self.size.width, self.size.height).into())
         } else {
-            ((0, 0), self.size)
+            // Our own margins run the other way to a frame's borders: the
+            // surface is bigger than the window, so the geometry is the inner
+            // rect. [vendored addition]
+            let m = self.decoration_margins;
+            ((m.left as i32, m.top as i32), m.deflate(self.size))
         };
 
         // Reload the hint.
@@ -755,6 +821,26 @@ impl WindowState {
             // Set inner size without the borders.
             viewport.set_destination(self.size.width as _, self.size.height as _);
         }
+    }
+
+    /// Keep `margins` logical pixels of surface outside the window proper — see
+    /// [`DecorationMargins`]. Re-configures immediately so the geometry and the
+    /// surface agree from here on. [vendored addition]
+    pub fn set_decoration_margins(&mut self, margins: DecorationMargins) {
+        if self.decoration_margins == margins {
+            return;
+        }
+        // The window the compositor knows about must not move or resize under
+        // the user just because we changed how much shadow we paint: hold the
+        // geometry and let the surface take the difference.
+        let geometry = self.decoration_margins.deflate(self.size);
+        self.decoration_margins = margins;
+        self.resize(margins.inflate(geometry));
+    }
+
+    /// The margins currently kept outside the window. [vendored addition]
+    pub fn decoration_margins(&self) -> DecorationMargins {
+        self.decoration_margins
     }
 
     /// Get the scale factor of the window.
@@ -1418,6 +1504,38 @@ fn blur_shape_rects(
         }
     }
     rects
+}
+
+#[cfg(test)]
+mod decoration_margin_tests {
+    use super::*;
+
+    const M: DecorationMargins = DecorationMargins { top: 12, right: 20, bottom: 28, left: 20 };
+
+    #[test]
+    fn the_surface_is_the_window_plus_its_margins() {
+        // What the compositor configures is the window; what we paint is the
+        // surface around it.
+        assert_eq!(M.inflate(LogicalSize::new(800, 600)), LogicalSize::new(840, 640));
+        assert_eq!(M.deflate(LogicalSize::new(840, 640)), LogicalSize::new(800, 600));
+    }
+
+    #[test]
+    fn no_margins_leave_the_surface_exactly_the_window() {
+        let size = LogicalSize::new(800, 600);
+        assert!(DecorationMargins::NONE.is_none());
+        assert_eq!(DecorationMargins::NONE.inflate(size), size);
+        assert_eq!(DecorationMargins::NONE.deflate(size), size);
+    }
+
+    #[test]
+    fn a_surface_smaller_than_its_margins_still_names_a_window() {
+        // Mid-resize the compositor can hand us less than the margins alone
+        // take up. A zero-sized `set_window_geometry` is a protocol error, so
+        // the window bottoms out at one pixel rather than vanishing.
+        let tiny = M.deflate(LogicalSize::new(1, 1));
+        assert!(tiny.width >= 1 && tiny.height >= 1, "got {tiny:?}");
+    }
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ use super::{ActiveEventLoop, WaylandError, WindowId};
 
 pub(crate) mod state;
 
-pub use state::WindowState;
+pub use state::{DecorationMargins, WindowState};
 
 /// The Wayland window.
 pub struct Window {
@@ -277,6 +277,12 @@ impl Window {
             Some(capabilities) => background_effect::blur_supported(capabilities),
             None => self.kwin_blur_available,
         }
+    }
+
+    /// Keep `margins` logical pixels of surface outside the window proper, to
+    /// draw a shadow into. [vendored addition]
+    pub fn set_decoration_margins(&self, margins: DecorationMargins) {
+        self.window_state.lock().unwrap().set_decoration_margins(margins);
     }
 
     /// Round the backdrop effect's corners to `top` and `bottom` logical

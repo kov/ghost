@@ -23,6 +23,11 @@ use crate::window::{Window, WindowAttributes};
 
 pub use crate::window::Theme;
 
+/// Space kept outside the window proper for the client to draw into — see
+/// [`WindowExtWayland::set_decoration_margins`]. [vendored addition]
+#[cfg(wayland_platform)]
+pub use crate::platform_impl::wayland::DecorationMargins;
+
 /// Additional methods on [`ActiveEventLoop`] that are specific to Wayland.
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
@@ -125,6 +130,22 @@ pub trait WindowExtWayland {
     ///
     /// [`Window::set_blur`]: crate::window::Window::set_blur
     fn set_blur_corner_radii(&self, top: u32, bottom: u32);
+
+    /// Keep `margins` logical pixels of surface *outside* the window proper, for
+    /// the client to draw a shadow into. [vendored addition]
+    ///
+    /// With `decorations(false)` the surface is the window and there is nowhere
+    /// to cast a shadow. This grows the surface and points
+    /// `xdg_surface.set_window_geometry` at the inner rect, so the compositor
+    /// still snaps, maximizes and tiles to the window while the client paints
+    /// the ring around it — the model GTK uses (`_GTK_FRAME_EXTENTS` on X11).
+    ///
+    /// [`Window::inner_size`] then reports the whole SURFACE, which is what the
+    /// client has to paint; the window inside it is that less the margins.
+    /// Wayland-only, and only meaningful while the client is undecorated.
+    ///
+    /// [`Window::inner_size`]: crate::window::Window::inner_size
+    fn set_decoration_margins(&self, margins: DecorationMargins);
 }
 
 impl WindowExtWayland for Window {
@@ -170,6 +191,19 @@ impl WindowExtWayland for Window {
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => {
                 window.set_blur_corner_radii(top, bottom)
+            },
+        }
+    }
+
+    #[inline]
+    fn set_decoration_margins(&self, margins: DecorationMargins) {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => (),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => {
+                window.set_decoration_margins(margins)
             },
         }
     }
