@@ -1279,7 +1279,7 @@ impl WindowState {
     /// [`Window::blur_supported`]: super::Window::blur_supported
     pub fn set_blur(&mut self, blurred: bool) {
         if let Some(manager) = self.background_effect_manager.clone() {
-            self.set_background_effect_blur(&manager, blurred);
+            self.set_background_effect_blur(&manager, blurred, true);
         } else {
             self.set_kwin_blur(blurred);
         }
@@ -1289,7 +1289,20 @@ impl WindowState {
     /// it starts empty and a NULL region removes it, so turning blur on means
     /// handing over a region and turning it off means dropping the object.
     /// [vendored addition]
-    fn set_background_effect_blur(&mut self, manager: &BackgroundEffectManager, blurred: bool) {
+    ///
+    /// `flush` commits the surface so the region lands now rather than with the
+    /// next frame. Right for a blur being switched on or off, when nothing else
+    /// may draw for a while — and WRONG while the window is being reconfigured:
+    /// a commit with no new buffer applies the new region to the OLD frame, so
+    /// the blur jumps to the window's new shape a beat before the window does,
+    /// and it tells the compositor the state change is already dealt with, which
+    /// ends the transition it was animating.
+    fn set_background_effect_blur(
+        &mut self,
+        manager: &BackgroundEffectManager,
+        blurred: bool,
+        flush: bool,
+    ) {
         // Read before the effect below borrows `self` mutably.
         let m = self.margins_now();
         if !blurred {
@@ -1323,10 +1336,8 @@ impl WindowState {
         );
         // `set_blur_region` copies, hence dropping the region here.
         effect.set_blur_region(Some(region.wl_region()));
-        // The region is double-buffered surface state. Before the initial
-        // configure the caller's own first commit will carry it; after, nothing
-        // else is guaranteed to commit soon enough, so flush it now.
-        if self.is_configured() {
+        // The region is double-buffered surface state; see `flush`.
+        if flush && self.is_configured() {
             self.window.wl_surface().commit();
         }
     }
@@ -1383,7 +1394,9 @@ impl WindowState {
             return;
         }
         if let Some(manager) = self.background_effect_manager.clone() {
-            self.set_background_effect_blur(&manager, true);
+            // No flush: this runs from `resize`, and the frame the client draws
+            // for that resize carries the region with it.
+            self.set_background_effect_blur(&manager, true, false);
         }
     }
 
