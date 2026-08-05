@@ -1897,6 +1897,24 @@ fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat
         .unwrap_or(formats[0])
 }
 
+/// The toolkit's name for one of our [`ResizeEdge`](ghost_ui_core::ResizeEdge)s.
+/// winit derives the matching cursor from it, so the mapping is only written once.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resize_direction(edge: ghost_ui_core::ResizeEdge) -> winit::window::ResizeDirection {
+    use ghost_ui_core::ResizeEdge as E;
+    use winit::window::ResizeDirection as D;
+    match edge {
+        E::North => D::North,
+        E::South => D::South,
+        E::East => D::East,
+        E::West => D::West,
+        E::NorthEast => D::NorthEast,
+        E::NorthWest => D::NorthWest,
+        E::SouthEast => D::SouthEast,
+        E::SouthWest => D::SouthWest,
+    }
+}
+
 /// Everything about a window that decides what its edge looks like — read off the
 /// real window by [`Graphics::window_edge`], so the decision itself
 /// ([`window_edge_for`]) is testable without one.
@@ -2567,6 +2585,14 @@ struct WindowState {
     /// double/triple clicks, and the running click count.
     last_click: Option<(Instant, PointerButton, PointPx)>,
     click_count: u8,
+    /// The resize edge the pointer was last over, so the cursor is put back when
+    /// it leaves and a press knows which edge it is grabbing.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    frame_edge: Option<ghost_ui_core::ResizeEdge>,
+    /// Whether any pointer button is currently held. Whatever a press started —
+    /// selecting text, dragging a tile — owns the pointer until it is let go, so
+    /// the window frame must not grab a drag that wanders into its resize band.
+    pointer_down: bool,
     /// Rate-limits repaints so output floods / held keys can't drive a software
     /// rasterizer at the 8 ms poll rate (see [`pacer`]).
     pacer: pacer::FramePacer,
@@ -3845,6 +3871,57 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// The resize edge under the pointer, when the frame is ours to grab — see
+    /// [`ghost_ui_core::resize_edge_at`], which decides it. Reading the window's
+    /// state is all that happens here.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn frame_edge_under_pointer(&self, id: WindowId) -> Option<ghost_ui_core::ResizeEdge> {
+        use winit::platform::wayland::WindowExtWayland;
+        let w = self.windows.get(&id)?;
+        let gfx = w.gfx.as_ref()?;
+        let size = gfx.window.inner_size();
+        ghost_ui_core::resize_edge_at(
+            w.pointer_pos,
+            (size.width, size.height),
+            gfx.window.scale_factor() as f32,
+            ghost_ui_core::FrameGrab {
+                own_frame: !gfx.window.is_decorated(),
+                boxed_in: gfx.window.is_maximized()
+                    || gfx.window.fullscreen().is_some()
+                    || gfx.window.is_tiled(),
+                pointer_down: w.pointer_down,
+            },
+        )
+    }
+
+    /// Track the frame's resize edges as the pointer moves: show the edge's own
+    /// cursor while it is over one, and put the cursor back when it leaves.
+    ///
+    /// Returns whether the motion belongs to the frame, in which case it does not
+    /// reach the model — the band lies inside the window, over the padding and the
+    /// first pixels of the grid, and a model that saw it would be selecting text
+    /// under a resize cursor.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn track_frame_edge(&mut self, id: WindowId) -> bool {
+        let edge = self.frame_edge_under_pointer(id);
+        let Some(w) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        if w.frame_edge == edge {
+            return edge.is_some();
+        }
+        w.frame_edge = edge;
+        if let Some(gfx) = w.gfx.as_ref() {
+            // Leaving the band restores the plain arrow; the model sets its own
+            // shape (a link's hand) from the motion events it gets from here on.
+            gfx.window.set_cursor(match edge {
+                Some(e) => winit::window::CursorIcon::from(resize_direction(e)),
+                None => winit::window::CursorIcon::Default,
+            });
+        }
+        edge.is_some()
+    }
+
     /// Timestamp user input on a window's render trace — the "kick" label that lets a
     /// recovered-stall report say whether a present self-recovered or needed an input
     /// (a scroll). Gated so a normal run does nothing.
@@ -5084,6 +5161,9 @@ impl App {
                 root,
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                #[cfg(all(unix, not(target_os = "macos")))]
+                frame_edge: None,
+                pointer_down: false,
                 next_tick: None,
                 last_click: None,
                 click_count: 0,
@@ -5568,6 +5648,9 @@ impl App {
                 root,
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                #[cfg(all(unix, not(target_os = "macos")))]
+                frame_edge: None,
+                pointer_down: false,
                 next_tick: None,
                 last_click: None,
                 click_count: 0,
@@ -6178,6 +6261,12 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(gfx) = w.gfx.as_mut() {
                         gfx.refresh_window_edge(focused);
                     }
+                    // A press whose release lands in another window leaves the
+                    // button stuck "down" here, and a stuck button means the frame
+                    // never offers a resize handle again.
+                    if !focused {
+                        w.pointer_down = false;
+                    }
                     w.pacer.request();
                 }
                 self.dispatch(id, UiEvent::Focus(focused), &fe);
@@ -6192,6 +6281,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }) else {
                     return;
                 };
+                // Our own frame's resize edges lie inside the window, so they get
+                // first refusal on the pointer before the model sees it.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                if self.track_frame_edge(id) {
+                    return;
+                }
                 self.dispatch(
                     id,
                     UiEvent::Pointer {
@@ -6209,6 +6304,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.note_input(id);
                 if let Some(b) = map_button(button) {
                     let pressed = state == ElementState::Pressed;
+                    // Grabbing one of our own frame's edges hands the resize to the
+                    // compositor, which takes the pointer with it — there is no
+                    // release to wait for, and the model never sees the press.
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    if pressed && b == PointerButton::Left {
+                        let edge = self.windows.get(&id).and_then(|w| w.frame_edge);
+                        if let Some(edge) = edge {
+                            if let Some(gfx) = self.windows.get(&id).and_then(|w| w.gfx.as_ref()) {
+                                let _ = gfx.window.drag_resize_window(resize_direction(edge));
+                            }
+                            return;
+                        }
+                    }
+                    if let Some(w) = self.windows.get_mut(&id) {
+                        w.pointer_down = pressed;
+                    }
                     let phase = if pressed {
                         PointerPhase::Press
                     } else {

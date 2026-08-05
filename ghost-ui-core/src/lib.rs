@@ -15,6 +15,7 @@ pub mod encode;
 pub mod event;
 pub mod fleet;
 pub mod focus_trace;
+pub mod frame;
 pub mod group;
 pub mod input;
 pub mod mouse;
@@ -28,6 +29,7 @@ pub use event::{
     DeadSession, DeadState, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent, WheelDelta,
 };
 pub use fleet::{FleetModel, Locality};
+pub use frame::{FrameGrab, ResizeEdge, resize_edge_at};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
 pub use ghost_vt::query::ThemeColors;
 pub use group::{Group, REMOTE_ID_SEP, is_remote_id};
