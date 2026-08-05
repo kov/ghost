@@ -1247,7 +1247,17 @@ impl WindowState {
                 return;
             },
         };
-        Self::add_blur_shape(&region, self.size, self.blur_top_radius, self.blur_bottom_radius);
+        // The effect belongs to the WINDOW, which our margins sit outside of:
+        // blurring the shadow's own ring would put a blurred halo where the
+        // window is see-through. [vendored addition]
+        let m = self.decoration_margins;
+        Self::add_blur_shape(
+            &region,
+            m.deflate(self.size),
+            (m.left as i32, m.top as i32),
+            self.blur_top_radius,
+            self.blur_bottom_radius,
+        );
         // `set_blur_region` copies, hence dropping the region here.
         effect.set_blur_region(Some(region.wl_region()));
         // The region is double-buffered surface state. Before the initial
@@ -1272,10 +1282,12 @@ impl WindowState {
     fn add_blur_shape(
         region: &Region,
         size: LogicalSize<u32>,
+        origin: (i32, i32),
         top_radius: u32,
         bottom_radius: u32,
     ) {
         for (x, y, w, h) in blur_shape_rects(size, top_radius, bottom_radius) {
+            let (x, y, w, h) = place_blur_rect((x, y, w, h), size, origin);
             region.add(x, y, w, h);
         }
     }
@@ -1299,6 +1311,7 @@ impl WindowState {
     /// [vendored addition]
     pub fn reapply_blur_shape(&mut self) {
         if (self.blur_top_radius, self.blur_bottom_radius) == (0, 0)
+            && self.decoration_margins.is_none()
             || self.background_effect.is_none()
         {
             return;
@@ -1506,6 +1519,32 @@ fn blur_shape_rects(
     rects
 }
 
+/// Put one shape rect where it belongs on the surface: offset into the window,
+/// and clipped to it. [vendored addition]
+///
+/// The body rect is deliberately overwide — the compositor clips the region to
+/// the surface, so one oversized rect means "all of it" at every size and never
+/// needs respecifying. Offset into a margin it no longer does: it overshoots the
+/// window on the far side and blurs the shadow's own ring, which shows as a
+/// strip of blurred backdrop down that edge. With nothing outside the window
+/// there is nothing to overshoot into, and the oversized rect is left alone.
+fn place_blur_rect(
+    rect: (i32, i32, i32, i32),
+    window: LogicalSize<u32>,
+    origin: (i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = rect;
+    if origin == (0, 0) {
+        return rect;
+    }
+    (
+        x + origin.0,
+        y + origin.1,
+        w.min(window.width as i32),
+        h.min(window.height as i32),
+    )
+}
+
 #[cfg(test)]
 mod decoration_margin_tests {
     use super::*;
@@ -1526,6 +1565,27 @@ mod decoration_margin_tests {
         assert!(DecorationMargins::NONE.is_none());
         assert_eq!(DecorationMargins::NONE.inflate(size), size);
         assert_eq!(DecorationMargins::NONE.deflate(size), size);
+    }
+
+    /// The blur must stop at the window, not run on into the shadow: the margin
+    /// is see-through, so blur out there lands at full strength on nothing and
+    /// reads as a strip of blurred backdrop stuck to that edge.
+    #[test]
+    fn the_effect_shape_stops_at_the_window_not_the_surface() {
+        const WINDOW: LogicalSize<u32> = LogicalSize::new(800, 600);
+        // The overwide body rect, as `blur_shape_rects` states it.
+        let body = (0, 0, WHOLE_SURFACE, WHOLE_SURFACE);
+
+        // No margins: the oversized rect is the point, and it is kept.
+        assert_eq!(place_blur_rect(body, WINDOW, (0, 0)), body);
+
+        // Offset into a margin, it is clipped to the window it belongs to.
+        assert_eq!(place_blur_rect(body, WINDOW, (20, 12)), (20, 12, 800, 600));
+        // A rect already inside the window keeps its own size.
+        assert_eq!(
+            place_blur_rect((5, 7, 100, 1), WINDOW, (20, 12)),
+            (25, 19, 100, 1)
+        );
     }
 
     #[test]

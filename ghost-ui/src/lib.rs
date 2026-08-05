@@ -1922,6 +1922,7 @@ fn resize_direction(edge: ghost_ui_core::ResizeEdge) -> winit::window::ResizeDir
 /// real window by [`Graphics::window_edge`], so the decision itself
 /// ([`window_edge_for`]) is testable without one.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Copy)]
 struct EdgeState {
     /// The surface is opaque, so its alpha never reaches the compositor.
     opaque: bool,
@@ -1962,6 +1963,7 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
     // scoop into the notch of a window that is otherwise shadowless — over a
     // light backdrop, a wedge hanging off the curve. The notch keeps whatever
     // the window itself has until the margins land.
+    let (margins, shadow) = window_shadow(state);
     let reach = radius * (std::f32::consts::SQRT_2 - 1.0);
     let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
     if !state.own_frame {
@@ -1993,12 +1995,49 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
         // own decorations there is nothing out there to draw on — so the ring
         // moves inside, where it still traces the same edge.
         outline_inside: state.own_frame,
-        // No room outside the window yet, so nothing to cast into — the shell
-        // does not ask winit for decoration margins.
-        margins: ghost_renderer::EdgeMargins::default(),
-        shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        margins,
+        shadow,
         corner_shadow,
     }
+}
+
+/// How far out of the window we keep room for its shadow, in logical pixels.
+///
+/// The falloff is spent well inside this — under 0.005 by ~25 logical pixels —
+/// and past the shadow the same room is the resize grab area, which is why
+/// sctk reserves a good deal more than the shadow strictly needs.
+#[cfg(all(unix, not(target_os = "macos")))]
+const SHADOW_MARGIN: f32 = 26.0;
+
+/// The room a window keeps around itself, and the shadow it casts into it.
+///
+/// Only a window that draws its own frame has any: with the CSD frame above us
+/// the shadow is its subsurfaces' job, and a window with no free outside corner
+/// — maximized, fullscreen, tiled — casts none at all, exactly as GNOME's own
+/// do, so the margin goes with it rather than sitting there as dead surface.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn window_shadow(state: EdgeState) -> (ghost_renderer::EdgeMargins, ghost_renderer::ShadowProfile) {
+    if !state.own_frame || state.boxed_in {
+        return Default::default();
+    }
+    // Sampled from the same layers the frame we are replacing casts, so a
+    // ghost-framed window sits in the same light as the rest of the desktop.
+    let profile = |down: f32| {
+        let mut lut = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
+        for (i, a) in lut.iter_mut().enumerate() {
+            let d = SHADOW_MARGIN * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
+            *a = sctk_adwaita::shadow::edge_alpha(d, down, state.focused);
+        }
+        lut
+    };
+    (
+        ghost_renderer::EdgeMargins::all(SHADOW_MARGIN),
+        ghost_renderer::ShadowProfile {
+            up: profile(-1.0),
+            side: profile(0.0),
+            down: profile(1.0),
+        },
+    )
 }
 
 /// Per-window GPU state, valid only once the window (and surface) exist. The frame
@@ -2258,6 +2297,28 @@ impl Graphics {
         )
     }
 
+    /// The room this window keeps around itself for its shadow, in physical
+    /// pixels — the second thing, after the bar, that moves the window off the
+    /// surface's origin. Read off the same [`WindowEdge`] the renderer draws
+    /// from, so the shape, the shadow and the coordinates cannot disagree.
+    fn margins_px(&self) -> ghost_ui_core::frame::FrameInset {
+        let m = self.renderer.window_edge().margins;
+        let scale = self.window.scale_factor() as f32;
+        let px = |v: f32| (v * scale).max(0.0).round() as u32;
+        ghost_ui_core::frame::FrameInset {
+            top: px(m.top),
+            right: px(m.right),
+            bottom: px(m.bottom),
+            left: px(m.left),
+        }
+    }
+
+    /// The size of the window inside this surface: what the shell must lay the
+    /// frame and the model out in.
+    fn window_px(&self) -> (u32, u32) {
+        self.margins_px().window(self.size())
+    }
+
     /// The titlebar to draw over this window's content: its height, its colours
     /// for the window's current focus, and the title.
     ///
@@ -2331,7 +2392,15 @@ impl Graphics {
     /// wears exactly the same wedge the bottom ones used to.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn shape_backdrop(window: &Window, edge: WindowEdge) {
-        use winit::platform::wayland::WindowExtWayland;
+        use winit::platform::wayland::{DecorationMargins, WindowExtWayland};
+        // Ask for the room the shadow needs *first*: it resizes the surface, and
+        // the effect region below is spelled out against the window inside it.
+        window.set_decoration_margins(DecorationMargins {
+            top: edge.margins.top.max(0.0) as u32,
+            right: edge.margins.right.max(0.0) as u32,
+            bottom: edge.margins.bottom.max(0.0) as u32,
+            left: edge.margins.left.max(0.0) as u32,
+        });
         let radius = edge.radius.max(0.0) as u32;
         let of = |rounded: bool| if rounded { radius } else { 0 };
         window.set_blur_corner_radii(of(edge.corners.top), of(edge.corners.bottom));
@@ -3391,11 +3460,14 @@ impl App {
         scale: f64,
         event_loop: &dyn Frontend,
     ) {
-        let bar = self
+        let (bar, m) = self
             .windows
             .get(&wid)
             .and_then(|w| w.gfx.as_ref())
-            .map_or(0, |g| g.bar_px());
+            .map_or((0, ghost_ui_core::frame::FrameInset::NONE), |g| {
+                (g.bar_px(), g.margins_px())
+            });
+        let (w_px, h_px) = m.window((w_px, h_px));
         self.dispatch(
             wid,
             UiEvent::Resize {
@@ -4060,12 +4132,13 @@ impl App {
             boxed_in: true,
             pointer_down: w.pointer_down,
         };
-        ghost_ui_core::frame::frame_hit(
+        ghost_ui_core::frame::frame_hit_within(
             pos,
             (size.width, size.height),
             gfx.window.scale_factor() as f32,
             grab,
             gfx.bar_px(),
+            gfx.margins_px(),
         )
     }
 
@@ -4096,10 +4169,12 @@ impl App {
     fn bar_rect(&self, id: WindowId) -> Option<ghost_render::scene::RectPx> {
         let gfx = self.windows.get(&id)?.gfx.as_ref()?;
         let h = gfx.bar_px();
-        (h > 0).then(|| ghost_render::scene::RectPx {
-            x: 0.0,
-            y: 0.0,
-            w: gfx.window.inner_size().width as f32,
+        let m = gfx.margins_px();
+        let (ww, _) = gfx.window_px();
+        (h > 0).then_some(ghost_render::scene::RectPx {
+            x: m.left as f32,
+            y: m.top as f32,
+            w: ww as f32,
             h: h as f32,
         })
     }
@@ -4228,18 +4303,16 @@ impl App {
         }
     }
 
-    /// A window-space pointer position in the model's space — the window less our
-    /// titlebar. `None` when the pointer is on the bar itself, which is chrome: the
-    /// model has no coordinate for it, and letting one through as a negative row
-    /// would land the click on the terminal's first line.
+    /// A surface-space pointer position in the model's space — the surface less
+    /// our shadow margins and our titlebar. `None` when the pointer is on either,
+    /// which is chrome: the model has no coordinate for it, and letting one
+    /// through as a negative row would land the click on the terminal's first
+    /// line.
     fn in_content(&self, id: WindowId, pos: PointPx) -> Option<PointPx> {
-        let bar = self
-            .windows
-            .get(&id)
-            .and_then(|w| w.gfx.as_ref())
-            .map_or(0, |g| g.bar_px());
-        let y = pos.y - f64::from(bar);
-        (y >= 0.0).then_some(PointPx { x: pos.x, y })
+        match self.frame_hit(id, pos) {
+            ghost_ui_core::frame::FrameHit::Content(pos) => Some(pos),
+            _ => None,
+        }
     }
 
     /// Timestamp user input on a window's render trace — the "kick" label that lets a
@@ -5373,6 +5446,10 @@ impl App {
             // Described before `gfx` is borrowed mutably below: the bar is read
             // off both the window and the window's state.
             let bar = w.gfx.as_ref().map(|g| g.titlebar(w));
+            let margins = w
+                .gfx
+                .as_ref()
+                .map_or(ghost_ui_core::frame::FrameInset::NONE, |g| g.margins_px());
             // A headless window has no surface to resize; the model still re-grids
             // below via the dispatched `Resize`.
             if let Some(gfx) = w.gfx.as_mut() {
@@ -5391,9 +5468,10 @@ impl App {
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
-                            let scene = ghost_ui_core::frame::with_titlebar(
+                            let scene = ghost_ui_core::frame::with_frame(
                                 w.root.view(&self.states),
                                 bar.as_ref().expect("gfx implies a bar"),
+                                margins,
                             );
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
@@ -6350,6 +6428,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     // A headless window has no surface; there is nothing to paint.
                     let bar = win.gfx.as_ref().map(|g| g.titlebar(win));
+                    let margins = win
+                        .gfx
+                        .as_ref()
+                        .map_or(ghost_ui_core::frame::FrameInset::NONE, |g| g.margins_px());
                     let Some(gfx) = win.gfx.as_mut() else {
                         return;
                     };
@@ -6380,12 +6462,14 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         let t_model = Instant::now();
                         let scene = win.root.view(&self.states);
-                        // The model laid out in the space under our titlebar; put
-                        // that space where it belongs and draw the bar above it.
+                        // The model laid out in the space under our titlebar and
+                        // inside our shadow margins; put that space where it belongs
+                        // and draw the bar above it.
                         let bar_px = gfx.bar_px();
-                        let scene = ghost_ui_core::frame::with_titlebar(
+                        let scene = ghost_ui_core::frame::with_frame(
                             scene,
                             bar.as_ref().expect("gfx implies a bar"),
+                            margins,
                         );
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
@@ -6400,7 +6484,10 @@ impl ApplicationHandler<UserEvent> for App {
                         // Keep the IME candidate window pinned to the text cursor.
                         if let Some(a) = win.root.ime_cursor_area(&self.states) {
                             gfx.window.set_ime_cursor_area(
-                                PhysicalPosition::new(a.x, a.y + bar_px as f32),
+                                PhysicalPosition::new(
+                                    a.x + margins.left as f32,
+                                    a.y + (bar_px + margins.top) as f32,
+                                ),
                                 PhysicalSize::new(a.w, a.h),
                             );
                         }

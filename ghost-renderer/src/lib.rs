@@ -809,11 +809,9 @@ pub struct WindowEdge {
     ///
     /// [`shadow`]: Self::shadow
     pub margins: EdgeMargins,
-    /// The window's drop shadow, across the margin: [`EDGE_SHADOW_STEPS`] alphas
-    /// evenly spaced from the window's edge out to the far side of the margin.
-    /// All zero draws none, which is what a window with no margin to cast into
-    /// must have.
-    pub shadow: [f32; EDGE_SHADOW_STEPS],
+    /// The window's drop shadow, cast across the margin. All zero draws none,
+    /// which is what a window with no margin to cast into must have.
+    pub shadow: ShadowProfile,
     /// The window's own drop shadow, sampled across the notch that rounding a
     /// corner opens: [`EDGE_SHADOW_STEPS`] alphas evenly spaced from the arc out
     /// to the square corner it cuts away, i.e. over `radius * (sqrt(2) - 1)`
@@ -826,6 +824,32 @@ pub struct WindowEdge {
     /// samples it from whatever actually draws the frame so the two agree (and
     /// track the window's focus, which the shadow follows).
     pub corner_shadow: [f32; EDGE_SHADOW_STEPS],
+}
+
+/// A window's drop shadow, sampled outward from its edge: [`EDGE_SHADOW_STEPS`]
+/// alphas evenly spaced from the edge out to the far side of the deepest margin.
+///
+/// Three of them, because a real window shadow is offset downward — deeper below
+/// the window than above it, which is what makes it read as lit from above
+/// rather than as an even glow. The shader picks by the direction the pixel lies
+/// in: straight up, straight down, or out to a side, and the projection between.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShadowProfile {
+    pub up: [f32; EDGE_SHADOW_STEPS],
+    pub side: [f32; EDGE_SHADOW_STEPS],
+    pub down: [f32; EDGE_SHADOW_STEPS],
+}
+
+impl ShadowProfile {
+    /// Nothing to cast.
+    pub fn is_none(&self) -> bool {
+        !self
+            .up
+            .iter()
+            .chain(&self.side)
+            .chain(&self.down)
+            .any(|a| *a > 0.0)
+    }
 }
 
 /// Logical pixels of surface outside the window on each side — see
@@ -954,8 +978,8 @@ struct EdgeUniforms {
     _pad: f32,
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
-    /// [`WindowEdge::shadow`], likewise.
-    margin_shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
+    /// [`WindowEdge::shadow`], likewise — up, side and down in turn.
+    margin_shadow: [[f32; 4]; 3 * EDGE_SHADOW_STEPS / 4],
 }
 
 /// Stands in when no platform fallback was installed: chrome text then draws
@@ -990,7 +1014,7 @@ struct EdgeU {
     shadow_reach: f32,
     pad: f32,
     shadow: array<vec4<f32>, 2>,
-    margin_shadow: array<vec4<f32>, 2>,
+    margin_shadow: array<vec4<f32>, 6>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
 
@@ -1062,15 +1086,52 @@ fn notch_shadow(t: f32) -> f32 {
     return mix(lo, hi, pos - floor(pos));
 }
 
-// The same read, against the profile cast across the margin.
-fn margin_shadow_at(t: f32) -> f32 {
+// The same read, against one of the three margin profiles: `band` 0 is up, 1 is
+// out to a side, 2 is down.
+fn margin_shadow_at(band: u32, t: f32) -> f32 {
     let steps = 8.0;
     let pos = clamp(t, 0.0, 1.0) * (steps - 1.0);
-    let i = u32(floor(pos));
-    let j = min(i + 1u, u32(steps) - 1u);
+    let base = band * 8u;
+    let i = base + u32(floor(pos));
+    let j = base + min(u32(floor(pos)) + 1u, u32(steps) - 1u);
     let lo = u.margin_shadow[i / 4u][i % 4u];
     let hi = u.margin_shadow[j / 4u][j % 4u];
     return mix(lo, hi, pos - floor(pos));
+}
+
+// How far below the window `p` lies, as the y of the unit vector pointing from
+// the window's edge out to it: +1 straight down, -1 straight up, 0 out to a
+// side. Zero when nothing points anywhere, which only happens dead on the edge.
+fn outward_down(p: vec2<f32>) -> f32 {
+    // Straight out of the rectangle, which already covers the four sides and
+    // every corner outside it.
+    var o = vec2<f32>(
+        min(p.x, 0.0) + max(p.x - u.viewport.x, 0.0),
+        min(p.y, 0.0) + max(p.y - u.viewport.y, 0.0),
+    );
+    // Inside the rectangle but outside the shape: the notch a rounded corner
+    // opens. There the direction is radial, out of that corner's circle.
+    if (o.x == 0.0 && o.y == 0.0 && u.radius > 0.0) {
+        let r = u.radius;
+        var cy = -1.0;
+        if (u.round_bottom > 0.0 && p.y > u.viewport.y - r) {
+            cy = u.viewport.y - r;
+        } else if (u.round_top > 0.0 && p.y < r) {
+            cy = r;
+        }
+        if (cy >= 0.0) {
+            if (p.x < r) {
+                o = p - vec2<f32>(r, cy);
+            } else if (p.x > u.viewport.x - r) {
+                o = p - vec2<f32>(u.viewport.x - r, cy);
+            }
+        }
+    }
+    let len = length(o);
+    if (len <= 0.0) {
+        return 0.0;
+    }
+    return o.y / len;
 }
 
 // Premultiplied black, source-over: the window's drop shadow, cast into the
@@ -1079,10 +1140,19 @@ fn margin_shadow_at(t: f32) -> f32 {
 // instead of stepping off it.
 @fragment
 fn margin_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let d = edge_distance(pos.xy - u.origin);
+    let p = pos.xy - u.origin;
+    let d = edge_distance(p);
     let outside = clamp(0.5 - d, 0.0, 1.0);
-    let a = margin_shadow_at(-d / max(u.shadow_reach, 0.0001)) * outside;
-    return vec4<f32>(0.0, 0.0, 0.0, a);
+    let t = -d / max(u.shadow_reach, 0.0001);
+    let down = outward_down(p);
+    let side = margin_shadow_at(1u, t);
+    var lit = side;
+    if (down >= 0.0) {
+        lit = mix(side, margin_shadow_at(2u, t), down);
+    } else {
+        lit = mix(side, margin_shadow_at(0u, t), -down);
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, lit * outside);
 }
 
 // Premultiplied black, added into the notch the cut opened: the shadow the
@@ -4899,6 +4969,12 @@ impl Renderer {
         self.chrome_weight = weight;
     }
 
+    /// The edge currently set — the shell reads its margins back so the
+    /// coordinates it works in and the shape the renderer draws agree.
+    pub fn window_edge(&self) -> WindowEdge {
+        self.window_edge
+    }
+
     pub fn set_window_edge(&mut self, edge: WindowEdge) {
         if self.window_edge != edge {
             self.window_edge = edge;
@@ -4950,9 +5026,15 @@ impl Renderer {
         for (i, a) in edge.corner_shadow.iter().enumerate() {
             shadow[i / 4][i % 4] = *a;
         }
-        let mut margin_shadow = [[0.0f32; 4]; EDGE_SHADOW_STEPS / 4];
-        for (i, a) in edge.shadow.iter().enumerate() {
-            margin_shadow[i / 4][i % 4] = *a;
+        let mut margin_shadow = [[0.0f32; 4]; 3 * EDGE_SHADOW_STEPS / 4];
+        for (band, profile) in [edge.shadow.up, edge.shadow.side, edge.shadow.down]
+            .iter()
+            .enumerate()
+        {
+            for (i, a) in profile.iter().enumerate() {
+                let at = band * EDGE_SHADOW_STEPS + i;
+                margin_shadow[at / 4][at % 4] = *a;
+            }
         }
         let uniforms = EdgeUniforms {
             viewport: [w as f32, h as f32],
@@ -5053,7 +5135,7 @@ impl Renderer {
                 };
                 pass.set_pipeline(&self.edge_cut_pipeline);
                 ring_pass(&mut pass);
-                if edge.shadow.iter().any(|a| *a > 0.0) {
+                if !edge.shadow.is_none() {
                     pass.set_pipeline(&self.edge_margin_shadow_pipeline);
                     ring_pass(&mut pass);
                 }
@@ -5112,7 +5194,7 @@ impl Renderer {
                 // just the same, so the same shadow belongs in it. Without this
                 // the shadow follows the arc round and then stops dead, leaving a
                 // clear wedge between the curve and the corner it replaced.
-                if !edge.margins.is_none() && edge.shadow.iter().any(|a| *a > 0.0) {
+                if !edge.margins.is_none() && !edge.shadow.is_none() {
                     pass.set_pipeline(&self.edge_margin_shadow_pipeline);
                     draw(&mut pass);
                 }
@@ -7328,7 +7410,7 @@ mod tests {
             outline: 0.75,
             outline_inside: false,
             margins: EdgeMargins::default(),
-            shadow: [0.0; EDGE_SHADOW_STEPS],
+            shadow: ShadowProfile::default(),
             corner_shadow: [shadow; EDGE_SHADOW_STEPS],
         };
         r.set_window_edge(edge(0.31));

@@ -107,6 +107,20 @@ pub fn bottom_corner_alpha(out: f32, active: bool) -> f32 {
     shadow(out, std::f32::consts::FRAC_1_SQRT_2, 1, active)
 }
 
+/// The alpha the shadow casts `out` logical pixels beyond the window's edge, in
+/// a direction `down` of which points downward: 1 straight down, -1 straight up,
+/// 0 out to a side.
+///
+/// Public for the same reason as [`bottom_corner_alpha`], one step further on: a
+/// client that draws its *whole* frame casts the shadow itself, everywhere,
+/// rather than patching the one place the decorations cannot reach. It asks here
+/// so its shadow is still this shadow — the same layers, and the same downward
+/// offset that makes a window look lit from above rather than floating in even
+/// light.
+pub fn edge_alpha(out: f32, down: f32, active: bool) -> f32 {
+    shadow(out, down, 1, active)
+}
+
 /// The alpha `pixel_dist` device pixels outside the window's nearest edge, in a
 /// direction `down` of which points downward: 1 straight down, -1 straight up,
 /// 0 out to a side, and the projection in between around a corner.

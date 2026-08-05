@@ -1881,7 +1881,7 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1945,7 +1945,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1958,7 +1958,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
             outline: 0.75,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2014,7 +2014,7 @@ fn the_ring_is_as_wide_as_the_border_the_frame_draws() {
             outline,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         });
         renderer.present_offscreen(&scene, font, 15.0)
@@ -2055,7 +2055,7 @@ fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
         outline,
         outline_inside: false,
         margins: ghost_renderer::EdgeMargins::default(),
-        shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        shadow: ghost_renderer::ShadowProfile::default(),
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
     };
     // Opaque, so the only thing that can lighten a pixel is the arc itself.
@@ -2104,7 +2104,7 @@ fn ghost_drawing_its_own_frame_rounds_all_four_corners() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         },
         0.5,
@@ -2145,7 +2145,7 @@ fn the_outer_border_carries_on_around_the_top_corners_too() {
         outline,
         outline_inside: false,
         margins: ghost_renderer::EdgeMargins::default(),
-        shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        shadow: ghost_renderer::ShadowProfile::default(),
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
     };
     let bare = edge_render(edge(0.0), 1.0);
@@ -2195,7 +2195,7 @@ fn our_own_frames_border_runs_along_the_straight_edges_too() {
         outline,
         outline_inside: true,
         margins: ghost_renderer::EdgeMargins::default(),
-        shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+        shadow: ghost_renderer::ShadowProfile::default(),
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
     };
     let bare = edge_render(edge(0.0), 1.0);
@@ -2250,7 +2250,7 @@ fn margins_put_the_window_inside_a_larger_surface() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::all(M),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         },
         0.5,
@@ -2310,11 +2310,21 @@ fn the_shadow_fills_the_margin_the_window_leaves() {
             0.5,
         )
     };
-    let mut profile = [0.0f32; ghost_renderer::EDGE_SHADOW_STEPS];
-    for (i, a) in profile.iter_mut().enumerate() {
-        *a = 0.6 * (1.0 - i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32);
-    }
-    let bare = lit([0.0; ghost_renderer::EDGE_SHADOW_STEPS]);
+    // A linear fade out from the edge, and — as a real window's shadow is —
+    // heavier below than above.
+    let fade = |peak: f32| {
+        let mut p = [0.0f32; ghost_renderer::EDGE_SHADOW_STEPS];
+        for (i, a) in p.iter_mut().enumerate() {
+            *a = peak * (1.0 - i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32);
+        }
+        p
+    };
+    let profile = ghost_renderer::ShadowProfile {
+        up: fade(0.2),
+        side: fade(0.4),
+        down: fade(0.8),
+    };
+    let bare = lit(ghost_renderer::ShadowProfile::default());
     let img = lit(profile);
     write_png("window-edge-margin-shadow.png", &img);
 
@@ -2349,6 +2359,15 @@ fn the_shadow_fills_the_margin_the_window_leaves() {
         px(&bare, w / 2, h / 2),
         "the shadow must not reach into the window"
     );
+    // It is offset downward, which is what makes the window read as lit from
+    // above rather than floating in even light: the same distance below the
+    // window is darker than above it, and a side is in between.
+    let (above, below) = (px(&img, w / 2, m - 1)[3], px(&img, w / 2, h - m)[3]);
+    let beside = px(&img, m - 1, h / 2)[3];
+    assert!(
+        below > beside && beside > above,
+        "the shadow should deepen downward: {above} above, {beside} beside, {below} below"
+    );
 }
 
 #[test]
@@ -2365,7 +2384,7 @@ fn the_frames_titlebar_still_keeps_the_top_corners_when_it_draws_them() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2392,7 +2411,7 @@ fn a_square_window_keeps_its_corners() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2417,7 +2436,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2430,7 +2449,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
             outline: 0.0,
             outline_inside: false,
             margins: ghost_renderer::EdgeMargins::default(),
-            shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+            shadow: ghost_renderer::ShadowProfile::default(),
             corner_shadow: frame_shadow(true),
         },
         0.5,

@@ -180,27 +180,90 @@ pub struct Titlebar {
 /// covers a titlebar any more than a dialog covers the desktop's.
 const BAR_Z: i32 = i32::MAX;
 
+/// Physical pixels of surface lying *outside* the window on each side, kept for
+/// the window's own drop shadow.
+///
+/// An undecorated window can be given room around itself, so the surface stops
+/// being the window: everything the frame draws is offset into it by this, and
+/// the ring left over is the renderer's to shadow. [`NONE`](Self::NONE) is a
+/// surface that is exactly the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameInset {
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+}
+
+impl FrameInset {
+    pub const NONE: Self = Self {
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+    };
+
+    /// Uniform on every side.
+    pub fn all(m: u32) -> Self {
+        Self {
+            top: m,
+            right: m,
+            bottom: m,
+            left: m,
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// The window inside a surface of `surface` px. Never empty.
+    pub fn window(&self, surface: (u32, u32)) -> (u32, u32) {
+        (
+            surface.0.saturating_sub(self.left + self.right).max(1),
+            surface.1.saturating_sub(self.top + self.bottom).max(1),
+        )
+    }
+}
+
 /// Lay `content` — a scene the model built for the space *under* the bar — into
-/// a window `bar_px` taller, with the titlebar in the strip it makes.
+/// the window, with the titlebar in the strip above it.
 ///
 /// Everything the model drew moves down by the bar's height. It laid out in a
 /// window that size, so nothing needs re-laying: the shell sizes the model to
 /// the content area, and this puts that area where it belongs.
 pub fn with_titlebar(content: Scene, bar: &Titlebar) -> Scene {
-    if bar.height_px == 0 {
+    with_frame(content, bar, FrameInset::NONE)
+}
+
+/// [`with_titlebar`], for a window that does not fill its surface: the frame is
+/// laid into the window at `margins`, and the surface around it left untouched
+/// for the renderer to cast the window's shadow into.
+pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene {
+    if bar.height_px == 0 && margins.is_none() {
         return content;
     }
     let bar_px = bar.height_px;
-    let (w, h) = content.size_px;
-    let mut scene = Scene::new((w, h + bar_px));
+    let (cw, ch) = content.size_px;
+    // The surface is the content, plus the bar above it, plus the margins all
+    // round — the model was sized to exactly what is left.
+    let mut scene = Scene::new((
+        cw + margins.left + margins.right,
+        ch + bar_px + margins.top + margins.bottom,
+    ));
     scene.layers = content.layers;
     for layer in &mut scene.layers {
-        layer.transform.ty += bar_px as f32;
+        layer.transform.tx += margins.left as f32;
+        layer.transform.ty += (bar_px + margins.top) as f32;
     }
+    if bar_px == 0 {
+        return scene;
+    }
+    let w = cw + margins.left + margins.right;
     let strip = RectPx {
-        x: 0.0,
-        y: 0.0,
-        w: w as f32,
+        x: margins.left as f32,
+        y: margins.top as f32,
+        w: (w - margins.left - margins.right) as f32,
         h: bar_px as f32,
     };
     let mut items = vec![SceneItem::Rect {
@@ -318,6 +381,22 @@ pub fn resize_edge_at(
     scale: f32,
     grab: FrameGrab,
 ) -> Option<ResizeEdge> {
+    resize_edge_within(pos, size, scale, grab, 0.0)
+}
+
+/// [`resize_edge_at`] on a *surface* of `size` whose window is inset by `margin`
+/// physical pixels — the room a window with its own shadow keeps around itself.
+///
+/// The whole margin grabs, and the band reaches that much further in: the point
+/// of having room outside the window is that the handles can live there instead
+/// of over the first pixels of the grid.
+pub fn resize_edge_within(
+    pos: PointPx,
+    size: (u32, u32),
+    scale: f32,
+    grab: FrameGrab,
+    margin: f32,
+) -> Option<ResizeEdge> {
     if !grab.own_frame || grab.boxed_in || grab.pointer_down {
         return None;
     }
@@ -326,8 +405,9 @@ pub fn resize_edge_at(
     if x < 0.0 || y < 0.0 || x >= w || y >= h {
         return None;
     }
-    let band = f64::from(RESIZE_BAND * scale.max(0.0));
-    let corner = f64::from(RESIZE_CORNER * scale.max(0.0));
+    let margin = f64::from(margin.max(0.0));
+    let band = f64::from(RESIZE_BAND * scale.max(0.0)) + margin;
+    let corner = f64::from(RESIZE_CORNER * scale.max(0.0)) + margin;
 
     let (west, east) = (x < band, x >= w - band);
     let (north, south) = (y < band, y >= h - band);
@@ -384,14 +464,46 @@ pub fn frame_hit(
     grab: FrameGrab,
     bar_px: u32,
 ) -> FrameHit {
-    if let Some(edge) = resize_edge_at(pos, size, scale, grab) {
+    frame_hit_within(pos, size, scale, grab, bar_px, FrameInset::NONE)
+}
+
+/// [`frame_hit`] on a surface whose window is inset by `margins`.
+///
+/// The margins are the window's shadow, and nothing of the window's is out
+/// there: past the resize band they are dead surface, which the model must not
+/// see as content at a negative row.
+pub fn frame_hit_within(
+    pos: PointPx,
+    size: (u32, u32),
+    scale: f32,
+    grab: FrameGrab,
+    bar_px: u32,
+    margins: FrameInset,
+) -> FrameHit {
+    // The handles are hit-tested on the SURFACE — all of it is ours to grab,
+    // and reaching into the shadow for an edge is the point of having one.
+    let deepest = margins
+        .top
+        .max(margins.right)
+        .max(margins.bottom)
+        .max(margins.left);
+    if let Some(edge) = resize_edge_within(pos, size, scale, grab, deepest as f32) {
         return FrameHit::Resize(edge);
     }
-    let y = pos.y - f64::from(bar_px);
+    let (x, y) = (
+        pos.x - f64::from(margins.left),
+        pos.y - f64::from(margins.top),
+    );
+    let (ww, wh) = margins.window(size);
+    if x < 0.0 || y < 0.0 || x >= f64::from(ww) || y >= f64::from(wh) {
+        // Out in the shadow, past the handles: not the window at all.
+        return FrameHit::Bar;
+    }
+    let y = y - f64::from(bar_px);
     if y < 0.0 {
         return FrameHit::Bar;
     }
-    FrameHit::Content(PointPx { x: pos.x, y })
+    FrameHit::Content(PointPx { x, y })
 }
 
 #[cfg(test)]
@@ -762,6 +874,85 @@ mod tests {
         assert_eq!(
             hit(400.0, 100.0),
             FrameHit::Content(PointPx { x: 400.0, y: 65.0 })
+        );
+    }
+
+    /// A window that keeps room around itself for its shadow sits inside its
+    /// surface, and everything the frame does moves in with it.
+    #[test]
+    fn a_window_with_margins_sits_inside_its_surface() {
+        const BAR: u32 = 35;
+        let m = FrameInset::all(20);
+        let hit = |x: f64, y: f64| frame_hit_within(PointPx { x, y }, SIZE, 1.0, grab(), BAR, m);
+
+        // The whole margin grabs — that is what the room outside is for.
+        assert_eq!(hit(400.0, 2.0), FrameHit::Resize(ResizeEdge::North));
+        assert_eq!(hit(400.0, 19.0), FrameHit::Resize(ResizeEdge::North));
+        // And the band reaches that much further in, past the window's edge.
+        assert_eq!(hit(400.0, 23.0), FrameHit::Resize(ResizeEdge::North));
+        // The bar starts at the window, not at the surface.
+        assert_eq!(hit(400.0, 40.0), FrameHit::Bar);
+        // And the content is offset by the margin AND the bar.
+        assert_eq!(
+            hit(420.0, 20.0 + BAR as f64 + 10.0),
+            FrameHit::Content(PointPx { x: 400.0, y: 10.0 })
+        );
+    }
+
+    /// Dead surface out in the shadow, past the handles, is not content — a
+    /// model that saw it would place the click at a negative row.
+    #[test]
+    fn the_shadow_past_the_handles_is_not_the_window() {
+        const BAR: u32 = 35;
+        let m = FrameInset::all(20);
+        // Nothing can grab: the window is boxed in, so the margin is inert.
+        let inert = FrameGrab {
+            boxed_in: true,
+            ..grab()
+        };
+        let hit = |x: f64, y: f64| frame_hit_within(PointPx { x, y }, SIZE, 1.0, inert, BAR, m);
+
+        assert_eq!(hit(400.0, 2.0), FrameHit::Bar, "above the window");
+        assert_eq!(hit(2.0, 300.0), FrameHit::Bar, "left of it");
+        assert_eq!(
+            hit(SIZE.0 as f64 - 2.0, 300.0),
+            FrameHit::Bar,
+            "right of it"
+        );
+        assert_eq!(hit(400.0, SIZE.1 as f64 - 2.0), FrameHit::Bar, "below it");
+    }
+
+    /// The scene the shell composes is the whole surface, with the frame laid
+    /// into the window inside it.
+    #[test]
+    fn the_composed_scene_puts_the_window_inside_the_surface() {
+        let m = FrameInset::all(20);
+        let bar = titlebar(35);
+        let content = Scene::new((760, 525));
+        let scene = with_frame(content, &bar, m);
+
+        assert_eq!(
+            scene.size_px,
+            (800, 600),
+            "content + bar + margins must come back to the surface"
+        );
+        let strip = scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                SceneItem::Rect {
+                    id: SceneId::Titlebar,
+                    rect,
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .expect("the titlebar strip");
+        assert_eq!(
+            (strip.x, strip.y, strip.w, strip.h),
+            (20.0, 20.0, 760.0, 35.0),
+            "the bar belongs to the window, not the surface"
         );
     }
 
