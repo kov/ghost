@@ -1531,6 +1531,8 @@ pub struct Renderer {
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
     window_edge: WindowEdge,
+    /// Set when [`Renderer::set_window_edge`] changed it, cleared when drawn.
+    edge_dirty: bool,
     /// Display scale factor (physical pixels per logical pixel), so the frost grain
     /// keeps a fixed logical size on HiDPI. Set by [`Renderer::set_scale_factor`];
     /// defaults to 1.0 (also what the headless golden path uses).
@@ -2295,6 +2297,7 @@ impl Renderer {
             edge_bind_group,
             edge_uniform_buf,
             window_edge: WindowEdge::default(),
+            edge_dirty: false,
             theme,
             frame_bg: None,
             scene_bg: None,
@@ -4582,7 +4585,20 @@ impl Renderer {
     /// opaque window's alpha is ignored by the compositor, so there is no corner
     /// to cut). Defaults to nothing, which encodes no pass at all.
     pub fn set_window_edge(&mut self, edge: WindowEdge) {
-        self.window_edge = edge;
+        if self.window_edge != edge {
+            self.window_edge = edge;
+            // The edge is not in the scene, so an unchanged scene would be
+            // skipped and the old corner left on the glass. The frame's own
+            // shadow lightens the instant a window goes to the backdrop; a
+            // corner still wearing the focused one is a dark wedge in the curve.
+            self.edge_dirty = true;
+        }
+    }
+
+    /// Whether the window edge has changed since the last frame was drawn —
+    /// consumed by [`Target::render_frame`], which must not skip that frame.
+    pub(crate) fn take_edge_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.edge_dirty)
     }
 
     /// Cut the window's bottom corners and trace its inset hairline onto `view`,
@@ -6869,6 +6885,57 @@ mod tests {
             t.render_frame(&mut r, &mut cache, &changed, font, SIZE_PX, || {}),
             FrameOutcome::Presented { .. }
         ));
+    }
+
+    #[test]
+    fn a_window_that_loses_focus_redraws_its_corners_over_an_identical_scene() {
+        // The window's edge is not part of the scene — it is the shadow and ring
+        // around a corner the decorations cannot reach into. When the window goes
+        // to the backdrop the frame around it lightens its own shadow at once, so
+        // ours has to lighten with it; skipping the frame because the *scene* is
+        // unchanged leaves a dark wedge sitting in the corner until something
+        // else happens to redraw.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let mut r = Renderer::headless(Theme::default());
+        let mut cache = SceneCache::default();
+        let mut t = Target::Offscreen;
+        let scene = single_scene(frame(20, 5, "hi"), 180, 90);
+
+        let edge = |shadow: f32| WindowEdge {
+            radius: 10.0,
+            highlight: 0.0,
+            outline: 0.75,
+            corner_shadow: [shadow; EDGE_SHADOW_STEPS],
+        };
+        r.set_window_edge(edge(0.31));
+        assert!(matches!(
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            FrameOutcome::Presented { .. }
+        ));
+        assert!(
+            matches!(
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                FrameOutcome::Clean
+            ),
+            "nothing changed at all"
+        );
+
+        // Focus lost: the same scene, a lighter corner.
+        r.set_window_edge(edge(0.11));
+        assert!(
+            matches!(
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                FrameOutcome::Presented { .. }
+            ),
+            "the corner has to be redrawn even though the scene has not changed"
+        );
+        assert!(
+            matches!(
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                FrameOutcome::Clean
+            ),
+            "and settle again once it has"
+        );
     }
 
     #[test]

@@ -6088,9 +6088,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 // The frame's shadow lightens in the backdrop, so the corner it
-                // hands us has to lighten with it.
-                if let Some(gfx) = self.windows.get_mut(&id).and_then(|w| w.gfx.as_mut()) {
-                    gfx.refresh_window_edge(focused);
+                // hands us has to lighten with it — and it needs a frame to do
+                // that in. Losing focus changes nothing else the shell draws, so
+                // without asking here the old corner stays on the glass until
+                // something unrelated redraws.
+                if let Some(w) = self.windows.get_mut(&id) {
+                    if let Some(gfx) = w.gfx.as_mut() {
+                        gfx.refresh_window_edge(focused);
+                    }
+                    w.pacer.request();
                 }
                 self.dispatch(id, UiEvent::Focus(focused), &fe);
             }

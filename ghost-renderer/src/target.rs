@@ -147,9 +147,13 @@ impl Target {
         // Skip an identical scene; otherwise present it. The per-session Surface keeps
         // the redraw cheap (it re-rasters only its changed rows), so the scene-level
         // verdict is just skip-or-present.
+        // The window edge rides outside the scene, so its own change has to be
+        // asked about separately — and always asked, so it is never left set for
+        // a later frame to trip over.
+        let edge_changed = renderer.take_edge_dirty();
         match cache.damage(scene, font_px) {
-            Damage::None => return FrameOutcome::Clean,
-            Damage::Full => {}
+            Damage::None if !edge_changed => return FrameOutcome::Clean,
+            Damage::None | Damage::Full => {}
         }
         match self {
             Target::Offscreen => {
