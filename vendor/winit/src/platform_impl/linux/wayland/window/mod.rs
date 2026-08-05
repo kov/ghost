@@ -279,10 +279,10 @@ impl Window {
         }
     }
 
-    /// Round the bottom corners of the backdrop effect to `radius` logical
+    /// Round the backdrop effect's corners to `top` and `bottom` logical
     /// pixels. [vendored addition]
-    pub fn set_blur_bottom_radius(&self, radius: u32) {
-        self.window_state.lock().unwrap().set_blur_bottom_radius(radius);
+    pub fn set_blur_corner_radii(&self, top: u32, bottom: u32) {
+        self.window_state.lock().unwrap().set_blur_corner_radii(top, bottom);
     }
 }
 

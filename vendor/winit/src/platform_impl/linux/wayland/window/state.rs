@@ -154,11 +154,12 @@ pub struct WindowState {
     /// [vendored addition]
     background_effect: Option<ExtBackgroundEffectSurfaceV1>,
     background_effect_manager: Option<BackgroundEffectManager>,
-    /// Radius, in logical pixels, of the *bottom* corners the client rounds off
-    /// its own surface — so the backdrop effect can be cut to the same shape
+    /// Radii, in logical pixels, of the top and bottom corners the client rounds
+    /// off its own surface — so the backdrop effect can be cut to the same shape
     /// instead of blurring a square box behind a rounded window. 0 is square.
-    /// See [`set_blur_bottom_radius`](Self::set_blur_bottom_radius).
+    /// See [`set_blur_corner_radii`](Self::set_blur_corner_radii).
     /// [vendored addition]
+    blur_top_radius: u32,
     blur_bottom_radius: u32,
 
     /// Whether the client side decorations have pending move operations.
@@ -203,6 +204,7 @@ impl WindowState {
             blur_manager: winit_state.kwin_blur_manager.clone(),
             background_effect: None,
             background_effect_manager: winit_state.background_effect_manager.clone(),
+            blur_top_radius: 0,
             blur_bottom_radius: 0,
             compositor,
             connection,
@@ -1159,7 +1161,7 @@ impl WindowState {
                 return;
             },
         };
-        Self::add_blur_shape(&region, self.size, self.blur_bottom_radius);
+        Self::add_blur_shape(&region, self.size, self.blur_top_radius, self.blur_bottom_radius);
         // `set_blur_region` copies, hence dropping the region here.
         effect.set_blur_region(Some(region.wl_region()));
         // The region is double-buffered surface state. Before the initial
@@ -1181,22 +1183,28 @@ impl WindowState {
     /// poking out of its own curve. There the shape is spelled out row by row:
     /// everything above the corners, then one rect per row across the arcs.
     /// [vendored addition]
-    fn add_blur_shape(region: &Region, size: LogicalSize<u32>, bottom_radius: u32) {
-        for (x, y, w, h) in blur_shape_rects(size, bottom_radius) {
+    fn add_blur_shape(
+        region: &Region,
+        size: LogicalSize<u32>,
+        top_radius: u32,
+        bottom_radius: u32,
+    ) {
+        for (x, y, w, h) in blur_shape_rects(size, top_radius, bottom_radius) {
             region.add(x, y, w, h);
         }
     }
 
-    /// Round the bottom corners of the backdrop effect by `radius` logical
-    /// pixels, matching a client that rounds those corners in its own drawing.
-    /// 0 (the default) leaves the effect square. Re-applied on resize, since
-    /// unlike the square shape this one is spelled out in surface coordinates.
+    /// Round the backdrop effect's corners by `top` and `bottom` logical pixels,
+    /// matching a client that rounds those corners in its own drawing. 0 (the
+    /// default) leaves that end square. Re-applied on resize, since unlike the
+    /// square shape this one is spelled out in surface coordinates.
     /// [vendored addition]
-    pub fn set_blur_bottom_radius(&mut self, radius: u32) {
-        if self.blur_bottom_radius == radius {
+    pub fn set_blur_corner_radii(&mut self, top: u32, bottom: u32) {
+        if (self.blur_top_radius, self.blur_bottom_radius) == (top, bottom) {
             return;
         }
-        self.blur_bottom_radius = radius;
+        self.blur_top_radius = top;
+        self.blur_bottom_radius = bottom;
         self.reapply_blur_shape();
     }
 
@@ -1204,7 +1212,9 @@ impl WindowState {
     /// rounded shape is in force, since the square one is size-independent.
     /// [vendored addition]
     pub fn reapply_blur_shape(&mut self) {
-        if self.blur_bottom_radius == 0 || self.background_effect.is_none() {
+        if (self.blur_top_radius, self.blur_bottom_radius) == (0, 0)
+            || self.background_effect.is_none()
+        {
             return;
         }
         if let Some(manager) = self.background_effect_manager.clone() {
@@ -1363,28 +1373,48 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
 /// needs respecifying. A rounded shape has to be spelled out instead —
 /// everything above the corners, then one rect per row across the arcs.
 /// [vendored addition]
-fn blur_shape_rects(size: LogicalSize<u32>, bottom_radius: u32) -> Vec<(i32, i32, i32, i32)> {
+fn blur_shape_rects(
+    size: LogicalSize<u32>,
+    top_radius: u32,
+    bottom_radius: u32,
+) -> Vec<(i32, i32, i32, i32)> {
     let (w, h) = (size.width, size.height);
-    let r = bottom_radius.min(w / 2).min(h);
-    if r == 0 {
+    let rt = top_radius.min(w / 2).min(h);
+    let rb = bottom_radius.min(w / 2).min(h - rt);
+    if rt == 0 && rb == 0 {
         return vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)];
     }
-    // Everything above the corners, overwide so the sides are never clipped short
-    // of the surface by a stale size.
-    let mut rects = vec![(0, 0, WHOLE_SURFACE, (h - r) as i32)];
-    let rf = r as f32;
-    for row in 0..r {
-        // Half-chord of the corner circle at this row's centre. Rounded *inward*
-        // (and then one more pixel), so the region always stops short of the curve
-        // the client drew: a region edge that overshoots it by even half a pixel
-        // leaves a thread of blur along the whole arc, where falling short hides
-        // under the client's own antialiasing.
-        let dy = row as f32 + 0.5;
+    // Everything between the corners, overwide so the sides are never clipped
+    // short of the surface by a stale size.
+    let mut rects = vec![(0, rt as i32, WHOLE_SURFACE, (h - rt - rb) as i32)];
+    // Half-chord of the corner circle at a row `dy` from its centre. Rounded
+    // *inward* (and then one more pixel), so the region always stops short of the
+    // curve the client drew: a region edge that overshoots it by even half a pixel
+    // leaves a thread of blur along the whole arc, where falling short hides under
+    // the client's own antialiasing.
+    let inset = |r: u32, dy: f32| {
+        let rf = r as f32;
         let dx = (rf * rf - dy * dy).max(0.0).sqrt();
-        let x = (rf - dx).ceil() as i32 + 1;
+        (rf - dx).ceil() as i32 + 1
+    };
+    let row_rect = |x: i32, y: u32| {
         let width = w as i32 - 2 * x;
         if width > 0 {
-            rects.push((x, (h - r + row) as i32, width, 1));
+            Some((x, y as i32, width, 1))
+        } else {
+            None
+        }
+    };
+    // The top arc, counting *up* to its centre at `rt`, then the bottom one
+    // counting down from its centre at `h - rb`.
+    for row in 0..rt {
+        if let Some(rect) = row_rect(inset(rt, rt as f32 - row as f32 - 0.5), row) {
+            rects.push(rect);
+        }
+    }
+    for row in 0..rb {
+        if let Some(rect) = row_rect(inset(rb, row as f32 + 0.5), h - rb + row) {
+            rects.push(rect);
         }
     }
     rects
@@ -1399,13 +1429,13 @@ mod blur_shape_tests {
     #[test]
     fn a_square_window_asks_for_one_oversized_rect() {
         // Size-independent, so it survives every resize without being respecified.
-        assert_eq!(blur_shape_rects(SIZE, 0), vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)]);
+        assert_eq!(blur_shape_rects(SIZE, 0, 0), vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)]);
     }
 
     #[test]
     fn a_rounded_window_stops_short_of_its_own_curve() {
         let r = 10u32;
-        let rects = blur_shape_rects(SIZE, r);
+        let rects = blur_shape_rects(SIZE, 0, r);
         let (_, _, _, top_h) = rects[0];
         assert_eq!(top_h, (SIZE.height - r) as i32, "the body must reach the corners");
 
@@ -1426,9 +1456,42 @@ mod blur_shape_tests {
         }
     }
 
+    /// A client that rounds all four corners — one drawing its own decorations —
+    /// needs the effect to stop at the top curve as well. Left square, the
+    /// corner it cut to transparent is where the blur shows at full strength.
+    #[test]
+    fn a_window_that_rounds_its_top_too_gets_the_effect_cut_there() {
+        let r = 10u32;
+        let rects = blur_shape_rects(SIZE, r, r);
+        let (_, body_y, _, body_h) = rects[0];
+        assert_eq!(body_y, r as i32, "the body must start below the top corners");
+        assert_eq!(body_h, (SIZE.height - 2 * r) as i32, "and end above the bottom ones");
+
+        let rows: Vec<_> = rects[1..].iter().filter(|r| r.1 < body_y).collect();
+        assert_eq!(rows.len() as u32, r, "one row per pixel of the top arc");
+        for &&(x, y, w, h) in &rows {
+            assert_eq!(h, 1);
+            // Inside the circle whose centre is `r` down from the top.
+            let dy = r as f32 - y as f32 - 0.5;
+            let dx = ((r * r) as f32 - dy * dy).max(0.0).sqrt();
+            assert!(
+                x as f32 >= r as f32 - dx,
+                "row {y} starts at {x}, outside the arc at {}",
+                r as f32 - dx
+            );
+            assert_eq!(w, SIZE.width as i32 - 2 * x, "the two corners must match");
+        }
+        // And it opens out downward, the mirror of the bottom arc closing in.
+        let widths: Vec<i32> = rows.iter().map(|r| r.2).collect();
+        assert!(
+            widths.windows(2).all(|p| p[1] >= p[0]),
+            "the top arc should open out, got {widths:?}"
+        );
+    }
+
     #[test]
     fn the_rows_narrow_toward_the_bottom() {
-        let rects = blur_shape_rects(SIZE, 12);
+        let rects = blur_shape_rects(SIZE, 0, 12);
         let widths: Vec<i32> = rects[1..].iter().map(|r| r.2).collect();
         assert!(widths.len() > 1, "a rounded corner needs more than one row");
         assert!(
@@ -1442,7 +1505,7 @@ mod blur_shape_tests {
         // A tiny window mid-resize must not produce rects outside the surface.
         for (w, h) in [(20u32, 8u32), (1, 1), (40, 40)] {
             let size = LogicalSize::new(w, h);
-            for &(x, y, rw, rh) in &blur_shape_rects(size, 100)[1..] {
+            for &(x, y, rw, rh) in &blur_shape_rects(size, 100, 100)[1..] {
                 assert!(x >= 0 && rw > 0 && x + rw <= w as i32, "{x}+{rw} outside {w}");
                 assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
             }

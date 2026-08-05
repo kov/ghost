@@ -2175,7 +2175,7 @@ impl Graphics {
         renderer.set_scale_factor(window.scale_factor() as f32);
         let edge = Self::window_edge(&window, !want_transparent, true);
         renderer.set_window_edge(edge);
-        Self::shape_backdrop(&window, edge.radius);
+        Self::shape_backdrop(&window, edge);
 
         Graphics {
             window,
@@ -2309,7 +2309,7 @@ impl Graphics {
     fn refresh_window_edge(&mut self, focused: bool) {
         let edge = Self::window_edge(&self.window, self.target.opaque(), focused);
         self.renderer.set_window_edge(edge);
-        Self::shape_backdrop(&self.window, edge.radius);
+        Self::shape_backdrop(&self.window, edge);
     }
 
     /// Cut the compositor's backdrop effect to the corners we round.
@@ -2320,14 +2320,21 @@ impl Graphics {
     /// reads as a bright wedge poking out of the curve, which is the same way
     /// this went wrong on macOS (there AppKit's own blur and shadow trace the
     /// content layer, so clipping the layer fixed both at once).
+    ///
+    /// Which corners we round is the edge's to say: while a CSD frame draws the
+    /// titlebar it rounds the top itself and only the bottom two are ours, but
+    /// with our own decorations all four are — and a top corner left square here
+    /// wears exactly the same wedge the bottom ones used to.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn shape_backdrop(window: &Window, radius: f32) {
+    fn shape_backdrop(window: &Window, edge: WindowEdge) {
         use winit::platform::wayland::WindowExtWayland;
-        window.set_blur_bottom_radius(radius.max(0.0) as u32);
+        let radius = edge.radius.max(0.0) as u32;
+        let of = |rounded: bool| if rounded { radius } else { 0 };
+        window.set_blur_corner_radii(of(edge.corners.top), of(edge.corners.bottom));
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn shape_backdrop(_window: &Window, _radius: f32) {}
+    fn shape_backdrop(_window: &Window, _edge: WindowEdge) {}
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {

@@ -124,7 +124,7 @@ pub trait WindowExtWayland {
     /// from us and is left square.
     ///
     /// [`Window::set_blur`]: crate::window::Window::set_blur
-    fn set_blur_bottom_radius(&self, radius: u32);
+    fn set_blur_corner_radii(&self, top: u32, bottom: u32);
 }
 
 impl WindowExtWayland for Window {
@@ -162,14 +162,14 @@ impl WindowExtWayland for Window {
     }
 
     #[inline]
-    fn set_blur_bottom_radius(&self, radius: u32) {
+    fn set_blur_corner_radii(&self, top: u32, bottom: u32) {
         #[allow(clippy::single_match)]
         match &self.window {
             #[cfg(x11_platform)]
             crate::platform_impl::Window::X(_) => (),
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => {
-                window.set_blur_bottom_radius(radius)
+                window.set_blur_corner_radii(top, bottom)
             },
         }
     }
