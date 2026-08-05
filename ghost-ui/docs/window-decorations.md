@@ -193,6 +193,81 @@ macOS-15 green-button tiling popover), manual `setFrame` resize, rounded
 corners + shadow, `canBecomeKeyWindow`, and would knowingly forfeit a11y +
 tiling-tool integration.
 
+## Implementation plan (2026-08-05)
+
+The decision above stands unchanged; this is the sequence to build it, written
+once the surrounding pieces existed. Since it was taken we gained
+`ghost_shaper::paint_text` (chrome text with fallback, shaping and color
+glyphs), `Scene::hit` as the canonical pointer router, and the window edge —
+corners, hairline, outline ring, shadow — in `ghost-renderer`.
+
+### Why much of this is deletion
+
+Today the frame is split between two owners: sctk-adwaita draws the titlebar,
+the top corners and the shadow, and we draw the bottom corners, the hairline,
+the outline ring, and a hand-sampled shadow laid into the notch its subsurfaces
+cannot reach (`WindowEdge::corner_shadow`). Owning the whole surface collapses
+that seam rather than adding to it.
+
+### What winit gives us, and the two patches it needs
+
+Verified in the vendored winit (0.30.13):
+
+- **Present on Wayland:** `drag_resize_window` → `xdg_toplevel.resize`,
+  `drag_window`, `show_window_menu`. The compositor still performs the geometry;
+  we only hit-test and set cursors.
+- **Missing 1 — tiled edges.** winit consumes the xdg tiled state internally
+  (`…/wayland/window/state.rs:446`) and never surfaces it. Needed to square off
+  and un-shadow a snapped window.
+- **Missing 2 — surface margins / input region.** With `decorations(false)` the
+  surface *is* the window, so there is nowhere outside it to cast a shadow. A
+  shadow costs a vendored patch (below). No patch, no shadow — this is the whole
+  reason P4 exists as its own phase.
+
+### Phases
+
+- **P0 — seam + flag.** `[window] decorations = system | ghost`, default
+  `system`, so the daily driver never rides a half-built frame. Wayland-only:
+  see the settings note below.
+- **P1 — the edge, ours.** `WindowEdge` grows from bottom-only to all four
+  corners, with our own values instead of alphas sampled off sctk's theme.
+  Rounding suppressed when maximized or tiled (needs patch 1). Tested as the
+  edge already is, with `ghost-shot` pixel assertions.
+- **P2 — interaction.** Resize edges/corners and the titlebar drag region become
+  `Scene` items with ids, so `Scene::hit` routes them like everything else and
+  the logic is headlessly testable in `ghost-ui-core`; the shell only maps a
+  `Cmd` onto the winit call. Per-edge cursors, double-click-to-maximize
+  honouring `action-double-click-titlebar`, right-click window menu.
+- **P3 — the bar.** Height, focus-dependent colors, title via `paint_text`, and
+  our own buttons laid out from GNOME's `button-layout` — order *and* side, both
+  of which are the classic CSD tell when wrong.
+- **P4 — shadow, and the deletion.** Vendored winit gains decoration margins:
+  inflate the surface, set `xdg_surface.set_window_geometry` to the content
+  rect, offset pointer coordinates, set the input region to content + resize
+  handles. That is the GTK model (see `_GTK_FRAME_EXTENTS` above) and it buys
+  back the libadwaita-fitted shadow, drawn by us into the margin and dropped
+  when maximized or tiled. `EDGE_SHADOW_STEPS`, `corner_shadow` and the notch
+  apparatus then go, along with `ghost-renderer`'s dev-dependency on
+  sctk-adwaita for shadow-profile pinning.
+- **P5 — retire the frame.** Flip the default, drop vendored sctk-adwaita and
+  the title hook. `ghost_shaper::paint_text` stays; it was always the reusable
+  half.
+
+### Settled scope
+
+- **The bar starts minimal** — title and window buttons, parity with what the
+  frame draws today. Tabs and fleet affordances in the headerbar are a product
+  change; bolting them onto the parity work means neither can be judged on its
+  own, and it keeps macOS out of scope for longer (the bar is the only reason
+  macOS would re-enter, and its backing-scale issue is unresolved).
+- **Ghost CSD stays behind the flag until P4 lands.** The shadow was fitted
+  against a measured GTK4 window; a shadowless interim default is the kind of
+  temporary that stays.
+- **Wayland only, and `system` is a real setting.** Mutter never offers
+  server-side decorations, but KDE does, and X11 has no shadow without
+  `_GTK_FRAME_EXTENTS`. `decorations = system` is supported configuration, not a
+  debug escape hatch.
+
 ## Open question (revisit only if pursuing Custom-on-mac)
 
 Is the desire for custom-on-mac an **aesthetic** goal (ghost wants its own chrome
