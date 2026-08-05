@@ -216,10 +216,6 @@ pub struct WindowState {
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
     decoration_margins: DecorationMargins,
-    /// Whether the geometry has been inset from the surface at any point, so it
-    /// is no longer safe to let a geometry change wait for the next frame.
-    /// [vendored addition]
-    geometry_inset: bool,
 
     /// Whether the client side decorations have pending move operations.
     ///
@@ -266,7 +262,6 @@ impl WindowState {
             blur_top_radius: 0,
             blur_bottom_radius: 0,
             decoration_margins: DecorationMargins::NONE,
-            geometry_inset: false,
             compositor,
             connection,
             csd_fails: false,
@@ -855,16 +850,6 @@ impl WindowState {
             viewport.set_destination(self.size.width as _, self.size.height as _);
         }
 
-        // Geometry is double-buffered: without a commit it does not take effect
-        // until the next frame, and until then the compositor goes on believing
-        // the window is the whole surface. That only matters once the two can
-        // differ — but it matters just as much on the way back to equal, which
-        // is the transition a maximize makes. Left uncommitted, the compositor
-        // latched the surface as the size to restore to and every maximize round
-        // trip grew the window by the margin. [vendored addition]
-        if self.geometry_inset && self.is_configured() {
-            self.window.wl_surface().commit();
-        }
     }
 
     /// Keep `margins` logical pixels of surface outside the window proper — see
@@ -879,7 +864,6 @@ impl WindowState {
         // geometry and let the surface take the difference.
         let geometry = self.margins_now().deflate(self.size);
         self.decoration_margins = margins;
-        self.geometry_inset = true;
         let now = self.margins_now();
         self.resize(now.inflate(geometry));
         self.size
