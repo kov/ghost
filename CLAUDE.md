@@ -18,6 +18,29 @@ timeout (`wait_until`), never fixed sleeps. XDG dirs are redirected to a tempdir
 (`set_xdg`) so the suite never touches real sessions or recordings. Reuse those
 helpers.
 
+## Launching ghost by hand leaks hosts
+
+A session's `ghost __host` outlives its client on purpose — that is the whole
+feature — so killing a hand-launched `ghost` leaves the host running, holding an
+inotify instance. The per-user cap is 128 (`fs.inotify.max_user_instances`), and
+once it is gone the watch/title tests fail **fast** (~0.1s, "never propagated")
+and read exactly like a regression. `inotify_init()` returning -1 is the tell.
+
+So end a manual run through the CLI, in the same XDG env, *before* removing its
+dirs:
+
+```sh
+env XDG_RUNTIME_DIR=/tmp/probe-rt ... ghost kill --all   # and only then rm -rf
+```
+
+Wiping the runtime dir first orphans the hosts for good: the socket they would
+be reached through is gone. Give each run its own `XDG_RUNTIME_DIR`,
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` so `kill --all` can never touch a real
+session, and reuse the same dirs across runs rather than making new ones.
+
+Cleaning up by pattern is the user's call, not ours — `pkill -f ghost` matches
+system-wide and kills their live sessions. Report leftovers instead.
+
 ## Searching recorded output
 
 Don't `grep` the recording files — they're framed-brotli, so a raw grep finds
