@@ -427,10 +427,11 @@ impl WindowState {
         // *window* to be. The window then came out a margin short of its own
         // maximized or snapped area, with a band of dead surface down two edges.
         if from_compositor {
-            let boxed =
-                configure.is_maximized() || configure.is_fullscreen() || configure.is_tiled();
-            let margins =
-                if boxed { DecorationMargins::NONE } else { self.decoration_margins };
+            let margins = if Self::is_boxed_in(&configure) {
+                DecorationMargins::NONE
+            } else {
+                self.decoration_margins
+            };
             new_size = margins.inflate(new_size);
         }
 
@@ -899,11 +900,25 @@ impl WindowState {
     /// in the middle of its own animation. [vendored addition]
     fn margins_now(&self) -> DecorationMargins {
         match self.last_configure.as_ref() {
-            Some(c) if c.is_maximized() || c.is_fullscreen() || c.is_tiled() => {
-                DecorationMargins::NONE
-            },
+            Some(c) if Self::is_boxed_in(c) => DecorationMargins::NONE,
             _ => self.decoration_margins,
         }
+    }
+
+    /// No free outside edge: the window's geometry has to fill what the
+    /// compositor gave it exactly. A half-snapped window is tiled against ONE
+    /// edge and reports it there — `is_tiled` alone is only the all-four case,
+    /// and taking it for the whole answer left a snapped window still keeping
+    /// room for a shadow it does not cast, overflowing its own tile.
+    /// [vendored addition]
+    fn is_boxed_in(configure: &WindowConfigure) -> bool {
+        configure.is_maximized()
+            || configure.is_fullscreen()
+            || configure.is_tiled()
+            || configure.is_tiled_left()
+            || configure.is_tiled_right()
+            || configure.is_tiled_top()
+            || configure.is_tiled_bottom()
     }
 
     /// Get the scale factor of the window.
