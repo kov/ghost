@@ -98,6 +98,20 @@ pub trait WindowExtWayland {
     /// [`Window::set_blur`]: crate::window::Window::set_blur
     fn blur_supported(&self) -> bool;
 
+    /// Whether the compositor has tiled this window against something — a screen
+    /// edge, another window, a tiling layout — as opposed to leaving it floating.
+    /// Always `false` for an X11 window.
+    ///
+    /// A tiled window has no free outside corner: its edges meet the screen or a
+    /// neighbour, so a client that rounds its corners, draws a drop shadow, or
+    /// offers resize handles has to drop all three where it is tiled, exactly as
+    /// it does when maximized. `Window::is_maximized` does not cover this — a
+    /// half-snapped window is tiled but not maximized.
+    ///
+    /// True if *any* edge is tiled, which is what the state means in practice: a
+    /// half or quarter snap tiles some edges and not others.
+    fn is_tiled(&self) -> bool;
+
     /// Round the bottom corners of the backdrop effect ([`Window::set_blur`]) by
     /// `radius` logical pixels; 0 (the default) leaves it square.
     ///
@@ -133,6 +147,17 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => false,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.blur_supported(),
+        }
+    }
+
+    #[inline]
+    fn is_tiled(&self) -> bool {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => false,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.is_tiled(),
         }
     }
 

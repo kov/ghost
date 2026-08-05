@@ -503,6 +503,30 @@ impl Window {
             .unwrap_or_default()
     }
 
+    /// Whether the compositor has tiled this window against anything — a screen
+    /// edge, another window, a tiling layout. [vendored addition]
+    ///
+    /// Checks the individual edges as well as sctk's `is_tiled()`, which is
+    /// `state.contains(TILED)` over ALL FOUR edges at once and so reports
+    /// `false` for the half and quarter snaps that are the common case (GNOME's
+    /// Super+Right sends `TILED_RIGHT|TOP|BOTTOM`, with no `LEFT`). Same
+    /// reasoning as `WindowState::is_stateless`.
+    pub fn is_tiled(&self) -> bool {
+        self.window_state
+            .lock()
+            .unwrap()
+            .last_configure
+            .as_ref()
+            .map(|c| {
+                c.is_tiled()
+                    || c.is_tiled_left()
+                    || c.is_tiled_right()
+                    || c.is_tiled_top()
+                    || c.is_tiled_bottom()
+            })
+            .unwrap_or_default()
+    }
+
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
         if maximized {

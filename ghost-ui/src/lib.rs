@@ -1897,6 +1897,73 @@ fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat
         .unwrap_or(formats[0])
 }
 
+/// Everything about a window that decides what its edge looks like — read off the
+/// real window by [`Graphics::window_edge`], so the decision itself
+/// ([`window_edge_for`]) is testable without one.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct EdgeState {
+    /// The surface is opaque, so its alpha never reaches the compositor.
+    opaque: bool,
+    /// The window has keyboard focus; the frame's shadow lightens without it.
+    focused: bool,
+    /// Maximized, fullscreen or tiled: no free outside corner to round.
+    boxed_in: bool,
+    /// ghost draws the decorations, so the top edge is ours too.
+    own_frame: bool,
+}
+
+/// The window edge [`EdgeState`] calls for — see [`Graphics::window_edge`], whose
+/// documentation this implements.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn window_edge_for(state: EdgeState) -> WindowEdge {
+    // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
+    // its titlebar starts — and, once we draw the whole frame, the radius the
+    // windows beside us on this desktop wear.
+    const RADIUS: f32 = 10.0;
+    let radius = if state.opaque || state.boxed_in {
+        0.0
+    } else {
+        RADIUS
+    };
+    let corners = if radius <= 0.0 {
+        ghost_renderer::Corners::NONE
+    } else if state.own_frame {
+        ghost_renderer::Corners::ALL
+    } else {
+        ghost_renderer::Corners::default()
+    };
+    // Rounding a corner cuts a notch out of the window that the frame's own
+    // subsurfaces cannot reach into, so we finish its shadow ourselves —
+    // sampled from the frame, at the depth this radius opens up.
+    let reach = radius * (std::f32::consts::SQRT_2 - 1.0);
+    let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
+    for (i, a) in corner_shadow.iter_mut().enumerate() {
+        let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
+        *a = sctk_adwaita::shadow::bottom_corner_alpha(d, state.focused);
+    }
+    // The dark ring the frame draws around the window, which stops short of
+    // the corners we round — read from the same theme the frame uses so the
+    // line we carry on with is the line it drew.
+    let outline = if state.boxed_in {
+        0.0
+    } else {
+        Graphics::frame_outline()
+    };
+    WindowEdge {
+        radius,
+        corners,
+        // No inset highlight. libadwaita traces one — `outline: 1px solid
+        // rgb(255 255 255/7%)` — but the windows we sit next to on this
+        // desktop do not: gnome-terminal's edge is the dark ring and nothing
+        // else, and measured against it ours read as glassy piping, a bright
+        // line curving round the corner where theirs has a deep one. The
+        // ring carries the edge on its own.
+        highlight: 0.0,
+        outline,
+        corner_shadow,
+    }
+}
+
 /// Per-window GPU state, valid only once the window (and surface) exist. The frame
 /// production itself lives in [`Target`] (shared with the headless harness); this
 /// just owns the window, the surface target, and the per-window render state.
@@ -2081,50 +2148,19 @@ impl Graphics {
     ///
     /// Only a translucent surface has a corner to cut: an opaque one's alpha never
     /// reaches the compositor, and zeroing it would paint the corners black rather than
-    /// clear. A maximized or fullscreen window has no outside corner at all, and GNOME
-    /// drops its own rounding and outline there too. (A half-tiled window should square
-    /// off as well, but winit reports no tiling state, so it keeps its curve for now.)
+    /// clear. A window with no free outside corner — maximized, fullscreen, or tiled
+    /// against a screen edge or a neighbour — squares off and drops its outline, as
+    /// GNOME does with its own.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn window_edge(window: &Window, opaque: bool, focused: bool) -> WindowEdge {
-        // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
-        // its titlebar starts — and, once we draw the whole frame, the radius the
-        // windows beside us on this desktop wear.
-        const RADIUS: f32 = 10.0;
-        let boxed_in = window.is_maximized() || window.fullscreen().is_some();
-        let radius = if opaque || boxed_in { 0.0 } else { RADIUS };
-        let corners = if radius <= 0.0 {
-            ghost_renderer::Corners::NONE
-        } else if window.is_decorated() {
-            ghost_renderer::Corners::default()
-        } else {
-            ghost_renderer::Corners::ALL
-        };
-        // Rounding a corner cuts a notch out of the window that the frame's own
-        // subsurfaces cannot reach into, so we finish its shadow ourselves —
-        // sampled from the frame, at the depth this radius opens up.
-        let reach = radius * (std::f32::consts::SQRT_2 - 1.0);
-        let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
-        for (i, a) in corner_shadow.iter_mut().enumerate() {
-            let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-            *a = sctk_adwaita::shadow::bottom_corner_alpha(d, focused);
-        }
-        // The dark ring the frame draws around the window, which stops short of
-        // the corners we round — read from the same theme the frame uses so the
-        // line we carry on with is the line it drew.
-        let outline = if boxed_in { 0.0 } else { Self::frame_outline() };
-        WindowEdge {
-            radius,
-            corners,
-            // No inset highlight. libadwaita traces one — `outline: 1px solid
-            // rgb(255 255 255/7%)` — but the windows we sit next to on this
-            // desktop do not: gnome-terminal's edge is the dark ring and nothing
-            // else, and measured against it ours read as glassy piping, a bright
-            // line curving round the corner where theirs has a deep one. The
-            // ring carries the edge on its own.
-            highlight: 0.0,
-            outline,
-            corner_shadow,
-        }
+        use winit::platform::wayland::WindowExtWayland;
+        window_edge_for(EdgeState {
+            opaque,
+            focused,
+            // A half-snapped window is tiled but NOT maximized, so both are asked.
+            boxed_in: window.is_maximized() || window.fullscreen().is_some() || window.is_tiled(),
+            own_frame: !window.is_decorated(),
+        })
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -6674,6 +6710,8 @@ mod tests {
         password_prompt, remote_spawn_target, respawn_opts, restore_plan, should_restore,
         startup_choice, theme_colors,
     };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    use super::{EdgeState, window_edge_for};
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
@@ -6683,6 +6721,66 @@ mod tests {
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_tiled_window_squares_off_like_a_maximized_one() {
+        // A half-snapped window meets the screen edge and its neighbour along
+        // three sides: rounding there cuts a see-through wedge into a corner
+        // that has nothing behind it, and the outline traces an edge that isn't
+        // one. GNOME squares off its own windows when they tile, and a snapped
+        // window is tiled WITHOUT being maximized — so asking `is_maximized`
+        // alone leaves ours curved against the wall.
+        let floating = window_edge_for(EdgeState {
+            opaque: false,
+            focused: true,
+            boxed_in: false,
+            own_frame: false,
+        });
+        let tiled = window_edge_for(EdgeState {
+            opaque: false,
+            focused: true,
+            boxed_in: true,
+            own_frame: false,
+        });
+        assert!(floating.radius > 0.0, "a floating window keeps its curve");
+        assert_eq!(tiled.radius, 0.0, "a tiled window has no corner to round");
+        assert_eq!(tiled.corners, ghost_renderer::Corners::NONE);
+        assert_eq!(tiled.outline, 0.0, "nor an outside edge to outline");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn only_our_own_frame_rounds_the_top_corners() {
+        // The frame above us rounds its own top corners; cutting there too takes
+        // a bite out of its curve. Without it the whole edge is ours.
+        let edge = |own_frame| {
+            window_edge_for(EdgeState {
+                opaque: false,
+                focused: true,
+                boxed_in: false,
+                own_frame,
+            })
+            .corners
+        };
+        assert_eq!(edge(false), ghost_renderer::Corners::default());
+        assert_eq!(edge(true), ghost_renderer::Corners::ALL);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_opaque_window_cuts_no_corners_at_all() {
+        // An opaque surface's alpha never reaches the compositor, so cutting a
+        // corner paints it black instead of clear.
+        let edge = window_edge_for(EdgeState {
+            opaque: true,
+            focused: true,
+            boxed_in: false,
+            own_frame: true,
+        });
+        assert_eq!(edge.radius, 0.0);
+        assert_eq!(edge.corners, ghost_renderer::Corners::NONE);
+    }
 
     /// Run `f` with `$XDG_*` redirected to a throwaway dir, serialized against
     /// other App tests (the env is process-global). So the shell's disk writes

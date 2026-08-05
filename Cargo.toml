@@ -32,7 +32,7 @@ license = "MIT OR Apache-2.0"
 inherits = "release"
 debug = true
 
-# Vendored winit 0.30.13 carrying two local patches, each to be reported
+# Vendored winit 0.30.13 carrying four local patches, each to be reported
 # upstream and then dropped:
 # - `is_stateless()` recognises partially-tiled / snapped windows so the window
 #   restores to its pre-snap size on Wayland/GNOME — see
@@ -46,6 +46,12 @@ debug = true
 #   otherwise) plus `WindowExtWayland::blur_supported`, so a client can tell
 #   whether its blur request was actually honoured and draw its own fallback
 #   glass when it wasn't — see vendor/winit/.../wayland/types/background_effect.rs.
+# - The xdg tiled state was consumed internally and never surfaced, so a client
+#   could not tell a snapped window from a floating one — and a window that
+#   rounds its corners, casts a shadow or offers resize handles has to drop all
+#   three where it is tiled, exactly as when maximized (which a snapped window
+#   is not). Added `WindowExtWayland::is_tiled` — see
+#   vendor/winit/.../wayland/window/mod.rs.
 #
 # Vendored wgpu-core 29.0.3 carrying one local patch, to be reported upstream
 # and then dropped:
