@@ -297,6 +297,73 @@ mod tests {
     }
 
     #[test]
+    fn the_sides_leave_the_top_corners_to_the_header() {
+        // The header carries the shadow for its own two rounded corners, and it
+        // is a subsurface above these — so a side part that also painted the
+        // column under the header's corner would have its shadow composited on
+        // top of the header's, drawing a hard line up out of the corner.
+        let window = (400, 300);
+        for (part, x, side) in [
+            (DecorationParts::LEFT, theme::BORDER_SIZE - 1, "left"),
+            (DecorationParts::RIGHT, 0, "right"),
+        ] {
+            let alphas = column(part, window, x);
+            // Only the corner rows: below them the header's own border column is
+            // opaque, so whatever a side part draws there never shows.
+            for (y, alpha) in alphas.iter().enumerate().take(theme::CORNER_RADIUS as usize) {
+                assert_eq!(
+                    *alpha, 0,
+                    "the {side} side drew {alpha} into the header's corner at row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_row_under_the_visible_border_is_shadowed_all_the_way_across() {
+        // The mirror of the side parts' column: the bottom part's visible border
+        // is its *first* row, so its shadow has to start there rather than a row
+        // in. Miss it and the line along the bottom is lighter than the ones down
+        // the sides — and lighter still than the corners, which do cover it, so
+        // the join reads as a grey spur poking out of each curve.
+        let width = 400 + 2 * theme::BORDER_SIZE;
+        let mut bottom = Pixmap::new(width, theme::BORDER_SIZE).expect("a valid pixmap size");
+        RenderedShadow::new(1, true).draw(&mut bottom.as_mut(), 1, DecorationParts::BOTTOM);
+
+        let alpha = |x: u32, y: u32| {
+            u32::from(
+                bottom
+                    .pixel(x, y)
+                    .expect("a pixel in the bottom part")
+                    .alpha(),
+            )
+        };
+
+        // It is the deepest row of all, being the closest to the window...
+        for x in [width / 3, width / 2, 2 * width / 3] {
+            assert!(alpha(x, 0) > 0 && alpha(x, 0) >= alpha(x, 1), "at {x}");
+        }
+
+        // ...and it deepens all the way in from the corner and holds, with no
+        // step or bump where the corner's own stretch of it hands over to the
+        // straight run — a bump there is a grey spur poking out of the curve.
+        for x in 0..width / 2 {
+            let (here, next) = (alpha(x, 0), alpha(x + 1, 0));
+            assert!(
+                next >= here,
+                "the border row's shadow shallows from {here} to {next} at x = {x}"
+            );
+        }
+        for x in width / 2..width - 1 {
+            let (here, next) = (alpha(x, 0), alpha(x + 1, 0));
+            assert!(
+                next <= here,
+                "the border row's shadow deepens from {here} to {next} at x = {x}"
+            );
+        }
+    }
+
+    #[test]
     fn the_drawn_parts_carry_the_offset_the_profile_describes() {
         // The profile above knows the shadow leans downward; this is the part
         // that has to lay the right strip against the right edge of the window.
@@ -322,6 +389,38 @@ mod tests {
             u32::from(below) > u32::from(above) * 3 / 2,
             "the shadow under the window ({below}) should be far deeper than over it ({above})"
         );
+    }
+
+    #[test]
+    fn the_bottom_corner_shadow_lands_on_the_corner_the_client_rounds() {
+        // The client rounds its bottom corners by `CORNER_RADIUS`, and this
+        // shadow has to be the shadow of *that* shape: the two meet along the
+        // window's own edge, and a corner drawn a pixel out of place puts a
+        // visible step in the shading right where they join.
+        let (w, h) = (400u32, 300u32);
+        let part_height = h + theme::HEADER_SIZE;
+        #[allow(clippy::unwrap_used)]
+        let mut pixmap = Pixmap::new(theme::BORDER_SIZE, part_height).unwrap();
+        RenderedShadow::new(1, true).draw(&mut pixmap.as_mut(), 1, DecorationParts::LEFT);
+
+        // In this part's pixels the window's left edge is `BORDER_SIZE` and its
+        // last row is `part_height - 1`, so the corner's centre sits here:
+        let r = theme::CORNER_RADIUS as f32;
+        let (cx, cy) = (theme::BORDER_SIZE as f32 + r, part_height as f32 - r);
+
+        for y in (part_height - theme::CORNER_RADIUS)..part_height {
+            let x = theme::BORDER_SIZE - 1;
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let reach = (dx * dx + dy * dy).sqrt();
+            let want = shadow(reach - r, dy / reach, 1, true);
+            #[allow(clippy::unwrap_used)]
+            let got = pixmap.pixel(x, y).unwrap().alpha() as f32 / 255.0;
+            assert!(
+                (got - want).abs() < 0.04,
+                "at row {y} the corner casts {got}, the rounded shape casts {want}",
+            );
+        }
+        let _ = w;
     }
 
     #[test]
@@ -577,7 +676,17 @@ impl RenderedShadow {
                     .saturating_sub(top_edge_height)
                     .saturating_sub(bottom_edge_height);
 
-                self.edges_draw(0, shadow_size as isize, dst_pixmap, 0, 0, dst_width, top_edge_height);
+                // Short of the border column: the header's own corner shadow
+                // covers it, from a subsurface above this one.
+                self.edges_draw(
+                    0,
+                    shadow_size as isize,
+                    dst_pixmap,
+                    0,
+                    0,
+                    dst_width.saturating_sub(visible_border_size),
+                    top_edge_height,
+                );
 
                 // Starting a column in means the strip's own first sample — the
                 // deepest one — lands on the border column instead of beside it.
@@ -613,7 +722,16 @@ impl RenderedShadow {
                 let src_x = edges_half as isize + corner_radius as isize
                     - visible_border_size as isize;
 
-                self.edges_draw(src_x, shadow_size as isize, dst_pixmap, 0, 0, dst_width, top_edge_height);
+                // Short of the border column, as on the left.
+                self.edges_draw(
+                    edges_half as isize + corner_radius as isize,
+                    shadow_size as isize,
+                    dst_pixmap,
+                    visible_border_size,
+                    0,
+                    dst_width.saturating_sub(visible_border_size),
+                    top_edge_height,
+                );
 
                 self.side_draw(&self.side, false, false, side_height, dst_pixmap, 0, top_edge_height);
 
@@ -636,7 +754,7 @@ impl RenderedShadow {
 
                 self.edges_draw(
                     0,
-                    edges_half as isize + (corner_radius - visible_border_size) as isize,
+                    edges_half as isize + corner_radius as isize,
                     dst_pixmap,
                     0,
                     0,
@@ -644,6 +762,9 @@ impl RenderedShadow {
                     dst_height,
                 );
 
+                // From the very first row, the same way the sides start on their
+                // own border column: down here that border is the part's first
+                // row, and its deepest sample belongs on it.
                 self.side_draw(
                     &self.bottom,
                     false,
@@ -651,12 +772,12 @@ impl RenderedShadow {
                     side_width,
                     dst_pixmap,
                     left_edge_width,
-                    visible_border_size,
+                    0,
                 );
 
                 self.edges_draw(
                     edges_half as isize,
-                    edges_half as isize + (corner_radius - visible_border_size) as isize,
+                    edges_half as isize + corner_radius as isize,
                     dst_pixmap,
                     left_edge_width + side_width,
                     0,
@@ -766,3 +887,4 @@ impl Shadow {
         cache.as_ref().unwrap().draw(pixmap);
     }
 }
+
