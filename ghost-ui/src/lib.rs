@@ -1993,6 +1993,10 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
         // own decorations there is nothing out there to draw on — so the ring
         // moves inside, where it still traces the same edge.
         outline_inside: state.own_frame,
+        // No room outside the window yet, so nothing to cast into — the shell
+        // does not ask winit for decoration margins.
+        margins: ghost_renderer::EdgeMargins::default(),
+        shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         corner_shadow,
     }
 }

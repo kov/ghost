@@ -798,6 +798,22 @@ pub struct WindowEdge {
     /// drop-shadow work) the only pixels we have are our own, so the line goes
     /// inside them.
     pub outline_inside: bool,
+    /// Logical pixels of surface lying *outside* the window on each side, which
+    /// the window's shape is inset by and its shadow cast into.
+    ///
+    /// An undecorated window can be given room around itself
+    /// (`WindowExtWayland::set_decoration_margins`): the surface grows and the
+    /// compositor is told the smaller inner rect is the window. Everything here
+    /// then traces that inner rect rather than the surface, and [`shadow`] fills
+    /// the ring left over.
+    ///
+    /// [`shadow`]: Self::shadow
+    pub margins: EdgeMargins,
+    /// The window's drop shadow, across the margin: [`EDGE_SHADOW_STEPS`] alphas
+    /// evenly spaced from the window's edge out to the far side of the margin.
+    /// All zero draws none, which is what a window with no margin to cast into
+    /// must have.
+    pub shadow: [f32; EDGE_SHADOW_STEPS],
     /// The window's own drop shadow, sampled across the notch that rounding a
     /// corner opens: [`EDGE_SHADOW_STEPS`] alphas evenly spaced from the arc out
     /// to the square corner it cuts away, i.e. over `radius * (sqrt(2) - 1)`
@@ -810,6 +826,38 @@ pub struct WindowEdge {
     /// samples it from whatever actually draws the frame so the two agree (and
     /// track the window's focus, which the shadow follows).
     pub corner_shadow: [f32; EDGE_SHADOW_STEPS],
+}
+
+/// Logical pixels of surface outside the window on each side — see
+/// [`WindowEdge::margins`]. All zero (the default) means the surface is the
+/// window, with nothing around it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EdgeMargins {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl EdgeMargins {
+    /// Uniform on every side.
+    pub fn all(m: f32) -> Self {
+        EdgeMargins {
+            top: m,
+            right: m,
+            bottom: m,
+            left: m,
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        self.top <= 0.0 && self.right <= 0.0 && self.bottom <= 0.0 && self.left <= 0.0
+    }
+
+    /// The deepest of the four — how far a shadow has to reach to fill them.
+    fn deepest(&self) -> f32 {
+        self.top.max(self.right).max(self.bottom).max(self.left)
+    }
 }
 
 /// Which end of the window we round, and so which end of it we own.
@@ -893,10 +941,21 @@ struct EdgeUniforms {
     round_bottom: f32,
     /// [`WindowEdge::outline_inside`], as a 0/1 flag.
     outline_inside: f32,
-    /// Pads `shadow` back onto the 16-byte stride a uniform array needs.
+    /// WGSL aligns the `vec2` below to 8 bytes, which leaves a hole here.
+    _pad0: f32,
+    /// Top-left of the window rect within the surface, in device pixels —
+    /// [`WindowEdge::margins`]. `viewport` is the window's size, not the
+    /// surface's, so everything the shader measures is relative to this.
+    origin: [f32; 2],
+    /// How far [`margin_shadow`] reaches out from the window's edge: the
+    /// deepest margin, in device pixels. 0 casts none.
+    shadow_reach: f32,
+    /// Pads the arrays back onto the 16-byte stride a uniform array needs.
     _pad: f32,
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
+    /// [`WindowEdge::shadow`], likewise.
+    margin_shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
 
 /// Stands in when no platform fallback was installed: chrome text then draws
@@ -927,8 +986,11 @@ struct EdgeU {
     round_top: f32,
     round_bottom: f32,
     outline_inside: f32,
+    origin: vec2<f32>,
+    shadow_reach: f32,
     pad: f32,
     shadow: array<vec4<f32>, 2>,
+    margin_shadow: array<vec4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
 
@@ -974,7 +1036,7 @@ fn edge_distance(p: vec2<f32>) -> f32 {
 // alone would leave a bright fringe).
 @fragment
 fn cut(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let c = clamp(edge_distance(pos.xy) + 0.5, 0.0, 1.0);
+    let c = clamp(edge_distance(pos.xy - u.origin) + 0.5, 0.0, 1.0);
     return vec4<f32>(c, c, c, c);
 }
 
@@ -982,7 +1044,7 @@ fn cut(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 // follows the corner arc round instead of running off it.
 @fragment
 fn hairline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let d = edge_distance(pos.xy);
+    let d = edge_distance(pos.xy - u.origin);
     let inside = clamp(d + 0.5, 0.0, 1.0);
     let a = u.highlight * clamp(u.band - d + 0.5, 0.0, 1.0) * inside;
     return vec4<f32>(a, a, a, a);
@@ -1000,13 +1062,36 @@ fn notch_shadow(t: f32) -> f32 {
     return mix(lo, hi, pos - floor(pos));
 }
 
+// The same read, against the profile cast across the margin.
+fn margin_shadow_at(t: f32) -> f32 {
+    let steps = 8.0;
+    let pos = clamp(t, 0.0, 1.0) * (steps - 1.0);
+    let i = u32(floor(pos));
+    let j = min(i + 1u, u32(steps) - 1u);
+    let lo = u.margin_shadow[i / 4u][i % 4u];
+    let hi = u.margin_shadow[j / 4u][j % 4u];
+    return mix(lo, hi, pos - floor(pos));
+}
+
+// Premultiplied black, source-over: the window's drop shadow, cast into the
+// margin around it. Only outside the shape — inside is the window's own, and
+// the arcs hand the boundary pixel over gradually so the shadow meets the curve
+// instead of stepping off it.
+@fragment
+fn margin_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let d = edge_distance(pos.xy - u.origin);
+    let outside = clamp(0.5 - d, 0.0, 1.0);
+    let a = margin_shadow_at(-d / max(u.shadow_reach, 0.0001)) * outside;
+    return vec4<f32>(0.0, 0.0, 0.0, a);
+}
+
 // Premultiplied black, added into the notch the cut opened: the shadow the
 // decorations would cast here if they could reach. Runs after the cut, which
 // left each pixel holding only the window's own share of it, and takes what the
 // window and the outline between them have not claimed.
 @fragment
 fn corner_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let d = edge_distance(pos.xy);
+    let d = edge_distance(pos.xy - u.origin);
     let outside = clamp(0.5 - d, 0.0, 1.0);
     let a = notch_shadow(-d / max(u.notch, 0.0001))
         * clamp(outside - u.outline * outline_ring(d), 0.0, 1.0);
@@ -1028,7 +1113,7 @@ fn outline_ring(d: f32) -> f32 {
 // the frame's straight border stops short of.
 @fragment
 fn corner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let a = u.outline * outline_ring(edge_distance(pos.xy));
+    let a = u.outline * outline_ring(edge_distance(pos.xy - u.origin));
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 
@@ -1045,7 +1130,7 @@ fn inner_ring(d: f32) -> f32 {
 // translucent one. Darkening them is the whole point.
 @fragment
 fn inner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let a = u.outline * inner_ring(edge_distance(pos.xy));
+    let a = u.outline * inner_ring(edge_distance(pos.xy - u.origin));
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 "#;
@@ -1637,6 +1722,7 @@ pub struct Renderer {
     edge_shadow_pipeline: wgpu::RenderPipeline,
     edge_outline_pipeline: wgpu::RenderPipeline,
     edge_inner_outline_pipeline: wgpu::RenderPipeline,
+    edge_margin_shadow_pipeline: wgpu::RenderPipeline,
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
     /// The face window chrome draws its text in — the desktop's UI font, not the
@@ -2402,6 +2488,12 @@ impl Renderer {
             "inner_outline",
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
         );
+        // The margin shadow lands on empty surface rather than on a pixel it
+        // shares with the window, so it composites normally too.
+        let edge_margin_shadow_pipeline = edge_pipeline(
+            "margin_shadow",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
 
         Renderer {
             gpu,
@@ -2417,6 +2509,7 @@ impl Renderer {
             edge_shadow_pipeline,
             edge_outline_pipeline,
             edge_inner_outline_pipeline,
+            edge_margin_shadow_pipeline,
             edge_bind_group,
             edge_uniform_buf,
             chrome_font: None,
@@ -4837,7 +4930,18 @@ impl Renderer {
         if edge.is_none() || surf.0 == 0 || surf.1 == 0 {
             return;
         }
-        let (w, h) = (surf.0, surf.1);
+        // The margins are surface the window does not occupy: everything below
+        // measures the WINDOW, at `origin` inside the surface, and the ring left
+        // over is where the shadow goes.
+        let px = |m: f32| (m * self.scale_factor).max(0.0).round() as u32;
+        let (ml, mt) = (px(edge.margins.left), px(edge.margins.top));
+        let (mr, mb) = (px(edge.margins.right), px(edge.margins.bottom));
+        // A surface smaller than its own margins is one mid-resize; it still has
+        // to name a window, so the window bottoms out at a pixel.
+        let (w, h) = (
+            surf.0.saturating_sub(ml + mr).max(1),
+            surf.1.saturating_sub(mt + mb).max(1),
+        );
         let radius = (edge.radius * self.scale_factor).max(0.0);
         let band = EDGE_HIGHLIGHT_WIDTH * self.scale_factor;
         // The notch is the gap between the arc and the corner it replaces.
@@ -4846,8 +4950,15 @@ impl Renderer {
         for (i, a) in edge.corner_shadow.iter().enumerate() {
             shadow[i / 4][i % 4] = *a;
         }
+        let mut margin_shadow = [[0.0f32; 4]; EDGE_SHADOW_STEPS / 4];
+        for (i, a) in edge.shadow.iter().enumerate() {
+            margin_shadow[i / 4][i % 4] = *a;
+        }
         let uniforms = EdgeUniforms {
             viewport: [w as f32, h as f32],
+            origin: [ml as f32, mt as f32],
+            shadow_reach: (edge.margins.deepest() * self.scale_factor).max(0.0),
+            margin_shadow,
             radius,
             highlight: edge.highlight.clamp(0.0, 1.0),
             band,
@@ -4857,6 +4968,7 @@ impl Renderer {
             round_top: f32::from(u8::from(edge.corners.top)),
             round_bottom: f32::from(u8::from(edge.corners.bottom)),
             outline_inside: f32::from(u8::from(edge.outline_inside)),
+            _pad0: 0.0,
             _pad: 0.0,
             shadow,
         };
@@ -4904,6 +5016,48 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.edge_bind_group, &[]);
+            // Every rect below is stated in the window's own coordinates; this
+            // is the one place they become the surface's.
+            let scissor = |pass: &mut wgpu::RenderPass<'_>,
+                           (x, y, rw, rh): (u32, u32, u32, u32)| {
+                if rw > 0 && rh > 0 {
+                    pass.set_scissor_rect(x + ml, y + mt, rw, rh);
+                    pass.draw(0..3, 0..1);
+                }
+            };
+            // The margin is surface the window does not occupy, and the scene
+            // filled it like everything else — so clear it, then cast the shadow
+            // into what it leaves. Both run before the corner passes below,
+            // which are scissored inside the window and cannot reach out here.
+            if !edge.margins.is_none() {
+                let ring = [
+                    // Top and bottom bands run the full surface width; the side
+                    // ones fill in between, so no pixel is drawn twice.
+                    (0, 0, surf.0, mt),
+                    (0, surf.1.saturating_sub(mb), surf.0, mb),
+                    (0, mt, ml, surf.1.saturating_sub(mt + mb)),
+                    (
+                        surf.0.saturating_sub(mr),
+                        mt,
+                        mr,
+                        surf.1.saturating_sub(mt + mb),
+                    ),
+                ];
+                let ring_pass = |pass: &mut wgpu::RenderPass<'_>| {
+                    for &(x, y, rw, rh) in &ring {
+                        if rw > 0 && rh > 0 {
+                            pass.set_scissor_rect(x, y, rw, rh);
+                            pass.draw(0..3, 0..1);
+                        }
+                    }
+                };
+                pass.set_pipeline(&self.edge_cut_pipeline);
+                ring_pass(&mut pass);
+                if edge.shadow.iter().any(|a| *a > 0.0) {
+                    pass.set_pipeline(&self.edge_margin_shadow_pipeline);
+                    ring_pass(&mut pass);
+                }
+            }
             if edge.highlight > 0.0 {
                 pass.set_pipeline(&self.edge_hairline_pipeline);
                 for rect in [
@@ -4912,10 +5066,7 @@ impl Renderer {
                     (0, h - bottom, w, bottom),
                     (0, 0, w, top),
                 ] {
-                    if rect.2 > 0 && rect.3 > 0 {
-                        pass.set_scissor_rect(rect.0, rect.1, rect.2, rect.3);
-                        pass.draw(0..3, 0..1);
-                    }
+                    scissor(&mut pass, rect);
                 }
             }
             // Our own border, when there is no frame outside the window to draw
@@ -4931,10 +5082,7 @@ impl Renderer {
                     (0, h - bottom, w, bottom),
                     (0, 0, w, top),
                 ] {
-                    if rect.2 > 0 && rect.3 > 0 {
-                        pass.set_scissor_rect(rect.0, rect.1, rect.2, rect.3);
-                        pass.draw(0..3, 0..1);
-                    }
+                    scissor(&mut pass, rect);
                 }
             }
             // Last, so the hairline is cut back to the arc along with everything
@@ -4954,14 +5102,22 @@ impl Renderer {
                 let squares = &squares[..n];
                 let draw = |pass: &mut wgpu::RenderPass<'_>| {
                     for &(x, y) in squares {
-                        pass.set_scissor_rect(x, y, r, r);
-                        pass.draw(0..3, 0..1);
+                        scissor(pass, (x, y, r, r));
                     }
                 };
                 pass.set_pipeline(&self.edge_cut_pipeline);
                 draw(&mut pass);
-                // Into the emptied notch, the shadow the frame cannot reach —
-                // when a frame is casting one at all.
+                // Rounding a corner opens a notch *inside* the window rect, which
+                // the margin ring does not cover — but it is outside the shape
+                // just the same, so the same shadow belongs in it. Without this
+                // the shadow follows the arc round and then stops dead, leaving a
+                // clear wedge between the curve and the corner it replaced.
+                if !edge.margins.is_none() && edge.shadow.iter().any(|a| *a > 0.0) {
+                    pass.set_pipeline(&self.edge_margin_shadow_pipeline);
+                    draw(&mut pass);
+                }
+                // The same job for a window whose frame draws the shadow outside
+                // it and cannot reach in — no margin of our own to cast into.
                 if edge.casts_corner_shadow() {
                     pass.set_pipeline(&self.edge_shadow_pipeline);
                     draw(&mut pass);
@@ -7171,6 +7327,8 @@ mod tests {
             highlight: 0.0,
             outline: 0.75,
             outline_inside: false,
+            margins: EdgeMargins::default(),
+            shadow: [0.0; EDGE_SHADOW_STEPS],
             corner_shadow: [shadow; EDGE_SHADOW_STEPS],
         };
         r.set_window_edge(edge(0.31));
