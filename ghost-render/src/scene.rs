@@ -52,6 +52,8 @@ pub enum SceneId {
     NavBar,
     /// An attach-state section header, keyed by locality rank.
     Section(u8),
+    /// The window's own titlebar, when ghost draws the decorations.
+    Titlebar,
 }
 
 /// A per-tile indicator.

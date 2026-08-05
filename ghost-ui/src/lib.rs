@@ -2017,9 +2017,17 @@ impl Graphics {
         // (`grid_from_pixels` divides physical px by cell·scale), which a physical size
         // would only get right at 1x.
         let m = metrics();
+        // Our own titlebar eats into the window rather than sitting above it (the
+        // desktop's frame is drawn outside), so the window has to open that much
+        // taller or the configured grid arrives one bar short.
+        let bar = if decorations == config::Decorations::Ghost {
+            f64::from(ghost_ui_core::frame::BAR_HEIGHT)
+        } else {
+            0.0
+        };
         let size = LogicalSize::new(
             f64::from(cols) * f64::from(m.advance) + 2.0 * f64::from(pad),
-            f64::from(rows) * f64::from(m.line_height) + 2.0 * f64::from(pad),
+            f64::from(rows) * f64::from(m.line_height) + 2.0 * f64::from(pad) + bar,
         );
         // Request a transparent window only when the theme is translucent, so an
         // opaque setup never pays the compositor's alpha-blending cost.
@@ -2201,6 +2209,34 @@ impl Graphics {
                 .outer_border
                 .alpha()
         })
+    }
+
+    /// Our titlebar's height in physical pixels, or 0 when the desktop draws the
+    /// frame. Every place the bar shifts something — the model's size, the scene,
+    /// the pointer, the IME box — takes it from here, so they cannot drift apart.
+    fn bar_px(&self) -> u32 {
+        ghost_ui_core::frame::bar_height_px(
+            !self.window.is_decorated(),
+            self.window.scale_factor() as f32,
+        )
+    }
+
+    /// The titlebar's background, read from the same desktop theme the CSD frame
+    /// we are replacing uses — so a ghost-framed window sits alongside the rest of
+    /// the desktop rather than beside it. Asked once, for the reason
+    /// [`frame_outline`](Self::frame_outline) explains.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn titlebar_color(&self) -> ghost_render::scene::Rgba {
+        static BG: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
+        *BG.get_or_init(|| {
+            let c = sctk_adwaita::theme::ColorTheme::auto().active.headerbar;
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn titlebar_color(&self) -> ghost_render::scene::Rgba {
+        [0.0, 0.0, 0.0, 1.0]
     }
 
     /// Re-decide the window edge after something it depends on moved: the window
@@ -3922,6 +3958,20 @@ impl App {
         edge.is_some()
     }
 
+    /// A window-space pointer position in the model's space — the window less our
+    /// titlebar. `None` when the pointer is on the bar itself, which is chrome: the
+    /// model has no coordinate for it, and letting one through as a negative row
+    /// would land the click on the terminal's first line.
+    fn in_content(&self, id: WindowId, pos: PointPx) -> Option<PointPx> {
+        let bar = self
+            .windows
+            .get(&id)
+            .and_then(|w| w.gfx.as_ref())
+            .map_or(0, |g| g.bar_px());
+        let y = pos.y - f64::from(bar);
+        (y >= 0.0).then_some(PointPx { x: pos.x, y })
+    }
+
     /// Timestamp user input on a window's render trace — the "kick" label that lets a
     /// recovered-stall report say whether a present self-recovered or needed an input
     /// (a scroll). Gated so a normal run does nothing.
@@ -5068,7 +5118,11 @@ impl App {
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
-                            let scene = w.root.view(&self.states);
+                            let scene = ghost_ui_core::frame::with_titlebar(
+                                w.root.view(&self.states),
+                                gfx.bar_px(),
+                                gfx.titlebar_color(),
+                            );
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
                         }
@@ -5098,11 +5152,18 @@ impl App {
                     event_loop,
                 );
             }
+            // The model lays out under our titlebar, so it is sized to the window
+            // less the bar — the one place the inset enters the model's world.
+            let bar = self
+                .windows
+                .get(&wid)
+                .and_then(|w| w.gfx.as_ref())
+                .map_or(0, |g| g.bar_px());
             self.dispatch(
                 wid,
                 UiEvent::Resize {
                     w_px: cw,
-                    h_px: ch,
+                    h_px: ch.saturating_sub(bar).max(1),
                     scale: cs,
                 },
                 event_loop,
@@ -5139,6 +5200,10 @@ impl App {
         let blur_supported = gfx
             .as_ref()
             .is_some_and(|g| backdrop_blur_supported(&g.window));
+        // Everything below sizes the MODEL, which lays out under our titlebar.
+        let h = h
+            .saturating_sub(gfx.as_ref().map_or(0, |g| g.bar_px()))
+            .max(1);
         let (mut root, states, init) = RootModel::fleet(metrics(), (w, h), scale as f32);
         // A fresh fleet owns no session, so its minted registry is empty; fold it in
         // for symmetry and stamp the shared registry so later mints take this theme.
@@ -5595,6 +5660,10 @@ impl App {
         let blur_supported = gfx
             .as_ref()
             .is_some_and(|g| backdrop_blur_supported(&g.window));
+        // Everything below sizes the MODEL, which lays out under our titlebar.
+        let h = h
+            .saturating_sub(gfx.as_ref().map_or(0, |g| g.bar_px()))
+            .max(1);
         let (cols, rows) = grid_from_pixels(w, h, scale as f32, cfg.padding());
         // The window's group identity — reclaimed for a restored window, freshly
         // minted otherwise — so the very first attach reports the right group.
@@ -6042,6 +6111,14 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         let t_model = Instant::now();
                         let scene = win.root.view(&self.states);
+                        // The model laid out in the space under our titlebar; put
+                        // that space where it belongs and draw the bar above it.
+                        let bar_px = gfx.bar_px();
+                        let scene = ghost_ui_core::frame::with_titlebar(
+                            scene,
+                            bar_px,
+                            gfx.titlebar_color(),
+                        );
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
                         // loop: a mid-animation tile that needs a full raster blits the best
@@ -6055,7 +6132,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // Keep the IME candidate window pinned to the text cursor.
                         if let Some(a) = win.root.ime_cursor_area(&self.states) {
                             gfx.window.set_ime_cursor_area(
-                                PhysicalPosition::new(a.x, a.y),
+                                PhysicalPosition::new(a.x, a.y + bar_px as f32),
                                 PhysicalSize::new(a.w, a.h),
                             );
                         }
@@ -6281,6 +6358,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }) else {
                     return;
                 };
+                let Some(pos) = self.in_content(id, pos) else {
+                    return;
+                };
                 // Our own frame's resize edges lie inside the window, so they get
                 // first refusal on the pointer before the model sees it.
                 #[cfg(all(unix, not(target_os = "macos")))]
@@ -6331,6 +6411,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }) else {
                         return;
                     };
+                    let Some(pos) = self.in_content(id, pos) else {
+                        return;
+                    };
                     self.dispatch(
                         id,
                         UiEvent::Pointer {
@@ -6363,6 +6446,9 @@ impl ApplicationHandler<UserEvent> for App {
                     .get(&id)
                     .map(|w| (w.pointer_pos, from_winit::mods(w.mods)))
                 else {
+                    return;
+                };
+                let Some(pos) = self.in_content(id, pos) else {
                     return;
                 };
                 self.dispatch(
