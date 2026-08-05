@@ -2067,15 +2067,18 @@ impl Graphics {
             let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
             *a = sctk_adwaita::shadow::shadow_alpha(d, focused);
         }
+        // The dark ring the frame draws around the window, which stops short of
+        // the corners we round — read from the same theme the frame uses so the
+        // line we carry on with is the line it drew.
+        let outline = if boxed_in { 0.0 } else { Self::frame_outline() };
         WindowEdge {
             radius,
             // libadwaita traces its window edge with `outline: 1px solid
             // rgb(255 255 255/7%)`, and we run brighter than that on purpose: it
             // draws on an opaque window, ours is diluted by everything showing
-            // through a translucent one, and the frame's outer line no longer
-            // helps (it is libadwaita's near-invisible 5% black now, where it
-            // used to be an opaque grey). At 7% the edge read as nothing.
+            // through a translucent one.
             highlight: if boxed_in { 0.0 } else { 0.14 },
+            outline,
             corner_shadow,
         }
     }
@@ -2083,6 +2086,23 @@ impl Graphics {
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     fn window_edge(_window: &Window, _opaque: bool, _focused: bool) -> WindowEdge {
         WindowEdge::default()
+    }
+
+    /// Alpha of the frame's outer border, asked once.
+    ///
+    /// `ColorTheme::auto()` picks light or dark by *spawning `dbus-send`* and
+    /// waiting up to 100ms for the portal, so it must not be on the path of
+    /// something as ordinary as a resize. The frame reads it once for the same
+    /// reason, and does not follow a live light/dark switch either.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn frame_outline() -> f32 {
+        static OUTLINE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *OUTLINE.get_or_init(|| {
+            sctk_adwaita::theme::ColorTheme::auto()
+                .active
+                .outer_border
+                .alpha()
+        })
     }
 
     /// Re-decide the window edge after something it depends on moved: the window

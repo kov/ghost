@@ -776,6 +776,14 @@ pub struct WindowEdge {
     /// libadwaita's `outline: 1px solid rgb(255 255 255/7%)`. 0 draws none.
     /// The top edge is left clean: the titlebar sits against it.
     pub highlight: f32,
+    /// Alpha of the dark 1px ring that traces the *outside* of the window, drawn
+    /// just past the corner arcs. 0 draws none.
+    ///
+    /// The frame draws this ring everywhere it can, but it can only draw outside
+    /// the window rectangle — and around a rounded corner the ring falls inside
+    /// it, in the notch. So the frame stops a radius short of each bottom corner
+    /// and we carry the line round, at the alpha the frontend read off the frame.
+    pub outline: f32,
     /// The window's own drop shadow, sampled across the notch that rounding a
     /// corner opens: [`EDGE_SHADOW_STEPS`] alphas evenly spaced from the arc out
     /// to the square corner it cuts away, i.e. over `radius * (sqrt(2) - 1)`
@@ -817,7 +825,8 @@ struct EdgeUniforms {
     /// How deep the notch goes: `radius * (sqrt(2) - 1)`, the distance from the
     /// arc to the corner it replaces. The far end of `shadow`.
     notch: f32,
-    _pad: [f32; 2],
+    outline: f32,
+    _pad: f32,
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
@@ -835,7 +844,8 @@ struct EdgeU {
     highlight: f32,
     band: f32,
     notch: f32,
-    pad: vec2<f32>,
+    outline: f32,
+    pad: f32,
     shadow: array<vec4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
@@ -906,6 +916,18 @@ fn corner_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let d = edge_distance(pos.xy);
     let outside = clamp(0.5 - d, 0.0, 1.0);
     let a = notch_shadow(-d / max(u.notch, 0.0001)) * outside;
+    return vec4<f32>(0.0, 0.0, 0.0, a);
+}
+
+// Premultiplied black, source-over: the window's outer border, carried around the
+// arc the frame's straight border stops short of. One pixel wide, hugging the
+// outside of the shape — its coverage peaks half a pixel out and is gone by one
+// and a half, so it lands on exactly the pixels the cut emptied.
+@fragment
+fn corner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let d = edge_distance(pos.xy);
+    let ring = clamp(0.5 - d, 0.0, 1.0) * clamp(d + 1.5, 0.0, 1.0);
+    let a = u.outline * ring;
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 "#;
@@ -1495,6 +1517,7 @@ pub struct Renderer {
     edge_cut_pipeline: wgpu::RenderPipeline,
     edge_hairline_pipeline: wgpu::RenderPipeline,
     edge_shadow_pipeline: wgpu::RenderPipeline,
+    edge_outline_pipeline: wgpu::RenderPipeline,
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
     window_edge: WindowEdge,
@@ -2231,6 +2254,10 @@ impl Renderer {
             "corner_shadow",
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
         );
+        let edge_outline_pipeline = edge_pipeline(
+            "corner_outline",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
 
         Renderer {
             gpu,
@@ -2244,6 +2271,7 @@ impl Renderer {
             edge_cut_pipeline,
             edge_hairline_pipeline,
             edge_shadow_pipeline,
+            edge_outline_pipeline,
             edge_bind_group,
             edge_uniform_buf,
             window_edge: WindowEdge::default(),
@@ -4566,7 +4594,8 @@ impl Renderer {
             highlight: edge.highlight.clamp(0.0, 1.0),
             band,
             notch,
-            _pad: [0.0; 2],
+            outline: edge.outline.clamp(0.0, 1.0),
+            _pad: 0.0,
             shadow,
         };
         self.gpu
@@ -4634,6 +4663,15 @@ impl Renderer {
                 for x in corners {
                     pass.set_scissor_rect(x, h - r, r, r);
                     pass.draw(0..3, 0..1);
+                }
+                // And over that, the window's outer border, picked up where the
+                // frame's straight one left off.
+                if edge.outline > 0.0 {
+                    pass.set_pipeline(&self.edge_outline_pipeline);
+                    for x in corners {
+                        pass.set_scissor_rect(x, h - r, r, r);
+                        pass.draw(0..3, 0..1);
+                    }
                 }
             }
         }

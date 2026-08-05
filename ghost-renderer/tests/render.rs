@@ -1877,6 +1877,7 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.0,
+            outline: 0.0,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1925,12 +1926,65 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
 }
 
 #[test]
+fn the_outer_border_carries_on_around_the_bottom_corners() {
+    // The window wears a dark 1px ring, and the CSD frame draws it everywhere it
+    // can — but it can only draw *outside* the window rectangle, and around a
+    // rounded corner the ring falls inside it. So the frame stops a radius short
+    // of each bottom corner and we draw that stretch ourselves; otherwise the
+    // window's outline breaks exactly where it turns.
+    let (_, w, h) = edge_window();
+    let bare = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            highlight: 0.0,
+            outline: 0.0,
+            corner_shadow: frame_shadow(true),
+        },
+        0.5,
+    );
+    let ringed = edge_render(
+        ghost_renderer::WindowEdge {
+            radius: 10.0,
+            highlight: 0.0,
+            outline: 0.75,
+            corner_shadow: frame_shadow(true),
+        },
+        0.5,
+    );
+
+    // 45° out along each corner's diagonal, one pixel past the arc: (2.5, h-2.5)
+    // sits 10.6px from the circle's centre, so it is the ring's own pixel.
+    for (x, corner) in [(2, "bottom-left"), (w - 3, "bottom-right")] {
+        let (before, after) = (px(&bare, x, h - 3), px(&ringed, x, h - 3));
+        assert_eq!(&after[..3], &[0, 0, 0], "the ring is black");
+        assert!(
+            i32::from(after[3]) - i32::from(before[3]) > 120,
+            "the {corner} arc should carry the ring: {before:?} -> {after:?}"
+        );
+    }
+
+    // And it is a hairline: neither the pixel outside it nor the window inside it
+    // is touched.
+    for (x, y, place) in [
+        (1, h - 2, "outside the ring"),
+        (5, h - 6, "inside the window"),
+    ] {
+        assert_eq!(
+            px(&bare, x, y),
+            px(&ringed, x, y),
+            "the ring must not reach {place}"
+        );
+    }
+}
+
+#[test]
 fn a_square_window_keeps_its_corners() {
     let (_, w, h) = edge_window();
     let img = edge_render(
         ghost_renderer::WindowEdge {
             radius: 0.0,
             highlight: 0.0,
+            outline: 0.0,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1951,6 +2005,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.0,
+            outline: 0.0,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1959,6 +2014,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
         ghost_renderer::WindowEdge {
             radius: 10.0,
             highlight: 0.07,
+            outline: 0.0,
             corner_shadow: frame_shadow(true),
         },
         0.5,

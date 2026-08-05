@@ -37,6 +37,7 @@ impl ColorTheme {
                 button_hover: Color::from_rgba8(207, 207, 207, 255),
                 button_icon: Color::from_rgba8(42, 42, 42, 255),
                 border_color: Color::from_rgba8(220, 220, 220, 255),
+                outer_border: light_outer_border(),
                 font_color: Color::from_rgba8(47, 47, 47, 255),
             },
             inactive: ColorMap {
@@ -45,6 +46,7 @@ impl ColorTheme {
                 button_hover: Color::from_rgba8(216, 216, 216, 255),
                 button_icon: Color::from_rgba8(148, 148, 148, 255),
                 border_color: Color::from_rgba8(220, 220, 220, 255),
+                outer_border: light_outer_border(),
                 font_color: Color::from_rgba8(150, 150, 150, 255),
             },
         }
@@ -59,6 +61,7 @@ impl ColorTheme {
                 button_hover: Color::from_rgba8(79, 79, 79, 255),
                 button_icon: Color::from_rgba8(255, 255, 255, 255),
                 border_color: Color::from_rgba8(58, 58, 58, 255),
+                outer_border: dark_outer_border(),
                 font_color: Color::from_rgba8(255, 255, 255, 255),
             },
             inactive: ColorMap {
@@ -67,6 +70,7 @@ impl ColorTheme {
                 button_hover: Color::from_rgba8(57, 57, 57, 255),
                 button_icon: Color::from_rgba8(144, 144, 144, 255),
                 border_color: Color::from_rgba8(58, 58, 58, 255),
+                outer_border: dark_outer_border(),
                 font_color: Color::from_rgba8(144, 144, 144, 255),
             },
         }
@@ -95,6 +99,8 @@ pub struct ColorMap {
     pub button_hover: Color,
     pub button_icon: Color,
     pub border_color: Color,
+    /// The hairline that traces the outside of the whole window.
+    pub outer_border: Color,
     pub font_color: Color,
 }
 
@@ -136,19 +142,33 @@ impl ColorMap {
             ..Default::default()
         }
     }
+
+    /// Kept apart from [`ColorMap::border_paint`], which is the headerbar's
+    /// bottom separator — a different line with a different job.
+    pub(crate) fn outer_border_paint(&self) -> Paint {
+        Paint {
+            shader: Shader::SolidColor(self.outer_border),
+            anti_alias: true,
+            ..Default::default()
+        }
+    }
 }
 
-/// The hairline libadwaita draws around the outside of a window — the last layer
-/// of its `window.csd` box-shadow, `0 0 0 1px rgb(0 0 0/5%)`. It is the same in
-/// the light and dark stylesheets: what actually separates a window from its
-/// backdrop is the *inner* highlight (`outline: 1px solid rgb(255 255 255/7%)`),
-/// which falls on the client's own pixels, not on this frame's.
+/// The ring GTK's Adwaita draws around the outside of every window — the last
+/// layer of the `decoration` box-shadow, `0 0 0 1px rgba(0,0,0,0.75)` in the
+/// dark stylesheet and `rgba(0,0,0,0.23)` in the light one. Both were read out
+/// of the stylesheets compiled into `libgtk-3.so.0`, and the dark value matches
+/// a measured gnome-terminal edge (~0.73 over the wallpaper).
 ///
-/// Kept apart from [`ColorMap::border_color`], which is the headerbar's bottom
-/// separator — a different line with a different job.
-pub(crate) fn outer_border_paint() -> Paint<'static> {
-    Paint {
-        shader: Shader::SolidColor(Color::from_rgba8(0, 0, 0, 13)),
-        ..Default::default()
-    }
+/// libadwaita's own value is a far fainter `rgb(0 0 0/5%)`, but it can afford
+/// that: a GTK4 window is opaque, so its *fill* draws the edge and the ring only
+/// darkens the transition. ghost is translucent — with 5% there is nothing at
+/// the boundary at all, and the window's outline stops dead where the headerbar
+/// ends.
+fn dark_outer_border() -> Color {
+    Color::from_rgba8(0, 0, 0, 191)
+}
+
+fn light_outer_border() -> Color {
+    Color::from_rgba8(0, 0, 0, 59)
 }

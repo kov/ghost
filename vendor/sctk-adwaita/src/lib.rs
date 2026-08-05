@@ -292,52 +292,17 @@ where
                     );
                 }
                 border => {
-                    // The visible border is one pt.
-                    let visible_border_size = VISIBLE_BORDER_SIZE * scale;
-
-                    // XXX we do all the match using integral types and then convert to f32 in the
-                    // end to ensure that result is finite.
-                    let border_rect = match border {
-                        DecorationParts::LEFT => {
-                            let x = (rect.x.unsigned_abs() * scale) - visible_border_size;
-                            let y = rect.y.unsigned_abs() * scale;
-                            Rect::from_xywh(
-                                x as f32,
-                                y as f32,
-                                visible_border_size as f32,
-                                (rect.height - y) as f32,
-                            )
-                        }
-                        DecorationParts::RIGHT => {
-                            let y = rect.y.unsigned_abs() * scale;
-                            Rect::from_xywh(
-                                0.,
-                                y as f32,
-                                visible_border_size as f32,
-                                (rect.height - y) as f32,
-                            )
-                        }
-                        // We draw small visible border only bellow the window surface, no need to
-                        // handle `TOP`.
-                        DecorationParts::BOTTOM => {
-                            let x = (rect.x.unsigned_abs() * scale) - visible_border_size;
-                            Rect::from_xywh(
-                                x as f32,
-                                0.,
-                                (rect.width - 2 * x) as f32,
-                                visible_border_size as f32,
-                            )
-                        }
-                        _ => None,
-                    };
+                    let rounded = !self.state.intersects(WindowState::TILED);
+                    let border_rect = visible_border_rect(border, rect, scale, rounded);
 
                     // Fill the visible border, if present. It sits over the
-                    // shadow's outermost pixel and is nearly transparent, so the
-                    // window's outside edge reads as libadwaita's does.
+                    // shadow's outermost pixel and continues the ring the header
+                    // draws around itself, so the window has one outline from
+                    // top to bottom.
                     if let Some(border_rect) = border_rect {
                         pixmap.fill_rect(
                             border_rect,
-                            &theme::outer_border_paint(),
+                            &colors.outer_border_paint(),
                             Transform::identity(),
                             None,
                         );
@@ -695,10 +660,28 @@ fn draw_headerbar_bg(
         CORNER_RADIUS as f32 * scale
     };
 
+    // The header is drawn one visible border wider than the window on each side
+    // (see `redraw_inner`), so that ring of pixels is the header's share of the
+    // window's outer border. Lay the border down over the whole shape and let
+    // the headerbar fill cover all but that ring — this is the line the border
+    // parts continue straight down the sides of the window, and without it the
+    // window's outline would stop where the headerbar ends.
+    let ring = get_margin_h_lp(state) * scale;
+
     let bg = rounded_headerbar_shape(0., 0., w, h, radius)?;
 
     pixmap.fill_path(
         &bg,
+        &colors.outer_border_paint(),
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    let inner = rounded_headerbar_shape(ring, ring, w - 2. * ring, h - ring, radius - ring)?;
+
+    pixmap.fill_path(
+        &inner,
         &colors.headerbar_paint(),
         FillRule::Winding,
         Transform::identity(),
@@ -706,7 +689,7 @@ fn draw_headerbar_bg(
     );
 
     pixmap.fill_rect(
-        Rect::from_xywh(0., h - 1., w, h)?,
+        Rect::from_xywh(ring, h - 1., w - 2. * ring, 1.)?,
         &colors.border_paint(),
         Transform::identity(),
         None,
@@ -776,11 +759,266 @@ fn rounded_headerbar_shape(x: f32, y: f32, width: f32, height: f32, radius: f32)
     pb.finish()
 }
 
+/// How far short of a bottom corner a straight border has to stop, for a corner
+/// of `radius` device pixels.
+///
+/// Not the radius itself: this border runs one pixel *outside* the window, so it
+/// is a chord of the ring at radius + 1, and it stays straight for as long as
+/// that ring is still within half a pixel of the window's edge. Cutting it at the
+/// full radius instead leaves a visible nick at each end of the bottom edge,
+/// where neither this border nor the client's arc has drawn anything.
+fn corner_inset(radius: u32) -> u32 {
+    if radius == 0 {
+        return 0;
+    }
+    let r = radius as f32;
+    // The ring at r + 1 crosses the border's own centre line (half a pixel out)
+    // at sqrt(r + 0.75) along the edge.
+    (r - (r + 0.75).sqrt()).round().max(0.) as u32
+}
+
+/// The slice of the window's outer border this decoration part owns, in that
+/// part's own pixmap coordinates. `None` for parts with no border to draw.
+///
+/// `rect` is the part's surface rect with its *size* already scaled but its
+/// origin still in logical points, as `redraw_inner` leaves it.
+///
+/// `rounded` stops the sides and the bottom [`CORNER_RADIUS`] short of the
+/// window's bottom corners, matching the radius the header rounds its top ones
+/// by. The client rounds those corners on its own pixels, and the arc's share of
+/// the border has to be drawn there too: the notch outside the arc falls
+/// *inside* the window rectangle, where no decoration subsurface reaches.
+fn visible_border_rect(border: usize, rect: parts::Rect, scale: u32, rounded: bool) -> Option<Rect> {
+    // The visible border is one pt.
+    let visible_border_size = VISIBLE_BORDER_SIZE * scale;
+    let corner = if rounded {
+        corner_inset(CORNER_RADIUS * scale)
+    } else {
+        0
+    };
+
+    // XXX we do all the match using integral types and then convert to f32 in the
+    // end to ensure that result is finite.
+    let rect = match border {
+        DecorationParts::LEFT => {
+            let x = (rect.x.unsigned_abs() * scale) - visible_border_size;
+            let y = rect.y.unsigned_abs() * scale;
+            Rect::from_xywh(
+                x as f32,
+                y as f32,
+                visible_border_size as f32,
+                rect.height.saturating_sub(y + corner) as f32,
+            )
+        }
+        DecorationParts::RIGHT => {
+            let y = rect.y.unsigned_abs() * scale;
+            Rect::from_xywh(
+                0.,
+                y as f32,
+                visible_border_size as f32,
+                rect.height.saturating_sub(y + corner) as f32,
+            )
+        }
+        // We draw small visible border only bellow the window surface, no need to
+        // handle `TOP`.
+        DecorationParts::BOTTOM => {
+            let x = (rect.x.unsigned_abs() * scale) - visible_border_size;
+            Rect::from_xywh(
+                (x + corner) as f32,
+                0.,
+                rect.width.saturating_sub(2 * (x + corner)) as f32,
+                visible_border_size as f32,
+            )
+        }
+        _ => None,
+    };
+
+    // A window barely taller than its own corners has nothing left to draw.
+    rect.filter(|rect| rect.width() > 0. && rect.height() > 0.)
+}
+
 // returns horizontal margin, logical points
 fn get_margin_h_lp(state: &WindowState) -> f32 {
     if state.intersects(WindowState::MAXIMIZED | WindowState::TILED) {
         0.
     } else {
         VISIBLE_BORDER_SIZE as f32
+    }
+}
+
+#[cfg(test)]
+mod header_outline_tests {
+    use super::*;
+    use tiny_skia::Pixmap;
+
+    /// The header pixmap as `redraw_inner` sizes it: the window plus one visible
+    /// border on each side.
+    fn header(state: WindowState) -> Pixmap {
+        let window_width = 40;
+        let margin = if state.intersects(WindowState::MAXIMIZED | WindowState::TILED) {
+            0
+        } else {
+            VISIBLE_BORDER_SIZE
+        };
+        let mut pixmap =
+            Pixmap::new(window_width + 2 * margin, HEADER_SIZE).expect("a valid pixmap size");
+        let theme = ColorTheme::dark();
+        draw_headerbar_bg(&mut pixmap.as_mut(), 1., &theme.active, &state)
+            .expect("the headerbar background to be drawable");
+        pixmap
+    }
+
+    fn rgba(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let p = pixmap.pixel(x, y).expect("a pixel inside the header");
+        (p.red(), p.green(), p.blue(), p.alpha())
+    }
+
+    #[test]
+    fn the_header_wears_the_windows_outer_border_on_its_own_edge() {
+        let pixmap = header(WindowState::ACTIVATED);
+        let (w, h) = (pixmap.width(), pixmap.height());
+        // Below the rounded corner, where the sides run straight.
+        let y = h - 8;
+
+        // Premultiplied: 75% black over nothing is (0, 0, 0, 191).
+        assert_eq!(rgba(&pixmap, 0, y), (0, 0, 0, 191));
+        assert_eq!(rgba(&pixmap, w - 1, y), (0, 0, 0, 191));
+        // And immediately inside it, the headerbar itself.
+        assert_eq!(rgba(&pixmap, 1, y), (48, 48, 48, 255));
+        assert_eq!(rgba(&pixmap, w - 2, y), (48, 48, 48, 255));
+    }
+
+    #[test]
+    fn the_outer_border_runs_over_the_top_corners_too() {
+        let pixmap = header(WindowState::ACTIVATED);
+        // A point on the top-left arc: the corner's centre is at (radius,
+        // radius), so 45° out along the diagonal lands on the border.
+        let d = (CORNER_RADIUS as f32) * (1. - std::f32::consts::FRAC_1_SQRT_2);
+        let (x, y) = (d.round() as u32, d.round() as u32);
+        let (r, g, b, a) = rgba(&pixmap, x, y);
+        assert!(
+            a > 128 && r < 24 && g < 24 && b < 24,
+            "the arc at ({x}, {y}) should be border, not {:?}",
+            (r, g, b, a)
+        );
+    }
+
+    #[test]
+    fn the_border_stops_at_the_bottom_where_the_window_takes_over() {
+        let pixmap = header(WindowState::ACTIVATED);
+        let (w, h) = (pixmap.width(), pixmap.height());
+        // The last row is the headerbar's separator from the content, and it
+        // runs the width of the *window*, leaving the outer border its columns.
+        assert_eq!(rgba(&pixmap, w / 2, h - 1), (58, 58, 58, 255));
+        assert_eq!(rgba(&pixmap, 0, h - 1), (0, 0, 0, 191));
+    }
+
+    #[test]
+    fn a_maximized_header_has_no_outline_to_draw() {
+        let pixmap = header(WindowState::ACTIVATED | WindowState::MAXIMIZED);
+        assert_eq!(rgba(&pixmap, 0, 0), (48, 48, 48, 255));
+        assert_eq!(rgba(&pixmap, pixmap.width() - 1, 0), (48, 48, 48, 255));
+    }
+}
+
+#[cfg(test)]
+mod visible_border_tests {
+    use super::*;
+
+    /// The left and right parts as `DecorationParts` builds and resizes them for
+    /// a `width` x `height` window.
+    fn side(border: usize, width: u32, height: u32, scale: u32) -> parts::Rect {
+        parts::Rect {
+            x: if border == DecorationParts::LEFT {
+                -(BORDER_SIZE as i32)
+            } else {
+                width as i32
+            },
+            y: -(HEADER_SIZE as i32),
+            width: BORDER_SIZE * scale,
+            height: (height + HEADER_SIZE) * scale,
+        }
+    }
+
+    fn bottom(width: u32, height: u32, scale: u32) -> parts::Rect {
+        parts::Rect {
+            x: -(BORDER_SIZE as i32),
+            y: height as i32,
+            width: (width + 2 * BORDER_SIZE) * scale,
+            height: BORDER_SIZE * scale,
+        }
+    }
+
+    #[test]
+    fn a_straight_border_stops_where_the_arc_leaves_the_edge() {
+        // Not at the radius: this border is a chord of the ring one pixel outside
+        // the window, which stays flush with the edge for a few pixels after the
+        // arc's own centre line has curved away.
+        assert_eq!(corner_inset(10), 7);
+        assert_eq!(corner_inset(20), 15);
+        assert_eq!(corner_inset(0), 0);
+    }
+
+    #[test]
+    fn the_sides_stop_where_the_bottom_corners_begin() {
+        let rect = side(DecorationParts::LEFT, 400, 300, 1);
+        let left = visible_border_rect(DecorationParts::LEFT, rect, 1, true)
+            .expect("the left border to have a rect");
+
+        assert_eq!(left.top(), HEADER_SIZE as f32, "starts below the header");
+        assert_eq!(
+            left.bottom(),
+            (HEADER_SIZE + 300 - corner_inset(CORNER_RADIUS)) as f32,
+            "and stops a corner radius above the window's bottom"
+        );
+    }
+
+    #[test]
+    fn the_bottom_is_inset_by_a_corner_at_each_end() {
+        let rect = bottom(400, 300, 1);
+        let b = visible_border_rect(DecorationParts::BOTTOM, rect, 1, true)
+            .expect("the bottom border to have a rect");
+
+        // The part starts `BORDER_SIZE` left of the window, and the window's own
+        // left edge is one visible border inside that.
+        let window_left = (BORDER_SIZE - VISIBLE_BORDER_SIZE) as f32;
+        assert_eq!(b.left(), window_left + corner_inset(CORNER_RADIUS) as f32);
+        assert_eq!(
+            b.width(),
+            400. + 2. * VISIBLE_BORDER_SIZE as f32 - 2. * corner_inset(CORNER_RADIUS) as f32
+        );
+    }
+
+    #[test]
+    fn a_square_window_keeps_the_border_running_the_whole_way() {
+        let rect = side(DecorationParts::RIGHT, 400, 300, 1);
+        let right = visible_border_rect(DecorationParts::RIGHT, rect, 1, false)
+            .expect("the right border to have a rect");
+
+        assert_eq!(right.bottom(), (HEADER_SIZE + 300) as f32);
+
+        let b = visible_border_rect(DecorationParts::BOTTOM, bottom(400, 300, 1), 1, false)
+            .expect("the bottom border to have a rect");
+        assert_eq!(b.width(), 400. + 2. * VISIBLE_BORDER_SIZE as f32);
+    }
+
+    #[test]
+    fn every_length_scales_with_the_output() {
+        let rect = side(DecorationParts::LEFT, 400, 300, 2);
+        let left = visible_border_rect(DecorationParts::LEFT, rect, 2, true)
+            .expect("the left border to have a rect");
+
+        assert_eq!(left.width(), 2. * VISIBLE_BORDER_SIZE as f32);
+        assert_eq!(left.top(), 2. * HEADER_SIZE as f32);
+        assert_eq!(
+            left.bottom(),
+            (2 * (HEADER_SIZE + 300) - corner_inset(2 * CORNER_RADIUS)) as f32
+        );
+    }
+
+    #[test]
+    fn a_window_shorter_than_its_own_corners_asks_for_no_border() {
+        let rect = side(DecorationParts::LEFT, 400, 4, 1);
+        assert!(visible_border_rect(DecorationParts::LEFT, rect, 1, true).is_none());
     }
 }
