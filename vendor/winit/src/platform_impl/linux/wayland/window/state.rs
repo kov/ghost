@@ -427,7 +427,11 @@ impl WindowState {
         // *window* to be. The window then came out a margin short of its own
         // maximized or snapped area, with a band of dead surface down two edges.
         if from_compositor {
-            new_size = self.decoration_margins.inflate(new_size);
+            let boxed =
+                configure.is_maximized() || configure.is_fullscreen() || configure.is_tiled();
+            let margins =
+                if boxed { DecorationMargins::NONE } else { self.decoration_margins };
+            new_size = margins.inflate(new_size);
         }
 
         // Apply configure bounds only when compositor let the user decide what size to pick.
@@ -827,7 +831,7 @@ impl WindowState {
         // area and came back a margin bigger every time. Margins are only ever
         // set while undecorated, so with a real frame this is a no-op.
         // [vendored addition]
-        let m = self.decoration_margins;
+        let m = self.margins_now();
         let ((x, y), outer_size) = (
             (x + m.left as i32, y + m.top as i32),
             m.deflate(outer_size),
@@ -872,16 +876,34 @@ impl WindowState {
         // The window the compositor knows about must not move or resize under
         // the user just because we changed how much shadow we paint: hold the
         // geometry and let the surface take the difference.
-        let geometry = self.decoration_margins.deflate(self.size);
+        let geometry = self.margins_now().deflate(self.size);
         self.decoration_margins = margins;
         self.geometry_inset = true;
-        self.resize(margins.inflate(geometry));
+        let now = self.margins_now();
+        self.resize(now.inflate(geometry));
         self.size
     }
 
     /// The margins currently kept outside the window. [vendored addition]
     pub fn decoration_margins(&self) -> DecorationMargins {
         self.decoration_margins
+    }
+
+    /// The margins in force *right now*. A window with no free outside edge —
+    /// maximized, fullscreen, tiled — has none: its geometry must fill what the
+    /// compositor gave it exactly, and there is nowhere outside it to draw.
+    ///
+    /// State-derived rather than set by the client, so a maximize needs no
+    /// second resize to drop them and no third to take them back. Sized twice
+    /// for one state change, the compositor gets two differently-sized buffers
+    /// in the middle of its own animation. [vendored addition]
+    fn margins_now(&self) -> DecorationMargins {
+        match self.last_configure.as_ref() {
+            Some(c) if c.is_maximized() || c.is_fullscreen() || c.is_tiled() => {
+                DecorationMargins::NONE
+            },
+            _ => self.decoration_margins,
+        }
     }
 
     /// Get the scale factor of the window.
@@ -1269,6 +1291,8 @@ impl WindowState {
     /// handing over a region and turning it off means dropping the object.
     /// [vendored addition]
     fn set_background_effect_blur(&mut self, manager: &BackgroundEffectManager, blurred: bool) {
+        // Read before the effect below borrows `self` mutably.
+        let m = self.margins_now();
         if !blurred {
             if let Some(effect) = self.background_effect.take() {
                 effect.destroy();
@@ -1291,7 +1315,6 @@ impl WindowState {
         // The effect belongs to the WINDOW, which our margins sit outside of:
         // blurring the shadow's own ring would put a blurred halo where the
         // window is see-through. [vendored addition]
-        let m = self.decoration_margins;
         Self::add_blur_shape(
             &region,
             m.deflate(self.size),

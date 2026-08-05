@@ -2420,11 +2420,22 @@ impl Graphics {
         use winit::platform::wayland::{DecorationMargins, WindowExtWayland};
         // Ask for the room the shadow needs *first*: it resizes the surface, and
         // the effect region below is spelled out against the window inside it.
+        // The room a *floating* window keeps, not the room this one has: winit
+        // drops it while the window is maximized, fullscreen or tiled, from the
+        // configure that says so. Zeroing it from here instead would size the
+        // surface a second time for one state change, and the compositor would
+        // get two differently-sized buffers in the middle of its own animation.
+        // `edge.margins` is the room in force, which is what we lay out in.
+        let room = if edge.outline_inside {
+            SHADOW_MARGIN
+        } else {
+            0.0
+        } as u32;
         let size = window.set_decoration_margins(DecorationMargins {
-            top: edge.margins.top.max(0.0) as u32,
-            right: edge.margins.right.max(0.0) as u32,
-            bottom: edge.margins.bottom.max(0.0) as u32,
-            left: edge.margins.left.max(0.0) as u32,
+            top: room,
+            right: room,
+            bottom: room,
+            left: room,
         });
         let radius = edge.radius.max(0.0) as u32;
         let of = |rounded: bool| if rounded { radius } else { 0 };
