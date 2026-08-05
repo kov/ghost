@@ -17,9 +17,9 @@ members = [
     "ghost-shot",
     "xtask",
 ]
-# The vendored winit and wgpu-core (see the patches below) are their own
-# packages, not members.
-exclude = ["vendor/winit", "vendor/wgpu-core"]
+# The vendored winit, wgpu-core and sctk-adwaita (see the patches below) are
+# their own packages, not members.
+exclude = ["vendor/winit", "vendor/wgpu-core", "vendor/sctk-adwaita"]
 
 [workspace.package]
 version = "0.1.0"
@@ -56,6 +56,19 @@ debug = true
 #   retrying an unacquirable surface leaks without bound (observed: 300M+
 #   burned ids, ~8GB, in one overnight session). The id is now allocated only
 #   once there is a texture to assign — see vendor/wgpu-core/src/present.rs.
+#
+# Vendored sctk-adwaita 0.10.1 (MIT) carrying one local patch, to be reported
+# upstream and then dropped:
+# - The window drop shadow was so diffuse it read as no shadow at all: it
+#   peaked at ~0.21 alpha and smeared that over 43px, where a real libadwaita
+#   window peaks at ~0.30 and is gone within ~15px. Refitted against a
+#   measured GTK4 window — see vendor/sctk-adwaita/src/shadow.rs.
+#
+# GNOME never offers server-side decorations (mutter has no
+# `zxdg_decoration_manager_v1`), so on Linux/Wayland every ghost window is
+# drawn by this frame — it is our titlebar whether we like it or not, until
+# ghost-ui/docs/window-decorations.md lands.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 wgpu-core = { path = "vendor/wgpu-core" }
+sctk-adwaita = { path = "vendor/sctk-adwaita" }
