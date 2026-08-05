@@ -786,6 +786,18 @@ pub struct WindowEdge {
     /// it, in the notch. So the frame stops a radius short of each bottom corner
     /// and we carry the line round, at the alpha the frontend read off the frame.
     pub outline: f32,
+    /// Draw [`outline`](Self::outline) just *inside* the shape instead, all the
+    /// way round.
+    ///
+    /// Outside is where the ring belongs while a CSD frame draws it: the frame's
+    /// border column lives there, and we only carry the line round the arcs it
+    /// cannot reach. Once ghost draws its own decorations there is no frame and
+    /// no column — outside the window is the compositor's, and a ring drawn
+    /// there lands nowhere, leaving a window bordered on its four corners and
+    /// bare in between. Until the frame gains margins of its own (the
+    /// drop-shadow work) the only pixels we have are our own, so the line goes
+    /// inside them.
+    pub outline_inside: bool,
     /// The window's own drop shadow, sampled across the notch that rounding a
     /// corner opens: [`EDGE_SHADOW_STEPS`] alphas evenly spaced from the arc out
     /// to the square corner it cuts away, i.e. over `radius * (sqrt(2) - 1)`
@@ -843,9 +855,17 @@ impl Default for Corners {
 pub const EDGE_SHADOW_STEPS: usize = 8;
 
 impl WindowEdge {
-    /// Nothing to draw — no pass is encoded at all.
+    /// Nothing to draw — no pass is encoded at all. An inner ring stands on its
+    /// own: it runs the straight edges whether or not the corners are rounded.
     fn is_none(&self) -> bool {
-        self.radius <= 0.0 && self.highlight <= 0.0
+        self.radius <= 0.0 && self.highlight <= 0.0 && !(self.outline_inside && self.outline > 0.0)
+    }
+
+    /// Whether the notch shadow has anything to lay down. Our own frame casts
+    /// none (there is nothing outside the window to cast it), so the pass is
+    /// skipped rather than run to write zeroes.
+    fn casts_corner_shadow(&self) -> bool {
+        self.corner_shadow.iter().any(|a| *a > 0.0)
     }
 }
 
@@ -871,8 +891,10 @@ struct EdgeUniforms {
     /// [`Corners`], as 0/1 flags the shader can multiply with.
     round_top: f32,
     round_bottom: f32,
+    /// [`WindowEdge::outline_inside`], as a 0/1 flag.
+    outline_inside: f32,
     /// Pads `shadow` back onto the 16-byte stride a uniform array needs.
-    _pad: [f32; 2],
+    _pad: f32,
     /// [`WindowEdge::corner_shadow`], padded to the uniform's vec4 stride.
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
@@ -904,7 +926,8 @@ struct EdgeU {
     outline_width: f32,
     round_top: f32,
     round_bottom: f32,
-    pad: vec2<f32>,
+    outline_inside: f32,
+    pad: f32,
     shadow: array<vec4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> u: EdgeU;
@@ -1006,6 +1029,23 @@ fn outline_ring(d: f32) -> f32 {
 @fragment
 fn corner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let a = u.outline * outline_ring(edge_distance(pos.xy));
+    return vec4<f32>(0.0, 0.0, 0.0, a);
+}
+
+// The share of a pixel a border drawn just INSIDE the shape covers: the same
+// band, the same width, reflected to the other side of the boundary.
+fn inner_ring(d: f32) -> f32 {
+    let w = max(u.outline_width, 0.0);
+    return clamp(min(w, d + 0.5) - max(0.0, d - 0.5), 0.0, 1.0);
+}
+
+// Premultiplied black, source-OVER rather than added: this line lies on the
+// window's own pixels, which are already fully covered, so adding to their
+// alpha would do nothing at all on an opaque window and only thicken a
+// translucent one. Darkening them is the whole point.
+@fragment
+fn inner_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let a = u.outline * inner_ring(edge_distance(pos.xy));
     return vec4<f32>(0.0, 0.0, 0.0, a);
 }
 "#;
@@ -1596,6 +1636,7 @@ pub struct Renderer {
     edge_hairline_pipeline: wgpu::RenderPipeline,
     edge_shadow_pipeline: wgpu::RenderPipeline,
     edge_outline_pipeline: wgpu::RenderPipeline,
+    edge_inner_outline_pipeline: wgpu::RenderPipeline,
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
     /// The face window chrome draws its text in — the desktop's UI font, not the
@@ -2355,6 +2396,12 @@ impl Renderer {
         };
         let edge_shadow_pipeline = edge_pipeline("corner_shadow", sum);
         let edge_outline_pipeline = edge_pipeline("corner_outline", sum);
+        // The inner ring shares no pixel with anything — it lies inside the
+        // shape, over the window's own — so it composites normally.
+        let edge_inner_outline_pipeline = edge_pipeline(
+            "inner_outline",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
 
         Renderer {
             gpu,
@@ -2369,6 +2416,7 @@ impl Renderer {
             edge_hairline_pipeline,
             edge_shadow_pipeline,
             edge_outline_pipeline,
+            edge_inner_outline_pipeline,
             edge_bind_group,
             edge_uniform_buf,
             chrome_font: None,
@@ -4808,7 +4856,8 @@ impl Renderer {
             outline_width: self.scale_factor.max(1.0),
             round_top: f32::from(u8::from(edge.corners.top)),
             round_bottom: f32::from(u8::from(edge.corners.bottom)),
-            _pad: [0.0; 2],
+            outline_inside: f32::from(u8::from(edge.outline_inside)),
+            _pad: 0.0,
             shadow,
         };
         self.gpu
@@ -4869,6 +4918,25 @@ impl Renderer {
                     }
                 }
             }
+            // Our own border, when there is no frame outside the window to draw
+            // it: the same four strips the hairline rides, so the line runs the
+            // whole perimeter and round the arcs in one pass. Before the cut,
+            // which then trims it back to the shape exactly as it trims the
+            // window's own pixels.
+            if edge.outline_inside && edge.outline > 0.0 {
+                pass.set_pipeline(&self.edge_inner_outline_pipeline);
+                for rect in [
+                    (0, top, side.min(w), sides),
+                    (w.saturating_sub(side), top, side.min(w), sides),
+                    (0, h - bottom, w, bottom),
+                    (0, 0, w, top),
+                ] {
+                    if rect.2 > 0 && rect.3 > 0 {
+                        pass.set_scissor_rect(rect.0, rect.1, rect.2, rect.3);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+            }
             // Last, so the hairline is cut back to the arc along with everything
             // else outside the shape.
             if radius > 0.0 {
@@ -4892,12 +4960,16 @@ impl Renderer {
                 };
                 pass.set_pipeline(&self.edge_cut_pipeline);
                 draw(&mut pass);
-                // Into the emptied notch, the shadow the frame cannot reach.
-                pass.set_pipeline(&self.edge_shadow_pipeline);
-                draw(&mut pass);
+                // Into the emptied notch, the shadow the frame cannot reach —
+                // when a frame is casting one at all.
+                if edge.casts_corner_shadow() {
+                    pass.set_pipeline(&self.edge_shadow_pipeline);
+                    draw(&mut pass);
+                }
                 // And over that, the window's outer border, picked up where the
-                // frame's straight one left off.
-                if edge.outline > 0.0 {
+                // frame's straight one left off. An inner ring has already run
+                // the whole perimeter, arcs included.
+                if edge.outline > 0.0 && !edge.outline_inside {
                     pass.set_pipeline(&self.edge_outline_pipeline);
                     draw(&mut pass);
                 }
@@ -7098,6 +7170,7 @@ mod tests {
             corners: Corners::default(),
             highlight: 0.0,
             outline: 0.75,
+            outline_inside: false,
             corner_shadow: [shadow; EDGE_SHADOW_STEPS],
         };
         r.set_window_edge(edge(0.31));

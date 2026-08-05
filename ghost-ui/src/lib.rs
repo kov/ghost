@@ -1956,11 +1956,19 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
     // Rounding a corner cuts a notch out of the window that the frame's own
     // subsurfaces cannot reach into, so we finish its shadow ourselves —
     // sampled from the frame, at the depth this radius opens up.
+    //
+    // Our own decorations cast no shadow at all yet: there is no frame, and no
+    // margin outside the window to cast into. Continuing one there paints a grey
+    // scoop into the notch of a window that is otherwise shadowless — over a
+    // light backdrop, a wedge hanging off the curve. The notch keeps whatever
+    // the window itself has until the margins land.
     let reach = radius * (std::f32::consts::SQRT_2 - 1.0);
     let mut corner_shadow = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
-    for (i, a) in corner_shadow.iter_mut().enumerate() {
-        let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-        *a = sctk_adwaita::shadow::bottom_corner_alpha(d, state.focused);
+    if !state.own_frame {
+        for (i, a) in corner_shadow.iter_mut().enumerate() {
+            let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
+            *a = sctk_adwaita::shadow::bottom_corner_alpha(d, state.focused);
+        }
     }
     // The dark ring the frame draws around the window, which stops short of
     // the corners we round — read from the same theme the frame uses so the
@@ -1981,6 +1989,10 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
         // ring carries the edge on its own.
         highlight: 0.0,
         outline,
+        // The frame's border column is a thing outside the window, and with our
+        // own decorations there is nothing out there to draw on — so the ring
+        // moves inside, where it still traces the same edge.
+        outline_inside: state.own_frame,
         corner_shadow,
     }
 }

@@ -1879,6 +1879,7 @@ fn the_window_edge_rounds_the_bottom_corners_and_leaves_the_top_to_the_frame() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1940,6 +1941,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -1950,6 +1952,7 @@ fn the_outer_border_carries_on_around_the_bottom_corners() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.75,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2003,6 +2006,7 @@ fn the_ring_is_as_wide_as_the_border_the_frame_draws() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline,
+            outline_inside: false,
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         });
         renderer.present_offscreen(&scene, font, 15.0)
@@ -2041,6 +2045,7 @@ fn the_arc_never_reads_lighter_than_the_border_that_traces_it() {
         corners: ghost_renderer::Corners::default(),
         highlight: 0.0,
         outline,
+        outline_inside: false,
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
     };
     // Opaque, so the only thing that can lighten a pixel is the arc itself.
@@ -2087,6 +2092,7 @@ fn ghost_drawing_its_own_frame_rounds_all_four_corners() {
             corners: ghost_renderer::Corners::ALL,
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
         },
         0.5,
@@ -2125,6 +2131,7 @@ fn the_outer_border_carries_on_around_the_top_corners_too() {
         corners: ghost_renderer::Corners::ALL,
         highlight: 0.0,
         outline,
+        outline_inside: false,
         corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
     };
     let bare = edge_render(edge(0.0), 1.0);
@@ -2156,6 +2163,63 @@ fn the_outer_border_carries_on_around_the_top_corners_too() {
 }
 
 #[test]
+fn our_own_frames_border_runs_along_the_straight_edges_too() {
+    // The outer ring is drawn just OUTSIDE the shape, which is where the CSD
+    // frame's own border column lives — we only carry it round the arcs the
+    // frame cannot reach. Draw our own decorations and there is no frame and no
+    // column: outside the window is the compositor's, and a ring drawn there
+    // lands nowhere. The window then wears a border on its four corners and
+    // nothing in between, which is the arcs looking like they were bolted on.
+    //
+    // So when the ring is ours it goes just INSIDE the shape, all the way
+    // round.
+    let (_, w, h) = edge_window();
+    let edge = |outline| ghost_renderer::WindowEdge {
+        radius: 10.0,
+        corners: ghost_renderer::Corners::ALL,
+        highlight: 0.0,
+        outline,
+        outline_inside: true,
+        corner_shadow: [0.0; ghost_renderer::EDGE_SHADOW_STEPS],
+    };
+    let bare = edge_render(edge(0.0), 1.0);
+    let ringed = edge_render(edge(0.75), 1.0);
+    write_png("window-edge-inner-ring.png", &ringed);
+
+    // Well clear of every corner: the middle of each straight edge.
+    for (x, y, name) in [
+        (w / 2, 0, "top"),
+        (w / 2, h - 1, "bottom"),
+        (0, h / 2, "left"),
+        (w - 1, h / 2, "right"),
+    ] {
+        let before = px(&bare, x, y);
+        let after = px(&ringed, x, y);
+        assert_eq!(
+            after[3], 255,
+            "the {name} edge must stay opaque — the ring darkens the window, it does not \
+             cut into it"
+        );
+        let (sum_before, sum_after) = (
+            before[0] as u32 + before[1] as u32 + before[2] as u32,
+            after[0] as u32 + after[1] as u32 + after[2] as u32,
+        );
+        assert!(
+            sum_after * 2 < sum_before,
+            "the {name} edge at ({x}, {y}) reads {after:?} with the ring and {before:?} \
+             without: the border did not reach it"
+        );
+    }
+    // And it stops there — one logical pixel in, not a frame around the content.
+    let inside = px(&ringed, w / 2, h - 4);
+    assert_eq!(
+        inside,
+        px(&bare, w / 2, h - 4),
+        "the ring must not reach 4px into the window"
+    );
+}
+
+#[test]
 fn the_frames_titlebar_still_keeps_the_top_corners_when_it_draws_them() {
     // The other half of the same switch: while the CSD frame is still drawing
     // the titlebar it rounds the top itself, and cutting there would take a bite
@@ -2167,6 +2231,7 @@ fn the_frames_titlebar_still_keeps_the_top_corners_when_it_draws_them() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2191,6 +2256,7 @@ fn a_square_window_keeps_its_corners() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2213,6 +2279,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.0,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
@@ -2223,6 +2290,7 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
             corners: ghost_renderer::Corners::default(),
             highlight: 0.07,
             outline: 0.0,
+            outline_inside: false,
             corner_shadow: frame_shadow(true),
         },
         0.5,
