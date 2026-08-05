@@ -12,7 +12,7 @@
 //! not eat into the terminal grid behind it.
 
 use crate::PointPx;
-use ghost_render::scene::{Layer, RectPx, Rgba, Scene, SceneId, SceneItem};
+use ghost_render::scene::{Layer, RectPx, Rgba, Scene, SceneId, SceneItem, TextAlign};
 
 /// How tall the titlebar we draw is, in logical pixels. sctk-adwaita's
 /// `HEADER_SIZE`, so a window whose frame we took over is the same height as
@@ -30,6 +30,19 @@ pub fn bar_height_px(own_frame: bool, scale: f32) -> u32 {
     (BAR_HEIGHT * scale.max(0.0)).round() as u32
 }
 
+/// Everything the titlebar draws: its height and colours, and the title.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Titlebar {
+    /// Height in physical px — [`bar_height_px`]. 0 draws no bar at all.
+    pub height_px: u32,
+    pub bg: Rgba,
+    /// The title's colour. The frame signals focus by dimming it.
+    pub fg: Rgba,
+    pub title: String,
+    /// Em size of the title, in physical px.
+    pub font_px: f32,
+}
+
 /// The layer depth the titlebar draws at. Above everything the model builds:
 /// the bar is the window's own frame, not content, and no overlay of ours
 /// covers a titlebar any more than a dialog covers the desktop's.
@@ -41,30 +54,43 @@ const BAR_Z: i32 = i32::MAX;
 /// Everything the model drew moves down by the bar's height. It laid out in a
 /// window that size, so nothing needs re-laying: the shell sizes the model to
 /// the content area, and this puts that area where it belongs.
-pub fn with_titlebar(content: Scene, bar_px: u32, bg: Rgba) -> Scene {
-    if bar_px == 0 {
+pub fn with_titlebar(content: Scene, bar: &Titlebar) -> Scene {
+    if bar.height_px == 0 {
         return content;
     }
+    let bar_px = bar.height_px;
     let (w, h) = content.size_px;
     let mut scene = Scene::new((w, h + bar_px));
     scene.layers = content.layers;
     for layer in &mut scene.layers {
         layer.transform.ty += bar_px as f32;
     }
-    scene.layers.push(Layer::new(
-        BAR_Z,
-        vec![SceneItem::Rect {
+    let strip = RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: w as f32,
+        h: bar_px as f32,
+    };
+    let mut items = vec![SceneItem::Rect {
+        id: SceneId::Titlebar,
+        rect: strip,
+        color: bar.bg,
+        radius: 0.0,
+    }];
+    if !bar.title.is_empty() {
+        // Centred on the window, as every headerbar on this desktop is. The
+        // renderer measures the shaped run to place it — the model has no faces
+        // and could only guess.
+        items.push(SceneItem::ChromeText {
             id: SceneId::Titlebar,
-            rect: RectPx {
-                x: 0.0,
-                y: 0.0,
-                w: w as f32,
-                h: bar_px as f32,
-            },
-            color: bg,
-            radius: 0.0,
-        }],
-    ));
+            rect: strip,
+            text: bar.title.clone(),
+            color: bar.fg,
+            size_px: bar.font_px,
+            align: TextAlign::Center,
+        });
+    }
+    scene.layers.push(Layer::new(BAR_Z, items));
     scene
 }
 
@@ -176,6 +202,16 @@ mod tests {
         resize_edge_at(PointPx { x, y }, SIZE, 1.0, grab())
     }
 
+    fn titlebar(height_px: u32) -> Titlebar {
+        Titlebar {
+            height_px,
+            bg: [0.1, 0.1, 0.1, 1.0],
+            fg: [1.0, 1.0, 1.0, 1.0],
+            title: "ghost".into(),
+            font_px: 15.0,
+        }
+    }
+
     /// A stand-in for whatever the model drew, one layer with one item in it.
     fn content(w: u32, h: u32) -> Scene {
         let mut s = Scene::new((w, h));
@@ -203,7 +239,7 @@ mod tests {
         // moves down to make room. Anything still drawn at the top of the window
         // would be under the titlebar.
         let bar = 35;
-        let scene = with_titlebar(content(800, 565), bar, [0.1, 0.1, 0.1, 1.0]);
+        let scene = with_titlebar(content(800, 565), &titlebar(bar));
         assert_eq!(scene.size_px, (800, 600), "the window is the bar taller");
 
         let drawn = scene
@@ -230,7 +266,7 @@ mod tests {
     fn the_titlebar_draws_over_everything_the_model_built() {
         // The bar is the window's frame, not content: no overlay of ours covers
         // it, any more than a dialog covers the desktop.
-        let scene = with_titlebar(content(800, 565), 35, [0.1, 0.1, 0.1, 1.0]);
+        let scene = with_titlebar(content(800, 565), &titlebar(35));
         let bar_z = scene
             .layers
             .iter()
@@ -252,7 +288,7 @@ mod tests {
         // No bar of ours means no strip and no inset — the scene must come
         // through untouched, not translated by zero into a different-looking one.
         let plain = content(800, 600);
-        let framed = with_titlebar(plain.clone(), 0, [0.1, 0.1, 0.1, 1.0]);
+        let framed = with_titlebar(plain.clone(), &titlebar(0));
         assert_eq!(framed, plain);
         assert_eq!(bar_height_px(false, 1.0), 0);
     }

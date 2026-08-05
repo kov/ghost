@@ -116,6 +116,81 @@ pub fn paint_text(
     Some(img)
 }
 
+/// One glyph of a laid-out string: which face it must be drawn from, which
+/// glyph, and where its pen sits relative to the run's origin (x rightwards
+/// from the start, y *up* from the baseline, as shaping reports it).
+///
+/// This is the seam between laying text out and putting it on a surface. The
+/// layout — per-character fallback, shaped positions, the synthesis a face
+/// needs — is subtle enough that it must exist once; what a caller does with
+/// the placements is not. [`paint_text`] rasterizes them into a CPU bitmap; a
+/// GPU renderer instead looks each up in its glyph atlas.
+#[derive(Clone, Copy)]
+pub struct PlacedGlyph<'a> {
+    pub face: FontRef<'a>,
+    pub id: u16,
+    pub x: f32,
+    pub y: f32,
+    /// What the chosen face does not itself provide (faux bold/italic).
+    pub synth: Synthesis,
+}
+
+/// A laid-out string: where each glyph goes, how far the run advances, and the
+/// vertical extent of the face it was laid out in (so a caller can centre it
+/// without measuring ink, which would make the text jump as it changed).
+#[derive(Clone)]
+pub struct TextLayout<'a> {
+    pub glyphs: Vec<PlacedGlyph<'a>>,
+    pub advance: f32,
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+/// Lay `text` out at `size_px`, drawing each character from the face that
+/// actually covers it — `fonts`' regular face where it can, otherwise whatever
+/// `fallback` resolves — with shaping's own positioning within each run.
+///
+/// The layout half of [`paint_text`]; see [`PlacedGlyph`] for why it is public.
+pub fn layout_text<'a>(
+    fonts: FontSet<'a>,
+    fallback: &mut dyn Fallback,
+    text: &str,
+    size_px: f32,
+    style: TextStyle,
+) -> TextLayout<'a> {
+    let (primary, synth) = fonts.face(false, false);
+    let mut glyphs = Vec::new();
+    let mut pen = 0.0f32;
+    for run in segment(primary, fallback, text) {
+        // A fallback face is used as it is: it was chosen for coverage, and
+        // synthesizing weight onto someone else's face is worse than not. The
+        // weight axis still applies — a fallback that has one should match the
+        // text it is standing in for, and one that hasn't ignores it.
+        let synth = if run.is_primary {
+            synth
+        } else {
+            Synthesis::default()
+        };
+        for g in shape_varied(run.face, run.text, size_px, style) {
+            glyphs.push(PlacedGlyph {
+                face: run.face,
+                id: g.id,
+                x: pen + g.x,
+                y: g.y,
+                synth,
+            });
+            pen += g.advance;
+        }
+    }
+    let m = primary.metrics(&[]).scale(size_px);
+    TextLayout {
+        glyphs,
+        advance: pen,
+        ascent: m.ascent,
+        descent: m.descent,
+    }
+}
+
 /// One rasterized glyph and where its top-left pixel goes, in a coordinate
 /// space whose origin is the pen start on the baseline (y-down).
 struct Placed {
@@ -188,7 +263,7 @@ impl Placed {
     }
 }
 
-/// Shape and rasterize every glyph of `text`, walking the pen across faces.
+/// Rasterize every glyph of a laid-out `text`, keeping each one's pen position.
 fn place(
     primary: FontRef<'_>,
     synth: Synthesis,
@@ -197,49 +272,58 @@ fn place(
     size_px: f32,
     style: TextStyle,
 ) -> Layout {
+    let laid = layout_text(
+        FontSet {
+            regular: primary,
+            // The synthesis the caller resolved is carried per-glyph by the
+            // layout; a bare regular slot is all it needs to segment runs.
+            bold: None,
+            italic: None,
+            bold_italic: None,
+        },
+        fallback,
+        text,
+        size_px,
+        style,
+    );
     let mut glyphs = Vec::new();
-    let mut pen = 0.0f32;
-    for run in segment(primary, fallback, text) {
-        // A fallback face is used as it is: it was chosen for coverage, and
-        // synthesizing weight onto someone else's face is worse than not. The
-        // weight axis still applies — a fallback that has one should match the
-        // text it is standing in for, and one that hasn't ignores it.
-        let synth = if run.is_primary {
+    for g in &laid.glyphs {
+        // The layout gives a fallback face no synthesis; the primary keeps the
+        // caller's, since `FontSet::single` above cannot carry it.
+        let synth = if same_face(g.face, primary) {
             synth
         } else {
-            Synthesis::default()
+            g.synth
         };
-        let color_capable = has_color_glyphs(run.face);
-        for g in shape_varied(run.face, run.text, size_px, style) {
-            let x = pen + g.x;
-            let y = -g.y;
-            let raster = color_capable
-                .then(|| rasterize_color(run.face, g.id, size_px))
-                .flatten()
-                .map(Raster::Color)
-                .or_else(|| {
-                    rasterize_varied(run.face, g.id, size_px, synth, style).map(Raster::Mask)
-                });
-            if let Some(bitmap) = raster {
-                let (left, top) = match &bitmap {
-                    Raster::Mask(b) => (b.left, b.top),
-                    Raster::Color(b) => (b.left, b.top),
-                };
-                glyphs.push(Placed {
-                    // `left`/`top` are y-up from the pen origin; the canvas is
-                    // y-down from the baseline.
-                    x: (x + left as f32).round() as i32,
-                    y: (y - top as f32).round() as i32,
-                    bitmap,
-                });
-            }
-            pen += g.advance;
+        let color_capable = has_color_glyphs(g.face);
+        let raster = color_capable
+            .then(|| rasterize_color(g.face, g.id, size_px))
+            .flatten()
+            .map(Raster::Color)
+            .or_else(|| rasterize_varied(g.face, g.id, size_px, synth, style).map(Raster::Mask));
+        if let Some(bitmap) = raster {
+            let (left, top) = match &bitmap {
+                Raster::Mask(b) => (b.left, b.top),
+                Raster::Color(b) => (b.left, b.top),
+            };
+            glyphs.push(Placed {
+                // `left`/`top` are y-up from the pen origin; the canvas is
+                // y-down from the baseline.
+                x: (g.x + left as f32).round() as i32,
+                y: (-g.y - top as f32).round() as i32,
+                bitmap,
+            });
         }
     }
     Layout {
         glyphs,
-        advance: pen,
+        advance: laid.advance,
     }
+}
+
+/// Whether two `FontRef`s are the same loaded face.
+fn same_face(a: FontRef<'_>, b: FontRef<'_>) -> bool {
+    a.key.value() == b.key.value()
 }
 
 /// [`shape`](crate::shape), with the style's variation settings applied. Chrome
@@ -311,10 +395,12 @@ fn rasterize_varied(
     })
 }
 
-/// A maximal slice of `text` drawn from one face.
-struct Run<'a> {
-    face: FontRef<'a>,
-    text: &'a str,
+/// A maximal slice of `text` drawn from one face. The face and the string are
+/// borrowed independently — a renderer holds faces for the whole run of the
+/// program and lays out whatever string it is handed.
+struct Run<'f, 't> {
+    face: FontRef<'f>,
+    text: &'t str,
     is_primary: bool,
 }
 
@@ -323,10 +409,14 @@ struct Run<'a> {
 /// font could have drawn; a character neither the primary nor the current
 /// fallback covers gets its own lookup, and one nothing covers stays on the
 /// primary and draws as `.notdef` — the honest "this font has no such glyph".
-fn segment<'a>(primary: FontRef<'a>, fallback: &mut dyn Fallback, text: &'a str) -> Vec<Run<'a>> {
-    let mut runs: Vec<Run<'a>> = Vec::new();
+fn segment<'f, 't>(
+    primary: FontRef<'f>,
+    fallback: &mut dyn Fallback,
+    text: &'t str,
+) -> Vec<Run<'f, 't>> {
+    let mut runs: Vec<Run<'f, 't>> = Vec::new();
     let mut start = 0usize;
-    let mut current: Option<(FontRef<'a>, bool)> = None;
+    let mut current: Option<(FontRef<'f>, bool)> = None;
     for (at, ch) in text.char_indices() {
         let face = if covers(primary, ch) {
             Some((primary, true))

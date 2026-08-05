@@ -877,6 +877,16 @@ struct EdgeUniforms {
     shadow: [[f32; 4]; EDGE_SHADOW_STEPS / 4],
 }
 
+/// Stands in when no platform fallback was installed: chrome text then draws
+/// what the chrome face itself covers, and `.notdef` for the rest.
+struct NoFallback;
+
+impl ghost_shaper::Fallback for NoFallback {
+    fn face_for(&mut self, _ch: char) -> Option<FontRef<'static>> {
+        None
+    }
+}
+
 /// The window edge: two fullscreen-triangle passes, each scissored down to the
 /// few hundred pixels it can touch.
 ///
@@ -1588,6 +1598,13 @@ pub struct Renderer {
     edge_outline_pipeline: wgpu::RenderPipeline,
     edge_bind_group: wgpu::BindGroup,
     edge_uniform_buf: wgpu::Buffer,
+    /// The face window chrome draws its text in — the desktop's UI font, not the
+    /// terminal's. `None` until the shell resolves one, in which case chrome text
+    /// is simply not drawn (a titlebar without a title beats a monospaced one).
+    chrome_font: Option<FontSet<'static>>,
+    /// The variable-font weight axis the chrome face is realized at, when the
+    /// desktop asks for a weight its family only offers as a variation.
+    chrome_weight: Option<f32>,
     window_edge: WindowEdge,
     /// Set when [`Renderer::set_window_edge`] changed it, cleared when drawn.
     edge_dirty: bool,
@@ -2354,6 +2371,8 @@ impl Renderer {
             edge_outline_pipeline,
             edge_bind_group,
             edge_uniform_buf,
+            chrome_font: None,
+            chrome_weight: None,
             window_edge: WindowEdge::default(),
             edge_dirty: false,
             theme,
@@ -4266,6 +4285,17 @@ impl Renderer {
                         scissor,
                         vec![solid(*rect, badge_color(*kind))],
                     ),
+                    SceneItem::ChromeText {
+                        rect,
+                        text,
+                        color,
+                        size_px: em,
+                        align,
+                        ..
+                    } => {
+                        let t = self.chrome_text_instances(*rect, text, *color, *em, *align);
+                        push_glyphs(&mut all, &mut draws, scissor, t);
+                    }
                     SceneItem::Text {
                         rect,
                         runs,
@@ -4354,6 +4384,85 @@ impl Renderer {
                         },
                     });
                 }
+            }
+        }
+        out
+    }
+
+    /// Glyph quads for a run of *proportional* chrome text laid out in `rect`.
+    ///
+    /// Shares its layout with [`ghost_shaper::paint_text`] — same per-character
+    /// fallback, same shaped positions, same synthesis — and differs only in
+    /// where the glyphs end up: the atlas here, a CPU bitmap there. The grid's
+    /// [`Self::text_instances`] cannot serve: it puts every glyph on the cell
+    /// pitch, which is right for a terminal and wrong for a sentence.
+    fn chrome_text_instances(
+        &mut self,
+        rect: RectPx,
+        text: &str,
+        color: [f32; 4],
+        size_px: f32,
+        align: ghost_render::TextAlign,
+    ) -> Vec<Instance> {
+        let Some(fonts) = self.chrome_font else {
+            return Vec::new();
+        };
+        // The fallback is borrowed for the layout and handed straight back, so
+        // the atlas walk below can take `&mut self` again.
+        let mut fallback = self.fallback.take();
+        let laid = match fallback.as_mut() {
+            Some(fb) => ghost_shaper::layout_text(
+                fonts,
+                fb.as_mut(),
+                text,
+                size_px,
+                ghost_shaper::TextStyle {
+                    weight: self.chrome_weight,
+                },
+            ),
+            None => ghost_shaper::layout_text(
+                fonts,
+                &mut NoFallback,
+                text,
+                size_px,
+                ghost_shaper::TextStyle {
+                    weight: self.chrome_weight,
+                },
+            ),
+        };
+        self.fallback = fallback;
+
+        let x0 = match align {
+            ghost_render::TextAlign::Left => rect.x,
+            // Centred on the box, and clipped to it from the left when the text
+            // is wider — a long title should run off the end, not off both.
+            ghost_render::TextAlign::Center => rect.x + ((rect.w - laid.advance) * 0.5).max(0.0),
+        };
+        // Centre the FACE, not the ink: a title without descenders must not sit
+        // differently from one with them.
+        let baseline = rect.y + (rect.h - (laid.ascent + laid.descent)) * 0.5 + laid.ascent;
+        // Emoji rasters are fitted to a box; the em square is the right one for
+        // text that has no cells.
+        let cell_box = (size_px, size_px);
+
+        let mut out = Vec::new();
+        for g in &laid.glyphs {
+            if let Some(slot) = self.ensure_glyph(g.face, g.id, size_px, g.synth, cell_box) {
+                out.push(Instance {
+                    rect: [
+                        x0 + g.x + slot.left as f32,
+                        baseline - g.y - slot.top as f32,
+                        slot.w as f32,
+                        slot.h as f32,
+                    ],
+                    uv: Self::slot_uv(&slot),
+                    // A color glyph carries its own; only its opacity is ours.
+                    color: if slot.color {
+                        [1.0, 1.0, 1.0, color[3]]
+                    } else {
+                        color
+                    },
+                });
             }
         }
         out
@@ -4642,6 +4751,13 @@ impl Renderer {
     /// whenever that changes (a live opacity edit takes the corners with it: an
     /// opaque window's alpha is ignored by the compositor, so there is no corner
     /// to cut). Defaults to nothing, which encodes no pass at all.
+    /// Set the face (and its variable-weight axis) that window chrome draws its
+    /// text in. Until this is called, [`SceneItem::ChromeText`] draws nothing.
+    pub fn set_chrome_font(&mut self, fonts: FontSet<'static>, weight: Option<f32>) {
+        self.chrome_font = Some(fonts);
+        self.chrome_weight = weight;
+    }
+
     pub fn set_window_edge(&mut self, edge: WindowEdge) {
         if self.window_edge != edge {
             self.window_edge = edge;

@@ -56,6 +56,13 @@ pub enum SceneId {
     Titlebar,
 }
 
+/// Where a [`SceneItem::ChromeText`] sits in its box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+}
+
 /// A per-tile indicator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeKind {
@@ -106,6 +113,22 @@ pub enum SceneItem {
         rect: RectPx,
         color: Rgba,
         radius: f32,
+    },
+    /// A run of *proportional* text — window chrome (a titlebar's title), not
+    /// grid content. Laid out by real shaping with per-character font fallback,
+    /// so it is positioned by each glyph's own advance rather than snapped to
+    /// the terminal's cell pitch, and a character the chrome font lacks is drawn
+    /// from one that has it.
+    ChromeText {
+        id: SceneId,
+        /// The box to lay the text out in; it is centred vertically, and
+        /// horizontally per `align`.
+        rect: RectPx,
+        text: String,
+        color: Rgba,
+        /// Em size in physical pixels.
+        size_px: f32,
+        align: TextAlign,
     },
     /// A run of styled text; `rect` is the text box (origin top-left).
     Text {
@@ -160,6 +183,7 @@ impl SceneItem {
     pub fn id(&self) -> SceneId {
         match self {
             SceneItem::Rect { id, .. }
+            | SceneItem::ChromeText { id, .. }
             | SceneItem::Text { id, .. }
             | SceneItem::Terminal { id, .. }
             | SceneItem::Border { id, .. }
@@ -170,6 +194,7 @@ impl SceneItem {
     pub fn rect(&self) -> RectPx {
         match self {
             SceneItem::Rect { rect, .. }
+            | SceneItem::ChromeText { rect, .. }
             | SceneItem::Text { rect, .. }
             | SceneItem::Terminal { rect, .. }
             | SceneItem::Border { rect, .. }

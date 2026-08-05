@@ -2138,6 +2138,24 @@ impl Graphics {
         // Draw characters outside the configured family (symbols, box-drawing, arrows)
         // from a covering system font instead of the tofu box.
         renderer.set_fallback(Box::new(font::SystemFallback::new()));
+        // Window chrome draws in the DESKTOP's UI font, not the terminal's — a
+        // monospaced titlebar reads as a mistake next to every other window.
+        #[cfg(target_os = "linux")]
+        {
+            let ui = title::desktop_font();
+            if let Some(face) = font::resolve_face(&ui.family, ui.style.as_deref()) {
+                renderer.set_chrome_font(
+                    ghost_shaper::FontSet::single(face),
+                    font::style_weight(ui.style.as_deref()),
+                );
+            } else {
+                eprintln!(
+                    "ghost-ui: no font for the desktop's titlebar family {:?}; \
+                     window chrome will draw no text",
+                    ui.family
+                );
+            }
+        }
         // Keep the frost grain a fixed logical size on HiDPI.
         renderer.set_scale_factor(window.scale_factor() as f32);
         let edge = Self::window_edge(&window, !want_transparent, true);
@@ -2221,22 +2239,47 @@ impl Graphics {
         )
     }
 
-    /// The titlebar's background, read from the same desktop theme the CSD frame
-    /// we are replacing uses — so a ghost-framed window sits alongside the rest of
-    /// the desktop rather than beside it. Asked once, for the reason
+    /// The titlebar to draw over this window's content: its height, its colours
+    /// for the window's current focus, and the title.
+    ///
+    /// The colours come from the same desktop theme the CSD frame we are
+    /// replacing uses, so a ghost-framed window sits alongside the rest of the
+    /// desktop rather than beside it. Read once, for the reason
     /// [`frame_outline`](Self::frame_outline) explains.
+    fn titlebar(&self, title: &str, focused: bool) -> ghost_ui_core::frame::Titlebar {
+        let (bg, fg) = Self::titlebar_colors(focused);
+        ghost_ui_core::frame::Titlebar {
+            height_px: self.bar_px(),
+            bg,
+            fg,
+            title: title.to_string(),
+            font_px: title::desktop_font().px_size(self.window.scale_factor() as f32),
+        }
+    }
+
+    /// The desktop theme's headerbar background and title colour, for a focused
+    /// or backdropped window.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn titlebar_color(&self) -> ghost_render::scene::Rgba {
-        static BG: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
-        *BG.get_or_init(|| {
-            let c = sctk_adwaita::theme::ColorTheme::auto().active.headerbar;
-            [c.red(), c.green(), c.blue(), c.alpha()]
-        })
+    fn titlebar_colors(focused: bool) -> (ghost_render::scene::Rgba, ghost_render::scene::Rgba) {
+        static THEME: std::sync::OnceLock<[[[f32; 4]; 2]; 2]> = std::sync::OnceLock::new();
+        let t = THEME.get_or_init(|| {
+            let theme = sctk_adwaita::theme::ColorTheme::auto();
+            let rgba = |c: sctk_adwaita::theme::Color| [c.red(), c.green(), c.blue(), c.alpha()];
+            [
+                [
+                    rgba(theme.inactive.headerbar),
+                    rgba(theme.inactive.font_color),
+                ],
+                [rgba(theme.active.headerbar), rgba(theme.active.font_color)],
+            ]
+        });
+        let pair = t[usize::from(focused)];
+        (pair[0], pair[1])
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn titlebar_color(&self) -> ghost_render::scene::Rgba {
-        [0.0, 0.0, 0.0, 1.0]
+    fn titlebar_colors(_focused: bool) -> (ghost_render::scene::Rgba, ghost_render::scene::Rgba) {
+        ([0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0])
     }
 
     /// Re-decide the window edge after something it depends on moved: the window
@@ -2621,6 +2664,11 @@ struct WindowState {
     /// double/triple clicks, and the running click count.
     last_click: Option<(Instant, PointerButton, PointPx)>,
     click_count: u8,
+    /// The window's title, as last set — the bar draws it, and the shell has to
+    /// keep it because the model hands it over as a command and forgets it.
+    title: String,
+    /// Whether the window has keyboard focus; the titlebar dims without it.
+    focused: bool,
     /// The resize edge the pointer was last over, so the cursor is put back when
     /// it leaves and a press knows which edge it is grabbing.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -3818,8 +3866,16 @@ impl App {
                     }
                 }
                 Cmd::SetTitle(t) => {
-                    if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
-                        gfx.window.set_title(&t);
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        if let Some(gfx) = w.gfx.as_ref() {
+                            gfx.window.set_title(&t);
+                        }
+                        // Our own titlebar draws it too, and a bar showing the
+                        // last window's title is worse than one showing none.
+                        if w.title != t {
+                            w.title = t;
+                            w.request_redraw();
+                        }
                     }
                 }
                 Cmd::OpenUrl(url) => open_url(&url),
@@ -5120,8 +5176,7 @@ impl App {
                         if !gfx.renderer.has_snapshot() {
                             let scene = ghost_ui_core::frame::with_titlebar(
                                 w.root.view(&self.states),
-                                gfx.bar_px(),
-                                gfx.titlebar_color(),
+                                &gfx.titlebar(&w.title, w.focused),
                             );
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
@@ -5226,6 +5281,8 @@ impl App {
                 root,
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                title: String::new(),
+                focused: true,
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -5717,6 +5774,8 @@ impl App {
                 root,
                 mods: ModifiersState::empty(),
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
+                title: String::new(),
+                focused: true,
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -6116,8 +6175,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let bar_px = gfx.bar_px();
                         let scene = ghost_ui_core::frame::with_titlebar(
                             scene,
-                            bar_px,
-                            gfx.titlebar_color(),
+                            &gfx.titlebar(&win.title, win.focused),
                         );
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
@@ -6344,6 +6402,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if !focused {
                         w.pointer_down = false;
                     }
+                    w.focused = focused;
                     w.pacer.request();
                 }
                 self.dispatch(id, UiEvent::Focus(focused), &fe);

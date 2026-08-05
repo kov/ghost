@@ -21,7 +21,7 @@ mod colr;
 mod text;
 
 pub use swash::FontRef;
-pub use text::{TextImage, TextStyle, paint_text};
+pub use text::{PlacedGlyph, TextImage, TextLayout, TextStyle, layout_text, paint_text};
 
 /// A glyph produced by shaping: the resolved glyph id, its horizontal advance
 /// in pixels, the positioning offset shaping gave it, and the byte offset of

@@ -2260,3 +2260,111 @@ fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
         "the top edge meets the titlebar and must stay clean"
     );
 }
+
+/// The bundled emoji subset — a *different* face from the chrome font, so a
+/// chrome-text test can prove the layout reaches for one when it must.
+const EMOJI: &[u8] =
+    include_bytes!("../../ghost-shaper/tests/assets/NotoColorEmoji-COLRv1-subset.ttf");
+
+/// Hands back the bundled emoji face for anything the chrome font lacks, exactly
+/// as the platform font database does at runtime.
+struct EmojiFallback(ghost_shaper::FontRef<'static>);
+
+impl ghost_shaper::Fallback for EmojiFallback {
+    fn face_for(&mut self, ch: char) -> Option<ghost_shaper::FontRef<'static>> {
+        ghost_shaper::covers(self.0, ch).then_some(self.0)
+    }
+}
+
+/// Render one chrome-text item on its own, returning the image and its box.
+fn chrome_text(text: &str, align: ghost_render::TextAlign) -> (Rendered, RectPx) {
+    let (w, h) = (400u32, 40u32);
+    let rect = RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: w as f32,
+        h: h as f32,
+    };
+    let scene = Scene {
+        size_px: (w, h),
+        layers: vec![Layer::new(
+            0,
+            vec![SceneItem::ChromeText {
+                id: SceneId::Titlebar,
+                rect,
+                text: text.into(),
+                color: [1.0, 1.0, 1.0, 1.0],
+                size_px: 20.0,
+                align,
+            }],
+        )],
+    };
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+    r.set_chrome_font(ghost_shaper::FontSet::single(font), None);
+    r.set_fallback(Box::new(EmojiFallback(
+        ghost_shaper::font_from_bytes(EMOJI).expect("emoji"),
+    )));
+    (r.present_offscreen(&scene, font, 15.0), rect)
+}
+
+/// The horizontal span of anything that differs from the background — read off
+/// a corner pixel, since the theme's background is not black.
+fn ink_span(img: &Rendered) -> Option<(u32, u32)> {
+    let bg = px(img, img.width - 1, 0);
+    let lit: Vec<u32> = (0..img.width)
+        .filter(|&x| (0..img.height).any(|y| px(img, x, y) != bg))
+        .collect();
+    Some((*lit.first()?, *lit.last()?))
+}
+
+#[test]
+fn chrome_text_is_laid_out_by_shaping_not_by_the_cell_grid() {
+    // The window's title is a sentence, not a terminal line. A character the
+    // chrome font has no glyph for must come from a face that does, at THAT
+    // face's advance — the grid path would give it a cell's width and the
+    // primary's `.notdef`.
+    let (plain, _) = chrome_text("AA", ghost_render::TextAlign::Left);
+    let (with_emoji, _) = chrome_text("A\u{1F92A}A", ghost_render::TextAlign::Left);
+    write_png("chrome-text.png", &with_emoji);
+
+    let (_, plain_end) = ink_span(&plain).expect("A A draws");
+    let (_, emoji_end) = ink_span(&with_emoji).expect("the emoji line draws");
+    assert!(
+        emoji_end > plain_end,
+        "the fallback glyph must take its own advance ({emoji_end} vs {plain_end})"
+    );
+
+    // And it keeps its own colours — the text colour is white, so anything
+    // non-grey is the emoji's.
+    let colored = (0..with_emoji.width)
+        .flat_map(|x| (0..with_emoji.height).map(move |y| (x, y)))
+        .map(|(x, y)| px(&with_emoji, x, y))
+        .any(|p| p[0].abs_diff(p[2]) > 24);
+    assert!(
+        colored,
+        "a color glyph in chrome text keeps its own colours"
+    );
+}
+
+#[test]
+fn centred_chrome_text_sits_in_the_middle_of_its_box() {
+    // The titlebar centres its title, which means the renderer has to measure
+    // the shaped run — the model cannot, it has no faces.
+    let (img, rect) = chrome_text("ghost", ghost_render::TextAlign::Center);
+    let (start, end) = ink_span(&img).expect("the title draws");
+    let mid = (start + end) as f32 * 0.5;
+    let box_mid = rect.x + rect.w * 0.5;
+    assert!(
+        (mid - box_mid).abs() <= 2.0,
+        "centred text should straddle the middle of its box ({mid} vs {box_mid})"
+    );
+
+    // Left-aligned, the same string starts at the box's left edge instead.
+    let (left, _) = chrome_text("ghost", ghost_render::TextAlign::Left);
+    let (left_start, _) = ink_span(&left).expect("the title draws");
+    assert!(
+        left_start < 4,
+        "left-aligned text starts at the box's edge, not {left_start}px in"
+    );
+}

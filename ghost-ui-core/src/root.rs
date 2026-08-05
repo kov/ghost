@@ -404,6 +404,7 @@ fn with_camera(mut scene: Scene, camera: Transform, chrome: f32) -> Scene {
                     SceneItem::Terminal { .. } | SceneItem::Badge { .. } => {}
                     SceneItem::Rect { color, .. }
                     | SceneItem::Text { color, .. }
+                    | SceneItem::ChromeText { color, .. }
                     | SceneItem::Border { color, .. } => color[3] *= chrome,
                 }
             }
