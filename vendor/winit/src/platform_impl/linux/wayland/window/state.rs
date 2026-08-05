@@ -216,6 +216,10 @@ pub struct WindowState {
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
     decoration_margins: DecorationMargins,
+    /// Whether the geometry has been inset from the surface at any point, so it
+    /// is no longer safe to let a geometry change wait for the next frame.
+    /// [vendored addition]
+    geometry_inset: bool,
 
     /// Whether the client side decorations have pending move operations.
     ///
@@ -262,6 +266,7 @@ impl WindowState {
             blur_top_radius: 0,
             blur_bottom_radius: 0,
             decoration_margins: DecorationMargins::NONE,
+            geometry_inset: false,
             compositor,
             connection,
             csd_fails: false,
@@ -385,6 +390,11 @@ impl WindowState {
 
         let stateless = Self::is_stateless(&configure);
 
+        // Whether the size below came from the compositor. It sizes the window
+        // *geometry*, which our margins sit outside of, so that one has to be
+        // inflated into the surface we actually paint; the fallbacks are surface
+        // sizes of ours already. [vendored addition]
+        let mut from_compositor = false;
         let (mut new_size, constrain) = if let Some(frame) = self.frame.as_mut() {
             // Configure the window states.
             frame.update_state(configure.state);
@@ -394,6 +404,7 @@ impl WindowState {
                     let (width, height) = frame.subtract_borders(width, height);
                     let width = width.map(|w| w.get()).unwrap_or(1);
                     let height = height.map(|h| h.get()).unwrap_or(1);
+                    from_compositor = true;
                     ((width, height).into(), false)
                 },
                 (..) if stateless => (self.stateless_size, true),
@@ -401,17 +412,23 @@ impl WindowState {
             }
         } else {
             match configure.new_size {
-                // The compositor sizes the window *geometry*, which our margins
-                // sit outside of — so the surface we have to paint is that much
-                // bigger. [vendored addition]
-                (Some(width), Some(height)) => (
-                    self.decoration_margins.inflate((width.get(), height.get()).into()),
-                    false,
-                ),
+                (Some(width), Some(height)) => {
+                    from_compositor = true;
+                    ((width.get(), height.get()).into(), false)
+                },
                 _ if stateless => (self.stateless_size, true),
                 _ => (self.size, true),
             }
         };
+        // Both branches, not just the undecorated one: an undecorated window
+        // still HAS a frame object here — hidden, subtracting no borders — so
+        // the branch above is the one it takes, and putting the inflate only in
+        // the other left the surface exactly the size the compositor asked the
+        // *window* to be. The window then came out a margin short of its own
+        // maximized or snapped area, with a band of dead surface down two edges.
+        if from_compositor {
+            new_size = self.decoration_margins.inflate(new_size);
+        }
 
         // Apply configure bounds only when compositor let the user decide what size to pick.
         if constrain {
@@ -798,12 +815,23 @@ impl WindowState {
 
             (frame.location(), frame.add_borders(self.size.width, self.size.height).into())
         } else {
-            // Our own margins run the other way to a frame's borders: the
-            // surface is bigger than the window, so the geometry is the inner
-            // rect. [vendored addition]
-            let m = self.decoration_margins;
-            ((m.left as i32, m.top as i32), m.deflate(self.size))
+            ((0, 0), self.size)
         };
+        // Our own margins run the other way to a frame's borders — the surface
+        // is bigger than the window, so the geometry is the inner rect — and
+        // they are applied on top of whatever the frame said. Not in the `else`
+        // alone: an UNDECORATED window still has a frame object, hidden, adding
+        // no borders, so that is the branch it takes. Left there, the geometry
+        // stayed the whole surface, the compositor never learned the window was
+        // smaller than it, and a maximize both fell a margin short of its own
+        // area and came back a margin bigger every time. Margins are only ever
+        // set while undecorated, so with a real frame this is a no-op.
+        // [vendored addition]
+        let m = self.decoration_margins;
+        let ((x, y), outer_size) = (
+            (x + m.left as i32, y + m.top as i32),
+            m.deflate(outer_size),
+        );
 
         // Reload the hint.
         self.reload_transparency_hint();
@@ -821,6 +849,17 @@ impl WindowState {
             // Set inner size without the borders.
             viewport.set_destination(self.size.width as _, self.size.height as _);
         }
+
+        // Geometry is double-buffered: without a commit it does not take effect
+        // until the next frame, and until then the compositor goes on believing
+        // the window is the whole surface. That only matters once the two can
+        // differ — but it matters just as much on the way back to equal, which
+        // is the transition a maximize makes. Left uncommitted, the compositor
+        // latched the surface as the size to restore to and every maximize round
+        // trip grew the window by the margin. [vendored addition]
+        if self.geometry_inset && self.is_configured() {
+            self.window.wl_surface().commit();
+        }
     }
 
     /// Keep `margins` logical pixels of surface outside the window proper — see
@@ -835,6 +874,7 @@ impl WindowState {
         // geometry and let the surface take the difference.
         let geometry = self.decoration_margins.deflate(self.size);
         self.decoration_margins = margins;
+        self.geometry_inset = true;
         self.resize(margins.inflate(geometry));
         self.size
     }

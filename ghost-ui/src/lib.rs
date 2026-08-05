@@ -2380,6 +2380,15 @@ impl Graphics {
         // the window was before the change and the window wears a band of dead
         // surface down the two edges the difference landed on.
         let surface = Self::shape_backdrop(&self.window, edge);
+        tracing::trace!(
+            target: "ghost::frame",
+            was = ?self.size(),
+            now = ?surface,
+            inner = ?self.window.inner_size(),
+            margins = ?edge.margins,
+            radius = edge.radius,
+            "edge refreshed"
+        );
         if let Some((w, h)) = surface
             && (w, h) != self.size()
             && w > 0
@@ -3489,8 +3498,18 @@ impl App {
         // Taking or dropping the shadow's margins resizes the surface with no
         // configure to announce it, so the size this event carried can already be
         // stale — the surface itself is the truth.
+        let event = (w_px, h_px);
         let (w_px, h_px) = surface.filter(|s| *s != (0, 0)).unwrap_or((w_px, h_px));
         let (w_px, h_px) = m.window((w_px, h_px));
+        tracing::trace!(
+            target: "ghost::frame",
+            ?event,
+            ?surface,
+            ?m,
+            bar,
+            model = ?(w_px, h_px.saturating_sub(bar).max(1)),
+            "model resized"
+        );
         self.dispatch(
             wid,
             UiEvent::Resize {
@@ -6426,6 +6445,7 @@ impl ApplicationHandler<UserEvent> for App {
                 else {
                     return;
                 };
+                tracing::trace!(target: "ghost::frame", ?size, "Resized");
                 self.resize_step(id, size.width.max(1), size.height.max(1), scale, &fe);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
