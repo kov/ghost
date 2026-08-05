@@ -30,6 +30,128 @@ pub fn bar_height_px(own_frame: bool, scale: f32) -> u32 {
     (BAR_HEIGHT * scale.max(0.0)).round() as u32
 }
 
+/// A window-control button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+impl WindowButton {
+    /// The glyph drawn in the button. Symbolic characters rather than an icon
+    /// set: the chrome font (with fallback) already covers them, and they are
+    /// the shapes every desktop uses for these three.
+    fn glyph(self, maximized: bool) -> &'static str {
+        match self {
+            WindowButton::Minimize => "\u{2212}",              // MINUS SIGN
+            WindowButton::Maximize if maximized => "\u{2750}", // UPPER RIGHT DROP-SHADOWED SQUARE
+            WindowButton::Maximize => "\u{25A1}",              // WHITE SQUARE
+            WindowButton::Close => "\u{2715}",                 // MULTIPLICATION X
+        }
+    }
+
+    fn name(spec: &str) -> Option<Self> {
+        match spec {
+            "minimize" => Some(WindowButton::Minimize),
+            "maximize" => Some(WindowButton::Maximize),
+            "close" => Some(WindowButton::Close),
+            // `appmenu`, `menu`, `icon`, `spacer`: nothing we draw.
+            _ => None,
+        }
+    }
+}
+
+/// Which buttons sit on which side of the titlebar. The desktop decides both
+/// the side and the order, and getting either wrong is the classic sign of a
+/// window that drew its own frame without asking.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ButtonLayout {
+    pub left: Vec<WindowButton>,
+    pub right: Vec<WindowButton>,
+}
+
+impl ButtonLayout {
+    /// Parse GNOME's `button-layout`: the two sides separated by a colon, each a
+    /// comma-separated list — `appmenu:minimize,maximize,close`. Entries that
+    /// name nothing we draw are dropped. A spec with no colon at all is all
+    /// left, as GNOME reads it.
+    pub fn parse(spec: &str) -> Self {
+        let spec = spec.trim().trim_matches('\'');
+        let (left, right) = spec.split_once(':').unwrap_or((spec, ""));
+        let side = |s: &str| {
+            s.split(',')
+                .map(str::trim)
+                .filter_map(WindowButton::name)
+                .collect()
+        };
+        ButtonLayout {
+            left: side(left),
+            right: side(right),
+        }
+    }
+
+    /// No buttons at all — a desktop that asked for none, or named only things
+    /// we do not draw.
+    pub fn is_empty(&self) -> bool {
+        self.left.is_empty() && self.right.is_empty()
+    }
+}
+
+/// Diameter of a window button, in logical pixels — libadwaita's.
+pub const BUTTON_SIZE: f32 = 24.0;
+/// Gap between adjacent buttons, and between the outermost one and the window
+/// edge, in logical pixels.
+pub const BUTTON_GAP: f32 = 6.0;
+
+/// Where each button goes in a `bar` strip at `scale`, left group then right.
+/// The right group is laid out from the window's right edge inwards, so the
+/// order reads left-to-right on screen either way.
+pub fn button_rects(layout: &ButtonLayout, bar: RectPx, scale: f32) -> Vec<(WindowButton, RectPx)> {
+    let size = BUTTON_SIZE * scale;
+    let gap = BUTTON_GAP * scale;
+    let y = bar.y + (bar.h - size) * 0.5;
+    let mut out = Vec::new();
+    for (i, b) in layout.left.iter().enumerate() {
+        out.push((
+            *b,
+            RectPx {
+                x: bar.x + gap + i as f32 * (size + gap),
+                y,
+                w: size,
+                h: size,
+            },
+        ));
+    }
+    let right_edge = bar.x + bar.w - gap;
+    let n = layout.right.len() as f32;
+    for (i, b) in layout.right.iter().enumerate() {
+        out.push((
+            *b,
+            RectPx {
+                x: right_edge - (n - i as f32) * size - (n - 1.0 - i as f32) * gap,
+                y,
+                w: size,
+                h: size,
+            },
+        ));
+    }
+    out
+}
+
+/// The button under `pos`, if any.
+pub fn button_at(
+    pos: PointPx,
+    layout: &ButtonLayout,
+    bar: RectPx,
+    scale: f32,
+) -> Option<WindowButton> {
+    button_rects(layout, bar, scale)
+        .into_iter()
+        .find(|(_, r)| r.contains(pos.x as f32, pos.y as f32))
+        .map(|(b, _)| b)
+}
+
 /// Everything the titlebar draws: its height and colours, and the title.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Titlebar {
@@ -41,6 +163,16 @@ pub struct Titlebar {
     pub title: String,
     /// Em size of the title, in physical px.
     pub font_px: f32,
+    /// Which buttons, on which side — the desktop's choice.
+    pub buttons: ButtonLayout,
+    /// The button under the pointer, drawn with its hover circle.
+    pub hovered: Option<WindowButton>,
+    /// The button being pressed, drawn deeper still.
+    pub pressed: Option<WindowButton>,
+    /// Whether the window is maximized, which changes the maximize glyph.
+    pub maximized: bool,
+    /// Scale, for sizing the buttons in physical px.
+    pub scale: f32,
 }
 
 /// The layer depth the titlebar draws at. Above everything the model builds:
@@ -77,14 +209,57 @@ pub fn with_titlebar(content: Scene, bar: &Titlebar) -> Scene {
         color: bar.bg,
         radius: 0.0,
     }];
+    let buttons = button_rects(&bar.buttons, strip, bar.scale);
     if !bar.title.is_empty() {
-        // Centred on the window, as every headerbar on this desktop is. The
-        // renderer measures the shaped run to place it — the model has no faces
-        // and could only guess.
+        // Centred between the button groups rather than on the window, so a
+        // title long enough to reach them stays clear of them — and a window
+        // with buttons on one side only still reads as centred in what is left.
+        let left = buttons
+            .iter()
+            .filter(|(b, _)| bar.buttons.left.contains(b))
+            .map(|(_, r)| r.x + r.w)
+            .fold(strip.x, f32::max);
+        let right = buttons
+            .iter()
+            .filter(|(b, _)| bar.buttons.right.contains(b))
+            .map(|(_, r)| r.x)
+            .fold(strip.x + strip.w, f32::min);
         items.push(SceneItem::ChromeText {
             id: SceneId::Titlebar,
-            rect: strip,
+            rect: RectPx {
+                x: left,
+                y: strip.y,
+                w: (right - left).max(0.0),
+                h: strip.h,
+            },
             text: bar.title.clone(),
+            color: bar.fg,
+            size_px: bar.font_px,
+            align: TextAlign::Center,
+        });
+    }
+    for (button, rect) in buttons {
+        // The circle only appears under the pointer, as libadwaita's do: three
+        // permanent discs in the corner of a terminal would be loud.
+        let shade = if bar.pressed == Some(button) {
+            Some(0.16)
+        } else if bar.hovered == Some(button) {
+            Some(0.09)
+        } else {
+            None
+        };
+        if let Some(alpha) = shade {
+            items.push(SceneItem::Rect {
+                id: SceneId::WindowButton,
+                rect,
+                color: [bar.fg[0], bar.fg[1], bar.fg[2], alpha],
+                radius: rect.h * 0.5,
+            });
+        }
+        items.push(SceneItem::ChromeText {
+            id: SceneId::WindowButton,
+            rect,
+            text: button.glyph(bar.maximized).into(),
             color: bar.fg,
             size_px: bar.font_px,
             align: TextAlign::Center,
@@ -209,7 +384,145 @@ mod tests {
             fg: [1.0, 1.0, 1.0, 1.0],
             title: "ghost".into(),
             font_px: 15.0,
+            buttons: ButtonLayout::default(),
+            hovered: None,
+            pressed: None,
+            maximized: false,
+            scale: 1.0,
         }
+    }
+
+    const BAR: RectPx = RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: 800.0,
+        h: 35.0,
+    };
+
+    #[test]
+    fn the_desktop_decides_which_buttons_and_on_which_side() {
+        // Both halves of `button-layout` matter: a window with its close button
+        // on the wrong side is the classic sign of an app that drew its own
+        // frame without asking the desktop.
+        let l = ButtonLayout::parse("'appmenu:minimize,maximize,close'");
+        assert_eq!(l.left, vec![]);
+        assert_eq!(
+            l.right,
+            vec![
+                WindowButton::Minimize,
+                WindowButton::Maximize,
+                WindowButton::Close
+            ]
+        );
+
+        // The other convention, and the order within a side is kept.
+        let l = ButtonLayout::parse("close,minimize,maximize:");
+        assert_eq!(
+            l.left,
+            vec![
+                WindowButton::Close,
+                WindowButton::Minimize,
+                WindowButton::Maximize
+            ]
+        );
+        assert!(l.right.is_empty());
+
+        // Entries naming things we do not draw are simply not drawn.
+        assert!(ButtonLayout::parse("appmenu:spacer").is_empty());
+    }
+
+    #[test]
+    fn the_right_hand_buttons_are_laid_out_from_the_right_edge_in() {
+        // Laid out in reading order but anchored to the right edge, so the
+        // close button is the outermost one and the group does not float.
+        let l = ButtonLayout::parse(":minimize,maximize,close");
+        let rects = button_rects(&l, BAR, 1.0);
+        assert_eq!(rects.len(), 3);
+        let xs: Vec<f32> = rects.iter().map(|(_, r)| r.x).collect();
+        assert!(xs[0] < xs[1] && xs[1] < xs[2], "reading order: {xs:?}");
+        assert_eq!(rects[0].0, WindowButton::Minimize);
+        assert_eq!(rects[2].0, WindowButton::Close);
+        let last = rects[2].1;
+        assert_eq!(
+            last.x + last.w,
+            BAR.w - BUTTON_GAP,
+            "the outermost button sits a gap from the edge"
+        );
+        // Vertically centred in the bar.
+        assert_eq!(last.y, (BAR.h - BUTTON_SIZE) * 0.5);
+    }
+
+    #[test]
+    fn the_left_hand_buttons_start_at_the_left_edge() {
+        let l = ButtonLayout::parse("close:");
+        let rects = button_rects(&l, BAR, 1.0);
+        assert_eq!(rects[0].1.x, BUTTON_GAP);
+    }
+
+    #[test]
+    fn a_click_finds_the_button_under_it() {
+        let l = ButtonLayout::parse(":minimize,close");
+        let rects = button_rects(&l, BAR, 1.0);
+        for (button, r) in &rects {
+            let mid = PointPx {
+                x: (r.x + r.w * 0.5) as f64,
+                y: (r.y + r.h * 0.5) as f64,
+            };
+            assert_eq!(button_at(mid, &l, BAR, 1.0), Some(*button));
+        }
+        // The empty stretch of bar is not a button.
+        assert_eq!(button_at(PointPx { x: 400.0, y: 17.0 }, &l, BAR, 1.0), None);
+    }
+
+    #[test]
+    fn only_the_button_under_the_pointer_wears_a_circle() {
+        // libadwaita's buttons are bare until hovered; three permanent discs in
+        // the corner of a terminal would be loud.
+        let discs = |hovered| {
+            let bar = Titlebar {
+                buttons: ButtonLayout::parse(":minimize,maximize,close"),
+                hovered,
+                ..titlebar(35)
+            };
+            with_titlebar(content(800, 565), &bar)
+                .layers
+                .iter()
+                .flat_map(|l| &l.items)
+                .filter(|i| {
+                    matches!(i, SceneItem::Rect { id, radius, .. }
+                        if *id == SceneId::WindowButton && *radius > 0.0)
+                })
+                .count()
+        };
+        assert_eq!(discs(None), 0, "no circles until the pointer is on one");
+        assert_eq!(discs(Some(WindowButton::Close)), 1, "and then exactly one");
+    }
+
+    #[test]
+    fn the_title_keeps_clear_of_the_buttons() {
+        // Centred between the groups, not on the window: a long title that
+        // reached the buttons would run under them.
+        let bar = Titlebar {
+            buttons: ButtonLayout::parse(":minimize,maximize,close"),
+            ..titlebar(35)
+        };
+        let scene = with_titlebar(content(800, 565), &bar);
+        let title = scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find(|i| matches!(i, SceneItem::ChromeText { id, .. } if *id == SceneId::Titlebar))
+            .expect("the title is drawn");
+        let leftmost_button = button_rects(&bar.buttons, BAR, 1.0)
+            .iter()
+            .map(|(_, r)| r.x)
+            .fold(f32::MAX, f32::min);
+        let r = title.rect();
+        assert!(
+            r.x + r.w <= leftmost_button,
+            "the title's box stops before the buttons ({} vs {leftmost_button})",
+            r.x + r.w
+        );
     }
 
     /// A stand-in for whatever the model drew, one layer with one item in it.

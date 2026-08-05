@@ -29,6 +29,9 @@
 
 mod bench;
 mod config;
+/// What the desktop says a window should look like (GNOME `gsettings`).
+#[cfg(target_os = "linux")]
+pub mod desktop;
 pub mod font;
 mod from_winit;
 mod groups;
@@ -2142,7 +2145,7 @@ impl Graphics {
         // monospaced titlebar reads as a mistake next to every other window.
         #[cfg(target_os = "linux")]
         {
-            let ui = title::desktop_font();
+            let ui = desktop::desktop_font();
             if let Some(face) = font::resolve_face(&ui.family, ui.style.as_deref()) {
                 renderer.set_chrome_font(
                     ghost_shaper::FontSet::single(face),
@@ -2246,14 +2249,20 @@ impl Graphics {
     /// replacing uses, so a ghost-framed window sits alongside the rest of the
     /// desktop rather than beside it. Read once, for the reason
     /// [`frame_outline`](Self::frame_outline) explains.
-    fn titlebar(&self, title: &str, focused: bool) -> ghost_ui_core::frame::Titlebar {
-        let (bg, fg) = Self::titlebar_colors(focused);
+    fn titlebar(&self, w: &WindowState) -> ghost_ui_core::frame::Titlebar {
+        let (bg, fg) = Self::titlebar_colors(w.focused);
+        let scale = self.window.scale_factor() as f32;
         ghost_ui_core::frame::Titlebar {
             height_px: self.bar_px(),
             bg,
             fg,
-            title: title.to_string(),
-            font_px: title::desktop_font().px_size(self.window.scale_factor() as f32),
+            title: w.title.clone(),
+            font_px: desktop::desktop_font().px_size(scale),
+            buttons: desktop::button_layout(),
+            hovered: w.hovered_button,
+            pressed: w.pressed_button,
+            maximized: self.window.is_maximized(),
+            scale,
         }
     }
 
@@ -2669,6 +2678,11 @@ struct WindowState {
     title: String,
     /// Whether the window has keyboard focus; the titlebar dims without it.
     focused: bool,
+    /// The titlebar button under the pointer, and the one a press landed on —
+    /// a button acts on RELEASE, and only if the pointer is still on it, so a
+    /// press dragged away is cancelled the way every toolkit's is.
+    hovered_button: Option<ghost_ui_core::frame::WindowButton>,
+    pressed_button: Option<ghost_ui_core::frame::WindowButton>,
     /// The resize edge the pointer was last over, so the cursor is put back when
     /// it leaves and a press knows which edge it is grabbing.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -4014,6 +4028,142 @@ impl App {
         edge.is_some()
     }
 
+    /// The titlebar strip of a window whose frame is ours, in window space.
+    /// `None` when the desktop draws the frame and there is no bar of ours.
+    #[cfg(target_os = "linux")]
+    fn bar_rect(&self, id: WindowId) -> Option<ghost_render::scene::RectPx> {
+        let gfx = self.windows.get(&id)?.gfx.as_ref()?;
+        let h = gfx.bar_px();
+        (h > 0).then(|| ghost_render::scene::RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: gfx.window.inner_size().width as f32,
+            h: h as f32,
+        })
+    }
+
+    /// Track which titlebar button the pointer is over, repainting when it
+    /// changes — the hover circle is the only thing that says a button is there.
+    #[cfg(target_os = "linux")]
+    fn track_bar_hover(&mut self, id: WindowId, pos: PointPx) {
+        let hovered = self.bar_rect(id).and_then(|bar| {
+            let scale = self.windows.get(&id)?.gfx.as_ref()?.window.scale_factor() as f32;
+            ghost_ui_core::frame::button_at(pos, &desktop::button_layout(), bar, scale)
+        });
+        if let Some(w) = self.windows.get_mut(&id)
+            && w.hovered_button != hovered
+        {
+            w.hovered_button = hovered;
+            w.request_redraw();
+        }
+    }
+
+    /// Act on a titlebar press: a button arms (it fires on release), and the bar
+    /// itself starts a window move, or performs the desktop's double-click
+    /// action, or opens the window menu.
+    ///
+    /// Returns whether the press was the bar's — the model never sees those.
+    #[cfg(target_os = "linux")]
+    fn press_on_bar(
+        &mut self,
+        id: WindowId,
+        pos: PointPx,
+        button: PointerButton,
+        clicks: u8,
+    ) -> bool {
+        let Some(bar) = self.bar_rect(id) else {
+            return false;
+        };
+        if !bar.contains(pos.x as f32, pos.y as f32) {
+            return false;
+        }
+        let Some(gfx) = self.windows.get(&id).and_then(|w| w.gfx.as_ref()) else {
+            return false;
+        };
+        let scale = gfx.window.scale_factor() as f32;
+        let on_button = ghost_ui_core::frame::button_at(pos, &desktop::button_layout(), bar, scale);
+        match button {
+            // The window menu is the right-click gesture on every desktop; the
+            // compositor draws it, so it is the compositor's to open.
+            PointerButton::Right => gfx
+                .window
+                .show_window_menu(PhysicalPosition::new(pos.x, pos.y)),
+            PointerButton::Left if on_button.is_some() => {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.pressed_button = on_button;
+                    w.request_redraw();
+                }
+            }
+            PointerButton::Left if clicks >= 2 => match desktop::double_click_action() {
+                desktop::DoubleClick::ToggleMaximize => {
+                    gfx.window.set_maximized(!gfx.window.is_maximized())
+                }
+                desktop::DoubleClick::Minimize => gfx.window.set_minimized(true),
+                desktop::DoubleClick::Menu => gfx
+                    .window
+                    .show_window_menu(PhysicalPosition::new(pos.x, pos.y)),
+                desktop::DoubleClick::None => {}
+            },
+            // Anywhere else on the bar drags the window. The compositor runs the
+            // move and keeps the pointer, so there is no release to wait for.
+            PointerButton::Left => {
+                let _ = gfx.window.drag_window();
+            }
+            PointerButton::Middle => {}
+        }
+        true
+    }
+
+    /// Act on a titlebar release: a button fires only if the pointer is still on
+    /// the one the press armed. Returns whether the release was the bar's.
+    #[cfg(target_os = "linux")]
+    fn release_on_bar(&mut self, id: WindowId, pos: PointPx, event_loop: &dyn Frontend) -> bool {
+        let Some(armed) = self.windows.get(&id).and_then(|w| w.pressed_button) else {
+            return false;
+        };
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.pressed_button = None;
+            w.request_redraw();
+        }
+        let still_on = self
+            .bar_rect(id)
+            .zip(self.windows.get(&id).and_then(|w| w.gfx.as_ref()))
+            .and_then(|(bar, gfx)| {
+                ghost_ui_core::frame::button_at(
+                    pos,
+                    &desktop::button_layout(),
+                    bar,
+                    gfx.window.scale_factor() as f32,
+                )
+            })
+            == Some(armed);
+        if still_on {
+            self.press_window_button(id, armed, event_loop);
+        }
+        true
+    }
+
+    /// Perform a window-control button.
+    #[cfg(target_os = "linux")]
+    fn press_window_button(
+        &mut self,
+        id: WindowId,
+        button: ghost_ui_core::frame::WindowButton,
+        event_loop: &dyn Frontend,
+    ) {
+        use ghost_ui_core::frame::WindowButton;
+        let Some(gfx) = self.windows.get(&id).and_then(|w| w.gfx.as_ref()) else {
+            return;
+        };
+        match button {
+            WindowButton::Minimize => gfx.window.set_minimized(true),
+            WindowButton::Maximize => gfx.window.set_maximized(!gfx.window.is_maximized()),
+            // The same path the frame's own close button took: closing is
+            // detaching, and the last window out shuts the app down.
+            WindowButton::Close => self.close_requested(id, event_loop),
+        }
+    }
+
     /// A window-space pointer position in the model's space — the window less our
     /// titlebar. `None` when the pointer is on the bar itself, which is chrome: the
     /// model has no coordinate for it, and letting one through as a negative row
@@ -5156,6 +5306,9 @@ impl App {
                 return;
             };
             let step = w.resize.note(now_ms, w_px, h_px, scale);
+            // Described before `gfx` is borrowed mutably below: the bar is read
+            // off both the window and the window's state.
+            let bar = w.gfx.as_ref().map(|g| g.titlebar(w));
             // A headless window has no surface to resize; the model still re-grids
             // below via the dispatched `Resize`.
             if let Some(gfx) = w.gfx.as_mut() {
@@ -5176,7 +5329,7 @@ impl App {
                         if !gfx.renderer.has_snapshot() {
                             let scene = ghost_ui_core::frame::with_titlebar(
                                 w.root.view(&self.states),
-                                &gfx.titlebar(&w.title, w.focused),
+                                bar.as_ref().expect("gfx implies a bar"),
                             );
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
@@ -5283,6 +5436,8 @@ impl App {
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 title: String::new(),
                 focused: true,
+                hovered_button: None,
+                pressed_button: None,
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -5501,6 +5656,16 @@ impl App {
     /// refcounted across windows. A session another window still drives or previews
     /// keeps its one live source (its driver downgraded to a mirror if this window was
     /// the driver and another only previews it).
+    /// The window was asked to close — by its own button, or by the desktop.
+    /// Closing is detaching: dropping the window drops its session clients and
+    /// the hosts keep the sessions running. The last window out shuts down.
+    fn close_requested(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
+        self.close_window(wid);
+        if self.windows.is_empty() {
+            self.shutdown(event_loop);
+        }
+    }
+
     fn close_window(&mut self, wid: WindowId) {
         self.windows.remove(&wid);
         let touched: Vec<String> = self
@@ -5776,6 +5941,8 @@ impl App {
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 title: String::new(),
                 focused: true,
+                hovered_button: None,
+                pressed_button: None,
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -6097,14 +6264,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let fe = WinitFrontend { event_loop };
         match event {
-            WindowEvent::CloseRequested => {
-                // Close = detach: dropping the window drops its session clients
-                // (the hosts keep the sessions running). Exit with the last one.
-                self.close_window(id);
-                if self.windows.is_empty() {
-                    self.shutdown(&fe);
-                }
-            }
+            WindowEvent::CloseRequested => self.close_requested(id, &fe),
             WindowEvent::Resized(size) => {
                 // Defer the costly relayout: capture + stretch-blit now, commit the
                 // real resize once the drag settles (see `resize_step`).
@@ -6140,6 +6300,7 @@ impl ApplicationHandler<UserEvent> for App {
                         win.render_trace.saw_redraw_event(now_ms);
                     }
                     // A headless window has no surface; there is nothing to paint.
+                    let bar = win.gfx.as_ref().map(|g| g.titlebar(win));
                     let Some(gfx) = win.gfx.as_mut() else {
                         return;
                     };
@@ -6175,7 +6336,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let bar_px = gfx.bar_px();
                         let scene = ghost_ui_core::frame::with_titlebar(
                             scene,
-                            &gfx.titlebar(&win.title, win.focused),
+                            bar.as_ref().expect("gfx implies a bar"),
                         );
                         let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
@@ -6426,6 +6587,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.track_frame_edge(id) {
                     return;
                 }
+                #[cfg(target_os = "linux")]
+                self.track_bar_hover(id, pos);
                 self.dispatch(
                     id,
                     UiEvent::Pointer {
@@ -6456,6 +6619,26 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                     }
+                    // Counted once, before anything can consume the press: the
+                    // titlebar's double-click needs the same count the model
+                    // would have seen, and counting again below would make every
+                    // click on the bar a double one.
+                    let Some((clicks, pos, mods)) = self.windows.get_mut(&id).map(|w| {
+                        let clicks = if pressed { w.count_click(b) } else { 1 };
+                        (clicks, w.pointer_pos, from_winit::mods(w.mods))
+                    }) else {
+                        return;
+                    };
+                    // The titlebar is chrome: its presses drive the window, not
+                    // the model, and its buttons fire on release.
+                    #[cfg(target_os = "linux")]
+                    if pressed {
+                        if self.press_on_bar(id, pos, b, clicks) {
+                            return;
+                        }
+                    } else if self.release_on_bar(id, pos, &fe) {
+                        return;
+                    }
                     if let Some(w) = self.windows.get_mut(&id) {
                         w.pointer_down = pressed;
                     }
@@ -6463,12 +6646,6 @@ impl ApplicationHandler<UserEvent> for App {
                         PointerPhase::Press
                     } else {
                         PointerPhase::Release
-                    };
-                    let Some((clicks, pos, mods)) = self.windows.get_mut(&id).map(|w| {
-                        let clicks = if pressed { w.count_click(b) } else { 1 };
-                        (clicks, w.pointer_pos, from_winit::mods(w.mods))
-                    }) else {
-                        return;
                     };
                     let Some(pos) = self.in_content(id, pos) else {
                         return;

@@ -54,6 +54,8 @@ pub enum SceneId {
     Section(u8),
     /// The window's own titlebar, when ghost draws the decorations.
     Titlebar,
+    /// One of the titlebar's window-control buttons.
+    WindowButton,
 }
 
 /// Where a [`SceneItem::ChromeText`] sits in its box.
