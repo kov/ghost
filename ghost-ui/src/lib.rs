@@ -7069,8 +7069,10 @@ impl App {
     /// leaving it up makes an exited shell feel like a window that refuses to go away.
     /// Same choice function as a launch, so "something to return to" means the same in
     /// both directions (a detached session anywhere, local or on a connected host, or a
-    /// remembered session on a host that is away). With no window left this quits ghost,
-    /// exactly as closing the last window by hand does.
+    /// remembered session on a host that is away). With no window left this quits ghost
+    /// — intended, not incidental: exiting the shell in your only window with nothing
+    /// detached anywhere leaves ghost nothing to be, exactly as closing that window by
+    /// hand does.
     fn close_emptied_windows(&mut self, candidates: &[WindowId], ended: &str, fe: &dyn Frontend) {
         let emptied: Vec<WindowId> = candidates
             .iter()

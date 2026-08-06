@@ -5979,14 +5979,15 @@ mod tests {
     }
 
     #[test]
-    fn exiting_the_last_shell_shows_the_fleet_not_quit() {
+    fn exiting_the_last_shell_leaves_the_window_on_the_fleet() {
         // The window model never closes itself: whether an emptied window stays on the
-        // fleet or goes away is the shell's call, made from the whole world's listing.
+        // fleet or goes away (and, if it was the last one, takes the app with it) is
+        // the shell's call, made from the whole world's listing.
         let mut r = root(); // owns only alpha (foreground)
         let cmds = end_foreground(&mut r, "alpha");
         assert!(
             r.is_fleet(),
-            "no sessions left in the window -> fleet overview, not quit"
+            "no sessions left in the window -> fleet overview"
         );
         assert!(
             cmds.contains(&Cmd::ListSessions),
