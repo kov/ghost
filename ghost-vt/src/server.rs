@@ -408,6 +408,18 @@ fn run_host(
     let _lock = unsafe { OwnedFd::from_raw_fd(lock_fd) };
     // SAFETY: the listening socket the parent bound and passed with CLOEXEC cleared.
     let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
+    // Both arrived with CLOEXEC cleared — that is how they crossed the spawn
+    // `execv` — and both must stop here, because the next thing this process
+    // execs is the USER'S SHELL. An inherited lock is the damaging one: an flock
+    // lives on the open file description, so a dup in anything the user
+    // backgrounds (`nohup make &`) keeps the lock held after the host is gone,
+    // and a free lock is precisely how `session::list` knows a host died. The
+    // session would then list forever and its name could never be reused, since
+    // that same flock is `spawn`'s atomic "already exists" check. The listener
+    // would hand a stray process ghost's control channel. A self-upgrade
+    // deliberately re-clears both in `prepare_upgrade`, right before its exec.
+    let _ = set_cloexec_raw(listener_fd);
+    let _ = set_cloexec_raw(lock_fd);
     let HostArgs {
         handoff_version: _, // already checked against HANDOFF_VERSION above
         opts,
@@ -435,6 +447,21 @@ fn run_host(
     );
     let _ = std::fs::remove_dir_all(paths::session_dir(&opts.name));
     result.unwrap_or(1)
+}
+
+/// Re-arm `FD_CLOEXEC` on a raw fd, so it stops at this process.
+fn set_cloexec_raw(raw: RawFd) -> io::Result<()> {
+    // SAFETY: plain fcntl on a fd we own.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFD);
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Clear `FD_CLOEXEC` so a descriptor survives `execv` into the host process.
