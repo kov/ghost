@@ -332,26 +332,44 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
             "the remote descriptor must be discarded by the clean exit"
         );
 
-        // And so must the window: back in the fleet with no corpse to relaunch
-        // and no lingering membership — a clean exit leaves nothing behind.
-        let forgotten = pump_until(&mut app, &fe, &q, Duration::from_secs(60), |app| {
-            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
-            let root = app.root(wid).expect("window");
-            let scene = root.view(app.states());
-            root.is_fleet()
-                && !sees_tile(&scene, "ephemeral")
-                && !sees_text(&scene, "relaunch")
-                && !app
-                    .groups()
-                    .iter()
-                    .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral")))
+        // And so must the window: with its only session ended and nothing left to
+        // return to (here or on the host), it closes rather than waiting on a
+        // session the user themselves ended — the same rule a local exit follows.
+        let closed = pump_until(&mut app, &fe, &q, Duration::from_secs(60), |app| {
+            if let Some(wid) = app.window_ids().first().copied() {
+                app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            }
+            app.window_ids().is_empty()
         });
         assert!(
-            forgotten,
-            "a cleanly-exited remote session must be forgotten, not offered for \
-             relaunch; groups={:?} shows={:?}",
+            closed,
+            "the window must close once its only remote session exits; groups={:?} \
+             shows={:?}",
             app.groups(),
-            visible_text(&app.root(wid).expect("window").view(app.states()))
+            app.root(wid).map(|r| visible_text(&r.view(app.states())))
+        );
+        // No lingering membership, and no corpse a later fleet would offer to
+        // relaunch — a clean exit leaves nothing behind.
+        assert!(
+            !app.groups()
+                .iter()
+                .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral"))),
+            "a cleanly-exited remote session must not stay remembered: {:?}",
+            app.groups()
+        );
+        let group = app.mint_group();
+        let later = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+        for _ in 0..20 {
+            app.dispatch(later, UiEvent::SessionsChanged, &fe);
+            pump(&mut app, &fe, &q);
+        }
+        let scene = app.root(later).expect("window").view(app.states());
+        assert!(
+            !sees_tile(&scene, "ephemeral") && !sees_text(&scene, "relaunch"),
+            "a cleanly-exited remote session must not be offered for relaunch; \
+             shows={:?}",
+            visible_text(&scene)
         );
     });
 }

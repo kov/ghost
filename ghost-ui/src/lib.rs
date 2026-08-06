@@ -7092,11 +7092,30 @@ impl App {
             sessions.extend(r.iter().cloned());
         }
         sessions.retain(|s| s.name != ended);
-        if !matches!(
-            new_window_choice(&sessions, &self.groups),
-            StartupChoice::Spawn
-        ) {
+        // ...and out of the group memberships the choice weighs too, or a REMOTE
+        // session that just exited reads as "a member no listing names" — the shape of
+        // a host that is away — and the window would sit waiting for a session the user
+        // themselves ended. A remote transport merely dropping never gets here (it is
+        // held for reconnect, not ended), so an ended remote id is genuinely gone.
+        let mut groups = self.groups.clone();
+        for g in &mut groups {
+            g.members.retain(|m| m != ended);
+        }
+        if !matches!(new_window_choice(&sessions, &groups), StartupChoice::Spawn) {
             return;
+        }
+        // Forget the ended session for good before the window that remembered it goes:
+        // the membership sweep lives in the fleet, and the fleet is what we are about
+        // to close, so a stale member would otherwise outlive the window in
+        // `groups.toml` — and a remote one would send every later launch into a fleet
+        // waiting for a session that ended here.
+        if groups != self.groups {
+            groups::save(&groups);
+            self.groups = groups.clone();
+            let others: Vec<WindowId> = self.windows.keys().copied().collect();
+            for other in others {
+                self.dispatch(other, UiEvent::GroupsLoaded(groups.clone()), fe);
+            }
         }
         for wid in emptied {
             self.close_window(wid);

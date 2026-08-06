@@ -60,6 +60,9 @@ graphics). It is also a manager for every ghost session on the machine:
   cycles them. Open more windows with a new-window shortcut. Closing a window (or the
   `Close` menu item / `Cmd-W`) **detaches** its sessions rather than killing them —
   the hosts keep running, and the sessions reappear in the fleet as "detached".
+  Symmetrically: a new window starts a fresh session when there is nothing to return
+  to, and a window whose last session *exits* closes when there is nothing left to
+  return to (otherwise it drops to the fleet).
 - **Fleet view (`F9`)** — a grid of every session as a *live* preview: sessions this
   window drives stay fed, so their tiles keep updating; sessions elsewhere show their
   last state. Arrow keys / `Tab` move focus, `Enter` dives into a tile (adopting it
