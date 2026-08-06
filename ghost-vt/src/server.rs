@@ -111,6 +111,18 @@ const OBSERVER_MAX_PENDING: usize = 256 * 1024;
 /// and recognized by [`run_host_if_invoked`].
 const HOST_ARG: &str = "__host";
 
+/// Where a freshly spawned host finds its listening socket and its liveness lock.
+/// Fixed numbers, because the forked child moves them there itself (see
+/// [`daemonize_and_exec`]) rather than the launcher clearing CLOEXEC on the
+/// originals and leaking them to whatever else it may exec meanwhile. A
+/// self-upgrade does not use these — it re-execs in place and passes whatever
+/// numbers the live fds already have.
+const HOST_LISTENER_FD: RawFd = 3;
+const HOST_LOCK_FD: RawFd = 4;
+/// Where the child parks its copies while it re-numbers them, clear of stdio and
+/// of both target slots.
+const STAGING_FD: libc::c_int = 10;
+
 /// The hidden subcommand a self-upgrade runs on its target to read that binary's
 /// [`HANDOFF_VERSION`] before exec'ing onto it (see [`probe_handoff_version`]).
 /// Kept in sync with the `__handoff` clap subcommand in `ghost-cli`.
@@ -324,13 +336,21 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     // The host runs in a re-exec'd process (see `run_host_if_invoked`) so it gets
     // a fresh, single-threaded address space — what makes spawning safe from a
     // multithreaded process, and what sheds any inherited heap/fds. We hand it its
-    // state on argv: the bound listener fd and the held lock fd (both kept open
-    // across the exec by clearing CLOEXEC) and the serialized spawn options.
-    // Everything that allocates — capturing the cwd, serialization, building the
-    // argv `CString`s — happens here in the parent, *before* the fork, so the path
-    // from fork to `execv` touches only async-signal-safe syscalls.
-    clear_cloexec(&listener)?;
-    clear_cloexec(&lock)?;
+    // state on argv: the bound listener fd, the held lock fd, and the serialized
+    // spawn options. Everything that allocates — capturing the cwd, serialization,
+    // building the argv `CString`s — happens here in the parent, *before* the
+    // fork, so the path from fork to `execv` touches only async-signal-safe
+    // syscalls.
+    //
+    // Both fds stay CLOEXEC here and are re-numbered onto `HOST_LISTENER_FD` /
+    // `HOST_LOCK_FD` inside the forked child instead (`dup2` clears CLOEXEC on
+    // the copy it makes). Clearing it on the originals would open a window in
+    // THIS process — from here until the `lock`/`listener` drop below — in which
+    // any other thread that fork/execs inherits them: the GUI runs ssh workers on
+    // their own threads, and a long-lived `ssh` holding a session's flock keeps
+    // that session unprunable for the life of the connection. The window is
+    // microseconds wide and the failure is invisible at the point of damage, so
+    // it is closed by construction rather than by timing.
     let listener_fd = listener.as_raw_fd();
     let lock_fd = lock.as_raw_fd();
 
@@ -345,11 +365,13 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let exe_c = CString::new(exe.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
+    // The numbers on argv are where the child will PUT the fds, not where they sit
+    // in this process — the child re-numbers them just before the exec.
     let argv_owned = [
         exe_c.clone(),
         CString::new(HOST_ARG).expect("HOST_ARG has no NUL"),
-        CString::new(listener_fd.to_string()).expect("fd digits have no NUL"),
-        CString::new(lock_fd.to_string()).expect("fd digits have no NUL"),
+        CString::new(HOST_LISTENER_FD.to_string()).expect("fd digits have no NUL"),
+        CString::new(HOST_LOCK_FD.to_string()).expect("fd digits have no NUL"),
         CString::new(blob).expect("hex blob has no NUL"),
     ];
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
@@ -360,7 +382,7 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     // `listener`, and `lock` must outlive the call (the forked child reads them up
     // to the exec); they drop here in the parent. The parent dropping its `lock`
     // copy does not release the flock — the host's inherited copy keeps it held.
-    unsafe { daemonize_and_exec(&exe_c, &argv) }
+    unsafe { daemonize_and_exec(&exe_c, &argv, listener_fd, lock_fd) }
 }
 
 /// If this process was re-exec'd as a session host (`__host <fd> <blob>` on
@@ -2468,10 +2490,20 @@ fn effective_command(
 /// process (where a fork that ran arbitrary code could deadlock on an inherited
 /// lock). All the argv setup is done by the caller before the fork.
 ///
+/// `listener_fd` and `lock_fd` are still CLOEXEC in the caller and are placed on
+/// [`HOST_LISTENER_FD`]/[`HOST_LOCK_FD`] here, in the child — the only process
+/// that may see them without the flag.
+///
 /// # Safety
 /// `argv` must be NUL-terminated and its pointers (and `exe`) must stay valid for
-/// the duration of the call.
-unsafe fn daemonize_and_exec(exe: &CStr, argv: &[*const libc::c_char]) -> io::Result<()> {
+/// the duration of the call, and `listener_fd`/`lock_fd` must be open in the
+/// calling process.
+unsafe fn daemonize_and_exec(
+    exe: &CStr,
+    argv: &[*const libc::c_char],
+    listener_fd: RawFd,
+    lock_fd: RawFd,
+) -> io::Result<()> {
     match unsafe { libc::fork() } {
         -1 => return Err(io::Error::last_os_error()),
         0 => {}
@@ -2514,6 +2546,29 @@ unsafe fn daemonize_and_exec(exe: &CStr, argv: &[*const libc::c_char]) -> io::Re
                 libc::close(nfd);
             }
         }
+        // Put the listener and the lock where the host expects them. This is the
+        // only place either descriptor loses CLOEXEC, and it is a private copy in
+        // a process that is about to become the host — no other thread of the
+        // launcher can fork between the clearing and the exec, because there are
+        // no other threads here.
+        //
+        // Both are staged above the target numbers first: the sources may already
+        // BE `HOST_LISTENER_FD`/`HOST_LOCK_FD` in some other order, and a direct
+        // `dup2` would then close one while duplicating the other. `F_DUPFD`
+        // yields the copies with CLOEXEC cleared, and `dup2` clears it on the
+        // final slots too. Stdio is settled above, so nothing here can land on it.
+        let staged_listener = libc::fcntl(listener_fd, libc::F_DUPFD, STAGING_FD);
+        let staged_lock = libc::fcntl(lock_fd, libc::F_DUPFD, STAGING_FD);
+        if staged_listener < 0 || staged_lock < 0 {
+            libc::_exit(127);
+        }
+        if libc::dup2(staged_listener, HOST_LISTENER_FD) < 0
+            || libc::dup2(staged_lock, HOST_LOCK_FD) < 0
+        {
+            libc::_exit(127);
+        }
+        libc::close(staged_listener);
+        libc::close(staged_lock);
         // Replace this image with the host. Only returns on failure.
         libc::execv(exe.as_ptr(), argv.as_ptr());
         libc::_exit(127);
