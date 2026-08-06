@@ -5491,6 +5491,7 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let now_ms = self.now_ms();
+        let mut cost = None;
         let (step, display) = {
             let Some(w) = self.windows.get_mut(&wid) else {
                 return;
@@ -5521,6 +5522,11 @@ impl App {
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
+                            // The other half of a refresh cycle's cost: building and
+                            // rasterizing the crisp scene at the just-committed size.
+                            // That render IS what the drag then shows, so charging it
+                            // measures the whole of what a refresh costs here.
+                            let t0 = Instant::now();
                             let scene = ghost_ui_core::frame::with_frame(
                                 w.root.view(&self.states),
                                 bar.as_ref().expect("gfx implies a bar"),
@@ -5528,6 +5534,7 @@ impl App {
                             );
                             let font_px = size_px() * w.root.render_scale();
                             gfx.renderer.capture_snapshot(&scene, gfx.fonts, font_px);
+                            cost = Some(t0.elapsed());
                         }
                         gfx.resize(w_px, h_px);
                         gfx.blit_snapshot();
@@ -5555,7 +5562,12 @@ impl App {
                     event_loop,
                 );
             }
+            let t0 = Instant::now();
             self.resize_model(wid, cw, ch, cs, event_loop);
+            cost = Some(cost.unwrap_or_default() + t0.elapsed());
+        }
+        if let (Some(cost), Some(w)) = (cost, self.windows.get_mut(&wid)) {
+            w.resize.charge(cost.as_millis() as u64);
         }
     }
 
@@ -7258,7 +7270,7 @@ impl App {
         // to the next attached session (or the fleet), so the window lives on until
         // the user closes it. Windows are removed only on an explicit close.
         // Commit any interactive resize that has settled (drag paused/released) or
-        // hit its max refresh interval: drop the blit snapshot and dispatch
+        // come due for a refresh: drop the blit snapshot and dispatch
         // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred
         // while dragging. Its `Cmd::Redraw` then paints the crisp scene.
         let now_ms = self.now_ms();
@@ -7271,7 +7283,23 @@ impl App {
             if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
                 gfx.renderer.clear_snapshot();
             }
+            // Time it: what a refresh costs on this machine, with this many
+            // sessions, is what paces the next one (see `resize::COST_MULTIPLE`).
+            // The other half — re-rendering the crisp scene — is charged where the
+            // next deferred step captures it.
+            let t0 = Instant::now();
             self.resize_model(wid, cw, ch, cs, fe);
+            let relayout = t0.elapsed();
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.resize.charge(relayout.as_millis() as u64);
+                tracing::trace!(
+                    target: "ghost::frame",
+                    window = ?wid,
+                    relayout_us = relayout.as_micros(),
+                    interval_ms = w.resize.interval_ms(),
+                    "resize refresh",
+                );
+            }
         }
         // Release any paced repaint that the frame budget now allows. The loop
         // re-enters here every `POLL` (8 ms < the 16 ms budget), so a deferred
