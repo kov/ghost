@@ -9,7 +9,7 @@
 //! Only a *drag* — a rapid stream of resizes — is worth coalescing. An isolated
 //! resize (a maximize, a tiling snap, an un-maximize, or the very first grab of a
 //! drag) is applied immediately and crisply: deferring it buys nothing (there is
-//! no stream to collapse) and the stretch-blit + delayed surface/model resize only
+//! no stream to collapse) and the blit + delayed surface/model resize only
 //! shows a stale frame and can race the compositor's resize handshake. So
 //! [`ResizeCoalescer::note`] returns [`Step::CommitNow`] for an isolated resize and
 //! [`Step::Defer`] once resizes are streaming.
@@ -18,7 +18,7 @@
 //! to commit it via [`ResizeCoalescer::poll`]: once the drag settles (no new size
 //! for [`SETTLE_MS`]), or — during a long continuous drag — at most once per
 //! [`MAX_MS`], so the content still refreshes instead of freezing. Between commits
-//! the shell stretch-blits the last crisp frame (see the renderer's snapshot path),
+//! the shell blits the last crisp frame (see the renderer's snapshot path),
 //! a single textured quad that stays cheap no matter how many tiles are on screen.
 //!
 //! It is pure (driven by an external millisecond clock) so its behaviour is
@@ -31,7 +31,7 @@ pub const SETTLE_MS: u64 = 80;
 
 /// During a *continuous* drag (sizes never pause long enough to settle), commit a
 /// real relayout at least this often so the content keeps refreshing rather than
-/// staying frozen-stretched. Generous, so a normal quick resize never hits it.
+/// staying frozen. Generous, so a normal quick resize never hits it.
 pub const MAX_MS: u64 = 250;
 
 /// A resize counts as part of a drag only if it arrives within this long of the
@@ -49,7 +49,7 @@ pub enum Step {
     /// Apply the relayout now — this resize stands alone (maximize, snap,
     /// un-maximize, or a drag's first grab), so there is nothing to coalesce.
     CommitNow(Target),
-    /// A drag is streaming: stretch-blit and defer the relayout until [`poll`]
+    /// A drag is streaming: blit and defer the relayout until [`poll`]
     /// reports the gesture has settled.
     ///
     /// [`poll`]: ResizeCoalescer::poll

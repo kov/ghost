@@ -85,7 +85,7 @@ impl SurfaceTarget {
         Some((frame_tex, view))
     }
 
-    /// Stretch-blit the renderer's held resize snapshot onto the surface — immediate
+    /// Blit the renderer's held resize snapshot onto the surface, unstretched — immediate
     /// feedback during an interactive resize, skipping the relayout/re-raster. Returns
     /// `true` if it presented. `pre_present` runs just before the present.
     pub fn blit_snapshot(&mut self, renderer: &mut Renderer, pre_present: impl FnOnce()) -> bool {

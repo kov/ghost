@@ -1184,33 +1184,26 @@ fn an_animated_dive_camera_does_not_re_rasterize_surfaces_each_frame() {
     );
 }
 
-#[test]
-fn a_resize_blit_scales_the_snapshot_without_reshaping() {
-    // During an interactive resize the shell captures the last crisp scene to a
-    // texture and stretch-blits it to the changing surface, deferring the real
-    // relayout. The blit must reproduce the snapshot (scaled) yet re-shape and
-    // re-rasterize NOTHING — that cheapness is the whole reason it exists.
-    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
-    let mut r = Renderer::headless(Theme::default());
-
-    // Text (so shaping happens) over a full green backdrop (a deterministic
-    // colour to find after the stretch).
+/// The scene the resize-snapshot tests capture: text (so shaping happens) over a
+/// full opaque-green backdrop, a deterministic colour to find after the blit.
+fn snapshot_scene(w: u32, h: u32) -> Scene {
     let frame = {
-        let mut vt = Vt::new(20, 4); // 180x72 px at METRICS
+        let mut vt = Vt::new((w / 9) as usize, (h / 18) as usize);
         vt.feed_str("snapshot text => fn main() {}");
         layout_frame(&vt, METRICS)
     };
-    let mut scene = Scene::new((180, 72));
+    let rect = RectPx {
+        x: 0.0,
+        y: 0.0,
+        w: w as f32,
+        h: h as f32,
+    };
+    let mut scene = Scene::new((w, h));
     scene.layers.push(Layer::new(
         0,
         vec![SceneItem::Rect {
             id: SceneId::Root,
-            rect: RectPx {
-                x: 0.0,
-                y: 0.0,
-                w: 180.0,
-                h: 72.0,
-            },
+            rect,
             color: [0.0, 1.0, 0.0, 1.0], // opaque green
             radius: 0.0,
         }],
@@ -1220,18 +1213,77 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
         vec![SceneItem::Terminal {
             id: SceneId::Root,
             session: 0,
-            rect: RectPx {
-                x: 0.0,
-                y: 0.0,
-                w: 180.0,
-                h: 72.0,
-            },
+            rect,
             frame: std::rc::Rc::new(frame),
             selection: None,
             dim: false,
             damage: TermDamage::All,
         }],
     ));
+    scene
+}
+
+#[test]
+fn a_resize_blit_draws_the_snapshot_unstretched_over_the_background() {
+    // Mid-drag the shell blits the last crisp frame instead of relaying out. It
+    // must not STRETCH that frame: distorting every glyph is exactly what makes a
+    // quick resize look bad, and the distortion grows with the drag. Instead the
+    // snapshot is drawn 1:1, anchored at the content origin, over a clear to the
+    // theme background — so the text stays exactly as crisp as it was, and the
+    // area the window just grew into is plain background until the reflow lands.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+    let scene = snapshot_scene(180, 72);
+
+    // What that scene looks like rendered for real, at its own size: the pixels
+    // the blit has to reproduce untouched.
+    let crisp = r.render_offscreen_scene(&scene, font, 15.0);
+
+    // Capture it, then blit into a window twice as large in both axes.
+    r.capture_snapshot(&scene, font, 15.0);
+    let grown = r.blit_snapshot_offscreen(360, 144);
+    assert_eq!((grown.width, grown.height), (360, 144));
+
+    // 1:1 and anchored: the snapshot's own area is the crisp render, pixel for
+    // pixel. A stretch would blur every glyph edge here.
+    for y in 0..72 {
+        for x in 0..180 {
+            assert_eq!(
+                px(&grown, x, y),
+                px(&crisp, x, y),
+                "the blit must reproduce the snapshot unscaled at ({x}, {y})"
+            );
+        }
+    }
+
+    // Beyond it: the theme background, not a stretched green. Check both the
+    // strip to the right and the one below.
+    let bg = Theme::default().bg;
+    let is_bg = |p: [u8; 4]| p[0] == bg[0] && p[1] == bg[1] && p[2] == bg[2] && p[3] == 0xff;
+    for (x, y, what) in [
+        (270, 36, "right of"),
+        (90, 110, "below"),
+        (270, 110, "past"),
+    ] {
+        assert!(
+            is_bg(px(&grown, x, y)),
+            "{what} the snapshot must be the theme background, got {:?}",
+            px(&grown, x, y)
+        );
+    }
+
+    write_png("resize-blit-anchored.png", &grown);
+}
+
+#[test]
+fn a_resize_blit_clips_a_shrinking_window_without_reshaping() {
+    // During an interactive resize the shell captures the last crisp scene to a
+    // texture and blits it to the changing surface, deferring the real relayout.
+    // The blit must reproduce the snapshot yet re-shape and re-rasterize NOTHING
+    // — that cheapness is the whole reason it exists.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut r = Renderer::headless(Theme::default());
+    let scene = snapshot_scene(180, 72);
 
     // Capture the snapshot — one real render, which shapes the text.
     r.capture_snapshot(&scene, font, 15.0);
@@ -1239,9 +1291,9 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
     let shapes = r.shape_misses();
     assert!(shapes > 0, "capturing the snapshot shaped its runs");
 
-    // Stretch-blit it to 2x: reshape and re-render nothing.
-    let big = r.blit_snapshot_offscreen(360, 144);
-    assert_eq!((big.width, big.height), (360, 144));
+    // Blit it into a window shrunk to half: reshape and re-render nothing.
+    let small = r.blit_snapshot_offscreen(90, 36);
+    assert_eq!((small.width, small.height), (90, 36));
     assert_eq!(
         r.shape_misses(),
         shapes,
@@ -1253,13 +1305,14 @@ fn a_resize_blit_scales_the_snapshot_without_reshaping() {
         "a snapshot blit renders no surfaces"
     );
 
-    // The green backdrop survives the scaled blit: sample a lower row (the text
-    // is on row 0; rows 1..3 are blank, so the rect shows through there).
+    // Shrinking clips rather than squeezing: the top-left of the snapshot is
+    // still there at its own scale, green backdrop and all (the text is on row 0;
+    // rows 1..3 are blank, so the rect shows through lower down).
     let is_green = |p: [u8; 4]| p[0] < 0x40 && p[1] > 0xa0 && p[2] < 0x40;
     assert!(
-        is_green(px(&big, 180, 110)),
-        "the blit must reproduce the (scaled) snapshot, got {:?}",
-        px(&big, 180, 110)
+        is_green(px(&small, 45, 30)),
+        "the blit must reproduce the snapshot, got {:?}",
+        px(&small, 45, 30)
     );
 
     // A second blit at a different size is also free.

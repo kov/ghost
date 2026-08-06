@@ -2478,7 +2478,7 @@ impl Graphics {
         self.renderer.invalidate_foreground();
     }
 
-    /// Stretch-blit the renderer's held resize snapshot to the surface — immediate
+    /// Blit the renderer's held resize snapshot to the surface, unstretched — immediate
     /// feedback during an interactive resize, without the relayout/re-raster of a
     /// full scene render. Returns whether a frame actually landed (`false` if there is
     /// no snapshot or the surface acquire failed), so the caller paces honestly rather
@@ -2489,7 +2489,7 @@ impl Graphics {
         };
         let landed = s.blit_snapshot(&mut self.renderer, || self.window.pre_present_notify());
         if landed {
-            // What's on screen is the stretched snapshot, not a model scene; keep the
+            // What's on screen is the held snapshot, not a model scene; keep the
             // scene cache invalid so the eventual crisp commit always redraws.
             self.scene_cache.invalidate();
         }
@@ -2829,7 +2829,7 @@ struct WindowState {
     /// pipeline and classifies a foreground that stops presenting while its session
     /// keeps feeding. Inert unless `RUST_LOG=ghost::render=trace`.
     render_trace: rendertrace::RenderTrace,
-    /// Defers the costly relayout/reflow during an interactive resize, stretching
+    /// Defers the costly relayout/reflow during an interactive resize, blitting
     /// the last crisp frame in the meantime (see [`resize`]).
     resize: resize::ResizeCoalescer,
     /// Per-frame timing during animations, printed on dive end when
@@ -5479,7 +5479,7 @@ impl App {
     /// Handle one interactive resize step for window `wid`. An isolated resize
     /// (maximize / snap / un-maximize / a drag's first grab) is applied immediately
     /// and crisply; a rapid drag stream captures the crisp scene once, then
-    /// reconfigures the surface and stretch-blits that snapshot for cheap feedback,
+    /// reconfigures the surface and blits that snapshot for cheap feedback,
     /// deferring the expensive real resize (relayout/reflow/PTY-resize/re-raster) to
     /// `about_to_wait`, which commits it once the drag settles.
     fn resize_step(
@@ -5517,7 +5517,7 @@ impl App {
                         gfx.resize(cw, ch);
                     }
                     // A drag is streaming: capture the last crisp frame once, then
-                    // stretch-blit it cheaply until the gesture settles (the real
+                    // blit it cheaply until the gesture settles (the real
                     // resize is committed from `about_to_wait`).
                     resize::Step::Defer => {
                         if !gfx.renderer.has_snapshot() {
@@ -6446,7 +6446,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => self.close_requested(id, &fe),
             WindowEvent::Resized(size) => {
-                // Defer the costly relayout: capture + stretch-blit now, commit the
+                // Defer the costly relayout: capture + blit now, commit the
                 // real resize once the drag settles (see `resize_step`).
                 let Some(scale) = self
                     .windows
@@ -7258,7 +7258,7 @@ impl App {
         // to the next attached session (or the fleet), so the window lives on until
         // the user closes it. Windows are removed only on an explicit close.
         // Commit any interactive resize that has settled (drag paused/released) or
-        // hit its max refresh interval: drop the stretch-blit snapshot and dispatch
+        // hit its max refresh interval: drop the blit snapshot and dispatch
         // the real resize, whose relayout/reflow/PTY-resize/re-raster we deferred
         // while dragging. Its `Cmd::Redraw` then paints the crisp scene.
         let now_ms = self.now_ms();

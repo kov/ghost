@@ -1391,17 +1391,20 @@ struct WarmRequest {
 }
 
 /// The last fully-rendered scene, captured to a texture so an interactive resize
-/// can stretch-blit it to the changing surface instead of re-laying-out and
+/// can blit it to the changing surface instead of re-laying-out and
 /// re-rasterizing the whole window at every drag step — ruinous in the fleet view
 /// on a software rasterizer. Captured at the gesture's first resize event and
 /// dropped when it settles and a crisp scene is rendered.
 struct Snapshot {
     /// Kept alive for the bind group that samples it.
     _texture: wgpu::Texture,
-    /// Samples `_texture` with the linear sampler, for a smooth stretch.
+    /// Samples `_texture`. Drawn 1:1, so the sampler's filtering never kicks in.
     bind_group: wgpu::BindGroup,
     /// The captured pixel size (the surface size at capture time).
     size: (u32, u32),
+    /// The window background at capture time, premultiplied as a pass clear.
+    /// A window that grows mid-drag exposes this beyond the snapshot's edge.
+    bg: wgpu::Color,
 }
 
 /// Per-row instance offsets for a steady single view, so a damaged (banded)
@@ -1881,13 +1884,13 @@ pub struct Renderer {
     /// RGBA pipeline for kitty-graphics image quads (samples `.rgba`, unlike the
     /// glyph pipeline which reads the `.r` coverage atlas).
     image_pipeline: wgpu::RenderPipeline,
-    /// Blit pipeline for cached surface textures — like `image_pipeline` but with
-    /// the passthrough `fs_blit` (the texture is already premultiplied).
-    blit_pipeline: wgpu::RenderPipeline,
-    /// The blit pipeline with blending DISABLED, used to composite the foreground Surface
-    /// into a padded window: the swapchain is cleared to the theme background (the
-    /// border) and the Surface REPLACES the inset region rather than blending over it
-    /// (which would double-count a translucent background). See [`Self::present_scene`].
+    /// Blit pipeline for already-premultiplied textures — like `image_pipeline` but
+    /// with the passthrough `fs_blit`, and with blending DISABLED so the texels
+    /// REPLACE the destination. Composites the foreground Surface into a padded
+    /// window (the swapchain is cleared to the theme background — the border — and
+    /// the Surface replaces the inset region rather than blending over it, which
+    /// would double-count a translucent background), and draws the resize snapshot
+    /// over its background clear. See [`Self::present_scene`].
     blit_replace_pipeline: wgpu::RenderPipeline,
     /// The glyph pipeline with blending DISABLED (`blend: None` ⇒ the fragment replaces
     /// the destination). A banded update draws one background-coloured quad with it to
@@ -1944,11 +1947,12 @@ pub struct Renderer {
     /// one-quad-per-draw instance buffer they index.
     image_draws: Vec<ImageDraw>,
     image_instances: Option<wgpu::Buffer>,
-    /// Linear sampler for the resize snapshot blit, so stretching the last crisp
-    /// frame while dragging looks smooth (the glyph/surface sampler is nearest).
+    /// Linear sampler for the resize snapshot blit. The blit is 1:1, so this
+    /// only matters if the device scale changes mid-drag (the glyph/surface
+    /// sampler is nearest).
     linear_sampler: wgpu::Sampler,
     /// The crisp scene captured for an in-flight interactive resize, if any (see
-    /// [`Snapshot`]); stretch-blitted each drag step until the resize commits.
+    /// [`Snapshot`]); blitted each drag step until the resize commits.
     snapshot: Option<Snapshot>,
     /// The single full-surface quad that blits `snapshot`, reused across steps.
     snapshot_instances: Option<wgpu::Buffer>,
@@ -2020,8 +2024,8 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        // Linear, for the resize snapshot blit: stretching the last crisp frame to
-        // a different surface size reads smooth rather than blocky.
+        // Linear, for the resize snapshot blit: it draws 1:1, but a scale change
+        // mid-drag reads smooth rather than blocky.
         let linear_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("snapshot sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -2170,47 +2174,13 @@ impl Renderer {
                 cache: None,
             });
 
-        // The surface-blit pipeline: identical to the image pipeline but with the
-        // passthrough fragment, since a cached surface texture is already
-        // premultiplied (rendered through the glyph pipeline).
-        let blit_pipeline = gpu
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("blit pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Instance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &ATTRS,
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_blit"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-
         // The blit pipeline with blending OFF, so the foreground Surface's premultiplied
         // texels REPLACE the destination. Used when the foreground is inset by the window
         // padding: the swapchain is cleared to the theme background (the border), and the
         // Surface overwrites the inset — a plain "over" blit would double-count the
         // background in a translucent theme. With no padding it writes the whole window,
-        // identical to clearing transparent and blitting "over".
+        // identical to clearing transparent and blitting "over". The resize snapshot
+        // blits through it too, over its own background clear, for the same reason.
         let blit_replace_pipeline =
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2609,7 +2579,6 @@ impl Renderer {
             bind_layout,
             sampler,
             image_pipeline,
-            blit_pipeline,
             blit_replace_pipeline,
             erase_pipeline,
             surfaces: HashMap::new(),
@@ -5346,12 +5315,12 @@ impl Renderer {
         }
     }
 
-    /// Capture `scene` to a texture so an interactive resize can stretch-blit it
-    /// (see [`Self::blit_snapshot_to_view`]) instead of re-laying-out and
+    /// Capture `scene` to a texture so an interactive resize can blit it (see
+    /// [`Self::blit_snapshot_to_view`]) instead of re-laying-out and
     /// re-rasterizing the whole window at every drag step. Renders the scene
-    /// exactly as the surface path would; the texture is kept (premultiplied, in
-    /// the surface format) and later sampled with linear filtering so the stretch
-    /// is smooth. Replaces any previously held snapshot.
+    /// exactly as the surface path would; the texture is kept premultiplied, in
+    /// the surface format, and later drawn 1:1. Replaces any previously held
+    /// snapshot.
     pub fn capture_snapshot<'f>(
         &mut self,
         scene: &Scene,
@@ -5400,10 +5369,20 @@ impl Renderer {
                     },
                 ],
             });
+        // `prepare_scene` above has just adopted this scene's app-set background
+        // (OSC 11), so this is the same colour the scene's own render cleared to.
+        let bg = self.frame_bg.unwrap_or(self.theme.bg);
+        let a = f64::from(self.theme.bg_alpha);
         self.snapshot = Some(Snapshot {
             _texture: texture,
             bind_group,
             size: (w, h),
+            bg: wgpu::Color {
+                r: f64::from(bg[0]) / 255.0 * a,
+                g: f64::from(bg[1]) / 255.0 * a,
+                b: f64::from(bg[2]) / 255.0 * a,
+                a,
+            },
         });
     }
 
@@ -5434,12 +5413,19 @@ impl Renderer {
     }
 
     /// Point the shared viewport uniform at the `w`×`h` blit target and (re)build
-    /// the single full-surface quad that samples the snapshot. No-op if no
-    /// snapshot is held.
+    /// the quad that draws the snapshot. No-op if no snapshot is held.
+    ///
+    /// The quad is the snapshot's OWN pixel size at the origin, not the target's:
+    /// the frame is drawn 1:1, anchored where the content is anchored. Stretching
+    /// it to the target instead would distort every glyph, and the distortion
+    /// grows with the drag — the worst thing to show while the user is dragging.
+    /// Unstretched, the text stays exactly as crisp as it was; the window merely
+    /// shows background where it has grown past the captured frame (and clips
+    /// where it has shrunk), which is close to what the reflow will land on.
     fn prepare_snapshot_blit(&mut self, w: u32, h: u32) {
-        if self.snapshot.is_none() {
+        let Some((sw, sh)) = self.snapshot.as_ref().map(|s| s.size) else {
             return;
-        }
+        };
         let uniforms = Uniforms {
             viewport: [w as f32, h as f32],
             _pad: [0.0, 0.0],
@@ -5448,7 +5434,7 @@ impl Renderer {
             .queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         let quad = [Instance {
-            rect: [0.0, 0.0, w as f32, h as f32],
+            rect: [0.0, 0.0, sw as f32, sh as f32],
             uv: [0.0, 0.0, 1.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
         }];
@@ -5462,11 +5448,14 @@ impl Renderer {
         );
     }
 
-    /// Clear to transparent, then blit the snapshot quad over the whole target.
-    /// The snapshot is premultiplied, so "over" transparent reproduces it exactly
-    /// (preserving a translucent theme's see-through background). Falls back to a
-    /// bare clear when no snapshot is held, so a stray call paints nothing rather
-    /// than reading an empty buffer.
+    /// Clear the target to the window background, then draw the snapshot quad
+    /// over it with blending OFF, so its premultiplied texels REPLACE the clear
+    /// rather than compositing over it — a translucent theme's see-through
+    /// background stays exactly as see-through as it was captured, instead of
+    /// being double-counted. Only where the window has grown past the captured
+    /// frame does the clear survive. Falls back to a transparent clear when no
+    /// snapshot is held, so a stray call paints nothing rather than reading an
+    /// empty buffer.
     fn encode_snapshot(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
         let mut encoder = self
             .gpu
@@ -5482,7 +5471,11 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Clear(
+                            self.snapshot
+                                .as_ref()
+                                .map_or(wgpu::Color::TRANSPARENT, |s| s.bg),
+                        ),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -5492,7 +5485,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let (Some(snap), Some(buf)) = (&self.snapshot, &self.snapshot_instances) {
-                pass.set_pipeline(&self.blit_pipeline);
+                pass.set_pipeline(&self.blit_replace_pipeline);
                 pass.set_bind_group(0, &snap.bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
@@ -5501,8 +5494,9 @@ impl Renderer {
         encoder.finish()
     }
 
-    /// Stretch-blit the captured snapshot to fill `view` (a window surface) at
-    /// `w`×`h`. Cheap — a single textured quad — so an interactive resize stays
+    /// Blit the captured snapshot into `view` (a window surface) at `w`×`h`,
+    /// unstretched over the window background (see [`Self::prepare_snapshot_blit`]).
+    /// Cheap — a single textured quad — so an interactive resize stays
     /// smooth regardless of how much content the window holds. The caller owns
     /// acquiring/presenting the surface texture. No-op if no snapshot is held.
     pub fn blit_snapshot_to_view(&mut self, view: &wgpu::TextureView, w: u32, h: u32) {
@@ -5512,15 +5506,15 @@ impl Renderer {
         self.prepare_snapshot_blit(w, h);
         let cb = self.encode_snapshot(view);
         self.gpu.queue.submit([cb]);
-        // Frost fresh at the blit target's resolution, so the grain stays crisp
-        // through a resize rather than stretching with the snapshot (or popping
-        // out until the drag commits). The snapshot is premultiplied over a
-        // transparent clear, so its see-through areas keep alpha < 1 for dest-over.
+        // Frost fresh at the blit target's resolution, so the grain covers the
+        // whole window rather than only the snapshot's area (or popping out until
+        // the drag commits). The snapshot's premultiplied texels replace the
+        // clear, so its see-through areas keep alpha < 1 for dest-over.
         self.apply_frost(view);
         self.apply_window_edge(view, (w, h));
     }
 
-    /// Stretch-blit the captured snapshot to a fresh `w`×`h` offscreen target and
+    /// Blit the captured snapshot to a fresh `w`×`h` offscreen target and
     /// read it back — the windowless counterpart of [`Self::blit_snapshot_to_view`]
     /// for tests and `ghost-shot`.
     pub fn blit_snapshot_offscreen(&mut self, w: u32, h: u32) -> Rendered {
