@@ -29,6 +29,7 @@ pub mod search;
 pub mod server;
 pub mod session;
 mod signals;
+pub mod systemd;
 pub mod terminfo;
 pub mod transport;
 pub mod watch;

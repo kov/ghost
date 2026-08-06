@@ -250,6 +250,16 @@ and `Ctrl-Tab` switches are instant.
 Sessions survive *disconnection*, never a *reboot of the machine running the
 session* (a PTY child cannot outlive its kernel).
 
+They survive a *logout* too, which on a systemd desktop takes more than
+daemonizing: processes are killed by their cgroup, and a host is born inside the
+launching app's scope, which is `PartOf=graphical-session.target`. So each host
+moves itself into a transient scope under `background.slice`, and ghost enables
+systemd lingering for the user (`loginctl disable-linger` to undo) so the user
+manager holding that slice outlives the last session. Both steps need no
+privilege and both are best-effort: without systemd, hosts simply behave as they
+did before — outliving their client, but not the login. See
+[`ghost-vt/src/systemd.rs`](ghost-vt/src/systemd.rs).
+
 The host and CLI client are single `poll()` loops. Signals are folded into them via
 a self-pipe — an installed handler writes each delivered signal's number to a pipe
 whose read end sits in the poll set — so the same code runs on Linux and macOS (no

@@ -273,6 +273,13 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     }
     paths::ensure_session_dir(&opts.name)?;
 
+    // A host outlives its client by design; make it outlive the *login* too. The
+    // host parks itself outside the graphical session once it is running (see
+    // `systemd::escape_graphical_session`), but that only survives a logout while
+    // the user's systemd manager does — which is what lingering buys. Best-effort
+    // and idempotent; see `systemd` for why neither half needs privilege.
+    crate::systemd::ensure_linger();
+
     // Acquire the session's lifetime lock. Held by the host across the fork+exec
     // and for its whole life (the kernel releases it on exit or crash), this lock
     // is the single source of truth for liveness: `session::list` prunes a
@@ -407,6 +414,13 @@ fn run_host(
         launch_dir,
         adopt,
     } = host_args;
+    // Get out of the launcher's app scope before doing anything else: it is
+    // `PartOf=graphical-session.target`, so until we move, a logout kills us
+    // however thoroughly we daemonized. A self-upgrade keeps its pid and so
+    // keeps its scope — there is nothing to escape on that path.
+    if adopt.is_none() {
+        crate::systemd::escape_graphical_session(&opts.name);
+    }
     // The name is the session's immutable identity: a rename only changes the
     // display-name label in `meta`, so files never move and cleanup always
     // targets the spawn-time directory. `lock_fd` is passed through so a
