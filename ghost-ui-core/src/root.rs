@@ -967,6 +967,14 @@ impl RootModel {
         matches!(&self.mode, Mode::Single { id, .. } if id == name)
     }
 
+    /// Whether this window is attached to no session at all — where a window lands
+    /// when its last session exits (and where a fleet window sits before it claims
+    /// anything). The shell reads it to decide whether an emptied window still has
+    /// anything to offer.
+    pub fn holds_nothing(&self) -> bool {
+        self.mine.is_empty()
+    }
+
     /// This window's `Single`-view foreground session id, or `None` in the fleet. The
     /// shell asserts a present shared state for exactly these (a `Single` window whose
     /// foreground state was reaped aborts in `drive`); a fleet window borrows its tiles'
@@ -1549,10 +1557,11 @@ impl RootModel {
             }
             return Vec::new();
         }
-        // The foreground session's child exited (the shell was quit). Exiting a
-        // shell never quits the app: switch to the next attached session, or drop
-        // to the fleet overview when this window has none left. (Standalone/test feed
-        // path; in the shell this is the fanned `SessionEnded` above.)
+        // The foreground session's child exited (the shell was quit): switch to the
+        // next attached session, or drop to the fleet overview when this window has
+        // none left. Whether an emptied window then closes is the shell's call — it is
+        // the half that knows what is left to return to. (Standalone/test feed path;
+        // in the shell this is the fanned `SessionEnded` above.)
         if let UiEvent::SessionData {
             name, ended: true, ..
         } = &ev
@@ -1963,11 +1972,14 @@ impl RootModel {
         cmds
     }
 
-    /// The foreground session's child exited. Exiting a shell never quits the
-    /// window: drop the dead session and switch to the next attached one — the
-    /// forward-cycle successor Ctrl-Tab would pick, reusing its already-attached
-    /// warm mirror — or, when the window has none left, fall back to the fleet
-    /// overview (which lists whatever sessions still exist, empty if none).
+    /// The foreground session's child exited: drop the dead session and switch to the
+    /// next attached one — the forward-cycle successor Ctrl-Tab would pick, reusing its
+    /// already-attached warm mirror — or, when the window has none left, fall back to
+    /// the fleet overview (which lists whatever sessions still exist, empty if none).
+    ///
+    /// The window itself never closes here: only the shell sees the whole world, and it
+    /// closes an emptied window when nothing anywhere is left to return to (the mirror
+    /// of a new window spawning a session in that same situation).
     fn foreground_ended(&mut self, sessions: &mut Sessions) -> Vec<Cmd> {
         let Mode::Single { id: gone, .. } = &self.mode else {
             return Vec::new();
@@ -5968,6 +5980,8 @@ mod tests {
 
     #[test]
     fn exiting_the_last_shell_shows_the_fleet_not_quit() {
+        // The window model never closes itself: whether an emptied window stays on the
+        // fleet or goes away is the shell's call, made from the whole world's listing.
         let mut r = root(); // owns only alpha (foreground)
         let cmds = end_foreground(&mut r, "alpha");
         assert!(

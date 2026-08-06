@@ -182,26 +182,28 @@ fn a_cleanly_exited_session_is_not_offered_for_relaunch() {
         // The user ends it from the keyboard.
         app.dispatch(wid, UiEvent::Text("\u{4}".into()), &fe);
 
-        // With nothing else to show, the window falls back to the fleet.
+        // With nothing else to show and nothing to return to, the window closes.
         assert!(
             wait_until(Duration::from_secs(10), || {
                 app.wake(&fe);
-                app.root(wid).expect("window").is_fleet()
+                app.root(wid).is_none()
             }),
-            "the window must fall back to the fleet once its only session exits; it shows: {:?}",
-            visible_text(&app.root(wid).expect("window").view(app.states()))
+            "the window must close once its only session exits; it shows: {:?}",
+            app.root(wid).map(|r| visible_text(&r.view(app.states())))
         );
 
-        // And that fleet must not remember the session as a relaunchable corpse.
+        // And no later fleet may remember the session as a relaunchable corpse.
+        let group = app.mint_group();
+        let fleet = app.open_fleet_window(&fe, group, None);
         assert!(
             wait_until(Duration::from_secs(5), || {
-                reconcile(&mut app, wid, &fe);
+                reconcile(&mut app, fleet, &fe);
                 app.wake(&fe);
-                let scene = app.root(wid).expect("window").view(app.states());
+                let scene = app.root(fleet).expect("window").view(app.states());
                 !sees_tile(&scene, "done-1") && !sees_text(&scene, "relaunch")
             }),
             "a cleanly-exited session must not be offered for relaunch; the fleet shows: {:?}",
-            visible_text(&app.root(wid).expect("window").view(app.states()))
+            visible_text(&app.root(fleet).expect("window").view(app.states()))
         );
         assert!(
             !app.groups()
@@ -477,5 +479,121 @@ fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
             "with nothing else to show, A falls back to the fleet"
         );
         support::kill_session("shared-1");
+    });
+}
+
+/// The mirror of "a new window with nothing detached spawns a session": when a
+/// window's last session exits and there is nothing to return to, the window has
+/// nothing to offer — an empty fleet is a dead end — so it closes. With no other
+/// window left, that quits ghost, exactly like closing it by hand.
+#[test]
+fn the_last_session_exiting_closes_the_window_when_nothing_is_attachable() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("solo-1", "echo solo-1 ready; exec cat");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "solo-1", group, None)
+            .expect("window");
+        app.wake(&fe);
+        assert!(
+            app.root(wid).expect("window").foregrounds("solo-1"),
+            "precondition: the window drives the session"
+        );
+
+        // The user ends it from the keyboard (Ctrl-D into `cat` == `exit`).
+        app.dispatch(wid, UiEvent::Text("\u{4}".into()), &fe);
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                app.wake(&fe);
+                app.window_ids().is_empty()
+            }),
+            "the window must close, not sit on an empty fleet; it shows: {:?}",
+            app.root(wid).map(|r| visible_text(&r.view(app.states())))
+        );
+        assert!(
+            fe.exited(),
+            "and with no window left, ghost quits — as it does when the last \
+             window is closed by hand"
+        );
+    });
+}
+
+/// The other half of the rule, symmetric with the new-window choice: a genuinely
+/// detached session IS something to return to, so the window stays open on the
+/// fleet where it can be reached.
+#[test]
+fn the_last_session_exiting_keeps_the_window_when_a_session_is_detached() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("quitter-1", "echo quitter-1 ready; exec cat");
+        spawn_session("elsewhere-1");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|i| i.name == "elsewhere-1" && !i.attached)
+            }),
+            "the other session never showed up as detached"
+        );
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "quitter-1", group, None)
+            .expect("window");
+        app.wake(&fe);
+        app.dispatch(wid, UiEvent::Text("\u{4}".into()), &fe);
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                app.wake(&fe);
+                app.root(wid).is_some_and(|r| r.is_fleet())
+            }),
+            "the window must fall back to the fleet, not close: {:?}",
+            app.root(wid).map(|r| visible_text(&r.view(app.states())))
+        );
+        assert!(!fe.exited(), "and ghost keeps running");
+        support::kill_session("elsewhere-1");
+    });
+}
+
+/// Closing an emptied window must not take the rest of the app with it: another
+/// window holding its own session keeps ghost alive.
+#[test]
+fn an_emptied_window_closes_alone_while_another_window_keeps_ghost_running() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("gone-a", "echo gone-a ready; exec cat");
+        support::spawn_session_running("stays-b", "echo stays-b ready; exec cat");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let ga = app.mint_group();
+        let a = app
+            .open_single_window(&fe, "gone-a", ga, None)
+            .expect("window A");
+        let gb = app.mint_group();
+        let b = app
+            .open_single_window(&fe, "stays-b", gb, None)
+            .expect("window B");
+        app.wake(&fe);
+
+        app.dispatch(a, UiEvent::Text("\u{4}".into()), &fe);
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                app.wake(&fe);
+                app.root(a).is_none()
+            }),
+            "A must close once its only session exits and nothing is attachable"
+        );
+        assert!(
+            app.root(b).is_some_and(|r| r.foregrounds("stays-b")),
+            "B keeps its own session"
+        );
+        assert!(!fe.exited(), "ghost stays running while a window remains");
+        support::kill_session("stays-b");
     });
 }

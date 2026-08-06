@@ -7036,6 +7036,19 @@ impl App {
             .filter(|(_, w)| w.root.views(name))
             .map(|(id, _)| *id)
             .collect();
+        // Only a window whose FOREGROUND this was can be emptied by its exit — a fleet
+        // window merely previewing it (or one the user opened with F9) is somewhere the
+        // user chose to be and must stay put. Noted before the fan, which is what moves
+        // those windows out of `Single`.
+        let foregrounding: Vec<WindowId> = viewers
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|w| w.root.foregrounds(name))
+            })
+            .collect();
         for wid in viewers {
             self.dispatch(
                 wid,
@@ -7046,6 +7059,51 @@ impl App {
             );
         }
         self.reconcile_source(name);
+        self.close_emptied_windows(&foregrounding, name, fe);
+    }
+
+    /// The mirror of [`open_launch_window`](Self::open_launch_window): a new window with
+    /// nothing to return to starts a session, so a window whose last session just exited
+    /// with nothing to return to closes. The fleet it fell back to would be empty — a
+    /// dead end offering neither a session to reattach nor anything to relaunch — and
+    /// leaving it up makes an exited shell feel like a window that refuses to go away.
+    /// Same choice function as a launch, so "something to return to" means the same in
+    /// both directions (a detached session anywhere, local or on a connected host, or a
+    /// remembered session on a host that is away). With no window left this quits ghost,
+    /// exactly as closing the last window by hand does.
+    fn close_emptied_windows(&mut self, candidates: &[WindowId], ended: &str, fe: &dyn Frontend) {
+        let emptied: Vec<WindowId> = candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|w| w.root.is_fleet() && w.root.holds_nothing())
+            })
+            .collect();
+        if emptied.is_empty() {
+            return;
+        }
+        // The same listing a launch weighs, minus the session that just ended: its host
+        // may still be tearing down, and a corpse listed as detached would read as
+        // something to return to.
+        let mut sessions = session::list().unwrap_or_default();
+        for r in self.remote_infos.values() {
+            sessions.extend(r.iter().cloned());
+        }
+        sessions.retain(|s| s.name != ended);
+        if !matches!(
+            new_window_choice(&sessions, &self.groups),
+            StartupChoice::Spawn
+        ) {
+            return;
+        }
+        for wid in emptied {
+            self.close_window(wid);
+        }
+        if self.windows.is_empty() {
+            self.shutdown(fe);
+        }
     }
 
     /// The once-per-wake work behind [`ApplicationHandler::about_to_wait`], taken
