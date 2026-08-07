@@ -383,13 +383,54 @@ pub struct TerminalView {
     /// idle-skip and per-session Surface both rely on. `RefCell` because `view` is
     /// `&self` (it runs at several call sites and must not need `&mut`).
     frame_memo: std::cell::RefCell<Option<(FrameKey, Rc<Frame>)>>,
+    /// The screen this view is frozen against, while a sticky (shift+drag)
+    /// selection is up — see [`Frozen`]. `None` = following the live session.
+    frozen: Option<Box<Frozen>>,
+    /// Bumped on every freeze and thaw, so the frame memo can never serve a
+    /// frozen frame to a live view (or the reverse): the frozen screen has its
+    /// own content version, unrelated to the session's.
+    freeze_epoch: u64,
+}
+
+/// A view frozen against a snapshot of its session's screen.
+///
+/// Selecting out of a program that repaints its screen in place — Claude Code's
+/// no-flicker mode is the case that forced this — cannot work by anchoring to
+/// content: what sits under the anchor is rewritten between the press and the
+/// release, and the program never leaves the live bottom, so there is no
+/// scrollback to anchor into either. So the gesture stops the *view* instead: a
+/// shift+press snapshots the screen, and the view renders, hit-tests and copies
+/// from that snapshot while the session keeps running underneath.
+///
+/// The snapshot is emulator state rather than a laid-out frame because scrolling
+/// keeps working inside the freeze — the view lays out new frames at new offsets
+/// from frozen content. Cloning is cheap in the way that matters: the kitty image
+/// store is shared (`Arc`), so what is copied is the cell grid.
+struct Frozen {
+    screen: screen::Screen,
+    /// Interaction since the last idle check — a freeze is let go only after
+    /// [`FREEZE_IDLE_MS`] without any.
+    touched: bool,
+    /// When the current idle stretch started, taken from the first
+    /// [`UiEvent::Tick`] after the last interaction. `None` until that tick
+    /// arrives (a pointer event carries no clock).
+    idle_since_ms: Option<u64>,
 }
 
 /// The inputs [`ghost_render::layout_frame_at`] depends on — the key for
 /// [`TerminalView`]'s frame memo. Two views/presents with an equal key produce a
 /// byte-identical frame, so the memo can hand back the same `Rc` and let
 /// `Rc::ptr_eq` stand in for a content compare.
-type FrameKey = (u64, CellMetrics, usize, f32);
+type FrameKey = (u64, u64, CellMetrics, usize, f32);
+
+/// How long a frozen view is kept without interaction before it lets go and
+/// snaps back to the live session. Long enough to read what you selected and
+/// switch windows to paste it, short enough that a freeze forgotten behind
+/// another window doesn't quietly stop showing output for the rest of the day.
+const FREEZE_IDLE_MS: u64 = 60_000;
+
+/// How often a frozen view checks its idle timer.
+const FREEZE_POLL_MS: u64 = 1_000;
 
 /// How long a synchronized-output hold may last before the scheduled tick
 /// releases it anyway. Generous for an atomic repaint burst, short enough that
@@ -1368,6 +1409,8 @@ impl TerminalView {
             hovered_link: None,
             trace: TermTrace::default(),
             frame_memo: std::cell::RefCell::new(None),
+            frozen: None,
+            freeze_epoch: 0,
         }
     }
 
@@ -1451,7 +1494,7 @@ impl TerminalView {
         if self.scroll_offset != 0 || self.scroll_frac != 0.0 {
             return None;
         }
-        let c = state.screen.vt().cursor();
+        let c = self.screen(state).vt().cursor();
         c.visible.then(|| {
             let row = c.row.min((state.rows as usize).saturating_sub(1));
             (row, c.col, ghost_vt::query::decscusr_digit(c.shape))
@@ -1466,7 +1509,7 @@ impl TerminalView {
         self.presented = Some(Presented {
             scroll: self.scroll_offset,
             scroll_frac: self.scroll_frac,
-            scrolled_off: state.screen.vt().lines_scrolled_off(),
+            scrolled_off: self.screen(state).vt().lines_scrolled_off(),
             selection: self.selection,
             size: self.size_px,
             zoom: self.zoom,
@@ -1493,6 +1536,108 @@ impl TerminalView {
             feed_dirty: self.feed_dirty,
             ..self.trace
         }
+    }
+
+    /// The screen this view draws, hit-tests and copies from: the frozen snapshot
+    /// while a sticky selection holds it, otherwise the live session's. Every read
+    /// that has to agree with what the user is *looking at* goes through here —
+    /// layout, selection projection, word/line/link hit-testing, the scroll clamp,
+    /// and the copy. Reads of how the *child* behaves (its key modes, mouse
+    /// protocol, bracketed paste, title, images) stay on the live state.
+    fn screen<'a>(&'a self, state: &'a SessionState) -> &'a screen::Screen {
+        match &self.frozen {
+            Some(f) => &f.screen,
+            None => &state.screen,
+        }
+    }
+
+    /// The maximum scroll-up offset in the screen being viewed (see
+    /// [`Self::screen`]) — the frozen snapshot's history while frozen.
+    fn max_scroll(&self, state: &SessionState) -> usize {
+        self.screen(state).vt().scrollback_len()
+    }
+
+    /// Freeze this view against the session's current screen, so a selection can
+    /// be made and kept against a screen that stops moving. A no-op when already
+    /// frozen: re-selecting inside a freeze must aim at the snapshot on screen,
+    /// not at a fresh one taken from output the user never saw.
+    fn freeze(&mut self, state: &SessionState) -> Vec<Cmd> {
+        if let Some(f) = self.frozen.as_mut() {
+            f.touched = true;
+            return Vec::new();
+        }
+        let mut screen = state.screen.clone();
+        // The snapshot is not where the child's cursor is any more — it is a
+        // still. Hide it in our private copy (DECTCEM), so the freeze doesn't
+        // draw a caret that has since moved on, the way scrolled-back does not.
+        screen.feed(b"\x1b[?25l");
+        self.frozen = Some(Box::new(Frozen {
+            screen,
+            touched: true,
+            idle_since_ms: None,
+        }));
+        self.freeze_epoch = self.freeze_epoch.wrapping_add(1);
+        self.view_slid = true;
+        vec![
+            Cmd::Redraw,
+            Cmd::ScheduleTick {
+                after_ms: FREEZE_POLL_MS,
+            },
+        ]
+    }
+
+    /// Let go of a frozen view: drop the snapshot and the selection made against
+    /// it (its rows index the snapshot's line space, not the session's) and
+    /// return to the live bottom, where the output that ran during the freeze is.
+    /// A no-op, with no commands, when nothing is frozen.
+    fn thaw(&mut self) -> Vec<Cmd> {
+        if self.frozen.take().is_none() {
+            return Vec::new();
+        }
+        self.freeze_epoch = self.freeze_epoch.wrapping_add(1);
+        self.selection = None;
+        self.sel_anchor = None;
+        self.scroll_offset = 0;
+        self.scroll_frac = 0.0;
+        self.view_slid = true;
+        vec![Cmd::Redraw]
+    }
+
+    /// Note interaction with a frozen view, restarting its idle timer.
+    fn touch_freeze(&mut self) {
+        if let Some(f) = self.frozen.as_mut() {
+            f.touched = true;
+            f.idle_since_ms = None;
+        }
+    }
+
+    /// Let go of a freeze left alone for [`FREEZE_IDLE_MS`], and keep polling
+    /// while one is up. Interaction since the last poll restarts the count.
+    fn freeze_tick(&mut self, now_ms: u64) -> Vec<Cmd> {
+        let Some(f) = self.frozen.as_mut() else {
+            return Vec::new();
+        };
+        if f.touched {
+            f.touched = false;
+            f.idle_since_ms = Some(now_ms);
+        }
+        let expired = f
+            .idle_since_ms
+            .is_some_and(|since| now_ms.saturating_sub(since) >= FREEZE_IDLE_MS);
+        if expired {
+            return self.thaw();
+        }
+        vec![Cmd::ScheduleTick {
+            after_ms: FREEZE_POLL_MS,
+        }]
+    }
+
+    /// Return to the live bottom, letting go of any freeze first — what typing,
+    /// pasting and an explicit scroll-to-bottom do.
+    fn go_live(&mut self, state: &SessionState) -> Vec<Cmd> {
+        let mut cmds = self.thaw();
+        cmds.extend(self.snap_to_bottom(state));
+        cmds
     }
 
     /// The selection projected into the current viewport for painting, clamped
@@ -1530,7 +1675,7 @@ impl TerminalView {
     /// monotonic lines-ever-scrolled-off space selections are anchored in.
     /// While parked between rows the window starts one line further up.
     fn abs_top(&self, state: &SessionState) -> usize {
-        (state.screen.vt().lines_scrolled_off() - self.scroll_offset)
+        (self.screen(state).vt().lines_scrolled_off() - self.scroll_offset)
             .saturating_sub(self.win_extra())
     }
 
@@ -1611,7 +1756,7 @@ impl TerminalView {
             // no present has drained (`redraw_owed`) — the debt rides with the model,
             // so even a tick that should have gone to the promoted view flushes it
             // once it arrives, rather than being lost to a cleared latch.
-            UiEvent::Tick { .. } => {
+            UiEvent::Tick { now_ms } => {
                 let mut cmds = if self.redraw_owed {
                     self.trace.redraws_emitted += 1;
                     vec![Cmd::Redraw]
@@ -1619,6 +1764,7 @@ impl TerminalView {
                     Vec::new()
                 };
                 cmds.extend(self.autoscroll_tick(state));
+                cmds.extend(self.freeze_tick(now_ms));
                 cmds
             }
             // A lone terminal ignores enumeration, subscription, and group
@@ -1693,7 +1839,7 @@ impl TerminalView {
     /// Physical-pixel rect of the text cursor, for positioning the IME candidate
     /// window. `None` while scrolled into history (no live cursor is shown).
     pub(crate) fn ime_cursor_area(&self, state: &SessionState) -> Option<RectPx> {
-        if self.scroll_offset != 0 || self.scroll_frac != 0.0 {
+        if self.frozen.is_some() || self.scroll_offset != 0 || self.scroll_frac != 0.0 {
             return None;
         }
         let (col1, row1) = state.screen.cursor();
@@ -1729,8 +1875,16 @@ impl TerminalView {
     /// the renderer the SAME allocation (an `Rc::ptr_eq` idle-skip / Surface hit). The
     /// key captures exactly [`layout_frame_at`]'s inputs, so a hit is byte-identical.
     fn memoized_frame(&self, state: &SessionState) -> Rc<Frame> {
+        // A frozen view lays out the snapshot, whose content never changes — so
+        // the key drops the session's live version (which would rebuild an
+        // identical frame on every feed) for the freeze epoch.
         let key: FrameKey = (
-            state.content_gen(),
+            if self.frozen.is_some() {
+                0
+            } else {
+                state.content_gen()
+            },
+            self.freeze_epoch,
             self.effective_metrics(),
             self.scroll_offset,
             self.scroll_frac,
@@ -1742,7 +1896,7 @@ impl TerminalView {
             return Rc::clone(frame);
         }
         let frame = Rc::new(layout_frame_at_px(
-            state.screen.vt(),
+            self.screen(state).vt(),
             self.effective_metrics(),
             self.scroll_offset,
             self.scroll_frac,
@@ -1771,9 +1925,31 @@ impl TerminalView {
             damage: self.damage(state),
         }];
         items.extend(self.hover_underlines(state));
+        items.extend(self.freeze_border(state, rect));
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer::new(0, items));
         scene
+    }
+
+    /// The frozen view's outline — the one cue that this window has stopped
+    /// following its session, so a freeze can never be mistaken for a hung
+    /// program. Drawn in the selection color, since the selection is what is
+    /// holding it. No text: the chrome text path doesn't shape at this size
+    /// (see `docs/`), and an outline reads at a glance anyway.
+    fn freeze_border(&self, state: &SessionState, rect: RectPx) -> Option<SceneItem> {
+        self.frozen.as_ref()?;
+        let [r, g, b] = state.theme.cursor;
+        Some(SceneItem::Border {
+            id: SceneId::Root,
+            rect,
+            color: [
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                0.9,
+            ],
+            width: (2.0 * self.render_scale()).max(1.0),
+        })
     }
 
     /// Thin underline rects over every visible run of the Ctrl/Cmd-hovered
@@ -1845,7 +2021,7 @@ impl TerminalView {
     /// sub-row fraction back to the row grid (every line-quantized motion
     /// lands aligned); returns whether the view actually moved.
     fn set_scroll(&mut self, state: &SessionState, offset: usize) -> bool {
-        let offset = offset.min(state.max_scroll());
+        let offset = offset.min(self.max_scroll(state));
         let changed = offset != self.scroll_offset || self.scroll_frac != 0.0;
         self.scroll_offset = offset;
         self.scroll_frac = 0.0;
@@ -1868,10 +2044,10 @@ impl TerminalView {
     /// stepping a row at a time. `Redraw` if the position moved.
     fn scroll_by_px(&mut self, state: &SessionState, dpx: f64) -> Vec<Cmd> {
         let lh = f64::from(self.effective_metrics().line_height);
-        let max_px = state.max_scroll() as f64 * lh;
+        let max_px = self.max_scroll(state) as f64 * lh;
         let cur = self.scroll_offset as f64 * lh + f64::from(self.scroll_frac);
         let target = (cur + dpx).clamp(0.0, max_px);
-        let offset = (target / lh).floor().min(state.max_scroll() as f64);
+        let offset = (target / lh).floor().min(self.max_scroll(state) as f64);
         let frac = (target - offset * lh) as f32;
         let offset = offset as usize;
         let changed = offset != self.scroll_offset || frac != self.scroll_frac;
@@ -1926,7 +2102,7 @@ impl TerminalView {
     /// viewport top lands at the top. The chord is always consumed; with no
     /// prompt to jump to the view just stays put.
     fn jump_to_prompt(&mut self, state: &SessionState, back: bool) -> Vec<Cmd> {
-        let vt = state.screen.vt();
+        let vt = self.screen(state).vt();
         let scrolled_off = vt.lines_scrolled_off();
         let top = scrolled_off - self.scroll_offset;
         let target = if back {
@@ -1985,11 +2161,24 @@ impl TerminalView {
                 None => Vec::new(),
             };
         }
+        // Escape dismisses a frozen view, the way it dismisses any transient
+        // mode, and is swallowed: while frozen the keyboard is not driving the
+        // program the user is looking at a snapshot of. Unfrozen it is the
+        // child's, untouched.
+        if self.frozen.is_some()
+            && matches!(key, Key::Named(NamedKey::Escape))
+            && !mods.ctrl
+            && !mods.alt
+            && !mods.sup
+        {
+            return self.thaw();
+        }
+        self.touch_freeze();
         if let Some(scroll) = self.scroll_key(state, key, mods) {
             let cmds = match scroll {
                 Scroll::By(d) => self.scroll_by(state, d),
                 Scroll::Top => {
-                    let top = state.max_scroll();
+                    let top = self.max_scroll(state);
                     if self.set_scroll(state, top) {
                         vec![Cmd::Redraw]
                     } else {
@@ -2041,9 +2230,10 @@ impl TerminalView {
                     kind,
                     alts,
                 ) {
-                    // Typing returns to the live bottom, then sends the keystroke.
+                    // Typing returns to the live bottom (letting go of a frozen
+                    // view), then sends the keystroke.
                     Some(bytes) => {
-                        let mut cmds = self.snap_to_bottom(state);
+                        let mut cmds = self.go_live(state);
                         cmds.extend(state.send(bytes));
                         cmds
                     }
@@ -2059,7 +2249,7 @@ impl TerminalView {
         if s.is_empty() {
             Vec::new()
         } else {
-            let mut cmds = self.snap_to_bottom(state);
+            let mut cmds = self.go_live(state);
             cmds.extend(state.send(s.as_bytes().to_vec()));
             cmds
         }
@@ -2082,7 +2272,7 @@ impl TerminalView {
         match text {
             Some(s) => {
                 let bytes = bracket_paste(s.as_bytes(), state.screen.vt().bracketed_paste());
-                let mut cmds = self.snap_to_bottom(state);
+                let mut cmds = self.go_live(state);
                 cmds.extend(state.send(bytes));
                 cmds
             }
@@ -2093,7 +2283,7 @@ impl TerminalView {
     fn copy(&self, state: &SessionState) -> Vec<Cmd> {
         match self.selection {
             Some(sel) => {
-                let text = selection_text(&state.screen, sel);
+                let text = selection_text(self.screen(state), sel);
                 if text.is_empty() {
                     Vec::new()
                 } else {
@@ -2175,7 +2365,10 @@ impl TerminalView {
         state.rows = rows;
         state.resize(cols, rows);
         // Reflow invalidates cell coordinates and the history view; drop any
-        // stale selection and return to the live bottom.
+        // stale selection and return to the live bottom. A frozen view goes with
+        // it: its snapshot is a screen of the pre-reflow geometry.
+        self.frozen = None;
+        self.freeze_epoch = self.freeze_epoch.wrapping_add(1);
         self.selection = None;
         self.sel_anchor = None;
         self.scroll_offset = 0;
@@ -2242,6 +2435,9 @@ impl TerminalView {
             // observer view must not, or a DECCOLM in the shared session would clobber
             // its unchanged window size.
             if outcome.grid_changed {
+                // The snapshot a freeze holds is a screen of the old geometry; a
+                // re-grid reflows out from under it, so let it go first.
+                cmds.extend(self.thaw());
                 self.selection = None;
                 self.sel_anchor = None;
                 self.scroll_offset = 0;
@@ -2252,47 +2448,54 @@ impl TerminalView {
                 }
             }
             let had_selection = self.selection.is_some();
-            // A primary↔alternate switch restarts the absolute line space the
-            // selection and the scroll offset are anchored in, so both name
-            // different content on the other side. Re-anchor to the live bottom of
-            // the buffer now showing. Unlike the live-bottom drop below this is
-            // *not* gated on `held`: a drag in flight is exactly the case that
-            // would otherwise carry primary-screen rows into the alternate buffer
-            // and copy whatever happens to sit there.
-            if outcome.buffer_switched {
-                self.selection = None;
-                self.sel_anchor = None;
-                self.scroll_offset = 0;
-                self.scroll_frac = 0.0;
-                self.view_slid = true;
-            }
-            // Keep a scrolled-up view pinned to its content: advance the offset by
-            // the gross lines that scrolled off the top this feed, clamped to
-            // retained history. At the bottom (offset 0) we just follow the live
-            // output. At the scrollback cap the offset can't grow to stay pinned, so
-            // the evicted lines slide the whole visible window while the offset stays
-            // put — force a full repaint the way a scroll does (see [`Self::damage`]).
-            if self.scroll_offset > 0 || self.scroll_frac > 0.0 {
-                let desired = self.scroll_offset + outcome.scrolled_off;
-                let capped = desired.min(state.max_scroll());
-                if capped < desired {
+            // Everything below reacts to the *live* screen moving — which is
+            // exactly what a frozen view is not showing. Its selection and scroll
+            // are anchored in the snapshot's line space, which no feed can touch,
+            // so leave both alone until it thaws. (Title, images and damage below
+            // still flow: they cost at most a repaint of an unchanged frame.)
+            if self.frozen.is_none() {
+                // A primary↔alternate switch restarts the absolute line space the
+                // selection and the scroll offset are anchored in, so both name
+                // different content on the other side. Re-anchor to the live bottom of
+                // the buffer now showing. Unlike the live-bottom drop below this is
+                // *not* gated on `held`: a drag in flight is exactly the case that
+                // would otherwise carry primary-screen rows into the alternate buffer
+                // and copy whatever happens to sit there.
+                if outcome.buffer_switched {
+                    self.selection = None;
+                    self.sel_anchor = None;
+                    self.scroll_offset = 0;
+                    self.scroll_frac = 0.0;
                     self.view_slid = true;
                 }
-                self.scroll_offset = capped;
-                // A sub-row fraction needs one more line above to slide in;
-                // at the cap there is none, so snap to the row grid.
-                if self.scroll_frac > 0.0 && self.scroll_offset >= state.max_scroll() {
-                    self.scroll_frac = 0.0;
+                // Keep a scrolled-up view pinned to its content: advance the offset by
+                // the gross lines that scrolled off the top this feed, clamped to
+                // retained history. At the bottom (offset 0) we just follow the live
+                // output. At the scrollback cap the offset can't grow to stay pinned, so
+                // the evicted lines slide the whole visible window while the offset stays
+                // put — force a full repaint the way a scroll does (see [`Self::damage`]).
+                if self.scroll_offset > 0 || self.scroll_frac > 0.0 {
+                    let desired = self.scroll_offset + outcome.scrolled_off;
+                    let capped = desired.min(state.max_scroll());
+                    if capped < desired {
+                        self.view_slid = true;
+                    }
+                    self.scroll_offset = capped;
+                    // A sub-row fraction needs one more line above to slide in;
+                    // at the cap there is none, so snap to the row grid.
+                    if self.scroll_frac > 0.0 && self.scroll_offset >= state.max_scroll() {
+                        self.scroll_frac = 0.0;
+                    }
                 }
-            }
-            // At the live bottom, new output replaces the viewport, so a
-            // viewport-relative selection no longer maps — drop it (unless a drag is
-            // live). While scrolled back, stay-put keeps the same content on screen,
-            // so the selection stays valid and is preserved. Dropping a visible
-            // highlight is itself a repaint even if no row's text changed.
-            if self.held.is_none() && self.scroll_offset == 0 && self.scroll_frac == 0.0 {
-                self.selection = None;
-                self.sel_anchor = None;
+                // At the live bottom, new output replaces the viewport, so a
+                // viewport-relative selection no longer maps — drop it (unless a drag is
+                // live). While scrolled back, stay-put keeps the same content on screen,
+                // so the selection stays valid and is preserved. Dropping a visible
+                // highlight is itself a repaint even if no row's text changed.
+                if self.held.is_none() && self.scroll_offset == 0 && self.scroll_frac == 0.0 {
+                    self.selection = None;
+                    self.sel_anchor = None;
+                }
             }
             let selection_dropped = had_selection && self.selection.is_none();
             // Reflect an OSC 0/2 window-title change to the shell, once per change.
@@ -2461,7 +2664,9 @@ impl TerminalView {
     /// local selection. Shift forces local selection even when the child grabs
     /// the mouse, as xterm does.
     fn report_to_app(&self, state: &SessionState, mods: Mods) -> bool {
-        state.mouse_active() && !mods.shift
+        // A frozen view is local-only: forwarding a pointer over a snapshot would
+        // hand the child coordinates for a screen the user is not looking at.
+        self.frozen.is_none() && state.mouse_active() && !mods.shift
     }
 
     /// 1-based `(col, row)` cell under a pointer position. Pointer coordinates are
@@ -2484,7 +2689,7 @@ impl TerminalView {
             usize::from(row1.saturating_sub(1)).min((state.rows as usize).saturating_sub(1));
         let row = self.grid_to_win_row(state, grid_row);
         let col = usize::from(col1.saturating_sub(1)).min((state.cols as usize).saturating_sub(1));
-        let vt = state.screen.vt();
+        let vt = self.screen(state).vt();
         let line = self.window_line(state, row)?;
         let id = line.cells().get(col)?.pen().link_id()?;
         let uri = vt.hyperlink(id)?;
@@ -2667,8 +2872,8 @@ impl TerminalView {
     /// line up while parked between rows). Row `0` while slid is the partial
     /// line peeking in at the top; the last row is fetched from the unslid
     /// view, whose bottom line the slid `view_at` no longer yields.
-    fn window_line<'a>(&self, state: &'a SessionState, row: usize) -> Option<&'a Line> {
-        let vt = state.screen.vt();
+    fn window_line<'a>(&'a self, state: &'a SessionState, row: usize) -> Option<&'a Line> {
+        let vt = self.screen(state).vt();
         let extra = self.win_extra();
         let rows = state.rows as usize;
         if extra == 1 && row == rows {
@@ -2737,6 +2942,7 @@ impl TerminalView {
         wheel: WheelDelta,
         clicks: u8,
     ) -> Vec<Cmd> {
+        self.touch_freeze();
         match phase {
             PointerPhase::Motion => {
                 let mut cmds = self.update_hover(state, pos, mods);
@@ -2789,11 +2995,31 @@ impl TerminalView {
                     return vec![Cmd::OpenUrl(url)];
                 }
                 self.held = Some(b);
+                // Shift+left is the sticky-selection gesture: stop the view on a
+                // snapshot so the selection can be made — and kept — against a
+                // screen that no longer moves. A plain left press is the dismiss:
+                // let go of the freeze and catch up with the live session before
+                // hit-testing, so the click lands on what the user now sees.
+                let mut pre = Vec::new();
+                if b == mouse::Button::Left {
+                    if mods.shift {
+                        pre = self.freeze(state);
+                    } else {
+                        pre = self.thaw();
+                    }
+                }
                 self.gesture_report = self.report_to_app(state, mods);
                 if self.gesture_report {
                     let cell = self.cursor_cell.unwrap_or((1, 1));
-                    let mut cmds =
-                        self.mouse_report(state, mouse::Kind::Press, Some(b), true, cell, mods);
+                    let mut cmds = pre;
+                    cmds.extend(self.mouse_report(
+                        state,
+                        mouse::Kind::Press,
+                        Some(b),
+                        true,
+                        cell,
+                        mods,
+                    ));
                     // A forwarded left-click still dismisses a stale local highlight.
                     if b == mouse::Button::Left && self.selection.take().is_some() {
                         cmds.push(Cmd::Redraw);
@@ -2830,13 +3056,15 @@ impl TerminalView {
                         });
                         self.selection = None;
                     }
-                    vec![Cmd::Redraw]
+                    pre.push(Cmd::Redraw);
+                    pre
                 } else if b == mouse::Button::Middle {
                     // Middle-click pastes the primary selection (the reply comes
                     // back as `ClipboardText`, like a normal paste).
-                    vec![Cmd::ReadPrimary]
+                    pre.push(Cmd::ReadPrimary);
+                    pre
                 } else {
-                    Vec::new()
+                    pre
                 }
             }
             PointerPhase::Release => {
@@ -2852,7 +3080,7 @@ impl TerminalView {
                 // A finalized local selection becomes the primary selection, so a
                 // middle-click elsewhere pastes it (X11/Wayland convention).
                 if let Some(sel) = self.selection {
-                    let text = selection_text(&state.screen, sel);
+                    let text = selection_text(self.screen(state), sel);
                     if !text.is_empty() {
                         cmds.push(Cmd::WritePrimary(text));
                     }
@@ -6048,6 +6276,203 @@ mod tests {
             key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
             vec![Cmd::WriteClipboard("L70\nL71\nL72\nL73".to_string())],
             "the copy runs from the anchored content to the pointer's row"
+        );
+    }
+
+    /// A pointer event carrying Shift — the sticky-selection gesture.
+    fn shift_ptr(phase: PointerPhase, button: Option<PointerButton>, x: f64, y: f64) -> UiEvent {
+        UiEvent::Pointer {
+            phase,
+            button,
+            pos: PointPx { x, y },
+            mods: Mods::SHIFT,
+            wheel: WheelDelta::NONE,
+            clicks: 1,
+        }
+    }
+
+    /// A complete shift+drag across row `y`, from `x0` to `x1`.
+    fn shift_drag(m: &mut TerminalModel, x0: f64, x1: f64, y: f64) {
+        m.update(shift_ptr(PointerPhase::Motion, None, x0, y));
+        m.update(shift_ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            x0,
+            y,
+        ));
+        m.update(shift_ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            x1,
+            y,
+        ));
+        m.update(shift_ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            x1,
+            y,
+        ));
+    }
+
+    fn tick_at(m: &mut TerminalModel, now_ms: u64) -> Vec<Cmd> {
+        m.update(UiEvent::Tick { now_ms })
+    }
+
+    /// Whether the drawn scene carries the frozen-view outline.
+    fn shows_freeze_border(m: &TerminalModel) -> bool {
+        m.view()
+            .layers
+            .iter()
+            .flat_map(|l| l.items.iter())
+            .any(|i| matches!(i, SceneItem::Border { .. }))
+    }
+
+    fn copy_text(m: &mut TerminalModel) -> Option<String> {
+        key(m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT)
+            .into_iter()
+            .find_map(|c| match c {
+                Cmd::WriteClipboard(t) => Some(t),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn a_shift_drag_freezes_the_view_against_new_output() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        assert!(m.selection().is_some(), "the shift+drag selected the line");
+        // A no-flicker TUI rewrites the row in place rather than scrolling: the
+        // live screen no longer holds the selected text at all.
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        assert_eq!(
+            top_row_text(&m),
+            "keep-this-line",
+            "the frozen snapshot is what the view keeps drawing"
+        );
+        assert_eq!(
+            copy_text(&mut m).as_deref(),
+            Some("keep-this-line"),
+            "and what a copy reads"
+        );
+        assert!(
+            shows_freeze_border(&m),
+            "a stopped view says so, so it is never read as a hung program"
+        );
+    }
+
+    #[test]
+    fn a_second_shift_drag_keeps_the_first_snapshot() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        // Re-selecting within the frozen view must not re-snapshot: what is on
+        // screen is what the user is aiming at.
+        shift_drag(&mut m, 1.0, 40.0, 1.0);
+        assert_eq!(top_row_text(&m), "keep-this-line");
+        assert_eq!(copy_text(&mut m).as_deref(), Some("keep-"));
+    }
+
+    #[test]
+    fn a_plain_click_clears_the_selection_and_goes_live() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        assert!(m.selection().is_none(), "the click dismissed the selection");
+        assert!(!shows_freeze_border(&m), "and the outline went with it");
+        assert_eq!(
+            top_row_text(&m),
+            "rewritten-line",
+            "and the view caught up with the output it missed"
+        );
+    }
+
+    #[test]
+    fn escape_ends_the_freeze_without_reaching_the_child() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        let cmds = key(&mut m, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "Escape dismisses the freeze instead of going to the child: {cmds:?}"
+        );
+        assert!(m.selection().is_none());
+        assert_eq!(top_row_text(&m), "rewritten-line");
+        // Unfrozen, Escape is the child's again.
+        let cmds = key(&mut m, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "Escape reaches the child when nothing is frozen: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn typing_ends_the_freeze_and_still_sends_the_key() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        let cmds = key(&mut m, Key::Char("x".into()), Mods::NONE);
+        assert!(
+            cmds.contains(&sent("alpha", b"x")),
+            "typing still types: {cmds:?}"
+        );
+        assert_eq!(top_row_text(&m), "rewritten-line");
+    }
+
+    #[test]
+    fn a_freeze_left_alone_times_out() {
+        let mut m = model();
+        feed(&mut m, b"keep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        feed(&mut m, b"\r\x1b[2Krewritten-line");
+        // Ticks while the freeze is fresh keep it.
+        tick_at(&mut m, 1_000);
+        assert_eq!(top_row_text(&m), "keep-this-line");
+        // Interaction pushes the deadline out.
+        m.update(shift_ptr(PointerPhase::Motion, None, 50.0, 1.0));
+        tick_at(&mut m, 1_000 + FREEZE_IDLE_MS);
+        assert_eq!(
+            top_row_text(&m),
+            "keep-this-line",
+            "the idle timer restarts on interaction"
+        );
+        tick_at(&mut m, 1_000 + 2 * FREEZE_IDLE_MS + 1);
+        assert_eq!(
+            top_row_text(&m),
+            "rewritten-line",
+            "a freeze left alone long enough lets go"
+        );
+        assert!(m.selection().is_none());
+    }
+
+    #[test]
+    fn a_frozen_view_reports_no_mouse_to_the_child() {
+        let mut m = model();
+        // The child grabs the mouse (any-motion tracking), as Claude Code does.
+        feed(&mut m, b"\x1b[?1003h\x1b[?1006hkeep-this-line");
+        shift_drag(&mut m, 1.0, 120.0, 1.0); // through the last cell of the text
+        let cmds = m.update(ptr(PointerPhase::Motion, None, 40.0, 20.0));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendInput { .. })),
+            "a frozen view is local-only: the child must not get coordinates for \
+             a screen the user is not looking at: {cmds:?}"
         );
     }
 
