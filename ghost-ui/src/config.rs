@@ -125,9 +125,9 @@ const MAX_PADDING: f32 = 200.0;
 /// Sane bounds for the configured initial grid; a value outside these clamps in
 /// (never 0 — a zero-size grid has no cells — and not so large it asks the
 /// compositor for an absurd window).
-const MIN_GRID: u16 = 1;
-const MAX_COLUMNS: u16 = 1000;
-const MAX_ROWS: u16 = 1000;
+pub(crate) const MIN_GRID: u16 = 1;
+pub(crate) const MAX_COLUMNS: u16 = 1000;
+pub(crate) const MAX_ROWS: u16 = 1000;
 
 /// The parsed `ui.toml`. Sections we don't read yet are ignored by serde.
 #[derive(Debug, Default, Deserialize)]

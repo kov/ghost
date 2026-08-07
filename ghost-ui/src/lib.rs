@@ -1582,8 +1582,11 @@ fn restore_plan(
             }
             Some(WindowPlan {
                 group,
-                cols: rec.cols,
-                rows: rec.rows,
+                // Held to the same range a configured grid is. What was saved is
+                // whatever the window last was, and a window can be dragged to —
+                // or a file can hold — a size no window should reopen as.
+                cols: rec.cols.clamp(config::MIN_GRID, config::MAX_COLUMNS),
+                rows: rec.rows.clamp(config::MIN_GRID, config::MAX_ROWS),
                 fleet: rec.fleet,
                 foreground: rec.foreground.clone(),
                 locals,
@@ -2224,11 +2227,18 @@ impl Graphics {
         let caps = surface.get_capabilities(&adapter);
         let format = choose_surface_format(&caps.formats);
         let win = window.inner_size();
+        // A window can open bigger than the device can allocate a texture for; the
+        // swapchain gives way rather than the process (see `presentable`).
+        let (sw, sh) = ghost_renderer::presentable(
+            win.width.max(1),
+            win.height.max(1),
+            device.limits().max_texture_dimension_2d,
+        );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: win.width.max(1),
-            height: win.height.max(1),
+            width: sw,
+            height: sh,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: choose_alpha_mode(
@@ -9463,6 +9473,29 @@ mod tests {
         assert!(w2.fleet);
         assert_eq!(w2.locals.len(), 1);
         assert!(w2.locals[0].dead, "gamma has no live session → relaunch");
+    }
+
+    #[test]
+    fn a_window_restores_to_a_grid_a_window_can_actually_be() {
+        // The saved grid is whatever the window last was, and a file is a file:
+        // it can hold a zero, or a number no display could ever be. A configured
+        // grid is clamped to a range a window can actually be — a restored one
+        // took a path around that clamp and was used verbatim.
+        let records = [
+            record("win-1", 125, 0, false, Some("alpha"), &["alpha"]),
+            record("win-2", 60000, 40, false, Some("beta"), &["beta"]),
+        ];
+        let sessions = [info("alpha", false), info("beta", false)];
+        let groups = [group("win-1", &["alpha"]), group("win-2", &["beta"])];
+
+        let plans = restore_plan(&records, &sessions, &groups);
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].rows >= 1, "no window is zero rows tall");
+        assert_eq!(plans[0].cols, 125, "a sane saved grid is left as it was");
+        assert!(
+            plans[1].cols <= config::MAX_COLUMNS,
+            "a saved grid cannot outrun the range a configured one is held to"
+        );
     }
 
     fn remote(sess: &str) -> String {

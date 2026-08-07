@@ -23,6 +23,26 @@ pub enum Target {
     Offscreen,
 }
 
+/// Hold a swapchain size to what the device can allocate a texture for.
+///
+/// A window can be bigger than that — a wall-sized or instrumented virtual
+/// display outruns the 8192 a software adapter offers — and configuring a
+/// surface past the limit is a validation error, which wgpu treats as fatal. A
+/// window that presents a smaller buffer than it is stretched by the compositor,
+/// which is a soft window; a window that aborts is no window.
+pub fn presentable(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    tracing::warn!(
+        target: "ghost::render",
+        requested = ?(w, h),
+        limit = max,
+        "window larger than the device can present; clamping the swapchain"
+    );
+    (w.clamp(1, max), h.clamp(1, max))
+}
+
 /// A configured window surface plus the handle state needed to reconfigure it when
 /// the swapchain is lost. Holds its own `Device` clone (cheap, `Arc`-backed).
 pub struct SurfaceTarget {
@@ -57,11 +77,13 @@ impl SurfaceTarget {
         (self.config.width, self.config.height)
     }
 
-    /// Reconfigure for a new physical size. A no-op on a zero dimension.
+    /// Reconfigure for a new physical size. A no-op on a zero dimension, and held
+    /// under what the device can allocate — see [`presentable`].
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
         }
+        let (w, h) = presentable(w, h, self.device.limits().max_texture_dimension_2d);
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
@@ -195,5 +217,25 @@ impl Target {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::presentable;
+
+    #[test]
+    fn a_window_the_device_can_present_is_left_alone() {
+        assert_eq!(presentable(1920, 1080, 8192), (1920, 1080));
+        assert_eq!(presentable(8192, 8192, 8192), (8192, 8192));
+    }
+
+    #[test]
+    fn a_window_wider_than_the_device_allows_is_held_to_the_limit() {
+        // Configuring a surface past the limit is a validation error, and wgpu
+        // treats those as fatal: unheld, an outsized display is not a stretched
+        // window but no window at all.
+        assert_eq!(presentable(20250, 1080, 8192), (8192, 1080));
+        assert_eq!(presentable(20250, 12000, 8192), (8192, 8192));
     }
 }

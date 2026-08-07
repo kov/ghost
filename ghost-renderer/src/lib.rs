@@ -14,7 +14,7 @@ use std::rc::Rc;
 use rayon::prelude::*;
 
 pub mod target;
-pub use target::{FrameOutcome, SurfaceTarget, Target};
+pub use target::{FrameOutcome, SurfaceTarget, Target, presentable};
 
 use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, CursorShape, Frame, Layer, PaletteOverrides, RectPx,
@@ -1505,11 +1505,42 @@ fn native_source_rect(frame: &Frame, rect: RectPx) -> RectPx {
 ///   reproduces the inline render byte-for-byte (background sliver past the last cell
 ///   included) and the very same Surface serves the foreground and, unchanged, the
 ///   slide's outgoing side — no re-raster across the role change.
-fn surface_src(frame: &Frame, rect: RectPx) -> RectPx {
-    if contain_scale(frame, rect) < 1.0 {
+fn surface_src(frame: &Frame, rect: RectPx, max_px: f32) -> RectPx {
+    let src = if contain_scale(frame, rect) < 1.0 {
         native_source_rect(frame, rect)
     } else {
         rect
+    };
+    fit_within(src, max_px)
+}
+
+/// Shrink `rect` uniformly, if it must, so neither side exceeds `max_px` — the
+/// largest texture the device will allocate.
+///
+/// Both ends of the size range reach past that limit. A rect whose shape is
+/// nothing like its frame's drives [`native_source_rect`]'s scale up by the axis
+/// that disagrees most and applies it to *both*, so a window dragged down to one
+/// row still showing a full-height session asks for a texture eighteen times
+/// wider than the session is, almost all of it letterbox. From the other
+/// direction, a display wider than the limit needs no scaling at all to be
+/// unallocatable. Either way `create_texture` fails validation, which wgpu
+/// treats as fatal — the size is not a big texture but a dead process.
+///
+/// So the resolution gives way first: the session rasters below native and the
+/// blit magnifies it, which costs sharpness in cases that are already degenerate
+/// (a window one row tall, a display no GPU here can hold a texture for).
+/// Uniform, so the contain-fit the blit reproduces is unchanged.
+fn fit_within(rect: RectPx, max_px: f32) -> RectPx {
+    let k = (max_px / rect.w.max(1.0))
+        .min(max_px / rect.h.max(1.0))
+        .min(1.0);
+    if k >= 1.0 {
+        return rect;
+    }
+    RectPx {
+        w: rect.w * k,
+        h: rect.h * k,
+        ..rect
     }
 }
 
@@ -2851,6 +2882,37 @@ impl Renderer {
         ((rect.w.ceil() as u32).max(1), (rect.h.ceil() as u32).max(1))
     }
 
+    /// The largest texture this device will allocate, in pixels. A request past
+    /// it is not a slow frame but a validation error wgpu treats as fatal, so
+    /// every size the renderer computes for a texture is held under it — see
+    /// [`fit_within`].
+    fn allocatable_size(&self, frame: &Frame, rect: RectPx) -> (u32, u32) {
+        let (w, h) = Self::surface_size(frame, rect);
+        self.allocatable(w, h)
+    }
+
+    fn max_texture_px(&self) -> f32 {
+        self.gpu.device.limits().max_texture_dimension_2d as f32
+    }
+
+    /// Hold a texture size the device can actually allocate, warning if it had to.
+    /// The clamps upstream should mean this never bites; it is here so that a size
+    /// arrived at by some path not yet found degrades to a stretched frame and a
+    /// log line rather than to an aborted process, and leaves the evidence.
+    fn allocatable(&self, w: u32, h: u32) -> (u32, u32) {
+        let max = self.gpu.device.limits().max_texture_dimension_2d;
+        if w <= max && h <= max {
+            return (w.max(1), h.max(1));
+        }
+        tracing::warn!(
+            target: "ghost::render",
+            requested = ?(w, h),
+            limit = max,
+            "texture larger than the device allows; clamping"
+        );
+        (w.clamp(1, max), h.clamp(1, max))
+    }
+
     /// The configured theme with `frame`'s app-set dynamic colors (OSC 10/11)
     /// substituted in — what every frame-scoped color resolution uses, so an
     /// app-recolored session paints its own defaults while the rest of the
@@ -3291,8 +3353,8 @@ impl Renderer {
         font: FontSet,
         size_px: f32,
     ) -> Surface {
-        let size = Self::surface_size(frame, rect);
-        let (tw, th) = size;
+        let (tw, th) = self.allocatable_size(frame, rect);
+        let size = (tw, th);
 
         // Full-size glyphs scaled to the texture (the same GPU minification the
         // inline path used), left at the texture origin; the blit applies the
@@ -4357,7 +4419,7 @@ impl Renderer {
                             // re-render every frame. The blit (below) carries the
                             // transform, so the terminal still moves/zooms; the texture
                             // stays put.
-                            let src = surface_src(frame, *rect);
+                            let src = surface_src(frame, *rect, self.max_texture_px());
                             let blit = self.ensure_surface(
                                 *session,
                                 frame,
@@ -5237,7 +5299,7 @@ impl Renderer {
         // Content-sized source (see `surface_src`): the Surface is exactly the inset
         // content size, so the blit into `dst` is 1:1. `ensure_surface` diffs the new
         // frame against the Surface's held frame and updates only the changed rows.
-        let src = surface_src(frame, dst);
+        let src = surface_src(frame, dst, self.max_texture_px());
         let win_key = (session, Self::surface_size(frame, src));
         // If the foreground Surface is stale (the last present drew a non-lone scene, so
         // this session's WINDOW-res texture missed intermediate feeds) or held a different
@@ -5328,8 +5390,7 @@ impl Renderer {
         size_px: f32,
     ) {
         let font = font.into();
-        let w = scene.size_px.0.max(1);
-        let h = scene.size_px.1.max(1);
+        let (w, h) = self.allocatable(scene.size_px.0, scene.size_px.1);
         let draws = self.prepare_scene(scene, font, size_px);
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("resize snapshot"),
@@ -6703,6 +6764,89 @@ mod tests {
             got, full,
             "a banded present must reproduce a full render of the frame"
         );
+    }
+
+    #[test]
+    fn a_session_far_taller_than_its_rect_asks_for_a_texture_the_device_allows() {
+        // A session renders at native resolution inside its rect, so the texture
+        // is the rect scaled by however much the frame had to shrink to fit. When
+        // the rect's shape is nothing like the frame's — a window dragged down to
+        // one row still showing a full-height session — that factor is set by the
+        // height and applied to the width too, and the texture goes off to
+        // thousands of pixels of pure letterbox. Past the device's limit that is
+        // not a big texture, it is `create_texture` failing validation and taking
+        // the process with it: the resize crash.
+        let max = 8192.0;
+        let f = frame(125, 18, "a session that outlives its window's height");
+        let rect = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 1125.0,
+            h: 18.0,
+        };
+        let src = surface_src(&f, rect, max);
+        let (tw, th) = Renderer::surface_size(&f, src);
+        assert!(
+            tw as f32 <= max && th as f32 <= max,
+            "asked for {tw}x{th}, over the device's {max}"
+        );
+        // Shrunk uniformly, so the blit still reproduces the same letterbox.
+        assert!(
+            (src.w / src.h - rect.w / rect.h).abs() < 0.01,
+            "the source rect keeps its aspect: {src:?} from {rect:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_larger_than_the_device_allows_still_renders() {
+        // The other end: a window wider than the device's maximum texture. Its
+        // surface is its on-screen rect 1:1, which cannot be allocated — so it
+        // gives way to what can be, rather than aborting.
+        let max = 8192.0;
+        let f = frame(200, 60, "a very wide display");
+        let rect = RectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 20000.0,
+            h: 1200.0,
+        };
+        let (tw, th) = Renderer::surface_size(&f, surface_src(&f, rect, max));
+        assert!(
+            tw as f32 <= max && th as f32 <= max,
+            "asked for {tw}x{th}, over the device's {max}"
+        );
+    }
+
+    #[test]
+    fn a_one_row_tile_of_a_tall_session_renders_instead_of_aborting() {
+        // The same thing through the real renderer, which is where it actually
+        // bit: an unallocatable texture is a validation error wgpu treats as
+        // fatal, so a failure here is the test binary dying, not an assert.
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+        let (w, h) = (1133u32, 61u32);
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![Layer::new(
+                0,
+                vec![SceneItem::Terminal {
+                    id: SceneId::Root,
+                    session: session_key("squashed"),
+                    rect: RectPx {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 1125.0,
+                        h: 18.0,
+                    },
+                    frame: std::rc::Rc::new(frame(125, 18, "still eighteen rows tall")),
+                    selection: None,
+                    dim: false,
+                    damage: TermDamage::All,
+                }],
+            )],
+        };
+        let mut r = Renderer::headless(Theme::default());
+        let _ = r.render_offscreen_scene(&scene, font, SIZE_PX);
+        assert_eq!(r.surface_renders(), 1, "the squashed session still rasters");
     }
 
     #[test]
