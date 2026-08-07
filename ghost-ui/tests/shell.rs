@@ -427,12 +427,26 @@ fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
         // Window B takes it over from its fleet — the same-process adopt-in-place.
         let g2 = app.mint_group();
         let b = app.open_fleet_window(&fe, g2, None);
-        reconcile(&mut app, b, &fe);
         // Sessions held by other windows hide behind a band ("N attached elsewhere ·
-        // show"), so reveal them first — the same two clicks the user makes.
-        let scene = app.root(b).expect("B").view(app.states());
-        let (sx, sy) = support::button_center(&scene, "show")
-            .unwrap_or_else(|| panic!("no reveal band: {:?}", visible_text(&scene)));
+        // show"), so reveal them first — the same two clicks the user makes. A's
+        // attachment reaches B's fleet through the session-meta push, which is not
+        // synchronous with A's attach: until it lands, B sees the session as merely
+        // detached and there is no band to click. Poll for it rather than assuming
+        // one reconcile carried it — under load it does not.
+        let mut reveal = None;
+        let revealed = wait_until(Duration::from_secs(5), || {
+            reconcile(&mut app, b, &fe);
+            app.wake(&fe);
+            let scene = app.root(b).expect("B").view(app.states());
+            reveal = support::button_center(&scene, "show");
+            reveal.is_some()
+        });
+        assert!(
+            revealed,
+            "no reveal band: {:?}",
+            visible_text(&app.root(b).expect("B").view(app.states()))
+        );
+        let (sx, sy) = reveal.expect("the band was found above");
         for ev in support::click_events(sx, sy) {
             app.dispatch(b, ev, &fe);
         }
