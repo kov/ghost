@@ -97,7 +97,9 @@ fn renders_ligature_line_to_image() {
     let bg = [16i32, 16, 18];
     let lit = img
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| {
             (i32::from(p[0]) - bg[0]).abs() > 12
                 || (i32::from(p[1]) - bg[1]).abs() > 12

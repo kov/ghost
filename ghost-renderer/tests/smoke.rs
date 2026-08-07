@@ -14,7 +14,7 @@ fn clears_to_solid_color_and_reads_back() {
     assert_eq!(img.width, 8);
     assert_eq!(img.height, 4);
     assert_eq!(img.rgba.len(), 8 * 4 * 4);
-    for px in img.rgba.chunks_exact(4) {
+    for px in img.rgba.as_chunks::<4>().0 {
         assert!(
             px[0] > 250 && px[1] < 5 && px[2] < 5 && px[3] > 250,
             "expected opaque red, got {px:?}"

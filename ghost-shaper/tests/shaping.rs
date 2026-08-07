@@ -325,7 +325,9 @@ fn emoji_font() -> FontRef<'static> {
 /// emoji has many; anything monochrome collapses to one (plus antialiased
 /// edges, which the alpha threshold filters out).
 fn distinct_colors(rgba: &[u8]) -> std::collections::HashSet<[u8; 3]> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[3] > 200)
         .map(|px| [px[0], px[1], px[2]])
         .collect()
@@ -370,7 +372,13 @@ fn both_subset_emoji_rasterize() {
         let gid = glyph_id(font, ch);
         let bmp = rasterize_color(font, gid, 24.0)
             .unwrap_or_else(|| panic!("{name} rasterizes in color"));
-        let covered = bmp.rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
+        let covered = bmp
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[3] > 0)
+            .count();
         assert!(
             covered > (bmp.width * bmp.height / 4) as usize,
             "{name} paints a substantial part of its box"

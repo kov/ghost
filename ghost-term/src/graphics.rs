@@ -788,6 +788,10 @@ fn decode_raw(
 }
 
 /// Decode a PNG (any common colour type / bit depth) into RGBA8.
+// `as_chunks` is what clippy wants for a constant chunk size, but it is stable
+// only from 1.88 and this crate keeps a 1.82 MSRV — `chunks_exact` is the same
+// walk, one bounds check per row of pixels.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn decode_png(raw: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(raw));
     // Expand palette / sub-byte greyscale to 8-bit channels and collapse 16-bit

@@ -86,7 +86,7 @@ pub(crate) fn rasterize_colrv1(
         .ok()?;
 
     let mut rgba = painter.base.take();
-    if rgba.chunks_exact(4).all(|px| px[3] == 0) {
+    if rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
         return None; // painted nothing: treat as "no color form"
     }
     unpremultiply(&mut rgba);
@@ -144,7 +144,7 @@ fn palette(font: &skrifa::FontRef) -> Vec<[u8; 4]> {
 /// Convert tiny-skia's premultiplied surface bytes to straight alpha, the
 /// [`ColorGlyphBitmap`] contract (rounding to nearest).
 fn unpremultiply(rgba: &mut [u8]) {
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         if a != 0 && a != 255 {
             for c in &mut px[..3] {

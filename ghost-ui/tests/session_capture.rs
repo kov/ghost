@@ -49,7 +49,9 @@ fn captures_a_real_session_to_a_png() {
     reader.next_frame(&mut buf).expect("png frame");
     // Theme background is ~[16,16,18]; text pixels are much brighter.
     let lit = buf
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > 40 || p[1] > 40 || p[2] > 40)
         .count();
     assert!(lit > 50, "rendered image looks blank ({lit} lit pixels)");
@@ -120,7 +122,9 @@ fn applies_color_scheme_from_config() {
     // Solarized-dark background is #002b36 = [0,43,54]; most of the (mostly
     // blank) screen should be exactly that, and never the default [16,16,18].
     let solar = buf
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] < 12 && (40..56).contains(&p[1]) && (48..64).contains(&p[2]))
         .count();
     let total = buf.len() / 4;
@@ -170,7 +174,9 @@ fn applies_window_opacity_from_config() {
     // premultiplied) RGB ~16 — a premultiplied PNG would store ~8 and composite
     // too dark in any viewer.
     let translucent_bg = buf
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (12..=20).contains(&p[0]) && (110..=145).contains(&p[3]))
         .count();
     assert!(
