@@ -36,11 +36,18 @@ use ghost_vt::connection::ConnectionSpec;
 
 use super::GHOST;
 
-/// `GHOST_REMOTE_GHOST` is a process-global env var each test points at its own
-/// isolated remote wrapper, so these real-`sshd` tests must not run concurrently or
-/// they'd read each other's remote binary. Serialize them (recovering from a
-/// poisoned lock so one test's panic doesn't cascade into "all skipped").
-pub static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// These real-`sshd` tests must not overlap, for two reasons: `GHOST_REMOTE_GHOST`
+/// is a process-global env var each points at its own isolated remote wrapper, and
+/// [`free_port`] picks a port by binding `:0` and letting go, so two fixtures built
+/// at once can pick the SAME one — the loser's `sshd` fails to bind and its test
+/// either skips or, worse, talks to the winner's remote and wedges when that test
+/// freezes its `sshd` subtree.
+///
+/// The lock is taken by [`RealRemote::start`] and held in the fixture until it
+/// drops, so setup and teardown are inside it too — a test cannot get the ordering
+/// wrong by construction. (Poisoning is recovered from, so one test's panic doesn't
+/// cascade into "all skipped".)
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Locate an `sshd` binary, or `None` so the caller can skip on a host without one.
 fn find_sshd() -> Option<PathBuf> {
@@ -107,11 +114,17 @@ pub struct RealRemote {
     identity: PathBuf,
     port: u16,
     sshd: Child,
+    /// Exclusion against the other real-`sshd` tests, held for this fixture's whole
+    /// life (see [`SERIAL`]). Last field, so it is released after everything it
+    /// protects — and after `Drop`, which runs before any field is dropped.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl RealRemote {
     /// Stand up the fixture, or `None` if no `sshd` is available (skip the test).
     pub fn start() -> Option<RealRemote> {
+        // Before anything else: no two fixtures may be built at once (see [`SERIAL`]).
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // The reboot/partition levers freeze or kill the per-connection `sshd`
         // subtree via /proc; without it (macOS) the fixture cannot do the one
         // thing it exists for, and every test asserting on a freeze that never
@@ -150,6 +163,7 @@ impl RealRemote {
             identity,
             port,
             sshd,
+            _serial: serial,
         })
     }
 

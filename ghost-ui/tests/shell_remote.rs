@@ -24,7 +24,7 @@ use std::time::Duration;
 use ghost_ui::{App, EventSink, HeadlessFrontend, QueuedEvents};
 use ghost_ui_core::UiEvent;
 use ghost_vt::remote::RemoteSsh;
-use support::remote::{RealRemote, SERIAL, retry_some};
+use support::remote::{RealRemote, retry_some};
 use support::{sees_text, sees_tile, visible_text, wait_until, with_isolated_xdg};
 
 /// Drive the loop the way winit does: run the App's once-per-wake pass, then apply
@@ -69,7 +69,6 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         eprintln!("shell_remote: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
@@ -251,7 +250,6 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
         eprintln!("shell_remote: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: process-global, held under SERIAL for the duration.
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
@@ -539,7 +537,6 @@ fn a_reattached_remote_session_retells_the_child_the_focus_state() {
         eprintln!("shell_remote: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
@@ -569,7 +566,6 @@ fn a_probed_wedged_transport_reconnects_without_waiting_for_the_keepalive() {
         eprintln!("shell_remote: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 

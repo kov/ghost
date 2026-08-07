@@ -19,7 +19,7 @@ use std::time::Duration;
 use ghost_vt::client::Session;
 use ghost_vt::remote::RemoteSsh;
 use ghost_vt::screen::Screen;
-use support::remote::{RealRemote, SERIAL, retry_some, wait_until};
+use support::remote::{RealRemote, retry_some, wait_until};
 
 /// The regression this fixture exists for. A remote reboot leaves ghost's shared
 /// ControlMaster wedged — TCP dead, process persisted by `ControlPersist`. The
@@ -36,7 +36,6 @@ fn ghost_reconnects_a_remote_after_a_reboot() {
         return;
     };
     // Point negotiation at the isolated remote binary. This binary's only test.
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
@@ -66,7 +65,6 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
         eprintln!("ssh_reboot: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     let ghost =
@@ -152,7 +150,6 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
         eprintln!("ssh_reboot: no sshd available; skipping");
         return;
     };
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     let ghost =
