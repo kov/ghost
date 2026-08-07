@@ -580,6 +580,11 @@ pub(crate) struct FeedOutcome {
     /// every view must drop selection and scroll and force a full repaint; the
     /// driving view also adopts `new_size_px`.
     grid_changed: bool,
+    /// The active screen buffer switched (primary↔alternate) during this feed.
+    /// Each buffer counts its own scrolled-off lines, so every absolute-row anchor
+    /// a view holds — the selection — names different content afterwards and must
+    /// be dropped, drag or no drag.
+    buffer_switched: bool,
     /// The window px the driving view should adopt after a `grid_changed` feed —
     /// the size a `CSI 14 t` in the same burst already reported.
     new_size_px: Option<(u32, u32)>,
@@ -1009,6 +1014,7 @@ impl SessionState {
             dirty: None,
             scrolled_off: 0,
             grid_changed: false,
+            buffer_switched: false,
             new_size_px: None,
             cursor: screen::CursorDamage::default(),
             placements_changed: false,
@@ -1020,6 +1026,7 @@ impl SessionState {
         if !bytes.is_empty() {
             out.fed = true;
             let before = self.screen.vt().lines_scrolled_off();
+            let alt_before = self.screen.vt().alternate_screen();
             let colors_before = self.render_colors();
             let palette_before = *self.palette();
             let focus_report_before = self.screen.vt().focus_report();
@@ -1065,7 +1072,16 @@ impl SessionState {
             // The gross lines that scrolled off the top this feed — a scrolled-up
             // view advances its offset by this to stay pinned to its content (done
             // per view in `apply_feed`, since the offset is a view fact).
-            out.scrolled_off = self.screen.vt().lines_scrolled_off().saturating_sub(before);
+            // The alternate buffer keeps its own scrolled-off count (it is built
+            // fresh on entry), so across a switch the delta below compares two
+            // unrelated line spaces — a switch reports no scroll and every view
+            // re-anchors instead (`apply_feed`, keyed off `buffer_switched`).
+            out.buffer_switched = self.screen.vt().alternate_screen() != alt_before;
+            out.scrolled_off = if out.buffer_switched {
+                0
+            } else {
+                self.screen.vt().lines_scrolled_off().saturating_sub(before)
+            };
             let display_size = geom.display_grid();
             let screen = &self.screen;
             let mode_state = |m: u16| screen.vt().dec_mode_state(m);
@@ -2235,6 +2251,21 @@ impl TerminalView {
                     self.size_px = px;
                 }
             }
+            let had_selection = self.selection.is_some();
+            // A primary↔alternate switch restarts the absolute line space the
+            // selection and the scroll offset are anchored in, so both name
+            // different content on the other side. Re-anchor to the live bottom of
+            // the buffer now showing. Unlike the live-bottom drop below this is
+            // *not* gated on `held`: a drag in flight is exactly the case that
+            // would otherwise carry primary-screen rows into the alternate buffer
+            // and copy whatever happens to sit there.
+            if outcome.buffer_switched {
+                self.selection = None;
+                self.sel_anchor = None;
+                self.scroll_offset = 0;
+                self.scroll_frac = 0.0;
+                self.view_slid = true;
+            }
             // Keep a scrolled-up view pinned to its content: advance the offset by
             // the gross lines that scrolled off the top this feed, clamped to
             // retained history. At the bottom (offset 0) we just follow the live
@@ -2259,7 +2290,6 @@ impl TerminalView {
             // live). While scrolled back, stay-put keeps the same content on screen,
             // so the selection stays valid and is preserved. Dropping a visible
             // highlight is itself a repaint even if no row's text changed.
-            let had_selection = self.selection.is_some();
             if self.held.is_none() && self.scroll_offset == 0 && self.scroll_frac == 0.0 {
                 self.selection = None;
                 self.sel_anchor = None;
@@ -6018,6 +6048,45 @@ mod tests {
             key(&mut m, Key::Char("c".into()), Mods::CTRL | Mods::SHIFT),
             vec![Cmd::WriteClipboard("L70\nL71\nL72\nL73".to_string())],
             "the copy runs from the anchored content to the pointer's row"
+        );
+    }
+
+    #[test]
+    fn entering_the_alt_screen_mid_drag_drops_the_selection() {
+        let mut m = model();
+        feed(&mut m, b"primary-line");
+        // A drag is live over the primary screen's first line.
+        begin_drag(&mut m, 1.0, 1.0);
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            100.0,
+            1.0,
+        ));
+        assert!(
+            m.selection().is_some(),
+            "the drag selected the primary line"
+        );
+        // The program switches to the alternate screen mid-drag. The alternate
+        // buffer starts its own absolute line space at 0, so the selection's
+        // rows silently come to name *different* content — the live-bottom drop
+        // can't catch it, since it is skipped while a drag is held.
+        feed(&mut m, b"\x1b[?1049h\x1b[2J\x1b[HALTERNATE!!");
+        assert!(
+            m.selection().is_none(),
+            "a buffer switch invalidates the absolute rows the selection is anchored in"
+        );
+        let cmds = m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            100.0,
+            1.0,
+        ));
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::WritePrimary(t) if t.contains("ALTERNATE"))),
+            "releasing must not publish the alternate screen's text as the selection: {cmds:?}"
         );
     }
 

@@ -106,6 +106,14 @@ impl Vt {
         self.terminal.lines_scrolled_off()
     }
 
+    /// Whether the alternate screen buffer is the active one (DEC ?1047/?1049).
+    /// Each buffer keeps its own [`lines_scrolled_off`](Self::lines_scrolled_off)
+    /// space, so a viewer anchoring anything (a selection, a scroll position) to
+    /// that space must re-anchor when this flips.
+    pub fn alternate_screen(&self) -> bool {
+        self.terminal.active_buffer_type() == crate::terminal::BufferType::Alternate
+    }
+
     pub fn lines(&self) -> impl Iterator<Item = &Line> {
         self.terminal.lines()
     }
