@@ -1902,6 +1902,31 @@ fn present_notify(window: &Window, _w: u32, _h: u32) {
     window.pre_present_notify();
 }
 
+/// Whether a buffer of `surface` physical pixels is one the window may commit,
+/// given that the window system has last configured the window to `window`.
+///
+/// A commit publishes far more than pixels. The acked configure, the window
+/// geometry, the decoration subsurfaces' new size and position, the blur region:
+/// all of it is double-buffered state, computed the moment the configure arrived
+/// and held until the surface next commits. A frame in flight from before that
+/// configure commits *all* of it around content that is still the old size — the
+/// frame's border snaps out to the new edge and the strip between it and the
+/// content is bare desktop, unblurred and undimmed, because no surface covers it
+/// yet. Measured before this gate: 285 of 711 commits over one drag carried a
+/// buffer of a different width than the geometry they published, out to 216px.
+///
+/// So the fix is not to defer any one of those — they ride together and can only
+/// be deferred together, by not committing at all until the buffer agrees. That
+/// costs a frame the shell is about to redraw anyway: the `Resized` that follows
+/// the configure is already queued, and the drag's next blit lands within a
+/// millisecond or two.
+///
+/// A window reporting a zero dimension is not held back — a surface never
+/// configures to zero, so nothing could ever match it.
+fn surface_matches_window(window: (u32, u32), surface: (u32, u32)) -> bool {
+    window.0 == 0 || window.1 == 0 || window == surface
+}
+
 /// Pick the surface (swapchain) format. Our shader writes colours that are
 /// already sRGB-encoded 8-bit bytes — the offscreen golden target is
 /// [`ghost_renderer::FORMAT`] (`Rgba8Unorm`) — so the swapchain must be a plain
@@ -2475,6 +2500,25 @@ impl Graphics {
         None
     }
 
+    /// Bring the swapchain to the size the window says it is, if it has fallen
+    /// behind, and report whether it had. See [`surface_matches_window`] for why a
+    /// frame drawn at the stale size must not be committed.
+    ///
+    /// Healing here rather than only skipping means the gate can fire at most once
+    /// per divergence: after this the two agree, whatever the model does with the
+    /// `Resized` that is already on its way.
+    fn sync_surface_to_window(&mut self) -> bool {
+        let window = self.window.inner_size();
+        if surface_matches_window((window.width, window.height), self.size()) {
+            return false;
+        }
+        if let Target::Surface(s) = &mut self.target {
+            s.resize(window.width, window.height);
+        }
+        self.scene_cache.invalidate();
+        true
+    }
+
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {
@@ -2512,6 +2556,11 @@ impl Graphics {
     /// no snapshot or the surface acquire failed), so the caller paces honestly rather
     /// than marking a dropped blit as painted.
     fn blit_snapshot(&mut self) -> bool {
+        // The blit is size-agnostic — it places the held snapshot unstretched and
+        // clears the rest to the window background — so a swapchain caught behind
+        // the window can simply be brought forward and drawn into, rather than
+        // costing a frame. What must not happen is committing at the old size.
+        self.sync_surface_to_window();
         let Target::Surface(s) = &mut self.target else {
             return false;
         };
@@ -2531,6 +2580,13 @@ impl Graphics {
     /// present glue to [`Target::render_frame`] — the same code the headless harness
     /// runs — and returns its [`FrameOutcome`], which decides the pacer bookkeeping.
     fn render(&mut self, scene: &Scene, font_px: f32) -> FrameOutcome {
+        // A scene laid out for the size before the last configure cannot go out:
+        // committing it publishes the new geometry around old content. Bring the
+        // swapchain forward and drop this frame — the `Resized` behind the
+        // configure relays out the model, and `Lost` keeps the repaint pending.
+        if self.sync_surface_to_window() {
+            return FrameOutcome::Lost;
+        }
         let outcome = self.target.render_frame(
             &mut self.renderer,
             &mut self.scene_cache,
@@ -7468,7 +7524,7 @@ mod tests {
         choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, glass,
         home_launch_dir, inherited_connection, namespace_remote_infos, new_window_choice,
         password_prompt, remote_spawn_target, respawn_opts, restore_plan, should_restore,
-        startup_choice, theme_colors,
+        startup_choice, surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
@@ -7481,6 +7537,32 @@ mod tests {
     use wgpu::TextureFormat::{
         Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
     };
+
+    #[test]
+    fn a_buffer_of_the_configured_size_is_free_to_go() {
+        assert!(surface_matches_window((1518, 1123), (1518, 1123)));
+    }
+
+    #[test]
+    fn a_buffer_left_over_from_the_size_before_is_held_back() {
+        // Everything the window system learns about a resize — the acked
+        // configure, the window geometry, the decoration subsurfaces, the blur
+        // region — is double-buffered state that lands on the next commit of
+        // this surface. Commit a buffer still at the old size and all of it
+        // takes effect around content that hasn't caught up: the frame's border
+        // jumps to the new edge and the strip behind it is bare desktop.
+        assert!(!surface_matches_window((1518, 1123), (1444, 1123)));
+        assert!(!surface_matches_window((1518, 1123), (1518, 1088)));
+    }
+
+    #[test]
+    fn a_window_with_no_size_yet_holds_nothing_back() {
+        // A surface never configures to a zero dimension, so a window reporting
+        // one can never be matched — gating on it would freeze the window
+        // instead of pacing it.
+        assert!(surface_matches_window((0, 720), (1280, 720)));
+        assert!(surface_matches_window((1280, 0), (1280, 720)));
+    }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
