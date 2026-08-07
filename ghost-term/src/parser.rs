@@ -7,7 +7,7 @@ use std::fmt::Display;
 
 const PARAMS_LEN: usize = 32;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Parser {
     pub state: State,
     params: [Param; PARAMS_LEN],
@@ -411,7 +411,7 @@ pub enum TbcScope {
     All,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum XtwinopsOp {
     /// `CSI 8 ; rows ; cols t` — resize the text area to a character grid.
     /// `None` is an omitted dimension (keep the one it has); `Some(0)` is xterm's

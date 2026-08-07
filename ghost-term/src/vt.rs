@@ -18,7 +18,7 @@ pub enum MouseProtocol {
     AnyMotion,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Vt {
     parser: Parser,
     terminal: Terminal,
@@ -3270,7 +3270,7 @@ mod tests {
         let image = vt.graphics_image(5).expect("image stored under id 5");
         assert_eq!((image.width, image.height), (2, 1));
         // RGB expands to RGBA with an opaque alpha.
-        assert_eq!(image.pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(*image.pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
         assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=5;OK\x1b\\");
         // Responses are drained, not repeated.
         assert!(vt.take_graphics_responses().is_empty());
@@ -3355,7 +3355,7 @@ mod tests {
         vt.feed_str("\x1b_Gm=0;AP8A\x1b\\");
 
         let image = vt.graphics_image(9).expect("assembled image");
-        assert_eq!(image.pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(*image.pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
         assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=9;OK\x1b\\");
     }
 
@@ -3390,7 +3390,7 @@ mod tests {
 
         let image = vt.graphics_image(3).expect("PNG stored");
         assert_eq!((image.width, image.height), (1, 1));
-        assert_eq!(image.pixels, vec![255, 0, 0, 255]);
+        assert_eq!(*image.pixels, [255, 0, 0, 255]);
         assert_eq!(vt.take_graphics_responses(), b"\x1b_Gi=3;OK\x1b\\");
     }
 

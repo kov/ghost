@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU16;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Links {
     by_uri: HashMap<String, NonZeroU16>,
     uris: Vec<String>,

@@ -38,6 +38,7 @@ pub struct CursorDamage {
     pub repaint: bool,
 }
 
+#[derive(Clone)]
 pub struct Screen {
     vt: Vt,
     cols: u16,

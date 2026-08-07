@@ -17,6 +17,7 @@
 //! is meaningless to a display attached from another machine.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use base64::Engine;
 
@@ -56,12 +57,17 @@ const MAX_STORED_IMAGES: usize = 1024;
 const MAX_PLACEMENTS: usize = 4096;
 
 /// A decoded image: RGBA8 pixels in row-major order, `width` × `height`.
+#[derive(Clone)]
 pub struct Image {
     pub id: u32,
     pub width: u32,
     pub height: u32,
-    /// `4 * width * height` bytes, RGBA, sRGB, top-left origin.
-    pub pixels: Vec<u8>,
+    /// `4 * width * height` bytes, RGBA, sRGB, top-left origin. Shared rather than
+    /// owned so cloning the terminal (a frozen selection snapshots it) stays cheap:
+    /// the image store's budget is [`MAX_STORED_BYTES`], far too much to copy on a
+    /// gesture. Images are immutable once decoded — a re-transmit under the same id
+    /// stores a new `Image`, it never edits these bytes.
+    pub pixels: Arc<[u8]>,
     /// Monotonic store generation, bumped every time an id is (re)transmitted. kitty
     /// lets a client replace the pixels under an existing id (animation frames, id
     /// reuse); consumers that cache uploads per id must re-send when this changes, or
@@ -138,7 +144,7 @@ pub struct Placement {
 
 /// The terminal's kitty-graphics state: the stored images, their placements, an
 /// in-progress chunked transfer, and the queued responses awaiting transmission.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GraphicsState {
     images: HashMap<u32, Image>,
     /// Placements on the active screen. Images are global, but placements are
@@ -184,6 +190,7 @@ impl std::fmt::Debug for GraphicsState {
 
 /// An in-progress chunked transfer: the first chunk's control data, the cursor
 /// anchor captured when it began, and the raw (base64-decoded) bytes so far.
+#[derive(Clone)]
 struct Chunk {
     control: Control,
     anchor: (usize, usize),
@@ -419,7 +426,7 @@ impl GraphicsState {
                 id,
                 width: image.0,
                 height: image.1,
-                pixels: image.2,
+                pixels: image.2.into(),
                 generation: self.next_generation,
             },
         );
@@ -645,6 +652,7 @@ impl GraphicsState {
 }
 
 /// Parsed control data (key=value, comma-separated), with kitty's defaults.
+#[derive(Clone)]
 struct Control {
     action: u8,
     format: u32,

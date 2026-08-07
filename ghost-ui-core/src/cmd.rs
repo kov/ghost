@@ -163,7 +163,9 @@ pub enum Cmd {
         id: u32,
         width: u32,
         height: u32,
-        rgba: Vec<u8>,
+        /// Shared with the emulator's image store rather than copied — several
+        /// windows viewing one session each upload the same pixels.
+        rgba: std::sync::Arc<[u8]>,
     },
     /// Open a hyperlink (OSC 8, Ctrl+click) in the system handler. The URL's
     /// scheme has already been allowlisted by the model.

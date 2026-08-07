@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirtyLines(Vec<bool>);
 
 impl DirtyLines {

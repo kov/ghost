@@ -6,7 +6,7 @@ use crate::cell::{Cell, Occupancy};
 use crate::line::Line;
 use crate::pen::{Pen, Protection};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Buffer {
     lines: VecDeque<Line>,
     pub cols: usize,

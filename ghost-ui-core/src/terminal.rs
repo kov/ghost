@@ -5468,7 +5468,7 @@ mod tests {
             id: 5,
             width: 2,
             height: 1,
-            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            rgba: [255, 0, 0, 255, 0, 255, 0, 255].into(),
         }));
         // The attached frontend answers the transfer with the OK ack itself.
         assert!(cmds.contains(&sent("alpha", b"\x1b_Gi=5;OK\x1b\\")));
@@ -5534,7 +5534,7 @@ mod tests {
             id: 5,
             width: 2,
             height: 1,
-            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            rgba: [255, 0, 0, 255, 0, 255, 0, 255].into(),
         }));
         // Re-transmit id 5 with DIFFERENT pixels (blue|green). kitty lets a client
         // replace an image under an existing id (an animation frame, a reused id); the
@@ -5551,7 +5551,7 @@ mod tests {
         });
         assert_eq!(
             uploaded,
-            Some(vec![0, 0, 255, 255, 0, 255, 0, 255]),
+            Some([0, 0, 255, 255, 0, 255, 0, 255].into()),
             "a re-transmit under an existing id must re-upload the replaced pixels: {cmds:?}"
         );
     }
@@ -5574,7 +5574,7 @@ mod tests {
             id: 7,
             width: 2,
             height: 1,
-            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            rgba: [255, 0, 0, 255, 0, 255, 0, 255].into(),
         }));
         // And it uploads once: a later redraw-causing feed does not re-upload.
         let cmds = m.update(UiEvent::SessionData {
@@ -5616,7 +5616,7 @@ mod tests {
             id: 7,
             width: 2,
             height: 1,
-            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            rgba: [255, 0, 0, 255, 0, 255, 0, 255].into(),
         }));
     }
 

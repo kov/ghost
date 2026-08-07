@@ -26,7 +26,7 @@ use unicode_width::UnicodeWidthChar;
 /// flag-set.
 const KITTY_KBD_STACK_MAX: usize = 32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Terminal {
     cols: usize,
     rows: usize,
@@ -237,7 +237,7 @@ pub(crate) enum CursorKeysMode {
     Application,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub(crate) struct SavedCtx {
     pub cursor_col: usize,
     pub cursor_row: usize,
