@@ -225,11 +225,36 @@ impl RealRemote {
     /// lying. With the subtree frozen, `ssh` reports "server not responding" and
     /// exits in ~45s (`ServerAliveInterval=15` × `ServerAliveCountMax=3`).
     pub fn reboot(&mut self) {
+        // A reboot takes the remote's processes with it — and if we only wiped the
+        // runtime dir, its session hosts would live on with their sockets deleted,
+        // unreachable by anything for the rest of the machine's uptime. End them
+        // first, which is both truer to a reboot and the only moment they can still
+        // be reached.
+        self.kill_sessions();
         for pid in descendants(self.sshd.id()) {
             signal(pid, "STOP");
         }
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
+    }
+
+    /// End every session on this remote, through the same wrapper the tests use
+    /// (just the local binary in the remote's env, so it works whether or not
+    /// `sshd` is up). Bounded wait so a host mid-exit isn't raced by a caller
+    /// about to delete the dir underneath it.
+    fn kill_sessions(&self) {
+        let _ = Command::new(&self.wrapper)
+            .args(["kill", "--all"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let sessions = self.remote_root.path().join("run").join("ghost");
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read_dir(&sessions)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+        });
     }
 
     /// Sever every live connection by killing the per-connection `sshd` subtree —
@@ -262,6 +287,13 @@ impl RealRemote {
 
 impl Drop for RealRemote {
     fn drop(&mut self) {
+        // End the *remote* sessions first. Their hosts run under this fixture's
+        // own runtime root, so the local `kill --all` in `with_isolated_xdg` never
+        // lists them — and like any host they outlive their client on purpose, so
+        // nothing else would ever reap them. Killing sshd below does not: a host is
+        // daemonized out of that subtree, and dropping the temp root takes away the
+        // socket it would have been reached through.
+        self.kill_sessions();
         // Deepest first, so a frozen monitor cannot outlive its worker, and SIGCONT
         // after the kill so anything stopped can actually die.
         for pid in descendants(self.sshd.id()).into_iter().rev() {

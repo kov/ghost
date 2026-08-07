@@ -60,6 +60,53 @@ fn isolated_shim() -> tempfile::TempDir {
     dir
 }
 
+/// A remote root that ends its sessions before it goes.
+///
+/// Every session spawned "on the remote" is a real host under
+/// `<root>/<tag>/run`, and a host outlives its client on purpose — so dropping
+/// the tempdir strands it, socket and all, holding an inotify instance until
+/// someone kills it by hand. The per-user cap is 128; past it the watch and
+/// title tests fail instantly with EMFILE and look like a regression.
+/// `no_leaks.rs` gates the equivalent for the other two harnesses.
+struct RemoteRoot(tempfile::TempDir);
+
+impl RemoteRoot {
+    fn new() -> RemoteRoot {
+        RemoteRoot(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for RemoteRoot {
+    fn drop(&mut self) {
+        // One destination per tag dir, each its own little XDG world.
+        let Ok(tags) = std::fs::read_dir(self.0.path()) else {
+            return;
+        };
+        for tag in tags.flatten() {
+            let root = tag.path();
+            let _ = Command::new(GHOST)
+                .args(["kill", "--all"])
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("HOME", root.join("home"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let sessions = root.join("run").join("ghost");
+            wait_until(Duration::from_secs(5), || {
+                std::fs::read_dir(&sessions)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+            });
+        }
+    }
+}
+
 /// A `ghost` command run on the initiator with its own (local) XDG — never the
 /// remote root, so it can only ever see *local* sessions.
 fn local_ghost(xdg: &Path) -> Command {
@@ -154,7 +201,7 @@ impl Drop for KillRemote<'_> {
 fn a_remote_session_is_invisible_locally_and_visible_over_the_transport() {
     let local = tempfile::tempdir().unwrap();
     let xdg = local.path();
-    let remote = tempfile::tempdir().unwrap();
+    let remote = RemoteRoot::new();
     let root = remote.path();
     let shim = isolated_shim();
     let ssh = shim.path().join("ssh");
@@ -208,7 +255,7 @@ fn a_remote_session_is_invisible_locally_and_visible_over_the_transport() {
 /// for the recursive-watch fix, on a genuinely isolated host.
 #[test]
 fn a_remote_title_change_propagates_over_the_watch_transport() {
-    let remote = tempfile::tempdir().unwrap();
+    let remote = RemoteRoot::new();
     let root = remote.path();
     let shim = isolated_shim();
     let ssh = shim.path().join("ssh");
@@ -295,7 +342,7 @@ fn a_remote_title_change_propagates_over_the_watch_transport() {
 /// session's actual level, the read the attach path relies on.
 #[test]
 fn the_transport_reports_a_remote_sessions_own_protocol_level() {
-    let remote = tempfile::tempdir().unwrap();
+    let remote = RemoteRoot::new();
     let root = remote.path();
     let shim = isolated_shim();
     let ssh = shim.path().join("ssh");
@@ -350,7 +397,7 @@ fn the_transport_reports_a_remote_sessions_own_protocol_level() {
 /// bring an old-protocol remote session up to the current level.
 #[test]
 fn restarting_a_remote_session_over_the_transport_keeps_it_live_and_seeded() {
-    let remote = tempfile::tempdir().unwrap();
+    let remote = RemoteRoot::new();
     let root = remote.path();
     let shim = isolated_shim();
     let ssh = shim.path().join("ssh");

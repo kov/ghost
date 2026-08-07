@@ -28,6 +28,10 @@ pub fn with_isolated_xdg<T>(f: impl FnOnce(&Path) -> T) -> T {
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Declared after `tmp` so it runs BEFORE the tempdir is removed: a host is
+    // reached through the socket in there, so wiping the dir first would orphan
+    // it for good. See [`HostReaper`].
+    let _reaper = HostReaper;
     // SAFETY: single-threaded within the lock; every test that reads these vars
     // holds it too.
     unsafe {
@@ -36,6 +40,40 @@ pub fn with_isolated_xdg<T>(f: impl FnOnce(&Path) -> T) -> T {
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
     }
     f(tmp.path())
+}
+
+/// Ends every session in the current (isolated) `$XDG_*` env when the run leaves
+/// [`with_isolated_xdg`] — on the way out of a passing test *and* while a failing
+/// one unwinds, which is when cleanup written at the end of a test body is exactly
+/// what does not happen.
+///
+/// A session host outlives its client by design, so nothing else will ever reap
+/// one: a test that spawns a session and drops its temp runtime dir strands that
+/// host forever, holding an inotify instance. The per-user cap is 128, and past it
+/// the watch/title tests fail in hundredths of a second with EMFILE and read like a
+/// regression. `no_leaks.rs` is the gate.
+///
+/// `kill --all` can only see sessions in the env we set, so this can never reach
+/// the developer's real sessions.
+struct HostReaper;
+
+impl Drop for HostReaper {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(GHOST)
+            .args(["kill", "--all"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Give the hosts the moment they need to actually go, so the tempdir
+        // removal below can't pull the socket out from under one still on its way
+        // out. Bounded, and skipped entirely in the common case of no sessions.
+        wait_until(Duration::from_secs(5), || {
+            ghost_vt::session::list()
+                .map(|l| l.is_empty())
+                .unwrap_or(true)
+        });
+    }
 }
 
 /// Read-until-predicate with a timeout — the suite's only sync primitive (never a
