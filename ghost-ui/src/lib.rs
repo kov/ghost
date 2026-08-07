@@ -1893,7 +1893,7 @@ fn backdrop_blur_supported(_window: &Window) -> bool {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn present_notify(window: &Window, w: u32, h: u32) {
     use winit::platform::wayland::WindowExtWayland;
-    window.set_blur_present_size(PhysicalSize::new(w, h));
+    window.set_present_size(PhysicalSize::new(w, h));
     window.pre_present_notify();
 }
 

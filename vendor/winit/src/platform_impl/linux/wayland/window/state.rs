@@ -211,6 +211,9 @@ pub struct WindowState {
     /// [`BlurRegion`], which is also where the *timing* of that telling lives.
     /// [vendored addition]
     blur_shape: BlurRegion,
+    /// The size a configure asked for, waiting for a buffer that size to be
+    /// stated with. See [`PendingSize`]. [vendored addition]
+    pending_size: PendingSize,
 
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
@@ -259,6 +262,7 @@ impl WindowState {
             background_effect: None,
             background_effect_manager: winit_state.background_effect_manager.clone(),
             blur_shape: BlurRegion::default(),
+            pending_size: PendingSize::default(),
             decoration_margins: DecorationMargins::NONE,
             compositor,
             connection,
@@ -803,6 +807,21 @@ impl WindowState {
         // partially-tiled (snapped) windows, so a snap no longer corrupts it.
         if Some(true) == self.last_configure.as_ref().map(Self::is_stateless) {
             self.stateless_size = inner_size;
+        }
+
+        // Nothing is told to the compositor from here: everything below is
+        // double-buffered state that would take effect around a buffer of the
+        // size before. It waits for the frame drawn at this size. [vendored
+        // addition] See [`PendingSize`].
+        self.pending_size.wants(inner_size);
+    }
+
+    /// Tell the compositor how big the window is, now that there is a buffer that
+    /// size to say it with. Does nothing until the presented buffer answers the
+    /// configure being held. [vendored addition] See [`PendingSize`].
+    fn apply_pending_size(&mut self, surface: PhysicalSize<u32>, scale: f64) {
+        if !self.pending_size.take_for(surface, scale) {
+            return;
         }
 
         // Update the inner frame.
@@ -1354,14 +1373,19 @@ impl WindowState {
         true
     }
 
-    /// State the blur region for the buffer the client is about to commit, whose
-    /// surface is `surface` logical pixels. Call it immediately before presenting
-    /// — the region is double-buffered surface state, so this is what pairs it
-    /// with the buffer it describes rather than with whatever configure arrived
-    /// most recently. See [`BlurRegion`] for what that pairing is worth.
-    /// [vendored addition]
-    pub fn blur_present_size(&mut self, surface: LogicalSize<u32>) {
-        self.write_blur_region(surface);
+    /// State everything the compositor is told about size for the buffer the
+    /// client is about to commit, whose surface is `surface` logical pixels. Call
+    /// it immediately before presenting.
+    ///
+    /// All of it — the window geometry and the decoration frame ([`PendingSize`]),
+    /// the blur region ([`BlurRegion`]) — is double-buffered state that takes
+    /// effect at the next commit, so it belongs here, paired with the buffer it
+    /// describes, rather than at the configure that asked for it. [vendored
+    /// addition]
+    pub fn present_size(&mut self, surface: PhysicalSize<u32>) {
+        let scale = self.scale_factor();
+        self.apply_pending_size(surface, scale);
+        self.write_blur_region(surface.to_logical(scale));
     }
 
     /// Round the backdrop effect's corners by `top` and `bottom` logical pixels,
@@ -1589,6 +1613,54 @@ fn blur_shape_rects(
 /// So the region goes where the buffer goes: [`Self::for_present`] is handed the
 /// size of the buffer about to be committed and answers with the region that
 /// describes *that*. Nothing else states one.
+/// The size a configure asked for, held until the client has a buffer that size.
+///
+/// Everything the compositor is told about how big the window is —
+/// `xdg_surface.set_window_geometry`, the decoration frame's own size and the
+/// position of its subsurfaces, the viewport destination — is double-buffered
+/// state that takes effect at the surface's next commit. Sent when the configure
+/// arrives, it takes effect at whatever the client commits next, and through a
+/// GPU swapchain that is a frame the client queued *before* the configure: the
+/// window's edges move to the new size around content that is still the old one.
+/// On a left-edge drag the compositor anchors placement from the geometry, so the
+/// whole window shifts left while the buffer stays short, and the shortfall opens
+/// as a strip of bare desktop down the right.
+///
+/// Nor can the client simply refuse to commit early — the commit is not its to
+/// time. Mesa's display queue puts the attach and commit on the wire on its own
+/// FIFO schedule, and a configure handled meanwhile lands between the two.
+///
+/// So the size is held here and applied from the present hook, against the buffer
+/// being committed, exactly as [`BlurRegion`] is. A drag that outruns the client
+/// simply overwrites it: only the newest configure is worth answering.
+#[derive(Debug, Default)]
+struct PendingSize {
+    wanted: Option<LogicalSize<u32>>,
+}
+
+impl PendingSize {
+    /// Note the size a configure (or the client itself) just asked for.
+    fn wants(&mut self, size: LogicalSize<u32>) {
+        self.wanted = Some(size);
+    }
+
+    /// Whether the buffer now being committed is the one that answers the held
+    /// configure — and if so, consume it, since it is about to be applied.
+    ///
+    /// Compared in physical pixels, the units the buffer is actually in: a
+    /// fractional scale does not round-trip through logical exactly, and a
+    /// half-pixel disagreement here would strand the configure forever — the
+    /// compositor would never learn the window's size again.
+    fn take_for(&mut self, surface: PhysicalSize<u32>, scale: f64) -> bool {
+        if self.wanted.map(|w| logical_to_physical_rounded(w, scale)) == Some(surface) {
+            self.wanted = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct BlurRegion {
     top_radius: u32,
@@ -1811,6 +1883,76 @@ mod blur_shape_tests {
             for &(x, y, rw, rh) in &blur_shape_rects(size, 100, 100)[1..] {
                 assert!(x >= 0 && rw > 0 && x + rw <= w as i32, "{x}+{rw} outside {w}");
                 assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
+            }
+        }
+    }
+}
+
+/// A configure is applied with the buffer that answers it — see [`PendingSize`].
+#[cfg(test)]
+mod pending_size_tests {
+    use super::*;
+
+    fn size(w: u32, h: u32) -> LogicalSize<u32> {
+        LogicalSize::new(w, h)
+    }
+
+    /// The buffer a client presents for a window of `size` logical pixels.
+    fn drawn(size: LogicalSize<u32>, scale: f64) -> PhysicalSize<u32> {
+        logical_to_physical_rounded(size, scale)
+    }
+
+    #[test]
+    fn a_configure_the_client_has_not_drawn_yet_is_held() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        // The frame in flight is still the size before. Applying the configure
+        // around it would move the window's edges past its own content.
+        assert!(!pending.take_for(drawn(size(1255, 1123), 1.0), 1.0));
+    }
+
+    #[test]
+    fn the_frame_that_answers_a_configure_applies_it() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        assert!(pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+    }
+
+    #[test]
+    fn a_configure_is_applied_once_and_not_on_every_later_frame() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        assert!(pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+        // The window is still this size a hundred frames later; restating it
+        // would be pure traffic.
+        assert!(!pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+    }
+
+    #[test]
+    fn only_the_newest_configure_is_waited_for() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        pending.wants(size(1186, 1123));
+        // A drag outruns the client: the size it drew for two configures ago is
+        // not the one the compositor is waiting to hear about.
+        assert!(!pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+        assert!(pending.take_for(drawn(size(1186, 1123), 1.0), 1.0));
+    }
+
+    #[test]
+    fn a_fractional_scale_does_not_strand_a_configure() {
+        // The window is sized in logical pixels and drawn in physical ones, and
+        // at 1.5x the two do not round-trip: comparing them anywhere but in the
+        // buffer's own units can leave a configure that no frame ever answers,
+        // and a window whose size the compositor never hears again.
+        for scale in [1.25, 1.5, 1.75, 2.0] {
+            for w in 1000..1100 {
+                let mut pending = PendingSize::default();
+                pending.wants(size(w, 723));
+                assert!(
+                    pending.take_for(drawn(size(w, 723), scale), scale),
+                    "{w} logical at {scale}x"
+                );
             }
         }
     }

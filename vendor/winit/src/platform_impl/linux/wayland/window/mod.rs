@@ -294,12 +294,10 @@ impl Window {
         self.window_state.lock().unwrap().set_blur_corner_radii(top, bottom);
     }
 
-    /// Shape the backdrop effect for the buffer about to be committed, whose
-    /// surface is `size` physical pixels. [vendored addition]
-    pub fn set_blur_present_size(&self, size: PhysicalSize<u32>) {
-        let mut state = self.window_state.lock().unwrap();
-        let size = size.to_logical(state.scale_factor());
-        state.blur_present_size(size);
+    /// State the window's size to the compositor for the buffer about to be
+    /// committed, whose surface is `size` physical pixels. [vendored addition]
+    pub fn set_present_size(&self, size: PhysicalSize<u32>) {
+        self.window_state.lock().unwrap().present_size(size);
     }
 }
 
