@@ -53,6 +53,13 @@ impl Xdg {
         }
     }
 
+    fn ghost_at(run: &std::path::Path, data: &std::path::Path) -> Command {
+        let mut c = Command::new(GHOST);
+        c.env("XDG_RUNTIME_DIR", run);
+        c.env("XDG_DATA_HOME", data);
+        c
+    }
+
     fn ghost(&self) -> Command {
         let mut c = Command::new(GHOST);
         c.env("XDG_RUNTIME_DIR", &self.run)
@@ -62,6 +69,24 @@ impl Xdg {
 
     fn sock(&self, name: &str) -> std::path::PathBuf {
         self.run.join("ghost").join(name).join("sock")
+    }
+}
+
+/// Ends this run's sessions before the temp dirs go.
+///
+/// A session host outlives its client on purpose, so nothing reaps one for us:
+/// dropping the tempdir first would strand it with its socket deleted, holding an
+/// inotify instance until someone kills it by hand. Past the per-user cap of 128
+/// the watch and title tests fail instantly with EMFILE and read like a
+/// regression. `no_leaks.rs` gates the same thing for the shared harnesses.
+impl Drop for Xdg {
+    fn drop(&mut self) {
+        let _ = Xdg::ghost_at(&self.run, &self.data)
+            .args(["kill", "--all"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 

@@ -227,15 +227,37 @@ impl RealRemote {
     pub fn reboot(&mut self) {
         // A reboot takes the remote's processes with it — and if we only wiped the
         // runtime dir, its session hosts would live on with their sockets deleted,
-        // unreachable by anything for the rest of the machine's uptime. End them
-        // first, which is both truer to a reboot and the only moment they can still
-        // be reached.
-        self.kill_sessions();
+        // unreachable by anything for the rest of the machine's uptime.
+        //
+        // They have to die the way a power cut kills them, NOT through `ghost kill`:
+        // that is a clean exit, and the shell rightly treats a session that ended
+        // cleanly as finished — forgetting it instead of holding it as recoverable,
+        // which is the whole behaviour the reboot tests assert. So SIGKILL the pids
+        // the runtime dir records, while the dir is still there to read them from.
+        for pid in self.session_pids() {
+            signal(pid, "KILL");
+        }
         for pid in descendants(self.sshd.id()) {
             signal(pid, "STOP");
         }
         let _ = std::fs::remove_dir_all(self.remote_root.path().join("run"));
         let _ = std::fs::create_dir_all(self.remote_root.path().join("run"));
+    }
+
+    /// The pid of every session host on this remote, read from the `pid` file each
+    /// one writes into its own directory under the runtime root this fixture owns.
+    /// Only ever pids this fixture's remote created — never a match on process
+    /// names, which would reach across the whole machine.
+    fn session_pids(&self) -> Vec<u32> {
+        let dir = self.remote_root.path().join("run").join("ghost");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("pid")).ok())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
     }
 
     /// End every session on this remote, through the same wrapper the tests use
