@@ -7369,16 +7369,16 @@ mod tests {
         let mut t = Target::Offscreen;
         let scene = single_scene(frame(20, 5, "hi"), 180, 90);
         assert!(matches!(
-            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
             FrameOutcome::Presented { .. }
         ));
         assert!(matches!(
-            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
             FrameOutcome::Clean
         ));
         let changed = single_scene(frame(20, 5, "ho"), 180, 90);
         assert!(matches!(
-            t.render_frame(&mut r, &mut cache, &changed, font, SIZE_PX, || {}),
+            t.render_frame(&mut r, &mut cache, &changed, font, SIZE_PX, |_, _| {}),
             FrameOutcome::Presented { .. }
         ));
     }
@@ -7409,12 +7409,12 @@ mod tests {
         };
         r.set_window_edge(edge(0.31));
         assert!(matches!(
-            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+            t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
             FrameOutcome::Presented { .. }
         ));
         assert!(
             matches!(
-                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
                 FrameOutcome::Clean
             ),
             "nothing changed at all"
@@ -7424,14 +7424,14 @@ mod tests {
         r.set_window_edge(edge(0.11));
         assert!(
             matches!(
-                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
                 FrameOutcome::Presented { .. }
             ),
             "the corner has to be redrawn even though the scene has not changed"
         );
         assert!(
             matches!(
-                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, || {}),
+                t.render_frame(&mut r, &mut cache, &scene, font, SIZE_PX, |_, _| {}),
                 FrameOutcome::Clean
             ),
             "and settle again once it has"

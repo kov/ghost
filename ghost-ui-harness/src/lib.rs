@@ -63,9 +63,10 @@ pub struct Harness {
     /// Where [`present`](Self::present) draws: offscreen by default, or a real window
     /// surface swapped in via [`set_surface`](Self::set_surface).
     target: Target,
-    /// Runs just before each surface present (e.g. winit's `pre_present_notify`);
-    /// no-op for the offscreen target.
-    pre_present: Box<dyn Fn()>,
+    /// Runs just before each surface present (e.g. winit's `pre_present_notify`),
+    /// told the physical size of the buffer being committed; no-op for the
+    /// offscreen target.
+    pre_present: Box<dyn Fn(u32, u32)>,
 }
 
 impl Harness {
@@ -114,7 +115,7 @@ impl Harness {
             clock_ms: 0,
             quit: false,
             target: Target::Offscreen,
-            pre_present: Box::new(|| {}),
+            pre_present: Box::new(|_, _| {}),
         }
     }
 
@@ -129,7 +130,7 @@ impl Harness {
         &mut self,
         renderer: Renderer,
         target: Target,
-        pre_present: impl Fn() + 'static,
+        pre_present: impl Fn(u32, u32) + 'static,
     ) {
         self.renderer = Some(renderer);
         self.target = target;
@@ -242,7 +243,7 @@ impl Harness {
         self.renderer
             .get_or_insert_with(|| Renderer::headless(Theme::default()));
         // Disjoint field borrows: renderer, cache, target, and the present hook
-        // (`&Box<dyn Fn()>` is itself `FnOnce`, so it passes straight through).
+        // (`&Box<dyn Fn(u32, u32)>` is itself `FnOnce`, so it passes straight through).
         let renderer = self.renderer.as_mut().expect("just inserted");
         let pre = &self.pre_present;
         match self

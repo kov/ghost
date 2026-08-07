@@ -205,13 +205,12 @@ pub struct WindowState {
     /// [vendored addition]
     background_effect: Option<ExtBackgroundEffectSurfaceV1>,
     background_effect_manager: Option<BackgroundEffectManager>,
-    /// Radii, in logical pixels, of the top and bottom corners the client rounds
-    /// off its own surface — so the backdrop effect can be cut to the same shape
-    /// instead of blurring a square box behind a rounded window. 0 is square.
-    /// See [`set_blur_corner_radii`](Self::set_blur_corner_radii).
+    /// The shape of that effect — the radii the client rounds its own corners by,
+    /// so the blur can be cut to the same curve rather than a square box behind
+    /// it — together with what the compositor has already been told. See
+    /// [`BlurRegion`], which is also where the *timing* of that telling lives.
     /// [vendored addition]
-    blur_top_radius: u32,
-    blur_bottom_radius: u32,
+    blur_shape: BlurRegion,
 
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
@@ -259,8 +258,7 @@ impl WindowState {
             blur_manager: winit_state.kwin_blur_manager.clone(),
             background_effect: None,
             background_effect_manager: winit_state.background_effect_manager.clone(),
-            blur_top_radius: 0,
-            blur_bottom_radius: 0,
+            blur_shape: BlurRegion::default(),
             decoration_margins: DecorationMargins::NONE,
             compositor,
             connection,
@@ -793,9 +791,13 @@ impl WindowState {
     fn resize(&mut self, inner_size: LogicalSize<u32>) {
         self.size = inner_size;
 
-        // A rounded backdrop shape is spelled out in surface coordinates, so it
-        // has to be redrawn against the new size. [vendored addition]
-        self.reapply_blur_shape();
+        // Deliberately NOT where the backdrop shape is respecified, though it is
+        // spelled out in surface coordinates and this is where those change: the
+        // region is double-buffered surface state and the buffer for this size
+        // does not exist yet, so a region stated here would ride out on whatever
+        // frame the client commits next — one still at the old size. It is stated
+        // at present time instead, against the buffer being committed. See
+        // [`BlurRegion`]. [vendored addition]
 
         // Update the stateless (restore) size. `is_stateless` now recognises
         // partially-tiled (snapped) windows, so a snap no longer corrupts it.
@@ -1279,7 +1281,7 @@ impl WindowState {
     /// [`Window::blur_supported`]: super::Window::blur_supported
     pub fn set_blur(&mut self, blurred: bool) {
         if let Some(manager) = self.background_effect_manager.clone() {
-            self.set_background_effect_blur(&manager, blurred, true);
+            self.set_background_effect_blur(&manager, blurred);
         } else {
             self.set_kwin_blur(blurred);
         }
@@ -1290,114 +1292,84 @@ impl WindowState {
     /// handing over a region and turning it off means dropping the object.
     /// [vendored addition]
     ///
-    /// `flush` commits the surface so the region lands now rather than with the
-    /// next frame. Right for a blur being switched on or off, when nothing else
-    /// may draw for a while — and WRONG while the window is being reconfigured:
-    /// a commit with no new buffer applies the new region to the OLD frame, so
-    /// the blur jumps to the window's new shape a beat before the window does,
-    /// and it tells the compositor the state change is already dealt with, which
-    /// ends the transition it was animating.
-    fn set_background_effect_blur(
-        &mut self,
-        manager: &BackgroundEffectManager,
-        blurred: bool,
-        flush: bool,
-    ) {
-        // Read before the effect below borrows `self` mutably.
-        let m = self.margins_now();
+    /// Switching it on states the region for the size the window is now, and
+    /// commits so it lands even if nothing draws for a while. That commit is safe
+    /// only *here*: it carries no new buffer, so during a reconfigure it would
+    /// apply the new region to the old frame — blur jumping to the window's new
+    /// shape a beat before the window does — and tell the compositor the state
+    /// change is already dealt with, ending the transition it was animating.
+    fn set_background_effect_blur(&mut self, manager: &BackgroundEffectManager, blurred: bool) {
         if !blurred {
             if let Some(effect) = self.background_effect.take() {
                 effect.destroy();
             }
+            // The region went with the effect object; a later one starts blank.
+            self.blur_shape.forget();
             return;
         }
-        let effect = match self.background_effect {
-            Some(ref effect) => effect,
-            None => self
-                .background_effect
-                .insert(manager.effect(self.window.wl_surface(), &self.queue_handle)),
+        if self.background_effect.is_none() {
+            self.background_effect =
+                Some(manager.effect(self.window.wl_surface(), &self.queue_handle));
+            self.blur_shape.forget();
+        }
+        if self.write_blur_region(self.size) && self.is_configured() {
+            self.window.wl_surface().commit();
+        }
+    }
+
+    /// State the blur region for a surface of `surface` logical pixels, unless the
+    /// compositor already has exactly that one. Returns whether anything was sent.
+    /// Never commits: the caller decides which buffer it rides with.
+    /// [vendored addition]
+    ///
+    /// The shape belongs to the **window**, which our margins sit outside of:
+    /// blurring the shadow's own ring would put a blurred halo where the window
+    /// is see-through.
+    fn write_blur_region(&mut self, surface: LogicalSize<u32>) -> bool {
+        let Some(effect) = self.background_effect.clone() else {
+            return false;
+        };
+        let m = self.margins_now();
+        let Some(rects) = self
+            .blur_shape
+            .for_present(m.deflate(surface), (m.left as i32, m.top as i32))
+        else {
+            return false;
         };
         let region = match Region::new(&*self.compositor) {
             Ok(region) => region,
             Err(err) => {
                 warn!("Failed to create the blur region: {err}");
-                return;
+                // Nothing reached the compositor, so it must not be remembered as
+                // having: let the next frame try again.
+                self.blur_shape.forget();
+                return false;
             },
         };
-        // The effect belongs to the WINDOW, which our margins sit outside of:
-        // blurring the shadow's own ring would put a blurred halo where the
-        // window is see-through. [vendored addition]
-        Self::add_blur_shape(
-            &region,
-            m.deflate(self.size),
-            (m.left as i32, m.top as i32),
-            self.blur_top_radius,
-            self.blur_bottom_radius,
-        );
-        // `set_blur_region` copies, hence dropping the region here.
-        effect.set_blur_region(Some(region.wl_region()));
-        // The region is double-buffered surface state; see `flush`.
-        if flush && self.is_configured() {
-            self.window.wl_surface().commit();
-        }
-    }
-
-    /// Fill `region` with the shape whose backdrop should be blurred.
-    ///
-    /// Square by default, and then one rect says it: the compositor clips the
-    /// region to the surface, so an oversized rect means "all of it" at every
-    /// size and never needs respecifying. A client that rounds its own bottom
-    /// corners needs the effect to stop at the same curve — otherwise the
-    /// corner it cut to transparent is where the blur shows at *full* strength,
-    /// undimmed by any content, and the window ends in a bright square wedge
-    /// poking out of its own curve. There the shape is spelled out row by row:
-    /// everything above the corners, then one rect per row across the arcs.
-    /// [vendored addition]
-    fn add_blur_shape(
-        region: &Region,
-        size: LogicalSize<u32>,
-        origin: (i32, i32),
-        top_radius: u32,
-        bottom_radius: u32,
-    ) {
-        for (x, y, w, h) in blur_shape_rects(size, top_radius, bottom_radius) {
-            let (x, y, w, h) = place_blur_rect((x, y, w, h), size, origin);
+        for (x, y, w, h) in rects {
             region.add(x, y, w, h);
         }
+        // `set_blur_region` copies, hence dropping the region here.
+        effect.set_blur_region(Some(region.wl_region()));
+        true
+    }
+
+    /// State the blur region for the buffer the client is about to commit, whose
+    /// surface is `surface` logical pixels. Call it immediately before presenting
+    /// — the region is double-buffered surface state, so this is what pairs it
+    /// with the buffer it describes rather than with whatever configure arrived
+    /// most recently. See [`BlurRegion`] for what that pairing is worth.
+    /// [vendored addition]
+    pub fn blur_present_size(&mut self, surface: LogicalSize<u32>) {
+        self.write_blur_region(surface);
     }
 
     /// Round the backdrop effect's corners by `top` and `bottom` logical pixels,
     /// matching a client that rounds those corners in its own drawing. 0 (the
-    /// default) leaves that end square. Re-applied on resize, since unlike the
-    /// square shape this one is spelled out in surface coordinates.
-    /// [vendored addition]
+    /// default) leaves that end square. Carried by the next frame, like every
+    /// other change to the shape. [vendored addition]
     pub fn set_blur_corner_radii(&mut self, top: u32, bottom: u32) {
-        if (self.blur_top_radius, self.blur_bottom_radius) == (top, bottom) {
-            return;
-        }
-        self.blur_top_radius = top;
-        self.blur_bottom_radius = bottom;
-        self.reapply_blur_shape();
-    }
-
-    /// Respecify the blur region against the current size — a no-op unless a
-    /// rounded shape is in force, since the square one is size-independent.
-    /// [vendored addition]
-    pub fn reapply_blur_shape(&mut self) {
-        // Unconditional while an effect exists. The square shape used to be
-        // size-independent — one oversized rect, never needing respecifying —
-        // but a shape can now be OFFSET as well as rounded, and a window that
-        // drops its margins and its rounding together (maximizing, snapping)
-        // would otherwise keep the inset shape it had when it was floating, and
-        // wear a blur-less band all round where its own shadow used to be.
-        if self.background_effect.is_none() {
-            return;
-        }
-        if let Some(manager) = self.background_effect_manager.clone() {
-            // No flush: this runs from `resize`, and the frame the client draws
-            // for that resize carries the region with it.
-            self.set_background_effect_blur(&manager, true, false);
-        }
+        self.blur_shape.set_radii(top, bottom);
     }
 
     /// Blur through KDE's `org_kde_kwin_blur`, for compositors that offer only
@@ -1598,6 +1570,70 @@ fn blur_shape_rects(
     rects
 }
 
+/// What the compositor has been told to blur — and, more to the point, *when* it
+/// is told. [vendored addition]
+///
+/// The region is double-buffered **surface** state: whatever was set last is what
+/// the next `wl_surface.commit` applies, including a commit carrying a buffer of
+/// some other size. A configure is therefore exactly the wrong moment to state
+/// one. The client's buffer for that configure does not exist yet — a client
+/// drawing through a GPU swapchain presents on its own schedule — so every frame
+/// committed in between pairs the *new* region with an *old* buffer. On a shrink
+/// the region falls short of the surface and the window wears an unblurred band
+/// down the edge that is still catching up; on a grow it is merely clipped back
+/// to the surface, which is why only one direction of the drag showed it.
+///
+/// Measured on a real drag before this existed: 873 of 1910 commits paired a
+/// buffer with a region of a different height, out to 162 logical pixels.
+///
+/// So the region goes where the buffer goes: [`Self::for_present`] is handed the
+/// size of the buffer about to be committed and answers with the region that
+/// describes *that*. Nothing else states one.
+#[derive(Debug, Default)]
+struct BlurRegion {
+    top_radius: u32,
+    bottom_radius: u32,
+    /// The rects the compositor already has, so a steady stream of frames at one
+    /// shape respecifies nothing. Kept as the rects themselves rather than the
+    /// size they came from: a square shape is one oversized rect at *every* size
+    /// (see [`blur_shape_rects`]), and comparing what is actually sent is what
+    /// makes a resize free for it without a special case saying so.
+    written: Option<Vec<(i32, i32, i32, i32)>>,
+}
+
+impl BlurRegion {
+    /// Round the corners by `top`/`bottom` logical pixels; 0 leaves that end
+    /// square. Stated by the next frame, like every other shape change.
+    fn set_radii(&mut self, top: u32, bottom: u32) {
+        self.top_radius = top;
+        self.bottom_radius = bottom;
+    }
+
+    /// The region for a buffer covering `window` at `origin` within the surface,
+    /// or `None` when the compositor already has exactly that one.
+    fn for_present(
+        &mut self,
+        window: LogicalSize<u32>,
+        origin: (i32, i32),
+    ) -> Option<Vec<(i32, i32, i32, i32)>> {
+        let rects: Vec<_> = blur_shape_rects(window, self.top_radius, self.bottom_radius)
+            .into_iter()
+            .map(|rect| place_blur_rect(rect, window, origin))
+            .collect();
+        if self.written.as_deref() == Some(rects.as_slice()) {
+            return None;
+        }
+        self.written = Some(rects.clone());
+        Some(rects)
+    }
+
+    /// Forget what the compositor knows. The effect object is per-surface state,
+    /// so destroying it takes the region with it and a fresh one must be told.
+    fn forget(&mut self) {
+        self.written = None;
+    }
+}
+
 /// Put one shape rect where it belongs on the surface: offset into the window,
 /// and clipped to it. [vendored addition]
 ///
@@ -1777,5 +1813,106 @@ mod blur_shape_tests {
                 assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
             }
         }
+    }
+}
+
+/// The region has to reach the compositor paired with the buffer it describes —
+/// see [`BlurRegion`] for what goes wrong when it doesn't.
+#[cfg(test)]
+mod blur_region_tests {
+    use super::*;
+
+    /// The height of the shape, which is what a vertical resize moves.
+    fn height(rects: &[(i32, i32, i32, i32)]) -> i32 {
+        rects.iter().map(|&(_, y, _, h)| y + h).max().unwrap_or(0)
+    }
+
+    fn rounded() -> BlurRegion {
+        let mut blur = BlurRegion::default();
+        blur.set_radii(0, 14);
+        blur
+    }
+
+    /// The bug, stated: a drag hands the client a stream of configures, and the
+    /// client's buffer for each one lands a frame or more later (ghost draws
+    /// through wgpu, which presents on its own schedule). Every frame committed
+    /// in between used to carry the region for the newest configure over a buffer
+    /// that was still the old size — on a shrink, an unblurred band down the edge.
+    #[test]
+    fn a_configure_the_client_has_not_drawn_yet_reaches_the_compositor_with_nothing() {
+        let mut blur = rounded();
+        let first = blur
+            .for_present(LogicalSize::new(800, 600), (0, 0))
+            .expect("the first frame states the region");
+        assert_eq!(height(&first), 600);
+
+        // A drag shrinks the window three times. Nothing here writes a region:
+        // there is no method to call, because a configure has no buffer to pair
+        // one with. The client keeps presenting the size it last drew...
+        for _ in 0..3 {
+            assert_eq!(
+                blur.for_present(LogicalSize::new(800, 600), (0, 0)),
+                None,
+                "a frame at an unchanged size must respecify nothing"
+            );
+        }
+
+        // ...and only the buffer that really is 800x480 carries the region for it.
+        let landed = blur
+            .for_present(LogicalSize::new(800, 480), (0, 0))
+            .expect("a new size states a new region");
+        assert_eq!(height(&landed), 480, "the region must describe the buffer it lands with");
+    }
+
+    /// The measurement that found this: on the traced drag, 873 of 1910 commits
+    /// paired a buffer with a region of another height, out to 162 logical pixels.
+    /// Whatever size a frame is, its region is that size.
+    #[test]
+    fn every_frame_of_a_drag_states_its_own_size() {
+        let mut blur = rounded();
+        for h in (400..=900).step_by(7) {
+            let size = LogicalSize::new(1000, h);
+            let rects = blur.for_present(size, (0, 0)).expect("a new size states a region");
+            assert_eq!(height(&rects), h as i32, "region must match the buffer at {h}");
+        }
+    }
+
+    /// A square shape is one oversized rect at every size (the compositor clips it
+    /// to the surface), so a resize gives the compositor nothing new to hear —
+    /// which is exactly why this class of bug never showed on a square window.
+    #[test]
+    fn a_square_window_states_its_region_once_and_never_again() {
+        let mut blur = BlurRegion::default();
+        assert!(blur.for_present(LogicalSize::new(800, 600), (0, 0)).is_some());
+        for h in [560, 520, 480] {
+            assert_eq!(blur.for_present(LogicalSize::new(800, h), (0, 0)), None);
+        }
+    }
+
+    #[test]
+    fn rounding_the_corners_is_carried_by_the_next_frame() {
+        let mut blur = BlurRegion::default();
+        let square = blur.for_present(LogicalSize::new(800, 600), (0, 0)).unwrap();
+        blur.set_radii(0, 14);
+        let curved = blur
+            .for_present(LogicalSize::new(800, 600), (0, 0))
+            .expect("a new shape at the same size still has to be stated");
+        assert_ne!(square, curved);
+    }
+
+    /// The effect object is per-surface state: destroying it (blur switched off)
+    /// throws the region away with it, so switching back on must state it afresh
+    /// rather than trust what the old effect was told.
+    #[test]
+    fn a_destroyed_effect_forgets_what_the_compositor_knew() {
+        let mut blur = rounded();
+        let size = LogicalSize::new(800, 600);
+        assert!(blur.for_present(size, (0, 0)).is_some());
+        assert_eq!(blur.for_present(size, (0, 0)), None);
+        blur.forget();
+        assert!(
+            blur.for_present(size, (0, 0)).is_some(),
+            "a fresh effect knows nothing and must be told"
+        );
     }
 }

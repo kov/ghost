@@ -315,7 +315,7 @@ fn write_png(path: &Path, img: &Rendered) {
     // un-premultiply (divide RGB by alpha). This is identity for opaque pixels
     // (alpha 255), leaving fully-opaque captures byte-for-byte unchanged.
     let mut straight = Vec::with_capacity(img.rgba.len());
-    for p in img.rgba.chunks_exact(4) {
+    for p in img.rgba.as_chunks::<4>().0 {
         let a = p[3];
         if a == 0 || a == 255 {
             straight.extend_from_slice(p);
@@ -1875,6 +1875,33 @@ fn backdrop_blur_supported(_window: &Window) -> bool {
     false
 }
 
+/// Tell the window system what we are about to put on the glass, immediately
+/// before presenting a buffer of `w`x`h` physical pixels.
+///
+/// Two things ride here, and both are about *this* buffer rather than about the
+/// window in general. `pre_present_notify` is winit's frame-callback hook. The
+/// backdrop-blur region is the one that has to know the size: it is
+/// double-buffered surface state, so whatever was last set is what the compositor
+/// applies at our next commit — and our next commit is not necessarily for the
+/// size the compositor last asked for. During a drag the swapchain is only
+/// reconfigured when the shell handles the resize, so frames already in flight
+/// still carry the old size; a region stated when the configure arrived would ride
+/// out on one of those and describe a window the buffer is not yet. Measured
+/// before this: 873 of 1910 commits over one drag paired a buffer with a region of
+/// another height, out to 162 logical pixels, which is an unblurred band down the
+/// edge that is still catching up.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn present_notify(window: &Window, w: u32, h: u32) {
+    use winit::platform::wayland::WindowExtWayland;
+    window.set_blur_present_size(PhysicalSize::new(w, h));
+    window.pre_present_notify();
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn present_notify(window: &Window, _w: u32, _h: u32) {
+    window.pre_present_notify();
+}
+
 /// Pick the surface (swapchain) format. Our shader writes colours that are
 /// already sRGB-encoded 8-bit bytes — the offscreen golden target is
 /// [`ghost_renderer::FORMAT`] (`Rgba8Unorm`) — so the swapchain must be a plain
@@ -2447,6 +2474,7 @@ impl Graphics {
     fn shape_backdrop(_window: &Window, _edge: WindowEdge) -> Option<(u32, u32)> {
         None
     }
+
     /// Physical pixel size of the window surface. (App windows are always
     /// surface-backed; the offscreen variant exists only for the headless harness.)
     fn size(&self) -> (u32, u32) {
@@ -2487,7 +2515,8 @@ impl Graphics {
         let Target::Surface(s) = &mut self.target else {
             return false;
         };
-        let landed = s.blit_snapshot(&mut self.renderer, || self.window.pre_present_notify());
+        let window = &self.window;
+        let landed = s.blit_snapshot(&mut self.renderer, |w, h| present_notify(window, w, h));
         if landed {
             // What's on screen is the held snapshot, not a model scene; keep the
             // scene cache invalid so the eventual crisp commit always redraws.
@@ -2508,7 +2537,7 @@ impl Graphics {
             scene,
             self.fonts,
             font_px,
-            || self.window.pre_present_notify(),
+            |w, h| present_notify(&self.window, w, h),
         );
         // Per-frame cache-efficiency line under `RUST_LOG=ghost::cache=trace`; free otherwise.
         self.renderer.emit_cache_trace();

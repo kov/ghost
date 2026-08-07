@@ -132,6 +132,29 @@ pub trait WindowExtWayland {
     /// [`Window::set_blur`]: crate::window::Window::set_blur
     fn set_blur_corner_radii(&self, top: u32, bottom: u32);
 
+    /// Shape the backdrop effect for the buffer the client is about to commit,
+    /// whose surface is `size` physical pixels. [vendored addition]
+    ///
+    /// Call this immediately before presenting, on the thread that presents, and
+    /// pass the size of the buffer being presented — not the size the last
+    /// configure asked for. The blur region is double-buffered *surface* state:
+    /// the compositor applies whatever was set last at the next
+    /// `wl_surface.commit`, so a region stated when a configure arrives rides out
+    /// on whatever frame the client happens to commit next. A client drawing
+    /// through a GPU swapchain presents on its own schedule, so that is a frame
+    /// still at the old size, and the region and the window disagree for as long
+    /// as the drag lasts — an unblurred band down the edge that is catching up.
+    ///
+    /// Stating it here instead pairs the region with the buffer it describes,
+    /// because the request is written to the connection just ahead of the
+    /// `attach`/`commit` that carries the buffer.
+    ///
+    /// Cheap to call every frame: a shape the compositor already has sends
+    /// nothing, and a square window's shape is one oversized rect at every size.
+    ///
+    /// [`Window::set_blur`]: crate::window::Window::set_blur
+    fn set_blur_present_size(&self, size: PhysicalSize<u32>);
+
     /// Keep `margins` logical pixels of surface *outside* the window proper, for
     /// the client to draw a shadow into. [vendored addition]
     ///
@@ -198,6 +221,17 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::Wayland(window) => {
                 window.set_blur_corner_radii(top, bottom)
             },
+        }
+    }
+
+    #[inline]
+    fn set_blur_present_size(&self, size: PhysicalSize<u32>) {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => (),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.set_blur_present_size(size),
         }
     }
 

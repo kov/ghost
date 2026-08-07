@@ -162,7 +162,7 @@ impl ApplicationHandler for WindowedDive {
         let names = ["edit", "build", "logs", "prod"];
         let mut h = Harness::fleet(METRICS, (size.width, size.height), scale as f32);
         let win = window.clone();
-        h.set_surface(renderer, target, move || win.pre_present_notify());
+        h.set_surface(renderer, target, move |_, _| win.pre_present_notify());
         h.set_sessions(
             names
                 .iter()

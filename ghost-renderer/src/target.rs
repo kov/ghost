@@ -87,8 +87,13 @@ impl SurfaceTarget {
 
     /// Blit the renderer's held resize snapshot onto the surface, unstretched — immediate
     /// feedback during an interactive resize, skipping the relayout/re-raster. Returns
-    /// `true` if it presented. `pre_present` runs just before the present.
-    pub fn blit_snapshot(&mut self, renderer: &mut Renderer, pre_present: impl FnOnce()) -> bool {
+    /// `true` if it presented. `pre_present` runs just before the present, and is told
+    /// the size of the buffer about to be committed (see [`Target::render_frame`]).
+    pub fn blit_snapshot(
+        &mut self,
+        renderer: &mut Renderer,
+        pre_present: impl FnOnce(u32, u32),
+    ) -> bool {
         if !renderer.has_snapshot() {
             return false;
         }
@@ -96,7 +101,7 @@ impl SurfaceTarget {
             return false;
         };
         renderer.blit_snapshot_to_view(&view, self.config.width, self.config.height);
-        pre_present();
+        pre_present(self.config.width, self.config.height);
         frame_tex.present();
         true
     }
@@ -133,7 +138,13 @@ impl Target {
     /// returns `Lost`.
     ///
     /// `pre_present` runs just before a surface present (the app's
-    /// `window.pre_present_notify()`); it is ignored for an offscreen target.
+    /// `window.pre_present_notify()`); it is ignored for an offscreen target. It is
+    /// handed the physical size of the buffer about to be committed, which is not
+    /// always the size the window was last configured to — the swapchain is
+    /// reconfigured when the app handles the resize, and frames in flight before
+    /// that still carry the old size. Anything the app must state to the window
+    /// system *about this buffer* (the backdrop-blur region) belongs here, with
+    /// that size, rather than at configure time.
     pub fn render_frame<'f>(
         &mut self,
         renderer: &mut Renderer,
@@ -141,7 +152,7 @@ impl Target {
         scene: &Scene,
         font: impl Into<FontSet<'f>>,
         font_px: f32,
-        pre_present: impl FnOnce(),
+        pre_present: impl FnOnce(u32, u32),
     ) -> FrameOutcome {
         let font = font.into();
         // Skip an identical scene; otherwise present it. The per-session Surface keeps
@@ -176,7 +187,7 @@ impl Target {
                 renderer.present_scene(&view, size, scene, font, font_px);
                 let build = t_build.elapsed();
                 let t_present = Instant::now();
-                pre_present();
+                pre_present(size.0, size.1);
                 frame_tex.present();
                 FrameOutcome::Presented {
                     build,
