@@ -6,13 +6,31 @@
 
 use ghost_ui_core::WindowRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The file's shape: repeated `[[window]]` tables.
-#[derive(Default, Serialize, Deserialize)]
-struct WindowsFile {
+/// The persisted workspace: a `[sessions]` table followed by repeated
+/// `[[window]]` tables.
+///
+/// `sessions` comes first because TOML puts every plain key before the first
+/// table header, and an array-of-tables opened above it would swallow the
+/// table's keys.
+#[derive(Default, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Workspace {
+    /// The compositor session this process's windows are registered under, per
+    /// desktop. Keyed by `$XDG_CURRENT_DESKTOP` because the identifier means
+    /// nothing to a different compositor — a machine that switches desktops must
+    /// not hand one desktop's id to another and have its windows come back
+    /// wrong, or not at all.
+    ///
+    /// Empty where the compositor doesn't speak `xdg_session_management_v1`,
+    /// which is most of them.
     #[serde(default)]
-    window: Vec<WindowRecord>,
+    pub sessions: BTreeMap<String, String>,
+
+    /// The windows open at the last quit.
+    #[serde(default, rename = "window")]
+    pub windows: Vec<WindowRecord>,
 }
 
 fn file_in(dir: &Path) -> PathBuf {
@@ -21,33 +39,28 @@ fn file_in(dir: &Path) -> PathBuf {
 
 /// Load the persisted workspace from `dir`; a missing or malformed file is just
 /// "no windows" (the next save rewrites it).
-fn load_from(dir: &Path) -> Vec<WindowRecord> {
+fn load_from(dir: &Path) -> Workspace {
     let Ok(text) = std::fs::read_to_string(file_in(dir)) else {
-        return Vec::new();
+        return Workspace::default();
     };
-    toml::from_str::<WindowsFile>(&text)
-        .map(|f| f.window)
-        .unwrap_or_default()
+    toml::from_str::<Workspace>(&text).unwrap_or_default()
 }
 
-fn save_in(dir: &Path, windows: &[WindowRecord]) -> std::io::Result<()> {
+fn save_in(dir: &Path, workspace: &Workspace) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let text = toml::to_string_pretty(&WindowsFile {
-        window: windows.to_vec(),
-    })
-    .map_err(std::io::Error::other)?;
+    let text = toml::to_string_pretty(workspace).map_err(std::io::Error::other)?;
     std::fs::write(file_in(dir), text)
 }
 
 /// The workspace persisted in the data dir (empty if none was ever saved).
-pub fn load() -> Vec<WindowRecord> {
+pub fn load() -> Workspace {
     load_from(&ghost_vt::paths::data_dir())
 }
 
-/// Persist `windows` to the data dir; best-effort (a failure only costs restore
-/// across runs, so it's logged, not fatal).
-pub fn save(windows: &[WindowRecord]) {
-    if let Err(e) = save_in(&ghost_vt::paths::data_dir(), windows) {
+/// Persist `workspace` to the data dir; best-effort (a failure only costs
+/// restore across runs, so it's logged, not fatal).
+pub fn save(workspace: &Workspace) {
+    if let Err(e) = save_in(&ghost_vt::paths::data_dir(), workspace) {
         eprintln!("ghost: saving workspace failed: {e}");
     }
 }
@@ -70,16 +83,47 @@ mod tests {
     #[test]
     fn the_workspace_round_trips_through_the_toml_file() {
         let dir = tempfile::tempdir().unwrap();
-        let windows = vec![rec("win-1", 120, 40, false), rec("win-2", 80, 24, true)];
-        save_in(dir.path(), &windows).unwrap();
-        assert_eq!(load_from(dir.path()), windows);
+        let workspace = Workspace {
+            windows: vec![rec("win-1", 120, 40, false), rec("win-2", 80, 24, true)],
+            ..Workspace::default()
+        };
+        save_in(dir.path(), &workspace).unwrap();
+        assert_eq!(load_from(dir.path()), workspace);
+    }
+
+    #[test]
+    fn the_compositor_session_ids_round_trip_alongside_the_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            sessions: BTreeMap::from([
+                ("GNOME".to_string(), "d3adb33f".to_string()),
+                ("synoik".to_string(), "c0ffee".to_string()),
+            ]),
+            windows: vec![rec("win-1", 120, 40, false)],
+        };
+        save_in(dir.path(), &workspace).unwrap();
+        assert_eq!(load_from(dir.path()), workspace);
+    }
+
+    #[test]
+    fn a_workspace_written_before_session_ids_existed_still_loads() {
+        // The file predates the `[sessions]` table; its windows must survive.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            file_in(dir.path()),
+            "[[window]]\ngroup_id = \"win-1\"\ncols = 80\nrows = 24\nfleet = false\n",
+        )
+        .unwrap();
+        let loaded = load_from(dir.path());
+        assert_eq!(loaded.windows.len(), 1);
+        assert!(loaded.sessions.is_empty());
     }
 
     #[test]
     fn a_missing_or_malformed_file_loads_as_no_windows() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_from(dir.path()), Vec::new());
+        assert_eq!(load_from(dir.path()), Workspace::default());
         std::fs::write(file_in(dir.path()), "not toml [").unwrap();
-        assert_eq!(load_from(dir.path()), Vec::new());
+        assert_eq!(load_from(dir.path()), Workspace::default());
     }
 }

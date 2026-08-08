@@ -1684,6 +1684,10 @@ fn interactive(fresh: bool, ssh_window: bool) {
     };
     let groups = groups::load();
     let workspace = windows::load();
+    // Cloned before `workspace` is moved into the write-on-change baseline. Every
+    // desktop's id is carried, not just this one's, so switching desktops and
+    // back doesn't cost the windows their places.
+    let compositor_sessions = workspace.sessions.clone();
     let startup = if harness.is_some() {
         Startup::Fleet // the harness populates and dives it
     } else if ssh_window {
@@ -1696,8 +1700,8 @@ fn interactive(fresh: bool, ssh_window: bool) {
         // A bare launch with saved windows recreates them, taking precedence over
         // the reconnect-through-the-fleet default below; `--fresh` or an explicit
         // `$GHOST_SESSION` skip that and open just what was asked for.
-        if should_restore(fresh, requested.as_deref(), &workspace) {
-            Startup::Restore(workspace.clone())
+        if should_restore(fresh, requested.as_deref(), &workspace.windows) {
+            Startup::Restore(workspace.windows.clone())
         } else {
             match requested {
                 Some(name) => Startup::Single(name),
@@ -1775,6 +1779,10 @@ fn interactive(fresh: bool, ssh_window: bool) {
         // first save only rewrites the file once the live windows diverge from it.
         last_workspace: workspace,
         workspace_dirty: false,
+        session: None,
+        desktop: desktop_key(),
+        compositor_sessions,
+        fresh,
     };
     // Each host gets a pushed `ghost __watch` stream started on connect (see
     // `App::register_remote`); nothing to poll here.
@@ -2118,6 +2126,7 @@ impl Graphics {
         let WindowSpec {
             mut theme,
             option_as_meta,
+            session_name,
             cols,
             rows,
             pad,
@@ -2188,6 +2197,21 @@ impl Graphics {
             let attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "ghost");
             WindowAttributesExtX11::with_name(attrs, APP_ID, "ghost")
         };
+        // Name the window in the compositor's session, so it reopens where it
+        // was. Must be an attribute rather than a call on the built window: the
+        // request only counts before the surface's first commit, which happens
+        // inside `create_window`. Inert off Wayland and where the compositor
+        // doesn't offer the protocol.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = match session_name {
+            Some(name) => {
+                use winit::platform::wayland::WindowAttributesExtWayland;
+                attrs.with_session_toplevel(name)
+            }
+            None => attrs,
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = session_name;
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // `theme.frost` arrives holding the configured density; keep it only where
         // the compositor isn't blurring for us, so glass is never drawn twice.
@@ -2622,6 +2646,10 @@ pub struct WindowSpec {
     pad: f32,
     /// Who draws the window frame — see `ghost-ui/docs/window-decorations.md`.
     decorations: config::Decorations,
+    /// The name this window is registered under in the compositor's session, so
+    /// it reopens where it was. `None` for a window with no durable identity to
+    /// name it by (the launch window), which restores nothing.
+    session_name: Option<String>,
 }
 
 /// A realized window handed back by the [`Frontend`]: its id, physical size, and
@@ -2634,6 +2662,31 @@ pub struct NewWindow {
     scale: f64,
 }
 
+/// Why this launch is opening its compositor session, which is what a
+/// compositor keys its restore policy on — synoik lets a `Launch` window take
+/// focus and a restored one open quietly.
+///
+/// Ghost never claims `recover`: it cannot tell a crash from a clean start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionReason {
+    /// A window opened because the user asked for one.
+    Launch,
+    /// Windows being recreated from the saved workspace.
+    SessionRestore,
+}
+
+/// What the compositor said about the session ghost opened. Reading only —
+/// requests go back through the [`Frontend`], which is the only thing holding a
+/// live connection.
+pub trait CompositorSession {
+    /// The identifier to persist, once the compositor has settled on one. `None`
+    /// until it says, which for a brand new session is a round trip away.
+    fn id(&self) -> Option<String>;
+
+    /// Whether another client took the session over, leaving ours inert.
+    fn replaced(&self) -> bool;
+}
+
 /// The windowing backend the [`App`] drives, behind a seam so its behaviour can
 /// run without winit. The production impl ([`WinitFrontend`]) wraps a winit
 /// `ActiveEventLoop`; the test impl ([`HeadlessFrontend`]) mints surface-less
@@ -2643,6 +2696,22 @@ pub struct NewWindow {
 pub trait Frontend {
     /// Realize a new window (a real OS window + GPU surface, or a headless stub).
     fn open_window(&self, spec: WindowSpec) -> NewWindow;
+
+    /// Open the compositor session that windows are registered against, reusing
+    /// `id` from a previous run when there is one. `None` where the desktop
+    /// doesn't remember windows for us, which is most of them.
+    fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<Box<dyn CompositorSession>>;
+
+    /// Forget the open session and every window position stored against it.
+    fn remove_session(&self);
+
+    /// Forget one window's stored position, leaving the rest alone. Takes a name
+    /// rather than a window because ghost forgets a window as it closes it.
+    fn forget_toplevel(&self, name: &str);
     /// Leave the event loop (quit).
     fn exit(&self);
     /// Set when the loop next wakes.
@@ -2669,12 +2738,72 @@ impl Frontend for WinitFrontend<'_> {
         }
     }
 
+    fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<Box<dyn CompositorSession>> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            let shared = self.event_loop.open_session(reason.into(), id)?;
+            Some(Box::new(shared) as Box<dyn CompositorSession>)
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            let _ = (reason, id);
+            None
+        }
+    }
+
+    fn remove_session(&self) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            self.event_loop.remove_session();
+        }
+    }
+
+    fn forget_toplevel(&self, name: &str) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            self.event_loop.remove_session_toplevel(name.to_string());
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = name;
+    }
+
     fn exit(&self) {
         self.event_loop.exit();
     }
 
     fn set_control_flow(&self, flow: ControlFlow) {
         self.event_loop.set_control_flow(flow);
+    }
+}
+
+/// The winit session handle read through the seam. The protocol's own shared
+/// state is already an `Arc` of lock-free-enough cells, so this is a newtype
+/// rather than a snapshot: `replaced` can turn true at any dispatch.
+#[cfg(all(unix, not(target_os = "macos")))]
+impl CompositorSession for std::sync::Arc<winit::platform::wayland::SessionShared> {
+    fn id(&self) -> Option<String> {
+        winit::platform::wayland::SessionShared::id(self)
+    }
+
+    fn replaced(&self) -> bool {
+        winit::platform::wayland::SessionShared::replaced(self)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl From<SessionReason> for winit::platform::wayland::SessionReason {
+    fn from(reason: SessionReason) -> Self {
+        match reason {
+            SessionReason::Launch => Self::Launch,
+            SessionReason::SessionRestore => Self::SessionRestore,
+        }
     }
 }
 
@@ -2692,14 +2821,50 @@ pub struct HeadlessFrontend {
     next_id: std::cell::Cell<u64>,
     /// Set when the App asks to quit ([`Frontend::exit`]).
     exited: std::cell::Cell<bool>,
+    /// The name each opened window was registered under, in open order.
+    registered: std::cell::RefCell<Vec<Option<String>>>,
+    /// Names the App asked the compositor to forget, in order.
+    forgotten: std::cell::RefCell<Vec<String>>,
+    /// Every session the App opened, as `(reason, requested id)`.
+    opened: std::cell::RefCell<Vec<(SessionReason, Option<String>)>>,
+    /// How many times the App removed a session outright.
+    removed: std::cell::Cell<usize>,
 }
 
 impl HeadlessFrontend {
+    /// The id this frontend's compositor always settles on, standing in for the
+    /// one a real compositor mints.
+    pub const SESSION_ID: &'static str = "headless-session";
+
     pub fn new() -> Self {
         Self {
             next_id: std::cell::Cell::new(1),
             exited: std::cell::Cell::new(false),
+            registered: std::cell::RefCell::new(Vec::new()),
+            forgotten: std::cell::RefCell::new(Vec::new()),
+            opened: std::cell::RefCell::new(Vec::new()),
+            removed: std::cell::Cell::new(0),
         }
+    }
+
+    /// The name each window opened so far was registered under.
+    pub fn registered_toplevels(&self) -> Vec<Option<String>> {
+        self.registered.borrow().clone()
+    }
+
+    /// The names the App has asked the compositor to forget.
+    pub fn forgotten_toplevels(&self) -> Vec<String> {
+        self.forgotten.borrow().clone()
+    }
+
+    /// Every session opened, as `(reason, the id asked for)`.
+    pub fn opened_sessions(&self) -> Vec<(SessionReason, Option<String>)> {
+        self.opened.borrow().clone()
+    }
+
+    /// How many sessions were removed outright.
+    pub fn removed_sessions(&self) -> usize {
+        self.removed.get()
     }
 
     /// Whether the App asked to quit.
@@ -2714,8 +2879,23 @@ impl Default for HeadlessFrontend {
     }
 }
 
+/// A compositor that always hands back the same identifier, whatever was asked
+/// for — enough to pin that ghost persists what it was *told*, not what it sent.
+struct HeadlessSession;
+
+impl CompositorSession for HeadlessSession {
+    fn id(&self) -> Option<String> {
+        Some(HeadlessFrontend::SESSION_ID.to_string())
+    }
+
+    fn replaced(&self) -> bool {
+        false
+    }
+}
+
 impl Frontend for HeadlessFrontend {
     fn open_window(&self, spec: WindowSpec) -> NewWindow {
+        self.registered.borrow_mut().push(spec.session_name.clone());
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         // Physical size == logical at scale 1.0, sized exactly as `Graphics::new`.
@@ -2729,6 +2909,25 @@ impl Frontend for HeadlessFrontend {
             size_px: (w.max(1), h.max(1)),
             scale: 1.0,
         }
+    }
+
+    fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<Box<dyn CompositorSession>> {
+        self.opened
+            .borrow_mut()
+            .push((reason, id.map(ToOwned::to_owned)));
+        Some(Box::new(HeadlessSession))
+    }
+
+    fn remove_session(&self) {
+        self.removed.set(self.removed.get() + 1);
+    }
+
+    fn forget_toplevel(&self, name: &str) {
+        self.forgotten.borrow_mut().push(name.to_string());
     }
 
     fn exit(&self) {
@@ -2748,6 +2947,7 @@ impl App {
     /// never started. Use [`headless_with_sink`](App::headless_with_sink) to run them
     /// for real (against a real remote host) and drain their results yourself.
     pub fn headless() -> Self {
+        let saved = windows::load();
         App {
             windows: HashMap::new(),
             states: Sessions::new(),
@@ -2783,8 +2983,12 @@ impl App {
             sessions_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _config_watcher: None,
             config_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_workspace: windows::load(),
+            last_workspace: saved.clone(),
             workspace_dirty: false,
+            session: None,
+            desktop: desktop_key(),
+            compositor_sessions: saved.sessions,
+            fresh: false,
         }
     }
 
@@ -3181,10 +3385,43 @@ pub struct App {
     /// The workspace snapshot last written to disk, so a rebuild that matches it
     /// skips the write. Kept current as windows change so a crash or reboot still
     /// restores what was open (see [`App::save_workspace`]).
-    last_workspace: Vec<ghost_ui_core::WindowRecord>,
+    last_workspace: windows::Workspace,
     /// Set when a window's set or state may have changed; the loop flushes the
     /// workspace snapshot once per wake rather than on every nested dispatch.
     workspace_dirty: bool,
+    /// The compositor session this process's windows are registered against, so
+    /// they reopen where they were. `None` on a desktop that doesn't offer the
+    /// protocol, which costs nothing but window positions.
+    session: Option<Box<dyn CompositorSession>>,
+    /// Which desktop the persisted session ids are filed under — a session
+    /// identifier means nothing to a different compositor.
+    desktop: String,
+    /// The session ids remembered for every desktop this workspace has seen,
+    /// carried through a save so switching desktops doesn't discard the other's.
+    compositor_sessions: std::collections::BTreeMap<String, String>,
+    /// `--fresh`: this launch starts over from nothing, which includes the
+    /// window positions the compositor was holding for us.
+    fresh: bool,
+}
+
+/// The desktop the compositor session is filed under. `$XDG_CURRENT_DESKTOP` is
+/// what the protocol itself points clients at; a session started outside a
+/// desktop environment still gets a stable key of its own.
+fn desktop_key() -> String {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Which reason a launch opens its compositor session under. A compositor may
+/// treat a restored window more gently than a launched one — synoik lets only a
+/// `Launch` take focus — so a workspace restore must say so.
+fn session_reason(startup: &Startup) -> SessionReason {
+    match startup {
+        Startup::Restore(_) => SessionReason::SessionRestore,
+        _ => SessionReason::Launch,
+    }
 }
 
 impl App {
@@ -4070,7 +4307,7 @@ impl App {
                 }
                 Cmd::UsePlainSshFallback => self.use_plain_ssh_fallback(wid, event_loop),
                 Cmd::CloseWindow => {
-                    self.close_window(wid);
+                    self.close_window(wid, event_loop);
                     if self.windows.is_empty() {
                         self.shutdown(event_loop);
                     }
@@ -5689,6 +5926,7 @@ impl App {
             rows: req_rows,
             pad: cfg.padding(),
             decorations: cfg.decorations(),
+            session_name: Some(group.id.clone()),
         });
         // Ask the realized window whether its compositor blurs; a headless window
         // has nothing to ask and needs no glass either way.
@@ -5774,6 +6012,12 @@ impl App {
     /// Returns whether anything opened — `false` means there is nothing to show
     /// and the process should exit.
     pub fn open_startup_windows(&mut self, event_loop: &dyn Frontend) -> bool {
+        // Before any window exists: a window is registered as it is created, and
+        // restoring one means changing the very first configure it is sent, so
+        // the session has to be open by then.
+        let reason = session_reason(&self.startup);
+        let remembered = self.compositor_sessions.get(&self.desktop).cloned();
+        self.open_compositor_session(event_loop, reason, remembered.as_deref(), self.fresh);
         // Consumed once (the caller's guard keeps this from re-running); the
         // placeholder is never used.
         match std::mem::replace(&mut self.startup, Startup::Fleet) {
@@ -5947,13 +6191,46 @@ impl App {
     /// Closing is detaching: dropping the window drops its session clients and
     /// the hosts keep the sessions running. The last window out shuts down.
     fn close_requested(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
-        self.close_window(wid);
+        self.close_window(wid, event_loop);
         if self.windows.is_empty() {
             self.shutdown(event_loop);
         }
     }
 
-    fn close_window(&mut self, wid: WindowId) {
+    /// Open the compositor session this process's windows register against.
+    ///
+    /// `fresh` is `--fresh`: start over from nothing, which has to include the
+    /// compositor's stored geometry. Merely dropping the id would orphan it —
+    /// the protocol can only forget a session that is open — so the remembered
+    /// one is opened, removed, and a new one opened in its place. All three
+    /// requests are ordered on the wire; none of them waits for a reply.
+    pub fn open_compositor_session(
+        &mut self,
+        event_loop: &dyn Frontend,
+        reason: SessionReason,
+        remembered: Option<&str>,
+        fresh: bool,
+    ) {
+        if fresh {
+            if remembered.is_some() {
+                event_loop.open_session(reason, remembered);
+                event_loop.remove_session();
+            }
+            self.compositor_sessions.remove(&self.desktop);
+            self.session = event_loop.open_session(reason, None);
+            return;
+        }
+        self.session = event_loop.open_session(reason, remembered);
+    }
+
+    fn close_window(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
+        // A closed window is forgotten, the way a browser forgets a closed tab:
+        // only what was open at the quit comes back. It is also what bounds the
+        // compositor's store, since every run mints fresh group ids and a name
+        // nothing forgets would be remembered forever.
+        if let Some(w) = self.windows.get(&wid) {
+            event_loop.forget_toplevel(&w.root.window_record().group_id);
+        }
         self.windows.remove(&wid);
         let touched: Vec<String> = self
             .sessions
@@ -6068,9 +6345,27 @@ impl App {
         // Stable order so an unchanged workspace serialises identically and the
         // write-on-change guard holds.
         records.sort_by(|a, b| a.group_id.cmp(&b.group_id));
-        if records != self.last_workspace {
-            windows::save(&records);
-            self.last_workspace = records;
+        // Persist the identifier the *compositor* settled on, never the one we
+        // asked for: an id it has forgotten comes back as a brand new one, and
+        // storing ours would keep asking for a session that no longer exists.
+        // `None` only means the reply hasn't arrived yet, so leave what we have.
+        if let Some(session) = &self.session {
+            if session.replaced() {
+                // Another client owns the id now and everything we hold for it
+                // is inert. Let go of the handle and leave the stored id alone —
+                // it is the other client's to keep current.
+                self.session = None;
+            } else if let Some(id) = session.id() {
+                self.compositor_sessions.insert(self.desktop.clone(), id);
+            }
+        }
+        let workspace = windows::Workspace {
+            sessions: self.compositor_sessions.clone(),
+            windows: records,
+        };
+        if workspace != self.last_workspace {
+            windows::save(&workspace);
+            self.last_workspace = workspace;
         }
     }
 
@@ -6128,7 +6423,7 @@ impl App {
 
     /// The saved workspace on disk — what a bare launch restores.
     pub fn saved_workspace() -> Vec<ghost_ui_core::WindowRecord> {
-        windows::load()
+        windows::load().windows
     }
 
     /// Session ids this process holds a live client for (the driven set).
@@ -6163,6 +6458,7 @@ impl App {
             rows: req_rows,
             pad: cfg.padding(),
             decorations: cfg.decorations(),
+            session_name: Some(group.id.clone()),
         });
         // Ask the realized window whether its compositor blurs; a headless window
         // has nothing to ask and needs no glass either way.
@@ -7215,7 +7511,7 @@ impl App {
             }
         }
         for wid in emptied {
-            self.close_window(wid);
+            self.close_window(wid, fe);
         }
         if self.windows.is_empty() {
             self.shutdown(fe);
@@ -7530,11 +7826,12 @@ mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
         App, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
-        PendingRemote, REMOTE_ID_SEP, StallEvent, StartupChoice, auth_error_message,
-        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, glass,
-        home_launch_dir, inherited_connection, namespace_remote_infos, new_window_choice,
-        password_prompt, remote_spawn_target, respawn_opts, restore_plan, should_restore,
-        startup_choice, surface_matches_window, theme_colors,
+        PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, Startup, StartupChoice,
+        auth_error_message, choose_alpha_mode, choose_surface_format, config,
+        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
+        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
+        respawn_opts, restore_plan, session_reason, should_restore, startup_choice,
+        surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
@@ -7825,6 +8122,156 @@ mod tests {
         assert!(
             flag_within(&flag, 2000),
             "a new entry in the session dir must trigger the flag"
+        );
+    }
+
+    // --- compositor session restore (`xdg_session_management_v1`) ----------
+    //
+    // Ghost keeps `windows.toml` as the truth for *which* windows exist and what
+    // they show; the compositor is asked only where they were. These pin the
+    // handshake: which windows get named, when a name is forgotten, and what a
+    // launch asks for.
+
+    #[test]
+    fn a_window_is_registered_with_the_compositor_under_its_group_id() {
+        // The group id is the only per-window identity that survives a restart
+        // (a restored window reclaims it), so it is the name the compositor
+        // stores geometry against.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let id = group.id.clone();
+            app.open_fleet_window(&fe, group, None);
+            assert_eq!(fe.registered_toplevels(), vec![Some(id)]);
+        });
+    }
+
+    #[test]
+    fn a_restored_window_asks_under_the_group_id_it_reclaimed() {
+        // The whole scheme rests on this: restore reclaims the saved group
+        // rather than minting a fresh one, so the name it asks the compositor
+        // for is the name the previous run saved geometry under. Mint a group,
+        // close its window, and reopen on the same group — the second window
+        // must ask for the same name, not a new one.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let id = group.id.clone();
+            app.open_fleet_window(&fe, group.clone(), None);
+            app.open_fleet_window(&fe, group, None);
+            assert_eq!(
+                fe.registered_toplevels(),
+                vec![Some(id.clone()), Some(id)],
+                "a reclaimed group keeps its name"
+            );
+        });
+    }
+
+    #[test]
+    fn closing_a_window_makes_the_compositor_forget_where_it_was() {
+        // Ghost's browser model: a closed window is gone, not remembered. It is
+        // also what bounds the compositor's store — every run mints new group
+        // ids, so names nothing forgets would accumulate forever.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let id = group.id.clone();
+            let wid = app.open_fleet_window(&fe, group, None);
+            app.close_window(wid, &fe);
+            assert_eq!(fe.forgotten_toplevels(), vec![id]);
+        });
+    }
+
+    #[test]
+    fn quitting_leaves_every_window_remembered() {
+        // The other half of the same rule, and the one restore depends on: a
+        // quit must forget nothing, or the next launch has nowhere to restore
+        // from.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            app.open_fleet_window(&fe, group, None);
+            app.shutdown(&fe);
+            assert!(fe.forgotten_toplevels().is_empty());
+        });
+    }
+
+    #[test]
+    fn an_ordinary_launch_reopens_the_remembered_session() {
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            app.open_compositor_session(&fe, SessionReason::SessionRestore, Some("old-id"), false);
+            assert_eq!(
+                fe.opened_sessions(),
+                vec![(SessionReason::SessionRestore, Some("old-id".to_string()))]
+            );
+            assert_eq!(
+                fe.removed_sessions(),
+                0,
+                "an ordinary launch forgets nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn a_fresh_launch_deletes_the_remembered_session_before_opening_a_new_one() {
+        // `--fresh` means start over from nothing, so the compositor's stored
+        // geometry has to go too. Dropping the id on our side would only orphan
+        // it — the session has to be reopened to be removed.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            app.open_compositor_session(&fe, SessionReason::Launch, Some("old-id"), true);
+            assert_eq!(
+                fe.opened_sessions(),
+                vec![
+                    (SessionReason::Launch, Some("old-id".to_string())),
+                    (SessionReason::Launch, None),
+                ]
+            );
+            assert_eq!(fe.removed_sessions(), 1);
+        });
+    }
+
+    #[test]
+    fn the_compositor_session_id_is_remembered_for_this_desktop() {
+        // Written back from what the compositor settled on, never from what we
+        // asked for: an id it has forgotten comes back as a fresh one, and
+        // storing ours would ask for a dead session forever.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            app.desktop = "synoik".to_string();
+            let fe = HeadlessFrontend::new();
+            app.open_compositor_session(&fe, SessionReason::Launch, None, false);
+            app.save_workspace();
+            assert_eq!(
+                super::windows::load()
+                    .sessions
+                    .get("synoik")
+                    .map(String::as_str),
+                Some(HeadlessFrontend::SESSION_ID),
+            );
+        });
+    }
+
+    #[test]
+    fn a_restore_launch_tells_the_compositor_it_is_a_restore() {
+        // Synoik keys focus-stealing on the reason: five windows restored at
+        // login must not each take focus in turn, while an app-launcher start
+        // still behaves like any other launch.
+        assert_eq!(
+            session_reason(&Startup::Restore(Vec::new())),
+            SessionReason::SessionRestore
+        );
+        assert_eq!(session_reason(&Startup::Fleet), SessionReason::Launch);
+        assert_eq!(
+            session_reason(&Startup::Single("a".into())),
+            SessionReason::Launch
         );
     }
 
@@ -8785,7 +9232,7 @@ mod tests {
             assert!(app.sessions.contains_key(name), "precondition: A drives it");
 
             // A closes. B still previews X in its fleet.
-            app.close_window(a);
+            app.close_window(a, &fe);
 
             let survived = sees(&app);
             let dropped_client = !app.sessions.contains_key(name);
@@ -8956,7 +9403,7 @@ mod tests {
             );
 
             // A closes. B still previews the now-driverless remote session.
-            app.close_window(a);
+            app.close_window(a, &fe);
 
             let downgraded = app.observers.contains_key(&composite);
             let host_kept = app
@@ -9569,7 +10016,7 @@ mod tests {
                 groups.iter().any(|g| g.members.contains(&rem)),
                 "the remote session is remembered as a group member: {groups:?}"
             );
-            let records = super::windows::load();
+            let records = super::windows::load().windows;
             assert!(
                 records
                     .iter()
@@ -9627,7 +10074,7 @@ mod tests {
                 app.pending_remote_restores.contains_key("kov@box"),
                 "the remote reconnect is queued while the window is open"
             );
-            app.close_window(wid);
+            app.close_window(wid, &fe);
             assert!(
                 !app.pending_remote_restores.contains_key("kov@box"),
                 "closing the window drops its queued remote reconnect"
