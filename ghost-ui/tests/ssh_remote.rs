@@ -107,6 +107,34 @@ impl Drop for RemoteRoot {
     }
 }
 
+/// The shim is written by one test and run moments later while three others are
+/// spawning processes of their own — and `Command` forks before it execs, so a
+/// sibling's fork copies whatever fds this process has open at that instant,
+/// including the one `isolated_shim`'s write is still using. Until that child
+/// reaches its own `execve` the kernel sees a writer on our script and refuses
+/// to exec it: `ETXTBSY`, "Text file busy", a hard error out of `.output()` and
+/// a red test that has nothing to do with what it was checking.
+///
+/// [`transport`] therefore hands the shim to `sh` to *read* rather than exec'ing
+/// it — `/bin/sh` is nothing we ever write, and a file being read is never busy.
+#[test]
+fn the_transport_runs_the_shim_even_while_a_writer_holds_it_open() {
+    let shim = isolated_shim();
+    let ssh = shim.path().join("ssh");
+    let remote = RemoteRoot::new();
+    // Stand in for the sibling's forked child, which holds exactly this.
+    let _writer = std::fs::OpenOptions::new().write(true).open(&ssh).unwrap();
+
+    let out = transport(remote.path(), &ssh, "dev@example", &["echo", "shim-ran"])
+        .output()
+        .expect("run the shim while it is held open for writing");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("shim-ran"),
+        "the shim did not run; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A `ghost` command run on the initiator with its own (local) XDG — never the
 /// remote root, so it can only ever see *local* sessions.
 fn local_ghost(xdg: &Path) -> Command {
@@ -123,7 +151,11 @@ fn local_ghost(xdg: &Path) -> Command {
 fn transport(remote_root: &Path, ssh: &Path, target: &str, remote: &[&str]) -> Command {
     let spec = ConnectionSpec::parse_target(target).unwrap();
     let argv = spec.ssh_command(&[], remote);
-    let mut c = Command::new(ssh);
+    // `sh <script>` rather than exec'ing the script: a file being *read* is never
+    // "busy", so this cannot lose the ETXTBSY race a sibling test's fork opens
+    // over the shim (see the test above). The shebang is decoration under this.
+    let mut c = Command::new("sh");
+    c.arg(ssh);
     c.args(&argv[1..]); // drop the leading "ssh"; we invoke the shim directly
     c.env("GHOST_REMOTE_ROOT", remote_root);
     c
