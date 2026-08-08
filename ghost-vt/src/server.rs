@@ -25,6 +25,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Options for starting a session.
@@ -122,6 +123,11 @@ const HOST_LOCK_FD: RawFd = 4;
 /// Where the child parks its copies while it re-numbers them, clear of stdio and
 /// of both target slots.
 const STAGING_FD: libc::c_int = 10;
+/// Where the failure pipe's write end is parked, above both slots the child
+/// `dup2`s onto and below [`STAGING_FD`] — see [`daemonize_and_exec`]. Left on a
+/// low number it could BE one of those slots, and the `dup2` would close the one
+/// descriptor a failure has left to speak through.
+const ERRNO_FD_FLOOR: libc::c_int = HOST_LOCK_FD + 1;
 
 /// The hidden subcommand a self-upgrade runs on its target to read that binary's
 /// [`HANDOFF_VERSION`] before exec'ing onto it (see [`probe_handoff_version`]).
@@ -283,6 +289,12 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
             ),
         ));
     }
+    // Before anything is created on disk: a host is an exec of this binary, and
+    // if there is nothing left to exec (the binary was replaced under a running
+    // process) the spawn is already lost. Checked here rather than at its use
+    // below so the failure leaves no session directory, no socket and no lock
+    // behind — state a listing has to prune and a group registry can pick up.
+    let exe = check_exec_target(std::env::current_exe()?)?;
     paths::ensure_session_dir(&opts.name)?;
 
     // A host outlives its client by design; make it outlive the *login* too. The
@@ -354,6 +366,10 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     let listener_fd = listener.as_raw_fd();
     let lock_fd = lock.as_raw_fd();
 
+    // Taken before `opts` is moved into the handoff blob, for the failure path
+    // below.
+    let session_dir = paths::session_dir(&opts.name);
+
     let host_args = HostArgs {
         handoff_version: HANDOFF_VERSION,
         launch_dir: std::env::current_dir().ok(),
@@ -362,7 +378,6 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     };
     let blob = encode_host_args(&host_args);
 
-    let exe = std::env::current_exe()?;
     let exe_c = CString::new(exe.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
     // The numbers on argv are where the child will PUT the fds, not where they sit
@@ -382,7 +397,16 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     // `listener`, and `lock` must outlive the call (the forked child reads them up
     // to the exec); they drop here in the parent. The parent dropping its `lock`
     // copy does not release the flock — the host's inherited copy keeps it held.
-    unsafe { daemonize_and_exec(&exe_c, &argv, listener_fd, lock_fd) }
+    let started = unsafe { daemonize_and_exec(&exe_c, &argv, listener_fd, lock_fd) };
+    if started.is_err() {
+        // No host will ever answer on this socket, and nothing else will tidy it
+        // promptly: a listing prunes a directory whose lock is free, but until it
+        // runs the name looks like a live session — which is how a spawn that
+        // never happened ended up as a member in the group registry.
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+    started
 }
 
 /// If this process was re-exec'd as a session host (`__host <fd> <blob>` on
@@ -2483,10 +2507,68 @@ fn effective_command(
     }
 }
 
+/// The suffix the kernel appends to `/proc/<pid>/exe` once the file it named has
+/// been unlinked. `std::env::current_exe` reads that link and hands the result
+/// back unchanged, so it arrives in the path as if it were part of the name.
+const DELETED_SUFFIX: &str = " (deleted)";
+
+/// The binary to exec a session host from — this process's own executable,
+/// refused when there is nothing left to exec.
+///
+/// Installing a new `ghost` over a running one unlinks the inode the running
+/// process is executing. `current_exe` then answers `".../ghost (deleted)"`, and
+/// exec'ing that can only fail — in a forked grandchild whose stdio is already
+/// `/dev/null`, which is why it was invisible. `ghost-cli`'s `__upgrade` documents
+/// the same trap for the self-upgrade path; this is the ordinary spawn path
+/// learning it.
+///
+/// Exec'ing `/proc/self/exe` instead would keep working across a rebuild, by
+/// starting every new host from the OLD binary indefinitely. Quietly running code
+/// the user has replaced is the worse failure, so this says so and stops.
+fn check_exec_target(exe: PathBuf) -> io::Result<PathBuf> {
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let shown = exe.display();
+    let message = if exe.to_string_lossy().ends_with(DELETED_SUFFIX) {
+        format!(
+            "the running ghost binary has been replaced on disk ({shown}); \
+             restart ghost to pick it up — a session cannot be started from an \
+             executable that is no longer there"
+        )
+    } else {
+        format!("the ghost binary ({shown}) is gone; a session cannot be started")
+    };
+    Err(io::Error::new(io::ErrorKind::NotFound, message))
+}
+
+/// Hand an errno back through the failure pipe. Async-signal-safe: a four-byte
+/// write to a pipe with room cannot short-write, and if it fails there is nothing
+/// left to report the failure with anyway.
+unsafe fn report_errno(wr: RawFd, errno: libc::c_int) {
+    let bytes = errno.to_ne_bytes();
+    unsafe { libc::write(wr, bytes.as_ptr().cast(), bytes.len()) };
+}
+
+/// The errno of the call that just failed.
+fn errno_now() -> libc::c_int {
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
 /// Classic double-fork daemonization, then `execv` the host.
 ///
-/// Returns `Ok(())` only in the original process. The daemonized grandchild
-/// execs `exe` with `argv` and never returns; on any failure it `_exit`s. From
+/// Returns `Ok(())` only in the original process, and only when the host is
+/// genuinely running: a failure anywhere past the first fork comes back as the
+/// `Err` it deserves, carried out of the child on a close-on-exec pipe. Nothing
+/// else could report it — by then the grandchild's stdio is `/dev/null`, and
+/// returning at the fork (as this used to) called every such failure a success.
+/// A successful `execv` closes the write end, and that EOF is the signal that the
+/// host exists.
+///
+/// The daemonized grandchild execs `exe` with `argv` and never returns; on any
+/// failure it reports and `_exit`s. From
 /// the first fork to the exec only async-signal-safe syscalls run — no
 /// allocation, no env access — so this is safe to call from a multithreaded
 /// process (where a fork that ran arbitrary code could deadlock on an inherited
@@ -2506,20 +2588,74 @@ unsafe fn daemonize_and_exec(
     listener_fd: RawFd,
     lock_fd: RawFd,
 ) -> io::Result<()> {
-    match unsafe { libc::fork() } {
-        -1 => return Err(io::Error::last_os_error()),
-        0 => {}
-        _ => return Ok(()), // original process
+    // The failure pipe. CLOEXEC is what makes it work in both directions: the
+    // child writes an errno into it when something goes wrong, and a successful
+    // `execv` closes it, so EOF — and only EOF — means the host is up.
+    let mut pipe_fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
+    // Park the write end clear of the two slots the child `dup2`s the listener and
+    // the lock onto. Sitting on one of those, it would be closed by that `dup2`:
+    // an exec that *succeeded* would still read as EOF, but a failing one would
+    // write its errno into the listener socket and the parent would read EOF and
+    // call it a success — the exact silence this pipe exists to end, restored.
+    // Done here, in the parent, because it allocates a descriptor, and using what
+    // `F_DUPFD_CLOEXEC` returns rather than the floor it was asked for: it answers
+    // with the lowest free descriptor at or above that, which is rarely the floor.
+    let wr = {
+        let moved = unsafe { libc::fcntl(wr, libc::F_DUPFD_CLOEXEC, ERRNO_FD_FLOOR) };
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(wr) };
+        if moved < 0 {
+            unsafe { libc::close(rd) };
+            return Err(err);
+        }
+        moved
+    };
+
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(err);
+    }
+    if child > 0 {
+        // The original process. Its own write end must go before the read, or the
+        // pipe never reaches EOF and this waits for a child that has already exec'd.
+        unsafe { libc::close(wr) };
+        let failure = read_errno(rd);
+        unsafe { libc::close(rd) };
+        // Reap the intermediate, which `_exit`ed the moment it had forked. Nothing
+        // ever did this, so every spawn — the successful ones too — left a zombie
+        // for as long as the launching process lived.
+        let mut status = 0;
+        while unsafe { libc::waitpid(child, &mut status, 0) } < 0 && errno_now() == libc::EINTR {}
+        return match failure {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => Ok(()),
+        };
     }
     // --- async-signal-safe only, from here until execv (or _exit) ---
     unsafe {
+        libc::close(rd);
         // New session: detach from the controlling terminal.
         if libc::setsid() == -1 {
+            report_errno(wr, errno_now());
             libc::_exit(127);
         }
         // Second fork: never a session leader, so we can't reacquire a terminal.
+        // The intermediate exits without reporting: its own copy of the write end
+        // closes with it, and the grandchild still holds the one that matters.
         match libc::fork() {
-            -1 => libc::_exit(127),
+            -1 => {
+                report_errno(wr, errno_now());
+                libc::_exit(127);
+            }
             0 => {}
             _ => libc::_exit(0),
         }
@@ -2562,19 +2698,49 @@ unsafe fn daemonize_and_exec(
         let staged_listener = libc::fcntl(listener_fd, libc::F_DUPFD, STAGING_FD);
         let staged_lock = libc::fcntl(lock_fd, libc::F_DUPFD, STAGING_FD);
         if staged_listener < 0 || staged_lock < 0 {
+            report_errno(wr, errno_now());
             libc::_exit(127);
         }
         if libc::dup2(staged_listener, HOST_LISTENER_FD) < 0
             || libc::dup2(staged_lock, HOST_LOCK_FD) < 0
         {
+            report_errno(wr, errno_now());
             libc::_exit(127);
         }
         libc::close(staged_listener);
         libc::close(staged_lock);
-        // Replace this image with the host. Only returns on failure.
+        // Replace this image with the host. Only returns on failure — and the
+        // commonest failure by far is a binary that was replaced under a running
+        // process (see `check_exec_target`), which is worth a word rather than a
+        // silent exit status nobody collects.
         libc::execv(exe.as_ptr(), argv.as_ptr());
+        report_errno(wr, errno_now());
         libc::_exit(127);
     }
+}
+
+/// Drain the failure pipe: the errno the child reported, or `None` if it reached
+/// EOF without writing one — which a close-on-exec write end only does once the
+/// `execv` has happened.
+fn read_errno(rd: RawFd) -> Option<libc::c_int> {
+    let mut buf = [0u8; std::mem::size_of::<libc::c_int>()];
+    let mut got = 0;
+    while got < buf.len() {
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().add(got).cast(), buf.len() - got) };
+        if n < 0 {
+            if errno_now() == libc::EINTR {
+                continue;
+            }
+            return None;
+        }
+        if n == 0 {
+            // EOF. A partial write cannot happen (four bytes to an empty pipe are
+            // atomic), so anything short of the whole errno is no errno at all.
+            return None;
+        }
+        got += n as usize;
+    }
+    Some(libc::c_int::from_ne_bytes(buf))
 }
 
 #[cfg(test)]
@@ -2606,6 +2772,127 @@ mod tests {
         let bytes = postcard::to_allocvec(&opts).unwrap();
         let back: SpawnOpts = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.connection, opts.connection);
+    }
+
+    /// The pids of this process's own children that are zombies right now.
+    ///
+    /// A leaked daemonize intermediate is always one of these: it `_exit`s the
+    /// instant it has forked, so it is dead from the caller's next instruction
+    /// and stays dead until someone reaps it. Live children of other tests are
+    /// running, not zombies, so this sees past them.
+    fn zombie_children() -> Vec<i32> {
+        let mut zombies = Vec::new();
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return zombies;
+        };
+        for task in tasks.flatten() {
+            let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                continue;
+            };
+            for pid in children.split_whitespace().filter_map(|p| p.parse().ok()) {
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // `...) S ...` — the state follows the last ')', which is the end
+                // of the comm field (which may itself contain spaces or ')').
+                if let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start())
+                    && rest.starts_with('Z')
+                {
+                    zombies.push(pid);
+                }
+            }
+        }
+        zombies
+    }
+
+    /// Two file descriptors standing in for the listener and the lock. Only their
+    /// openness matters here: the exec is going to fail before anything reads them.
+    fn scratch_fds() -> (std::fs::File, std::fs::File) {
+        (
+            std::fs::File::open("/dev/null").unwrap(),
+            std::fs::File::open("/dev/null").unwrap(),
+        )
+    }
+
+    /// Everything after the first fork used to happen where nobody could see it:
+    /// the grandchild's stdio is `/dev/null` by then, and `spawn` returned `Ok` the
+    /// moment the fork itself succeeded. So an `execv` that failed — which is what a
+    /// rebuild under a running GUI causes, see
+    /// [`check_exec_target`] — produced a session directory, a bound socket, a
+    /// group entry, and no host, with not one word logged anywhere.
+    #[test]
+    fn a_spawn_whose_exec_fails_says_so() {
+        let (listener, lock) = scratch_fds();
+        let exe = CString::new("/nonexistent/ghost").unwrap();
+        let argv_owned = [exe.clone()];
+        let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+        argv.push(std::ptr::null());
+
+        let err =
+            unsafe { daemonize_and_exec(&exe, &argv, listener.as_raw_fd(), lock.as_raw_fd()) }
+                .expect_err("an exec that cannot happen must not report success");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the grandchild's errno should reach the caller verbatim, got {err}"
+        );
+    }
+
+    /// The daemonize intermediate `_exit`s as soon as it has forked, and nothing
+    /// ever waited on it — so every session spawn left a zombie for the life of the
+    /// GUI, successful ones included.
+    #[test]
+    fn a_spawn_reaps_its_daemonize_intermediate() {
+        let before = zombie_children();
+        let (listener, lock) = scratch_fds();
+        let exe = CString::new("/nonexistent/ghost").unwrap();
+        let argv_owned = [exe.clone()];
+        let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let _ = unsafe { daemonize_and_exec(&exe, &argv, listener.as_raw_fd(), lock.as_raw_fd()) };
+
+        // The intermediate is reaped before the call returns, so this needs no
+        // settling time; poll only to keep an unrelated test's exiting child from
+        // being read as ours.
+        for _ in 0..20 {
+            let new: Vec<i32> = zombie_children()
+                .into_iter()
+                .filter(|pid| !before.contains(pid))
+                .collect();
+            if new.is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("a spawn left an unreaped daemonize intermediate behind");
+    }
+
+    /// What broke `Alt-t` on a live desktop: installing a new `ghost` unlinks the
+    /// inode the running GUI is executing, `readlink("/proc/self/exe")` then answers
+    /// `".../ghost (deleted)"`, and Rust hands that path back verbatim. Exec'ing it
+    /// can only fail, so it is refused with something a person can act on instead.
+    #[test]
+    fn a_replaced_binary_is_refused_as_an_exec_target() {
+        // The live case: a real binary, still there, is used as-is.
+        let real = std::env::current_exe().unwrap();
+        assert_eq!(check_exec_target(real.clone()).unwrap(), real);
+
+        // The readlink artifact: refused, and the message has to name the cause,
+        // because the only cure is a restart the user has to choose to do.
+        let deleted = PathBuf::from(format!("{} (deleted)", real.display()));
+        let err = check_exec_target(deleted).expect_err("a deleted binary cannot be exec'd");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("replaced") && msg.contains("restart"),
+            "message must say what happened and what to do, got {msg}"
+        );
+
+        // A path that is merely absent is refused too, but it is not the
+        // replaced-binary story and must not claim to be.
+        let missing = PathBuf::from("/nonexistent/ghost");
+        let err = check_exec_target(missing).expect_err("a missing binary cannot be exec'd");
+        assert!(!err.to_string().contains("replaced"));
     }
 
     #[test]
