@@ -1,5 +1,6 @@
 //! The state of the window, which is shared with the event-loop.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -381,6 +382,9 @@ impl WindowState {
                     // Its parts have no size yet, and it is already dirty. [vendored
                     // addition] See [`FrameSizing`].
                     self.frame_sizing.frame_shown();
+                    // The window is the same size, but its geometry is not: borders
+                    // now sit outside it. [vendored addition]
+                    self.pending_size.invalidate();
                 },
                 Err(err) => {
                     warn!("Failed to create client side decorations frame: {err}");
@@ -389,7 +393,11 @@ impl WindowState {
             }
         } else if configure.decoration_mode == DecorationMode::Server {
             // Drop the frame for server side decorations to save resources.
-            self.frame = None;
+            if self.frame.take().is_some() {
+                // The borders that were outside the window are gone with it.
+                // [vendored addition]
+                self.pending_size.invalidate();
+            }
         }
 
         let stateless = Self::is_stateless(&configure);
@@ -763,10 +771,7 @@ impl WindowState {
         if self.frame_sizing.needs_size() {
             let size = self.size;
             if let Some(frame) = self.frame.as_mut().filter(|frame| !frame.is_hidden()) {
-                frame.resize(
-                    NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap()),
-                    NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap()),
-                );
+                frame.resize(nonzero(size.width), nonzero(size.height));
                 self.frame_sizing.frame_sized();
             }
         }
@@ -844,25 +849,26 @@ impl WindowState {
     /// size to say it with. Does nothing until the presented buffer answers the
     /// configure being held. [vendored addition] See [`PendingSize`].
     fn apply_pending_size(&mut self, surface: PhysicalSize<u32>, scale: f64) {
-        if !self.pending_size.take_for(surface, scale) {
+        // Everything below describes the buffer being committed, so it is all
+        // derived from the size *that buffer* is — not from `self.size`, which a
+        // configure the client has not caught up with has already moved on.
+        // [vendored addition]
+        let Some(size) = self.pending_size.resolve(surface, scale) else {
             return;
-        }
+        };
 
         // Update the inner frame.
         let mut sized = false;
         let ((x, y), outer_size) = if let Some(frame) = self.frame.as_mut() {
             // Resize only visible frame.
             if !frame.is_hidden() {
-                frame.resize(
-                    NonZeroU32::new(self.size.width).unwrap(),
-                    NonZeroU32::new(self.size.height).unwrap(),
-                );
+                frame.resize(nonzero(size.width), nonzero(size.height));
                 sized = true;
             }
 
-            (frame.location(), frame.add_borders(self.size.width, self.size.height).into())
+            (frame.location(), frame.add_borders(size.width, size.height).into())
         } else {
-            ((0, 0), self.size)
+            ((0, 0), size)
         };
         if sized {
             self.frame_sizing.frame_sized();
@@ -897,9 +903,8 @@ impl WindowState {
         // Update the target viewport, this is used if and only if fractional scaling is in use.
         if let Some(viewport) = self.viewport.as_ref() {
             // Set inner size without the borders.
-            viewport.set_destination(self.size.width as _, self.size.height as _);
+            viewport.set_destination(size.width as _, size.height as _);
         }
-
     }
 
     /// Keep `margins` logical pixels of surface outside the window proper — see
@@ -914,6 +919,10 @@ impl WindowState {
         // geometry and let the surface take the difference.
         let geometry = self.margins_now().deflate(self.size);
         self.decoration_margins = margins;
+        // The geometry is deliberately held where it was while the surface grows or
+        // shrinks around it, so the size alone will not say that anything changed.
+        // [vendored addition]
+        self.pending_size.invalidate();
         let now = self.margins_now();
         self.resize(now.inflate(geometry));
         self.size
@@ -1239,6 +1248,9 @@ impl WindowState {
             if decorate {
                 self.frame_sizing.frame_shown();
             }
+            // Showing or hiding the frame changes the geometry around a window that
+            // is the same size as it was. [vendored addition]
+            self.pending_size.invalidate();
             // Force the resize.
             self.resize(self.size);
         }
@@ -1416,6 +1428,13 @@ impl WindowState {
     /// effect at the next commit, so it belongs here, paired with the buffer it
     /// describes, rather than at the configure that asked for it. [vendored
     /// addition]
+    ///
+    /// Which bounds how fresh any of it can be: a window that has stopped drawing
+    /// keeps describing the last buffer it drew. That is the point rather than a
+    /// shortfall — that buffer is what is on the glass — and it is what the
+    /// protocol expects: the configure is acked the moment it arrives (sctk does it
+    /// on the way in), which says only that we heard it. The commit is what says we
+    /// have drawn it.
     pub fn present_size(&mut self, surface: PhysicalSize<u32>) {
         let scale = self.scale_factor();
         self.apply_pending_size(surface, scale);
@@ -1647,7 +1666,8 @@ fn blur_shape_rects(
 /// So the region goes where the buffer goes: [`Self::for_present`] is handed the
 /// size of the buffer about to be committed and answers with the region that
 /// describes *that*. Nothing else states one.
-/// The size a configure asked for, held until the client has a buffer that size.
+/// The size the compositor has been told the window is, and the sizes it has asked
+/// for that no buffer has answered yet.
 ///
 /// Everything the compositor is told about how big the window is —
 /// `xdg_surface.set_window_geometry`, the decoration frame's own size and the
@@ -1664,12 +1684,27 @@ fn blur_shape_rects(
 /// time. Mesa's display queue puts the attach and commit on the wire on its own
 /// FIFO schedule, and a configure handled meanwhile lands between the two.
 ///
-/// So the size is held here and applied from the present hook, against the buffer
-/// being committed, exactly as [`BlurRegion`] is. A drag that outruns the client
-/// simply overwrites it: only the newest configure is worth answering.
+/// So the size is stated from the present hook, against the buffer being committed,
+/// exactly as [`BlurRegion`] is — and the question asked there is not "has the
+/// configure I am waiting for been answered" but "**what size is this buffer**".
+/// That distinction is the whole of [`Self::resolve`]. Waiting for one nominated
+/// size has no floor: one configure that no buffer ever matches exactly — a scale
+/// that lands mid-flight, a size the client rounds — and the window's geometry is
+/// never published again, silently and for good. A buffer, by contrast, always has
+/// a size, so there is always something true to say.
+///
+/// The sizes asked for are kept only to name the buffer *exactly*: at a fractional
+/// scale logical and physical do not round-trip, so a buffer drawn for a size we
+/// were given is answered with that size rather than with one recovered from its
+/// pixel count. A buffer matching none of them still describes itself.
 #[derive(Debug, Default)]
 struct PendingSize {
-    wanted: Option<LogicalSize<u32>>,
+    /// Sizes asked for whose buffer may still be in flight, oldest first.
+    asked: VecDeque<LogicalSize<u32>>,
+    /// The size the compositor was last told about — what makes a restatement of
+    /// the same size pure traffic, and what [`Self::invalidate`] drops when
+    /// something *other* than the size changes the geometry.
+    stated: Option<LogicalSize<u32>>,
 }
 
 /// Whether the decoration frame has been given a size since it last became
@@ -1717,26 +1752,61 @@ impl FrameSizing {
     }
 }
 
+/// A frame dimension, which the toolkit takes as non-zero. Nothing should ever hand
+/// one a zero — a surface never configures to nothing — but a frame drawn at 1 pixel
+/// is a cosmetic mistake where a panic is a dead terminal. [vendored addition]
+fn nonzero(dimension: u32) -> NonZeroU32 {
+    NonZeroU32::new(dimension).unwrap_or(NonZeroU32::MIN)
+}
+
 impl PendingSize {
+    /// How many asked-for sizes are worth keeping. A buffer in flight is one or two
+    /// configures behind at worst; past that the client has stopped drawing and the
+    /// backlog is history, which [`Self::resolve`]'s floor covers anyway.
+    const IN_FLIGHT: usize = 8;
+
     /// Note the size a configure (or the client itself) just asked for.
     fn wants(&mut self, size: LogicalSize<u32>) {
-        self.wanted = Some(size);
+        if self.asked.back() == Some(&size) {
+            return;
+        }
+        if self.asked.len() == Self::IN_FLIGHT {
+            self.asked.pop_front();
+        }
+        self.asked.push_back(size);
     }
 
-    /// Whether the buffer now being committed is the one that answers the held
-    /// configure — and if so, consume it, since it is about to be applied.
+    /// Forget what the compositor has been told, because something that is not the
+    /// window's size has changed the geometry that describes it — a frame appearing
+    /// or going, or the margins the client keeps outside the window. The next
+    /// buffer restates it, at whatever size that buffer is.
+    fn invalidate(&mut self) {
+        self.stated = None;
+    }
+
+    /// The size to tell the compositor the window is, for the buffer now being
+    /// committed — or `None` when it already knows.
     ///
-    /// Compared in physical pixels, the units the buffer is actually in: a
-    /// fractional scale does not round-trip through logical exactly, and a
-    /// half-pixel disagreement here would strand the configure forever — the
-    /// compositor would never learn the window's size again.
-    fn take_for(&mut self, surface: PhysicalSize<u32>, scale: f64) -> bool {
-        if self.wanted.map(|w| logical_to_physical_rounded(w, scale)) == Some(surface) {
-            self.wanted = None;
-            true
-        } else {
-            false
+    /// Matched in physical pixels, the units the buffer is actually in: at a
+    /// fractional scale logical and physical do not round-trip, so a size we were
+    /// asked for is recognised by what it *draws as* and answered exactly. A buffer
+    /// that matches nothing asked for is answered with its own size converted back:
+    /// approximate at a fractional scale, corrected by the next buffer that does
+    /// match, and — unlike saying nothing — never the end of the conversation.
+    fn resolve(&mut self, surface: PhysicalSize<u32>, scale: f64) -> Option<LogicalSize<u32>> {
+        let draws_as = |size: LogicalSize<u32>| logical_to_physical_rounded(size, scale) == surface;
+        if self.stated.is_some_and(draws_as) {
+            return None;
         }
+        let size = self
+            .asked
+            .iter()
+            .rev()
+            .copied()
+            .find(|&size| draws_as(size))
+            .unwrap_or_else(|| surface.to_logical(scale));
+        self.stated = Some(size);
+        Some(size)
     }
 }
 
@@ -2018,7 +2088,8 @@ mod frame_sizing_tests {
     }
 }
 
-/// A configure is applied with the buffer that answers it — see [`PendingSize`].
+/// What the compositor is told describes the buffer it is told with — see
+/// [`PendingSize`].
 #[cfg(test)]
 mod pending_size_tests {
     use super::*;
@@ -2033,58 +2104,115 @@ mod pending_size_tests {
     }
 
     #[test]
-    fn a_configure_the_client_has_not_drawn_yet_is_held() {
+    fn the_buffer_that_answers_a_configure_states_it() {
         let mut pending = PendingSize::default();
         pending.wants(size(1223, 1123));
-        // The frame in flight is still the size before. Applying the configure
-        // around it would move the window's edges past its own content.
-        assert!(!pending.take_for(drawn(size(1255, 1123), 1.0), 1.0));
+        assert_eq!(
+            pending.resolve(drawn(size(1223, 1123), 1.0), 1.0),
+            Some(size(1223, 1123))
+        );
+    }
+
+    /// The frame in flight when a configure lands is still the size before, and
+    /// that size is what the compositor already knows. Restating it around a
+    /// buffer that has not changed says nothing — and stating the *new* size
+    /// around it would move the window's edges past its own content.
+    #[test]
+    fn a_configure_the_client_has_not_drawn_yet_states_nothing() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1255, 1123));
+        pending.resolve(drawn(size(1255, 1123), 1.0), 1.0);
+        pending.wants(size(1223, 1123));
+        assert_eq!(pending.resolve(drawn(size(1255, 1123), 1.0), 1.0), None);
     }
 
     #[test]
-    fn the_frame_that_answers_a_configure_applies_it() {
+    fn a_size_the_compositor_already_knows_is_not_stated_again() {
         let mut pending = PendingSize::default();
         pending.wants(size(1223, 1123));
-        assert!(pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
-    }
-
-    #[test]
-    fn a_configure_is_applied_once_and_not_on_every_later_frame() {
-        let mut pending = PendingSize::default();
-        pending.wants(size(1223, 1123));
-        assert!(pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+        assert!(pending.resolve(drawn(size(1223, 1123), 1.0), 1.0).is_some());
         // The window is still this size a hundred frames later; restating it
         // would be pure traffic.
-        assert!(!pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
+        assert_eq!(pending.resolve(drawn(size(1223, 1123), 1.0), 1.0), None);
     }
 
+    /// A drag outruns the client, so the buffer that arrives is the one drawn for
+    /// a configure two back. It still describes itself, and saying so is the whole
+    /// job: waiting for the newest configure instead is what leaves a window whose
+    /// size the compositor never hears again.
     #[test]
-    fn only_the_newest_configure_is_waited_for() {
+    fn a_buffer_drawn_for_an_outrun_configure_still_describes_itself() {
         let mut pending = PendingSize::default();
         pending.wants(size(1223, 1123));
         pending.wants(size(1186, 1123));
-        // A drag outruns the client: the size it drew for two configures ago is
-        // not the one the compositor is waiting to hear about.
-        assert!(!pending.take_for(drawn(size(1223, 1123), 1.0), 1.0));
-        assert!(pending.take_for(drawn(size(1186, 1123), 1.0), 1.0));
+        assert_eq!(
+            pending.resolve(drawn(size(1223, 1123), 1.0), 1.0),
+            Some(size(1223, 1123))
+        );
+        assert_eq!(
+            pending.resolve(drawn(size(1186, 1123), 1.0), 1.0),
+            Some(size(1186, 1123))
+        );
+    }
+
+    /// The floor, and the reason nothing can strand: a buffer no configure asked
+    /// for is still a buffer on the glass, and what is on the glass is what the
+    /// compositor is owed. Answering "nothing to say" to a size we did not
+    /// recognise is how a window stops publishing its geometry for good.
+    #[test]
+    fn a_buffer_no_configure_asked_for_still_describes_itself() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        assert_eq!(
+            pending.resolve(PhysicalSize::new(900, 700), 1.0),
+            Some(size(900, 700))
+        );
     }
 
     #[test]
-    fn a_fractional_scale_does_not_strand_a_configure() {
-        // The window is sized in logical pixels and drawn in physical ones, and
-        // at 1.5x the two do not round-trip: comparing them anywhere but in the
-        // buffer's own units can leave a configure that no frame ever answers,
-        // and a window whose size the compositor never hears again.
+    fn a_fractional_scale_does_not_lose_the_size_a_buffer_was_drawn_for() {
+        // The window is sized in logical pixels and drawn in physical ones, and at
+        // 1.5x the two do not round-trip: recovering the logical size from the
+        // buffer alone would drift, so a size we were actually asked for is
+        // matched in the buffer's own units and answered exactly.
         for scale in [1.25, 1.5, 1.75, 2.0] {
             for w in 1000..1100 {
                 let mut pending = PendingSize::default();
                 pending.wants(size(w, 723));
-                assert!(
-                    pending.take_for(drawn(size(w, 723), scale), scale),
+                assert_eq!(
+                    pending.resolve(drawn(size(w, 723), scale), scale),
+                    Some(size(w, 723)),
                     "{w} logical at {scale}x"
                 );
             }
         }
+    }
+
+    /// The geometry is a function of more than the window's size — the frame's
+    /// borders and the margins the client keeps outside the window are in it too.
+    /// A frame appearing changes it without changing the size, so "the compositor
+    /// already knows this size" stops being a reason to stay quiet.
+    #[test]
+    fn a_frame_appearing_makes_the_same_size_worth_stating_again() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1223, 1123));
+        pending.resolve(drawn(size(1223, 1123), 1.0), 1.0);
+        pending.invalidate();
+        assert_eq!(
+            pending.resolve(drawn(size(1223, 1123), 1.0), 1.0),
+            Some(size(1223, 1123))
+        );
+    }
+
+    /// A drag asks for hundreds of sizes; only the handful that can still be in
+    /// flight are worth keeping, and the rest resolve by the floor anyway.
+    #[test]
+    fn the_sizes_asked_for_do_not_pile_up() {
+        let mut pending = PendingSize::default();
+        for w in 0..1000 {
+            pending.wants(size(1000 + w, 723));
+        }
+        assert!(pending.asked.len() <= PendingSize::IN_FLIGHT);
     }
 }
 
