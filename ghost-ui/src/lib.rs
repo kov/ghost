@@ -6256,9 +6256,11 @@ impl App {
 
     fn close_window(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
         // A closed window is forgotten, the way a browser forgets a closed tab:
-        // only what was open at the quit comes back. It is also what bounds the
-        // compositor's store, since every run mints fresh group ids and a name
-        // nothing forgets would be remembered forever.
+        // only what was open at the quit comes back. Group ids are durable (a
+        // restored window reclaims its own, so the compositor recognises the name
+        // across runs), which is exactly why a name has to be released explicitly:
+        // nothing else ever bounds the compositor's store. The other release is in
+        // `restore_workspace`, for a window that stopped being restorable.
         if let Some(w) = self.windows.get(&wid) {
             event_loop.forget_toplevel(&w.root.window_record().group_id);
         }
@@ -6612,7 +6614,18 @@ impl App {
         records: Vec<ghost_ui_core::WindowRecord>,
     ) {
         let sessions = session::list().unwrap_or_default();
-        for plan in restore_plan(&records, &sessions, &self.groups) {
+        let plans = restore_plan(&records, &sessions, &self.groups);
+        // A record the plan dropped names a window that will never open again, and
+        // the compositor holds geometry under that name until someone releases it.
+        // `close_window` covers a window that was closed; this is the only other
+        // moment anyone still knows the name existed, so it is where the store stops
+        // growing by one entry per window that quietly stopped being restorable.
+        for rec in &records {
+            if !plans.iter().any(|p| p.group.id == rec.group_id) {
+                event_loop.forget_toplevel(&rec.group_id);
+            }
+        }
+        for plan in plans {
             self.restore_window(event_loop, plan);
         }
         // Every restored window has queued its remote members; reconnect their
@@ -10038,6 +10051,39 @@ mod tests {
             vec![rem2.clone()],
             "its remote member is planned"
         );
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_restored_is_forgotten_by_the_compositor() {
+        // The compositor stores geometry per toplevel NAME and keeps it until
+        // something forgets it. Closing a window forgets its name; a window that
+        // simply never comes back — its group pruned from the registry, so
+        // `restore_plan` drops the record — had nothing to forget it, so its name
+        // sat in the compositor's session store forever. Restore is the last
+        // moment anyone knows that name existed, so it forgets it there.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            // One restorable window (remote-only, so it opens as a fleet without
+            // spawning anything) and one whose group is gone.
+            let rem = format!("kov@box{REMOTE_ID_SEP}work");
+            app.groups = vec![group("win-live", &[&rem])];
+            let records = vec![
+                record("win-live", 80, 24, true, None, &[&rem]),
+                record("win-gone", 80, 24, true, Some("ghost"), &["ghost"]),
+            ];
+            app.restore_workspace(&fe, records);
+            assert_eq!(
+                fe.registered_toplevels(),
+                vec![Some("win-live".to_string())],
+                "only the restorable window is registered"
+            );
+            assert_eq!(
+                fe.forgotten_toplevels(),
+                vec!["win-gone".to_string()],
+                "the window that cannot come back releases its stored geometry"
+            );
+        });
     }
 
     #[test]
