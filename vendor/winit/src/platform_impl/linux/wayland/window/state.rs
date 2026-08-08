@@ -214,6 +214,9 @@ pub struct WindowState {
     /// The size a configure asked for, waiting for a buffer that size to be
     /// stated with. See [`PendingSize`]. [vendored addition]
     pending_size: PendingSize,
+    /// Whether the decoration frame has been given a size since it last became
+    /// something the client draws. See [`FrameSizing`]. [vendored addition]
+    frame_sizing: FrameSizing,
 
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
@@ -263,6 +266,7 @@ impl WindowState {
             background_effect_manager: winit_state.background_effect_manager.clone(),
             blur_shape: BlurRegion::default(),
             pending_size: PendingSize::default(),
+            frame_sizing: FrameSizing::default(),
             decoration_margins: DecorationMargins::NONE,
             compositor,
             connection,
@@ -374,6 +378,9 @@ impl WindowState {
                     // Hide the frame if we were asked to not decorate.
                     frame.set_hidden(!self.decorate);
                     self.frame = Some(frame);
+                    // Its parts have no size yet, and it is already dirty. [vendored
+                    // addition] See [`FrameSizing`].
+                    self.frame_sizing.frame_shown();
                 },
                 Err(err) => {
                     warn!("Failed to create client side decorations frame: {err}");
@@ -747,6 +754,23 @@ impl WindowState {
 
     /// Refresh the decorations frame if it's present returning whether the client should redraw.
     pub fn refresh_frame(&mut self) -> bool {
+        // Give the frame a size before drawing it, if the configure that would have
+        // is still waiting for the buffer that answers it: its parts are zero-width
+        // until something resizes them, and a zero-width part is a zero-width
+        // `wl_shm` buffer, which is a fatal protocol error. [vendored addition] See
+        // [`FrameSizing`]. Only the frame's own pixels; the compositor still hears
+        // about the window's size from [`PendingSize`], with the buffer that is it.
+        if self.frame_sizing.needs_size() {
+            let size = self.size;
+            if let Some(frame) = self.frame.as_mut().filter(|frame| !frame.is_hidden()) {
+                frame.resize(
+                    NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap()),
+                    NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap()),
+                );
+                self.frame_sizing.frame_sized();
+            }
+        }
+
         if let Some(frame) = self.frame.as_mut() {
             if !frame.is_hidden() && frame.is_dirty() {
                 return frame.draw();
@@ -825,6 +849,7 @@ impl WindowState {
         }
 
         // Update the inner frame.
+        let mut sized = false;
         let ((x, y), outer_size) = if let Some(frame) = self.frame.as_mut() {
             // Resize only visible frame.
             if !frame.is_hidden() {
@@ -832,12 +857,16 @@ impl WindowState {
                     NonZeroU32::new(self.size.width).unwrap(),
                     NonZeroU32::new(self.size.height).unwrap(),
                 );
+                sized = true;
             }
 
             (frame.location(), frame.add_borders(self.size.width, self.size.height).into())
         } else {
             ((0, 0), self.size)
         };
+        if sized {
+            self.frame_sizing.frame_sized();
+        }
         // Our own margins run the other way to a frame's borders — the surface
         // is bigger than the window, so the geometry is the inner rect — and
         // they are applied on top of whatever the frame said. Not in the `else`
@@ -1205,6 +1234,11 @@ impl WindowState {
 
         if let Some(frame) = self.frame.as_mut() {
             frame.set_hidden(!decorate);
+            // Nothing sized it while it was hidden, so it is back to the zero-width
+            // parts it was built with. [vendored addition] See [`FrameSizing`].
+            if decorate {
+                self.frame_sizing.frame_shown();
+            }
             // Force the resize.
             self.resize(self.size);
         }
@@ -1638,6 +1672,51 @@ struct PendingSize {
     wanted: Option<LogicalSize<u32>>,
 }
 
+/// Whether the decoration frame has been given a size since it last became
+/// something the client draws. [vendored addition]
+///
+/// A frame is born with zero-width parts — `DecorationParts::resize` is what gives
+/// them one — so drawing a frame nothing has sized asks the compositor for a
+/// `wl_shm` buffer zero pixels wide. That is a protocol error, and a protocol error
+/// is not survivable: the connection is torn down, the Vulkan surface on it is lost,
+/// and the process dies at the next `Surface::configure`, which is a whole window
+/// (every window) vanishing with no warning.
+///
+/// Sizing the frame used to be inseparable from the configure that asked for it, so
+/// there was no such moment. [`PendingSize`] holds that configure back until a buffer
+/// answers it — rightly, since the frame's subsurfaces move around the buffer that is
+/// committed with them — and that opens a gap in which the frame is dirty (it is
+/// created dirty, and unhiding it dirties it) but has never been sized. Winit's own
+/// event loop draws in exactly that gap: it calls `refresh_frame` before handing the
+/// client the redraw that would produce the answering buffer.
+///
+/// So the frame is sized on its way into that draw ([`WindowState::refresh_frame`]),
+/// which is only about the frame's own pixels. What the *compositor* is told about the
+/// window's size stays where [`PendingSize`] put it, paired with its buffer.
+#[derive(Debug, Default)]
+struct FrameSizing {
+    sized: bool,
+}
+
+impl FrameSizing {
+    /// A frame the client draws now exists — freshly created, or unhidden after a
+    /// spell undecorated, during which every configure skipped it. Either way its
+    /// parts are the zero-width ones it was built with.
+    fn frame_shown(&mut self) {
+        self.sized = false;
+    }
+
+    /// The frame has been resized, so it may be drawn.
+    fn frame_sized(&mut self) {
+        self.sized = true;
+    }
+
+    /// Whether the frame must be sized before it can be drawn.
+    fn needs_size(&self) -> bool {
+        !self.sized
+    }
+}
+
 impl PendingSize {
     /// Note the size a configure (or the client itself) just asked for.
     fn wants(&mut self, size: LogicalSize<u32>) {
@@ -1885,6 +1964,57 @@ mod blur_shape_tests {
                 assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
             }
         }
+    }
+}
+
+/// A frame is sized before it is ever drawn — see [`FrameSizing`].
+#[cfg(test)]
+mod frame_sizing_tests {
+    use super::*;
+
+    /// The sequence a brand-new window goes through: the frame is built with
+    /// zero-width parts and dirty (its title, scale and state are all set on it),
+    /// and the configure that would have sized it is held for the buffer that
+    /// answers it. `refresh_frame` runs before that buffer exists, so the frame
+    /// has to be sized on the way into the draw — otherwise it asks for a
+    /// zero-width `wl_shm` buffer, which is a protocol error and kills the
+    /// connection.
+    #[test]
+    fn a_frame_is_sized_before_the_first_time_it_is_drawn() {
+        let mut sizing = FrameSizing::default();
+        sizing.frame_shown();
+        assert!(
+            sizing.needs_size(),
+            "a frame nothing has sized must not be drawn as it is"
+        );
+        sizing.frame_sized();
+        assert!(!sizing.needs_size());
+    }
+
+    /// ...and only the first time: re-sizing a frame on every draw would redo the
+    /// subsurface placement of a window whose size has not changed.
+    #[test]
+    fn a_frame_that_has_a_size_is_not_sized_again() {
+        let mut sizing = FrameSizing::default();
+        sizing.frame_shown();
+        sizing.frame_sized();
+        assert!(!sizing.needs_size());
+        assert!(!sizing.needs_size());
+    }
+
+    /// A frame hidden while the window was undecorated is skipped by every
+    /// configure that lands meanwhile (only a visible frame is resized), so
+    /// showing it again leaves the same zero-width parts as a fresh one.
+    #[test]
+    fn a_frame_shown_again_needs_a_size_again() {
+        let mut sizing = FrameSizing::default();
+        sizing.frame_shown();
+        sizing.frame_sized();
+        sizing.frame_shown();
+        assert!(
+            sizing.needs_size(),
+            "an unhidden frame was never sized while it was hidden"
+        );
     }
 }
 

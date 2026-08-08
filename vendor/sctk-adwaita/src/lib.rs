@@ -247,6 +247,15 @@ where
             rect.width *= scale;
             rect.height *= scale;
 
+            // A part with no area is one nothing has sized yet — a frame is built
+            // with zero-width parts and `Self::resize` is what gives them one. Asking
+            // for a buffer that shape is a `wl_shm` protocol error, which is fatal:
+            // the connection goes, and with it the client. There is nothing to draw
+            // anyway. [ghost addition]
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+
             let (buffer, canvas) = match self.pool.create_buffer(
                 rect.width as i32,
                 rect.height as i32,
