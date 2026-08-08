@@ -218,6 +218,9 @@ pub struct WindowState {
     /// Whether the decoration frame has been given a size since it last became
     /// something the client draws. See [`FrameSizing`]. [vendored addition]
     frame_sizing: FrameSizing,
+    /// Whether it has been drawn since then, which is what lets a window geometry
+    /// count it. See [`FrameDrawn`]. [vendored addition]
+    frame_drawn: FrameDrawn,
 
     /// Space the client keeps outside the window proper, to draw a shadow into.
     /// See [`DecorationMargins`]. [vendored addition]
@@ -268,6 +271,7 @@ impl WindowState {
             blur_shape: BlurRegion::default(),
             pending_size: PendingSize::default(),
             frame_sizing: FrameSizing::default(),
+            frame_drawn: FrameDrawn::default(),
             decoration_margins: DecorationMargins::NONE,
             compositor,
             connection,
@@ -382,6 +386,7 @@ impl WindowState {
                     // Its parts have no size yet, and it is already dirty. [vendored
                     // addition] See [`FrameSizing`].
                     self.frame_sizing.frame_shown();
+                    self.frame_drawn.frame_shown();
                     // The window is the same size, but its geometry is not: borders
                     // now sit outside it. [vendored addition]
                     self.pending_size.invalidate();
@@ -873,6 +878,24 @@ impl WindowState {
         if sized {
             self.frame_sizing.frame_sized();
         }
+        // Draw the frame into the commit that is about to carry the geometry below,
+        // if nothing has drawn it yet. The geometry reaches above the content origin
+        // by the frame's top border, and a compositor clamps it to what is actually
+        // MAPPED in the surface tree — a decoration part with no buffer is not.
+        // Stated without them, the geometry is clamped back to the content, and the
+        // window loses a header on every launch. The parts are sized just above, so
+        // this is never the zero-width draw [`FrameSizing`] exists to prevent, and
+        // they are synchronized subsurfaces, so what is drawn here takes effect with
+        // the parent commit rather than ahead of it. [vendored addition] See
+        // [`FrameDrawn`].
+        if self.frame_drawn.needs_draw() {
+            if let Some(frame) = self.frame.as_mut().filter(|frame| !frame.is_hidden()) {
+                // The bool says the client should redraw; it is mid-present of a
+                // buffer at this very size, so there is nothing to ask it for.
+                let _ = frame.draw();
+                self.frame_drawn.frame_drawn();
+            }
+        }
         // Our own margins run the other way to a frame's borders — the surface
         // is bigger than the window, so the geometry is the inner rect — and
         // they are applied on top of whatever the frame said. Not in the `else`
@@ -1247,6 +1270,7 @@ impl WindowState {
             // parts it was built with. [vendored addition] See [`FrameSizing`].
             if decorate {
                 self.frame_sizing.frame_shown();
+                self.frame_drawn.frame_shown();
             }
             // Showing or hiding the frame changes the geometry around a window that
             // is the same size as it was. [vendored addition]
@@ -1733,6 +1757,55 @@ struct FrameSizing {
     sized: bool,
 }
 
+/// Whether the decoration frame has been *drawn* since it last became something
+/// the client draws. [vendored addition]
+///
+/// The window geometry says where the window's edges are, and a frame that sits
+/// above the content origin puts its top edge at a negative y. A compositor clamps
+/// a declared geometry to the bounding box of the surface **and its subsurfaces** —
+/// correctly, and per the xdg-shell spec: a decoration part that has been created
+/// but never given a buffer is unmapped, and an unmapped surface bounds nothing.
+///
+/// So the geometry and the frame's buffers have to arrive in the same commit, and
+/// they did not. The geometry is stated at present time ([`PendingSize`]), while
+/// the frame is drawn from the event loop's refresh — which, on the first frame,
+/// runs *after* that present. The first commit therefore declared a window one
+/// header taller than the only mapped surface in its tree; the clamp took the
+/// header back; the configure that came of it was one header short; the client
+/// resized to it, stated that, and was clamped again.
+///
+/// Measured on a real desktop before this existed: 910 → 866 → 823 physical
+/// pixels, exactly one 35px header per launch, ratcheting for as long as the
+/// window's size was remembered — a terminal that shrank by two rows every time it
+/// was opened.
+///
+/// Only the first draw needs forcing. After that the frame has buffers, the
+/// geometry it is counted in is honest, and redrawing it is the refresh's job
+/// (which skips a frame that is not dirty).
+#[derive(Debug, Default)]
+struct FrameDrawn {
+    drawn: bool,
+}
+
+impl FrameDrawn {
+    /// A frame the client draws now exists — freshly created, or unhidden after a
+    /// spell undecorated. Either way nothing of it is mapped yet.
+    fn frame_shown(&mut self) {
+        self.drawn = false;
+    }
+
+    /// The frame has been drawn, so its parts are mapped and a geometry may count
+    /// them.
+    fn frame_drawn(&mut self) {
+        self.drawn = true;
+    }
+
+    /// Whether the frame must be drawn before the geometry that includes it.
+    fn needs_draw(&self) -> bool {
+        !self.drawn
+    }
+}
+
 impl FrameSizing {
     /// A frame the client draws now exists — freshly created, or unhidden after a
     /// spell undecorated, during which every configure skipped it. Either way its
@@ -2034,6 +2107,58 @@ mod blur_shape_tests {
                 assert!(y >= 0 && y + rh <= h as i32, "{y}+{rh} outside {h}");
             }
         }
+    }
+}
+
+/// A frame is drawn into the commit that first declares it — see [`FrameDrawn`].
+#[cfg(test)]
+mod frame_drawn_tests {
+    use super::*;
+
+    /// The sequence that was wrong: a brand-new window's frame exists (its parts
+    /// are created with the window) but has no buffers, and the first thing the
+    /// compositor is told about the window's size is stated at present time —
+    /// before the event loop's refresh has drawn the frame. So the first commit
+    /// has to draw it, or it declares a window taller than anything mapped in its
+    /// surface tree.
+    #[test]
+    fn a_frame_is_drawn_before_the_first_geometry_that_counts_it() {
+        let mut drawn = FrameDrawn::default();
+        drawn.frame_shown();
+        assert!(
+            drawn.needs_draw(),
+            "a frame with no buffers cannot be included in a window geometry"
+        );
+        drawn.frame_drawn();
+        assert!(!drawn.needs_draw());
+    }
+
+    /// ...and only until it has been. Every later present leaves the frame to the
+    /// event loop's own refresh, which redraws it when it is dirty and skips it
+    /// when it is not; forcing a draw per frame would repaint the decorations of a
+    /// window that is merely showing new terminal output.
+    #[test]
+    fn a_frame_that_has_been_drawn_is_left_to_the_refresh() {
+        let mut drawn = FrameDrawn::default();
+        drawn.frame_shown();
+        drawn.frame_drawn();
+        assert!(!drawn.needs_draw());
+        assert!(!drawn.needs_draw());
+    }
+
+    /// A frame hidden while the window was undecorated has its parts torn back
+    /// down to nothing, so showing it again is starting over — the same reasoning
+    /// that makes [`FrameSizing`] re-size it.
+    #[test]
+    fn a_frame_shown_again_needs_drawing_again() {
+        let mut drawn = FrameDrawn::default();
+        drawn.frame_shown();
+        drawn.frame_drawn();
+        drawn.frame_shown();
+        assert!(
+            drawn.needs_draw(),
+            "an unhidden frame has no buffers the geometry can count on"
+        );
     }
 }
 
