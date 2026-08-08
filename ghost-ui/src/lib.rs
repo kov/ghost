@@ -46,6 +46,7 @@ mod resize;
 pub mod title;
 mod windows;
 
+use instance::LastExit;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1682,6 +1683,18 @@ fn interactive(fresh: bool, ssh_window: bool) {
             instance::Role::Primary { _lock, listener } => (_lock, listener),
         }
     };
+    // Only now that this process is the one that will actually run: claim the
+    // marker and learn how the last run went. A secondary returns above without
+    // ever touching it, so a forwarded new-window request can't make the next
+    // launch think something crashed.
+    let benching = harness.is_some();
+    let last_exit = if benching {
+        // Bench mode skips the instance guard, so it must skip the marker too —
+        // it would otherwise leave a crash behind for the user's real ghost.
+        LastExit::Clean
+    } else {
+        instance::mark_running()
+    };
     let groups = groups::load();
     let workspace = windows::load();
     // Cloned before `workspace` is moved into the write-on-change baseline. Every
@@ -1783,10 +1796,17 @@ fn interactive(fresh: bool, ssh_window: bool) {
         desktop: desktop_key(),
         compositor_sessions,
         fresh,
+        last_exit,
     };
     // Each host gets a pushed `ghost __watch` stream started on connect (see
     // `App::register_remote`); nothing to poll here.
     event_loop.run_app(&mut app).expect("run app");
+    // Reached only by the loop ending on its own terms — the `expect` above, a
+    // panic, or a signal all leave the marker in place, which is exactly what
+    // makes the next launch a `recover`.
+    if !benching {
+        instance::mark_clean_exit();
+    }
 }
 
 /// Pick a surface alpha mode. Our pipeline emits premultiplied alpha, so for a
@@ -2663,15 +2683,21 @@ pub struct NewWindow {
 }
 
 /// Why this launch is opening its compositor session, which is what a
-/// compositor keys its restore policy on — synoik lets a `Launch` window take
-/// focus and a restored one open quietly.
-///
-/// Ghost never claims `recover`: it cannot tell a crash from a clean start.
+/// compositor keys its restore policy on — a launched app may land on the
+/// active workspace with a remembered size while a recovered one goes back
+/// exactly where it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionReason {
-    /// A window opened because the user asked for one.
+    /// The ordinary case: someone started ghost. Still a launch when the bare
+    /// start goes on to recreate every window from the saved workspace — that
+    /// is ghost's own state, not the desktop session putting ghost back.
     Launch,
-    /// Windows being recreated from the saved workspace.
+    /// The previous run died without reaching the shutdown funnel (see
+    /// [`instance::LastExit`]).
+    Recover,
+    /// The desktop session itself restored ghost. Not claimed today: nothing in
+    /// the environment tells ghost a session manager started it, and guessing
+    /// would cost every ordinary launch its `launch`.
     SessionRestore,
 }
 
@@ -2802,6 +2828,7 @@ impl From<SessionReason> for winit::platform::wayland::SessionReason {
     fn from(reason: SessionReason) -> Self {
         match reason {
             SessionReason::Launch => Self::Launch,
+            SessionReason::Recover => Self::Recover,
             SessionReason::SessionRestore => Self::SessionRestore,
         }
     }
@@ -2989,6 +3016,7 @@ impl App {
             desktop: desktop_key(),
             compositor_sessions: saved.sessions,
             fresh: false,
+            last_exit: LastExit::Clean,
         }
     }
 
@@ -3402,6 +3430,9 @@ pub struct App {
     /// `--fresh`: this launch starts over from nothing, which includes the
     /// window positions the compositor was holding for us.
     fresh: bool,
+    /// How the previous run ended, which is the whole of the `launch` vs
+    /// `recover` decision (see [`session_reason`]).
+    last_exit: LastExit,
 }
 
 /// The desktop the compositor session is filed under. `$XDG_CURRENT_DESKTOP` is
@@ -3414,13 +3445,13 @@ fn desktop_key() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Which reason a launch opens its compositor session under. A compositor may
-/// treat a restored window more gently than a launched one — synoik lets only a
-/// `Launch` take focus — so a workspace restore must say so.
-fn session_reason(startup: &Startup) -> SessionReason {
-    match startup {
-        Startup::Restore(_) => SessionReason::SessionRestore,
-        _ => SessionReason::Launch,
+/// Which reason a launch opens its compositor session under. Every start is a
+/// `launch`, including the bare one that recreates the whole saved workspace;
+/// only a run picking up after a crashed one asks to `recover`.
+fn session_reason(last_exit: LastExit) -> SessionReason {
+    match last_exit {
+        LastExit::Crashed => SessionReason::Recover,
+        LastExit::Clean => SessionReason::Launch,
     }
 }
 
@@ -6015,7 +6046,7 @@ impl App {
         // Before any window exists: a window is registered as it is created, and
         // restoring one means changing the very first configure it is sent, so
         // the session has to be open by then.
-        let reason = session_reason(&self.startup);
+        let reason = session_reason(self.last_exit);
         let remembered = self.compositor_sessions.get(&self.desktop).cloned();
         self.open_compositor_session(event_loop, reason, remembered.as_deref(), self.fresh);
         // Consumed once (the caller's guard keeps this from re-running); the
@@ -7825,13 +7856,12 @@ impl App {
 mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
-        App, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
-        PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, Startup, StartupChoice,
-        auth_error_message, choose_alpha_mode, choose_surface_format, config,
-        connect_outcome_wanted, glass, home_launch_dir, inherited_connection,
-        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, session_reason, should_restore, startup_choice,
-        surface_matches_window, theme_colors,
+        App, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall, LastExit,
+        PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, StartupChoice, auth_error_message,
+        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, glass,
+        home_launch_dir, inherited_connection, namespace_remote_infos, new_window_choice,
+        password_prompt, remote_spawn_target, respawn_opts, restore_plan, session_reason,
+        should_restore, startup_choice, surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
@@ -8260,19 +8290,33 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_launch_tells_the_compositor_it_is_a_restore() {
-        // Synoik keys focus-stealing on the reason: five windows restored at
-        // login must not each take focus in turn, while an app-launcher start
-        // still behaves like any other launch.
-        assert_eq!(
-            session_reason(&Startup::Restore(Vec::new())),
-            SessionReason::SessionRestore
-        );
-        assert_eq!(session_reason(&Startup::Fleet), SessionReason::Launch);
-        assert_eq!(
-            session_reason(&Startup::Single("a".into())),
-            SessionReason::Launch
-        );
+    fn an_ordinary_launch_says_launch_however_much_it_restores() {
+        // Recreating our own saved windows is not `session_restore` — that
+        // reason is for an app the *session manager* brought back. A bare
+        // `ghost` is a launch even though it reopens everything, so the
+        // compositor treats it like any app-launcher start.
+        assert_eq!(session_reason(LastExit::Clean), SessionReason::Launch);
+    }
+
+    #[test]
+    fn a_launch_after_a_crash_asks_the_compositor_to_recover() {
+        // The one case that isn't a plain launch: the previous run died without
+        // reaching the shutdown funnel, so the compositor is told to put the
+        // windows back rather than place them as if they were new.
+        assert_eq!(session_reason(LastExit::Crashed), SessionReason::Recover);
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            app.last_exit = LastExit::Crashed;
+            let fe = HeadlessFrontend::new();
+            assert!(app.open_startup_windows(&fe));
+            assert_eq!(
+                fe.opened_sessions()
+                    .first()
+                    .map(|(reason, _)| *reason)
+                    .expect("the launch opened a compositor session"),
+                SessionReason::Recover,
+            );
+        });
     }
 
     #[test]

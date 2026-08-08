@@ -61,6 +61,58 @@ pub enum Role {
     Secondary,
 }
 
+/// How the previous run of the UI ended, which is the difference between a
+/// `launch` and a `recover` in `xdg_session_management_v1` — a compositor may
+/// put a recovered app's windows back exactly where they were while a launched
+/// one lands on the active workspace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LastExit {
+    /// It went through the shutdown funnel (or there was no previous run).
+    Clean,
+    /// It disappeared without one: a panic, a signal, an OOM kill, or the
+    /// compositor dying underneath it.
+    Crashed,
+}
+
+/// Leave a marker saying a UI is running, and report how the last one ended.
+///
+/// The marker lives in the **runtime** dir, so it dies with the login session:
+/// a reboot is not a crash, while a compositor that died and came back within
+/// the same session is one. Only the owning launch (see [`acquire`]) marks —
+/// a secondary exits without ever having run.
+pub fn mark_running() -> LastExit {
+    mark_running_in(&ghost_vt::paths::runtime_dir())
+}
+
+/// Erase the marker: this run ended the way it was supposed to.
+pub fn mark_clean_exit() {
+    mark_clean_exit_in(&ghost_vt::paths::runtime_dir());
+}
+
+fn running_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("ui.running")
+}
+
+/// [`mark_running`] over an explicit runtime `dir`, for tests.
+fn mark_running_in(dir: &Path) -> LastExit {
+    let _ = std::fs::create_dir_all(dir);
+    let path = running_path(dir);
+    let last = if path.exists() {
+        LastExit::Crashed
+    } else {
+        LastExit::Clean
+    };
+    // Best effort: a marker we couldn't write only costs the *next* launch its
+    // `recover`, which is a hint, not a correctness property.
+    let _ = std::fs::write(&path, b"");
+    last
+}
+
+/// [`mark_clean_exit`] over an explicit runtime `dir`, for tests.
+fn mark_clean_exit_in(dir: &Path) {
+    let _ = std::fs::remove_file(running_path(dir));
+}
+
 /// Decide this process's [`Role`] against the real runtime dir. `want` is what
 /// this launch asked for, forwarded to the owner when there already is one.
 pub fn acquire(want: Request) -> Role {
@@ -162,6 +214,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ghost-instance-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn a_run_that_never_ended_cleanly_looks_like_a_crash_to_the_next_launch() {
+        let dir = scratch("crash");
+        // Nothing has ever run here: this launch is not a recovery.
+        assert_eq!(mark_running_in(&dir), LastExit::Clean);
+        // That run vanished without saying goodbye — panicked, killed, OOM. The
+        // next launch is the one recovering from it.
+        assert_eq!(mark_running_in(&dir), LastExit::Crashed);
+        // And once a run does end through the shutdown funnel, the launch after
+        // it is ordinary again.
+        mark_clean_exit_in(&dir);
+        assert_eq!(mark_running_in(&dir), LastExit::Clean);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
