@@ -2188,6 +2188,18 @@ mod pending_size_tests {
         }
     }
 
+    /// Everything stated here is in logical pixels, so a window that is the same
+    /// size on a screen of a different scale has nothing new to say — even though
+    /// the buffer that says it has a different pixel count. Recognising the buffer
+    /// by what the stated size draws as *now* is what keeps that quiet.
+    #[test]
+    fn a_scale_change_alone_states_nothing() {
+        let mut pending = PendingSize::default();
+        pending.wants(size(1268, 1088));
+        pending.resolve(drawn(size(1268, 1088), 1.25), 1.25);
+        assert_eq!(pending.resolve(drawn(size(1268, 1088), 1.5), 1.5), None);
+    }
+
     /// The geometry is a function of more than the window's size — the frame's
     /// borders and the margins the client keeps outside the window are in it too.
     /// A frame appearing changes it without changing the size, so "the compositor
