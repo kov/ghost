@@ -18,7 +18,7 @@ mod event_loop;
 mod output;
 mod seat;
 mod state;
-mod types;
+pub mod types;
 mod window;
 
 #[derive(Debug)]

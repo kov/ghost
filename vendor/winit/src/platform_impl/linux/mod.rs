@@ -73,6 +73,10 @@ impl ApplicationName {
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
     pub activation_token: Option<ActivationToken>,
+    /// The name identifying this toplevel within the process's session, for
+    /// `xdg_session_management_v1` to restore its state against. Wayland only.
+    /// [vendored addition]
+    pub session_toplevel: Option<String>,
     #[cfg(x11_platform)]
     pub x11: X11WindowAttributes,
 }
@@ -96,6 +100,7 @@ impl Default for PlatformSpecificWindowAttributes {
         Self {
             name: None,
             activation_token: None,
+            session_toplevel: None,
             #[cfg(x11_platform)]
             x11: X11WindowAttributes {
                 visual_id: None,

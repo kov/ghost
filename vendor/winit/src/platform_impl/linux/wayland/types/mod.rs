@@ -3,6 +3,7 @@
 pub mod cursor;
 pub mod background_effect;
 pub mod kwin_blur;
+pub mod session_management;
 pub mod wp_fractional_scaling;
 pub mod wp_viewporter;
 pub mod xdg_activation;

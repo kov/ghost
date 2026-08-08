@@ -101,6 +101,9 @@ wayland = [
     "wayland-backend",
     "wayland-protocols",
     "wayland-protocols-plasma",
+    # [vendored addition] `xdg_session_management_v1` has no generated module in
+    # wayland-protocols yet (0.32.13 ships only the XML), so we scan our own copy.
+    "wayland-scanner",
     "sctk",
     "ahash",
     "memmap2",
@@ -290,6 +293,12 @@ optional = true
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.wayland-protocols-plasma]
 version = "0.3.8"
 features = ["client"]
+optional = true
+
+# [vendored addition] Generates the `xdg_session_management_v1` bindings from our
+# own copy of the staging XML; drop this once wayland-protocols ships the module.
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.wayland-scanner]
+version = "0.31.10"
 optional = true
 
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.x11-dl]

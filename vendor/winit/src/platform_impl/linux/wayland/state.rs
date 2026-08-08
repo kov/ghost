@@ -31,6 +31,7 @@ use crate::platform_impl::wayland::seat::{
 };
 use crate::platform_impl::wayland::types::background_effect::BackgroundEffectManager;
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
+use crate::platform_impl::wayland::types::session_management::{Session, SessionManager};
 use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
 use crate::platform_impl::wayland::types::wp_viewporter::ViewporterState;
 use crate::platform_impl::wayland::types::xdg_activation::XdgActivationState;
@@ -114,6 +115,15 @@ pub struct WinitState {
     /// Cross-desktop background-effect (blur) manager. [vendored addition]
     pub background_effect_manager: Option<BackgroundEffectManager>,
 
+    /// Toplevel session-restore manager. [vendored addition]
+    pub session_manager: Option<SessionManager>,
+
+    /// The session this process holds open, if it asked for one. At most one:
+    /// a second `get_session` for an id this client already holds is an
+    /// `in_use` protocol error, which would take the whole application down.
+    /// [vendored addition]
+    pub session: Option<Session>,
+
     /// Loop handle to re-register event sources, such as keyboard repeat.
     pub loop_handle: LoopHandle<'static, Self>,
 
@@ -183,6 +193,8 @@ impl WinitState {
             fractional_scaling_manager,
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
             background_effect_manager: BackgroundEffectManager::new(globals, queue_handle).ok(),
+            session_manager: SessionManager::new(globals, queue_handle).ok(),
+            session: None,
 
             seats,
             text_input_state: TextInputState::new(globals, queue_handle).ok(),

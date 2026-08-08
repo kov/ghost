@@ -29,16 +29,97 @@ pub use crate::window::Theme;
 #[cfg(wayland_platform)]
 pub use crate::platform_impl::wayland::DecorationMargins;
 
+/// The process's handle on its toplevel session — see
+/// [`ActiveEventLoopExtWayland::open_session`]. [vendored addition]
+#[cfg(wayland_platform)]
+pub use crate::platform_impl::wayland::types::session_management::{SessionReason, SessionShared};
+
 /// Additional methods on [`ActiveEventLoop`] that are specific to Wayland.
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+
+    /// Open this process's toplevel session, so the compositor remembers where
+    /// the windows named through
+    /// [`WindowAttributesExtWayland::with_session_toplevel`] were, and restores
+    /// them on a later run. [vendored addition]
+    ///
+    /// Pass the identifier a previous run persisted, or [`None`] for a first
+    /// run. An identifier the compositor has since forgotten is *not* an error:
+    /// it is treated as [`None`], and a fresh one arrives on the returned
+    /// handle. So persist [`SessionShared::id`] rather than the id you passed,
+    /// or a forgotten session is asked for forever.
+    ///
+    /// `reason` says how the instance came to be started. Compositors are free
+    /// to restore more state for a recovered or session-restored instance than
+    /// for a freshly launched one, and to decide differently whether a restored
+    /// window may take focus.
+    ///
+    /// Returns [`None`] where the compositor does not offer the protocol, on
+    /// X11, or if a session is already open — a second request for a live
+    /// identifier is a protocol error that would disconnect the application, so
+    /// it is refused here rather than sent.
+    #[cfg(wayland_platform)]
+    fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<std::sync::Arc<SessionShared>>;
+
+    /// Forget the session opened by [`open_session`](Self::open_session) and
+    /// every window state the compositor stored against it, then allow a new one
+    /// to be opened. For a launch that means to start over from nothing.
+    /// [vendored addition]
+    #[cfg(wayland_platform)]
+    fn remove_session(&self);
+
+    /// Forget one named toplevel and the state stored against it, leaving the
+    /// rest of the session alone. [vendored addition]
+    ///
+    /// Named rather than taken as a [`Window`] because a client that forgets a
+    /// window on close generally does so once the window is already gone.
+    #[cfg(wayland_platform)]
+    fn remove_session_toplevel(&self, name: String);
 }
 
 impl ActiveEventLoopExtWayland for ActiveEventLoop {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.p.is_wayland()
+    }
+
+    #[cfg(wayland_platform)]
+    #[inline]
+    fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<std::sync::Arc<SessionShared>> {
+        match &self.p {
+            crate::platform_impl::ActiveEventLoop::Wayland(window_target) => {
+                window_target.open_session(reason, id)
+            },
+            #[cfg(x11_platform)]
+            _ => None,
+        }
+    }
+
+    #[cfg(wayland_platform)]
+    #[inline]
+    fn remove_session(&self) {
+        #[allow(irrefutable_let_patterns)]
+        if let crate::platform_impl::ActiveEventLoop::Wayland(window_target) = &self.p {
+            window_target.remove_session();
+        }
+    }
+
+    #[cfg(wayland_platform)]
+    #[inline]
+    fn remove_session_toplevel(&self, name: String) {
+        #[allow(irrefutable_let_patterns)]
+        if let crate::platform_impl::ActiveEventLoop::Wayland(window_target) = &self.p {
+            window_target.remove_session_toplevel(name);
+        }
     }
 }
 
@@ -183,6 +264,21 @@ pub trait WindowExtWayland {
     /// [`Window::inner_size`]: crate::window::Window::inner_size
     /// [`Window::request_inner_size`]: crate::window::Window::request_inner_size
     fn set_decoration_margins(&self, margins: DecorationMargins) -> PhysicalSize<u32>;
+
+    /// Whether the compositor restored remembered state into this window's first
+    /// configure, for a window named through
+    /// [`WindowAttributesExtWayland::with_session_toplevel`]. [vendored addition]
+    ///
+    /// `false` for an unnamed window, on X11, and for a name the compositor had
+    /// nothing stored against — which is the ordinary first-run case, not an
+    /// error. Settled by the time the window exists, because the event that sets
+    /// it is pinned to arrive before the first configure and window creation
+    /// waits for that configure.
+    ///
+    /// A client that wants to fall back to its own remembered size when the
+    /// compositor had nothing needs this; one that is happy to open at its
+    /// default size does not.
+    fn session_restored(&self) -> bool;
 }
 
 impl WindowExtWayland for Window {
@@ -255,6 +351,16 @@ impl WindowExtWayland for Window {
             },
         }
     }
+
+    #[inline]
+    fn session_restored(&self) -> bool {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => false,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.session_restored(),
+        }
+    }
 }
 
 /// Additional methods on [`WindowAttributes`] that are specific to Wayland.
@@ -267,6 +373,26 @@ pub trait WindowAttributesExtWayland {
     /// For details about application ID conventions, see the
     /// [Desktop Entry Spec](https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-latest.html#desktop-file-id)
     fn with_name(self, general: impl Into<String>, instance: impl Into<String>) -> Self;
+
+    /// Identify this window within the session opened by
+    /// [`ActiveEventLoopExtWayland::open_session`], so the compositor restores
+    /// whatever it remembers about a window of that name — geometry, workspace,
+    /// maximized or fullscreen state — into the window's first configure.
+    /// [vendored addition]
+    ///
+    /// The name must be stable across runs and unique within the session; it is
+    /// the client's job to pick one that survives a restart, since a name the
+    /// next run cannot reproduce restores nothing. A name the compositor has
+    /// nothing stored against is not an error — the window simply opens as
+    /// asked, and its state is remembered under that name from then on.
+    ///
+    /// Restored state arrives as an ordinary configure, so a client that already
+    /// follows configures needs no further work; use
+    /// [`WindowExtWayland::session_restored`] only to find out whether anything
+    /// was in fact restored.
+    ///
+    /// Ignored on X11, and where the compositor does not offer the protocol.
+    fn with_session_toplevel(self, name: impl Into<String>) -> Self;
 }
 
 impl WindowAttributesExtWayland for WindowAttributes {
@@ -274,6 +400,12 @@ impl WindowAttributesExtWayland for WindowAttributes {
     fn with_name(mut self, general: impl Into<String>, instance: impl Into<String>) -> Self {
         self.platform_specific.name =
             Some(crate::platform_impl::ApplicationName::new(general.into(), instance.into()));
+        self
+    }
+
+    #[inline]
+    fn with_session_toplevel(mut self, name: impl Into<String>) -> Self {
+        self.platform_specific.session_toplevel = Some(name.into());
         self
     }
 }

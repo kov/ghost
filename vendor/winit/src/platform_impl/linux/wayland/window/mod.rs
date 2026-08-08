@@ -18,6 +18,7 @@ use tracing::warn;
 
 use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::platform_impl::wayland::logical_to_physical_rounded;
+use crate::platform_impl::wayland::types::session_management::ToplevelSession;
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
 use crate::event_loop::AsyncRequestSerial;
@@ -91,6 +92,13 @@ pub struct Window {
     /// — unlike the capability above, a bound global does not come and go.
     /// [vendored addition]
     kwin_blur_available: bool,
+
+    /// This toplevel's handle in the process's session, when the caller named it
+    /// through `WindowAttributesExtWayland::with_session_toplevel`. Held for the
+    /// window's life: dropping it destroys the object, which by spec leaves the
+    /// stored state alone but gives up the handle the client would rename
+    /// through. [vendored addition]
+    toplevel_session: Option<ToplevelSession>,
 }
 
 impl Window {
@@ -200,6 +208,18 @@ impl Window {
             xdg_activation.activate(token.token, &surface);
         }
 
+        // Ask the compositor to restore this toplevel's remembered state, if the
+        // caller named it and we hold a session. This has to happen here, in the
+        // gap between the `xdg_toplevel` existing and the surface's first commit:
+        // restoring means changing the very first configure, and after the commit
+        // below the request is an `already_mapped` protocol error. An unknown name
+        // is not an error — the compositor treats it as a plain add and sends no
+        // `restored` event. [vendored addition]
+        let toplevel_session = attributes.platform_specific.session_toplevel.and_then(|name| {
+            let session = state.session.as_ref()?;
+            Some(session.restore_toplevel(window.xdg_toplevel(), name, &queue_handle))
+        });
+
         // XXX Do initial commit.
         window.commit();
 
@@ -252,11 +272,19 @@ impl Window {
             window_events_sink,
             background_effect_capabilities,
             kwin_blur_available,
+            toplevel_session,
         })
     }
 
     pub(crate) fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
         NonNull::new(self.window.xdg_toplevel().id().as_ptr().cast())
+    }
+
+    /// Whether the compositor restored remembered state into this window's
+    /// initial configure. False for a window that was never named, or whose name
+    /// the compositor had nothing stored against. [vendored addition]
+    pub fn session_restored(&self) -> bool {
+        self.toplevel_session.as_ref().is_some_and(ToplevelSession::restored)
     }
 
     /// Whether [`set_blur`](Self::set_blur) can actually blur this window's

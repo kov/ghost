@@ -4093,6 +4093,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
+ "wayland-scanner",
  "web-sys",
  "web-time",
  "windows-sys 0.52.0",

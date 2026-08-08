@@ -27,6 +27,7 @@ use crate::event::{Event, InnerSizeWriter, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::platform::min_timeout;
+use crate::platform_impl::wayland::types::session_management::{SessionReason, SessionShared};
 use crate::platform_impl::{
     ActiveEventLoop as PlatformActiveEventLoop, OsError, PlatformCustomCursor,
 };
@@ -686,6 +687,48 @@ impl ActiveEventLoop {
 
     #[inline]
     pub fn listen_device_events(&self, _allowed: DeviceEvents) {}
+
+    /// Open the process's toplevel session. See
+    /// [`ActiveEventLoopExtWayland::open_session`]. [vendored addition]
+    ///
+    /// [`ActiveEventLoopExtWayland::open_session`]: crate::platform::wayland::ActiveEventLoopExtWayland::open_session
+    pub(crate) fn open_session(
+        &self,
+        reason: SessionReason,
+        id: Option<&str>,
+    ) -> Option<Arc<SessionShared>> {
+        let mut state = self.state.borrow_mut();
+        // A second `get_session` for an id this client already holds is an
+        // `in_use` protocol error, which disconnects the whole application. The
+        // caller cannot see which ids are live, so refusing here is the only
+        // place that can make the mistake unreachable.
+        if state.session.is_some() {
+            warn!("a session is already open; ignoring open_session");
+            return None;
+        }
+        let session = state.session_manager.as_ref()?.open(reason, id, &self.queue_handle);
+        let shared = session.shared();
+        state.session = Some(session);
+        Some(shared)
+    }
+
+    /// Forget the process's session and everything the compositor stored for it.
+    /// [vendored addition]
+    pub(crate) fn remove_session(&self) {
+        // `remove` is a destructor, so this also clears the guard above: opening
+        // a fresh session afterwards is exactly what a "forget everything" launch
+        // needs to do.
+        if let Some(session) = self.state.borrow_mut().session.take() {
+            session.remove();
+        }
+    }
+
+    /// Forget one named toplevel's stored state. [vendored addition]
+    pub(crate) fn remove_session_toplevel(&self, name: String) {
+        if let Some(session) = self.state.borrow().session.as_ref() {
+            session.remove_toplevel(name);
+        }
+    }
 
     pub(crate) fn create_custom_cursor(&self, cursor: CustomCursorSource) -> RootCustomCursor {
         RootCustomCursor {
