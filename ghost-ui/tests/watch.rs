@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use ghost_vt::client::Session;
 use ghost_vt::session::SessionInfo;
+use rustix::fs::{FlockOperation, OFlags, flock};
 
 fn ghost(xdg: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ghost"));
@@ -161,6 +162,116 @@ fn watch_pushes_on_title_change() {
                 .any(|i| i.name == "titled" && i.title == "HELLO-TITLE")
         }),
         "the title change was not pushed to the watcher within the heartbeat window"
+    );
+}
+
+/// A session that becomes listable *while* `__watch` is still building its first
+/// listing must still be streamed.
+///
+/// `ghost new -d` returns as soon as the host is forked: the session's lock is
+/// already held, but its `pid` is not written until the host has exec'd and come
+/// up, and `session::list` deliberately keeps a directory out of the listing
+/// until that pid appears. So the instant a session becomes *visible* is a `pid`
+/// write landing some milliseconds after the spawn command exited — routinely
+/// after a `__watch` started right behind it has taken its first snapshot. Emit
+/// that snapshot before registering the watcher and the write falls in the gap:
+/// the session is in no listing and no change is pending, so it stays invisible
+/// until the 30s heartbeat.
+///
+/// In the wild the gap is a fraction of a millisecond, which is what made this a
+/// roughly 1-in-10 flake in the remote watch test rather than a plain bug. Here
+/// it is held open on purpose: `list` reads each session's `lock` with an
+/// ordinary read-only open, and opening a FIFO read-only blocks until a writer
+/// arrives — so a session directory whose `lock` is a FIFO parks the scan
+/// mid-listing for as long as we like.
+#[test]
+fn a_session_that_becomes_listable_mid_scan_is_still_streamed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let runtime = xdg.join("run").join("ghost");
+    std::fs::create_dir_all(&runtime).unwrap();
+
+    // Two session directories. Which one the scan reaches first is the
+    // directory's own order, not alphabetical — so lay both down and ask.
+    for name in ["sess-a", "sess-b"] {
+        std::fs::create_dir_all(runtime.join(name)).unwrap();
+    }
+    let order: Vec<String> = std::fs::read_dir(&runtime)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    // The first one scanned is the session under test; the second parks the scan
+    // *after* it, so its pid write cannot sneak into the initial listing.
+    let (late, blocker) = (&order[0], &order[1]);
+
+    // The one under test looks exactly like a session mid-spawn: a live host
+    // holds its lock, and no pid yet. Holding the flock here stands in for that
+    // host — `list` reads liveness from the lock, and nothing else about a host
+    // is needed to be listed.
+    let lock = std::fs::File::create(runtime.join(late).join("lock")).unwrap();
+    flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+
+    let fifo = runtime.join(blocker).join("lock");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success(),
+        "could not create the blocking lock"
+    );
+
+    let mut child = ghost(xdg)
+        .arg("__watch")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = KillChild(child);
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(l) = line else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+
+    // A non-blocking open for writing succeeds only once a reader is waiting on
+    // the FIFO — so this returning is proof the scan is parked, and parked
+    // *past* the session under test.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let release = loop {
+        match rustix::fs::open(
+            &fifo,
+            OFlags::WRONLY | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => break fd,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("the watcher never reached the blocking lock: {e}"),
+        }
+    };
+
+    // The moment the flake turns on: the session becomes listable now, with the
+    // first listing already past it and the watcher not yet registered.
+    std::fs::write(
+        runtime.join(late).join("pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    // Let the scan finish, and with it the initial (still empty) listing.
+    drop(release);
+
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |s| {
+            s.iter().any(|i| i.name == *late)
+        }),
+        "a session that came up while the first listing was being built was \
+         never streamed — the change landed before the watcher was registered, \
+         so nothing will report it until the 30s heartbeat"
     );
 }
 

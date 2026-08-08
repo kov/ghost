@@ -37,8 +37,6 @@ fn wakes(kind: &notify::EventKind) -> bool {
 pub fn run() -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut last = listing_line()?;
-    write_line(&mut out, &last)?;
 
     let dir = paths::runtime_dir();
     // The dir may not exist before the first session; create it so the watch binds.
@@ -60,6 +58,18 @@ pub fn run() -> io::Result<()> {
     watcher
         .watch(&dir, notify::RecursiveMode::Recursive)
         .map_err(io::Error::other)?;
+
+    // The first listing is taken *after* the watch is registered, never before.
+    // A session is only listable once its host has written its pid, which lands
+    // some milliseconds after the spawn command that forked it returned — so a
+    // session coming up right now becomes visible at an instant we do not
+    // control. Snapshot first and that instant can fall between the snapshot and
+    // the registration: the listing misses it and no event is pending, so it
+    // stays unreported until the heartbeat, half a minute later. This way round
+    // the change is either already in the snapshot or waiting in `rx`; the worst
+    // case is a redundant wake, which the `line != last` check below absorbs.
+    let mut last = listing_line()?;
+    write_line(&mut out, &last)?;
 
     loop {
         match rx.recv_timeout(HEARTBEAT) {
