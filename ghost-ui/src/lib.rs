@@ -1368,7 +1368,11 @@ fn esctest_host() {
 
 // ---- interactive mode (window) -----------------------------------------
 
-fn spawn_session(name: &str, command: Vec<String>, connection: Option<ConnectionSpec>) {
+fn spawn_session(
+    name: &str,
+    command: Vec<String>,
+    connection: Option<ConnectionSpec>,
+) -> std::io::Result<()> {
     server::spawn(SpawnOpts {
         name: name.to_string(),
         command, // empty => $SHELL (unless `connection` derives an `ssh …` child)
@@ -1384,7 +1388,6 @@ fn spawn_session(name: &str, command: Vec<String>, connection: Option<Connection
         start_on_attach: true,
         connection,
     })
-    .expect("spawn session");
 }
 
 /// The connection a new terminal in a window inherits: the session it was spawned
@@ -1723,8 +1726,16 @@ fn interactive(fresh: bool, ssh_window: bool) {
                     StartupChoice::Fleet => Startup::Fleet,
                     StartupChoice::Spawn => {
                         let n = format!("{}-{}", ghost_vt::paths::host_tag(), std::process::id());
-                        spawn_session(&n, vec![], None);
-                        Startup::Single(n)
+                        match spawn_session(&n, vec![], None) {
+                            Ok(()) => Startup::Single(n),
+                            // Nothing to show a single view of. Start on the fleet,
+                            // which is also where an existing session would be found
+                            // if this launch simply could not add to it.
+                            Err(e) => {
+                                eprintln!("ghost: could not start a session: {e}");
+                                Startup::Fleet
+                            }
+                        }
                     }
                 },
             }
@@ -2738,6 +2749,20 @@ pub trait Frontend {
     /// Forget one window's stored position, leaving the rest alone. Takes a name
     /// rather than a window because ghost forgets a window as it closes it.
     fn forget_toplevel(&self, name: &str);
+
+    /// Start a local session's host process.
+    ///
+    /// Fallible, and the failure is not exotic: the host is a forked exec of this
+    /// same binary, so installing a new `ghost` over the running one leaves every
+    /// later spawn with nothing to exec (`ghost_vt::server::check_exec_target`).
+    /// On the seam because it is a side effect the headless shell must be able to
+    /// refuse — a spawn that cannot be made to fail cannot be tested for.
+    fn spawn_session(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        connection: Option<ConnectionSpec>,
+    ) -> std::io::Result<()>;
     /// Leave the event loop (quit).
     fn exit(&self);
     /// Set when the loop next wakes.
@@ -2800,6 +2825,15 @@ impl Frontend for WinitFrontend<'_> {
         let _ = name;
     }
 
+    fn spawn_session(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        connection: Option<ConnectionSpec>,
+    ) -> std::io::Result<()> {
+        spawn_session(name, command, connection)
+    }
+
     fn exit(&self) {
         self.event_loop.exit();
     }
@@ -2856,6 +2890,11 @@ pub struct HeadlessFrontend {
     opened: std::cell::RefCell<Vec<(SessionReason, Option<String>)>>,
     /// How many times the App removed a session outright.
     removed: std::cell::Cell<usize>,
+    /// Every local session the App asked to start, in order.
+    spawned: std::cell::RefCell<Vec<String>>,
+    /// Set to make every spawn fail, standing in for the binary having been
+    /// replaced under a running GUI.
+    spawns_fail: std::cell::Cell<bool>,
 }
 
 impl HeadlessFrontend {
@@ -2871,7 +2910,19 @@ impl HeadlessFrontend {
             forgotten: std::cell::RefCell::new(Vec::new()),
             opened: std::cell::RefCell::new(Vec::new()),
             removed: std::cell::Cell::new(0),
+            spawned: std::cell::RefCell::new(Vec::new()),
+            spawns_fail: std::cell::Cell::new(false),
         }
+    }
+
+    /// Make every later spawn fail the way a replaced binary does.
+    pub fn fail_spawns(&self) {
+        self.spawns_fail.set(true);
+    }
+
+    /// The local sessions the App asked to start, attempted or not.
+    pub fn spawned_sessions(&self) -> Vec<String> {
+        self.spawned.borrow().clone()
     }
 
     /// The name each window opened so far was registered under.
@@ -2955,6 +3006,25 @@ impl Frontend for HeadlessFrontend {
 
     fn forget_toplevel(&self, name: &str) {
         self.forgotten.borrow_mut().push(name.to_string());
+    }
+
+    fn spawn_session(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        connection: Option<ConnectionSpec>,
+    ) -> std::io::Result<()> {
+        self.spawned.borrow_mut().push(name.to_string());
+        if self.spawns_fail.get() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the running ghost binary has been replaced on disk",
+            ));
+        }
+        // Otherwise really start one. The headless frontend stands in for the
+        // window system, not for the session machinery: the shell tests attach to
+        // these hosts and read their screens, so a stub here would test the stub.
+        spawn_session(name, command, connection)
     }
 
     fn exit(&self) {
@@ -4295,11 +4365,13 @@ impl App {
                     }
                 }
                 Cmd::Spawn { name, command } => {
-                    spawn_session(&name, command, None);
                     // Best-effort attach; a later reconcile re-attaches if it lost the
                     // race. A freshly-spawned name is new, so the shared client map has
-                    // no entry — this window becomes its driver.
-                    if !self.sessions.contains_key(&name)
+                    // no entry — this window becomes its driver. A spawn that failed
+                    // has no host to attach to at all.
+                    if let Err(e) = event_loop.spawn_session(&name, command, None) {
+                        eprintln!("ghost: could not start session {name}: {e}");
+                    } else if !self.sessions.contains_key(&name)
                         && let Some(w) = self.windows.get(&wid)
                     {
                         // Handshake at the window's real grid (see `attach_into`).
@@ -4361,9 +4433,16 @@ impl App {
                     match remote_spawn_target(connection.as_ref(), &connected) {
                         Some(target) => self.spawn_remote_session(wid, &target, &name),
                         None => {
-                            spawn_session(&name, vec![], connection);
-                            if self.attach_into(wid, &name) {
-                                self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                            // A spawn that failed started nothing, so there is
+                            // nothing to attach to and nothing to adopt: falling
+                            // through would record a member the fleet can never show.
+                            match event_loop.spawn_session(&name, vec![], connection) {
+                                Ok(()) => {
+                                    if self.attach_into(wid, &name) {
+                                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                                    }
+                                }
+                                Err(e) => eprintln!("ghost: could not start a session: {e}"),
                             }
                         }
                     }
@@ -5389,9 +5468,13 @@ impl App {
         // The descriptor carries the `ConnectionSpec`, so the session is marked a
         // plain-ssh session by derivation (`foreground_connection`) — no stored
         // "is fallback" flag.
-        spawn_session(&name, vec![], Some(spec));
-        if self.attach_into(wid, &name) {
-            self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+        match event_loop.spawn_session(&name, vec![], Some(spec)) {
+            Ok(()) => {
+                if self.attach_into(wid, &name) {
+                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                }
+            }
+            Err(e) => eprintln!("ghost: could not start the ssh session: {e}"),
         }
     }
 
@@ -6120,9 +6203,19 @@ impl App {
                 let name = self.unique_session_name();
                 // A fresh window starts a local session (no foreground to inherit
                 // an ssh connection from; a P5 ssh group would set one here).
-                spawn_session(&name, vec![], None);
                 let group = self.mint_group();
-                self.open_single_window(event_loop, &name, group, None);
+                match event_loop.spawn_session(&name, vec![], None) {
+                    Ok(()) => {
+                        self.open_single_window(event_loop, &name, group, None);
+                    }
+                    // The window was asked for and still opens; it just has no
+                    // session to show, which is the empty fleet. Opening the single
+                    // view instead would put it on a name nothing is serving.
+                    Err(e) => {
+                        eprintln!("ghost: could not start a session for the new window: {e}");
+                        self.open_fleet_window(event_loop, group, None);
+                    }
+                }
             }
             // new_window_choice never asks to attach a specific session, but keep the
             // match exhaustive: an explicit name would open that session's single view.
@@ -10051,6 +10144,44 @@ mod tests {
             vec![rem2.clone()],
             "its remote member is planned"
         );
+    }
+
+    /// A local session is a forked exec of ghost's own binary, so starting one
+    /// can fail — most easily by installing a new `ghost` over the running one,
+    /// which unlinks the inode the GUI is executing (see
+    /// `ghost_vt::server::check_exec_target`). That used to be unnoticeable:
+    /// `spawn` reported success whatever became of the forked child, so `Alt-t`
+    /// played its animation, opened nothing, and said nothing.
+    ///
+    /// Now it reports — and a window has to survive being told. The call site
+    /// ended in `.expect("spawn session")`, which would have turned a replaced
+    /// binary from an invisible no-op into every window on the desktop vanishing.
+    #[test]
+    fn a_session_that_cannot_be_spawned_leaves_the_window_standing() {
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            fe.fail_spawns();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let groups_before = app.groups.clone();
+
+            app.exec(wid, vec![ghost_ui_core::Cmd::SpawnSession], &fe);
+
+            assert_eq!(
+                fe.spawned_sessions().len(),
+                1,
+                "the spawn was attempted, and failed"
+            );
+            assert!(
+                app.windows.contains_key(&wid),
+                "a window outlives a session that could not start"
+            );
+            assert_eq!(
+                app.groups, groups_before,
+                "a session that never started must not be recorded as a member of anything"
+            );
+        });
     }
 
     #[test]
