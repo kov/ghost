@@ -1984,6 +1984,17 @@ mod tests {
     }
 
     #[test]
+    fn a_line_says_whether_it_soft_wraps_into_the_next() {
+        // The flag lives on the line that CONTINUES: a consumer joining logical
+        // lines reads it on row N to decide whether row N+1 is a continuation.
+        let mut vt = Vt::builder().size(4, 4).build();
+        vt.feed_str("abcdef\r\nxy");
+        assert!(vt.line(0).is_wrapped(), "row 0 runs on into row 1");
+        assert!(!vt.line(1).is_wrapped(), "row 1 ended with a real newline");
+        assert!(!vt.line(2).is_wrapped(), "'xy' fits, so it never wrapped");
+    }
+
+    #[test]
     fn lines_scrolled_off_is_monotonic_across_trimming() {
         // 2 rows + a 3-line scrollback cap: at most 5 lines are ever retained.
         let mut vt = Vt::builder().size(2, 2).scrollback_limit(3).build();

@@ -2854,27 +2854,66 @@ impl TerminalView {
     /// scrolled-back view by cell (not `screen.text()`, whose char indices don't
     /// line up with cell columns once a wide character is present).
     fn word_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
-        let line = self.window_line(state, row)?;
-        let cells = line.cells();
         // A word cell is one holding a word character, or the (zero-width) tail
         // of a wide character, which continues whatever head precedes it.
-        let word = |i: usize| {
-            cells
+        let word = |line: &Line, i: usize| {
+            line.cells()
                 .get(i)
                 .is_some_and(|c| is_word_char(c.char(), &self.word_chars) || c.width() == 0)
         };
-        if !word(col) {
+        if !word(self.window_line(state, row)?, col) {
             return None;
         }
-        let mut start = col;
-        while start > 0 && word(start - 1) {
-            start -= 1;
+        // Leftwards, stepping into the row above whenever that row soft-wraps
+        // into this one — the two are one logical line, and a word straddling
+        // the fold is still one word.
+        let (mut srow, mut scol) = (row, col);
+        while let Some(line) = self.window_line(state, srow) {
+            if scol > 0 {
+                if !word(line, scol - 1) {
+                    break;
+                }
+                scol -= 1;
+                continue;
+            }
+            let Some(prev) = srow
+                .checked_sub(1)
+                .and_then(|r| self.window_line(state, r))
+                .filter(|prev| prev.is_wrapped())
+            else {
+                break;
+            };
+            let end = content_len(prev);
+            if end == 0 || !word(prev, end - 1) {
+                break;
+            }
+            srow -= 1;
+            scol = end - 1;
         }
-        let mut end = col;
-        while end + 1 < cells.len() && word(end + 1) {
-            end += 1;
+        // Rightwards, the same, following the fold into the continuation row.
+        let (mut erow, mut ecol) = (row, col);
+        while let Some(line) = self.window_line(state, erow) {
+            let end = content_len(line);
+            if ecol + 1 < end {
+                if !word(line, ecol + 1) {
+                    break;
+                }
+                ecol += 1;
+                continue;
+            }
+            let Some(next) = self
+                .window_line(state, erow + 1)
+                .filter(|_| line.is_wrapped())
+            else {
+                break;
+            };
+            if !word(next, 0) {
+                break;
+            }
+            erow += 1;
+            ecol = 0;
         }
-        Some(Selection::new((row, start), (row, end)))
+        Some(Selection::new((srow, scol), (erow, ecol)))
     }
 
     /// The line at viewport `row`: column 0 through its last non-blank cell (the
@@ -3176,6 +3215,21 @@ fn map_button(b: PointerButton) -> mouse::Button {
 /// job, not this one (see docs/selection-design.md).
 pub const DEFAULT_WORD_CHARS: &str = "-#%&+,./=?@\\_~·";
 
+/// How many of `line`'s cells are content. A soft-wrapped line filled the width
+/// by definition, so any trailing blanks on one are padding — the gap left when
+/// a wide glyph would have straddled the edge and moved down whole. They are
+/// layout, not text: word walks step over them into the continuation row, and
+/// copied text leaves them out.
+fn content_len(line: &Line) -> usize {
+    if !line.is_wrapped() {
+        return line.len();
+    }
+    line.cells()
+        .iter()
+        .rposition(|c| !c.is_default())
+        .map_or(0, |i| i + 1)
+}
+
 /// Whether `c` is part of a word for double-click selection, given the extra
 /// word characters configured on top of the alphanumerics.
 fn is_word_char(c: char, extra: &str) -> bool {
@@ -3229,7 +3283,7 @@ pub fn selection_text(screen: &Screen, sel: Selection) -> String {
         .skip(start_row - first_abs)
         .take(sel.end.0 - start_row + 1)
         .collect();
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<(String, bool)> = Vec::new();
     for (i, line) in window.iter().enumerate() {
         let row = start_row + i;
         let text = match sel.row_span(row, cols) {
@@ -3248,9 +3302,19 @@ pub fn selection_text(screen: &Screen, sel: Selection) -> String {
         } else {
             text.trim_end().to_string()
         };
-        lines.push(text);
+        // A row that soft-wraps into the next is the same logical line, so no
+        // newline goes between them: what is pasted is what the program printed,
+        // not what the window happened to be wide enough to show.
+        lines.push((text, line.is_wrapped()));
     }
-    lines.join("\n")
+    let mut out = String::new();
+    for (i, (text, wrapped)) in lines.iter().enumerate() {
+        out.push_str(text);
+        if i + 1 < lines.len() && !wrapped {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4013,6 +4077,82 @@ mod tests {
         m.update(ptr(PointerPhase::Motion, None, 9.0 * 10.0 + 1.0, 1.0));
         m.update(press_n(9.0 * 10.0 + 1.0, 1.0, 2));
         assert_eq!(m.selection(), Some(Selection::new((0, 6), (0, 20))));
+    }
+
+    /// A model with a deliberately narrow grid, so a modest token soft-wraps.
+    fn narrow_model(cols: u16) -> TerminalModel {
+        let mut m = TerminalModel::new("alpha".to_string(), cols, 6, METRICS);
+        m.set_policy(ghost_term::SessionPolicy::allow_all());
+        m
+    }
+
+    #[test]
+    fn a_word_that_soft_wraps_selects_across_the_wrap() {
+        // 24 word characters on a 20-column grid: cols 0..=19 of row 0, then
+        // cols 0..=3 of row 1. Double-clicking either half takes the whole token.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"aaaa/bbbb/cccc/dddd/eeee");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        assert_eq!(
+            m.selection(),
+            Some(Selection::new((0, 0), (1, 3))),
+            "clicking the first half reaches into the continuation row"
+        );
+        // And from the tail half, back through the wrap into row 0.
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 2.0 + 1.0, 20.0));
+        m.update(press_n(9.0 * 2.0 + 1.0, 20.0, 2));
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (1, 3))));
+    }
+
+    #[test]
+    fn a_hard_newline_still_stops_the_word() {
+        // The row below is a real line, not a continuation, so the word ends at
+        // the row edge even though both rows are full of word characters.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"aaaaaaaaaaaaaaaaaaaa\r\nbbbb");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (0, 19))));
+    }
+
+    #[test]
+    fn copying_a_soft_wrapped_selection_leaves_out_the_newline() {
+        // What the user pastes is what the program printed: one unbroken token,
+        // with no newline smuggled in at the wrap point.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"aaaa/bbbb/cccc/dddd/eeee\r\ntail");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        let sel = m.view.selection.expect("a selection");
+        assert_eq!(
+            selection_text(&m.state.screen, sel),
+            "aaaa/bbbb/cccc/dddd/eeee"
+        );
+    }
+
+    #[test]
+    fn copying_across_a_hard_newline_keeps_it() {
+        let mut m = narrow_model(20);
+        feed(&mut m, b"one\r\ntwo");
+        let sel = Selection::new((0, 0), (1, 2));
+        assert_eq!(selection_text(&m.state.screen, sel), "one\ntwo");
+    }
+
+    #[test]
+    fn a_wide_char_across_the_wrap_keeps_cell_columns_and_text_aligned() {
+        // 世 is two cells wide and cannot straddle the edge, so it moves whole to
+        // the next row — the wrap point and the char count disagree, which is
+        // exactly where a text-indexed implementation goes wrong.
+        let mut m = narrow_model(20);
+        feed(&mut m, "aaaaaaaaaaaaaaaaaaa世b".as_bytes());
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 3.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 3.0 + 1.0, 1.0, 2));
+        let sel = m.view.selection.expect("a selection");
+        assert_eq!(
+            selection_text(&m.state.screen, sel),
+            "aaaaaaaaaaaaaaaaaaa世b"
+        );
     }
 
     #[test]

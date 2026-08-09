@@ -358,6 +358,15 @@ impl Line {
         &self.cells
     }
 
+    /// Whether this line soft-wraps into the next one — it filled the width and
+    /// the text carried on, rather than ending at a newline. The flag is on the
+    /// line that *continues*, so joining logical lines means reading it on row
+    /// `n` to decide whether row `n + 1` is a continuation of it.
+    #[must_use]
+    pub fn is_wrapped(&self) -> bool {
+        self.wrapped
+    }
+
     pub fn chunks<'a>(
         &'a self,
         predicate: impl Fn(&Cell, &Cell) -> bool + 'a,
