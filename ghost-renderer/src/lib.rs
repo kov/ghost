@@ -1415,13 +1415,8 @@ struct Snapshot {
     bg: wgpu::Color,
 }
 
-/// Per-row instance offsets for a steady single view, so a damaged (banded)
-/// redraw can draw only the band's rows instead of the whole instance buffer.
-/// llvmpipe processes every *drawn* instance's vertices at submit time regardless
-/// of the scissor (the scissor only culls at the raster stage), so at 4K the win
-/// is culling the draw itself — not just the rasterization.
-///
-/// Translate every instance's screen rect by `(dx, dy)`.
+/// Translate every instance's screen rect by `(dx, dy)`. Instances are built at
+/// frame-local coordinates; this moves a built frame to the tile it occupies.
 fn translate(insts: &mut [Instance], dx: f32, dy: f32) {
     for i in insts {
         i.rect[0] += dx;
