@@ -2883,7 +2883,7 @@ impl TerminalView {
             else {
                 break;
             };
-            let end = content_len(prev);
+            let end = content_len(prev, self.window_line(state, srow));
             if end == 0 || !word(prev, end - 1) {
                 break;
             }
@@ -2893,7 +2893,7 @@ impl TerminalView {
         // Rightwards, the same, following the fold into the continuation row.
         let (mut erow, mut ecol) = (row, col);
         while let Some(line) = self.window_line(state, erow) {
-            let end = content_len(line);
+            let end = content_len(line, self.window_line(state, erow + 1));
             if ecol + 1 < end {
                 if !word(line, ecol + 1) {
                     break;
@@ -2962,7 +2962,7 @@ impl TerminalView {
         let mut at = None;
         let mut r = first;
         while let Some(line) = self.window_line(state, r) {
-            let end = content_len(line);
+            let end = content_len(line, self.window_line(state, r + 1));
             for (c, cell) in line.cells()[..end].iter().enumerate() {
                 // The zero-width tail of a wide character is part of its head,
                 // not a character of its own.
@@ -2989,13 +2989,34 @@ impl TerminalView {
         at.map(|at| (cells, at))
     }
 
-    /// The line at viewport `row`: column 0 through its last non-blank cell (the
-    /// whole row when blank), as an inclusive selection.
+    /// The *logical* line through viewport `row`: the soft-wrapped rows either
+    /// side of it, from column 0 to the last non-blank cell of the row that ends
+    /// it (the whole row when blank), as an inclusive selection. A fold is where
+    /// the width ran out, not where the line ended, so it is crossed; a real
+    /// newline is not.
     fn line_at(&self, state: &SessionState, row: usize) -> Option<Selection> {
-        let line = self.window_line(state, row)?;
-        let cells = line.cells();
-        let last = cells.iter().rposition(|c| !c.is_default()).unwrap_or(0);
-        Some(Selection::new((row, 0), (row, last)))
+        self.window_line(state, row)?;
+        let mut first = row;
+        while first
+            .checked_sub(1)
+            .and_then(|r| self.window_line(state, r))
+            .is_some_and(Line::is_wrapped)
+        {
+            first -= 1;
+        }
+        let mut last = row;
+        while self.window_line(state, last).is_some_and(Line::is_wrapped)
+            && self.window_line(state, last + 1).is_some()
+        {
+            last += 1;
+        }
+        let line = self.window_line(state, last)?;
+        let end = line
+            .cells()
+            .iter()
+            .rposition(|c| !c.is_default())
+            .unwrap_or(0);
+        Some(Selection::new((first, 0), (last, end)))
     }
 
     /// The rendered window's `row`-th line (the frame's row space: slid one
@@ -3533,19 +3554,29 @@ fn trim_url_tail(chars: &[char]) -> usize {
     }
 }
 
-/// How many of `line`'s cells are content. A soft-wrapped line filled the width
-/// by definition, so any trailing blanks on one are padding — the gap left when
-/// a wide glyph would have straddled the edge and moved down whole. They are
-/// layout, not text: word walks step over them into the continuation row, and
-/// copied text leaves them out.
-fn content_len(line: &Line) -> usize {
+/// How many of `line`'s cells are content, given the row `next` it wraps into.
+///
+/// A soft-wrapped line filled the width by definition, so a trailing blank on it
+/// is layout rather than text in exactly one case: the glyph that wrapped was too
+/// wide for the gap left at the edge and moved down whole. That gap is one cell
+/// short of the glyph's width, and it is what word walks step over and copied
+/// text leaves out. Every other trailing blank is a space the program printed —
+/// dropping it would fuse the words either side of the fold.
+fn content_len(line: &Line, next: Option<&Line>) -> usize {
     if !line.is_wrapped() {
         return line.len();
     }
-    line.cells()
+    let pad = next
+        .and_then(|n| n.cells().first())
+        .map_or(1, |c| usize::from(c.width()).max(1))
+        - 1;
+    let blanks = line
+        .cells()
         .iter()
-        .rposition(|c| !c.is_default())
-        .map_or(0, |i| i + 1)
+        .rev()
+        .take_while(|c| c.is_default())
+        .count();
+    line.len() - blanks.min(pad)
 }
 
 /// Whether `c` is part of a word for double-click selection, given the extra
@@ -3604,18 +3635,23 @@ pub fn selection_text(screen: &Screen, sel: Selection) -> String {
     let mut lines: Vec<(String, bool)> = Vec::new();
     for (i, line) in window.iter().enumerate() {
         let row = start_row + i;
+        // A wrapped row's trailing blank may be the gap a wide glyph left when it
+        // moved down whole; `content_len` knows which, and anything past it is
+        // layout. Every other row keeps only what it printed.
+        let len = if line.is_wrapped() {
+            content_len(line, window.get(i + 1).copied())
+        } else {
+            line.len()
+        };
         let text = match sel.row_span(row, cols) {
-            Some((c0, c1)) => {
-                let len = line.len();
-                line.cells()[c0.min(len)..c1.min(len)]
-                    .iter()
-                    .filter(|cell| cell.width() != 0)
-                    .map(|cell| cell.char())
-                    .collect::<String>()
-            }
+            Some((c0, c1)) => line.cells()[c0.min(len)..c1.min(len)]
+                .iter()
+                .filter(|cell| cell.width() != 0)
+                .map(|cell| cell.char())
+                .collect::<String>(),
             None => String::new(),
         };
-        let text = if row == sel.end.0 {
+        let text = if row == sel.end.0 || line.is_wrapped() {
             text
         } else {
             text.trim_end().to_string()
@@ -4600,6 +4636,19 @@ mod tests {
     }
 
     #[test]
+    fn a_space_at_the_wrap_point_survives_the_copy() {
+        // The fold lands exactly on a printed space. It fills the last column, so
+        // it looks like padding and used to be trimmed away — fusing the two words
+        // into "foxjumps" on paste.
+        let mut screen = Screen::new(20, 3, screen::DEFAULT_SCROLLBACK);
+        screen.feed(b"the quick brown fox jumps over");
+        assert_eq!(
+            selection_text(&screen, Selection::new((0, 0), (1, 9))),
+            "the quick brown fox jumps over"
+        );
+    }
+
+    #[test]
     fn a_wide_char_across_the_wrap_keeps_cell_columns_and_text_aligned() {
         // 世 is two cells wide and cannot straddle the edge, so it moves whole to
         // the next row — the wrap point and the char count disagree, which is
@@ -4623,6 +4672,67 @@ mod tests {
         m.update(press_n(9.0, 1.0, 3));
         // Whole line: col 0 through the last non-blank ('d' at col 10).
         assert_eq!(m.selection(), Some(Selection::new((0, 0), (0, 10))));
+    }
+
+    /// Triple-click at viewport cell `(row, col)` and return the text selected.
+    fn triple_click_text(m: &mut TerminalModel, row: usize, col: usize) -> String {
+        let x = 9.0 * col as f64 + 1.0;
+        let y = 18.0 * row as f64 + 1.0;
+        m.update(ptr(PointerPhase::Motion, None, x, y));
+        m.update(press_n(x, y, 3));
+        match m.view.selection {
+            Some(sel) => selection_text(&m.state.screen, sel),
+            None => String::new(),
+        }
+    }
+
+    #[test]
+    fn triple_click_selects_the_whole_soft_wrapped_line() {
+        // The line the user sees is the one they typed, not the rows the width
+        // happened to break it into — and it reads the same from either row.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"the quick brown fox jumps over");
+        assert_eq!(
+            triple_click_text(&mut m, 0, 3),
+            "the quick brown fox jumps over"
+        );
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (1, 9))));
+        let mut m = narrow_model(20);
+        feed(&mut m, b"the quick brown fox jumps over");
+        assert_eq!(
+            triple_click_text(&mut m, 1, 3),
+            "the quick brown fox jumps over"
+        );
+    }
+
+    #[test]
+    fn triple_click_stops_at_a_real_newline() {
+        // A hard newline is where the program ended the line, so the selection
+        // ends there too — only a fold gets crossed.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"first line\r\nsecond line");
+        assert_eq!(triple_click_text(&mut m, 0, 3), "first line");
+        assert_eq!(triple_click_text(&mut m, 1, 3), "second line");
+    }
+
+    #[test]
+    fn a_triple_click_drag_extends_by_whole_logical_lines() {
+        // Dragging after a triple-click grows by the same unit it started with,
+        // so a wrapped line comes along whole rather than by its rows.
+        let mut m = narrow_model(20);
+        feed(&mut m, b"the quick brown fox jumps over\r\ntail");
+        // Anchor on the *continuation* row, so the first row only comes along if
+        // the anchor is the whole logical line.
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 18.0 + 1.0));
+        m.update(press_n(1.0, 18.0 + 1.0, 3));
+        // Drag down onto the last row: the wrapped pair plus the tail line.
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            1.0,
+            18.0 * 2.0 + 1.0,
+        ));
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (2, 3))));
     }
 
     #[test]

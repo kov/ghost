@@ -117,8 +117,8 @@ newline still stops it; copying across the wrap yields no `\n` while copying
 across a real newline keeps it; a wide char moved down at the wrap point keeps
 cells and text aligned.
 
-Not included: triple-click still selects the physical row, not the logical
-line. Worth doing, tracked as a follow-up.
+Not included at the time: triple-click still selected the physical row — done in
+phase 4 below.
 
 ### Phase 3a — URL selection (kitty-style, no regex)
 
@@ -174,6 +174,39 @@ maps one past the last cell, keeping an exclusive match end exclusive).
 Tests: `a/src/foo.rs` and `b/src/foo.rs` select `src/foo.rs`; clicking the `a/`
 does too; `src/foo.rs:12:5` selects the path; a URL inside a diff line still
 selects as a URL (the arbitration test).
+
+### Phase 3c — the config surface
+
+`[[input.selection_rules]]` in `ui.toml`: `regex`, `group` (default 0 = whole
+match), `precision` (default 1, clamped to the URI tier so an OSC 8 link always
+wins). Writing any rule **replaces** the built-in set, wezterm's semantics — the
+README sample carries both defaults verbatim so they can be copied back. A rule
+whose regex doesn't compile is logged and dropped, keeping the rest.
+
+The word characters and the rules became one `SelectionConfig`, since they plumb
+identically and always together: the setter fans out to the foreground and warm
+mirrors, and `resize_model` stamps it where a view is *sized*. The stamp is not
+redundant — a session adopted after the config was read mints a fresh view the
+setter never saw, which is what the red test pins.
+
+### Phase 4 — triple-click by logical line
+
+`line_at` walks the fold the way `word_at` does: rewind while the row above
+wraps, run forward while this one does, end at the last non-blank of the row
+that ends the run. Drag extension goes through `line_at`, so dragging by whole
+logical lines falls out of it.
+
+This surfaced a real bug in phase 2's `content_len`: it treated *every* trailing
+blank on a wrapped row as padding, so a fold landing exactly on a printed space
+ate it — `fox jumps` pasted as `foxjumps`. Only one case is genuinely layout:
+the gap a too-wide glyph left when it moved down whole, which is one cell short
+of that glyph's width. `content_len` now takes the continuation row and trims
+only that much; `selection_text` uses it rather than blanket-trimming.
+
+Tests: triple-click from either row of a wrapped pair selects the whole logical
+line; a hard newline still bounds it; a drag anchored on a continuation row
+grows from the whole line, not the row; and the fold-space copy, pinned on
+`selection_text` directly.
 
 ## Roadmap (not in these phases)
 
