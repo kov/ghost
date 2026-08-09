@@ -330,7 +330,7 @@ impl UiConfig {
                     fg: s.fg,
                     bg: s.bg,
                     palette: s.palette,
-                    ..Theme::default() // keep the default selection tint
+                    ..Theme::default()
                 },
                 None => {
                     eprintln!("ghost-ui: unknown color scheme {id:?}, using the default");
@@ -495,7 +495,6 @@ mod tests {
         assert_eq!(t.bg, [0x00, 0x2b, 0x36]);
         assert_eq!(t.fg, [0x83, 0x94, 0x96]);
         assert_eq!(t.palette[1], [0xdc, 0x32, 0x2f]); // solarized red
-        assert_eq!(t.selection, Theme::default().selection); // unchanged
     }
 
     #[test]

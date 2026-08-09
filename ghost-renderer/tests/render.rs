@@ -321,21 +321,94 @@ fn highlights_a_selection_band() {
     let path = write_png("ghost_selection_sample.png", &img);
     eprintln!("WROTE PNG: {}", path.display());
 
-    // The selection tint is bluish and well above the near-neutral background;
-    // glyphs drawn on top read as light gray (blue ~= red), so this predicate
-    // catches the tint fill but not the glyphs or the bg.
-    let tinted = |p: [u8; 4]| p[2] > 45 && i32::from(p[2]) > i32::from(p[0]) + 8;
+    // Selection is the theme inverted: an opaque fill in the theme foreground,
+    // with the glyphs restated in the theme background. `light` catches the
+    // fill but not the (dark) glyph strokes or the (dark) page background.
 
-    // Selected cells 0..=4 (x 0..45) are mostly filled with the tint.
-    let (hits, total) = band(&img, 0, 45, tinted);
+    // Selected cells 0..=4 (x 0..45) are mostly filled with the foreground.
+    let (hits, total) = band(&img, 0, 45, light);
     assert!(
         hits * 2 > total,
-        "selected band should be mostly tinted ({hits}/{total})"
+        "selected band should be mostly filled ({hits}/{total})"
     );
 
-    // "world" (cols 6..=10, x 54..99) is outside the selection — no tint.
-    let (bleed, _) = band(&img, 54, 99, tinted);
-    assert_eq!(bleed, 0, "selection tint bled past its range ({bleed})");
+    // Glyphs survive inside the fill, drawn dark: the band is not a blank slab.
+    let (strokes, _) = band(&img, 0, 45, |p| p[0] < 80 && p[1] < 80 && p[2] < 80);
+    assert!(strokes > 15, "selected glyphs should read dark ({strokes})");
+
+    // "world" (cols 6..=10, x 54..99) is outside the selection — unfilled. Its
+    // glyphs are light, so require *most* of the band to be dark page instead.
+    let (bleed, bleed_total) = band(&img, 54, 99, light);
+    assert!(
+        bleed * 2 < bleed_total,
+        "selection fill bled past its range ({bleed}/{bleed_total})"
+    );
+}
+
+#[test]
+fn selection_overrides_the_cells_own_colors() {
+    // The reason selection inverts the theme rather than tinting: a cell that
+    // already paints its own fg and bg (here red on blue) used to show through
+    // a translucent tint, leaving the highlight invisible. Selected, the cell
+    // must read as the theme's inverse and nothing of its own colors survives.
+    let mut vt = Vt::new(40, 1);
+    vt.feed_str("\x1b[?25l\x1b[31;44mhello\x1b[0m world");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    let mut renderer = Renderer::headless(Theme::default());
+    renderer.set_selection(Some(Selection::new((0, 0), (0, 4))));
+    let img = renderer.render_offscreen(&frame, font, 15.0);
+    let path = write_png("ghost_selection_over_colors.png", &img);
+    eprintln!("WROTE PNG: {}", path.display());
+
+    // Cells 0..=4 (x 0..45) are the theme foreground, not the cell's blue bg.
+    let (filled, total) = band(&img, 0, 45, light);
+    assert!(
+        filled * 2 > total,
+        "selected colored cells should be filled with the theme fg ({filled}/{total})"
+    );
+    let (blue, _) = band(&img, 0, 45, strong_blue);
+    assert_eq!(blue, 0, "the cell's own background survived the selection");
+    let (red, _) = band(&img, 0, 45, strong_red);
+    assert_eq!(red, 0, "the cell's own foreground survived the selection");
+
+    // Unselected, the same styling is untouched: "world" keeps the page bg and
+    // the run's red-on-blue is gone only because the SGR was reset before it.
+    let (outside, outside_total) = band(&img, 54, 99, light);
+    assert!(
+        outside * 2 < outside_total,
+        "unselected cells should not be filled ({outside}/{outside_total})"
+    );
+}
+
+#[test]
+fn block_cursor_stays_visible_inside_a_selection() {
+    // Selecting the line you just typed is the common case, so the cursor lands
+    // inside the selection. An opaque highlight would swallow a block cursor
+    // painted in the foreground — it has to invert against the highlight too.
+    let mut vt = Vt::new(10, 1);
+    vt.feed_str("hi");
+    let frame = layout_frame(&vt, METRICS);
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+    let mut renderer = Renderer::headless(Theme::default());
+    renderer.set_selection(Some(Selection::new((0, 0), (0, 2))));
+    let img = renderer.render_offscreen(&frame, font, 15.0);
+
+    // The cursor cell (col 2, x 18..27) is a dark block against the highlight.
+    let (dark, total) = band(&img, 18, 27, |p| p[0] < 80 && p[1] < 80 && p[2] < 80);
+    assert!(
+        dark * 2 > total,
+        "cursor block should invert against the selection ({dark}/{total})"
+    );
+
+    // Its neighbours are still highlighted, so the block reads as a hole in it.
+    let (filled, filled_total) = band(&img, 0, 18, light);
+    assert!(
+        filled * 2 > filled_total,
+        "selection around the cursor should stay filled ({filled}/{filled_total})"
+    );
 }
 
 #[test]

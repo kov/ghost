@@ -450,8 +450,6 @@ pub fn render_solid(width: u32, height: u32, color: [f64; 4]) -> Rendered {
 pub struct Theme {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
-    /// Selection highlight tint, drawn translucently over cell backgrounds.
-    pub selection: [u8; 3],
     /// The 16 base ANSI colors (indices 0..=15). Color schemes replace these;
     /// the 256-color cube and grayscale ramp (16..=255) stay standard.
     pub palette: [[u8; 3]; 16],
@@ -479,7 +477,6 @@ impl Default for Theme {
         Theme {
             fg: [0xd8, 0xdb, 0xe0],
             bg: [0x10, 0x10, 0x12],
-            selection: [0x3a, 0x53, 0x7a],
             palette: ghost_term::ANSI_16,
             bg_alpha: 1.0,
             frost: 0.0,
@@ -496,8 +493,19 @@ impl Theme {
     }
 }
 
-/// Alpha of the selection tint — translucent so text stays readable beneath it.
-const SELECTION_ALPHA: f32 = 0.45;
+/// Selection is drawn as the theme inverted: an opaque fill in the theme's
+/// foreground with the text restated in its background. A translucent tint
+/// disappears over cells that paint their own colors — a TUI's backgrounds, a
+/// colorized listing — and can leave text the same hue as the highlight. The
+/// inverse is legible whatever the content, and because it comes from the
+/// *theme* rather than each cell (VTE's per-cell reverse video) the selection
+/// reads as one block instead of a stripe of the screen's own colors.
+///
+/// Applies to the theme in force for the frame, so an app's OSC 10/11 override
+/// carries into its selection.
+fn selection_colors(theme: Theme) -> (/* fill */ [f32; 4], /* text */ [f32; 4]) {
+    (to_rgba(theme.fg), to_rgba(theme.bg))
+}
 
 /// Bold brightens the 8 base ANSI colors to their bright variants (xterm-ish).
 fn maybe_brighten(c: Option<Color>, bold: bool) -> Option<Color> {
@@ -3891,19 +3899,17 @@ impl Renderer {
 
         let mut backgrounds: Vec<Instance> = Vec::new();
         let mut selection_rects: Vec<Instance> = Vec::new();
+        // Cursor blocks on selected cells, drawn after the highlight that would
+        // otherwise paint over them — see the block-cursor branch below.
+        let mut cursor_over_selection: Vec<Instance> = Vec::new();
         let mut glyphs: Vec<Instance> = Vec::new();
 
-        // Selection highlight: one translucent rect per selected row, computed
+        let (sel_fill, sel_text) = selection_colors(theme);
+        // Selection highlight: one opaque rect per selected row, computed
         // straight from cell geometry (trimmed trailing blanks carry no run, so
         // it can't be derived from runs). Drawn over backgrounds, under glyphs.
         if let Some(sel) = selection {
-            let [r, g, b] = self.theme.selection;
-            let color = [
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-                SELECTION_ALPHA,
-            ];
+            let color = sel_fill;
             for row in rows.clone() {
                 if let Some((c0, c1)) = sel.row_span(row, frame.cols) {
                     selection_rects.push(Instance {
@@ -3926,6 +3932,11 @@ impl Renderer {
             let layout = &frame.rows_layout[row];
             let row_y = row as f32 * metrics.line_height + dy;
             let baseline_y = row_y + baseline;
+            // The highlight covers this row's cells [c0, c1); everything drawn
+            // over it — glyphs, rules, the cursor — flips to the theme's
+            // background so it stays legible against the fill.
+            let sel_span = selection.and_then(|s| s.row_span(row, frame.cols));
+            let selected = |col: usize| sel_span.is_some_and(|(c0, c1)| col >= c0 && col < c1);
             for run in &layout.runs {
                 let cursor_here = cursor.filter(|c| c.row == row && c.col == run.start_col);
                 let (fg, bg_opt) = run_colors(&run.style, theme, frame.palette.as_deref());
@@ -3940,22 +3951,41 @@ impl Renderer {
                 // An app-set cursor color (OSC 12) replaces the fill instead.
                 // Underline and bar cursors leave the glyph in its normal colour
                 // and instead get a thin rule drawn after the glyphs (below).
+                // On a selected cell the highlight has already claimed the
+                // colours, so the cursor reverses *it* instead: a block in the
+                // theme background under a glyph in its foreground. It also has
+                // to be painted after the highlight, or the fill covers it.
                 let block_cursor = matches!(cursor_here.map(|c| c.shape), Some(CursorShape::Block));
-                let (block, glyph_color) = if block_cursor {
-                    (
+                let cursor_selected = block_cursor && selected(run.start_col);
+                let (block, glyph_color) = match (block_cursor, cursor_selected) {
+                    (true, true) => (Some(cursor_rgba.unwrap_or(sel_text)), sel_fill),
+                    (true, false) => (
                         Some(cursor_rgba.unwrap_or(fg)),
                         bg_opt.unwrap_or(to_rgba(theme.bg)),
-                    )
-                } else {
-                    (bg_opt, fg)
+                    ),
+                    _ => (bg_opt, fg),
                 };
                 if let Some(color) = block {
-                    backgrounds.push(Instance {
+                    let inst = Instance {
                         rect: [x, row_y, w, metrics.line_height],
                         uv: OPAQUE_UV,
                         color,
-                    });
+                    };
+                    if cursor_selected {
+                        cursor_over_selection.push(inst);
+                    } else {
+                        backgrounds.push(inst);
+                    }
                 }
+                // Colour for text at `col`: the selection's, unless the cursor
+                // already reversed this cell (its pair is computed above).
+                let color_at = |col: usize| {
+                    if block_cursor || !selected(col) {
+                        glyph_color
+                    } else {
+                        sel_text
+                    }
+                };
 
                 // Place each shaped glyph at its cluster's CELL origin, not by
                 // accumulating font advance — a terminal is a fixed grid, so a
@@ -3979,6 +4009,9 @@ impl Renderer {
                     );
                     let span = span_cols(&run.text, &col_of_byte, g.cluster, run.width_cols as u16);
                     let cell_box = (span as f32 * metrics.advance, metrics.line_height);
+                    // A ligature straddling the selection edge takes the colour
+                    // of the cell it starts in — one glyph, one colour.
+                    let glyph_color = color_at(run.start_col + cell);
                     if let Some(slot) = self.ensure_glyph(gface, gid, size_px, gsynth, cell_box) {
                         glyphs.push(Instance {
                             rect: [
@@ -4004,24 +4037,45 @@ impl Renderer {
                 // the cell background. Thickness scales with the (physical) cell.
                 if run.style.underline || run.style.strikethrough {
                     let thickness = (metrics.line_height / 14.0).max(1.0);
-                    let line = |y: f32| {
-                        solid(
-                            RectPx {
-                                x,
-                                y,
-                                w,
-                                h: thickness,
-                            },
-                            glyph_color,
-                        )
+                    // A rule crossing the selection edge is cut there, so each
+                    // piece carries the colour of the text it belongs to.
+                    let end = run.start_col + run.width_cols;
+                    let blank = (0, 0, glyph_color);
+                    let mut segs = [(run.start_col, end, glyph_color), blank, blank];
+                    let mut n = 1;
+                    if let Some((c0, c1)) = sel_span.filter(|_| !block_cursor) {
+                        let (a, b) = (c0.max(run.start_col), c1.min(end));
+                        if a < b {
+                            segs = [(a, b, sel_text), blank, blank];
+                            n = 1;
+                            for tail in [(run.start_col, a), (b, end)] {
+                                if tail.0 < tail.1 {
+                                    segs[n] = (tail.0, tail.1, glyph_color);
+                                    n += 1;
+                                }
+                            }
+                        }
+                    }
+                    let mut rules = |y: f32| {
+                        for &(from, to, color) in &segs[..n] {
+                            glyphs.push(solid(
+                                RectPx {
+                                    x: from as f32 * metrics.advance,
+                                    y,
+                                    w: (to - from) as f32 * metrics.advance,
+                                    h: thickness,
+                                },
+                                color,
+                            ));
+                        }
                     };
                     if run.style.underline {
                         let y =
                             (baseline_y + thickness).min(row_y + metrics.line_height - thickness);
-                        glyphs.push(line(y));
+                        rules(y);
                     }
                     if run.style.strikethrough {
-                        glyphs.push(line(row_y + metrics.line_height * 0.5 - thickness * 0.5));
+                        rules(row_y + metrics.line_height * 0.5 - thickness * 0.5);
                     }
                 }
 
@@ -4029,7 +4083,14 @@ impl Renderer {
                 // (the app-set OSC 12 color when there is one) over the
                 // unmodified glyph (the block path above handles its own fill).
                 // Underline = a thick rule along the cell bottom; bar = a thin
-                // rule down the cell's leading edge.
+                // rule down the cell's leading edge. On a selected cell the
+                // foreground is the highlight's own fill, so the rule takes the
+                // selection's text colour to stay visible.
+                let caret = cursor_rgba.unwrap_or(if selected(run.start_col) {
+                    sel_text
+                } else {
+                    fg
+                });
                 match cursor_here.map(|c| c.shape) {
                     Some(CursorShape::Underline) => {
                         let thickness = (metrics.line_height / 8.0).max(2.0);
@@ -4040,7 +4101,7 @@ impl Renderer {
                                 w,
                                 h: thickness,
                             },
-                            cursor_rgba.unwrap_or(fg),
+                            caret,
                         ));
                     }
                     Some(CursorShape::Bar) => {
@@ -4052,7 +4113,7 @@ impl Renderer {
                                 w: width,
                                 h: metrics.line_height,
                             },
-                            cursor_rgba.unwrap_or(fg),
+                            caret,
                         ));
                     }
                     _ => {}
@@ -4060,7 +4121,8 @@ impl Renderer {
             }
         }
 
-        backgrounds.extend(selection_rects); // tint over cell backgrounds
+        backgrounds.extend(selection_rects); // highlight over cell backgrounds
+        backgrounds.extend(cursor_over_selection); // and the cursor over that
         backgrounds.extend(glyphs); // glyphs stay crisp on top
         backgrounds
     }
