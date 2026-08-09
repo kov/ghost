@@ -214,6 +214,81 @@ fn app_set_bg_is_exact_on_translucent_themes_across_render_paths() {
 }
 
 #[test]
+fn a_band_update_erases_every_pixel_it_may_draw_into() {
+    // A row whose bottom edge falls mid-pixel used to keep the last scanline of
+    // whatever it said before: the erase quad covers the pixels whose centres
+    // lie in the band, while the scissor rounds outwards, so the half-covered
+    // row was erased by neither yet still drawn into. Shrinking such a line left
+    // the tail of the old text behind one scanline tall — the detritus under a
+    // status line that rewrites itself in place.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    // Fractional, as a scaled display's metrics are, so the boundary between the
+    // two rows lands in the middle of a pixel rather than between two.
+    let metrics = CellMetrics {
+        advance: 9.0,
+        line_height: 18.5,
+    };
+    let mut vt = Vt::new(20, 2);
+    vt.feed_str("\x1b[?25lgypqjgypqjgypqj");
+
+    let scene_of = |vt: &Vt, damage: TermDamage| {
+        let mut scene = Scene::new((180, 37));
+        scene.layers.push(Layer::new(
+            0,
+            vec![SceneItem::Terminal {
+                id: SceneId::Root,
+                session: session_key("s"),
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 180.0,
+                    h: 37.0,
+                },
+                frame: std::rc::Rc::new(layout_frame(vt, metrics)),
+                selection: None,
+                dim: false,
+                damage,
+            }],
+        ));
+        scene
+    };
+
+    // Full raster of the long line, then rewrite the row short and band-update.
+    let mut r = Renderer::headless(Theme::default());
+    let _ = r.present_offscreen(&scene_of(&vt, TermDamage::All), font, 15.0);
+    vt.feed_str("\x1b[1;1H\x1b[2Khi");
+    let banded = r.present_offscreen(
+        &scene_of(&vt, TermDamage::Rows { lo: 0, hi: 0 }),
+        font,
+        15.0,
+    );
+    assert_eq!(r.surface_band_updates(), 1, "band path not exercised");
+
+    // A fresh full raster of the short line is the reference: nothing of the
+    // long line may survive anywhere, overhang included.
+    let mut fresh = Renderer::headless(Theme::default());
+    let full = fresh.present_offscreen(&scene_of(&vt, TermDamage::All), font, 15.0);
+    assert_no_stale_pixels(&banded, &full);
+}
+
+/// Assert two rasters of the same content are identical, naming where they part
+/// company — a bare slice comparison prints the whole buffer and says nothing.
+fn assert_no_stale_pixels(got: &Rendered, want: &Rendered) {
+    let diffs: Vec<_> = (0..got.height)
+        .flat_map(|y| (0..got.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| px(got, x, y) != px(want, x, y))
+        .collect();
+    assert!(
+        diffs.is_empty(),
+        "{} pixels left over from the previous frame, first at {:?}: {:?} vs {:?}",
+        diffs.len(),
+        &diffs[..diffs.len().min(8)],
+        px(got, diffs[0].0, diffs[0].1),
+        px(want, diffs[0].0, diffs[0].1),
+    );
+}
+
+#[test]
 fn banded_updates_match_the_full_raster_on_translucent_themes() {
     // A band update erases with a replace quad; its color must come out equal
     // to the pass clear (straight-alpha instance color, premultiplied once by

@@ -3266,7 +3266,7 @@ impl Renderer {
         // Build the ±1-expanded rows so an adjacent row's glyph spilling INTO the band
         // is drawn (then clipped to the band by the scissor) — exactly as the steady
         // damaged redraw expands its build. Selection is part of the session, so a band
-        // that intersects it repaints the tint.
+        // that intersects it repaints the highlight.
         let last = frame.rows_layout.len().saturating_sub(1);
         let (build_lo, build_hi) = (lo.saturating_sub(1), (hi + 1).min(last));
         let insts = self.build_instances(frame, font, size_px, selection, build_lo..build_hi + 1);
@@ -3275,8 +3275,19 @@ impl Renderer {
         self.band_instances = insts.len() as u32;
 
         // The bg-replace quad (replace-blend, so it overwrites at any alpha) and the band
-        // glyphs/selection (alpha-blend over it).
-        let erase = [solid(band, self.bg_fill_color(frame))];
+        // glyphs/selection (alpha-blend over it). It is cut to the scissor's whole
+        // pixels rather than to `band`: the scissor rounds outwards, so a fractional
+        // band would leave the pixel row it half-covers inside the scissor but outside
+        // the quad — erased by neither, and free to keep the old frame's ink.
+        let erase = [solid(
+            RectPx {
+                x: scissor[0] as f32,
+                y: scissor[1] as f32,
+                w: scissor[2] as f32,
+                h: scissor[3] as f32,
+            },
+            self.bg_fill_color(frame),
+        )];
         let erase_buf = self
             .gpu
             .device
