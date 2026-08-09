@@ -2461,6 +2461,18 @@ impl RootModel {
         }
     }
 
+    /// The cell the connect overlay is laid out on: the base cell taken up a
+    /// size ([`CONNECT_SCALE`]) *and* out to the device's pixels. The scene
+    /// rasterizes the overlay's text at the screen's scale like everything else,
+    /// so measuring it against the base cell would put full-size glyphs in
+    /// half-size boxes on a HiDPI screen.
+    fn connect_metrics(&self) -> CellMetrics {
+        CellMetrics {
+            advance: self.metrics.advance * CONNECT_SCALE * self.scale,
+            line_height: self.metrics.line_height * CONNECT_SCALE * self.scale,
+        }
+    }
+
     /// The physical-pixel rect of the connect error line — the exact geometry
     /// [`connect_scene`](Self::connect_scene) draws it at (both scale by
     /// [`CONNECT_SCALE`] and share these formulas), so click-to-copy lands on the
@@ -2471,8 +2483,10 @@ impl RootModel {
         let ConnectPhase::Error { message } = &prompt.phase else {
             return None;
         };
-        let advance = self.metrics.advance * CONNECT_SCALE;
-        let line_height = self.metrics.line_height * CONNECT_SCALE;
+        let CellMetrics {
+            advance,
+            line_height,
+        } = self.connect_metrics();
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
         let tw = (message.chars().count() as f32 * advance).max(1.0);
         let ty = ((h - line_height * 6.0) * 0.5).max(0.0);
@@ -2499,12 +2513,13 @@ impl RootModel {
         const FIELD_BG: Rgba = [0.12, 0.13, 0.16, 1.0];
         const BORDER: Rgba = [0.30, 0.60, 0.95, 1.0];
         const SCALE: f32 = CONNECT_SCALE;
+        /// The field's corner, in **logical** px — taken out to the overlay's
+        /// own scale below, like every other length here.
+        const FIELD_RADIUS: f32 = 5.0;
 
         let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
-        let m = CellMetrics {
-            advance: self.metrics.advance * SCALE,
-            line_height: self.metrics.line_height * SCALE,
-        };
+        let m = self.connect_metrics();
+        let field_radius = FIELD_RADIUS * SCALE * self.scale;
         let text_w = |s: &str| s.chars().count() as f32 * m.advance;
         let center_x = |tw: f32| ((w - tw) * 0.5).max(0.0);
         let run = |s: &str| Run {
@@ -2591,7 +2606,7 @@ impl RootModel {
                     id: SceneId::NavBar,
                     rect,
                     color: FIELD_BG,
-                    radius: 5.0,
+                    radius: field_radius,
                 });
                 items.push(SceneItem::Border {
                     id: SceneId::NavBar,
@@ -5027,6 +5042,41 @@ mod tests {
         assert!(
             !scene_has(&r, "\u{2588}"),
             "the caret is a block overlay rect, not a glyph spliced into the text"
+        );
+    }
+
+    #[test]
+    fn the_connect_overlay_is_drawn_at_the_screens_scale() {
+        // Everything in the overlay is placed from `self.metrics`, which is the
+        // *base* (1x) cell — while its text is rasterized at the scene's own
+        // scale, which is the device's. On a HiDPI screen that draws full-size
+        // glyphs into half-size boxes. The whole dialog must grow with the
+        // screen: same window, twice the pixels, twice the scale.
+        let field = |k: u32, scale: f32| {
+            let (mut r, _) = fleet(METRICS, (SIZE.0 * k, SIZE.1 * k), scale);
+            r.begin_connect();
+            typed(&mut r, "kov@box");
+            r.view().layers[0]
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    SceneItem::Rect { rect, radius, .. } if *radius > 0.0 => {
+                        Some((rect.w, rect.h, *radius))
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("the host field's panel")
+        };
+        let (w1, h1, r1) = field(1, 1.0);
+        let (w2, h2, r2) = field(2, 2.0);
+        assert!(
+            (w2 - w1 * 2.0).abs() < 0.5 && (h2 - h1 * 2.0).abs() < 0.5,
+            "the field is twice the size on twice the pixels: {w1}x{h1} -> {w2}x{h2}"
+        );
+        assert!(
+            (r2 / h2 - r1 / h1).abs() < 0.001,
+            "and its corner is as round relative to it ({r1} on {h1}, {r2} on {h2})"
         );
     }
 

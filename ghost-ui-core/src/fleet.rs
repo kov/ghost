@@ -34,6 +34,12 @@ use crate::text_input::TextInput;
 use crate::{Cmd, PointPx, PointerPhase, SessionId, Sessions, UiEvent, WheelDelta};
 
 const GAP: f32 = 10.0;
+/// Corner radii, in **logical** px — the fleet lays out in physical ones, so
+/// these are scaled by the device factor where they are used. A card's panel is
+/// rounded a little more than the chips on it, which are small enough that more
+/// would read as a lozenge.
+const CARD_RADIUS: f32 = 5.0;
+const CHIP_RADIUS: f32 = 3.0;
 const FOCUS_BORDER: f32 = 2.0;
 const FOCUS_COLOR: Rgba = [0.30, 0.60, 0.95, 1.0];
 /// Multi-select mark ring (Space / Ctrl-click): amber, distinct from focus.
@@ -3765,6 +3771,9 @@ impl FleetModel {
     pub fn view(&self, sessions: &Sessions) -> Scene {
         let (headers, placements, band, _content_h) = self.sections_layout();
         let metrics = self.effective_metrics();
+        // Physical px, like everything else the layout measures in.
+        let card_radius = CARD_RADIUS * self.scale;
+        let chip_radius = CHIP_RADIUS * self.scale;
         let view_h = self.size_px.1 as f32;
         let sy = self.scroll_y;
         let mut items = Vec::new();
@@ -3797,7 +3806,7 @@ impl FleetModel {
                         id,
                         rect: chip,
                         color: BUTTON_BG,
-                        radius: 3.0,
+                        radius: chip_radius,
                     });
                     items.push(SceneItem::Text {
                         id,
@@ -3868,7 +3877,7 @@ impl FleetModel {
                             id,
                             rect: chip,
                             color: BUTTON_BG,
-                            radius: 3.0,
+                            radius: chip_radius,
                         });
                         items.push(SceneItem::Text {
                             id,
@@ -3933,7 +3942,7 @@ impl FleetModel {
                 id: SceneId::Tile(handle),
                 rect,
                 color: CARD_BG,
-                radius: 5.0,
+                radius: card_radius,
             });
 
             // Metadata header — or the live buffer of an in-progress rename.
@@ -4024,7 +4033,7 @@ impl FleetModel {
                     id: SceneId::Label(handle),
                     rect: preview,
                     color: PLACEHOLDER_BG,
-                    radius: 3.0,
+                    radius: chip_radius,
                 });
                 let waiting = tile
                     .awaiting_host
@@ -4065,7 +4074,7 @@ impl FleetModel {
                         id: SceneId::Tile(handle),
                         rect: chip,
                         color: BUTTON_BG,
-                        radius: 3.0,
+                        radius: chip_radius,
                     });
                     out.push(SceneItem::Text {
                         id: SceneId::Label(handle),
@@ -4087,7 +4096,7 @@ impl FleetModel {
                         id: SceneId::Tile(handle),
                         rect: chip,
                         color: BUTTON_BG,
-                        radius: 3.0,
+                        radius: chip_radius,
                     });
                     out.push(SceneItem::Text {
                         id: SceneId::Label(handle),
@@ -4188,7 +4197,9 @@ impl FleetModel {
                     id: SceneId::NavBar,
                     rect,
                     color: bg,
-                    radius: 5.0,
+                    // The modal is drawn a size up, buttons included, so its
+                    // corners take the same step: a radius belongs to the box.
+                    radius: card_radius * MODAL_SCALE,
                 });
                 if p.selected == choice {
                     items.push(SceneItem::Border {
@@ -8391,6 +8402,45 @@ mod tests {
         assert!(
             (headers[0].1.y - GAP).abs() < 1.0,
             "an overflowing grid starts at the top"
+        );
+    }
+
+    #[test]
+    fn a_cards_corners_are_as_round_on_a_hidpi_screen() {
+        // The fleet lays out in *physical* pixels — the cell metrics it measures
+        // everything against are the device-scaled ones — so a bare number in a
+        // radius is a physical number, and the same card comes out half as round
+        // on a 2x display. A HiDPI screen of the same size is twice the pixels at
+        // twice the scale, and the card grows with them; its corner must too.
+        let card = |k: u32, scale: f64| {
+            let mut m = fleet();
+            m.update(UiEvent::Resize {
+                w_px: WIDE.0 * k,
+                h_px: WIDE.1 * k,
+                scale,
+            });
+            list(&mut m, &["a"]);
+            m.view().layers[0]
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    SceneItem::Rect {
+                        id: SceneId::Tile(_),
+                        rect,
+                        radius,
+                        ..
+                    } => Some((rect.h, *radius)),
+                    _ => None,
+                })
+                .expect("the card's panel")
+        };
+        let (h1, r1) = card(1, 1.0);
+        let (h2, r2) = card(2, 2.0);
+        assert!(h2 > h1 * 1.5, "the card itself grew with the screen");
+        assert!(
+            (r2 / h2 - r1 / h1).abs() < 0.001,
+            "the corner is as round relative to its card at 2x ({r2} on {h2}) \
+             as at 1x ({r1} on {h1})"
         );
     }
 
