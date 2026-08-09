@@ -32,8 +32,10 @@ license = "MIT OR Apache-2.0"
 inherits = "release"
 debug = true
 
-# Vendored winit 0.30.13 carrying four local patches, each to be reported
-# upstream and then dropped:
+# Vendored winit 0.30.13 carrying seven local patches, each to be reported
+# upstream and then dropped. Every addition is marked `[vendored addition]` in
+# vendor/winit/src/platform/wayland.rs, which is the list to check this one
+# against — it has fallen behind before:
 # - `is_stateless()` recognises partially-tiled / snapped windows so the window
 #   restores to its pre-snap size on Wayland/GNOME — see
 #   vendor/winit/.../linux/wayland/window/state.rs (winit + smithay-client-toolkit).
@@ -52,6 +54,19 @@ debug = true
 #   three where it is tiled, exactly as when maximized (which a snapped window
 #   is not). Added `WindowExtWayland::is_tiled` — see
 #   vendor/winit/.../wayland/window/mod.rs.
+# - With `decorations(false)` the surface IS the window, so there is nowhere
+#   outside it to cast a shadow. `set_decoration_margins` grows the surface and
+#   points `xdg_surface.set_window_geometry` at the inner rect, so the
+#   compositor still snaps/maximizes/tiles to the window while we paint the ring
+#   around it — GTK's model (`_GTK_FRAME_EXTENTS`). This is what lets ghost's own
+#   frame cast a shadow at all.
+# - `set_present_size` states the size a buffer is about to be committed at, so
+#   the blur region reaches the compositor with the frame it describes rather
+#   than a configure ahead of it — see [present-time window state].
+# - xdg-session-management: `with_session_toplevel` names a window in the
+#   compositor's session so it reopens where it was, `open_session` /
+#   `session_restored` drive and report the restore. Not a fix but a protocol
+#   winit does not speak yet.
 #
 # Vendored wgpu-core 29.0.3 carrying one local patch, to be reported upstream
 # and then dropped:

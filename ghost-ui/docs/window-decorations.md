@@ -265,13 +265,19 @@ Verified in the vendored winit (0.30.13):
   now the buttons' hover circle) is drawn square. Fixing it means a per-instance
   radius and a rounded-box SDF in the glyph shader, which is the hottest one we
   have; worth its own change with its own before/after, not a rider on this one.
-- **P4 — shadow, and the deletion.** Vendored winit gains decoration margins:
-  inflate the surface, set `xdg_surface.set_window_geometry` to the content
-  rect, offset pointer coordinates, set the input region to content + resize
-  handles. That is the GTK model (see `_GTK_FRAME_EXTENTS` above) and it buys
-  back the libadwaita-fitted shadow, drawn by us into the margin and dropped
-  when maximized or tiled. `EDGE_SHADOW_STEPS`, `corner_shadow` and the notch
-  apparatus then go.
+- **P4 — shadow, and the deletion.** The shadow half is **done**: vendored winit
+  grew `set_decoration_margins`, which inflates the surface and points
+  `xdg_surface.set_window_geometry` at the content rect — the GTK model (see
+  `_GTK_FRAME_EXTENTS` above) — so the compositor still snaps and tiles to the
+  window while we paint the libadwaita-fitted shadow into the margin, dropped
+  when maximized or tiled.
+
+  The deletion half is **not**. `EDGE_SHADOW_STEPS`, `corner_shadow` and the
+  notch apparatus were to go with it, and they are all still here — now serving
+  only the `!own_frame` case, i.e. X11, where the notch they patch is a notch in
+  a window the WM framed rather than one we did. Whether that is worth keeping
+  or is just untested residue is the open question; it is the last thing
+  outstanding in this plan.
 - **P5 — retire the frame.** Done ahead of P4, in two steps. The default
   flipped and the flag went, and with it `ghost-ui/src/title.rs` — nothing fills
   the title-renderer hook once the frame it patched is never built. Then the
