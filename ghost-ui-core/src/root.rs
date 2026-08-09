@@ -474,6 +474,10 @@ pub struct RootModel {
     /// the window edges. Applied to the foreground/warm models and folded into
     /// [`Self::grid`] so the attach handshake matches. 0 = flush (the historic look).
     pad: f32,
+    /// Extra characters counting as part of a word for double-click selection, on
+    /// top of the alphanumerics (`[input] word_chars`). Stamped onto the foreground
+    /// and warm views like [`Self::pad`]; see `docs/selection-design.md`.
+    word_chars: String,
     /// When set, this window is showing the "connect to a host" prompt (a new
     /// ssh window before its first session): it swallows the keyboard into the
     /// entry and renders the prompt overlay instead of the live view.
@@ -594,9 +598,13 @@ fn resize_model(
     size_px: (u32, u32),
     scale: f32,
     pad: f32,
+    word_chars: &str,
     driving: bool,
 ) -> Vec<Cmd> {
     view.set_padding(pad);
+    // Like the padding: stamped here so a view created mid-life (a warm mirror, a
+    // freshly opened session) picks the configured set up before it is ever used.
+    view.set_word_chars(word_chars);
     // Straight to `resize` (bypassing `update`'s trivial Resize delegation) so real
     // drivership rides through: only the window that owns the session re-grids it.
     view.resize(state, size_px.0.max(1), size_px.1.max(1), scale, driving)
@@ -785,6 +793,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
+            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
             connect: None,
             // Set by the first `view`, before the shell ever presents; no
             // `mark_presented` runs until then.
@@ -829,6 +838,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
+            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
             connect: None,
             foreground_painted: Cell::new(false),
         }
@@ -858,6 +868,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
+            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
             connect: None,
             foreground_painted: Cell::new(false),
         };
@@ -1338,6 +1349,26 @@ impl RootModel {
         }
     }
 
+    /// Set the extra word characters for double-click selection, propagating them
+    /// to the live foreground and every warm mirror. Like the padding, this is
+    /// per-view, not session state, so a Ctrl-Tab switch keeps the setting.
+    pub fn set_word_chars(&mut self, extra: &str) {
+        self.word_chars.clear();
+        self.word_chars.push_str(extra);
+        if let Mode::Single { view, .. } = &mut self.mode {
+            view.set_word_chars(extra);
+        }
+        for view in self.warm.values_mut() {
+            view.set_word_chars(extra);
+        }
+    }
+
+    /// The extra word characters last handed to [`set_word_chars`](Self::set_word_chars).
+    /// Lets the shell (and tests) read back a config hot-reload.
+    pub fn word_chars(&self) -> &str {
+        &self.word_chars
+    }
+
     /// The current inner padding (logical px per side) — the value last handed to
     /// [`set_padding`](Self::set_padding). Lets the shell (and tests) read back a
     /// config hot-reload.
@@ -1620,13 +1651,22 @@ impl RootModel {
             // Resize the foreground and every warm background mirror, so a
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
+            let word_chars = self.word_chars.clone();
             let mut cmds = match &mut self.mode {
                 Mode::Single { id, view } => {
                     let driving = self.mine.contains(id);
                     let state = sessions
                         .get_mut(id)
                         .expect("foreground session state present");
-                    resize_model(view, state, self.size_px, self.scale, self.pad, driving)
+                    resize_model(
+                        view,
+                        state,
+                        self.size_px,
+                        self.scale,
+                        self.pad,
+                        &word_chars,
+                        driving,
+                    )
                 }
                 Mode::Fleet(f) => {
                     return f.update(sessions, &self.mine, UiEvent::Resize { w_px, h_px, scale });
@@ -1641,6 +1681,7 @@ impl RootModel {
                         self.size_px,
                         self.scale,
                         self.pad,
+                        &word_chars,
                         driving,
                     ));
                 }
@@ -1948,6 +1989,7 @@ impl RootModel {
             self.size_px,
             self.scale,
             self.pad,
+            &self.word_chars,
             true,
         ));
         // The window title follows the foreground: reassert this session's remembered
@@ -2031,6 +2073,7 @@ impl RootModel {
                 self.size_px,
                 self.scale,
                 self.pad,
+                &self.word_chars,
                 driving,
             );
             // The window title follows the new foreground, not the exited session.

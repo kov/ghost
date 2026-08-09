@@ -114,7 +114,7 @@ dissolves the group, `Esc` leaves.
 The window reads a small, hand-edited TOML at `$XDG_CONFIG_HOME/ghost/ui.toml`
 (unknown keys are ignored, so a file survives version skew). It selects a color
 scheme, background opacity and frosting, initial grid size and padding, base font
-size + family, and the macOS Option-key behavior:
+size + family, double-click word characters, and the macOS Option-key behavior:
 
 ```toml
 [colors]
@@ -134,6 +134,7 @@ family = "Fira Code"
 
 [input]
 option_as_meta = true   # macOS: treat Option as Meta
+word_chars = "-#%&+,./=?@\\_~·"  # extra double-click word characters; default is VTE's
 
 [zoom]
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
@@ -154,7 +155,7 @@ mid-session (you switched the desktop effect off) hands the window back to frost
 and switching it on takes it away again.
 
 Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
-frost, and padding to every open window without a restart. Font and the initial
+frost, padding, and word characters to every open window without a restart. Font and the initial
 grid size (`columns`/`rows`) apply only to newly opened windows.
 
 ## The CLI

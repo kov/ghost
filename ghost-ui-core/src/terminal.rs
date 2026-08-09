@@ -279,6 +279,9 @@ pub struct TerminalView {
     /// hit-testing and the IME caret. The scene canvas stays the full window, so the
     /// border is filled by the terminal background. 0 = flush to the edges.
     pad: f32,
+    /// Extra characters that count as part of a word for double-click selection,
+    /// on top of the alphanumerics — see [`DEFAULT_WORD_CHARS`].
+    word_chars: String,
     /// Last 1-based `(col, row)` cell the pointer was over (`None` until moved).
     cursor_cell: Option<(u16, u16)>,
     /// Button currently held (drag vs hover).
@@ -1351,6 +1354,12 @@ impl TerminalModel {
         self.view.set_padding(pad_logical)
     }
 
+    /// Set the extra word characters for double-click selection (see
+    /// [`TerminalView::set_word_chars`]).
+    pub fn set_word_chars(&mut self, extra: &str) {
+        self.view.set_word_chars(extra)
+    }
+
     /// Physical-pixel rect of the text cursor (see
     /// [`TerminalView::ime_cursor_area`]).
     pub fn ime_cursor_area(&self) -> Option<RectPx> {
@@ -1387,6 +1396,7 @@ impl TerminalView {
             size_px,
             display_px: None,
             pad: 0.0,
+            word_chars: DEFAULT_WORD_CHARS.to_string(),
             cursor_cell: None,
             held: None,
             gesture_report: false,
@@ -1793,6 +1803,14 @@ impl TerminalView {
     /// afterwards; storing it here is enough for [`Self::view`] and hit-testing.
     pub(crate) fn set_padding(&mut self, pad_logical: f32) {
         self.pad = pad_logical.max(0.0);
+    }
+
+    /// Set the extra word characters used by double-click selection (see
+    /// [`DEFAULT_WORD_CHARS`]). Takes effect on the next press; a selection
+    /// already made is left alone.
+    pub(crate) fn set_word_chars(&mut self, extra: &str) {
+        self.word_chars.clear();
+        self.word_chars.push_str(extra);
     }
 
     /// Padding in physical px per side: the logical value scaled by the device factor
@@ -2843,7 +2861,7 @@ impl TerminalView {
         let word = |i: usize| {
             cells
                 .get(i)
-                .is_some_and(|c| is_word_char(c.char()) || c.width() == 0)
+                .is_some_and(|c| is_word_char(c.char(), &self.word_chars) || c.width() == 0)
         };
         if !word(col) {
             return None;
@@ -3150,10 +3168,18 @@ fn map_button(b: PointerButton) -> mouse::Button {
     }
 }
 
-/// Whether `c` is part of a word for double-click selection: alphanumerics and
-/// underscore (so identifiers select whole, stopping at spaces and punctuation).
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// Characters that count as part of a word for double-click selection *on top
+/// of* the Unicode alphanumerics, matching VTE's `word-char-exceptions` default
+/// — so identifiers (`foo_bar-baz`), paths, flags and hosts select whole.
+///
+/// Deliberately without `:`, as VTE has it: a URI is the content-aware layer's
+/// job, not this one (see docs/selection-design.md).
+pub const DEFAULT_WORD_CHARS: &str = "-#%&+,./=?@\\_~·";
+
+/// Whether `c` is part of a word for double-click selection, given the extra
+/// word characters configured on top of the alphanumerics.
+fn is_word_char(c: char, extra: &str) -> bool {
+    c.is_alphanumeric() || extra.contains(c)
 }
 
 // ---- pure protocol helpers (shared with the shell) ----
@@ -3924,6 +3950,69 @@ mod tests {
         m.update(press_n(55.0, 1.0, 2));
         // "bar_baz" spans cols 4..=10 (underscore is a word char).
         assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 10))));
+    }
+
+    #[test]
+    fn double_click_selects_through_dashes_dots_and_slashes() {
+        let mut m = model();
+        // The default word-character set is VTE's, so an identifier with both
+        // separators, and a path, each select whole rather than in fragments.
+        feed(&mut m, b"test_for_selection-none /usr/local/bin");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        assert_eq!(
+            m.selection(),
+            Some(Selection::new((0, 0), (0, 22))),
+            "the whole token, across '_' and '-'"
+        );
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 30.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 30.0 + 1.0, 1.0, 2));
+        assert_eq!(
+            m.selection(),
+            Some(Selection::new((0, 24), (0, 37))),
+            "the whole path, across '/'"
+        );
+    }
+
+    #[test]
+    fn the_drawn_scene_carries_the_whole_double_clicked_token() {
+        // What the user sees: the selection the renderer is handed spans the
+        // whole dashed token, not the fragment under the pointer.
+        let mut m = model();
+        feed(&mut m, b"test_for_selection-none end");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        let scene = m.view();
+        match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { selection, .. } => {
+                assert_eq!(*selection, Some(Selection::new((0, 0), (0, 22))));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn the_word_character_set_is_configurable() {
+        let mut m = model();
+        // Emptying the exceptions leaves bare alphanumerics, so an underscore
+        // now breaks the word.
+        m.set_word_chars("");
+        feed(&mut m, b"foo bar_baz qux");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
+        assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 6))));
+    }
+
+    #[test]
+    fn a_uri_still_breaks_at_the_scheme_colon() {
+        let mut m = model();
+        // Documents the limit of the character-set layer: ':' is not a word
+        // character (VTE's default omits it too), so the scheme is left behind.
+        // Selecting a whole URI is the content-aware layer's job, not this one.
+        feed(&mut m, b"https://example.com/a");
+        m.update(ptr(PointerPhase::Motion, None, 9.0 * 10.0 + 1.0, 1.0));
+        m.update(press_n(9.0 * 10.0 + 1.0, 1.0, 2));
+        assert_eq!(m.selection(), Some(Selection::new((0, 6), (0, 20))));
     }
 
     #[test]

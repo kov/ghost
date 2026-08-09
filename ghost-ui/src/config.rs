@@ -2,7 +2,8 @@
 //! from `$XDG_CONFIG_HOME/ghost/ui.toml`. It selects a color scheme (`[colors]`),
 //! a persisted font zoom (`[zoom]`), the background opacity, the fallback frost
 //! density, initial grid size, and inner padding (`[window]`), the base
-//! font size + family (`[font]`), and how the macOS Option key behaves
+//! font size + family (`[font]`), the double-click word characters
+//! (`[input] word_chars`), and how the macOS Option key behaves
 //! (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
@@ -11,6 +12,7 @@
 //! ignored, so a file that carries settings a newer ghost added still loads here.
 
 use ghost_renderer::Theme;
+use ghost_ui_core::DEFAULT_WORD_CHARS;
 use serde::Deserialize;
 
 /// A built-in color scheme: foreground/background plus the 16 base ANSI colors.
@@ -239,6 +241,12 @@ impl Default for Font {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct Input {
+    /// Extra characters that count as part of a word when double-clicking, on top
+    /// of the Unicode alphanumerics. The default is VTE's (GNOME Terminal's), so
+    /// `foo_bar-baz` and `/usr/local/bin` each select whole. Set it to `""` for
+    /// bare alphanumerics. Note it deliberately has no `:` — selecting a whole URI
+    /// is the content-aware layer's job, not this one.
+    word_chars: String,
     /// macOS only: treat the Option (⌥) key as Meta, so Option+key sends an
     /// ESC-prefixed byte (Alt-b word motion, readline Meta bindings, …) instead
     /// of composing an accented character. On by default, matching a terminal's
@@ -250,6 +258,7 @@ struct Input {
 impl Default for Input {
     fn default() -> Self {
         Input {
+            word_chars: DEFAULT_WORD_CHARS.to_string(),
             option_as_meta: true,
         }
     }
@@ -335,6 +344,11 @@ impl UiConfig {
     /// The configured fontconfig family name, or `None` to use the bundled font.
     pub fn font_family(&self) -> Option<&str> {
         self.font.family.as_deref()
+    }
+
+    /// Extra word characters for double-click selection — see [`Input::word_chars`].
+    pub fn word_chars(&self) -> &str {
+        &self.input.word_chars
     }
 
     /// Whether the macOS Option key acts as Meta (ESC-prefix) rather than
@@ -570,6 +584,35 @@ mod tests {
             UiConfig::parse("[input]\noption_as_meta = true\n")
                 .unwrap()
                 .option_as_meta()
+        );
+    }
+
+    #[test]
+    fn word_chars_defaults_to_vte_s_set_and_parses() {
+        // Unset (in every shape) gives the VTE-compatible default, so paths and
+        // dashed identifiers double-click whole out of the box.
+        assert_eq!(UiConfig::default().word_chars(), DEFAULT_WORD_CHARS);
+        assert_eq!(
+            UiConfig::parse("").unwrap().word_chars(),
+            DEFAULT_WORD_CHARS
+        );
+        assert_eq!(
+            UiConfig::parse("[input]\n").unwrap().word_chars(),
+            DEFAULT_WORD_CHARS
+        );
+        // An explicit set replaces it outright, empty included — that's the way to
+        // ask for bare alphanumerics.
+        assert_eq!(
+            UiConfig::parse("[input]\nword_chars = \"_-\"\n")
+                .unwrap()
+                .word_chars(),
+            "_-"
+        );
+        assert_eq!(
+            UiConfig::parse("[input]\nword_chars = \"\"\n")
+                .unwrap()
+                .word_chars(),
+            ""
         );
     }
 
