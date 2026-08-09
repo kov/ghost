@@ -272,10 +272,18 @@ Verified in the vendored winit (0.30.13):
   cannot see it at all (build 0.39 → 0.35 ms avg, inside its own noise), which
   is the number that decides it: real frames are damage-limited bands on real
   hardware, not full 4K cold rebuilds in software.
-  Still open, and a *producer* bug rather than a renderer one: the radii in
-  `fleet.rs` and `root.rs` are literals (`3.0`, `5.0`) in a scene laid out in
-  **physical** pixels, so they are half as round on a 2x display. The frame's
-  own `rect.h * 0.5` is scale-derived and correct.
+  The *producer* half of it is fixed too: the radii in `fleet.rs` and `root.rs`
+  were literals in a scene laid out in **physical** pixels, so they came out
+  half as round on a 2x display. They are named logical constants now, scaled
+  where used. Chasing it turned up the same bug a size larger in the connect
+  overlay, which placed *everything* from the base 1x cell while its text drew
+  at the device's scale — full-size glyphs in half-size boxes; it measures on a
+  scaled cell now.
+  What remains, same class, deliberately not swept up because it moves the grid
+  rather than just rounding it: `GAP`, `SECTION_EXTRA_GAP`, `FOCUS_BORDER`,
+  `BADGE_PX` and the chips' `inset(…, 2.0/3.0)` in `fleet.rs` are all physical
+  literals, so gaps and focus rings are half as thick at 2x while the cards they
+  separate scale.
 - **P4 — shadow, and the deletion.** The shadow half is **done**: vendored winit
   grew `set_decoration_margins`, which inflates the surface and points
   `xdg_surface.set_window_geometry` at the content rect — the GTK model (see
