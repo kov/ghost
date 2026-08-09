@@ -1,15 +1,19 @@
-//! Optional **windowed** harness test: drives a real F9 dive against a real window
+//! **Windowed** harness test: drives a real F9 dive against a real window
 //! swapchain surface, exercising the acquire→`present_scene`→present path that the
 //! offscreen tests never touch. Same `Harness` driver as the headless tests — only
 //! the render target is swapped for a `Target::Surface`.
 //!
-//! Gated, because it needs a compositor + GPU and creates a visible window: it
-//! no-ops unless `GHOST_UI_WINDOWED=1` and a Wayland display is present, so a plain
-//! `cargo test` stays headless. Run it with:
+//! It brings its own compositor: a headless weston on a private socket, started
+//! and reaped by the test, so a plain `cargo test` runs it — no environment to
+//! set, and no window on anyone's desktop. It used to be opt-in behind
+//! `GHOST_UI_WINDOWED=1`, which meant nothing ran it and it rotted quietly
+//! against a model change. Weston must be installed; without it the test says so
+//! and returns, because a compositor is the one thing it cannot supply itself.
+//!
+//! To watch it instead, against your own session:
 //!
 //! ```sh
-//! GHOST_UI_WINDOWED=1 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u) \
-//!   cargo test -p ghost-ui-harness --test windowed -- --nocapture
+//! GHOST_UI_WINDOWED=1 cargo test -p ghost-ui-harness --test windowed -- --nocapture
 //! ```
 //!
 //! Linux-only: it uses the Wayland `EventLoopBuilderExtWayland` and runs the
@@ -36,6 +40,76 @@ const METRICS: CellMetrics = CellMetrics {
     advance: 9.0,
     line_height: 18.0,
 };
+
+/// A headless weston, alive for as long as this value is.
+///
+/// The compositor is a child process, so it has to be reaped on every way out of
+/// the test — including a panic, which is why the kill hangs off `Drop` rather
+/// than off the end of the test body. We hold the handle, so nothing here ever
+/// has to go looking for a process by name.
+struct Weston {
+    child: std::process::Child,
+    /// The private `XDG_RUNTIME_DIR` its socket lives in; removed with it.
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Weston {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Weston {
+    /// Start weston headless on a socket of its own and point this process at
+    /// it. `None` when weston is not installed — the one thing the test cannot
+    /// provide for itself.
+    ///
+    /// The GL renderer, not the default pixman: a software compositor advertises
+    /// no dmabuf, so no Vulkan adapter is compatible with the surface and the
+    /// window this test exists to draw into cannot be presented to at all.
+    fn start() -> Option<Weston> {
+        let dir = tempfile::tempdir().expect("a runtime dir");
+        let socket = "ghost-windowed-test";
+        let child = std::process::Command::new("weston")
+            .args([
+                "--backend=headless",
+                "--renderer=gl",
+                "--no-config",
+                // Never idle out mid-test and stop repainting.
+                "--idle-time=0",
+                &format!("--socket={socket}"),
+                "--width=1400",
+                "--height=900",
+            ])
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let weston = Weston { child, _dir: dir };
+
+        // SAFETY: winit and wgpu read these from the environment, and there is no
+        // other way to aim them at our socket. Sound here because this is the only
+        // test in the binary and it has not started a thread yet, so nothing else
+        // can be reading the environment concurrently.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", weston._dir.path());
+            std::env::set_var("WAYLAND_DISPLAY", socket);
+        }
+
+        // Wait for the socket rather than sleeping a guessed amount: weston is
+        // ready the moment it is there to connect to.
+        let sock = weston._dir.path().join(socket);
+        for _ in 0..200 {
+            if sock.exists() {
+                return Some(weston);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("weston started but never opened {}", sock.display());
+    }
+}
 
 fn info(name: &str, attached: bool, created_at: i64) -> SessionInfo {
     SessionInfo {
@@ -226,10 +300,19 @@ impl ApplicationHandler for WindowedDive {
 
 #[test]
 fn windowed_dive_presents_frames_to_a_real_surface() {
-    if std::env::var("GHOST_UI_WINDOWED").is_err() {
-        eprintln!("skipping windowed test (set GHOST_UI_WINDOWED=1 + a Wayland display to run)");
-        return;
-    }
+    // Normally the test supplies its own compositor. `GHOST_UI_WINDOWED=1` runs it
+    // against the ambient session instead, so the dive can be watched happening.
+    let watching = std::env::var("GHOST_UI_WINDOWED").is_ok();
+    let _weston = match watching {
+        true => None,
+        false => match Weston::start() {
+            Some(w) => Some(w),
+            None => {
+                eprintln!("skipping windowed test: weston is not installed");
+                return;
+            }
+        },
+    };
     if std::env::var("WAYLAND_DISPLAY").is_err() {
         eprintln!("skipping windowed test (no WAYLAND_DISPLAY)");
         return;

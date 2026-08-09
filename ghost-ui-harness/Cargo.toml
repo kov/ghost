@@ -28,3 +28,6 @@ winit = { version = "0.30", default-features = false, features = [
 ] }
 wgpu = "29"
 pollster = "0.4"
+# A private XDG_RUNTIME_DIR for the weston the windowed test starts, so its socket
+# cannot collide with a real session's or another run's.
+tempfile = "3"
