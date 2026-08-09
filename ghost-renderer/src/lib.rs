@@ -617,6 +617,11 @@ struct Instance {
     uv: [f32; 4],
     /// Color, straight alpha.
     color: [f32; 4],
+    /// Corner radius in pixels, 0 for a square quad — which every glyph and
+    /// every plain fill is, so the shader takes a branch around the rounding
+    /// rather than paying for it on the hottest instance in the frame. Never
+    /// larger than half the shorter side; see [`solid_rounded`].
+    radius: f32,
 }
 
 #[repr(C)]
@@ -636,11 +641,19 @@ struct InstanceIn {
     @location(0) rect: vec4<f32>,
     @location(1) uv: vec4<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) radius: f32,
 };
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    // The quad's centre and half-extents in pixels, and its corner radius —
+    // everything the rounded-corner distance field needs. All per-instance, so
+    // all flat: the fragment's own position gives the field its variable, and
+    // interpolating anything per-pixel for the sake of a corner would be a tax
+    // on every glyph in the frame.
+    @location(2) @interpolate(flat) box: vec4<f32>,
+    @location(3) @interpolate(flat) radius: f32,
 };
 
 @vertex
@@ -656,7 +669,18 @@ fn vs(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
     out.pos = vec4<f32>(clip, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, c);
     out.color = inst.color;
+    out.box = vec4<f32>(inst.rect.xy + inst.rect.zw * 0.5, inst.rect.zw * 0.5);
+    out.radius = inst.radius;
     return out;
+}
+
+// Coverage of a rounded box, from the signed distance to its outline: negative
+// inside, positive out, in pixels. Antialiased over the one pixel the edge
+// crosses, which is what `clamp(0.5 - d, 0, 1)` reads out.
+fn rounded_coverage(local: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(local) - (half - vec2<f32>(r, r));
+    let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return clamp(0.5 - d, 0.0, 1.0);
 }
 
 @fragment
@@ -670,7 +694,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // Premultiplied output: the surface alpha modes our windows use (and Wayland
     // / macOS natively) expect colour already scaled by coverage. At full opacity
     // this is identity, so opaque rendering is unchanged.
-    let cov = in.color.a * texel.a;
+    var cov = in.color.a * texel.a;
+    // Square is the overwhelming majority — every glyph, every cell background —
+    // and takes the branch, so a rect that asked for nothing is bit-for-bit what
+    // it was before corners could be cut at all.
+    if (in.radius > 0.0) {
+        cov = cov * rounded_coverage(in.pos.xy - in.box.xy, in.box.zw, in.radius);
+    }
     return vec4<f32>(in.color.rgb * texel.rgb * cov, cov);
 }
 
@@ -1581,6 +1611,21 @@ fn solid(rect: RectPx, color: [f32; 4]) -> Instance {
         rect: [rect.x, rect.y, rect.w, rect.h],
         uv: OPAQUE_UV,
         color,
+        radius: 0.0,
+    }
+}
+
+/// A solid filled quad with its corners rounded off by `radius`.
+///
+/// Half the shorter side is as round as a rectangle gets — the two short ends
+/// become semicircles and a square becomes a circle. Asking for more is asking
+/// for a shape that doesn't exist, and the distance field would answer with a
+/// pinched one, so the radius is clamped here, once, rather than trusted from
+/// every caller.
+fn solid_rounded(rect: RectPx, color: [f32; 4], radius: f32) -> Instance {
+    Instance {
+        radius: radius.clamp(0.0, rect.w.min(rect.h) * 0.5),
+        ..solid(rect, color)
     }
 }
 
@@ -2138,8 +2183,8 @@ impl Renderer {
                 bind_group_layouts: &[Some(&bind_layout)],
                 immediate_size: 0,
             });
-        const ATTRS: [wgpu::VertexAttribute; 3] =
-            wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+        const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32];
         let pipeline = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2828,6 +2873,7 @@ impl Renderer {
                 rect: d.rect,
                 uv: d.uv,
                 color: [1.0, 1.0, 1.0, 1.0],
+                radius: 0.0,
             })
             .collect();
         Self::upload_instances(
@@ -3399,6 +3445,7 @@ impl Renderer {
                 rect: d.rect,
                 uv: d.uv,
                 color: [1.0, 1.0, 1.0, 1.0],
+                radius: 0.0,
             })
             .collect();
 
@@ -3928,6 +3975,7 @@ impl Renderer {
                         ],
                         uv: OPAQUE_UV,
                         color,
+                        radius: 0.0,
                     });
                 }
             }
@@ -3977,6 +4025,7 @@ impl Renderer {
                         rect: [x, row_y, w, metrics.line_height],
                         uv: OPAQUE_UV,
                         color,
+                        radius: 0.0,
                     };
                     if cursor_selected {
                         cursor_over_selection.push(inst);
@@ -4035,6 +4084,7 @@ impl Renderer {
                             } else {
                                 glyph_color
                             },
+                            radius: 0.0,
                         });
                     }
                 }
@@ -4580,9 +4630,17 @@ impl Renderer {
                             );
                         }
                     }
-                    SceneItem::Rect { rect, color, .. } => {
-                        push_glyphs(&mut all, &mut draws, scissor, vec![solid(*rect, *color)])
-                    }
+                    SceneItem::Rect {
+                        rect,
+                        color,
+                        radius,
+                        ..
+                    } => push_glyphs(
+                        &mut all,
+                        &mut draws,
+                        scissor,
+                        vec![solid_rounded(*rect, *color, *radius)],
+                    ),
                     SceneItem::Border {
                         rect, color, width, ..
                     } => {
@@ -4693,6 +4751,7 @@ impl Renderer {
                         } else {
                             color
                         },
+                        radius: 0.0,
                     });
                 }
             }
@@ -4773,6 +4832,7 @@ impl Renderer {
                     } else {
                         color
                     },
+                    radius: 0.0,
                 });
             }
         }
@@ -4791,6 +4851,7 @@ impl Renderer {
                 rect: [r.x, r.y, r.w, r.h],
                 uv: [0.0, 0.0, 1.0, 1.0], // sample the whole surface texture
                 color: [1.0, 1.0, 1.0, 1.0],
+                radius: 0.0,
             })
             .collect();
         Self::upload_instances(
@@ -5567,6 +5628,7 @@ impl Renderer {
             rect: [0.0, 0.0, sw as f32, sh as f32],
             uv: [0.0, 0.0, 1.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
+            radius: 0.0,
         }];
         Self::upload_instances(
             &self.gpu.device,

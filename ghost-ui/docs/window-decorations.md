@@ -260,11 +260,22 @@ Verified in the vendored winit (0.30.13):
   `action-double-click-titlebar`, right-click window menu. Making the top strip
   of the terminal a drag handle before there is a bar would only take away the
   ability to select text there.
-  Known gap found while building it: `SceneItem::Rect` carries a `radius` the
-  renderer **ignores** — every rounded rect in the UI (fleet cards, the toast,
-  now the buttons' hover circle) is drawn square. Fixing it means a per-instance
-  radius and a rounded-box SDF in the glyph shader, which is the hottest one we
-  have; worth its own change with its own before/after, not a rider on this one.
+  The gap found while building it — `SceneItem::Rect` carried a `radius` the
+  renderer ignored, so every rounded rect in the UI (fleet cards, the toast, the
+  buttons' hover circle) drew square — is **closed**: the instance grew a
+  radius, and `fs` cuts the corners with a rounded-box distance field, branched
+  around when the radius is 0 so a glyph is bit-for-bit what it was. The
+  before/after that earned it its own change: on a 4K screen of dense colored
+  text (12.8k instances) the full render path goes 3.43 → 3.75 ms **on
+  lavapipe**, and all of that is the instance growing 48 → 52 bytes — compiling
+  the fragment branch out leaves 3.70. On the GPU the windowed dive/slide bench
+  cannot see it at all (build 0.39 → 0.35 ms avg, inside its own noise), which
+  is the number that decides it: real frames are damage-limited bands on real
+  hardware, not full 4K cold rebuilds in software.
+  Still open, and a *producer* bug rather than a renderer one: the radii in
+  `fleet.rs` and `root.rs` are literals (`3.0`, `5.0`) in a scene laid out in
+  **physical** pixels, so they are half as round on a 2x display. The frame's
+  own `rect.h * 0.5` is scale-derived and correct.
 - **P4 — shadow, and the deletion.** The shadow half is **done**: vendored winit
   grew `set_decoration_margins`, which inflates the surface and points
   `xdg_surface.set_window_geometry` at the content rect — the GTK model (see

@@ -2625,6 +2625,69 @@ fn a_square_window_keeps_its_corners() {
     );
 }
 
+/// A single red rect on the default background, at (10,10)-(50,30).
+fn rounded_rect(radius: f32) -> Rendered {
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut scene = Scene::new((60, 40));
+    scene.layers.push(Layer::new(
+        0,
+        vec![SceneItem::Rect {
+            id: SceneId::Root,
+            rect: RectPx {
+                x: 10.0,
+                y: 10.0,
+                w: 40.0,
+                h: 20.0,
+            },
+            color: [1.0, 0.0, 0.0, 1.0],
+            radius,
+        }],
+    ));
+    Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, 15.0)
+}
+
+#[test]
+fn a_rect_with_a_radius_has_its_corners_cut() {
+    // A rect carries a `radius`, and a chrome that asks for one means it: the
+    // window buttons' hover backing asks for `h * 0.5` and is meant to read as a
+    // circle, not a square. Half the height is also the widest a radius can
+    // usefully be — the ends become full semicircles, so this is the shape that
+    // proves both the cut and its limit.
+    let img = rounded_rect(10.0);
+    write_png("ghost_rounded_rect.png", &img);
+
+    assert!(strong_red(px(&img, 30, 20)), "the middle is filled");
+    // The left cap's arc is centred at (20,20) with radius 10, so its leftmost
+    // point (10,20) is on the fill and the square corner (10,10) is well outside.
+    assert!(
+        strong_red(px(&img, 11, 20)),
+        "the cap reaches the left edge"
+    );
+    assert!(
+        !strong_red(px(&img, 11, 11)),
+        "the corner the arc cuts away is not painted"
+    );
+    assert!(
+        !strong_red(px(&img, 48, 28)),
+        "and neither is the opposite one"
+    );
+}
+
+#[test]
+fn a_rect_without_a_radius_keeps_its_corners() {
+    // The overwhelmingly common rect — every background fill — must stay square,
+    // and square to the pixel: the SDF that cuts the corners above may not shave
+    // a fraction of coverage off the edges of one that asked for nothing.
+    let img = rounded_rect(0.0);
+    for (x, y) in [(10, 10), (49, 10), (10, 29), (49, 29)] {
+        assert_eq!(
+            px(&img, x, y),
+            [255, 0, 0, 255],
+            "radius 0 fills its corner ({x},{y}) exactly"
+        );
+    }
+}
+
 #[test]
 fn the_window_edge_draws_the_inset_highlight_libadwaita_traces() {
     // libadwaita defines a window's edge with `outline: 1px solid
