@@ -163,11 +163,17 @@ impl ApplicationHandler for WindowedDive {
         let mut h = Harness::fleet(METRICS, (size.width, size.height), scale as f32);
         let win = window.clone();
         h.set_surface(renderer, target, move |_, _| win.pre_present_notify());
+        // Detached, but for the last: adopting a session held by another window
+        // without taking it over would double-attach it, which the fleet's extract
+        // guard refuses — so the ones this test opens come from the detached pool,
+        // as in the headless `f9_round_trips_single_to_fleet_to_single`. The odd one
+        // out stays attached elsewhere, keeping the grid's foreign band — a distinct
+        // tile treatment — in the frames being presented.
         h.set_sessions(
             names
                 .iter()
                 .enumerate()
-                .map(|(i, n)| info(n, i < 2, i as i64 + 1))
+                .map(|(i, n)| info(n, i == names.len() - 1, i as i64 + 1))
                 .collect(),
         );
         for n in &names[..2] {
