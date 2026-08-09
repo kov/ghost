@@ -2916,6 +2916,79 @@ impl TerminalView {
         Some(Selection::new((srow, scol), (erow, ecol)))
     }
 
+    /// The best extent for a double-click at viewport `(row, col)`: the whole
+    /// hyperlink run if the cell carries one, else the whole URI it sits inside,
+    /// else the word under it. Each rung knows more than the one below it — OSC 8
+    /// is the program telling us outright, the scanner recognizes a shape, the
+    /// word walk only knows which characters cling together.
+    fn smart_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
+        self.content_at(state, row, col)
+            .or_else(|| self.word_at(state, row, col))
+    }
+
+    /// The content-aware rungs alone: a hyperlink run, else a URI. `None` when
+    /// the click is on neither, leaving the word walk to answer.
+    fn content_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
+        let (cells, at) = self.logical_line(state, row, col)?;
+        let (a, b) = link_run(&cells, at).or_else(|| url_span(&cells, at))?;
+        Some(Selection::new(
+            (cells[a].row, cells[a].col),
+            (cells[b].row, cells[b].col + cells[b].width - 1),
+        ))
+    }
+
+    /// The logical line through viewport `(row, col)` — the soft-wrapped rows
+    /// either side of it joined back together — as one cell per printed
+    /// character, plus the index of the clicked one. Cells, never `text()`: a
+    /// wide character makes char indices and columns disagree, and a match has
+    /// to map back to columns.
+    fn logical_line(
+        &self,
+        state: &SessionState,
+        row: usize,
+        col: usize,
+    ) -> Option<(Vec<LogicalCell>, usize)> {
+        // Rewind to the first row of the wrapped run.
+        let mut first = row;
+        while let Some(prev) = first
+            .checked_sub(1)
+            .and_then(|r| self.window_line(state, r))
+            .filter(|prev| prev.is_wrapped())
+        {
+            let _ = prev;
+            first -= 1;
+        }
+        let mut cells = Vec::new();
+        let mut at = None;
+        let mut r = first;
+        while let Some(line) = self.window_line(state, r) {
+            let end = content_len(line);
+            for (c, cell) in line.cells()[..end].iter().enumerate() {
+                // The zero-width tail of a wide character is part of its head,
+                // not a character of its own.
+                if cell.width() == 0 {
+                    continue;
+                }
+                let width = usize::from(cell.width()).max(1);
+                if r == row && (c..c + width).contains(&col) {
+                    at = Some(cells.len());
+                }
+                cells.push(LogicalCell {
+                    row: r,
+                    col: c,
+                    width,
+                    ch: cell.char(),
+                    link: cell.pen().link_id(),
+                });
+            }
+            if !line.is_wrapped() {
+                break;
+            }
+            r += 1;
+        }
+        at.map(|at| (cells, at))
+    }
+
     /// The line at viewport `row`: column 0 through its last non-blank cell (the
     /// whole row when blank), as an inclusive selection.
     fn line_at(&self, state: &SessionState, row: usize) -> Option<Selection> {
@@ -3095,7 +3168,7 @@ impl TerminalView {
                             SelectMode::Line
                         };
                         let ext = if clicks == 2 {
-                            self.word_at(state, row, col)
+                            self.smart_at(state, row, col)
                         } else {
                             self.line_at(state, row)
                         }
@@ -3214,6 +3287,116 @@ fn map_button(b: PointerButton) -> mouse::Button {
 /// Deliberately without `:`, as VTE has it: a URI is the content-aware layer's
 /// job, not this one (see docs/selection-design.md).
 pub const DEFAULT_WORD_CHARS: &str = "-#%&+,./=?@\\_~·";
+
+/// One printed character of a logical line, with the grid cell it came from —
+/// the bridge a content-aware match crosses to get back to columns.
+struct LogicalCell {
+    row: usize,
+    col: usize,
+    /// Cells this character occupies (2 for a wide one), so a match ending on it
+    /// covers the whole glyph.
+    width: usize,
+    ch: char,
+    /// OSC 8 hyperlink id, when the program marked this cell as part of a link.
+    link: Option<u16>,
+}
+
+/// URI schemes we recognize in plain text. Anchoring on a known scheme and
+/// running outward over the legal characters is kitty's approach, and it beats a
+/// URL regex at exactly the place those go wrong: the tail.
+const URL_PREFIXES: &[&str] = &["https://", "http://", "file://", "ftp://", "mailto:"];
+
+/// Trailing characters that are legal in a URI but, at the very end, are almost
+/// always the prose around it rather than part of the link.
+const URL_TRAILERS: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"'];
+
+/// Whether `c` can appear in a URI (RFC 3986's unreserved + reserved sets, plus
+/// the escape marker).
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
+/// The inclusive index range of the hyperlink run covering `at`, when the
+/// program marked that cell with an OSC 8 id.
+fn link_run(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
+    let id = cells.get(at)?.link?;
+    let mut a = at;
+    while a > 0 && cells[a - 1].link == Some(id) {
+        a -= 1;
+    }
+    let mut b = at;
+    while b + 1 < cells.len() && cells[b + 1].link == Some(id) {
+        b += 1;
+    }
+    Some((a, b))
+}
+
+/// The inclusive index range of the URI covering `at`, if any: anchor on a known
+/// scheme, run right over the legal characters, then give back the punctuation
+/// that belongs to the sentence rather than the link. The longest match covering
+/// the click wins, so `http://` inside a longer `https://` cannot shadow it.
+fn url_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = cells.iter().map(|c| c.ch).collect();
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..=at {
+        // A scheme has to start a token: `xhttps://…` is not a link.
+        if start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '/') {
+            continue;
+        }
+        if !URL_PREFIXES.iter().any(|p| starts_with(&chars[start..], p)) {
+            continue;
+        }
+        let mut end = start;
+        while end < chars.len() && is_url_char(chars[end]) {
+            end += 1;
+        }
+        end = trim_url_tail(&chars[start..end]) + start;
+        if end <= at || !(start..end).contains(&at) {
+            continue;
+        }
+        if best.is_none_or(|(a, b)| end - start > b + 1 - a) {
+            best = Some((start, end - 1));
+        }
+    }
+    best
+}
+
+/// Case-insensitive ASCII prefix test over a char slice.
+fn starts_with(chars: &[char], prefix: &str) -> bool {
+    prefix.len() <= chars.len()
+        && prefix
+            .chars()
+            .zip(chars)
+            .all(|(p, c)| c.eq_ignore_ascii_case(&p))
+}
+
+/// The length of `chars` with the trailing prose trimmed off: sentence
+/// punctuation, and closing brackets with no opener inside the match (a
+/// *balanced* pair really is part of the path).
+fn trim_url_tail(chars: &[char]) -> usize {
+    let mut end = chars.len();
+    loop {
+        let Some(&last) = chars[..end].last() else {
+            return end;
+        };
+        if URL_TRAILERS.contains(&last) {
+            end -= 1;
+            continue;
+        }
+        let opener = match last {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => return end,
+        };
+        let opens = chars[..end].iter().filter(|&&c| c == opener).count();
+        let closes = chars[..end].iter().filter(|&&c| c == last).count();
+        if closes <= opens {
+            return end;
+        }
+        end -= 1;
+    }
+}
 
 /// How many of `line`'s cells are content. A soft-wrapped line filled the width
 /// by definition, so any trailing blanks on one are padding — the gap left when
@@ -4067,16 +4250,91 @@ mod tests {
         assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 6))));
     }
 
+    /// Double-click at viewport cell `(row, col)` and return the text selected.
+    fn double_click_text(m: &mut TerminalModel, row: usize, col: usize) -> String {
+        let x = 9.0 * col as f64 + 1.0;
+        let y = 18.0 * row as f64 + 1.0;
+        m.update(ptr(PointerPhase::Motion, None, x, y));
+        m.update(press_n(x, y, 2));
+        match m.view.selection {
+            Some(sel) => selection_text(&m.state.screen, sel),
+            None => String::new(),
+        }
+    }
+
     #[test]
-    fn a_uri_still_breaks_at_the_scheme_colon() {
+    fn double_click_selects_a_whole_uri() {
+        // The scheme colon, the query and its separators all come along — none of
+        // them are word characters, so only a content-aware pass gets this right.
         let mut m = model();
-        // Documents the limit of the character-set layer: ':' is not a word
-        // character (VTE's default omits it too), so the scheme is left behind.
-        // Selecting a whole URI is the content-aware layer's job, not this one.
+        feed(&mut m, b"see https://example.com/a?b=c&d=e now");
+        assert_eq!(
+            double_click_text(&mut m, 0, 20),
+            "https://example.com/a?b=c&d=e"
+        );
+        assert_eq!(m.selection(), Some(Selection::new((0, 4), (0, 32))));
+    }
+
+    #[test]
+    fn a_uri_stops_before_the_punctuation_around_it() {
+        // Prose wraps URIs in brackets and ends sentences with a full stop; none
+        // of that belongs to the link, however legal the characters are in one.
+        let mut m = model();
+        feed(&mut m, b"(https://example.com/a).");
+        assert_eq!(double_click_text(&mut m, 0, 10), "https://example.com/a");
+        let mut m = model();
+        feed(&mut m, b"see https://example.com/a, then");
+        assert_eq!(double_click_text(&mut m, 0, 10), "https://example.com/a");
+    }
+
+    #[test]
+    fn a_balanced_bracket_inside_a_uri_is_kept() {
+        // Only an UNBALANCED closer is punctuation around the link — wiki-style
+        // paths really do contain a matched pair.
+        let mut m = model();
+        feed(&mut m, b"https://example.com/a_(b)_c end");
+        assert_eq!(
+            double_click_text(&mut m, 0, 10),
+            "https://example.com/a_(b)_c"
+        );
+    }
+
+    #[test]
+    fn a_uri_that_soft_wraps_selects_whole() {
+        let mut m = narrow_model(20);
+        feed(&mut m, b"https://example.com/a?b=c");
+        assert_eq!(double_click_text(&mut m, 0, 5), "https://example.com/a?b=c");
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (1, 4))));
+    }
+
+    #[test]
+    fn a_uri_wins_over_the_word_under_the_pointer() {
+        // The click is on "example", which is a perfectly good word; the URI it
+        // sits inside is the better answer.
+        let mut m = model();
         feed(&mut m, b"https://example.com/a");
-        m.update(ptr(PointerPhase::Motion, None, 9.0 * 10.0 + 1.0, 1.0));
-        m.update(press_n(9.0 * 10.0 + 1.0, 1.0, 2));
-        assert_eq!(m.selection(), Some(Selection::new((0, 6), (0, 20))));
+        assert_ne!(double_click_text(&mut m, 0, 10), "example");
+    }
+
+    #[test]
+    fn a_hyperlink_selects_its_whole_display_run() {
+        // OSC 8 says exactly where the link starts and ends, spaces included —
+        // no scanner has to guess, and no word walk would ever join these two.
+        let mut m = model();
+        feed(
+            &mut m,
+            b"\x1b]8;;https://example.com\x1b\\click here\x1b]8;;\x1b\\ after",
+        );
+        assert_eq!(double_click_text(&mut m, 0, 7), "click here");
+        assert_eq!(m.selection(), Some(Selection::new((0, 0), (0, 9))));
+    }
+
+    #[test]
+    fn plain_words_are_untouched_by_the_content_aware_pass() {
+        // No URI, no link: the word-character walk still answers.
+        let mut m = model();
+        feed(&mut m, b"test_for_selection-none end");
+        assert_eq!(double_click_text(&mut m, 0, 5), "test_for_selection-none");
     }
 
     /// A model with a deliberately narrow grid, so a modest token soft-wraps.

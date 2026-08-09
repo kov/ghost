@@ -122,14 +122,30 @@ line. Worth doing, tracked as a follow-up.
 
 ### Phase 3a — URL selection (kitty-style, no regex)
 
-Scheme-anchored scanner over the phase-2 logical line: find a prefix from a
-configurable `url_prefixes` list at or before the click, extend right over the
-URL-legal character class minus an exclusion set, trim sentence-tail junk.
-Wrapped URLs work by construction. OSC 8 runs still win outright.
+Scheme-anchored scanner: find a prefix from `URL_PREFIXES` at or before the
+click, extend right over the URL-legal character class, then trim the tail —
+sentence punctuation, and closing brackets with no opener inside the match, so a
+*balanced* pair in a wiki-style path survives. A scheme must start a token, so
+`xhttps://…` is not a link. The longest match covering the click wins, so
+`http://` cannot shadow the `https://` it sits inside. Wrapped URIs work by
+construction; OSC 8 runs win outright.
 
-Tests: `https://x/a?b=c&d=e` selected whole from a click in the middle; the same
-wrapped across two rows; trailing `)` and `.` excluded; an OSC 8 link whose
-display text differs from its URI selects the display run.
+`LogicalCell` + `logical_line` land here rather than in 3b: the scanner is the
+first thing needing a joined view, so this is where the offset table earns its
+place. One entry per printed character — `(row, col, width, char, link_id)`,
+built from cells. The width is what lets a match ending on a wide character
+cover the whole glyph; the link id is what makes the OSC 8 rung a walk over the
+same array rather than a second traversal.
+
+Tests: a URI selected whole from a click in the middle, query included; the same
+wrapped across two rows; `(…)`, a trailing `.` and a trailing `,` left out while
+a balanced `(b)` inside the path is kept; a URI beating the plain word under the
+pointer; an OSC 8 run selecting display text no word walk would join; and plain
+words still answered by the word walk.
+
+Not included: a double-click *drag* still extends by words rather than smart
+units (iTerm2 behaves the same way), and Ctrl-click still only opens OSC 8
+links — the scanner could feed it a plain URI too, a natural follow-up.
 
 ### Phase 3b — regex rules with `highlight`
 
