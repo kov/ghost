@@ -1488,6 +1488,10 @@ fn apply_layer(
             inst.rect[1] = inst.rect[1] * t.scale + t.ty;
             inst.rect[2] *= t.scale;
             inst.rect[3] *= t.scale;
+            // The corner scales with the box it rounds — a card zoomed by the
+            // dive stays as round as it was, and stays inside the clamp, which
+            // is a ratio and so survives any uniform scale.
+            inst.radius *= t.scale;
         }
         inst.color[3] *= opacity;
     }

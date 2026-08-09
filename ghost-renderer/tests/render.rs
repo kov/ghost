@@ -2674,6 +2674,53 @@ fn a_rect_with_a_radius_has_its_corners_cut() {
 }
 
 #[test]
+fn a_radius_rides_the_layer_camera_like_the_rect_it_rounds() {
+    // Fleet cards are rounded rects inside the tile-world layer, and the dive
+    // zooms that layer continuously — so a radius that stayed put while its rect
+    // grew would have the cards' corners un-round themselves through the whole
+    // animation, and shrink into the pinched shape the clamp exists to prevent.
+    // A 20x20 rect with radius 10 is a circle, and at scale 2 it must be a
+    // *bigger circle*: centred (60,60), radius 20.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut scene = Scene::new((100, 100));
+    scene.layers.push(
+        Layer::new(
+            0,
+            vec![SceneItem::Rect {
+                id: SceneId::Root,
+                rect: RectPx {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 20.0,
+                    h: 20.0,
+                },
+                color: [1.0, 0.0, 0.0, 1.0],
+                radius: 10.0,
+            }],
+        )
+        .with_transform(Transform {
+            scale: 2.0,
+            tx: 40.0,
+            ty: 40.0,
+        }),
+    );
+    let img = Renderer::headless(Theme::default()).render_offscreen_scene(&scene, font, 15.0);
+    write_png("ghost_rounded_rect_scaled.png", &img);
+
+    assert!(strong_red(px(&img, 60, 60)), "the middle is filled");
+    assert!(
+        strong_red(px(&img, 60, 42)),
+        "and the top of the circle reaches the rect's edge"
+    );
+    // 21.2px from the centre: outside a circle of radius 20, but comfortably
+    // inside a 40x40 box whose corners were only cut by an unscaled 10.
+    assert!(
+        !strong_red(px(&img, 45, 45)),
+        "the corner is cut to the radius the camera scaled, not the one it was given"
+    );
+}
+
+#[test]
 fn a_rect_without_a_radius_keeps_its_corners() {
     // The overwhelmingly common rect — every background fill — must stay square,
     // and square to the pixel: the SDF that cuts the corners above may not shave
