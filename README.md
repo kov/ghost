@@ -114,7 +114,8 @@ dissolves the group, `Esc` leaves.
 The window reads a small, hand-edited TOML at `$XDG_CONFIG_HOME/ghost/ui.toml`
 (unknown keys are ignored, so a file survives version skew). It selects a color
 scheme, background opacity and frosting, initial grid size and padding, base font
-size + family, double-click word characters, and the macOS Option-key behavior:
+size + family, double-click word characters and selection rules, and the macOS
+Option-key behavior:
 
 ```toml
 [colors]
@@ -135,6 +136,20 @@ family = "Fira Code"
 [input]
 option_as_meta = true   # macOS: treat Option as Meta
 word_chars = "-#%&+,./=?@\\_~·"  # extra double-click word characters; default is VTE's
+
+# Content-aware double-click rules. Each matches the logical line under the
+# click; `group` is the capture group that becomes the selection, so a rule can
+# recognize `a/src/foo.rs` and hand you `src/foo.rs`. Writing any rule replaces
+# the built-in set, which is exactly these two — copy them to keep them.
+# `precision` (1 by default) breaks ties: 2 ties a recognized URI and wins on
+# length; an OSC 8 hyperlink always wins.
+[[input.selection_rules]]
+regex = '\b[ab]/(\S+)'              # git diff paths, without the a/ or b/
+group = 1
+
+[[input.selection_rules]]
+regex = '([^\s:]+):(\d+)(?::(\d+))?'  # file:line:col, without the position
+group = 1
 
 [zoom]
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts

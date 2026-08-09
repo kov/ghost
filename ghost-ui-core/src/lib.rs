@@ -36,8 +36,8 @@ pub use group::{Group, REMOTE_ID_SEP, is_remote_id};
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::{RootModel, Sessions, feed_observed, feed_shared};
 pub use terminal::{
-    DEFAULT_WORD_CHARS, Shortcut, TermTrace, TerminalModel, bracket_paste, classify_shortcut,
-    query_replies, selection_text,
+    DEFAULT_WORD_CHARS, SelectionConfig, Shortcut, SmartRule, TermTrace, TerminalModel,
+    bracket_paste, classify_shortcut, default_smart_rules, query_replies, selection_text,
 };
 pub use workspace::{WindowRecord, WorkspaceSnapshot};
 

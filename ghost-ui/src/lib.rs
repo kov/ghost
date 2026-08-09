@@ -3868,7 +3868,7 @@ impl App {
         let theme = cfg.theme();
         let colors = theme_colors(&theme);
         let pad = cfg.padding();
-        let word_chars = cfg.word_chars();
+        let selection = cfg.selection();
         let wids: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in wids {
             let cmds = {
@@ -3878,7 +3878,7 @@ impl App {
                 // Model side (headless-observable): the default colors and padding.
                 let cmds = w.root.set_theme(&mut self.states, colors);
                 w.root.set_padding(pad);
-                w.root.set_word_chars(word_chars);
+                w.root.set_selection_config(&selection);
                 // Gfx side (no model representation; absent under a headless
                 // frontend): the renderer theme — opacity/frost/scheme colours bake
                 // into cached surfaces, so `set_theme` drops them — the compositor
@@ -6063,7 +6063,7 @@ impl App {
         // honour what the host is refusing (see `ghost_term::policy`).
         root.set_policy(&mut self.states, session_policy_pair());
         root.set_padding(cfg.padding());
-        root.set_word_chars(cfg.word_chars());
+        root.set_selection_config(&cfg.selection());
         // A fleet window owns nothing yet, so reclaiming a group here just adopts
         // its identity — the members come from the loaded registry below.
         let claims = root.set_my_group(group);
@@ -6631,7 +6631,7 @@ impl App {
         root.set_theme(&mut self.states, theme_colors(&cfg.theme()));
         root.set_policy(&mut self.states, session_policy_pair());
         root.set_padding(cfg.padding());
-        root.set_word_chars(cfg.word_chars());
+        root.set_selection_config(&cfg.selection());
         // Seed the persisted registry BEFORE the group claim, so the claim's
         // save extends it rather than clobbering it with just this window.
         root.update(&mut self.states, UiEvent::GroupsLoaded(self.groups.clone()));
@@ -8533,7 +8533,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_config_reapplies_theme_padding_and_word_chars_to_every_window() {
+    fn reload_config_reapplies_theme_padding_and_selection_to_every_window() {
         // A config hot-reload fans the new model-side settings out to EVERY open
         // window. (The gfx-side keys — opacity/frost/blur — have no headless seam;
         // this covers the plumbing and the multi-window fan-out, which is the logic
@@ -8552,7 +8552,7 @@ mod tests {
 
             // Reload a config that changes both padding and the color scheme.
             let cfg = config::UiConfig::parse(
-                "[window]\npadding = 21.0\n\n[colors]\nscheme = \"tango-dark\"\n\n[input]\nword_chars = \"@\"\n",
+                "[window]\npadding = 21.0\n\n[colors]\nscheme = \"tango-dark\"\n\n[input]\nword_chars = \"@\"\n\n[[input.selection_rules]]\nregex = '(GH-\\d+)'\ngroup = 1\n",
             )
             .expect("parse");
             assert_ne!(cfg.padding(), default_pad, "precondition: config differs");
@@ -8568,9 +8568,14 @@ mod tests {
                 let root = &app.windows[&wid].root;
                 assert_eq!(root.padding(), 21.0, "reload updates padding on {wid:?}");
                 assert_eq!(
-                    root.word_chars(),
+                    root.selection_config().word_chars,
                     "@",
                     "reload updates the word characters on {wid:?}"
+                );
+                assert_eq!(
+                    root.selection_config().rules.len(),
+                    1,
+                    "reload updates the selection rules on {wid:?}"
                 );
                 assert_eq!(
                     root.theme(&app.states),

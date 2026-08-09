@@ -3,7 +3,8 @@
 //! a persisted font zoom (`[zoom]`), the background opacity, the fallback frost
 //! density, initial grid size, and inner padding (`[window]`), the base
 //! font size + family (`[font]`), the double-click word characters
-//! (`[input] word_chars`), and how the macOS Option key behaves
+//! (`[input] word_chars`), the content-aware selection rules
+//! (`[[input.selection_rules]]`), and how the macOS Option key behaves
 //! (`[input] option_as_meta`).
 //!
 //! Only [`load`](UiConfig::load) touches the filesystem; the scheme/theme mapping
@@ -12,7 +13,7 @@
 //! ignored, so a file that carries settings a newer ghost added still loads here.
 
 use ghost_renderer::Theme;
-use ghost_ui_core::DEFAULT_WORD_CHARS;
+use ghost_ui_core::{DEFAULT_WORD_CHARS, SelectionConfig, SmartRule};
 use serde::Deserialize;
 
 /// A built-in color scheme: foreground/background plus the 16 base ANSI colors.
@@ -247,6 +248,10 @@ struct Input {
     /// bare alphanumerics. Note it deliberately has no `:` — selecting a whole URI
     /// is the content-aware layer's job, not this one.
     word_chars: String,
+    /// Content-aware double-click rules, replacing the built-in set when present
+    /// (so copy the defaults you want to keep — the README sample lists them).
+    /// Absent, the built-ins apply.
+    selection_rules: Option<Vec<Rule>>,
     /// macOS only: treat the Option (⌥) key as Meta, so Option+key sends an
     /// ESC-prefixed byte (Alt-b word motion, readline Meta bindings, …) instead
     /// of composing an accented character. On by default, matching a terminal's
@@ -259,7 +264,35 @@ impl Default for Input {
     fn default() -> Self {
         Input {
             word_chars: DEFAULT_WORD_CHARS.to_string(),
+            selection_rules: None,
             option_as_meta: true,
+        }
+    }
+}
+
+/// One content-aware double-click rule — see [`Input::selection_rules`].
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Rule {
+    /// The shape to recognize, matched against the logical line under the click.
+    regex: String,
+    /// Which capture group becomes the selection; 0 (the default) is the whole
+    /// match. Matching wide and selecting narrow is how `a/src/foo.rs` selects
+    /// `src/foo.rs` while still being recognized by its `a/`.
+    group: usize,
+    /// How sure this rule is, breaking ties against the other rungs. 1 (the
+    /// default) loses to a recognized URI; 2 ties it, and the longer match wins.
+    /// Higher is clamped to 2 — an OSC 8 hyperlink is the program's own word on
+    /// where the link is, and always wins.
+    precision: u8,
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Rule {
+            regex: String::new(),
+            group: 0,
+            precision: 1,
         }
     }
 }
@@ -346,9 +379,31 @@ impl UiConfig {
         self.font.family.as_deref()
     }
 
-    /// Extra word characters for double-click selection — see [`Input::word_chars`].
-    pub fn word_chars(&self) -> &str {
-        &self.input.word_chars
+    /// Everything double-click selection is configured with: the extra word
+    /// characters and the content-aware rules, compiled. A rule whose regex
+    /// doesn't compile is logged and dropped, keeping the rest — a typo in one
+    /// rule shouldn't cost the others.
+    pub fn selection(&self) -> SelectionConfig {
+        let Some(rules) = &self.input.selection_rules else {
+            return SelectionConfig {
+                word_chars: self.input.word_chars.clone(),
+                ..SelectionConfig::default()
+            };
+        };
+        let rules = rules
+            .iter()
+            .filter_map(|r| match SmartRule::new(&r.regex, r.group, r.precision) {
+                Ok(rule) => Some(rule),
+                Err(e) => {
+                    tracing::warn!("ui.toml: ignoring selection rule {:?}: {e}", r.regex);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        SelectionConfig {
+            word_chars: self.input.word_chars.clone(),
+            rules: rules.into(),
+        }
     }
 
     /// Whether the macOS Option key acts as Meta (ESC-prefix) rather than
@@ -591,13 +646,16 @@ mod tests {
     fn word_chars_defaults_to_vte_s_set_and_parses() {
         // Unset (in every shape) gives the VTE-compatible default, so paths and
         // dashed identifiers double-click whole out of the box.
-        assert_eq!(UiConfig::default().word_chars(), DEFAULT_WORD_CHARS);
         assert_eq!(
-            UiConfig::parse("").unwrap().word_chars(),
+            UiConfig::default().selection().word_chars,
             DEFAULT_WORD_CHARS
         );
         assert_eq!(
-            UiConfig::parse("[input]\n").unwrap().word_chars(),
+            UiConfig::parse("").unwrap().selection().word_chars,
+            DEFAULT_WORD_CHARS
+        );
+        assert_eq!(
+            UiConfig::parse("[input]\n").unwrap().selection().word_chars,
             DEFAULT_WORD_CHARS
         );
         // An explicit set replaces it outright, empty included — that's the way to
@@ -605,15 +663,63 @@ mod tests {
         assert_eq!(
             UiConfig::parse("[input]\nword_chars = \"_-\"\n")
                 .unwrap()
-                .word_chars(),
+                .selection()
+                .word_chars,
             "_-"
         );
         assert_eq!(
             UiConfig::parse("[input]\nword_chars = \"\"\n")
                 .unwrap()
-                .word_chars(),
+                .selection()
+                .word_chars,
             ""
         );
+    }
+
+    #[test]
+    fn selection_rules_default_to_the_built_ins_and_are_replaced_wholesale() {
+        // Unset in every shape leaves the built-ins in place.
+        let built_in = ghost_ui_core::default_smart_rules().len();
+        assert_eq!(UiConfig::default().selection().rules.len(), built_in);
+        assert_eq!(
+            UiConfig::parse("").unwrap().selection().rules.len(),
+            built_in
+        );
+        assert_eq!(
+            UiConfig::parse("[input]\n")
+                .unwrap()
+                .selection()
+                .rules
+                .len(),
+            built_in
+        );
+        // A configured set replaces them: what you write is what runs, so the
+        // built-ins have to be copied in if you want to keep them.
+        let c = UiConfig::parse(
+            "[[input.selection_rules]]\nregex = '(GH-\\d+)'\ngroup = 1\nprecision = 2\n",
+        )
+        .unwrap();
+        assert_eq!(c.selection().rules.len(), 1);
+        // An empty array is a deliberate "no rules", not a fall back to defaults.
+        assert_eq!(
+            UiConfig::parse("[input]\nselection_rules = []\n")
+                .unwrap()
+                .selection()
+                .rules
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_selection_rule_that_does_not_compile_is_dropped_not_fatal() {
+        // Config is never fatal, and one typo shouldn't silently disarm the rules
+        // that do compile.
+        let c = UiConfig::parse(
+            "[[input.selection_rules]]\nregex = '('\n\n[[input.selection_rules]]\nregex = '(GH-\\d+)'\ngroup = 1\n",
+        )
+        .unwrap();
+        assert_eq!(c.selection().rules.len(), 1);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::input::{Key, Mods, NamedKey};
-use crate::terminal::{DrivingGeometry, FeedOutcome, SessionState, TerminalView};
+use crate::terminal::{DrivingGeometry, FeedOutcome, SelectionConfig, SessionState, TerminalView};
 use crate::terminal::{Shortcut, classify_shortcut};
 use crate::text_input::TextInput;
 use crate::{
@@ -474,10 +474,10 @@ pub struct RootModel {
     /// the window edges. Applied to the foreground/warm models and folded into
     /// [`Self::grid`] so the attach handshake matches. 0 = flush (the historic look).
     pad: f32,
-    /// Extra characters counting as part of a word for double-click selection, on
-    /// top of the alphanumerics (`[input] word_chars`). Stamped onto the foreground
-    /// and warm views like [`Self::pad`]; see `docs/selection-design.md`.
-    word_chars: String,
+    /// What double-click selection is configured with — the extra word characters
+    /// and the content-aware rules (`[input]`). Stamped onto the foreground and
+    /// warm views like [`Self::pad`]; see `docs/selection-design.md`.
+    selection: SelectionConfig,
     /// When set, this window is showing the "connect to a host" prompt (a new
     /// ssh window before its first session): it swallows the keyboard into the
     /// entry and renders the prompt overlay instead of the live view.
@@ -598,13 +598,13 @@ fn resize_model(
     size_px: (u32, u32),
     scale: f32,
     pad: f32,
-    word_chars: &str,
+    selection: &SelectionConfig,
     driving: bool,
 ) -> Vec<Cmd> {
     view.set_padding(pad);
     // Like the padding: stamped here so a view created mid-life (a warm mirror, a
     // freshly opened session) picks the configured set up before it is ever used.
-    view.set_word_chars(word_chars);
+    view.set_selection_config(selection);
     // Straight to `resize` (bypassing `update`'s trivial Resize delegation) so real
     // drivership rides through: only the window that owns the session re-grids it.
     view.resize(state, size_px.0.max(1), size_px.1.max(1), scale, driving)
@@ -793,7 +793,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
-            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
+            selection: SelectionConfig::default(),
             connect: None,
             // Set by the first `view`, before the shell ever presents; no
             // `mark_presented` runs until then.
@@ -838,7 +838,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
-            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
+            selection: SelectionConfig::default(),
             connect: None,
             foreground_painted: Cell::new(false),
         }
@@ -868,7 +868,7 @@ impl RootModel {
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
             pad: 0.0,
-            word_chars: crate::terminal::DEFAULT_WORD_CHARS.to_string(),
+            selection: SelectionConfig::default(),
             connect: None,
             foreground_painted: Cell::new(false),
         };
@@ -1349,24 +1349,24 @@ impl RootModel {
         }
     }
 
-    /// Set the extra word characters for double-click selection, propagating them
-    /// to the live foreground and every warm mirror. Like the padding, this is
-    /// per-view, not session state, so a Ctrl-Tab switch keeps the setting.
-    pub fn set_word_chars(&mut self, extra: &str) {
-        self.word_chars.clear();
-        self.word_chars.push_str(extra);
+    /// Set what double-click selection is configured with, propagating it to the
+    /// live foreground and every warm mirror. Like the padding, this is per-view,
+    /// not session state, so a Ctrl-Tab switch keeps the setting.
+    pub fn set_selection_config(&mut self, cfg: &SelectionConfig) {
+        self.selection = cfg.clone();
         if let Mode::Single { view, .. } = &mut self.mode {
-            view.set_word_chars(extra);
+            view.set_selection_config(cfg);
         }
         for view in self.warm.values_mut() {
-            view.set_word_chars(extra);
+            view.set_selection_config(cfg);
         }
     }
 
-    /// The extra word characters last handed to [`set_word_chars`](Self::set_word_chars).
-    /// Lets the shell (and tests) read back a config hot-reload.
-    pub fn word_chars(&self) -> &str {
-        &self.word_chars
+    /// What was last handed to
+    /// [`set_selection_config`](Self::set_selection_config). Lets the shell (and
+    /// tests) read back a config hot-reload.
+    pub fn selection_config(&self) -> &SelectionConfig {
+        &self.selection
     }
 
     /// The current inner padding (logical px per side) — the value last handed to
@@ -1651,7 +1651,7 @@ impl RootModel {
             // Resize the foreground and every warm background mirror, so a
             // backgrounded session is never left at a stale size (its prompt or a
             // full-screen program like `top` would come back mis-laid-out).
-            let word_chars = self.word_chars.clone();
+            let selection = self.selection.clone();
             let mut cmds = match &mut self.mode {
                 Mode::Single { id, view } => {
                     let driving = self.mine.contains(id);
@@ -1664,7 +1664,7 @@ impl RootModel {
                         self.size_px,
                         self.scale,
                         self.pad,
-                        &word_chars,
+                        &selection,
                         driving,
                     )
                 }
@@ -1681,7 +1681,7 @@ impl RootModel {
                         self.size_px,
                         self.scale,
                         self.pad,
-                        &word_chars,
+                        &selection,
                         driving,
                     ));
                 }
@@ -1989,7 +1989,7 @@ impl RootModel {
             self.size_px,
             self.scale,
             self.pad,
-            &self.word_chars,
+            &self.selection,
             true,
         ));
         // The window title follows the foreground: reassert this session's remembered
@@ -2073,7 +2073,7 @@ impl RootModel {
                 self.size_px,
                 self.scale,
                 self.pad,
-                &self.word_chars,
+                &self.selection,
                 driving,
             );
             // The window title follows the new foreground, not the exited session.
@@ -4099,6 +4099,47 @@ mod tests {
             scale: 2.0,
         });
         assert_eq!(r.grid(), (88, 25));
+    }
+
+    #[test]
+    fn a_session_opened_after_the_config_still_gets_its_selection_rules() {
+        use crate::{SceneItem, SmartRule};
+        // The setter can only reach the views that exist when it runs. A session
+        // adopted later mints a fresh view, which picks the config up where it is
+        // sized — the same trap the padding has, one field over.
+        let mut r = root();
+        r.root.set_selection_config(&crate::SelectionConfig {
+            word_chars: crate::DEFAULT_WORD_CHARS.to_string(),
+            rules: vec![SmartRule::new(r"[a-z]+/(GH-\d+)", 1, 1).unwrap()].into(),
+        });
+        r.update(UiEvent::AdoptSession("beta".into()));
+        feed(&mut r, "beta", b"on fix/GH-1234 today");
+        // Double-click the ticket: the rule matches `fix/GH-1234` and selects the
+        // group, which no word walk would ever cut down to.
+        let (x, y) = (9.0 * 8.0 + 1.0, 1.0);
+        r.update(UiEvent::Pointer {
+            phase: PointerPhase::Motion,
+            button: None,
+            pos: crate::PointPx { x, y },
+            mods: Mods::NONE,
+            wheel: crate::WheelDelta::NONE,
+            clicks: 0,
+        });
+        r.update(UiEvent::Pointer {
+            phase: PointerPhase::Press,
+            button: Some(PointerButton::Left),
+            pos: crate::PointPx { x, y },
+            mods: Mods::NONE,
+            wheel: crate::WheelDelta::NONE,
+            clicks: 2,
+        });
+        let scene = r.view();
+        match scene.terminals().next().unwrap() {
+            SceneItem::Terminal { selection, .. } => {
+                assert_eq!(*selection, Some(crate::Selection::new((0, 7), (0, 13))));
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

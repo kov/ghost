@@ -23,7 +23,6 @@ use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
 use regex::Regex;
 use std::rc::Rc;
-use std::sync::LazyLock;
 
 use std::collections::HashMap;
 
@@ -281,9 +280,9 @@ pub struct TerminalView {
     /// hit-testing and the IME caret. The scene canvas stays the full window, so the
     /// border is filled by the terminal background. 0 = flush to the edges.
     pad: f32,
-    /// Extra characters that count as part of a word for double-click selection,
-    /// on top of the alphanumerics — see [`DEFAULT_WORD_CHARS`].
-    word_chars: String,
+    /// What double-click selection is configured with: the extra word characters
+    /// and the content-aware rules.
+    selection_cfg: SelectionConfig,
     /// Last 1-based `(col, row)` cell the pointer was over (`None` until moved).
     cursor_cell: Option<(u16, u16)>,
     /// Button currently held (drag vs hover).
@@ -1356,10 +1355,10 @@ impl TerminalModel {
         self.view.set_padding(pad_logical)
     }
 
-    /// Set the extra word characters for double-click selection (see
-    /// [`TerminalView::set_word_chars`]).
-    pub fn set_word_chars(&mut self, extra: &str) {
-        self.view.set_word_chars(extra)
+    /// Set what double-click selection is configured with (see
+    /// [`TerminalView::set_selection_config`]).
+    pub fn set_selection_config(&mut self, cfg: &SelectionConfig) {
+        self.view.set_selection_config(cfg)
     }
 
     /// Physical-pixel rect of the text cursor (see
@@ -1398,7 +1397,7 @@ impl TerminalView {
             size_px,
             display_px: None,
             pad: 0.0,
-            word_chars: DEFAULT_WORD_CHARS.to_string(),
+            selection_cfg: SelectionConfig::default(),
             cursor_cell: None,
             held: None,
             gesture_report: false,
@@ -1810,9 +1809,8 @@ impl TerminalView {
     /// Set the extra word characters used by double-click selection (see
     /// [`DEFAULT_WORD_CHARS`]). Takes effect on the next press; a selection
     /// already made is left alone.
-    pub(crate) fn set_word_chars(&mut self, extra: &str) {
-        self.word_chars.clear();
-        self.word_chars.push_str(extra);
+    pub(crate) fn set_selection_config(&mut self, cfg: &SelectionConfig) {
+        self.selection_cfg = cfg.clone();
     }
 
     /// Padding in physical px per side: the logical value scaled by the device factor
@@ -2859,9 +2857,9 @@ impl TerminalView {
         // A word cell is one holding a word character, or the (zero-width) tail
         // of a wide character, which continues whatever head precedes it.
         let word = |line: &Line, i: usize| {
-            line.cells()
-                .get(i)
-                .is_some_and(|c| is_word_char(c.char(), &self.word_chars) || c.width() == 0)
+            line.cells().get(i).is_some_and(|c| {
+                is_word_char(c.char(), &self.selection_cfg.word_chars) || c.width() == 0
+            })
         };
         if !word(self.window_line(state, row)?, col) {
             return None;
@@ -2932,7 +2930,7 @@ impl TerminalView {
     /// `None` when the click is on none of them, leaving the word walk to answer.
     fn content_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
         let (cells, at) = self.logical_line(state, row, col)?;
-        let (a, b) = smart_span(&cells, at)?;
+        let (a, b) = smart_span(&self.selection_cfg.rules, &cells, at)?;
         Some(Selection::new(
             (cells[a].row, cells[a].col),
             (cells[b].row, cells[b].col + cells[b].width - 1),
@@ -3366,7 +3364,8 @@ fn url_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
 /// A shape worth recognizing, and which capture group of it is worth selecting.
 /// Matching wide and selecting narrow is wezterm's `highlight`: the `a/` is what
 /// makes a diff path recognizable as one, and is the last thing you want pasted.
-struct SmartRule {
+#[derive(Debug, Clone)]
+pub struct SmartRule {
     re: Regex,
     /// The capture group that becomes the selection; 0 is the whole match.
     group: usize,
@@ -3375,35 +3374,70 @@ struct SmartRule {
     precision: u8,
 }
 
+impl SmartRule {
+    /// Compile a rule. `precision` is clamped to [`PRECISION_URL`]: a rule may
+    /// tie the URI scanner and win on length, but never outrank an OSC 8
+    /// hyperlink, which is the program's own word on where the link is.
+    pub fn new(pattern: &str, group: usize, precision: u8) -> Result<Self, regex::Error> {
+        Ok(SmartRule {
+            re: Regex::new(pattern)?,
+            group,
+            precision: precision.clamp(PRECISION_RULE, PRECISION_URL),
+        })
+    }
+}
+
 /// The precision tiers. A hyperlink is the program telling us outright, a URI is
 /// a shape we recognize from its scheme, and a rule is a guess from context.
 const PRECISION_LINK: u8 = 3;
 const PRECISION_URL: u8 = 2;
 const PRECISION_RULE: u8 = 1;
 
-/// The rules we ship. Hardcoded for now; a config surface follows once the shape
-/// has settled in use (see docs/selection-design.md).
-static SMART_RULES: LazyLock<Vec<SmartRule>> = LazyLock::new(|| {
-    vec![
+thread_local! {
+    /// The rules we ship, compiled once per thread and shared by every view —
+    /// they are immutable, and a view only ever swaps the whole set.
+    static DEFAULT_RULES: Rc<[SmartRule]> = Rc::from(vec![
         // `git diff` names a file twice, each with a bookkeeping prefix.
-        SmartRule {
-            re: Regex::new(r"\b[ab]/(\S+)").expect("diff path rule is valid"),
-            group: 1,
-            precision: PRECISION_RULE,
-        },
+        SmartRule::new(r"\b[ab]/(\S+)", 1, PRECISION_RULE).expect("diff path rule is valid"),
         // Where compilers and grep point: `path:line` and `path:line:col`.
-        SmartRule {
-            re: Regex::new(r"([^\s:]+):(\d+)(?::(\d+))?").expect("file position rule is valid"),
-            group: 1,
-            precision: PRECISION_RULE,
-        },
-    ]
-});
+        SmartRule::new(r"([^\s:]+):(\d+)(?::(\d+))?", 1, PRECISION_RULE)
+            .expect("file position rule is valid"),
+    ]);
+}
+
+/// The built-in rule set: diff paths and `file:line[:col]`. Configured rules
+/// replace it wholesale rather than adding to it.
+#[must_use]
+pub fn default_smart_rules() -> Rc<[SmartRule]> {
+    DEFAULT_RULES.with(Rc::clone)
+}
+
+/// Everything double-click selection is configured with. The two travel
+/// together — the shell reads both from `[input]`, and every view, warm mirror
+/// and resized model gets both stamped on it — so they plumb as one thing.
+#[derive(Debug, Clone)]
+pub struct SelectionConfig {
+    /// Extra word characters on top of the alphanumerics — see
+    /// [`DEFAULT_WORD_CHARS`].
+    pub word_chars: String,
+    /// The content-aware rules, in no particular order: they all get their say
+    /// and the scoring decides.
+    pub rules: Rc<[SmartRule]>,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        SelectionConfig {
+            word_chars: DEFAULT_WORD_CHARS.to_string(),
+            rules: default_smart_rules(),
+        }
+    }
+}
 
 /// The best content-aware span covering `at`, as inclusive indices into `cells`.
 /// Every rung offers what it found; the surest wins, and within a tier the match
 /// that saw more context does — so a URI inside a diff line is still a URI.
-fn smart_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
+fn smart_span(rules: &[SmartRule], cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
     let mut best: Option<(u8, usize, (usize, usize))> = None;
     let mut offer = |precision: u8, seen: usize, span: (usize, usize)| {
         if best.is_none_or(|(p, len, _)| (precision, seen) > (p, len)) {
@@ -3416,7 +3450,7 @@ fn smart_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
     if let Some(span) = url_span(cells, at) {
         offer(PRECISION_URL, span.1 + 1 - span.0, span);
     }
-    for (precision, seen, span) in rule_spans(cells, at) {
+    for (precision, seen, span) in rule_spans(rules, cells, at) {
         offer(precision, seen, span);
     }
     best.map(|(_, _, span)| span)
@@ -3425,7 +3459,11 @@ fn smart_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
 /// Every rule match containing `at`, as `(precision, whole-match length,
 /// selected span)`. Containment is tested against the *whole* match, so clicking
 /// the `a/` a rule anchors on still selects the path it introduces.
-fn rule_spans(cells: &[LogicalCell], at: usize) -> Vec<(u8, usize, (usize, usize))> {
+fn rule_spans(
+    rules: &[SmartRule],
+    cells: &[LogicalCell],
+    at: usize,
+) -> Vec<(u8, usize, (usize, usize))> {
     // The rules need a string; `at` and the answers are cell indices. `owner`
     // maps each byte back to the character it belongs to, and one past the end
     // to one past the last character, so a match's exclusive end stays exclusive.
@@ -3438,7 +3476,7 @@ fn rule_spans(cells: &[LogicalCell], at: usize) -> Vec<(u8, usize, (usize, usize
     owner.push(cells.len());
 
     let mut found = Vec::new();
-    for rule in SMART_RULES.iter() {
+    for rule in rules {
         for caps in rule.re.captures_iter(&text) {
             let Some(whole) = caps.get(0) else { continue };
             let (start, end) = (owner[whole.start()], owner[whole.end()]);
@@ -4335,12 +4373,35 @@ mod tests {
         }
     }
 
+    /// A selection config with the given extra word characters, keeping the
+    /// built-in rules.
+    fn word_chars_cfg(extra: &str) -> SelectionConfig {
+        SelectionConfig {
+            word_chars: extra.to_string(),
+            ..SelectionConfig::default()
+        }
+    }
+
+    #[test]
+    fn configured_rules_replace_the_built_in_ones() {
+        // A rule of the user's own: pick the ticket out of a branch name. It is
+        // theirs alone, so the built-in diff rule is gone with it.
+        let mut m = model();
+        m.set_selection_config(&SelectionConfig {
+            word_chars: DEFAULT_WORD_CHARS.to_string(),
+            rules: vec![SmartRule::new(r"[a-z]+/(GH-\d+)", 1, 1).unwrap()].into(),
+        });
+        feed(&mut m, b"on fix/GH-1234 and a/src/foo.rs");
+        assert_eq!(double_click_text(&mut m, 0, 10), "GH-1234");
+        assert_eq!(double_click_text(&mut m, 0, 22), "a/src/foo.rs");
+    }
+
     #[test]
     fn the_word_character_set_is_configurable() {
         let mut m = model();
         // Emptying the exceptions leaves bare alphanumerics, so an underscore
         // now breaks the word.
-        m.set_word_chars("");
+        m.set_selection_config(&word_chars_cfg(""));
         feed(&mut m, b"foo bar_baz qux");
         m.update(ptr(PointerPhase::Motion, None, 9.0 * 5.0 + 1.0, 1.0));
         m.update(press_n(9.0 * 5.0 + 1.0, 1.0, 2));
