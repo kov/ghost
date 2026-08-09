@@ -200,9 +200,10 @@ struct Window {
 pub enum Decorations {
     /// The desktop's own frame (a CSD frame from winit, or real server-side
     /// decorations where a compositor offers them).
-    #[default]
     System,
-    /// ghost's, drawn into our own surface.
+    /// ghost's, drawn into our own surface. The default: the frame carries
+    /// window state the desktop's has nowhere to put.
+    #[default]
     Ghost,
 }
 
@@ -426,12 +427,13 @@ impl UiConfig {
     /// edges. Non-finite falls back to the default; otherwise clamped to a sane range
     /// (0 opts out). The shell scales this by the device factor and hands it to the
     /// model, which insets the grid and lets the terminal background fill the border.
-    /// Who draws the window frame. An unrecognized value reads as
-    /// [`Decorations::System`], so a typo never leaves a window with no frame.
+    /// Who draws the window frame. Ours unless the desktop's is asked for by
+    /// name, so an unrecognized value reads as [`Decorations::Ghost`] — the
+    /// frame ghost can put window state into.
     pub fn decorations(&self) -> Decorations {
         match self.window.decorations.as_deref() {
-            Some("ghost") => Decorations::Ghost,
-            _ => Decorations::System,
+            Some("system") => Decorations::System,
+            _ => Decorations::Ghost,
         }
     }
 
@@ -466,26 +468,26 @@ mod tests {
     }
 
     #[test]
-    fn decorations_default_to_the_desktops_own_frame() {
-        // ghost's own frame is opt-in while it is being built, and stays a
-        // supported setting after: a compositor that offers real server-side
-        // decorations should be allowed to draw them.
-        assert_eq!(UiConfig::default().decorations(), Decorations::System);
+    fn decorations_default_to_ghosts_own_frame() {
+        // The frame is ours to build on — it carries window state the desktop's
+        // has nowhere to put — so it is what a window gets unless asked
+        // otherwise. The desktop's frame stays a supported setting.
+        assert_eq!(UiConfig::default().decorations(), Decorations::Ghost);
         assert_eq!(
             UiConfig::parse("").unwrap().decorations(),
-            Decorations::System
+            Decorations::Ghost
         );
-        let c = UiConfig::parse("[window]\ndecorations = \"ghost\"\n").unwrap();
-        assert_eq!(c.decorations(), Decorations::Ghost);
         let c = UiConfig::parse("[window]\ndecorations = \"system\"\n").unwrap();
         assert_eq!(c.decorations(), Decorations::System);
+        let c = UiConfig::parse("[window]\ndecorations = \"ghost\"\n").unwrap();
+        assert_eq!(c.decorations(), Decorations::Ghost);
     }
 
     #[test]
-    fn an_unreadable_decorations_setting_keeps_the_desktops_frame() {
+    fn an_unreadable_decorations_setting_keeps_the_default_frame() {
         // Never fatal, and never a window with no frame at all because of a typo.
         let c = UiConfig::parse("[window]\ndecorations = \"gost\"\n").unwrap();
-        assert_eq!(c.decorations(), Decorations::System);
+        assert_eq!(c.decorations(), Decorations::Ghost);
     }
 
     #[test]

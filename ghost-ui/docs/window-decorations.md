@@ -226,9 +226,11 @@ Verified in the vendored winit (0.30.13):
 
 ### Phases
 
-- **P0 — seam + flag.** `[window] decorations = system | ghost`, default
-  `system`, so the daily driver never rides a half-built frame. Wayland-only:
-  see the settings note below.
+- **P0 — seam + flag.** `[window] decorations = system | ghost`. Opened
+  defaulting to `system`, so the daily driver never rode a half-built frame;
+  now defaults to `ghost`, which is where window state that the desktop's frame
+  has nowhere to put — the selection-freeze notice, and what follows it — is
+  shown. Wayland-only: see the settings note below.
 - **P1 — the edge, ours.** `WindowEdge` grows from bottom-only to all four
   corners, with our own values instead of alphas sampled off sctk's theme.
   Rounding suppressed when maximized or tiled (needs patch 1). Tested as the
