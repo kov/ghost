@@ -1394,6 +1394,17 @@ impl RootModel {
         self.anim.is_some()
     }
 
+    /// What this window's frame should say about the state it is in, if anything
+    /// (see [`crate::frame::Titlebar::notice`]). Only the foreground view can be
+    /// in one: a fleet tile has no freeze of its own, because a shift+drag never
+    /// reaches one — it routes through [`FleetModel::update`], not a tile's view.
+    pub fn chrome_notice(&self) -> Option<&'static str> {
+        match &self.mode {
+            Mode::Single { view, .. } => view.chrome_notice(),
+            Mode::Fleet(_) => None,
+        }
+    }
+
     pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         let cmds = self.update_dispatch(sessions, ev);
         // Mirror ownership changes into the window's single `mine` set at the one

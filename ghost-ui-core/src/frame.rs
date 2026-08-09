@@ -161,6 +161,11 @@ pub struct Titlebar {
     /// The title's colour. The frame signals focus by dimming it.
     pub fg: Rgba,
     pub title: String,
+    /// A mode the window is in — drawn in place of the title, over a bar
+    /// [chilled](chilled) to make the mode obvious. `None` is the ordinary
+    /// window. The frame is where a mode belongs: it costs no content, reads at
+    /// a glance, and leaves the edges of the terminal alone.
+    pub notice: Option<String>,
     /// Em size of the title, in physical px.
     pub font_px: f32,
     /// Which buttons, on which side — the desktop's choice.
@@ -173,6 +178,24 @@ pub struct Titlebar {
     pub maximized: bool,
     /// Scale, for sizing the buttons in physical px.
     pub scale: f32,
+}
+
+/// The cold the bar takes on behind a [notice](Titlebar::notice), and how far it
+/// is carried there.
+const ICE: Rgba = [0.42, 0.72, 0.88, 1.0];
+const ICE_MIX: f32 = 0.45;
+
+/// A bar colour pulled towards ice. Mixed rather than replaced, so the result
+/// still belongs to the desktop's theme — a light bar chills light, a dark one
+/// dark — and the title colour the theme chose keeps its contrast.
+fn chilled(bg: Rgba) -> Rgba {
+    let mix = |from: f32, to: f32| from + (to - from) * ICE_MIX;
+    [
+        mix(bg[0], ICE[0]),
+        mix(bg[1], ICE[1]),
+        mix(bg[2], ICE[2]),
+        bg[3],
+    ]
 }
 
 /// The layer depth the titlebar draws at. Above everything the model builds:
@@ -269,11 +292,18 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
     let mut items = vec![SceneItem::Rect {
         id: SceneId::Titlebar,
         rect: strip,
-        color: bar.bg,
+        color: match bar.notice {
+            Some(_) => chilled(bar.bg),
+            None => bar.bg,
+        },
         radius: 0.0,
     }];
     let buttons = button_rects(&bar.buttons, strip, bar.scale);
-    if !bar.title.is_empty() {
+    // A notice stands in for the title: the mode the window is in matters more
+    // than its name for as long as it lasts, and the compositor still knows the
+    // real title, so the task switcher goes on naming the window properly.
+    let heading = bar.notice.as_ref().unwrap_or(&bar.title);
+    if !heading.is_empty() {
         // Centred between the button groups rather than on the window, so a
         // title long enough to reach them stays clear of them — and a window
         // with buttons on one side only still reads as centred in what is left.
@@ -295,7 +325,7 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
                 w: (right - left).max(0.0),
                 h: strip.h,
             },
-            text: bar.title.clone(),
+            text: heading.clone(),
             color: bar.fg,
             size_px: bar.font_px,
             align: TextAlign::Center,
@@ -530,6 +560,7 @@ mod tests {
             bg: [0.1, 0.1, 0.1, 1.0],
             fg: [1.0, 1.0, 1.0, 1.0],
             title: "ghost".into(),
+            notice: None,
             font_px: 15.0,
             buttons: ButtonLayout::default(),
             hovered: None,
@@ -643,6 +674,74 @@ mod tests {
         };
         assert_eq!(discs(None), 0, "no circles until the pointer is on one");
         assert_eq!(discs(Some(WindowButton::Close)), 1, "and then exactly one");
+    }
+
+    /// The bar's own strip, and every piece of text drawn on it.
+    fn bar_of(scene: &Scene) -> (Rgba, Vec<String>) {
+        let items: Vec<_> = scene.layers.iter().flat_map(|l| &l.items).collect();
+        let strip = items
+            .iter()
+            .find_map(|i| match i {
+                SceneItem::Rect {
+                    id, color, radius, ..
+                } if *id == SceneId::Titlebar && *radius == 0.0 => Some(*color),
+                _ => None,
+            })
+            .expect("the bar is drawn");
+        let text = items
+            .iter()
+            .filter_map(|i| match i {
+                SceneItem::ChromeText { id, text, .. } if *id == SceneId::Titlebar => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        (strip, text)
+    }
+
+    fn window_buttons(scene: &Scene) -> usize {
+        scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter(
+                |i| matches!(i, SceneItem::ChromeText { id, .. } if *id == SceneId::WindowButton),
+            )
+            .count()
+    }
+
+    #[test]
+    fn a_notice_takes_over_the_bar_and_chills_it() {
+        // A window in a mode says so in its frame, where it costs no content and
+        // reads at a glance: the notice stands in for the title and the bar goes
+        // cold behind it. The buttons stay — a window in a mode is still a window.
+        let plain = titlebar(35);
+        let noticed = Titlebar {
+            notice: Some("paused".into()),
+            ..plain.clone()
+        };
+        let before = with_titlebar(content(800, 565), &plain);
+        let after = with_titlebar(content(800, 565), &noticed);
+
+        let (warm, titles) = bar_of(&before);
+        let (cold, said) = bar_of(&after);
+        assert_eq!(titles, vec!["ghost".to_string()], "the title, normally");
+        assert_eq!(
+            said,
+            vec!["paused".to_string()],
+            "the notice, instead of it"
+        );
+        assert_ne!(cold, warm, "a noticed bar does not look like a normal one");
+        assert!(
+            cold[2] > cold[0] && cold[2] > warm[2],
+            "and it reads as cold — bluer than it is red, and than it was: {cold:?}"
+        );
+        assert_eq!(
+            window_buttons(&after),
+            window_buttons(&before),
+            "the window's buttons are not taken away by a notice"
+        );
     }
 
     #[test]

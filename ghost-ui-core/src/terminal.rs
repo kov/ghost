@@ -436,6 +436,11 @@ const FREEZE_IDLE_MS: u64 = 60_000;
 /// How often a frozen view checks its idle timer.
 const FREEZE_POLL_MS: u64 = 1_000;
 
+/// What the window's frame says while a view is frozen. Names the state and the
+/// way out of it — the freeze is easy to enter by accident, and a user who does
+/// not know they are in one is watching a terminal that has apparently died.
+pub const FREEZE_NOTICE: &str = "Paused for selection · Esc to resume";
+
 /// How long a synchronized-output hold may last before the scheduled tick
 /// releases it anyway. Generous for an atomic repaint burst, short enough that
 /// an app dying between BSU and ESU reads as a hiccup, not a hang.
@@ -1373,6 +1378,12 @@ impl TerminalModel {
         self.view.selection(&self.state)
     }
 
+    /// What the window's chrome should say about this view (see
+    /// [`TerminalView::chrome_notice`]).
+    pub fn chrome_notice(&self) -> Option<&'static str> {
+        self.view.chrome_notice()
+    }
+
     /// The window title for this session (see [`SessionState::title`]).
     pub fn title(&self) -> String {
         self.state.title()
@@ -1943,31 +1954,17 @@ impl TerminalView {
             damage: self.damage(state),
         }];
         items.extend(self.hover_underlines(state));
-        items.extend(self.freeze_border(state, rect));
         let mut scene = Scene::new(self.size_px);
         scene.layers.push(Layer::new(0, items));
         scene
     }
 
-    /// The frozen view's outline — the one cue that this window has stopped
-    /// following its session, so a freeze can never be mistaken for a hung
-    /// program. Drawn in the selection color, since the selection is what is
-    /// holding it. No text: the chrome text path doesn't shape at this size
-    /// (see `docs/`), and an outline reads at a glance anyway.
-    fn freeze_border(&self, state: &SessionState, rect: RectPx) -> Option<SceneItem> {
-        self.frozen.as_ref()?;
-        let [r, g, b] = state.theme.cursor;
-        Some(SceneItem::Border {
-            id: SceneId::Root,
-            rect,
-            color: [
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-                0.9,
-            ],
-            width: (2.0 * self.render_scale()).max(1.0),
-        })
+    /// What the window's chrome should say about this view: that it has stopped
+    /// following its session, and how to start it again. A freeze that announced
+    /// itself with nothing but an outline said neither — it read as a hung
+    /// program, and gave no way out. See [`crate::frame::Titlebar::notice`].
+    pub fn chrome_notice(&self) -> Option<&'static str> {
+        self.frozen.as_ref().map(|_| FREEZE_NOTICE)
     }
 
     /// Thin underline rects over every visible run of the Ctrl/Cmd-hovered
@@ -7117,13 +7114,9 @@ mod tests {
         m.update(UiEvent::Tick { now_ms })
     }
 
-    /// Whether the drawn scene carries the frozen-view outline.
-    fn shows_freeze_border(m: &TerminalModel) -> bool {
-        m.view()
-            .layers
-            .iter()
-            .flat_map(|l| l.items.iter())
-            .any(|i| matches!(i, SceneItem::Border { .. }))
+    /// What the window's chrome says about this view, if anything.
+    fn notice(m: &TerminalModel) -> Option<&'static str> {
+        m.chrome_notice()
     }
 
     fn copy_text(m: &mut TerminalModel) -> Option<String> {
@@ -7154,9 +7147,13 @@ mod tests {
             Some("keep-this-line"),
             "and what a copy reads"
         );
+        // A stopped view has to say so, or it reads as a hung program — and it
+        // has to say how to start it again, which an outline never could.
+        let said = notice(&m).expect("the chrome says the view is paused");
+        assert_eq!(said, FREEZE_NOTICE);
         assert!(
-            shows_freeze_border(&m),
-            "a stopped view says so, so it is never read as a hung program"
+            said.contains("Esc"),
+            "the notice names the way out of the freeze: {said:?}"
         );
     }
 
@@ -7192,7 +7189,7 @@ mod tests {
             1.0,
         ));
         assert!(m.selection().is_none(), "the click dismissed the selection");
-        assert!(!shows_freeze_border(&m), "and the outline went with it");
+        assert_eq!(notice(&m), None, "and the chrome went back to normal");
         assert_eq!(
             top_row_text(&m),
             "rewritten-line",
@@ -7213,6 +7210,7 @@ mod tests {
         );
         assert!(m.selection().is_none());
         assert_eq!(top_row_text(&m), "rewritten-line");
+        assert_eq!(notice(&m), None, "the chrome stops saying it is paused");
         // Unfrozen, Escape is the child's again.
         let cmds = key(&mut m, Key::Named(NamedKey::Escape), Mods::NONE);
         assert!(

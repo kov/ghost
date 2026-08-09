@@ -2451,6 +2451,7 @@ impl Graphics {
             bg,
             fg,
             title: w.title.clone(),
+            notice: w.root.chrome_notice().map(str::to_string),
             font_px: desktop::desktop_font().px_size(scale),
             buttons: desktop::button_layout(),
             hovered: w.hovered_button,
