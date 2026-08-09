@@ -2044,15 +2044,15 @@ fn edge_window() -> (std::rc::Rc<ghost_render::Frame>, u32, u32) {
     (frame, 40 * 9, 8 * 18)
 }
 
-/// The frame's own shadow, sampled across the notch a rounded corner opens —
-/// the same call the frontend makes, so the test pins the real profile rather
-/// than a number copied out of it.
+/// The window shadow sampled across the notch a rounded corner opens — the same
+/// call the frontend makes, so the test pins the real profile rather than a
+/// number copied out of it.
 fn frame_shadow(focused: bool) -> [f32; ghost_renderer::EDGE_SHADOW_STEPS] {
     let mut lut = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
     let reach = 10.0 * (std::f32::consts::SQRT_2 - 1.0);
     for (i, a) in lut.iter_mut().enumerate() {
         let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-        *a = sctk_adwaita::shadow::bottom_corner_alpha(d, focused);
+        *a = ghost_renderer::shadow::bottom_corner_alpha(d, focused);
     }
     lut
 }

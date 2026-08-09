@@ -203,11 +203,11 @@ corners, hairline, outline ring, shadow — in `ghost-renderer`.
 
 ### Why much of this is deletion
 
-Today the frame is split between two owners: sctk-adwaita draws the titlebar,
-the top corners and the shadow, and we draw the bottom corners, the hairline,
+The frame used to be split between two owners: sctk-adwaita drew the titlebar,
+the top corners and the shadow, and we drew the bottom corners, the hairline,
 the outline ring, and a hand-sampled shadow laid into the notch its subsurfaces
-cannot reach (`WindowEdge::corner_shadow`). Owning the whole surface collapses
-that seam rather than adding to it.
+could not reach (`WindowEdge::corner_shadow`). Owning the whole surface
+collapsed that seam rather than adding to it — and took the crate with it.
 
 ### What winit gives us, and the two patches it needs
 
@@ -236,7 +236,7 @@ Verified in the vendored winit (0.30.13):
   Wayland, the desktop's on X11 and macOS. A leftover `decorations = …` key in
   a config is ignored rather than an error.
 - **P1 — the edge, ours.** `WindowEdge` grows from bottom-only to all four
-  corners, with our own values instead of alphas sampled off sctk's theme.
+  corners, with our own values instead of alphas sampled off a frame crate.
   Rounding suppressed when maximized or tiled (needs patch 1). Tested as the
   edge already is, with `ghost-shot` pixel assertions.
 - **P2 — resize.** The eight resize edges, per-edge cursors, and
@@ -271,14 +271,16 @@ Verified in the vendored winit (0.30.13):
   handles. That is the GTK model (see `_GTK_FRAME_EXTENTS` above) and it buys
   back the libadwaita-fitted shadow, drawn by us into the margin and dropped
   when maximized or tiled. `EDGE_SHADOW_STEPS`, `corner_shadow` and the notch
-  apparatus then go, along with `ghost-renderer`'s dev-dependency on
-  sctk-adwaita for shadow-profile pinning.
-- **P5 — retire the frame.** Done ahead of P4: the default flipped, the flag
-  went, and with it `ghost-ui/src/title.rs` — nothing fills the vendored title
-  hook now that the frame it patched is never built. What remains of that
-  vendoring is the shadow curve and `ColorTheme`, both still read. The hook
-  patch itself is inert and can be offered upstream or dropped.
-  `ghost_shaper::paint_text` stays; it was always the reusable half.
+  apparatus then go.
+- **P5 — retire the frame.** Done ahead of P4, in two steps. The default
+  flipped and the flag went, and with it `ghost-ui/src/title.rs` — nothing fills
+  the title-renderer hook once the frame it patched is never built. Then the
+  vendored sctk-adwaita itself: of ~1200 diverged lines, all that was still read
+  were the libadwaita-fitted shadow curve and the Adwaita palette, so both were
+  adopted outright (`ghost-renderer/src/shadow.rs`, `desktop::frame_colors`) and
+  the crate, its four patches and winit's `wayland-csd-adwaita` feature all went.
+  Asking a decoration crate what our own window looks like was the wrong way
+  round. `ghost_shaper::paint_text` stays; it was always the reusable half.
 
 ### Settled scope
 

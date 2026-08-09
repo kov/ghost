@@ -14,9 +14,9 @@
 use crate::PointPx;
 use ghost_render::scene::{Layer, RectPx, Rgba, Scene, SceneId, SceneItem, TextAlign};
 
-/// How tall the titlebar we draw is, in logical pixels. sctk-adwaita's
-/// `HEADER_SIZE`, so a window whose frame we took over is the same height as
-/// one whose frame we didn't, and as every other window on the desktop.
+/// How tall the titlebar we draw is, in logical pixels. GTK's `HEADER_SIZE`, so
+/// a window whose frame we took over is the same height as one whose frame we
+/// didn't, and as every other window on the desktop.
 pub const BAR_HEIGHT: f32 = 35.0;
 
 /// The titlebar's height in physical pixels — 0 when the desktop draws the
@@ -381,8 +381,8 @@ pub const RESIZE_BAND: f32 = 6.0;
 
 /// How far a corner's grab reaches along each edge, in logical pixels — a
 /// corner is easier to hit than a hairline of edge, and grabbing one resizes
-/// both axes at once. sctk-adwaita's `RESIZE_HANDLE_CORNER_SIZE`, so ours is as
-/// forgiving as the frame we are replacing.
+/// both axes at once. GTK's `RESIZE_HANDLE_CORNER_SIZE`, so ours is as forgiving
+/// as the frame we replaced.
 pub const RESIZE_CORNER: f32 = 24.0;
 
 /// What the window can offer the pointer right now.

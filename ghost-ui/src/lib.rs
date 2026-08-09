@@ -2026,9 +2026,8 @@ struct EdgeState {
 /// documentation this implements.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn window_edge_for(state: EdgeState) -> WindowEdge {
-    // sctk-adwaita's `CORNER_RADIUS`, so our bottom corners continue the curve
-    // its titlebar starts — and, once we draw the whole frame, the radius the
-    // windows beside us on this desktop wear.
+    // GTK's `CORNER_RADIUS`: the radius the windows beside us on this desktop
+    // wear, and the one our own titlebar starts the curve at.
     const RADIUS: f32 = 10.0;
     let radius = if state.opaque || state.boxed_in {
         0.0
@@ -2042,9 +2041,9 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
     } else {
         ghost_renderer::Corners::default()
     };
-    // Rounding a corner cuts a notch out of the window that the frame's own
-    // subsurfaces cannot reach into, so we finish its shadow ourselves —
-    // sampled from the frame, at the depth this radius opens up.
+    // Rounding a corner cuts a notch out of the window that the desktop's frame
+    // cannot reach into, so we finish its shadow ourselves — the same profile,
+    // at the depth this radius opens up.
     //
     // Our own decorations cast no shadow at all yet: there is no frame, and no
     // margin outside the window to cast into. Continuing one there paints a grey
@@ -2057,7 +2056,7 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
     if !state.own_frame {
         for (i, a) in corner_shadow.iter_mut().enumerate() {
             let d = reach * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-            *a = sctk_adwaita::shadow::bottom_corner_alpha(d, state.focused);
+            *a = ghost_renderer::shadow::bottom_corner_alpha(d, state.focused);
         }
     }
     // The dark ring the frame draws around the window, which stops short of
@@ -2091,9 +2090,10 @@ fn window_edge_for(state: EdgeState) -> WindowEdge {
 
 /// How far out of the window we keep room for its shadow, in logical pixels.
 ///
-/// The falloff is spent well inside this — under 0.005 by ~25 logical pixels —
-/// and past the shadow the same room is the resize grab area, which is why
-/// sctk reserves a good deal more than the shadow strictly needs.
+/// The falloff is spent well inside this — under 0.005 by ~25 logical pixels
+/// (see [`ghost_renderer::shadow::SHADOW_REACH`]). Past the shadow the same room
+/// would be resize grab area, which is why the frame we replaced reserved a good
+/// deal more than the shadow strictly needs.
 #[cfg(all(unix, not(target_os = "macos")))]
 const SHADOW_MARGIN: f32 = 26.0;
 
@@ -2108,13 +2108,13 @@ fn window_shadow(state: EdgeState) -> (ghost_renderer::EdgeMargins, ghost_render
     if !state.own_frame || state.boxed_in {
         return Default::default();
     }
-    // Sampled from the same layers the frame we are replacing casts, so a
-    // ghost-framed window sits in the same light as the rest of the desktop.
+    // The same layers a GNOME window casts, so a ghost window sits in the same
+    // light as the rest of the desktop.
     let profile = |down: f32| {
         let mut lut = [0.0; ghost_renderer::EDGE_SHADOW_STEPS];
         for (i, a) in lut.iter_mut().enumerate() {
             let d = SHADOW_MARGIN * i as f32 / (ghost_renderer::EDGE_SHADOW_STEPS - 1) as f32;
-            *a = sctk_adwaita::shadow::edge_alpha(d, down, state.focused);
+            *a = ghost_renderer::shadow::edge_alpha(d, down, state.focused);
         }
         lut
     };
@@ -2383,21 +2383,10 @@ impl Graphics {
         WindowEdge::default()
     }
 
-    /// Alpha of the frame's outer border, asked once.
-    ///
-    /// `ColorTheme::auto()` picks light or dark by *spawning `dbus-send`* and
-    /// waiting up to 100ms for the portal, so it must not be on the path of
-    /// something as ordinary as a resize. The frame reads it once for the same
-    /// reason, and does not follow a live light/dark switch either.
+    /// Alpha of the window's outer border — see [`desktop::FrameColors::outline`].
     #[cfg(all(unix, not(target_os = "macos")))]
     fn frame_outline() -> f32 {
-        static OUTLINE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        *OUTLINE.get_or_init(|| {
-            sctk_adwaita::theme::ColorTheme::auto()
-                .active
-                .outer_border
-                .alpha()
-        })
+        desktop::frame_colors(true).outline
     }
 
     /// Our titlebar's height in physical pixels, or 0 when the desktop draws the
@@ -2435,10 +2424,7 @@ impl Graphics {
     /// The titlebar to draw over this window's content: its height, its colours
     /// for the window's current focus, and the title.
     ///
-    /// The colours come from the same desktop theme the CSD frame we are
-    /// replacing uses, so a ghost-framed window sits alongside the rest of the
-    /// desktop rather than beside it. Read once, for the reason
-    /// [`frame_outline`](Self::frame_outline) explains.
+    /// The colours are the desktop's — see [`desktop::frame_colors`].
     fn titlebar(&self, w: &WindowState) -> ghost_ui_core::frame::Titlebar {
         let (bg, fg) = Self::titlebar_colors(w.focused);
         let scale = self.window.scale_factor() as f32;
@@ -2461,20 +2447,8 @@ impl Graphics {
     /// or backdropped window.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn titlebar_colors(focused: bool) -> (ghost_render::scene::Rgba, ghost_render::scene::Rgba) {
-        static THEME: std::sync::OnceLock<[[[f32; 4]; 2]; 2]> = std::sync::OnceLock::new();
-        let t = THEME.get_or_init(|| {
-            let theme = sctk_adwaita::theme::ColorTheme::auto();
-            let rgba = |c: sctk_adwaita::theme::Color| [c.red(), c.green(), c.blue(), c.alpha()];
-            [
-                [
-                    rgba(theme.inactive.headerbar),
-                    rgba(theme.inactive.font_color),
-                ],
-                [rgba(theme.active.headerbar), rgba(theme.active.font_color)],
-            ]
-        });
-        let pair = t[usize::from(focused)];
-        (pair[0], pair[1])
+        let c = desktop::frame_colors(focused);
+        (c.bg, c.fg)
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]

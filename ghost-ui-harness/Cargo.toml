@@ -17,6 +17,14 @@ ghost-vt = { path = "../ghost-vt" }
 # Only the optional windowed test (tests/windowed.rs) needs a real window + surface.
 # winit resolves to the workspace's vendored copy via [patch.crates-io]; wgpu/pollster
 # match the app so the surface device and the renderer device are the same wgpu.
-winit = "0.30"
+# Default features minus `wayland-csd-adwaita`: winit only builds a CSD frame for a
+# window that asks to be decorated, and ghost never does — it draws its own. Off,
+# the whole Adwaita frame (and tiny-skia, and ab_glyph) leaves the build.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
 wgpu = "29"
 pollster = "0.4"

@@ -1,21 +1,26 @@
 //! What the desktop tells us about how a window should look: the titlebar font,
-//! which window buttons go on which side, and what a double-click on the bar
-//! does.
+//! which window buttons go on which side, what a double-click on the bar does,
+//! and the colours to draw the bar in.
 //!
 //! All of it comes from GNOME's `gsettings`, which is a subprocess — so each is
 //! asked once and remembered. None of them change mid-session in practice, and
-//! the CSD frame we are replacing reads its own copies once for the same reason.
+//! the CSD frame we replaced read its own copies once for the same reason.
 
+use ghost_render::scene::Rgba;
 use ghost_ui_core::frame::ButtonLayout;
 
-/// Read one `org.gnome.desktop.wm.preferences` key, or `None` if gsettings
-/// cannot answer (not GNOME, not installed, no session bus).
-fn wm_preference(key: &str) -> Option<String> {
+/// Read one key of one schema, or `None` if gsettings cannot answer (not GNOME,
+/// not installed, no session bus).
+fn setting(schema: &str, key: &str) -> Option<String> {
     let out = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.wm.preferences", key])
+        .args(["get", schema, key])
         .output()
         .ok()?;
     String::from_utf8(out.stdout).ok()
+}
+
+fn wm_preference(key: &str) -> Option<String> {
+    setting("org.gnome.desktop.wm.preferences", key)
 }
 
 /// The desktop's configured titlebar font: family, style and point size, as
@@ -99,6 +104,81 @@ pub fn button_layout() -> ButtonLayout {
                 .unwrap_or_else(|| ButtonLayout::parse(":close"))
         })
         .clone()
+}
+
+/// The colours a window frame is drawn in, for one focus state.
+///
+/// Adwaita's, transcribed from the GTK and libadwaita stylesheets — the same
+/// values the CSD frame we replaced used, so a ghost window sits alongside the
+/// rest of the desktop rather than beside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameColors {
+    /// The headerbar fill.
+    pub bg: Rgba,
+    /// The title text on it.
+    pub fg: Rgba,
+    /// The hairline traced around the outside of the whole window: the last
+    /// layer of Adwaita's `decoration` box-shadow, `0 0 0 1px rgba(0,0,0,0.75)`
+    /// dark and `rgba(0,0,0,0.23)` light, both read out of the stylesheets
+    /// compiled into `libgtk-3.so.0`. The dark value matches a measured
+    /// gnome-terminal edge (~0.73 over the wallpaper).
+    ///
+    /// libadwaita's own is a far fainter `rgb(0 0 0/5%)`, but it can afford
+    /// that: a GTK4 window is opaque, so its *fill* draws the edge and the ring
+    /// only darkens the transition. ghost is translucent — at 5% there is
+    /// nothing at the boundary at all, and the outline stops dead where the
+    /// headerbar ends.
+    pub outline: f32,
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// Whether the desktop asks for a dark window frame. `color-scheme` is GNOME's
+/// own key; the cross-desktop route is the `org.freedesktop.appearance` portal,
+/// which is worth reaching for only once a non-GNOME desktop is in the picture.
+fn prefer_dark() -> bool {
+    setting("org.gnome.desktop.interface", "color-scheme")
+        .is_some_and(|s| s.contains("prefer-dark"))
+}
+
+/// The frame colours for a focused or backdropped window, asked once.
+///
+/// Read once for the reason the module docs give, and so a light/dark switch
+/// mid-session does not repaint half the windows — the frame does not follow
+/// one, exactly as the frame it replaced did not.
+pub fn frame_colors(focused: bool) -> FrameColors {
+    static COLORS: std::sync::OnceLock<[FrameColors; 2]> = std::sync::OnceLock::new();
+    COLORS.get_or_init(|| {
+        if prefer_dark() {
+            [
+                FrameColors {
+                    bg: rgb(34, 34, 38),
+                    fg: rgb(144, 144, 144),
+                    outline: 191.0 / 255.0,
+                },
+                FrameColors {
+                    bg: rgb(46, 46, 50),
+                    fg: rgb(255, 255, 255),
+                    outline: 191.0 / 255.0,
+                },
+            ]
+        } else {
+            [
+                FrameColors {
+                    bg: rgb(250, 250, 251),
+                    fg: rgb(150, 150, 150),
+                    outline: 59.0 / 255.0,
+                },
+                FrameColors {
+                    bg: rgb(255, 255, 255),
+                    fg: rgb(47, 47, 47),
+                    outline: 59.0 / 255.0,
+                },
+            ]
+        }
+    })[usize::from(focused)]
 }
 
 /// What a double-click on the titlebar does.
@@ -204,6 +284,35 @@ mod tests {
         assert_eq!(DoubleClick::parse("lower"), DoubleClick::None);
         // An unknown value falls back to what GNOME ships as the default.
         assert_eq!(DoubleClick::parse("wat"), DoubleClick::ToggleMaximize);
+    }
+
+    #[test]
+    fn the_frame_wears_the_desktops_own_colours() {
+        // Transcribed values, so what they are worth pinning against is
+        // Adwaita itself: a headerbar that is #2e2e32 dark and white light,
+        // legible title text on each, and the outer ring at the stylesheet's
+        // 0.75 / 0.23 rather than libadwaita's 5%, which vanishes against a
+        // translucent window.
+        let dark = FrameColors {
+            bg: rgb(46, 46, 50),
+            fg: rgb(255, 255, 255),
+            outline: 191.0 / 255.0,
+        };
+        assert!((dark.outline - 0.75).abs() < 0.01);
+        let light = FrameColors {
+            bg: rgb(255, 255, 255),
+            fg: rgb(47, 47, 47),
+            outline: 59.0 / 255.0,
+        };
+        assert!((light.outline - 0.23).abs() < 0.01);
+        // Whichever this desktop asks for, a focused window's bar stands
+        // forward of a backdropped one and its title is the stronger of the
+        // two against it.
+        let (focused, backdrop) = (frame_colors(true), frame_colors(false));
+        assert!(focused == dark || focused == light);
+        let contrast = |c: &FrameColors| (c.fg[0] - c.bg[0]).abs();
+        assert!(contrast(&focused) > contrast(&backdrop));
+        assert_ne!(focused.bg, backdrop.bg);
     }
 
     #[test]

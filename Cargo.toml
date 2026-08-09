@@ -17,9 +17,9 @@ members = [
     "ghost-shot",
     "xtask",
 ]
-# The vendored winit, wgpu-core and sctk-adwaita (see the patches below) are
-# their own packages, not members.
-exclude = ["vendor/winit", "vendor/wgpu-core", "vendor/sctk-adwaita"]
+# The vendored winit and wgpu-core (see the patches below) are their own
+# packages, not members.
+exclude = ["vendor/winit", "vendor/wgpu-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -63,22 +63,12 @@ debug = true
 #   burned ids, ~8GB, in one overnight session). The id is now allocated only
 #   once there is a texture to assign — see vendor/wgpu-core/src/present.rs.
 #
-# Vendored sctk-adwaita 0.10.1 (MIT) carrying one local patch, to be reported
-# upstream and then dropped:
-# - The window drop shadow was so diffuse it read as no shadow at all: it
-#   peaked at ~0.21 alpha and smeared that over 43px, where a real libadwaita
-#   window peaks at ~0.30 and is gone within ~15px. Refitted against a
-#   measured GTK4 window — see vendor/sctk-adwaita/src/shadow.rs.
-# - The titlebar text is drawn from ONE font face with no shaping and no color
-#   glyphs, so any character that face lacks came out as `.notdef` or as
-#   nothing. Added a renderer seam (`title::set_title_renderer`) the application
-#   fills with its own text stack — see vendor/sctk-adwaita/src/title/hook.rs.
-#   Nothing fills it any more: ghost draws its own frame, so the frame this
-#   patched is never built. Worth offering upstream, or dropping.
-#
-# ghost draws its own frame on Wayland, so what it takes from this crate is the
-# desktop's colours and the shadow curve — see ghost-ui/docs/window-decorations.md.
+# sctk-adwaita was vendored here too, for the CSD frame winit drew our windows
+# with. ghost draws its own frame now, so the frame, the crate and the four
+# patches we carried on it are all gone — the two pieces still worth having, the
+# libadwaita-fitted shadow curve and the Adwaita palette, were adopted outright
+# (ghost-renderer/src/shadow.rs and ghost-ui/src/desktop.rs). winit's
+# `wayland-csd-adwaita` feature is off for the same reason.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 wgpu-core = { path = "vendor/wgpu-core" }
-sctk-adwaita = { path = "vendor/sctk-adwaita" }

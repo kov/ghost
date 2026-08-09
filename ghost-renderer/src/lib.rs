@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use rayon::prelude::*;
 
+pub mod shadow;
 pub mod target;
 pub use target::{FrameOutcome, SurfaceTarget, Target, presentable};
 

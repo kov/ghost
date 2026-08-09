@@ -33,7 +33,15 @@ ghost-vt = { path = "../ghost-vt" }
 ghost-term = { path = "../ghost-term" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-winit = "0.30"
+# Default features minus `wayland-csd-adwaita`: winit only builds a CSD frame for a
+# window that asks to be decorated, and ghost never does — it draws its own. Off,
+# the whole Adwaita frame (and tiny-skia, and ab_glyph) leaves the build.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
 wgpu = "29"
 pollster = "0.4"
 png = "0.18"
@@ -57,11 +65,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
-# The desktop theme the CSD frame is drawn from (vendored, patched — see the
-# root manifest). We draw the frame ourselves now, so what we take from it is
-# the colours and the shadow: asked for rather than copied, so a ghost window
-# sits alongside the rest of the desktop.
-sctk-adwaita = "0.10"
 # Emoji_Presentation property data: chars that default to emoji presentation
 # route font fallback through fontconfig's `emoji` generic family, so they get
 # the color emoji font instead of whatever monochrome face covers them.
