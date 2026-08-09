@@ -57,9 +57,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
-# The CSD frame winit draws our window with (vendored, patched — see the root
-# manifest). A direct dep so the shadow we lay into the corners we round is the
-# frame's own, asked for rather than copied.
+# The desktop theme the CSD frame is drawn from (vendored, patched — see the
+# root manifest). We draw the frame ourselves now, so what we take from it is
+# the colours and the shadow: asked for rather than copied, so a ghost window
+# sits alongside the rest of the desktop.
 sctk-adwaita = "0.10"
 # Emoji_Presentation property data: chars that default to emoji presentation
 # route font fallback through fontconfig's `emoji` generic family, so they get
@@ -93,8 +94,3 @@ tempfile = "3"
 pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["termios"] }
 serde_json = "1.0.150"
-
-# The titlebar test drives the CSD frame's real `TitleText`, whose color type
-# is tiny-skia's. Same 0.11 line the vendored frame uses, so it is the same type
-# and no new crate is compiled.
-tiny-skia = "0.11"

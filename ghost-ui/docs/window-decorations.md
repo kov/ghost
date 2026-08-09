@@ -226,11 +226,15 @@ Verified in the vendored winit (0.30.13):
 
 ### Phases
 
-- **P0 — seam + flag.** `[window] decorations = system | ghost`. Opened
-  defaulting to `system`, so the daily driver never rode a half-built frame;
-  now defaults to `ghost`, which is where window state that the desktop's frame
-  has nowhere to put — the selection-freeze notice, and what follows it — is
-  shown. Wayland-only: see the settings note below.
+- **P0 — seam + flag.** `[window] decorations = system | ghost`, opened
+  defaulting to `system` so the daily driver never rode a half-built frame.
+  Then the default flipped to `ghost` — the frame is where window state the
+  desktop's has nowhere to put goes (the selection-freeze notice, and what
+  follows it) — and the flag was **removed**: a fallback nothing exercises only
+  diverges, and the two frames had already stopped agreeing about what a window
+  can say. Who draws the frame is now a platform fact, not a setting: ours on
+  Wayland, the desktop's on X11 and macOS. A leftover `decorations = …` key in
+  a config is ignored rather than an error.
 - **P1 — the edge, ours.** `WindowEdge` grows from bottom-only to all four
   corners, with our own values instead of alphas sampled off sctk's theme.
   Rounding suppressed when maximized or tiled (needs patch 1). Tested as the
@@ -269,9 +273,12 @@ Verified in the vendored winit (0.30.13):
   when maximized or tiled. `EDGE_SHADOW_STEPS`, `corner_shadow` and the notch
   apparatus then go, along with `ghost-renderer`'s dev-dependency on
   sctk-adwaita for shadow-profile pinning.
-- **P5 — retire the frame.** Flip the default, drop vendored sctk-adwaita and
-  the title hook. `ghost_shaper::paint_text` stays; it was always the reusable
-  half.
+- **P5 — retire the frame.** Done ahead of P4: the default flipped, the flag
+  went, and with it `ghost-ui/src/title.rs` — nothing fills the vendored title
+  hook now that the frame it patched is never built. What remains of that
+  vendoring is the shadow curve and `ColorTheme`, both still read. The hook
+  patch itself is inert and can be offered upstream or dropped.
+  `ghost_shaper::paint_text` stays; it was always the reusable half.
 
 ### Settled scope
 
@@ -280,13 +287,13 @@ Verified in the vendored winit (0.30.13):
   change; bolting them onto the parity work means neither can be judged on its
   own, and it keeps macOS out of scope for longer (the bar is the only reason
   macOS would re-enter, and its backing-scale issue is unresolved).
-- **Ghost CSD stays behind the flag until P4 lands.** The shadow was fitted
-  against a measured GTK4 window; a shadowless interim default is the kind of
-  temporary that stays.
-- **Wayland only, and `system` is a real setting.** Mutter never offers
-  server-side decorations, but KDE does, and X11 has no shadow without
-  `_GTK_FRAME_EXTENTS`. `decorations = system` is supported configuration, not a
-  debug escape hatch.
+- **Wayland only.** Mutter never offers server-side decorations, so there the
+  frame is client-side either way and taking it over changes only who paints
+  pixels we already own. On X11 the window manager's frame is real — and there
+  is no shadow without `_GTK_FRAME_EXTENTS` — so the desktop keeps it; macOS
+  keeps its native traffic lights until the mac CSD work lands. The consequence
+  to hold onto: anything the frame alone can say (the freeze notice) is unsaid
+  on those platforms.
 
 ## Open question (revisit only if pursuing Custom-on-mac)
 

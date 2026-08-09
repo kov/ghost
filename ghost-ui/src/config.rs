@@ -188,23 +188,6 @@ struct Window {
     /// Inner padding in logical px per side between the terminal grid and the window
     /// edges (clamped on apply). DPI-scaled, filled with the terminal background.
     padding: f32,
-    /// Who draws the window frame: `"system"` (the default) leaves it to the
-    /// desktop — which on GNOME means winit's CSD frame, since mutter offers no
-    /// server-side decorations — and `"ghost"` draws our own. Anything else
-    /// reads as `"system"`. See ghost-ui/docs/window-decorations.md.
-    decorations: Option<String>,
-}
-
-/// Who draws the window frame — see [`Window::decorations`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Decorations {
-    /// The desktop's own frame (a CSD frame from winit, or real server-side
-    /// decorations where a compositor offers them).
-    System,
-    /// ghost's, drawn into our own surface. The default: the frame carries
-    /// window state the desktop's has nowhere to put.
-    #[default]
-    Ghost,
 }
 
 impl Default for Window {
@@ -216,7 +199,6 @@ impl Default for Window {
             columns: DEFAULT_COLUMNS,
             rows: DEFAULT_ROWS,
             padding: DEFAULT_PADDING,
-            decorations: None,
         }
     }
 }
@@ -427,16 +409,6 @@ impl UiConfig {
     /// edges. Non-finite falls back to the default; otherwise clamped to a sane range
     /// (0 opts out). The shell scales this by the device factor and hands it to the
     /// model, which insets the grid and lets the terminal background fill the border.
-    /// Who draws the window frame. Ours unless the desktop's is asked for by
-    /// name, so an unrecognized value reads as [`Decorations::Ghost`] — the
-    /// frame ghost can put window state into.
-    pub fn decorations(&self) -> Decorations {
-        match self.window.decorations.as_deref() {
-            Some("system") => Decorations::System,
-            _ => Decorations::Ghost,
-        }
-    }
-
     pub fn padding(&self) -> f32 {
         if self.window.padding.is_finite() {
             self.window.padding.clamp(0.0, MAX_PADDING)
@@ -468,26 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn decorations_default_to_ghosts_own_frame() {
-        // The frame is ours to build on — it carries window state the desktop's
-        // has nowhere to put — so it is what a window gets unless asked
-        // otherwise. The desktop's frame stays a supported setting.
-        assert_eq!(UiConfig::default().decorations(), Decorations::Ghost);
-        assert_eq!(
-            UiConfig::parse("").unwrap().decorations(),
-            Decorations::Ghost
-        );
-        let c = UiConfig::parse("[window]\ndecorations = \"system\"\n").unwrap();
-        assert_eq!(c.decorations(), Decorations::System);
-        let c = UiConfig::parse("[window]\ndecorations = \"ghost\"\n").unwrap();
-        assert_eq!(c.decorations(), Decorations::Ghost);
-    }
-
-    #[test]
-    fn an_unreadable_decorations_setting_keeps_the_default_frame() {
-        // Never fatal, and never a window with no frame at all because of a typo.
-        let c = UiConfig::parse("[window]\ndecorations = \"gost\"\n").unwrap();
-        assert_eq!(c.decorations(), Decorations::Ghost);
+    fn a_leftover_decorations_setting_is_harmless() {
+        // Who draws the frame stopped being a setting: ghost draws it wherever it
+        // can. A config written while it was one must not become a config that
+        // fails to load, and nothing else in it may be lost either.
+        let c = UiConfig::parse("[window]\ndecorations = \"system\"\ncolumns = 100\n").unwrap();
+        assert_eq!(c.columns(), 100);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The window frame ghost draws itself: which part of it the pointer is over.
 //!
-//! With `[window] decorations = "ghost"` there is no CSD frame above us doing
-//! this, so the resize edges are ours to find. The compositor still performs the
+//! Where ghost draws its own frame there is no CSD frame above us doing this,
+//! so the resize edges are ours to find. The compositor still performs the
 //! resize — the shell only says "the user grabbed this edge" — but *which* edge,
 //! and whether there is one to grab at all, is decided here so it is settled in
 //! tests rather than only in front of a compositor.
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn the_desktops_own_frame_keeps_its_edges() {
-        // With system decorations the frame around us handles resizing; reaching
+        // Where the desktop frames us it handles resizing too; reaching
         // for the same edges would fight it.
         let system = FrameGrab {
             own_frame: false,

@@ -43,7 +43,6 @@ mod resize;
 /// The CSD frame's titlebar text, drawn with ghost's own font stack. Linux
 /// only: every other platform draws its own titlebar.
 #[cfg(target_os = "linux")]
-pub mod title;
 mod windows;
 
 use instance::LastExit;
@@ -1661,11 +1660,6 @@ fn interactive(fresh: bool, ssh_window: bool) {
         .with_writer(std::io::stderr)
         .try_init();
 
-    // The CSD frame builds its title renderer when the first window is created,
-    // so ghost's text stack has to be in place before that — see `title`.
-    #[cfg(target_os = "linux")]
-    title::install();
-
     // Bench mode (`GHOST_BENCH=dive`/`slide`) drives a scripted animation against
     // this same real path with a synthetic session list, so it opens with no host.
     let harness = bench::Harness::from_env();
@@ -2161,8 +2155,23 @@ impl Graphics {
             cols,
             rows,
             pad,
-            decorations,
         } = spec;
+        // ghost draws its own frame wherever taking it over changes only who
+        // paints pixels we already own — Wayland, where the frame is a
+        // client-side one anyway (mutter offers no server-side decorations). On
+        // X11 the window manager's frame is real, and replacing it would mean
+        // reimplementing what it does for us; on macOS the native traffic lights
+        // stay. Decided once, here: it sets both how tall the window opens and
+        // whether we ask for the desktop's frame at all, and those two must agree.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let own_frame = {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            event_loop
+                .display_handle()
+                .is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_)))
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let own_frame = false;
         // Open sized to `cols`x`rows` cells at the base font, plus the padding border on
         // each side, so the configured grid fits inside it (padding surrounds, not eats
         // into, the grid). A LOGICAL size (not physical) so winit scales it by the monitor
@@ -2173,7 +2182,7 @@ impl Graphics {
         // Our own titlebar eats into the window rather than sitting above it (the
         // desktop's frame is drawn outside), so the window has to open that much
         // taller or the configured grid arrives one bar short.
-        let bar = if decorations == config::Decorations::Ghost {
+        let bar = if own_frame {
             f64::from(ghost_ui_core::frame::BAR_HEIGHT)
         } else {
             0.0
@@ -2200,20 +2209,8 @@ impl Graphics {
             .with_maximized(maximized)
             .with_transparent(want_transparent)
             .with_blur(glass(want_transparent, false, 0.0).blur);
-        // `[window] decorations = "ghost"`: drop the desktop's frame and draw our
-        // own. Wayland only — there the frame is a client-side one anyway (mutter
-        // offers no server-side decorations), so taking it over changes who draws
-        // pixels we already own. On X11 the window manager's frame is real, and
-        // replacing it would mean reimplementing what it does for us.
         #[cfg(all(unix, not(target_os = "macos")))]
-        let wayland = {
-            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-            event_loop
-                .display_handle()
-                .is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_)))
-        };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let attrs = if decorations == config::Decorations::Ghost && wayland {
+        let attrs = if own_frame {
             attrs.with_decorations(false)
         } else {
             attrs
@@ -2353,15 +2350,14 @@ impl Graphics {
 
     /// What the platform's window frame leaves for us to draw — see [`WindowEdge`].
     ///
-    /// On Linux GNOME offers no server-side decorations, so sctk-adwaita's CSD frame
-    /// draws the titlebar: it rounds the window's *top* corners itself and its shadow
-    /// curves around all four, leaving the bottom two — and the hairline that separates
-    /// the content from whatever shows behind it — to us. Everywhere else the window
-    /// server owns the whole edge (on macOS our vendored winit rounds the content layer
-    /// itself), so we draw none of it.
+    /// Where the desktop frames us, that frame rounds the window's *top* corners
+    /// itself and its shadow curves around all four, leaving the bottom two — and the
+    /// hairline that separates the content from whatever shows behind it — to us. On
+    /// macOS the window server owns the whole edge (our vendored winit rounds the
+    /// content layer itself), so we draw none of it.
     ///
-    /// With `[window] decorations = "ghost"` there is no frame above us at all, so
-    /// the top edge is ours too and the curve runs all the way round — the window is
+    /// Where ghost draws its own frame there is nothing above us at all, so the top
+    /// edge is ours too and the curve runs all the way round — the window is
     /// undecorated exactly when we asked for that, so the window itself is the source
     /// of truth.
     ///
@@ -2676,8 +2672,6 @@ pub struct WindowSpec {
     cols: u16,
     rows: u16,
     pad: f32,
-    /// Who draws the window frame — see `ghost-ui/docs/window-decorations.md`.
-    decorations: config::Decorations,
     /// The name this window is registered under in the compositor's session, so
     /// it reopens where it was. `None` for a window with no durable identity to
     /// name it by (the launch window), which restores nothing.
@@ -6042,7 +6036,6 @@ impl App {
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
-            decorations: cfg.decorations(),
             session_name: Some(group.id.clone()),
         });
         // Ask the realized window whether its compositor blurs; a headless window
@@ -6587,7 +6580,6 @@ impl App {
             cols: req_cols,
             rows: req_rows,
             pad: cfg.padding(),
-            decorations: cfg.decorations(),
             session_name: Some(group.id.clone()),
         });
         // Ask the realized window whether its compositor blurs; a headless window

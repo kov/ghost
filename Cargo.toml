@@ -72,13 +72,12 @@ debug = true
 # - The titlebar text is drawn from ONE font face with no shaping and no color
 #   glyphs, so any character that face lacks came out as `.notdef` or as
 #   nothing. Added a renderer seam (`title::set_title_renderer`) the application
-#   fills with its own text stack — see vendor/sctk-adwaita/src/title/hook.rs
-#   and ghost-ui/src/title.rs. Generic enough to offer upstream.
+#   fills with its own text stack — see vendor/sctk-adwaita/src/title/hook.rs.
+#   Nothing fills it any more: ghost draws its own frame, so the frame this
+#   patched is never built. Worth offering upstream, or dropping.
 #
-# GNOME never offers server-side decorations (mutter has no
-# `zxdg_decoration_manager_v1`), so on Linux/Wayland every ghost window is
-# drawn by this frame — it is our titlebar whether we like it or not, until
-# ghost-ui/docs/window-decorations.md lands.
+# ghost draws its own frame on Wayland, so what it takes from this crate is the
+# desktop's colours and the shadow curve — see ghost-ui/docs/window-decorations.md.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 wgpu-core = { path = "vendor/wgpu-core" }
