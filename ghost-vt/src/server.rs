@@ -289,12 +289,11 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
             ),
         ));
     }
-    // Before anything is created on disk: a host is an exec of this binary, and
-    // if there is nothing left to exec (the binary was replaced under a running
-    // process) the spawn is already lost. Checked here rather than at its use
-    // below so the failure leaves no session directory, no socket and no lock
-    // behind — state a listing has to prune and a group registry can pick up.
-    let exe = check_exec_target(std::env::current_exe()?)?;
+    // Resolved before anything is created on disk, so a process that cannot name
+    // its own executable at all fails leaving no session directory, no socket and
+    // no lock behind — state a listing has to prune and a group registry can pick
+    // up. `exec` is the running image; `argv0` is only what `ps` shows.
+    let (exec, argv0) = host_exec_target(&std::env::current_exe()?);
     paths::ensure_session_dir(&opts.name)?;
 
     // A host outlives its client by design; make it outlive the *login* too. The
@@ -378,12 +377,16 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     };
     let blob = encode_host_args(&host_args);
 
-    let exe_c = CString::new(exe.as_os_str().as_bytes())
+    let exec_c = CString::new(exec.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
+    let argv0_c = CString::new(argv0.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("executable path contains a NUL byte"))?;
     // The numbers on argv are where the child will PUT the fds, not where they sit
-    // in this process — the child re-numbers them just before the exec.
+    // in this process — the child re-numbers them just before the exec. `argv[0]`
+    // is the loaded path rather than the exec'd one, so `ps` names the binary and
+    // not the `/proc` link it was reached through.
     let argv_owned = [
-        exe_c.clone(),
+        argv0_c.clone(),
         CString::new(HOST_ARG).expect("HOST_ARG has no NUL"),
         CString::new(HOST_LISTENER_FD.to_string()).expect("fd digits have no NUL"),
         CString::new(HOST_LOCK_FD.to_string()).expect("fd digits have no NUL"),
@@ -393,11 +396,15 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     argv.push(std::ptr::null());
 
     // Daemonize and exec the host. Returns here only in the original process; the
-    // daemonized grandchild execs `exe_c` and never returns. `argv_owned`,
+    // daemonized grandchild execs `exec_c` and never returns. `argv_owned`,
     // `listener`, and `lock` must outlive the call (the forked child reads them up
     // to the exec); they drop here in the parent. The parent dropping its `lock`
     // copy does not release the flock — the host's inherited copy keeps it held.
-    let started = unsafe { daemonize_and_exec(&exe_c, &argv, listener_fd, lock_fd) };
+    //
+    // `argv0_c` is passed as the fallback: on a system with no `/proc` mounted the
+    // running image is unreachable, and the path we were loaded from is all there
+    // is. It works whenever it has not been replaced, which is the common case.
+    let started = unsafe { daemonize_and_exec(&exec_c, &argv0_c, &argv, listener_fd, lock_fd) };
     if started.is_err() {
         // No host will ever answer on this socket, and nothing else will tidy it
         // promptly: a listing prunes a directory whose lock is free, but until it
@@ -2511,35 +2518,40 @@ fn effective_command(
 /// been unlinked. `std::env::current_exe` reads that link and hands the result
 /// back unchanged, so it arrives in the path as if it were part of the name.
 const DELETED_SUFFIX: &str = " (deleted)";
+/// The running image, exec'able whatever has become of the file it was loaded
+/// from — see [`host_exec_target`].
+#[cfg(target_os = "linux")]
+const PROC_SELF_EXE: &str = "/proc/self/exe";
 
-/// The binary to exec a session host from — this process's own executable,
-/// refused when there is nothing left to exec.
+/// Where a session host is exec'd from, and the name it wears in `ps`.
 ///
-/// Installing a new `ghost` over a running one unlinks the inode the running
-/// process is executing. `current_exe` then answers `".../ghost (deleted)"`, and
-/// exec'ing that can only fail — in a forked grandchild whose stdio is already
-/// `/dev/null`, which is why it was invisible. `ghost-cli`'s `__upgrade` documents
-/// the same trap for the self-upgrade path; this is the ordinary spawn path
-/// learning it.
+/// The exec goes through the **running image** (`/proc/self/exe`), not the path it
+/// was loaded from. Installing a new `ghost` over a running one unlinks that path,
+/// `current_exe` then answers `".../ghost (deleted)"`, and exec'ing that can only
+/// fail — in a forked grandchild whose stdio is already `/dev/null`, which is why
+/// it silently killed every new session until the GUI was restarted.
 ///
-/// Exec'ing `/proc/self/exe` instead would keep working across a rebuild, by
-/// starting every new host from the OLD binary indefinitely. Quietly running code
-/// the user has replaced is the worse failure, so this says so and stops.
-fn check_exec_target(exe: PathBuf) -> io::Result<PathBuf> {
-    if exe.exists() {
-        return Ok(exe);
-    }
-    let shown = exe.display();
-    let message = if exe.to_string_lossy().ends_with(DELETED_SUFFIX) {
-        format!(
-            "the running ghost binary has been replaced on disk ({shown}); \
-             restart ghost to pick it up — a session cannot be started from an \
-             executable that is no longer there"
-        )
-    } else {
-        format!("the ghost binary ({shown}) is gone; a session cannot be started")
+/// The running image is always there. So a host started now runs the same build as
+/// the GUI that started it, however the file has been churned underneath — which is
+/// the version story we want anyway: hosts outlive their clients, and a window full
+/// of hosts from three different builds is worse than a window full of hosts that
+/// all match. Picking up a new binary is then exactly what restarting the GUI does,
+/// one deliberate act, and its new hosts are the new build.
+///
+/// `argv[0]` stays the real path, with the readlink artifact trimmed, so `ps` reads
+/// `/home/…/ghost __host …` rather than `/proc/self/exe __host …`.
+fn host_exec_target(current: &std::path::Path) -> (PathBuf, PathBuf) {
+    let shown = current.to_string_lossy();
+    let argv0 = match shown.strip_suffix(DELETED_SUFFIX) {
+        Some(real) => PathBuf::from(real),
+        None => current.to_path_buf(),
     };
-    Err(io::Error::new(io::ErrorKind::NotFound, message))
+    #[cfg(target_os = "linux")]
+    let exec = PathBuf::from(PROC_SELF_EXE);
+    // No `/proc` to exec through; the loaded path is all there is.
+    #[cfg(not(target_os = "linux"))]
+    let exec = argv0.clone();
+    (exec, argv0)
 }
 
 /// Hand an errno back through the failure pipe. Async-signal-safe: a four-byte
@@ -2584,6 +2596,7 @@ fn errno_now() -> libc::c_int {
 /// calling process.
 unsafe fn daemonize_and_exec(
     exe: &CStr,
+    fallback: &CStr,
     argv: &[*const libc::c_char],
     listener_fd: RawFd,
     lock_fd: RawFd,
@@ -2709,11 +2722,13 @@ unsafe fn daemonize_and_exec(
         }
         libc::close(staged_listener);
         libc::close(staged_lock);
-        // Replace this image with the host. Only returns on failure — and the
-        // commonest failure by far is a binary that was replaced under a running
-        // process (see `check_exec_target`), which is worth a word rather than a
-        // silent exit status nobody collects.
+        // Replace this image with the host. Only returns on failure, and the first
+        // path is the running image, which cannot have gone away (see
+        // `host_exec_target`) — so a failure here means there was no `/proc` to
+        // reach it through, and the path we were loaded from is the only other
+        // thing to try.
         libc::execv(exe.as_ptr(), argv.as_ptr());
+        libc::execv(fallback.as_ptr(), argv.as_ptr());
         report_errno(wr, errno_now());
         libc::_exit(127);
     }
@@ -2828,9 +2843,12 @@ mod tests {
         let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
         argv.push(std::ptr::null());
 
-        let err =
-            unsafe { daemonize_and_exec(&exe, &argv, listener.as_raw_fd(), lock.as_raw_fd()) }
-                .expect_err("an exec that cannot happen must not report success");
+        // Both the running image and the fallback are the same nonexistent path
+        // here: neither can be exec'd, which is the failure under test.
+        let err = unsafe {
+            daemonize_and_exec(&exe, &exe, &argv, listener.as_raw_fd(), lock.as_raw_fd())
+        }
+        .expect_err("an exec that cannot happen must not report success");
         assert_eq!(
             err.kind(),
             io::ErrorKind::NotFound,
@@ -2849,7 +2867,9 @@ mod tests {
         let argv_owned = [exe.clone()];
         let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
         argv.push(std::ptr::null());
-        let _ = unsafe { daemonize_and_exec(&exe, &argv, listener.as_raw_fd(), lock.as_raw_fd()) };
+        let _ = unsafe {
+            daemonize_and_exec(&exe, &exe, &argv, listener.as_raw_fd(), lock.as_raw_fd())
+        };
 
         // The intermediate is reaped before the call returns, so this needs no
         // settling time; poll only to keep an unrelated test's exiting child from
@@ -2869,30 +2889,33 @@ mod tests {
 
     /// What broke `Alt-t` on a live desktop: installing a new `ghost` unlinks the
     /// inode the running GUI is executing, `readlink("/proc/self/exe")` then answers
-    /// `".../ghost (deleted)"`, and Rust hands that path back verbatim. Exec'ing it
-    /// can only fail, so it is refused with something a person can act on instead.
+    /// `".../ghost (deleted)"`, and Rust hands that path back verbatim — a path that
+    /// cannot be exec'd.
+    ///
+    /// The running image can, always, so that is what a host is exec'd from. A host
+    /// then matches the GUI that spawned it whatever has happened to the file, and
+    /// picking up a new binary is what restarting the GUI does — one deliberate act
+    /// instead of a window full of mixed-version hosts.
     #[test]
-    fn a_replaced_binary_is_refused_as_an_exec_target() {
-        // The live case: a real binary, still there, is used as-is.
+    fn a_replaced_binary_still_spawns_from_the_running_image() {
         let real = std::env::current_exe().unwrap();
-        assert_eq!(check_exec_target(real.clone()).unwrap(), real);
 
-        // The readlink artifact: refused, and the message has to name the cause,
-        // because the only cure is a restart the user has to choose to do.
-        let deleted = PathBuf::from(format!("{} (deleted)", real.display()));
-        let err = check_exec_target(deleted).expect_err("a deleted binary cannot be exec'd");
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        let msg = err.to_string();
-        assert!(
-            msg.contains("replaced") && msg.contains("restart"),
-            "message must say what happened and what to do, got {msg}"
+        // The ordinary case: the exec goes through the running image, not the path
+        // it was loaded from, so nothing about that path can break it.
+        let (exec, argv0) = host_exec_target(&real);
+        #[cfg(target_os = "linux")]
+        assert_eq!(exec, PathBuf::from("/proc/self/exe"));
+        assert_eq!(argv0, real, "ps should still name the real binary");
+
+        // The replaced case: same exec target, and the readlink artifact is trimmed
+        // off the name so `ps` reads `/…/ghost __host …`, not `…ghost (deleted)`.
+        let deleted = PathBuf::from(format!("{}{DELETED_SUFFIX}", real.display()));
+        let (exec_after, argv0_after) = host_exec_target(&deleted);
+        assert_eq!(
+            exec_after, exec,
+            "a replaced binary changes nothing about where a host is exec'd from"
         );
-
-        // A path that is merely absent is refused too, but it is not the
-        // replaced-binary story and must not claim to be.
-        let missing = PathBuf::from("/nonexistent/ghost");
-        let err = check_exec_target(missing).expect_err("a missing binary cannot be exec'd");
-        assert!(!err.to_string().contains("replaced"));
+        assert_eq!(argv0_after, real);
     }
 
     #[test]
