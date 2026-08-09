@@ -13,6 +13,9 @@ ghost-vt = { path = "../ghost-vt" }
 # Session groups persist across runs; the shell serializes them (TOML), the
 # core only derives the shape.
 serde = { version = "1", features = ["derive"] }
+# Content-aware selection rules (diff paths, `file:line:col`) are regexes run
+# over the logical line under a double-click.
+regex = "1.13.1"
 # Cache-efficiency instrumentation is emitted via `tracing`; free unless a
 # subscriber (installed by the binary) enables the target under `RUST_LOG`.
 tracing = "0.1.44"

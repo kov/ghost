@@ -149,21 +149,31 @@ links — the scanner could feed it a plain URI too, a natural follow-up.
 
 ### Phase 3b — regex rules with `highlight`
 
-`regex` lands as a direct dependency here (currently only transitive, via
-criterion/proptest — verify latest stable when adding), and with it the
-`LogicalLine` helper deferred from phase 2: soft-wrapped rows joined into one
-string, plus a per-char `(row, col)` offset table built from **cells**, not
-`text()`, so a match span maps back to grid coordinates across wide characters.
-Rule shape
-`{ regex, highlight: usize, precision }`, where `highlight` picks the capture
-group that becomes the selection. The diff rule is `\b[ab]/(\S+)` with
-`highlight = 1`.
+`regex` lands as a direct dependency here (1.13.1). Rules are
+`{ re, group, precision }` — wezterm's `highlight` under a plainer name: the
+rule matches wide and the named capture group is what gets selected, so the `a/`
+that makes a diff path recognizable is not the thing that gets pasted.
+Containment is tested against the **whole match**, so clicking the `a/` itself
+still resolves to the path it introduces.
 
-Ships hardcoded with a small rule set (diff path, `file:line:col`); the config
-surface follows once the shape has settled in use.
+Two rules ship, both hardcoded: `\b[ab]/(\S+)` for diff paths and
+`([^\s:]+):(\d+)(?::(\d+))?` for `file:line[:col]`. The config surface follows
+once the shape has settled in use.
 
-Tests: `a/src/foo.rs` selects `src/foo.rs`, `b/` likewise; a URL inside a diff
-line still selects as a URL, not as a path (the arbitration test).
+Arbitration moved out of the `or_else` chain into `smart_span`: each rung offers
+a candidate with a precision tier — hyperlink 3, URI 2, rule 1 — and the best
+`(precision, whole-match length)` wins. Tier before length is what the design
+needs: with `/` a word character since phase 1, the word walk's `a/src/foo.rs`
+is *longer* than the rule's `src/foo.rs`, so length alone would undo the whole
+phase. The same ordering keeps a URI inside a diff line a URI.
+
+The regex needs a string while everything else is in cell indices, so
+`rule_spans` builds one alongside a byte → cell-index table (one past the end
+maps one past the last cell, keeping an exclusive match end exclusive).
+
+Tests: `a/src/foo.rs` and `b/src/foo.rs` select `src/foo.rs`; clicking the `a/`
+does too; `src/foo.rs:12:5` selects the path; a URL inside a diff line still
+selects as a URL (the arbitration test).
 
 ## Roadmap (not in these phases)
 

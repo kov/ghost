@@ -21,7 +21,9 @@ use ghost_term::{
 };
 use ghost_vt::query::{QueryScanner, ReplyCtx, ThemeColors};
 use ghost_vt::screen::{self, Screen};
+use regex::Regex;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use std::collections::HashMap;
 
@@ -2926,11 +2928,11 @@ impl TerminalView {
             .or_else(|| self.word_at(state, row, col))
     }
 
-    /// The content-aware rungs alone: a hyperlink run, else a URI. `None` when
-    /// the click is on neither, leaving the word walk to answer.
+    /// The content-aware rungs alone: a hyperlink run, a URI, or a rule match.
+    /// `None` when the click is on none of them, leaving the word walk to answer.
     fn content_at(&self, state: &SessionState, row: usize, col: usize) -> Option<Selection> {
         let (cells, at) = self.logical_line(state, row, col)?;
-        let (a, b) = link_run(&cells, at).or_else(|| url_span(&cells, at))?;
+        let (a, b) = smart_span(&cells, at)?;
         Some(Selection::new(
             (cells[a].row, cells[a].col),
             (cells[b].row, cells[b].col + cells[b].width - 1),
@@ -3359,6 +3361,101 @@ fn url_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
         }
     }
     best
+}
+
+/// A shape worth recognizing, and which capture group of it is worth selecting.
+/// Matching wide and selecting narrow is wezterm's `highlight`: the `a/` is what
+/// makes a diff path recognizable as one, and is the last thing you want pasted.
+struct SmartRule {
+    re: Regex,
+    /// The capture group that becomes the selection; 0 is the whole match.
+    group: usize,
+    /// How sure this shape makes us, so a specific rule beats a longer vaguer
+    /// match instead of losing to it on length alone.
+    precision: u8,
+}
+
+/// The precision tiers. A hyperlink is the program telling us outright, a URI is
+/// a shape we recognize from its scheme, and a rule is a guess from context.
+const PRECISION_LINK: u8 = 3;
+const PRECISION_URL: u8 = 2;
+const PRECISION_RULE: u8 = 1;
+
+/// The rules we ship. Hardcoded for now; a config surface follows once the shape
+/// has settled in use (see docs/selection-design.md).
+static SMART_RULES: LazyLock<Vec<SmartRule>> = LazyLock::new(|| {
+    vec![
+        // `git diff` names a file twice, each with a bookkeeping prefix.
+        SmartRule {
+            re: Regex::new(r"\b[ab]/(\S+)").expect("diff path rule is valid"),
+            group: 1,
+            precision: PRECISION_RULE,
+        },
+        // Where compilers and grep point: `path:line` and `path:line:col`.
+        SmartRule {
+            re: Regex::new(r"([^\s:]+):(\d+)(?::(\d+))?").expect("file position rule is valid"),
+            group: 1,
+            precision: PRECISION_RULE,
+        },
+    ]
+});
+
+/// The best content-aware span covering `at`, as inclusive indices into `cells`.
+/// Every rung offers what it found; the surest wins, and within a tier the match
+/// that saw more context does — so a URI inside a diff line is still a URI.
+fn smart_span(cells: &[LogicalCell], at: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(u8, usize, (usize, usize))> = None;
+    let mut offer = |precision: u8, seen: usize, span: (usize, usize)| {
+        if best.is_none_or(|(p, len, _)| (precision, seen) > (p, len)) {
+            best = Some((precision, seen, span));
+        }
+    };
+    if let Some(span) = link_run(cells, at) {
+        offer(PRECISION_LINK, span.1 + 1 - span.0, span);
+    }
+    if let Some(span) = url_span(cells, at) {
+        offer(PRECISION_URL, span.1 + 1 - span.0, span);
+    }
+    for (precision, seen, span) in rule_spans(cells, at) {
+        offer(precision, seen, span);
+    }
+    best.map(|(_, _, span)| span)
+}
+
+/// Every rule match containing `at`, as `(precision, whole-match length,
+/// selected span)`. Containment is tested against the *whole* match, so clicking
+/// the `a/` a rule anchors on still selects the path it introduces.
+fn rule_spans(cells: &[LogicalCell], at: usize) -> Vec<(u8, usize, (usize, usize))> {
+    // The rules need a string; `at` and the answers are cell indices. `owner`
+    // maps each byte back to the character it belongs to, and one past the end
+    // to one past the last character, so a match's exclusive end stays exclusive.
+    let mut text = String::new();
+    let mut owner = Vec::new();
+    for (i, cell) in cells.iter().enumerate() {
+        text.push(cell.ch);
+        owner.resize(text.len(), i);
+    }
+    owner.push(cells.len());
+
+    let mut found = Vec::new();
+    for rule in SMART_RULES.iter() {
+        for caps in rule.re.captures_iter(&text) {
+            let Some(whole) = caps.get(0) else { continue };
+            let (start, end) = (owner[whole.start()], owner[whole.end()]);
+            if !(start..end).contains(&at) {
+                continue;
+            }
+            let Some(group) = caps.get(rule.group).filter(|g| !g.is_empty()) else {
+                continue;
+            };
+            found.push((
+                rule.precision,
+                end - start,
+                (owner[group.start()], owner[group.end()] - 1),
+            ));
+        }
+    }
+    found
 }
 
 /// Case-insensitive ASCII prefix test over a char slice.
@@ -4327,6 +4424,50 @@ mod tests {
         );
         assert_eq!(double_click_text(&mut m, 0, 7), "click here");
         assert_eq!(m.selection(), Some(Selection::new((0, 0), (0, 9))));
+    }
+
+    #[test]
+    fn a_diff_path_selects_without_its_a_or_b_prefix() {
+        // `git diff` names the same file twice with a bookkeeping prefix nobody
+        // wants pasted. The rule matches the whole thing and selects the group.
+        let mut m = model();
+        feed(&mut m, b"--- a/src/foo.rs");
+        assert_eq!(double_click_text(&mut m, 0, 10), "src/foo.rs");
+        let mut m = model();
+        feed(&mut m, b"+++ b/src/foo.rs");
+        assert_eq!(double_click_text(&mut m, 0, 10), "src/foo.rs");
+    }
+
+    #[test]
+    fn clicking_the_diff_prefix_itself_still_selects_the_path() {
+        // Containment is tested against the whole match, so the `a/` under the
+        // pointer resolves to the path it introduces rather than to itself.
+        let mut m = model();
+        feed(&mut m, b"--- a/src/foo.rs");
+        assert_eq!(double_click_text(&mut m, 0, 4), "src/foo.rs");
+    }
+
+    #[test]
+    fn a_file_position_selects_without_its_line_and_column() {
+        // Compiler and grep output point at a place in a file; the path is what
+        // gets pasted into an editor.
+        let mut m = model();
+        feed(&mut m, b"error at src/foo.rs:12:5: oops");
+        assert_eq!(double_click_text(&mut m, 0, 12), "src/foo.rs");
+    }
+
+    #[test]
+    fn a_uri_in_a_diff_line_still_selects_as_a_uri() {
+        // Both rungs match here: the path rule sees `a/b?x=1`, the scanner sees
+        // the whole link. Precision decides, and the scanner is the precise one.
+        let mut m = model();
+        feed(&mut m, b"--- https://example.com/a/b?x=1");
+        // Column 25 is inside both: the URI, and the `a/b?x=1` the path rule
+        // finds within it.
+        assert_eq!(
+            double_click_text(&mut m, 0, 25),
+            "https://example.com/a/b?x=1"
+        );
     }
 
     #[test]
