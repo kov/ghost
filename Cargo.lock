@@ -1114,6 +1114,8 @@ dependencies = [
  "ghost-ui-core",
  "ghost-vt",
  "pollster",
+ "rustix 1.1.4",
+ "tempfile",
  "wgpu",
  "winit",
 ]

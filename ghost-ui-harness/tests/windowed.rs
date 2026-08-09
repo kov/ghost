@@ -44,9 +44,15 @@ const METRICS: CellMetrics = CellMetrics {
 /// A headless weston, alive for as long as this value is.
 ///
 /// The compositor is a child process, so it has to be reaped on every way out of
-/// the test — including a panic, which is why the kill hangs off `Drop` rather
-/// than off the end of the test body. We hold the handle, so nothing here ever
-/// has to go looking for a process by name.
+/// the test, and there are two kinds. A panic unwinds — verified to unwind even
+/// from inside the winit callback — so the kill hangs off `Drop` rather than off
+/// the end of the test body. An abort does not: a SIGSEGV in a driver's teardown
+/// (this test has had one, see the Mesa note below), a SIGKILL, a `^C` on cargo
+/// itself. `Drop` cannot help there, so weston is *also* told to die with us, by
+/// the kernel, in [`start`](Weston::start).
+///
+/// Both routes go through a handle we hold. Nothing here ever goes looking for a
+/// process by name — that would match every weston this user is running.
 struct Weston {
     child: std::process::Child,
     /// The private `XDG_RUNTIME_DIR` its socket lives in; removed with it.
@@ -69,9 +75,26 @@ impl Weston {
     /// no dmabuf, so no Vulkan adapter is compatible with the surface and the
     /// window this test exists to draw into cannot be presented to at all.
     fn start() -> Option<Weston> {
+        use std::os::unix::process::CommandExt;
+
         let dir = tempfile::tempdir().expect("a runtime dir");
         let socket = "ghost-windowed-test";
-        let child = std::process::Command::new("weston")
+        let mut cmd = std::process::Command::new("weston");
+        // The backstop for every exit `Drop` cannot see: ask the kernel to send
+        // weston a SIGTERM the moment we die, however we die. Set in the child
+        // between fork and exec, because it is a property of the child.
+        //
+        // Linux counts the *thread* that spawned it, not the process — which is
+        // this test's own thread, and it outlives every use we make of weston.
+        unsafe {
+            cmd.pre_exec(|| {
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::TERM,
+                ))
+                .map_err(std::io::Error::from)
+            });
+        }
+        let child = cmd
             .args([
                 "--backend=headless",
                 "--renderer=gl",
