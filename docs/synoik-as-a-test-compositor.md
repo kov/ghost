@@ -162,3 +162,13 @@ every present. Fixed in synoik `65c0cfaa`, which pins headless's scanout
 state to a real element pass: measured against that build the same dive takes
 0.34–0.45s, the weston number. It is not on the remote yet, so the pin — and
 this paragraph — move when it is.
+
+**Headless synoik is not a frame-rate reference**, and that fix is why. It
+moved a headless client from 1 fps to *unpaced*: callbacks go out once per
+redraw and the output then idles, so a self-pacing client cycles
+commit→redraw→callback as fast as the CPU allows, whatever the 60 Hz the output
+advertises. That is what our rigs want — and most of why 0.34s beats weston —
+but it means nothing measured here in fps or frames-per-unit-time means
+anything: the denominator is the CPU, not a clock. Frames *presented* and frame
+*geometry*, which is all this suite asserts, are unaffected. Take pacing
+numbers on a real display, never here.
