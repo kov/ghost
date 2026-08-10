@@ -363,13 +363,9 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
 
     let out = prebuilt_dir();
     fs::create_dir_all(&out)?;
-    // `cargo zigbuild` bundles sysroots for cross-OS; plain `cargo build` uses the
-    // system toolchain (fine for a same-OS arch flip when it's installed).
-    let subcommand = if std::env::var_os("GHOST_ZIGBUILD").is_some() {
-        "zigbuild"
-    } else {
-        "build"
-    };
+    // `GHOST_ZIGBUILD=1` forces zig for *everything*; otherwise it is chosen per
+    // target, for the ones that actually need it.
+    let force_zig = std::env::var_os("GHOST_ZIGBUILD").is_some();
 
     let host = host_triple();
     let mut failed = Vec::new();
@@ -380,6 +376,11 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
         // the host's configured linker and `target/release/`. Everything else is a
         // cross build; make the target available first (idempotent).
         let native = host.as_deref() == Some(triple.as_str());
+        let subcommand = if force_zig || wants_zig(triple, std::env::consts::OS) {
+            "zigbuild"
+        } else {
+            "build"
+        };
         let mut cmd = Command::new(cargo());
         cmd.current_dir(&ws)
             .args([subcommand, "--release", "-p", "ghost-host"]);
@@ -441,6 +442,17 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
 /// being staged to remotes long after it stopped matching this build, and a
 /// remote host older than its client is a session that misbehaves in ways nobody
 /// traces back to a stale file.
+/// Whether `triple` has to be linked through `cargo zigbuild` — which bundles the
+/// sysroot for the target OS — rather than a plain `cargo build`.
+///
+/// Only crossing the *OS* boundary needs it; an arch flip within one OS links with
+/// the toolchain already here. Decided per target rather than per run so
+/// `cargo xtask install` refreshes the darwin prebuilts too: making that depend on
+/// an environment variable somebody has to remember is how they went stale.
+fn wants_zig(triple: &str, host_os: &str) -> bool {
+    triple.contains("darwin") != (host_os == "macos")
+}
+
 /// Cut the staging prebuilts as part of an install, so the binary ghost copies to
 /// a remote is always the one this install just built. They used to be refreshed
 /// only when someone remembered to, by hand, which is to say rarely: the
@@ -663,6 +675,23 @@ fn copy_dir(src: &Path, dst: &Path) -> R<()> {
 #[cfg(test)]
 mod prebuilt_tests {
     use super::*;
+
+    /// Which targets need `cargo zigbuild` rather than a plain `cargo build`.
+    ///
+    /// This has to be decided per target, not per run. `cargo xtask install`
+    /// refreshes everything without being handed an environment variable, and if
+    /// reaching across operating systems needed one, the darwin prebuilts would go
+    /// on being skipped by every install — which is the staleness this was all
+    /// meant to end.
+    #[test]
+    fn only_a_cross_os_target_is_built_through_zig() {
+        // From Linux: darwin crosses the OS boundary, musl does not.
+        assert!(wants_zig("aarch64-apple-darwin", "linux"));
+        assert!(!wants_zig("x86_64-unknown-linux-musl", "linux"));
+        // And the mirror image from a Mac.
+        assert!(wants_zig("x86_64-unknown-linux-musl", "macos"));
+        assert!(!wants_zig("x86_64-apple-darwin", "macos"));
+    }
 
     /// An install refreshes the prebuilts, and a prebuilt it cannot build must not
     /// take the install down with it. The two are only loosely related: prebuilts

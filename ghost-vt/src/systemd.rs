@@ -141,7 +141,15 @@ fn run_quiet(cmd: &mut Command) -> std::io::Result<String> {
     // when this runs.
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(cmd, || {
-            libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
+            // Every argument widened to `c_long` explicitly: `syscall` is
+            // variadic, so a bare `3` would go through as an `i32` next to a
+            // `u32` and leave the register contents up to the ABI.
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_long,
+                libc::c_uint::MAX as libc::c_long,
+                0 as libc::c_long,
+            );
             Ok(())
         });
     }

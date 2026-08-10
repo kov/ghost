@@ -243,15 +243,16 @@ was installed from. To cut them on their own:
 ```sh
 cargo xtask prebuilt                        # every platform but this one → the prebuilt dir
 cargo xtask prebuilt aarch64-apple-darwin   # a specific target
-GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # build via cargo-zigbuild (for a cross-OS
-                                            # target, e.g. a macOS prebuilt from Linux)
+GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # force zig for every target, not just
+                                            # the ones that cross an OS boundary
 ```
 
 `ghost-host` is pure Rust and GUI-free, so cross-building needs no C toolchain or
 sysroot. On Linux the default targets are **static musl** binaries: `rustup target
 add` is the only setup (xtask does it), they link with the bundled `rust-lld`, and
-being static they run on any remote regardless of its glibc. Only cross-*OS* builds
-want `GHOST_ZIGBUILD=1` (plus `cargo install cargo-zigbuild` and zig on `PATH`).
+being static they run on any remote regardless of its glibc. Crossing an *OS*
+boundary is linked through `cargo zigbuild` automatically — install it once with
+`cargo install cargo-zigbuild` and put zig on `PATH`.
 
 **A macOS prebuilt cross-builds from Linux with no Apple SDK.** `ghost-host` links
 against no macOS framework — the session watcher uses kqueue rather than FSEvents
