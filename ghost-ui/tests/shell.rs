@@ -612,6 +612,61 @@ fn an_emptied_window_closes_alone_while_another_window_keeps_ghost_running() {
     });
 }
 
+/// Alt+T branches a new session off the one you are looking at, and "branch off"
+/// means the whole context, not just the host: the new session must start in the
+/// **same directory** as the session it came from — the one thing you would
+/// otherwise retype every time.
+///
+/// Driven through the key, against a session really working in that directory, and
+/// asserted on the start request the shell hands the frontend. The last step (a
+/// host honouring the directory it was given) is a real session away, covered by
+/// `an_explicit_cwd_starts_the_child_there_not_where_the_spawner_ran`; a headless
+/// test cannot take it, because a session host is a re-exec of the running
+/// executable and this test binary is not one.
+#[test]
+fn a_new_session_starts_where_the_one_it_branched_off_is() {
+    with_isolated_xdg(|tmp| {
+        let work = tmp.join("work");
+        std::fs::create_dir(&work).expect("a directory to work in");
+        let work = work.canonicalize().expect("canonical work dir");
+        support::spawn_session_running_in("branch-a", Some(&work), "echo branch-a ready; exec cat");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "branch-a", g, None)
+            .expect("window");
+        app.wake(&fe);
+
+        app.dispatch(
+            wid,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("t".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+        app.wake(&fe);
+
+        let asked = fe.spawn_requests();
+        assert_eq!(asked.len(), 1, "Alt+T must start one session: {asked:?}");
+        let (_, cwd) = &asked[0];
+        assert_eq!(
+            cwd.as_ref().and_then(|c| c.canonicalize().ok()).as_deref(),
+            Some(work.as_path()),
+            "the new session must be started in the directory its sibling is \
+             working in, not wherever ghost itself was launched"
+        );
+        support::kill_session("branch-a");
+    });
+}
+
 /// Alt+N opens a *second* window; the one you pressed it in must still be there,
 /// still showing its own session. Asserted through the shortcut rather than by
 /// calling `open_launch_window` twice, because the report is about the key.

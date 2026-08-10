@@ -102,6 +102,19 @@ pub fn display_path(p: &Path) -> String {
     }
 }
 
+/// The inverse of [`display_path`]: expand a leading `~` against *this* machine's
+/// home. A listing's `cwd` is written for eyes, and it is the only form of a
+/// remote session's directory another machine ever sees — so when that machine
+/// asks this one for a session beside it (`ghost new --cwd '~/proj'`), the `~` is
+/// resolved here, where the home actually is. Anything else, `~user/…` included
+/// (nothing produces it), passes through untouched.
+pub fn expand_home(p: &Path) -> std::path::PathBuf {
+    match (dirs::home_dir(), p.strip_prefix("~")) {
+        (Some(home), Ok(rest)) => home.join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 /// [`list`], but over an explicit runtime directory (so it can be tested against
 /// a tempdir rather than the process's real XDG location).
 fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
@@ -355,6 +368,23 @@ fn prune(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote ghost is asked to open a session beside one already on its host,
+    /// and the only form of that directory the asking machine has is the
+    /// home-collapsed one the listing showed it. Expanding it is the host's job:
+    /// nobody else knows what `~` is here.
+    #[test]
+    fn a_displayed_path_round_trips_back_to_the_real_one() {
+        let home = dirs::home_dir().expect("a home directory");
+        let real = home.join("proj/web");
+        assert_eq!(expand_home(Path::new(&display_path(&real))), real);
+        assert_eq!(expand_home(Path::new(&display_path(&home))), home);
+        // An absolute path outside home is already the whole truth, and `~user`
+        // is nobody's home to expand here — both pass through untouched.
+        for kept in ["/srv/build", "~ana/proj"] {
+            assert_eq!(expand_home(Path::new(kept)), Path::new(kept));
+        }
+    }
 
     #[test]
     fn list_uses_the_lock_to_keep_live_and_prune_dead_sessions() {

@@ -77,7 +77,7 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
         let remote_ghost =
             retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
-        r.spawn_host(&remote_ghost, "work")
+        r.spawn_host(&remote_ghost, "work", None)
             .expect("spawn remote session");
         assert!(
             wait_until(Duration::from_secs(5), || r
@@ -257,7 +257,7 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
         let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
         let remote_ghost =
             retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
-        r.spawn_host(&remote_ghost, "ephemeral")
+        r.spawn_host(&remote_ghost, "ephemeral", None)
             .expect("spawn remote session");
         assert!(
             wait_until(Duration::from_secs(5), || r
@@ -372,6 +372,115 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
     });
 }
 
+/// Alt+T on a session living on a remote host opens the new one **on that host,
+/// in the same directory**. Both halves are the point: the directory only means
+/// anything over there, and the only form of it this side ever sees is the
+/// home-collapsed `~/…` the host's own listing reports — so the `~` has to travel
+/// back to the machine that knows what it stands for.
+#[test]
+fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
+    let Some(remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    // SAFETY: process-global, held under SERIAL for the duration.
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        // A directory under the remote's own home, so its listing reports it as
+        // `~/proj` — exactly the form the shell has to hand back.
+        let proj = remote.home().join("proj");
+        std::fs::create_dir_all(&proj).expect("a directory on the remote");
+
+        let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+        let remote_ghost =
+            retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+        r.spawn_host(&remote_ghost, "work", proj.to_str())
+            .expect("spawn remote session");
+        assert!(
+            wait_until(Duration::from_secs(10), || r
+                .list_sessions(&remote_ghost)
+                .map(|s| s
+                    .iter()
+                    .any(|i| i.name == "work" && i.cwd.as_deref() == Some("~/proj")))
+                .unwrap_or(false)),
+            "the session never came up on the remote in ~/proj: {:?}",
+            r.list_sessions(&remote_ghost)
+        );
+
+        let q: Arc<QueuedEvents> = Arc::default();
+        let sink: Arc<dyn EventSink> = q.clone();
+        let mut app = App::headless_with_sink(sink);
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+
+        let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            sees_tile(&app.root(wid).expect("window").view(app.states()), "work")
+        });
+        assert!(
+            discovered,
+            "the remote session never appeared in the fleet: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        // Open it, the way the user does — the window is now driving a session that
+        // lives over there, which is what Alt+T branches off.
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::tile_center(&scene, "work")
+            .unwrap_or_else(|| panic!("no card to click: {:?}", visible_text(&scene)));
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+            for ev in support::click_events(cx, cy) {
+                app.dispatch(wid, ev, &fe);
+            }
+        }
+        let attached = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            !app.root(wid).expect("window").is_fleet()
+        });
+        assert!(
+            attached,
+            "the window never opened the remote session: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        app.dispatch(
+            wid,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("t".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+
+        // A second session on the host — and working where its sibling is, which it
+        // can only be if the `~` was expanded over there.
+        let sibling = pump_until(&mut app, &fe, &q, Duration::from_secs(30), |_| {
+            r.list_sessions(&remote_ghost)
+                .map(|s| {
+                    s.iter()
+                        .any(|i| i.name != "work" && i.cwd.as_deref() == Some("~/proj"))
+                })
+                .unwrap_or(false)
+        });
+        assert!(
+            sibling,
+            "Alt+T must open the new session on the host, in the same directory: {:?}",
+            r.list_sessions(&remote_ghost)
+        );
+    });
+}
+
 /// How many times `needle` is rendered on session `id`'s screen.
 fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
     app.states()
@@ -400,7 +509,7 @@ fn rig_focus_child(remote: &RealRemote) -> FocusRig {
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     let remote_ghost =
         retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
-    r.spawn_host(&remote_ghost, "focus")
+    r.spawn_host(&remote_ghost, "focus", None)
         .expect("spawn remote session");
     assert!(
         wait_until(Duration::from_secs(5), || r

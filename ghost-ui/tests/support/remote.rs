@@ -203,6 +203,12 @@ impl RealRemote {
         &self.wrapper
     }
 
+    /// The remote's `$HOME` — what a `~` in anything the remote reports (a
+    /// session's directory, say) stands for over there.
+    pub fn home(&self) -> PathBuf {
+        self.remote_root.path().join("home")
+    }
+
     /// Make the remote go **silent**, the way a real reboot or network partition
     /// does: the peer stops responding with **no FIN/RST**, so the local
     /// ControlMaster can't tell the connection died — it wedges (TCP dead, process

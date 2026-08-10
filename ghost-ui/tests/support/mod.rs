@@ -109,8 +109,19 @@ pub fn spawn_chatty_session(name: &str) {
 
 /// Spawn a detached session running `script` under `sh -c`.
 pub fn spawn_session_running(name: &str, script: &str) {
-    let ok = std::process::Command::new(GHOST)
-        .args(["new", name, "-d", "--", "sh", "-c", script])
+    spawn_session_running_in(name, None, script);
+}
+
+/// [`spawn_session_running`], but with the child started in `cwd` — the fixture for
+/// anything about where a session (or one branched off it) is working.
+pub fn spawn_session_running_in(name: &str, cwd: Option<&Path>, script: &str) {
+    let mut cmd = std::process::Command::new(GHOST);
+    cmd.args(["new", name, "-d"]);
+    if let Some(dir) = cwd {
+        cmd.arg("--cwd").arg(dir);
+    }
+    let ok = cmd
+        .args(["--", "sh", "-c", script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

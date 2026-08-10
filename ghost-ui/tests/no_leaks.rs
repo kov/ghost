@@ -70,7 +70,8 @@ fn a_dropped_sshd_fixture_leaves_no_remote_hosts_behind() {
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
     let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
     let ghost = retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
-    r.spawn_host(&ghost, "leak-remote").expect("spawn remote");
+    r.spawn_host(&ghost, "leak-remote", None)
+        .expect("spawn remote");
     assert!(
         wait_until(Duration::from_secs(10), || r
             .list_sessions(&ghost)

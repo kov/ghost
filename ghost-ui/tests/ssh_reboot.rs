@@ -77,7 +77,7 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
     };
 
     // A session exists on the remote before the reboot.
-    r.spawn_host(&ghost, "recovered")
+    r.spawn_host(&ghost, "recovered", None)
         .expect("spawn remote session");
     assert!(
         wait_until(Duration::from_secs(5), || listed(&ghost)),
@@ -92,7 +92,7 @@ fn a_remote_session_relaunches_on_its_host_after_a_reboot() {
     // recovery path holds the already-negotiated host). Pre-fix this failed: the
     // relaunch multiplexed onto the wedged master.
     r.reap_wedged_master();
-    r.spawn_host(&ghost, "recovered")
+    r.spawn_host(&ghost, "recovered", None)
         .expect("relaunch on the returned host");
     assert!(
         wait_until(Duration::from_secs(10), || listed(&ghost)),
@@ -156,7 +156,7 @@ fn a_dropped_connection_reattaches_and_resyncs_a_surviving_session() {
         retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("initial negotiate");
 
     // A live session with recognizable content on its screen.
-    r.spawn_host(&ghost, "survivor")
+    r.spawn_host(&ghost, "survivor", None)
         .expect("spawn remote session");
     assert!(
         wait_until(Duration::from_secs(5), || r

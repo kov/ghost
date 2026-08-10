@@ -863,8 +863,18 @@ impl RemoteSsh {
     /// Ensure a detached remote host named `name` exists. A fresh session is
     /// created; a failure here (the name already hosts a live session) is
     /// tolerated — the caller then attaches to whatever is there.
-    pub fn spawn_host(&self, remote_ghost: &str, name: &str) -> io::Result<()> {
-        let out = self.command(&[remote_ghost, "new", "-d", name]).output()?;
+    ///
+    /// `cwd` is where the remote child should start — the directory a session on
+    /// this host is already working in, so a new terminal branched off it opens
+    /// beside it. It is written as the remote reports it, home-collapsed (`~/…`),
+    /// and the remote `ghost new` expands it against its own home; only that side
+    /// knows where that is.
+    pub fn spawn_host(&self, remote_ghost: &str, name: &str, cwd: Option<&str>) -> io::Result<()> {
+        let mut argv = vec![remote_ghost, "new", "-d", name];
+        if let Some(cwd) = cwd {
+            argv.extend(["--cwd", cwd]);
+        }
+        let out = self.command(&argv).output()?;
         if !out.status.success() {
             eprintln!(
                 "ghost: remote session '{name}' already present, attaching to it \

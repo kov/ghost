@@ -281,7 +281,7 @@ fn dispatch(command: Command) {
                 name: name.clone(),
                 command,
                 size: (80, 24),
-                cwd,
+                cwd: cwd.map(|d| session::expand_home(&d)),
                 record,
                 seed_from,
                 scrollback,
@@ -347,7 +347,7 @@ fn dispatch(command: Command) {
             };
             match remote.negotiate() {
                 Ok(remote_ghost) => {
-                    if let Err(e) = remote.spawn_host(&remote_ghost, &name) {
+                    if let Err(e) = remote.spawn_host(&remote_ghost, &name, None) {
                         fail(&format!("failed to start the remote host: {e}"));
                     }
                     if detached {

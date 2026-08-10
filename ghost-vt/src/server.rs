@@ -2448,7 +2448,11 @@ fn spawn_child(
     if let Some(dirs) = &term.terminfo_dirs {
         cmd = cmd.env("TERMINFO_DIRS", dirs);
     }
-    if let Some(dir) = launch_dir {
+    // A directory that is no longer there would fail the spawn outright. An
+    // inherited one (a new terminal opening beside its sibling, possibly across
+    // ssh) can go stale between the asking and the starting, and no session at
+    // all is a far worse answer than one in the default directory.
+    if let Some(dir) = launch_dir.filter(|d| d.is_dir()) {
         cmd = cmd.current_dir(dir);
     }
     cmd.spawn(pts)

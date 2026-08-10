@@ -692,7 +692,7 @@ fn spawn_connect_worker(
                     });
                 };
                 match remote.negotiate_with_progress(&mut on_progress) {
-                    Ok(remote_ghost) => match remote.spawn_host(&remote_ghost, &name) {
+                    Ok(remote_ghost) => match remote.spawn_host(&remote_ghost, &name, None) {
                         Ok(()) => ConnectOutcome::Transport { remote_ghost },
                         Err(e) => {
                             ConnectOutcome::Error(format!("could not start the remote host: {e}"))
@@ -1371,12 +1371,13 @@ fn spawn_session(
     name: &str,
     command: Vec<String>,
     connection: Option<ConnectionSpec>,
+    cwd: Option<PathBuf>,
 ) -> std::io::Result<()> {
     server::spawn(SpawnOpts {
         name: name.to_string(),
         command, // empty => $SHELL (unless `connection` derives an `ssh …` child)
         size: (COLS, ROWS),
-        cwd: None,
+        cwd,
         // Record like the CLI does (`--no-record` is its opt-out): the
         // recording is what lets a dead session's card preview its last
         // screen, and what seeds a recreate with its predecessor's history.
@@ -1405,6 +1406,48 @@ fn inherited_connection(
     foreground: Option<&ConnectionSpec>,
 ) -> Option<ConnectionSpec> {
     foreground.or(group).cloned()
+}
+
+/// Where a new session's directory is inherited *from* — the counterpart to
+/// [`inherited_connection`], resolved by [`App::inherited_spawn_cwd`].
+#[derive(Debug, PartialEq, Eq)]
+enum CwdSource<'a> {
+    /// A local session's own recorded directory.
+    Local(&'a str),
+    /// A session on a remote host, named as that host knows it.
+    Remote { target: &'a str, session: &'a str },
+}
+
+/// Which session (if any) a new terminal should take its **directory** from: the
+/// foreground it is branching off — but only when the new session will run on the
+/// same machine as that foreground, because a directory means nothing anywhere
+/// else. `remote_target` is where the spawn is routed
+/// ([`remote_spawn_target`]), `connection` what it inherited
+/// ([`inherited_connection`]).
+///
+/// The cases that must yield nothing rather than a wrong directory:
+/// - an inherited connection with no live transport — the new session is a local
+///   `ssh <host>` child, and the foreground's directory is this machine's, not the
+///   host's, so the remote shell would be asked to start in a path that is at best
+///   meaningless there;
+/// - a spawn routed onto a host the foreground is not on (a group connection
+///   winning over a local foreground, or a cross-host take-over);
+/// - a local spawn while the foreground lives on a remote host.
+fn cwd_source<'a>(
+    foreground: Option<&'a str>,
+    connection: Option<&ConnectionSpec>,
+    remote_target: Option<&'a str>,
+) -> Option<CwdSource<'a>> {
+    let fg = foreground?;
+    match (remote_target, remote_id_parts(fg)) {
+        // Branching off a remote session onto its own host.
+        (Some(target), Some((fg_target, session))) if target == fg_target => {
+            Some(CwdSource::Remote { target, session })
+        }
+        // Both local, and staying local: the ordinary new-terminal case.
+        (None, None) if connection.is_none() => Some(CwdSource::Local(fg)),
+        _ => None,
+    }
 }
 
 /// The connected remote host a new inheriting session should be created *on*, if
@@ -1720,7 +1763,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
                     StartupChoice::Fleet => Startup::Fleet,
                     StartupChoice::Spawn => {
                         let n = format!("{}-{}", ghost_vt::paths::host_tag(), std::process::id());
-                        match spawn_session(&n, vec![], None) {
+                        match spawn_session(&n, vec![], None, None) {
                             Ok(()) => Startup::Single(n),
                             // Nothing to show a single view of. Start on the fleet,
                             // which is also where an existing session would be found
@@ -2805,11 +2848,14 @@ pub trait Frontend {
     /// later spawn with nothing to exec (`ghost_vt::server::check_exec_target`).
     /// On the seam because it is a side effect the headless shell must be able to
     /// refuse — a spawn that cannot be made to fail cannot be tested for.
+    /// `cwd` is where the child should start (`None` ⇒ ghost's own launch
+    /// directory) — how a new terminal lands beside the session it branched off.
     fn spawn_session(
         &self,
         name: &str,
         command: Vec<String>,
         connection: Option<ConnectionSpec>,
+        cwd: Option<PathBuf>,
     ) -> std::io::Result<()>;
     /// Leave the event loop (quit).
     fn exit(&self);
@@ -2878,8 +2924,9 @@ impl Frontend for WinitFrontend<'_> {
         name: &str,
         command: Vec<String>,
         connection: Option<ConnectionSpec>,
+        cwd: Option<PathBuf>,
     ) -> std::io::Result<()> {
-        spawn_session(name, command, connection)
+        spawn_session(name, command, connection, cwd)
     }
 
     fn exit(&self) {
@@ -2938,8 +2985,9 @@ pub struct HeadlessFrontend {
     opened: std::cell::RefCell<Vec<(SessionReason, Option<String>)>>,
     /// How many times the App removed a session outright.
     removed: std::cell::Cell<usize>,
-    /// Every local session the App asked to start, in order.
-    spawned: std::cell::RefCell<Vec<String>>,
+    /// Every local session the App asked to start, in order, with the directory
+    /// it asked for it to start in.
+    spawned: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
     /// Set to make every spawn fail, standing in for the binary having been
     /// replaced under a running GUI.
     spawns_fail: std::cell::Cell<bool>,
@@ -2970,6 +3018,16 @@ impl HeadlessFrontend {
 
     /// The local sessions the App asked to start, attempted or not.
     pub fn spawned_sessions(&self) -> Vec<String> {
+        self.spawned
+            .borrow()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Those same requests with the directory each was to start in — what a new
+    /// terminal inherits from the session it branched off.
+    pub fn spawn_requests(&self) -> Vec<(String, Option<PathBuf>)> {
         self.spawned.borrow().clone()
     }
 
@@ -3061,8 +3119,11 @@ impl Frontend for HeadlessFrontend {
         name: &str,
         command: Vec<String>,
         connection: Option<ConnectionSpec>,
+        cwd: Option<PathBuf>,
     ) -> std::io::Result<()> {
-        self.spawned.borrow_mut().push(name.to_string());
+        self.spawned
+            .borrow_mut()
+            .push((name.to_string(), cwd.clone()));
         if self.spawns_fail.get() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -3072,7 +3133,7 @@ impl Frontend for HeadlessFrontend {
         // Otherwise really start one. The headless frontend stands in for the
         // window system, not for the session machinery: the shell tests attach to
         // these hosts and read their screens, so a stub here would test the stub.
-        spawn_session(name, command, connection)
+        spawn_session(name, command, connection, cwd)
     }
 
     fn exit(&self) {
@@ -4369,7 +4430,7 @@ impl App {
                     if let Some((target, real)) =
                         remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
                     {
-                        self.spawn_remote_session(wid, &target, &real);
+                        self.spawn_remote_session(wid, &target, &real, None);
                     } else if self.respawn_dead(&id) && self.attach_into(wid, &id) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
@@ -4419,7 +4480,7 @@ impl App {
                     // race. A freshly-spawned name is new, so the shared client map has
                     // no entry — this window becomes its driver. A spawn that failed
                     // has no host to attach to at all.
-                    if let Err(e) = event_loop.spawn_session(&name, command, None) {
+                    if let Err(e) = event_loop.spawn_session(&name, command, None, None) {
                         eprintln!("ghost: could not start session {name}: {e}");
                     } else if !self.sessions.contains_key(&name)
                         && let Some(w) = self.windows.get(&wid)
@@ -4480,13 +4541,23 @@ impl App {
                         .lock()
                         .map(|m| m.keys().cloned().collect())
                         .unwrap_or_default();
-                    match remote_spawn_target(connection.as_ref(), &connected) {
-                        Some(target) => self.spawn_remote_session(wid, &target, &name),
+                    let target = remote_spawn_target(connection.as_ref(), &connected);
+                    // …and, on the same footing, where that session is working: a
+                    // new terminal opens beside the one it came from, not back at
+                    // whatever directory ghost itself was launched in.
+                    let cwd = self.inherited_spawn_cwd(wid, connection.as_ref(), target.as_deref());
+                    match target {
+                        Some(target) => self.spawn_remote_session(wid, &target, &name, cwd),
                         None => {
                             // A spawn that failed started nothing, so there is
                             // nothing to attach to and nothing to adopt: falling
                             // through would record a member the fleet can never show.
-                            match event_loop.spawn_session(&name, vec![], connection) {
+                            match event_loop.spawn_session(
+                                &name,
+                                vec![],
+                                connection,
+                                cwd.map(PathBuf::from),
+                            ) {
                                 Ok(()) => {
                                     if self.attach_into(wid, &name) {
                                         self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
@@ -4961,7 +5032,7 @@ impl App {
         // kept by ControlPersist); clear it so the relaunch opens a fresh connection
         // instead of multiplexing onto the corpse.
         host.remote.reap_wedged_master();
-        if let Err(e) = host.remote.spawn_host(&host.remote_ghost, real) {
+        if let Err(e) = host.remote.spawn_host(&host.remote_ghost, real, None) {
             eprintln!("ghost: could not relaunch remote session '{real}' on {target}: {e}");
         }
     }
@@ -4983,7 +5054,11 @@ impl App {
         real: &str,
     ) -> bool {
         host.remote.reap_wedged_master();
-        if host.remote.spawn_host(&host.remote_ghost, real).is_err() {
+        if host
+            .remote
+            .spawn_host(&host.remote_ghost, real, None)
+            .is_err()
+        {
             return false;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5518,7 +5593,7 @@ impl App {
         // The descriptor carries the `ConnectionSpec`, so the session is marked a
         // plain-ssh session by derivation (`foreground_connection`) — no stored
         // "is fallback" flag.
-        match event_loop.spawn_session(&name, vec![], Some(spec)) {
+        match event_loop.spawn_session(&name, vec![], Some(spec), None) {
             Ok(()) => {
                 if self.attach_into(wid, &name) {
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
@@ -5654,6 +5729,43 @@ impl App {
         inherited_connection(group.as_ref(), foreground.as_ref())
     }
 
+    /// The directory a new session spawned into `wid` should start in: where the
+    /// session it is branching off is working, when the two will run on the same
+    /// machine (see [`cwd_source`]). `None` ⇒ wherever ghost itself was launched,
+    /// the old behaviour.
+    ///
+    /// A local directory is read from the foreground's descriptor (the host keeps
+    /// it current from the child's `/proc` cwd) and dropped if it has since gone —
+    /// a vanished directory would fail the spawn outright, and no new terminal at
+    /// all is a far worse answer than one in the wrong place. A remote directory
+    /// comes from its host's own listing, which reports it home-collapsed, so the
+    /// `~` travels back to the host that can expand it (`ghost new --cwd`).
+    fn inherited_spawn_cwd(
+        &self,
+        wid: WindowId,
+        connection: Option<&ConnectionSpec>,
+        remote_target: Option<&str>,
+    ) -> Option<String> {
+        let fg = self.windows.get(&wid)?.root.foreground()?.as_str();
+        match cwd_source(Some(fg), connection, remote_target)? {
+            CwdSource::Local(id) => {
+                let cwd = ghost_vt::descriptor::read(id)?.cwd?;
+                cwd.is_dir().then(|| cwd.to_string_lossy().into_owned())
+            }
+            CwdSource::Remote { target, session } => {
+                // A host's stashed listing is namespaced (`<target>␟<real>`), so it
+                // is looked up by the composite id, not the name the host uses.
+                let composite = remote_fleet_id(target, session);
+                self.remote_infos
+                    .get(target)?
+                    .iter()
+                    .find(|i| i.name == composite)?
+                    .cwd
+                    .clone()
+            }
+        }
+    }
+
     /// The ssh connection an owned foreground session `id` carries, if any — read
     /// from stored data, never a live command line. A session driven over the
     /// transport (`<target>␟<real>`) has no local descriptor, so its spec comes
@@ -5786,7 +5898,13 @@ impl App {
     /// worker posts [`UserEvent::RemoteSessionSpawned`] back — never blocking the
     /// event loop, which a slow or wedged host would otherwise freeze for every
     /// window. Mirrors the connect worker ([`spawn_connect_worker`]).
-    fn spawn_remote_session(&mut self, wid: WindowId, target: &str, name: &str) {
+    fn spawn_remote_session(
+        &mut self,
+        wid: WindowId,
+        target: &str,
+        name: &str,
+        cwd: Option<String>,
+    ) {
         let host = self
             .remotes
             .lock()
@@ -5808,7 +5926,7 @@ impl App {
             host.remote.reap_wedged_master();
             let result = host
                 .remote
-                .spawn_host(&host.remote_ghost, &name)
+                .spawn_host(&host.remote_ghost, &name, cwd.as_deref())
                 .map_err(|e| e.to_string());
             sink.post(UserEvent::RemoteSessionSpawned {
                 wid,
@@ -6259,7 +6377,7 @@ impl App {
                 // A fresh window starts a local session (no foreground to inherit
                 // an ssh connection from; a P5 ssh group would set one here).
                 let group = self.mint_group();
-                match event_loop.spawn_session(&name, vec![], None) {
+                match event_loop.spawn_session(&name, vec![], None, None) {
                     Ok(()) => {
                         self.open_single_window(event_loop, &name, group, None);
                     }
@@ -8032,12 +8150,13 @@ impl App {
 mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
-        App, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall, LastExit,
-        PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, StartupChoice, auth_error_message,
-        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, glass,
-        home_launch_dir, inherited_connection, namespace_remote_infos, new_window_choice,
-        password_prompt, remote_spawn_target, respawn_opts, restore_plan, session_reason,
-        should_restore, startup_choice, surface_matches_window, theme_colors,
+        App, CwdSource, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
+        LastExit, PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, StartupChoice,
+        auth_error_message, choose_alpha_mode, choose_surface_format, config,
+        connect_outcome_wanted, cwd_source, glass, home_launch_dir, inherited_connection,
+        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
+        respawn_opts, restore_plan, session_reason, should_restore, startup_choice,
+        surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
@@ -9073,7 +9192,7 @@ mod tests {
             let name = "orphan-1";
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
                 .unwrap();
             let created = wait_until(true, name);
 
@@ -9158,7 +9277,7 @@ mod tests {
             // main-loop continuation the result the worker posts back.
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
                 .unwrap();
             app.finish_remote_session_spawn(
                 wid,
@@ -9601,7 +9720,7 @@ mod tests {
             let name = "rp-1";
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
                 .unwrap();
             app.finish_remote_session_spawn(
                 a,
@@ -9929,7 +10048,7 @@ mod tests {
             // main-loop continuation that indexes and attaches the new session.
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), name)
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
                 .unwrap();
             app.finish_remote_session_spawn(
                 wid,
@@ -10009,6 +10128,53 @@ mod tests {
 
         // No inherited connection → a plain local `$SHELL`.
         assert_eq!(remote_spawn_target(None, &connected), None);
+    }
+
+    /// A directory only means something on the machine it is on, so a new
+    /// terminal takes one from the session it branched off exactly when the two
+    /// will run on the same machine — and takes nothing, rather than something
+    /// wrong, otherwise.
+    #[test]
+    fn a_directory_is_inherited_only_from_a_sibling_on_the_same_machine() {
+        let spec = ConnectionSpec::parse_target("kov@box").expect("valid target");
+        let remote_fg = format!("kov@box{REMOTE_ID_SEP}work");
+
+        // Local to local — the ordinary new-terminal case.
+        assert_eq!(
+            cwd_source(Some("alpha"), None, None),
+            Some(CwdSource::Local("alpha"))
+        );
+
+        // Branching off a remote session onto its own host: the directory is that
+        // host's, and so is the new session.
+        assert_eq!(
+            cwd_source(Some(&remote_fg), Some(&spec), Some("kov@box")),
+            Some(CwdSource::Remote {
+                target: "kov@box",
+                session: "work"
+            })
+        );
+
+        // An inherited connection with no transport: the new session is a local
+        // `ssh <host>` child, so the foreground's local directory says nothing
+        // about where that remote shell should start.
+        assert_eq!(cwd_source(Some("ssh-box"), Some(&spec), None), None);
+
+        // A spawn routed onto a host the foreground is not on (a group connection
+        // winning, or a cross-host take-over), and its mirror image — a local
+        // spawn while the foreground lives elsewhere.
+        assert_eq!(
+            cwd_source(Some("alpha"), Some(&spec), Some("kov@box")),
+            None
+        );
+        assert_eq!(
+            cwd_source(Some(&remote_fg), Some(&spec), Some("kov@other")),
+            None
+        );
+        assert_eq!(cwd_source(Some(&remote_fg), None, None), None);
+
+        // Nothing in the foreground (an empty fleet window): nothing to inherit.
+        assert_eq!(cwd_source(None, None, None), None);
     }
 
     fn info(name: &str, attached: bool) -> SessionInfo {
@@ -10475,7 +10641,7 @@ mod tests {
             let real = "restored-1";
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), real)
+                .spawn_host(ghost_bin.to_str().unwrap(), real, None)
                 .unwrap();
 
             // A restored remote-only window is waiting to re-adopt it: opened as a
@@ -10549,10 +10715,10 @@ mod tests {
             // Two sessions survived on the host.
             let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), "fg-1")
+                .spawn_host(ghost_bin.to_str().unwrap(), "fg-1", None)
                 .unwrap();
             remote
-                .spawn_host(ghost_bin.to_str().unwrap(), "bg-1")
+                .spawn_host(ghost_bin.to_str().unwrap(), "bg-1", None)
                 .unwrap();
 
             let group = app.mint_group();
