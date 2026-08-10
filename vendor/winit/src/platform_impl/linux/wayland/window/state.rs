@@ -712,6 +712,15 @@ impl WindowState {
         self.size
     }
 
+    /// The size of the window *proper* — the geometry the compositor is told
+    /// about, which is [`inner_size`](Self::inner_size) less whatever margins are
+    /// in force. Equal to the surface for a window keeping no room around
+    /// itself. [vendored addition]
+    #[inline]
+    pub fn geometry_size(&self) -> LogicalSize<u32> {
+        self.margins_now().deflate(self.size)
+    }
+
     /// Whether the window received initial configure event from the compositor.
     #[inline]
     pub fn is_configured(&self) -> bool {

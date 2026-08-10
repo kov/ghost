@@ -265,6 +265,19 @@ pub trait WindowExtWayland {
     /// [`Window::request_inner_size`]: crate::window::Window::request_inner_size
     fn set_decoration_margins(&self, margins: DecorationMargins) -> PhysicalSize<u32>;
 
+    /// The size of the window *proper*: [`Window::inner_size`] less the margins
+    /// in force. [vendored addition]
+    ///
+    /// The two differ only while margins are set, and the difference is not
+    /// their pixelated total: the surface grows by the margins' LOGICAL total
+    /// and that sum is rounded once, so a client splitting the ring back into
+    /// per-side pixels must take its totals from here rather than rounding each
+    /// side of its own margins. Falls back to the surface size wherever margins
+    /// cannot be set (X11).
+    ///
+    /// [`Window::inner_size`]: crate::window::Window::inner_size
+    fn geometry_size(&self) -> PhysicalSize<u32>;
+
     /// Whether the compositor restored remembered state into this window's first
     /// configure, for a window named through
     /// [`WindowAttributesExtWayland::with_session_toplevel`]. [vendored addition]
@@ -349,6 +362,16 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::Wayland(window) => {
                 window.set_decoration_margins(margins)
             },
+        }
+    }
+
+    #[inline]
+    fn geometry_size(&self) -> PhysicalSize<u32> {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => self.inner_size(),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.geometry_size(),
         }
     }
 

@@ -316,6 +316,13 @@ impl Window {
         logical_to_physical_rounded(size, state.scale_factor())
     }
 
+    /// The size of the window proper inside the surface — [`Self::inner_size`]
+    /// less the margins in force. [vendored addition]
+    pub fn geometry_size(&self) -> PhysicalSize<u32> {
+        let state = self.window_state.lock().unwrap();
+        logical_to_physical_rounded(state.geometry_size(), state.scale_factor())
+    }
+
     /// Round the backdrop effect's corners to `top` and `bottom` logical
     /// pixels. [vendored addition]
     pub fn set_blur_corner_radii(&self, top: u32, bottom: u32) {
