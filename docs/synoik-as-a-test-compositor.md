@@ -30,9 +30,11 @@ what it would need, in the order that decides whether a test can exist at all.
    surface and ghost's swapchain dies at creation (`ERROR_SURFACE_LOST_KHR`,
    "no surface-compatible adapter"). Rendering to a DRM render node the way
    mutter's gbm renderer does is enough — nothing has to reach a screen.
-2. **No seat, no logind session, no TTY.** A nested synoik currently exits with
-   "Failed to open session: Function not implemented (os error 38)". A test
-   process is not a session leader and cannot become one.
+2. **No seat, no logind session, no TTY.** A test process is not a session
+   leader and cannot become one. (The "Failed to open session: Function not
+   implemented (os error 38)" we first hit was our own mistake: running plain
+   `synoik` picks the tty backend, which is the only thing that touches
+   libseat. `--headless` never does.)
 3. **A private Wayland socket, named by a flag.** Tests run concurrently and
    must never touch each other or the live desktop: `--wayland-display=NAME`
    (or a path) plus honouring `XDG_RUNTIME_DIR`, like weston's `--socket` and
@@ -101,3 +103,39 @@ able to write the test at all.
 If synoik grows 1–5 it replaces mutter in `fractional_scale.rs` immediately, and
 weston in `windowed.rs` right after; 6–14 are each worth a test that cannot be
 written today.
+
+## Status — everything above is answered
+
+synoik implemented this list on 2026-08-10 (rationale in that repo's
+`docs/fork/headless-test-compositor.md`). 6, 7, 9, 10 and 13 already worked;
+1 (`df659a12`, headless dmabuf), 14 (`562edd3e`), 4 + 8 + 5 (`5004eb8d`,
+`--output WxH[@SCALE]`, repeatable, and no more xwayland-satellite in
+`/tmp/.X11-unix`), 11 (`4ce53800`) and 3 (`bcde724e`) landed. 12, the per-window
+frame counter, was declined in favour of the existing `synoik msg frame-perf` —
+two instruments measuring adjacent things is how one silently omits its own
+event.
+
+**Verified against a real ghost run**, not just reported: a headless synoik at
+`--output 1600x1000@1.25` hands ghost a working swapchain, and across
+maximize → runtime scale change to 1.3333 → unmaximize the frame invariant
+holds every time (`surface − geometry == inset`: 65/65 floating at 1.25, 0/0
+maximized, 69/70 floating at 1.3333) with zero dropped frames. `msg -j windows`
+reports `surface_size` beside `window_size`, so the shadow ring can finally be
+checked from *outside* ghost — 780×527 against 728×475 logical is the same 65px
+ghost measured for itself. Maximize-at-fractional-scale, called untestable
+above, is now writable. Input injection, screenshot-to-file and
+`ext-background-effect-v1` are reported working but we have not exercised them.
+
+Two caveats gate a synoik rig: the headless dmabuf path is **LINEAR 8888 only**
+(a Venus constraint), and on a driver without `VK_EXT_physical_device_drm` —
+lavapipe — no dmabuf global is advertised at all and the client silently falls
+back to shm. So a synoik rig needs a real GPU, where weston's `--renderer=gl`
+did not. Traps: isolate `XDG_CONFIG_HOME` or the developer's `monitors.xml`
+overrides the requested scale with no error, keep `XDG_RUNTIME_DIR` short (the
+108-byte `sockaddr_un` limit), pass `SYNOIK_SOCKET` explicitly on every `msg`
+call so an ambient one cannot aim at the live desktop, and script against
+`Maximize`/`ToggleTiledLeft` rather than the niri column verbs this fork is
+replacing.
+
+None of it is released yet, so no test here depends on it until synoik pushes
+and the installed binary catches up.
