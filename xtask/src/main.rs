@@ -5,13 +5,17 @@
 //! * `cargo xtask install` — on macOS, bundle and copy the `.app` into
 //!   `/Applications`; elsewhere a freedesktop install into `--prefix <dir>`
 //!   (default `$HOME/.local`): `bin/ghost`, the `.desktop` entry in
-//!   `share/applications`, and the icon in the hicolor theme.
+//!   `share/applications`, and the icon in the hicolor theme. Either way it then
+//!   refreshes the staging prebuilts, so what ghost copies to a remote is the
+//!   build just installed; a prebuilt that cannot be built warns and no more.
 //! * `cargo xtask icon`    — regenerate `assets/ghost.icns` from the SVG.
 //! * `cargo xtask prebuilt [<triple>…]` — cross-build the headless `ghost-host`
 //!   for each target and drop it in the prebuilt dir as `ghost-<os>-<arch>`, where
-//!   staging's resolver finds it. No triples ⇒ this host OS's two arches. Set
-//!   `GHOST_ZIGBUILD=1` to build through `cargo zigbuild` (bundles its own
-//!   sysroots, so cross-OS builds need no system cross-toolchain).
+//!   staging's resolver finds it. No triples ⇒ every supported platform but this
+//!   one. Set `GHOST_ZIGBUILD=1` to build through `cargo zigbuild` (bundles its
+//!   own sysroots, so cross-OS builds need no system cross-toolchain). Darwin
+//!   targets cross-build from Linux this way with no Apple SDK — `ghost-host`
+//!   links against no macOS framework.
 //!
 //! The bundle is **relocatable and launcher-free**: the `ghost` binary has no
 //! non-system dylib dependencies, falls through to the GUI when launched with no
@@ -85,12 +89,14 @@ fn run() -> R<()> {
             }
             copy_dir(&app, &dest)?;
             println!("installed {}", dest.display());
+            install_prebuilts();
         }
         Some("install") => {
             let prefix = install_prefix(&std::env::args().skip(2).collect::<Vec<_>>())?;
             let binary = build_release(&workspace_dir())?;
             install_freedesktop(&binary, &prefix)?;
             println!("installed into {}", prefix.display());
+            install_prebuilts();
             if !on_path(&prefix.join("bin")) {
                 println!(
                     "note: {} is not on your PATH — the desktop entry runs `ghost`",
@@ -425,6 +431,36 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
     Ok(())
 }
 
+/// What an install should say about a prebuilt refresh that did not fully
+/// succeed — `None` when it did.
+///
+/// An install never *fails* on this. The prebuilts are for staging onto other
+/// machines, and someone installing ghost here without a cross toolchain still
+/// wants ghost installed here. But it is said out loud, with the command to retry
+/// on its own: a prebuilt that silently stops being rebuilt is one that goes on
+/// being staged to remotes long after it stopped matching this build, and a
+/// remote host older than its client is a session that misbehaves in ways nobody
+/// traces back to a stale file.
+/// Cut the staging prebuilts as part of an install, so the binary ghost copies to
+/// a remote is always the one this install just built. They used to be refreshed
+/// only when someone remembered to, by hand, which is to say rarely: the
+/// difference between a client and the host it staged was free to grow until
+/// something broke in a way that looked like anything but version skew.
+fn install_prebuilts() {
+    println!("refreshing the staging prebuilts…");
+    if let Some(warning) = prebuilt_refresh_warning(build_prebuilts(&[])) {
+        eprintln!("{warning}");
+    }
+}
+
+fn prebuilt_refresh_warning(result: R<()>) -> Option<String> {
+    let e = result.err()?;
+    Some(format!(
+        "warning: the staging prebuilts were not fully refreshed: {e}\n\
+         note: ghost is installed regardless; retry them with `cargo xtask prebuilt`"
+    ))
+}
+
 /// The Rust host target triple (`rustc -vV`'s `host:` line), so a request for the
 /// host's own arch can build without `--target`. `None` if `rustc` can't be run.
 fn host_triple() -> Option<String> {
@@ -473,31 +509,36 @@ fn default_triples() -> Vec<String> {
 
 /// Why `failed` could not be built, and what to do about it.
 ///
-/// A macOS target from a non-Mac is the case worth spelling out. `cargo zigbuild`
-/// supplies a linker and libSystem, so `GHOST_ZIGBUILD=1` looks like the answer —
-/// but zig does not carry Apple's *frameworks*, and the link dies on `unable to
-/// find framework 'CoreFoundation'`. That needs a real macOS SDK.
-///
-/// So the hint leads with the cheaper answer: a prebuilt is a plain file with no
-/// install step, so one built where it is native — a Mac, or a CI runner — can be
-/// dropped straight into the prebuilt directory. Cross-building it here is the
-/// fallback, not the expectation.
+/// This used to single out a macOS target from a non-Mac as needing Apple's SDK,
+/// and steer people toward building it on a Mac instead. That is no longer true:
+/// the frameworks came from `fsevent-sys` alone, and with the session watcher on
+/// kqueue (see `ghost-vt`'s `notify` dependency) a darwin prebuilt links from
+/// Linux with zig and nothing else. Every failure now has the same two causes —
+/// a missing target, or a cross-OS link with no zig behind it.
 fn failure_hint(failed: &[String], host_os: &str) -> String {
-    let wants_apple_sdk = host_os != "macos" && failed.iter().any(|t| t.contains("darwin"));
-    let mut hint = format!("could not build {}", failed.join(", "));
-    if wants_apple_sdk {
+    // Cross-OS is what needs zig; a musl target from Linux links self-contained
+    // with the bundled rust-lld, so don't send that case looking for it.
+    let cross_os = failed
+        .iter()
+        .any(|t| t.contains("darwin") != (host_os == "macos"));
+    let mut hint = format!(
+        "could not build {} — install that target's toolchain \
+         (`rustup target add <triple>`)",
+        failed.join(", ")
+    );
+    if cross_os {
         hint.push_str(
-            " — a macOS target needs Apple's SDK for its frameworks, which zig does not \
-             carry (the link fails on `unable to find framework 'CoreFoundation'`). \
-             Easiest: don't cross-build it. A prebuilt is a plain file, so drop one \
-             built on a Mac — or downloaded from CI — into the prebuilt dir and it is \
-             ready to stage. To build it here anyway, point SDKROOT at a MacOSX.sdk \
-             and set GHOST_ZIGBUILD=1",
+            ", and set GHOST_ZIGBUILD=1 to link across operating systems \
+             (needs `cargo install cargo-zigbuild` and zig on PATH)",
         );
-    } else {
+    }
+    // Said only where it would otherwise be looked for. This hint used to send
+    // people after an Apple SDK, so the reassurance is aimed at whoever remembers
+    // that — and at anyone who reaches for one when a darwin link fails.
+    if host_os != "macos" && failed.iter().any(|t| t.contains("darwin")) {
         hint.push_str(
-            " — install that target's toolchain (`rustup target add <triple>`), or set \
-             GHOST_ZIGBUILD=1 to link it with zig",
+            ". No Apple SDK is involved — the staged binary links against no macOS \
+             framework",
         );
     }
     hint
@@ -623,26 +664,57 @@ fn copy_dir(src: &Path, dst: &Path) -> R<()> {
 mod prebuilt_tests {
     use super::*;
 
+    /// An install refreshes the prebuilts, and a prebuilt it cannot build must not
+    /// take the install down with it. The two are only loosely related: prebuilts
+    /// are for staging onto *other* machines, and someone installing ghost here
+    /// with no cross toolchain installed still wants ghost installed here. The
+    /// failure is worth saying out loud, though — a silent skip is how they went
+    /// stale in the first place.
     #[test]
-    fn a_failed_macos_target_names_the_sdk_and_the_way_around_it() {
-        // The old hint said "set GHOST_ZIGBUILD=1", which is what you have already
-        // done by the time you see this — zig supplies libSystem but NOT Apple's
-        // frameworks, so the link dies on `unable to find framework
-        // 'CoreFoundation'`. Name the actual requirement, and the escape hatch:
-        // prebuilts are plain files, so one built on a Mac can simply be copied.
-        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux");
-        assert!(hint.contains("SDK"), "names the real blocker: {hint}");
+    fn a_prebuilt_that_cannot_be_built_warns_instead_of_failing_the_install() {
+        let warning = prebuilt_refresh_warning(Err("no toolchain for it".into()))
+            .expect("a failure is reported");
         assert!(
-            hint.contains("SDKROOT"),
-            "names the variable that fixes it: {hint}"
+            warning.contains("no toolchain for it"),
+            "carries why it failed: {warning}"
         );
         assert!(
-            hint.contains("prebuilt"),
-            "offers copying the artifact instead: {hint}"
+            warning.contains("cargo xtask prebuilt"),
+            "names how to retry it on its own: {warning}"
+        );
+        // Nothing to say when they all built.
+        assert_eq!(prebuilt_refresh_warning(Ok(())), None);
+    }
+
+    #[test]
+    fn a_failed_macos_target_sends_nobody_hunting_for_an_apple_sdk() {
+        // This hint used to say a darwin target needs Apple's SDK, and that the
+        // real answer was to build it on a Mac and copy the file over. That was
+        // true only because `fsevent-sys` pulled CoreServices and CoreFoundation
+        // into the staged binary; with the watcher on kqueue it links from Linux
+        // with zig and nothing else. Advice that sends someone to find a Mac — or
+        // an SDK they cannot license onto this machine — is worse than none, and
+        // it is how the prebuilts came to sit untouched for weeks.
+        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux");
+        assert!(
+            !hint.contains("SDKROOT"),
+            "nothing to point at an SDK any more: {hint}"
+        );
+        assert!(
+            hint.contains("No Apple SDK is involved"),
+            "says so outright, where one would otherwise be hunted for: {hint}"
+        );
+        assert!(
+            hint.contains("GHOST_ZIGBUILD"),
+            "names what a cross-OS link does need: {hint}"
+        );
+        assert!(
+            hint.contains("rustup target add"),
+            "names what to install: {hint}"
         );
 
-        // A Linux target failing is a toolchain problem, not an SDK one — don't
-        // send someone hunting for an Xcode SDK they never needed.
+        // A Linux target failing is the same story with one less step — no zig
+        // needed for a musl target, which links with the bundled rust-lld.
         let hint = failure_hint(&["x86_64-unknown-linux-musl".to_string()], "macos");
         assert!(
             !hint.contains("SDK"),

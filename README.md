@@ -237,21 +237,28 @@ platform. It looks for a file named `ghost-<os>-<arch>` — `os` ∈ `linux`/`ma
 1. `$GHOST_PREBUILT_DIR`, then
 2. `$XDG_DATA_HOME/ghost/prebuilt/` (`~/.local/share/ghost/prebuilt/`).
 
-Generate them with xtask:
+`cargo xtask install` refreshes them, so an installed ghost stages the build it
+was installed from. To cut them on their own:
 
 ```sh
-cargo xtask prebuilt                        # this OS's two arches → the prebuilt dir
+cargo xtask prebuilt                        # every platform but this one → the prebuilt dir
 cargo xtask prebuilt aarch64-apple-darwin   # a specific target
 GHOST_ZIGBUILD=1 cargo xtask prebuilt …     # build via cargo-zigbuild (for a cross-OS
-                                            # target, e.g. a Linux prebuilt from a Mac)
+                                            # target, e.g. a macOS prebuilt from Linux)
 ```
 
 `ghost-host` is pure Rust and GUI-free, so cross-building needs no C toolchain or
 sysroot. On Linux the default targets are **static musl** binaries: `rustup target
 add` is the only setup (xtask does it), they link with the bundled `rust-lld`, and
-being static they run on any remote regardless of its glibc. On macOS the native
-Apple toolchain builds both arches. Only cross-*OS* builds (a Linux binary from a
-Mac, or vice-versa) want `GHOST_ZIGBUILD=1`.
+being static they run on any remote regardless of its glibc. Only cross-*OS* builds
+want `GHOST_ZIGBUILD=1` (plus `cargo install cargo-zigbuild` and zig on `PATH`).
+
+**A macOS prebuilt cross-builds from Linux with no Apple SDK.** `ghost-host` links
+against no macOS framework — the session watcher uses kqueue rather than FSEvents
+precisely so it doesn't (`ghost-vt`'s `notify` dependency). Keep it that way: a
+dependency that pulls in CoreFoundation or CoreServices makes the darwin prebuilts
+buildable only on a Mac, and a prebuilt nobody can rebuild is one that silently
+goes stale and starts staging an old host to remotes.
 
 The binary is a few MB and is the only thing staged to the remote. With no matching
 prebuilt ghost falls back to the ssh child, so a missing one never breaks a
