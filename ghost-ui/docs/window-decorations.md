@@ -291,6 +291,16 @@ Verified in the vendored winit (0.30.13):
   window while we paint the libadwaita-fitted shadow into the margin, dropped
   when maximized or tiled.
 
+  The one arithmetic rule that came out of it: the shadow ring's pixels are
+  `surface_px - geometry_px` per axis (`FrameInset::fit`, reading winit's
+  vendored `WindowExtWayland::geometry_size`), split by rounding the leading
+  side only. Rounding each logical margin on its own disagrees with the surface
+  by a pixel at fractional scale — 26 logical at 1.25 is 32.5, so two sides
+  claim 66 where the compositor grew the surface by 65 — and a scene one pixel
+  wider than the swapchain is a scissor validation error, which wgpu treats as
+  fatal from a destructor: the whole process aborts. `Graphics::render` now
+  drops any scene whose size disagrees with the surface rather than draw it.
+
   The deletion half is **not**. `EDGE_SHADOW_STEPS`, `corner_shadow` and the
   notch apparatus were to go with it, and they are all still here — now serving
   only the `!own_frame` case, i.e. X11, where the notch they patch is a notch in
