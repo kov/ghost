@@ -155,6 +155,14 @@ build rather than leaving 5 GB behind; every run after is instant. No network (o
 a build failure) is a skip naming the log. `$SYNOIK` still overrides, which is
 how the pin gets moved.
 
+Pin only a rev that is **green on synoik's CI**, not merely one that builds:
+`bcc73a63`, the rev this pinned first, turned out to have failed its own CI
+with a SIGSEGV in the Vulkan render tests. It built and served us fine — we
+build the binary, we do not run their suite — but "our tests pass against it"
+is not evidence about the tree. Synoik now builds `--no-default-features` in
+CI (not just `check`, which cannot fail on linking), so the configuration this
+rig depends on is covered there.
+
 One cost to know about: the windowed dive takes ~12s under headless synoik
 where it took ~0.5s under headless weston, for the same 13 presented frames.
 Root-caused upstream: headless never sets a primary scanout output, so frame
