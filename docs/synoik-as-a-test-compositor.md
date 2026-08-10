@@ -158,4 +158,7 @@ One cost to know about: the windowed dive takes ~12s under headless synoik
 where it took ~0.5s under headless weston, for the same 13 presented frames.
 Root-caused upstream: headless never sets a primary scanout output, so frame
 callbacks come only from synoik's 995ms overdue timer and Fifo waits it out on
-every present. A fix is synoik's to make; re-time this when it lands.
+every present. Fixed in synoik `65c0cfaa`, which pins headless's scanout
+state to a real element pass: measured against that build the same dive takes
+0.34–0.45s, the weston number. It is not on the remote yet, so the pin — and
+this paragraph — move when it is.
