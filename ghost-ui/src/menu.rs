@@ -53,6 +53,16 @@ pub enum UserEvent {
         target: String,
         names: Option<std::collections::HashSet<String>>,
     },
+    /// What a remote host said about itself in its `__probe` handshake. Fetched
+    /// once by the watcher thread when it takes up a host, because it describes
+    /// the machine and not the moment: it cannot change while that ghost runs.
+    /// Its `home` is what lets a remote session's directory be shown shortened —
+    /// the listing carries whole paths (they cross machines), and the only home
+    /// they may be shortened against is the reporting host's own.
+    RemoteEnv {
+        target: String,
+        env: ghost_vt::remote::HostEnv,
+    },
     /// The background half of an ssh connect finished (negotiate/stage/spawn ran
     /// off the event loop): the main loop attaches the window over the result.
     ConnectFinished {

@@ -106,10 +106,23 @@ pub fn list() -> io::Result<Vec<SessionInfo>> {
 /// directory is that host's, and shortening `/Users/kov/proj` against a local
 /// `/home/kov` would either do nothing or, worse, lie.
 pub fn display_path(p: &Path) -> String {
-    match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
+    match dirs::home_dir() {
+        Some(home) => shorten_under(p, &home),
         None => p.display().to_string(),
+    }
+}
+
+/// [`display_path`] against a home given explicitly, for a path that belongs to
+/// another machine: a remote session's directory arrives whole, and the only
+/// home it may be shortened against is the one its own host reported in the
+/// handshake ([`crate::remote::HostEnv`]). Shortening it against ours would
+/// either fail to match or — same username, same layout — match and claim a
+/// directory here that is not the one the session is in.
+pub fn shorten_under(p: &Path, home: &Path) -> String {
+    match p.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
     }
 }
 

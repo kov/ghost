@@ -292,10 +292,107 @@ fn resolve_ghost_binary(target: Platform) -> Option<PathBuf> {
 /// compatibility gate.
 pub const PROBE_MARKER: &str = "ghost-transport";
 
-/// The line `ghost __probe` emits: the [`PROBE_MARKER`] plus the protocol level
-/// this binary speaks.
+/// What the far side told us about itself in its `__probe` reply.
+///
+/// The handshake is the one moment a remote ghost speaks *as itself*, before any
+/// session exists — so it is where the facts about its machine belong. `home` is
+/// the reason this exists: paths cross the wire whole (see
+/// [`crate::session::list`]), and shortening one for display needs the home it
+/// should be shortened against, which is the far side's, not ours. The rest is
+/// the same interrogation `negotiate` already does out-of-band with `uname`, plus
+/// the login shell, answered here for free.
+///
+/// Every field is optional because the reply is *additive*: a ghost older than
+/// these keys still answers with a marker and a `proto=`, and must keep
+/// negotiating. That is also why none of this bumps
+/// [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL) — the gate is a floor
+/// ([`probe_reply_speaks_our_protocol`]), so a bump would reject the very hosts
+/// whose staged copy is too old to be re-staged by anything but a successful
+/// negotiation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostEnv {
+    /// The remote user's `$HOME`.
+    pub home: Option<String>,
+    /// `uname -s`, lowercased (`linux`, `darwin`, …).
+    pub os: Option<String>,
+    /// `uname -m` (`x86_64`, `arm64`, …).
+    pub arch: Option<String>,
+    /// The remote user's `$SHELL`.
+    pub shell: Option<String>,
+}
+
+/// The line `ghost __probe` emits: the [`PROBE_MARKER`], the protocol level this
+/// binary speaks, and what this machine is ([`HostEnv`]).
 pub fn probe_line() -> String {
-    format!("{PROBE_MARKER} proto={}", crate::protocol::PROTO_LEVEL)
+    let mut line = format!("{PROBE_MARKER} proto={}", crate::protocol::PROTO_LEVEL);
+    let mut put = |key: &str, value: Option<String>| {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            line.push_str(&format!(" {key}={}", escape_probe_value(&v)));
+        }
+    };
+    put("home", std::env::var("HOME").ok());
+    put("os", Some(std::env::consts::OS.to_string()));
+    put("arch", Some(std::env::consts::ARCH.to_string()));
+    put("shell", std::env::var("SHELL").ok());
+    line
+}
+
+/// Percent-escape a probe value so the line stays whitespace-separated `k=v`
+/// tokens whatever a home or shell path happens to contain. A directory with a
+/// space in it is ordinary on macOS, and one would otherwise split into two
+/// tokens and truncate the value silently.
+fn escape_probe_value(v: &str) -> String {
+    v.chars()
+        .map(|c| match c {
+            '%' => "%25".to_string(),
+            c if c.is_whitespace() => format!("%{:02X}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+fn unescape_probe_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        match rest
+            .get(i + 1..i + 3)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            Some(b) => {
+                out.push(b as char);
+                rest = &rest[i + 3..];
+            }
+            // A stray `%` is data, not an escape: keep it rather than eat the tail.
+            None => {
+                out.push('%');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What a `__probe` reply says about the machine that answered. Unknown keys are
+/// ignored and absent ones stay `None`, so a reply from any vintage parses.
+pub fn parse_probe_env(reply: &str) -> HostEnv {
+    let mut env = HostEnv::default();
+    for tok in reply.split_whitespace() {
+        let Some((key, value)) = tok.split_once('=') else {
+            continue;
+        };
+        let value = Some(unescape_probe_value(value)).filter(|v| !v.is_empty());
+        match key {
+            "home" => env.home = value,
+            "os" => env.os = value,
+            "arch" => env.arch = value,
+            "shell" => env.shell = value,
+            _ => {}
+        }
+    }
+    env
 }
 
 /// Whether a `__probe` reply is from a remote ghost this initiator can actually
@@ -662,24 +759,31 @@ impl RemoteSsh {
     /// [`PROBE_MARKER`] — a clean exit is not enough (a shell that echoed the
     /// command line would pass a looser check).
     fn probe(&self, candidate: &str) -> bool {
+        self.probe_env(candidate).is_some()
+    }
+
+    /// What `<candidate> __probe` says about the remote machine, or `None` if it
+    /// is not a ghost we can speak to. This *is* the probe — [`probe`](Self::probe)
+    /// is it with the answer thrown away — so a caller that wants the far side's
+    /// [`HostEnv`] pays no extra round trip beyond the one negotiation already
+    /// makes.
+    pub fn probe_env(&self, candidate: &str) -> Option<HostEnv> {
         let mut cmd = self.command(&[candidate, "__probe"]);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let Ok(mut child) = cmd.spawn() else {
-            return false;
-        };
+        let mut child = cmd.spawn().ok()?;
         // Bounded so a master that wedged mid-negotiation can't hang the probe forever
         // (`reap_wedged_master` clears a KNOWN-dead master up front; this is a backstop).
         if !matches!(wait_bounded(&mut child, PROBE_TIMEOUT), Some(s) if s.success()) {
-            return false;
+            return None;
         }
         let mut buf = String::new();
         if let Some(mut out) = child.stdout.take() {
             use std::io::Read as _;
             let _ = out.read_to_string(&mut buf);
         }
-        probe_reply_speaks_our_protocol(&buf)
+        probe_reply_speaks_our_protocol(&buf).then(|| parse_probe_env(&buf))
     }
 
     /// Copy `binary` (the resolver's pick — our own exe or a prebuilt for the
@@ -1123,6 +1227,32 @@ mod tests {
         assert!(!probe_reply_speaks_our_protocol(
             "ghost-transport proto=abc"
         ));
+    }
+
+    #[test]
+    fn the_handshake_says_which_machine_answered() {
+        let env = parse_probe_env(&probe_line());
+        assert_eq!(env.os.as_deref(), Some(std::env::consts::OS));
+        assert_eq!(env.arch.as_deref(), Some(std::env::consts::ARCH));
+        assert_eq!(env.home, std::env::var("HOME").ok());
+    }
+
+    #[test]
+    fn a_home_with_a_space_in_it_survives_the_handshake() {
+        // Ordinary on macOS, and the line is whitespace-separated tokens — so an
+        // unescaped value would split in two and truncate without a word.
+        let env = parse_probe_env("ghost-transport proto=6 home=/Users/ada%20lovelace os=macos");
+        assert_eq!(env.home.as_deref(), Some("/Users/ada lovelace"));
+        assert_eq!(env.os.as_deref(), Some("macos"));
+    }
+
+    #[test]
+    fn a_handshake_from_a_ghost_too_old_to_describe_itself_still_negotiates() {
+        // The keys are additive, not a protocol level: an older remote answers
+        // with nothing but a marker and a level, and must still be spoken to.
+        let old = format!("ghost-transport proto={}", crate::protocol::PROTO_LEVEL);
+        assert!(probe_reply_speaks_our_protocol(&old));
+        assert_eq!(parse_probe_env(&old), HostEnv::default());
     }
 
     #[test]

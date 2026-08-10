@@ -542,6 +542,16 @@ fn start_remote_watcher(
     let child: Arc<std::sync::Mutex<Option<std::process::Child>>> = Arc::default();
     let (t_stop, t_child) = (stop.clone(), child.clone());
     std::thread::spawn(move || {
+        // Asked once, here rather than at registration: the handshake is an ssh
+        // round trip, and this thread is already the place a host's round trips
+        // are allowed to be slow. What it answers describes the machine, so it
+        // stays true for as long as that ghost is the one we speak to.
+        if let Some(env) = host.remote.probe_env(&host.remote_ghost) {
+            sink.post(UserEvent::RemoteEnv {
+                target: target.clone(),
+                env,
+            });
+        }
         let mut failures: u32 = 0;
         while !t_stop.load(Relaxed) {
             let pushed = watch_stream_once(&target, &host, &sink, &t_stop, &t_child);
@@ -1835,6 +1845,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         proxy: Some(proxy),
         remotes,
         remote_infos: HashMap::new(),
+        remote_envs: HashMap::new(),
         remote_remembered: HashMap::new(),
         remote_index: HashMap::new(),
         remote_watchers: HashMap::new(),
@@ -3186,6 +3197,7 @@ impl App {
             proxy: None,
             remotes: Arc::default(),
             remote_infos: HashMap::new(),
+            remote_envs: HashMap::new(),
             remote_remembered: HashMap::new(),
             remote_index: HashMap::new(),
             remote_watchers: HashMap::new(),
@@ -3534,6 +3546,12 @@ pub struct App {
     /// means "unknown" (an older remote ghost, or the fetch hasn't landed), and
     /// the sweep stays conservative: not-listed members remain relaunchable.
     remote_remembered: HashMap<String, HashSet<String>>,
+    /// What each connected host said about its machine in the `__probe`
+    /// handshake, keyed by target. Only `home` is read today — to shorten a
+    /// remote session's directory for display against the home it actually
+    /// belongs to — but the rest is what the far side is, answered in the one
+    /// exchange where it speaks for itself.
+    remote_envs: HashMap<String, ghost_vt::remote::HostEnv>,
     /// Maps a namespaced remote fleet id back to `(target, real id)`, so a
     /// take-over/observe of a remote tile reaches the right host and session.
     /// Rebuilt whenever `remote_infos` changes.
@@ -4278,8 +4296,20 @@ impl App {
                     // Merge the connected hosts' latest listings (watcher-fed) so
                     // the fleet shows local and remote sessions together.
                     let mut combined = infos.clone();
-                    for r in self.remote_infos.values() {
-                        combined.extend(r.iter().cloned());
+                    for (target, r) in &self.remote_infos {
+                        // The host's own home, if it told us one — never ours.
+                        // Without it the whole path is shown: long, but true.
+                        let home = self
+                            .remote_envs
+                            .get(target)
+                            .and_then(|e| e.home.as_deref())
+                            .map(PathBuf::from);
+                        combined.extend(r.iter().cloned().map(|mut i| {
+                            if let (Some(home), Some(cwd)) = (&home, &i.cwd) {
+                                i.cwd = Some(session::shorten_under(Path::new(cwd), home));
+                            }
+                            i
+                        }));
                     }
                     self.dispatch(wid, UiEvent::SessionList(combined), event_loop);
                     if live {
@@ -7055,6 +7085,15 @@ impl App {
                         self.remote_remembered.remove(&target);
                     }
                 }
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            // The host described its machine in the handshake. Keep it and
+            // re-list: tiles already drawn with a whole remote path can now
+            // shorten it against that host's own home.
+            UserEvent::RemoteEnv { target, env } => {
+                self.remote_envs.insert(target, env);
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -10455,6 +10494,78 @@ mod tests {
     /// Now it reports — and a window has to survive being told. The call site
     /// ended in `.expect("spawn session")`, which would have turned a replaced
     /// binary from an invisible no-op into every window on the desktop vanishing.
+    /// A remote session's directory is drawn shortened against the home of the
+    /// machine it is on — never ours, and never left whole once that host has
+    /// said what its home is.
+    ///
+    /// The two are indistinguishable when both sides run the same layout, which
+    /// is how the wrong one hides: `/Users/kov/proj` shortened against a Linux
+    /// `/home/kov` simply refuses to match and shows whole, but a mac talking to
+    /// a mac would have shown `~/proj` for a directory that is not under this
+    /// machine's home at all. So the home under test is one only the far side
+    /// has.
+    #[test]
+    fn a_remote_tile_shortens_its_directory_against_its_own_hosts_home() {
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+
+            let listed = SessionInfo {
+                cwd: Some("/Users/kov/proj".into()),
+                ..info("work", false)
+            };
+            app.remote_infos.insert(
+                "kov@mac".to_string(),
+                namespace_remote_infos("kov@mac", vec![listed]),
+            );
+
+            // Before the handshake lands there is no home to shorten against, so
+            // the path is shown whole rather than guessed at.
+            app.exec(wid, vec![ghost_ui_core::Cmd::ListSessions], &fe);
+            assert!(
+                // The card clips its meta line to its width, so the tail may be
+                // elided — the head is what says which form it took.
+                fleet_text(&app, wid)
+                    .iter()
+                    .any(|t| t.contains("· /Users/") && !t.contains('~')),
+                "an unknown home leaves the directory whole: {:?}",
+                fleet_text(&app, wid)
+            );
+
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteEnv {
+                    target: "kov@mac".to_string(),
+                    env: ghost_vt::remote::HostEnv {
+                        home: Some("/Users/kov".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+            app.exec(wid, vec![ghost_ui_core::Cmd::ListSessions], &fe);
+            assert!(
+                fleet_text(&app, wid).iter().any(|t| t.contains("~/proj")),
+                "the host's own home shortens its session's directory: {:?}",
+                fleet_text(&app, wid)
+            );
+        });
+    }
+
+    /// Every text run a window is currently drawing — what the user can read.
+    fn fleet_text(app: &App, wid: crate::WindowId) -> Vec<String> {
+        let mut out = Vec::new();
+        for layer in &app.windows[&wid].root.view(&app.states).layers {
+            for item in &layer.items {
+                if let ghost_render::SceneItem::Text { runs, .. } = item {
+                    out.extend(runs.iter().map(|r| r.text.clone()));
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn a_session_that_cannot_be_spawned_leaves_the_window_standing() {
         with_isolated_xdg(|| {
