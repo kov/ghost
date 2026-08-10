@@ -240,6 +240,35 @@ impl FrameInset {
         *self == Self::NONE
     }
 
+    /// The inset a `surface` keeps around a `window` of the given physical size,
+    /// distributed by `logical` per-side margins (top, right, bottom, left) at
+    /// `scale`.
+    ///
+    /// The totals come from the two sizes, never from the margins: the window
+    /// system grows the surface by the margins' *logical* total and pixelates
+    /// that once, so rounding each side on its own can spend a pixel the surface
+    /// never gained. 26 logical a side at scale 1.25 is 32.5 px — 33 and 33 is
+    /// 66, while the surface only grew by 65 — and the model, laid out in
+    /// `window(surface)`, would then compose back one pixel wider than the
+    /// buffer it is drawn into. So each axis rounds its leading side and gives
+    /// the remainder to the trailing one, which keeps
+    /// `window(surface) + inset == surface` exact at every scale.
+    pub fn fit(logical: [f32; 4], scale: f32, surface: (u32, u32), window: (u32, u32)) -> Self {
+        let px = |v: f32| (v * scale.max(0.0)).max(0.0).round() as u32;
+        let split = |lead: f32, total: u32| {
+            let lead = px(lead).min(total);
+            (lead, total - lead)
+        };
+        let (top, bottom) = split(logical[0], surface.1.saturating_sub(window.1));
+        let (left, right) = split(logical[3], surface.0.saturating_sub(window.0));
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
     /// The window inside a surface of `surface` px. Never empty.
     pub fn window(&self, surface: (u32, u32)) -> (u32, u32) {
         (
@@ -1067,5 +1096,59 @@ mod tests {
             frame_hit(PointPx { x: 1.0, y: 1.0 }, SIZE, 1.0, grab, 0),
             FrameHit::Content(PointPx { x: 1.0, y: 1.0 })
         );
+    }
+}
+
+#[cfg(test)]
+mod inset_tests {
+    use super::*;
+
+    /// The shadow margins are logical, and the window system grows the *surface*
+    /// by their logical total before turning the whole thing into pixels. Round
+    /// each side on its own and the two disagree the moment a side lands on a
+    /// half pixel: 26 logical at scale 1.25 is 32.5 px, which rounds to 33 a side
+    /// — 66 — while the surface only ever grew by 65. The model is then laid out
+    /// in a window a pixel narrower than the one it is composed back into, and
+    /// the scene overruns the swapchain it is drawn to.
+    ///
+    /// These are the real numbers from a 1088x763-logical window at scale 1.25.
+    #[test]
+    fn an_inset_takes_its_totals_from_the_surface_it_sits_in() {
+        let m = FrameInset::fit([26.0; 4], 1.25, (1425, 1019), (1360, 954));
+        assert_eq!(
+            (m.left + m.right, m.top + m.bottom),
+            (65, 65),
+            "the inset spans exactly the surface the window does not fill"
+        );
+        assert_eq!(
+            m.window((1425, 1019)),
+            (1360, 954),
+            "and so the window it leaves is the window the compositor knows"
+        );
+    }
+
+    /// The other half of the same rule: whatever the model was laid out in has to
+    /// compose back to exactly the surface, or the frame draws past its buffer.
+    #[test]
+    fn a_frame_composes_back_to_the_surface_it_was_measured_from() {
+        let surface = (1425, 1019);
+        let m = FrameInset::fit([26.0; 4], 1.25, surface, (1360, 954));
+        let bar_px = bar_height_px(true, 1.25);
+        let (cw, ch) = m.window(surface);
+        let content = Scene::new((cw, ch.saturating_sub(bar_px).max(1)));
+        let bar = Titlebar {
+            height_px: bar_px,
+            bg: [0.1, 0.1, 0.1, 1.0],
+            fg: [1.0, 1.0, 1.0, 1.0],
+            title: "t".into(),
+            notice: None,
+            font_px: 12.0,
+            scale: 1.25,
+            buttons: ButtonLayout::default(),
+            hovered: None,
+            pressed: None,
+            maximized: false,
+        };
+        assert_eq!(with_frame(content, &bar, m).size_px, surface);
     }
 }
