@@ -183,17 +183,36 @@ fn prune_script(dir: &str, keep: usize) -> String {
     )
 }
 
-/// A short content hash of the ghost binary at `path`, memoized per path for the
-/// process. Stamps the staged path so a *changed* build re-stages while an
-/// identical one reuses the existing copy — crucial in development, where the
-/// version string doesn't move between builds. `"unknown"` if the file can't be
-/// read (staging then falls back to version-only stamping for that binary).
+/// A short content hash of the ghost binary at `path`, memoized for the process.
+/// Stamps the staged path so a *changed* build re-stages while an identical one
+/// reuses the existing copy — crucial in development, where the version string
+/// doesn't move between builds. `"unknown"` if the file can't be read (staging
+/// then falls back to version-only stamping for that binary).
+///
+/// **Memoized on the file's identity, not just its path.** The prebuilt lives at
+/// a fixed path that is rewritten in place every time it is rebuilt, so keying on
+/// the path alone means a long-running ghost answers with the hash of a file that
+/// no longer exists — and goes on staging, and re-using, a remote copy of the
+/// build it saw at startup no matter how many times you rebuild. That cost two
+/// rounds of "rebuild, retest, still broken" in one afternoon. Modification time
+/// and length settle it without re-reading megabytes on every negotiation.
 fn build_stamp(path: &Path) -> String {
     use std::hash::{Hash as _, Hasher as _};
-    static STAMPS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, String>>> =
+    type Identity = (PathBuf, Option<(std::time::SystemTime, u64)>);
+    static STAMPS: std::sync::OnceLock<std::sync::Mutex<HashMap<Identity, String>>> =
         std::sync::OnceLock::new();
+    let identity: Identity = (
+        path.to_path_buf(),
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len()))),
+    );
     let cache = STAMPS.get_or_init(Default::default);
-    if let Some(s) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+    if let Some(s) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&identity)
+    {
         return s.clone();
     }
     let stamp = std::fs::read(path)
@@ -206,7 +225,7 @@ fn build_stamp(path: &Path) -> String {
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf(), stamp.clone());
+        .insert(identity, stamp.clone());
     stamp
 }
 
@@ -1232,6 +1251,28 @@ mod tests {
         assert!(!probe_reply_speaks_our_protocol(
             "ghost-transport proto=abc"
         ));
+    }
+
+    #[test]
+    fn a_rebuilt_binary_restages_even_though_its_path_never_moved() {
+        // The prebuilt is rewritten in place on every rebuild, so a stamp
+        // remembered by path alone describes a file that is gone — and a
+        // long-running ghost keeps re-using the remote copy of the build it saw
+        // when it started, however many times you rebuild and reinstall.
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ghost-macos-aarch64");
+        std::fs::write(&binary, b"the build under test").unwrap();
+        let before = build_stamp(&binary);
+
+        // Rebuilt: same path, different contents. Stamped far enough apart that
+        // the modification time has to have moved.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&binary, b"the build after the fix").unwrap();
+        assert_ne!(
+            build_stamp(&binary),
+            before,
+            "a rebuilt binary must stage under a new name, or the remote keeps the old one"
+        );
     }
 
     #[test]
