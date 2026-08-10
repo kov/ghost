@@ -313,9 +313,14 @@ pub const PROBE_MARKER: &str = "ghost-transport";
 pub struct HostEnv {
     /// The remote user's `$HOME`.
     pub home: Option<String>,
-    /// `uname -s`, lowercased (`linux`, `darwin`, …).
+    /// Rust's own name for the OS (`linux`, `macos`, …) — [`std::env::consts::OS`],
+    /// **not** uname's dialect. A mac is `macos` here and `darwin` in the
+    /// [`Platform`] that staging picks a binary by; the two are not
+    /// interchangeable, and nothing should compare them.
     pub os: Option<String>,
-    /// `uname -m` (`x86_64`, `arm64`, …).
+    /// Rust's own name for the architecture ([`std::env::consts::ARCH`]:
+    /// `x86_64`, `aarch64`, …), with the same caveat as [`Self::os`] — uname
+    /// says `arm64` where this says `aarch64`.
     pub arch: Option<String>,
     /// The remote user's `$SHELL`.
     pub shell: Option<String>,

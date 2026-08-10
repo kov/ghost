@@ -6673,6 +6673,9 @@ impl App {
         }
         self.remote_infos.retain(|t, _| in_use.contains(t));
         self.remote_remembered.retain(|t, _| in_use.contains(t));
+        // Goes with the host that answered it: the next connect gets its own
+        // handshake, and a machine's home is not ours to remember for it.
+        self.remote_envs.retain(|t, _| in_use.contains(t));
         // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
         self.remote_watchers.retain(|t, _| in_use.contains(t));
         self.rebuild_remote_index();
