@@ -313,6 +313,44 @@ fn an_explicit_cwd_starts_the_child_there_not_where_the_spawner_ran() {
     );
 }
 
+/// Where a session *is* has to track where its child went, not where it started:
+/// the fleet labels a tile with it, and a new session branched off one (Alt+T)
+/// starts there. The child's own `cd` is the whole story — it emits a prompt and
+/// nothing else, far short of the recording's checkpoint budget, so a refresh
+/// tied to that budget would report the launch directory for the rest of the
+/// session's life.
+#[test]
+fn a_child_that_changes_directory_is_recorded_there_promptly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let moved_to = xdg.join("elsewhere");
+    std::fs::create_dir_all(&moved_to).unwrap();
+
+    // A shell that settles, moves, then prints its prompt-sized morsel — the
+    // shape of a user typing `cd`, with nowhere near a checkpoint's worth of
+    // output behind it.
+    let script = format!("sleep 0.3; cd {}; echo '$ '; sleep 30", moved_to.display());
+    spawn_and_settle(xdg, "wanderer", &["sh", "-c", &script]);
+    let _guard = KillOnDrop {
+        xdg,
+        name: "wanderer",
+    };
+    let target = moved_to.canonicalize().unwrap();
+    // The recorded `cwd` field specifically — the command line also names the
+    // directory, so a substring match over the whole file proves nothing.
+    let recorded_cwd = |xdg: &Path| -> Option<String> {
+        let d: serde_json::Value = serde_json::from_str(&read_descriptor(xdg, "wanderer")?).ok()?;
+        Some(d.get("cwd")?.as_str()?.to_string())
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            recorded_cwd(xdg).is_some_and(|c| Path::new(&c) == target)
+        }),
+        "the child's new directory must be recorded soon after it moves: {:?}",
+        recorded_cwd(xdg)
+    );
+}
+
 #[test]
 fn a_rename_reaches_the_descriptor() {
     let tmp = tempfile::tempdir().unwrap();

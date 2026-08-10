@@ -97,6 +97,13 @@ fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
     }
 }
 
+/// Shortest gap between two looks at where the child is working (a readlink of
+/// `/proc/<pid>/cwd`). Output arrives in floods, so the look is rate-limited; the
+/// gap is well under human reaction time, so a `cd` is recorded before the user
+/// can act on it, while a megabyte-a-second stream pays for a handful of
+/// readlinks a second.
+const CWD_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Cap on connections awaiting classification, bounding memory against a peer
 /// that connects but never sends its first message.
 const MAX_PENDING: usize = 8;
@@ -1182,6 +1189,10 @@ fn host_main(
     // The last cwd written to the durable descriptor, so refreshes only touch
     // the file when the child actually moved.
     let mut desc_cwd: Option<std::path::PathBuf> = None;
+    // When we last looked at where the child is. The look itself is a readlink,
+    // but output arrives in floods, so it is rate-limited rather than run per
+    // chunk (see [`CWD_REFRESH_INTERVAL`]).
+    let mut cwd_checked_at = Instant::now();
     if adopt.is_none() && !opts.start_on_attach {
         child = Some(spawn_child(
             &child_command,
@@ -1579,6 +1590,23 @@ fn host_main(
                         meta.title = screen.title().to_string();
                         let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
                     }
+                    // The child wrote something, so it may have just moved — a `cd`
+                    // is followed by a prompt. Kept on its own short clock rather
+                    // than the recording's checkpoint budget: a `cd` produces a few
+                    // hundred bytes where that budget is a megabyte, so tying the two
+                    // together left the session reported in its launch directory for
+                    // as long as it lived. What reads this: the fleet's tile label,
+                    // and a session branched off this one (Alt+T), which starts where
+                    // this one is working.
+                    if cwd_checked_at.elapsed() >= CWD_REFRESH_INTERVAL {
+                        cwd_checked_at = Instant::now();
+                        if let Some(cwd) = child_cwd(&child)
+                            && desc_cwd.as_ref() != Some(&cwd)
+                        {
+                            crate::descriptor::set_cwd(current_name, &cwd);
+                            desc_cwd = Some(cwd);
+                        }
+                    }
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
@@ -1600,15 +1628,6 @@ fn host_main(
                                 let imgs = screen.graphics_images();
                                 let _ = r.checkpoint_with_images(c, rws, &dump, &imgs);
                                 dirty_since_checkpoint = false;
-                            }
-                            // Same cadence: keep the durable descriptor's cwd
-                            // current (a cheap /proc readlink; only an actual
-                            // move rewrites the file).
-                            if let Some(cwd) = child_cwd(&child)
-                                && desc_cwd.as_ref() != Some(&cwd)
-                            {
-                                crate::descriptor::set_cwd(current_name, &cwd);
-                                desc_cwd = Some(cwd);
                             }
                             // Reset the budget whether or not we wrote: a screen
                             // unchanged since the last checkpoint waits another full
