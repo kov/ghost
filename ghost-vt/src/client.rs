@@ -289,6 +289,7 @@ impl Subscriber {
                         ServerMsg::Exited(_)
                         | ServerMsg::RenameResult { .. }
                         | ServerMsg::UpgradeResult { .. }
+                        | ServerMsg::SpawnFailed { .. }
                         | ServerMsg::Superseded => {}
                     }
                 }
@@ -314,6 +315,11 @@ pub struct Pump {
     /// so the caller can try to reconnect and resync instead of tearing the tile
     /// down. A clean child exit leaves this `false`.
     pub disconnected: bool,
+    /// Why nothing ever started, when the host's last word was
+    /// [`ServerMsg::SpawnFailed`]. Set alongside `ended`; the session is over
+    /// either way, but a caller with somewhere to show this can say what went
+    /// wrong instead of leaving a window that quietly did nothing.
+    pub failed: Option<String>,
 }
 
 /// An attached session for an event-loop front-end (a GUI): attach and
@@ -520,6 +526,11 @@ impl Session {
                     match msg {
                         ServerMsg::Output(bytes) => pump.output.extend_from_slice(&bytes),
                         ServerMsg::Exited(_code) => pump.ended = true,
+                        // The child never started; the host is exiting behind this.
+                        ServerMsg::SpawnFailed { message } => {
+                            pump.failed = Some(message);
+                            pump.ended = true;
+                        }
                         // `Superseded` is ignored here: the GUI's take-over is
                         // coordinated through the shared model, and the drop that
                         // follows surfaces via the usual EOF path — unchanged from
@@ -751,6 +762,12 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                     }
                     ServerMsg::Exited(_code) => {
                         eprint!("\r\n[ghost: session ended]\r\n");
+                        return Ok(());
+                    }
+                    // Nothing ever ran: say what could not be started, rather than
+                    // leaving the user to read a bare disconnect as a ghost bug.
+                    ServerMsg::SpawnFailed { message } => {
+                        eprint!("\r\n[ghost: could not start {message}]\r\n");
                         return Ok(());
                     }
                     ServerMsg::RenameResult { ok, message } => {

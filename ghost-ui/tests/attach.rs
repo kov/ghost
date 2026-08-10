@@ -1233,3 +1233,33 @@ fn rename_prompt_renames_attached_session() {
         term.screen()
     );
 }
+
+#[test]
+fn a_child_that_cannot_be_started_says_why_before_the_session_ends() {
+    // The child is spawned only once a client has attached, so by the time a
+    // bad command fails there IS someone to tell — and telling them is the whole
+    // difference between "ghost is broken" and "you typed the wrong path". The
+    // host used to just exit, which the client read as an ordinary disconnect.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-nostart";
+    let _guard = KillOnDrop { xdg, name };
+
+    let missing = xdg.join("definitely-not-a-program");
+    let term = Attached::new_session(xdg, name, &[missing.to_str().unwrap()], 80, 24);
+
+    assert!(
+        term.wait_for_screen(Duration::from_secs(10), |lines| {
+            lines.iter().any(|l| l.contains("could not start"))
+        }),
+        "the attached terminal never learned why nothing started; got: {:?}",
+        term.screen()
+    );
+    assert!(
+        term.screen()
+            .iter()
+            .any(|l| l.contains("definitely-not-a-program")),
+        "and it names what it could not start: {:?}",
+        term.screen()
+    );
+}

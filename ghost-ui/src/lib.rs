@@ -1138,6 +1138,10 @@ enum PumpEnd {
     Live,
     Exited,
     Disconnected,
+    /// The child never started at all, and the host said why on its way out
+    /// (`ServerMsg::SpawnFailed`). An end like `Exited` — there is nothing to
+    /// reconnect to — but one the user is owed an explanation for.
+    NeverStarted,
 }
 
 impl PumpEnd {
@@ -1149,7 +1153,7 @@ impl PumpEnd {
 
 /// Drain up to `max` pending reads off a session, returning the accumulated output
 /// and how it ended. A read error is a transport failure, i.e. `Disconnected`.
-fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd) {
+fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd, Option<String>) {
     let mut bytes = Vec::new();
     for _ in 0..max {
         match session.pump() {
@@ -1159,23 +1163,21 @@ fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd) {
                     bytes.extend_from_slice(&p.output);
                 }
                 if p.ended {
-                    return (
-                        bytes,
-                        if p.disconnected {
-                            PumpEnd::Disconnected
-                        } else {
-                            PumpEnd::Exited
-                        },
-                    );
+                    let end = match (&p.failed, p.disconnected) {
+                        (Some(_), _) => PumpEnd::NeverStarted,
+                        (None, true) => PumpEnd::Disconnected,
+                        (None, false) => PumpEnd::Exited,
+                    };
+                    return (bytes, end, p.failed);
                 }
                 if empty {
                     break;
                 }
             }
-            Err(_) => return (bytes, PumpEnd::Disconnected),
+            Err(_) => return (bytes, PumpEnd::Disconnected, None),
         }
     }
-    (bytes, PumpEnd::Live)
+    (bytes, PumpEnd::Live, None)
 }
 
 // ---- capture mode (headless) -------------------------------------------
@@ -1230,7 +1232,7 @@ fn capture(path: PathBuf) {
     let start = Instant::now();
     let mut last_change = Instant::now();
     loop {
-        let (bytes, end) = pump(&mut session, 64);
+        let (bytes, end, _) = pump(&mut session, 64);
         let ended = end.is_end();
         if !bytes.is_empty() || ended {
             last_change = if bytes.is_empty() {
@@ -1352,7 +1354,7 @@ fn esctest_host() {
             .unwrap_or(300),
     );
     loop {
-        let (bytes, end) = pump(&mut session, 256);
+        let (bytes, end, _) = pump(&mut session, 256);
         let ended = end.is_end();
         if !bytes.is_empty() || ended {
             let cmds = model.update(UiEvent::SessionData {
@@ -7864,6 +7866,15 @@ impl App {
     /// same outcome as observers. A client with no driving view (transitional) is fed
     /// as observed so any previewer still updates. Commands are buffered while the
     /// window borrows are live, then executed.
+    /// Every window currently showing `name`, in any mode.
+    fn windows_viewing(&self, name: &str) -> Vec<WindowId> {
+        self.windows
+            .iter()
+            .filter(|(_, w)| w.root.views(name))
+            .map(|(wid, _)| *wid)
+            .collect()
+    }
+
     fn feed_driven_to_windows(&mut self, name: &str, bytes: &[u8], ended: bool, fe: &dyn Frontend) {
         let driver_wid = self.pick_driver(name);
         let mut buffered: Vec<(WindowId, Vec<Cmd>)> = Vec::new();
@@ -8093,14 +8104,22 @@ impl App {
             // The pump is also where a `flush_pending` retries input the transport
             // refused, so the depth AFTER it is what is really stuck (see
             // `note_input_queue`).
-            let (bytes, end, queued) = match self.sessions.get_mut(&name) {
+            let (bytes, end, why, queued) = match self.sessions.get_mut(&name) {
                 Some(s) => {
-                    let (bytes, end) = pump(s, 32);
-                    (bytes, end, s.pending_input())
+                    let (bytes, end, why) = pump(s, 32);
+                    (bytes, end, why, s.pending_input())
                 }
                 None => continue,
             };
             self.note_input_queue(&name, queued, now);
+            // Nothing ever ran in this session. Tell every window watching it,
+            // in the frame, instead of letting it end as a blank that never
+            // explained itself.
+            if let Some(why) = why {
+                for wid in self.windows_viewing(&name) {
+                    self.report_failure(wid, "Could not start a session", &why);
+                }
+            }
             // A REMOTE session whose transport dropped is held and reconnected, not
             // torn down — its session may still be alive on the far side. A local EOF
             // (the host process is gone) is a genuine end, as before.

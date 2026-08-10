@@ -1833,15 +1833,34 @@ fn host_main(
         // queries are emitted with a display client already attached to answer
         // them. Eager sessions already have a child, so this never fires.
         if child.is_none() && client.as_ref().is_some_and(|c| c.resynced) {
-            child = Some(spawn_child(
+            match spawn_child(
                 &child_command,
                 current_name,
                 launch_dir,
                 pts.take()
                     .expect("slave present until the deferred child spawns"),
-            )?);
-            desc_cwd = child_cwd(&child).or_else(|| launch_dir.map(Into::into));
-            write_descriptor(current_name, &meta, desc_cwd.clone());
+            ) {
+                Ok(c) => {
+                    child = Some(c);
+                    desc_cwd = child_cwd(&child).or_else(|| launch_dir.map(Into::into));
+                    write_descriptor(current_name, &meta, desc_cwd.clone());
+                }
+                // Nothing will ever run in this session, so the host is done. Say
+                // why on the way out: this is the one moment a client is attached
+                // and listening, and the bare exit it used to get was
+                // indistinguishable from an ordinary disconnect. Best-effort and
+                // flushed by hand — the loop that normally drains the send queue
+                // is not going to run again.
+                Err(e) => {
+                    if let Some(c) = &mut client {
+                        let _ = c.conn.send(&crate::protocol::ServerMsg::SpawnFailed {
+                            message: format!("{}: {e}", child_command_label(&child_command)),
+                        });
+                        let _ = c.flush();
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Push queued output to the client.
@@ -2461,6 +2480,16 @@ fn discard_traces(name: &str, record: Option<&std::path::Path>) {
 
 /// Build and spawn the session's child on the given PTY slave, honoring the
 /// launch directory. Shared by eager start and deferred (first-attach) start.
+/// What to call the child in a failure message: the program, since that is what
+/// the user got wrong. An empty command is the login shell, whose name came from
+/// the environment rather than from them.
+fn child_command_label(command: &[String]) -> String {
+    command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "the login shell".to_string())
+}
+
 fn spawn_child(
     command: &[String],
     session_name: &str,

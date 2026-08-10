@@ -173,6 +173,16 @@ pub enum ServerMsg {
     /// straight back, in an endless take-over war. To the current display client
     /// only.
     Superseded,
+    /// The session's child could not be started at all — a command that is not
+    /// there, a directory that is gone — and the host is about to exit, so this
+    /// is the last thing it will ever say. Sent only to a client that is already
+    /// attached, which the deferred start guarantees: the child is spawned by the
+    /// first completed handshake, so there is always someone to tell.
+    ///
+    /// No protocol level guards it. A host only ever sends it just before dying,
+    /// so a client too old to decode it drops the connection instead — which is
+    /// exactly what every client did before this message existed.
+    SpawnFailed { message: String },
 }
 
 /// The protocol feature level this binary speaks. The host writes it to the
@@ -413,6 +423,12 @@ mod tests {
             5,
         );
         assert_eq!(wire_tag(&ServerMsg::Superseded), 6);
+        assert_eq!(
+            wire_tag(&ServerMsg::SpawnFailed {
+                message: String::new()
+            }),
+            7,
+        );
 
         // SessionEvent::Resized was appended after PROTO_SUBSCRIBE shipped; it must
         // stay at the tail so level-3 subscribers keep skipping only it.
@@ -440,6 +456,9 @@ mod tests {
                 message: "refused".to_string(),
             },
             ServerMsg::Superseded,
+            ServerMsg::SpawnFailed {
+                message: "no such file".to_string(),
+            },
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));
