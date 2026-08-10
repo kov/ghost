@@ -2461,20 +2461,88 @@ fn spawn_child(
 }
 
 /// The child's current working directory, best-effort: Linux reads it from
-/// `/proc`; elsewhere (or on any error) `None`, and the descriptor keeps the
-/// launch directory.
+/// `/proc`, macOS asks the kernel about the process; elsewhere (or on any error)
+/// `None`, and the descriptor keeps the launch directory.
+///
+/// This is what makes a session follow its shell — the fleet tile's label, and
+/// the directory a session branched off this one (Alt+T) starts in. A platform
+/// that can't answer doesn't degrade politely: it reports the launch directory
+/// forever, so every `cd` the user makes is invisible and a branched session
+/// opens in the wrong place.
 fn child_cwd(child: &Option<crate::child::Child>) -> Option<std::path::PathBuf> {
+    let child = child.as_ref()?;
     #[cfg(target_os = "linux")]
     {
-        child
-            .as_ref()
-            .and_then(|c| std::fs::read_link(format!("/proc/{}/cwd", c.id())).ok())
+        std::fs::read_link(format!("/proc/{}/cwd", child.id())).ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_child_cwd(child.id())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = child;
         None
     }
+}
+
+/// macOS has no `/proc`, so the current directory is asked of the kernel:
+/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)` fills a `struct proc_vnodepathinfo`,
+/// whose first member is the process's current directory and whose second is its
+/// root. Only a process of our own uid answers — the child is ours.
+///
+/// **The struct's layout is derived from the kernel's own answer rather than
+/// transcribed.** `proc_vnodepathinfo` is two identical `vnode_info_path`s, each
+/// a `vnode_info` header followed by a fixed `MAXPATHLEN` path buffer, and the
+/// call returns how many bytes it filled — so the header's size is
+/// `filled / 2 - MAXPATHLEN` and the current directory's path begins there.
+/// Transcribing the header instead would mean copying a dozen fields out of
+/// `sys/proc_info.h` and being silently wrong — reading a path from the middle of
+/// a timestamp — if any one of them were misjudged, on a platform this build
+/// cannot run a test on.
+#[cfg(target_os = "macos")]
+fn macos_child_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    /// `PROC_PIDVNODEPATHINFO` from `sys/proc_info.h`.
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+    /// `MAXPATHLEN`, the size of each embedded path buffer.
+    const MAXPATHLEN: usize = 1024;
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    // Comfortably above the real struct (~2.3 KiB): the kernel fills what it has
+    // and tells us how much, and refuses outright if the buffer is too small.
+    let mut buf = [0u8; 8192];
+    // SAFETY: the buffer is ours, live for the call, and its true length is what
+    // we declare. A `pid` that has since exited is an error return, not a hazard.
+    let filled = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as libc::c_int,
+        )
+    };
+    let filled = usize::try_from(filled).ok()?;
+    // Two equal halves, each ending in a `MAXPATHLEN` buffer — anything else is
+    // not the struct we asked for, so refuse rather than read at a guessed offset.
+    if filled > buf.len() || filled % 2 != 0 || filled / 2 <= MAXPATHLEN {
+        return None;
+    }
+    let path = &buf[filled / 2 - MAXPATHLEN..filled / 2];
+    let path = &path[..path.iter().position(|&b| b == 0)?];
+    (!path.is_empty()).then(|| {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    })
 }
 
 /// Record the durable descriptor once the child actually starts — the fleet's
