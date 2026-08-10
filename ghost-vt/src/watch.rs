@@ -58,6 +58,19 @@ pub fn run() -> io::Result<()> {
     watcher
         .watch(&dir, notify::RecursiveMode::Recursive)
         .map_err(io::Error::other)?;
+    // The descriptors too, in the *data* dir — a separate tree. Almost everything
+    // a listing reports is a write under the runtime dir, but the working
+    // directory is not: a `cd` rewrites only `<data>/sessions/<name>.json`, where
+    // nothing was watching. That made the one field a branched session inherits
+    // the one field that arrived on the 30s heartbeat, so a new session opened in
+    // the directory its sibling had left half a minute ago.
+    //
+    // Best-effort: a host that has never written a descriptor has no such
+    // directory, and failing to watch it must not cost the listing its stream.
+    let descriptors = paths::data_dir().join("sessions");
+    if std::fs::create_dir_all(&descriptors).is_ok() {
+        let _ = watcher.watch(&descriptors, notify::RecursiveMode::NonRecursive);
+    }
 
     // The first listing is taken *after* the watch is registered, never before.
     // A session is only listable once its host has written its pid, which lands

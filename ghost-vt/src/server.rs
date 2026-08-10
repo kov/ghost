@@ -97,12 +97,32 @@ fn checkpoint_interval(max_bytes: Option<usize>) -> usize {
     }
 }
 
-/// Shortest gap between two looks at where the child is working (a readlink of
-/// `/proc/<pid>/cwd`). Output arrives in floods, so the look is rate-limited; the
-/// gap is well under human reaction time, so a `cd` is recorded before the user
-/// can act on it, while a megabyte-a-second stream pays for a handful of
-/// readlinks a second.
-const CWD_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the child must be quiet before we look at where it is working.
+///
+/// A **trailing** edge, not a rate limit, and the distinction is the whole point.
+/// A `cd` reaches us as two things in quick succession: the echo of the typed
+/// line, and then the new prompt. Look on the *first* byte and the shell has not
+/// run the command yet; rate-limit the look and the settled state that follows
+/// milliseconds later is exactly what gets skipped. Then the shell falls silent,
+/// nothing more arrives to trigger another look, and the session goes on
+/// reporting the directory it was in before the `cd` — until the user happens to
+/// type something else. Which is how this read from the outside: a directory that
+/// updated "eventually".
+///
+/// So each write pushes the look further out, and it happens once the flood
+/// stops. Well under human reaction time, so a `cd` is recorded before the user
+/// can act on it, and a megabyte-a-second stream pays for no readlinks at all
+/// until it pauses.
+const CWD_SETTLE: Duration = Duration::from_millis(100);
+
+/// How long a look may be deferred by a child that never stops writing.
+///
+/// [`CWD_SETTLE`] alone would starve one: every write pushes the look out, so a
+/// build streaming for ten minutes would never be looked at. Rare — a program
+/// that noisy is usually not moving — but "usually" is not a guarantee, and the
+/// rate-limited look this replaced did keep up during a flood. So the deferral is
+/// capped from the first write that owed one.
+const CWD_MAX_DEFER: Duration = Duration::from_secs(1);
 
 /// Cap on connections awaiting classification, bounding memory against a peer
 /// that connects but never sends its first message.
@@ -1189,10 +1209,13 @@ fn host_main(
     // The last cwd written to the durable descriptor, so refreshes only touch
     // the file when the child actually moved.
     let mut desc_cwd: Option<std::path::PathBuf> = None;
-    // When we last looked at where the child is. The look itself is a readlink,
-    // but output arrives in floods, so it is rate-limited rather than run per
-    // chunk (see [`CWD_REFRESH_INTERVAL`]).
-    let mut cwd_checked_at = Instant::now();
+    // When to next look at where the child is working, if a look is owed. Set
+    // whenever the child writes and pushed further out by each write, so the look
+    // lands once it has settled rather than mid-burst (see [`CWD_SETTLE`]).
+    let mut cwd_look_at: Option<Instant> = None;
+    // When the child first wrote without having been looked at since — the point
+    // [`CWD_MAX_DEFER`] is measured from, so a ceaseless writer is still looked at.
+    let mut cwd_owed_since: Option<Instant> = None;
     if adopt.is_none() && !opts.start_on_attach {
         child = Some(spawn_child(
             &child_command,
@@ -1372,8 +1395,15 @@ fn host_main(
         // by wall clock (its boundary window can lapse with the child idle and no
         // fd ever waking us), so while one is pending, cap the wait at the time
         // left until its deadline — the loop tail re-checks it every wake.
-        let poll_timeout: Option<Timespec> = pending_upgrade.as_ref().map(|p| {
-            let left = p.deadline.saturating_duration_since(Instant::now());
+        // An owed cwd look is decided by wall clock too, and is the common case: a
+        // `cd` is followed by silence, so nothing would ever wake us to notice the
+        // child moved. Whichever deadline is nearer sets the cap.
+        let deadline = [pending_upgrade.as_ref().map(|p| p.deadline), cwd_look_at]
+            .into_iter()
+            .flatten()
+            .min();
+        let poll_timeout: Option<Timespec> = deadline.map(|d| {
+            let left = d.saturating_duration_since(Instant::now());
             Timespec {
                 tv_sec: left.as_secs() as i64,
                 tv_nsec: left.subsec_nanos() as i64,
@@ -1598,15 +1628,9 @@ fn host_main(
                     // as long as it lived. What reads this: the fleet's tile label,
                     // and a session branched off this one (Alt+T), which starts where
                     // this one is working.
-                    if cwd_checked_at.elapsed() >= CWD_REFRESH_INTERVAL {
-                        cwd_checked_at = Instant::now();
-                        if let Some(cwd) = child_cwd(&child)
-                            && desc_cwd.as_ref() != Some(&cwd)
-                        {
-                            crate::descriptor::set_cwd(current_name, &cwd);
-                            desc_cwd = Some(cwd);
-                        }
-                    }
+                    let now = Instant::now();
+                    let cap = *cwd_owed_since.get_or_insert(now) + CWD_MAX_DEFER;
+                    cwd_look_at = Some((now + CWD_SETTLE).min(cap));
                     if let Some(r) = &mut recorder {
                         let _ = r.output(&ptybuf[..n]);
                         bytes_since_checkpoint += n;
@@ -1919,6 +1943,20 @@ fn host_main(
                     notify_exit(&mut client, 0);
                     return Ok(0);
                 }
+            }
+        }
+
+        // The child wrote and has now gone quiet: look at where it ended up. This
+        // is what carries a `cd` into the descriptor, and from there into the
+        // listing a session branched off this one inherits its directory from.
+        if cwd_look_at.is_some_and(|at| Instant::now() >= at) {
+            cwd_look_at = None;
+            cwd_owed_since = None;
+            if let Some(cwd) = child_cwd(&child)
+                && desc_cwd.as_ref() != Some(&cwd)
+            {
+                crate::descriptor::set_cwd(current_name, &cwd);
+                desc_cwd = Some(cwd);
             }
         }
 

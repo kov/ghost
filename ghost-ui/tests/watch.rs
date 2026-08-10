@@ -165,6 +165,144 @@ fn watch_pushes_on_title_change() {
     );
 }
 
+/// A `cd` must reach the watcher promptly, not on the heartbeat.
+///
+/// The directory a session is working in is what a session branched off it opens
+/// in, and for a remote host that inheritance reads the *listing* — so a cwd the
+/// listing carries half a minute late is inheritance that silently gives the
+/// wrong answer for half a minute. Reported from a real mac: the new session kept
+/// landing in `~`, and "eventually" landed in the right place.
+///
+/// The cause is that a cwd change is the one listing field that leaves no trace
+/// in the watched tree. Everything else the listing reports — a session
+/// appearing, its title, its attach state — is a write under the *runtime* dir,
+/// while the cwd lives in the durable descriptor under the *data* dir. So the
+/// write happened where nobody was looking and only the 30s heartbeat carried it.
+#[test]
+fn watch_pushes_on_working_directory_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let moved_to = xdg.join("elsewhere");
+    std::fs::create_dir_all(&moved_to).unwrap();
+
+    ghost(xdg)
+        .args(["new", "-d", "wanderer", "--", "sh"])
+        .output()
+        .unwrap();
+    let _guard2 = KillOnDrop {
+        xdg,
+        name: "wanderer",
+    };
+
+    let mut child = ghost(xdg)
+        .arg("__watch")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = KillChild(child);
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(l) = line else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |s| {
+            s.iter().any(|i| i.name == "wanderer")
+        }),
+        "the session was not pushed to the watcher"
+    );
+
+    // Move the shell, exactly as a user typing `cd` would.
+    let target = moved_to.canonicalize().unwrap();
+    let mut session =
+        Session::attach_path(&sock(xdg, "wanderer"), "wanderer", 80, 24).expect("attach");
+    session
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    session
+        .send_input(format!("cd {}\n", target.display()).as_bytes())
+        .unwrap();
+
+    // Well under the 30s heartbeat: this has to be the watch noticing, not the
+    // keepalive coming round.
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |s| {
+            s.iter().any(|i| {
+                i.name == "wanderer" && i.cwd.as_deref() == Some(&*target.to_string_lossy())
+            })
+        }),
+        "the new working directory was not pushed within the heartbeat window"
+    );
+}
+
+/// A child that never stops writing is still looked at.
+///
+/// The look waits for the child to settle, which on its own would mean a session
+/// producing continuous output is never looked at at all — its directory frozen
+/// at whatever it was when the noise started. So the wait is capped, and this is
+/// what holds the cap in place: the shell moves and then writes without pause, so
+/// the only way the new directory can be reported is the cap expiring.
+#[test]
+fn a_ceaselessly_writing_child_still_reports_where_it_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let moved_to = xdg.join("elsewhere");
+    std::fs::create_dir_all(&moved_to).unwrap();
+
+    ghost(xdg)
+        .args(["new", "-d", "noisy", "--", "sh"])
+        .output()
+        .unwrap();
+    let _guard2 = KillOnDrop { xdg, name: "noisy" };
+
+    let mut child = ghost(xdg)
+        .arg("__watch")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = KillChild(child);
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(l) = line else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |s| {
+            s.iter().any(|i| i.name == "noisy")
+        }),
+        "the session was not pushed to the watcher"
+    );
+
+    // Move, then write forever with no gap for the settle to land in.
+    let target = moved_to.canonicalize().unwrap();
+    let mut session = Session::attach_path(&sock(xdg, "noisy"), "noisy", 80, 24).expect("attach");
+    session
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    session
+        .send_input(format!("cd {}; while :; do echo noise; done\n", target.display()).as_bytes())
+        .unwrap();
+
+    assert!(
+        wait_for(&rx, Duration::from_secs(10), |s| {
+            s.iter()
+                .any(|i| i.name == "noisy" && i.cwd.as_deref() == Some(&*target.to_string_lossy()))
+        }),
+        "a child that never pauses must still have its directory reported"
+    );
+}
+
 /// A session that becomes listable *while* `__watch` is still building its first
 /// listing must still be streamed.
 ///
