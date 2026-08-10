@@ -13,9 +13,13 @@
 //!   for each target and drop it in the prebuilt dir as `ghost-<os>-<arch>`, where
 //!   staging's resolver finds it. No triples ⇒ every supported platform but this
 //!   one. Set `GHOST_ZIGBUILD=1` to build through `cargo zigbuild` (bundles its
-//!   own sysroots, so cross-OS builds need no system cross-toolchain). Darwin
-//!   targets cross-build from Linux this way with no Apple SDK — `ghost-host`
-//!   links against no macOS framework.
+//!   own sysroots, so cross-OS builds need no system cross-toolchain). A darwin
+//!   target links CoreServices and CoreFoundation (the session watcher's FSEvents
+//!   backend), so crossing to one also needs a macOS SDK: it is picked up from
+//!   `$XDG_DATA_HOME/ghost/macos-sdk/MacOSX.sdk` (or `GHOST_MACOS_SDK`) with no
+//!   flag to remember. Nobody need go to Apple for it — copy
+//!   `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk` off a Mac you already
+//!   have.
 //!
 //! The bundle is **relocatable and launcher-free**: the `ghost` binary has no
 //! non-system dylib dependencies, falls through to the GUI when launched with no
@@ -368,6 +372,8 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
     let force_zig = std::env::var_os("GHOST_ZIGBUILD").is_some();
 
     let host = host_triple();
+    // Found once, not per target: both darwin arches link against the same one.
+    let sdk = macos_sdk();
     let mut failed = Vec::new();
     for triple in triples {
         let name = triple_to_name(triple).expect("validated above");
@@ -396,6 +402,16 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
         // host-wide `[target.'cfg(target_os="linux")']` linker setting doesn't feed
         // the cross build its host-arch linker. A per-target override would instead
         // *combine* with that config and pass e.g. `-fuse-ld=mold` on to rust-lld.
+        // Crossing to darwin from elsewhere: hand the linker the SDK so it can
+        // resolve CoreServices and CoreFoundation, which the watcher's FSEvents
+        // backend needs. On a Mac this is already the compiler's own default, so
+        // don't override it there.
+        if triple.contains("darwin")
+            && std::env::consts::OS != "macos"
+            && let Some(sdk) = &sdk
+        {
+            cmd.env("SDKROOT", sdk);
+        }
         if triple.contains("musl") && subcommand == "build" {
             let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
             if !flags.is_empty() {
@@ -427,7 +443,7 @@ fn build_prebuilts(triples: &[String]) -> R<()> {
         triples.len()
     );
     if !failed.is_empty() {
-        return Err(failure_hint(&failed, std::env::consts::OS).into());
+        return Err(failure_hint(&failed, std::env::consts::OS, sdk.as_deref()).into());
     }
     Ok(())
 }
@@ -527,7 +543,39 @@ fn default_triples() -> Vec<String> {
 /// kqueue (see `ghost-vt`'s `notify` dependency) a darwin prebuilt links from
 /// Linux with zig and nothing else. Every failure now has the same two causes —
 /// a missing target, or a cross-OS link with no zig behind it.
-fn failure_hint(failed: &[String], host_os: &str) -> String {
+/// The per-user data base everything durable-but-not-source lives under.
+fn data_home() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".local").join("share")
+        })
+}
+
+/// Where a macOS SDK is looked for when cross-building the darwin prebuilts,
+/// given an explicit `GHOST_MACOS_SDK` and the data home to fall back under.
+///
+/// Kept beside the prebuilts it exists to build, for the same reason they are not
+/// in the source tree: it outlives any one checkout, and a build should not
+/// depend on where somebody happened to clone. Pure, so the layout is testable
+/// without an SDK on disk.
+fn macos_sdk_path(explicit: Option<PathBuf>, data_home: &Path) -> PathBuf {
+    explicit.unwrap_or_else(|| data_home.join("ghost").join("macos-sdk").join("MacOSX.sdk"))
+}
+
+/// The macOS SDK to cross-build darwin targets against, if one is there.
+fn macos_sdk() -> Option<PathBuf> {
+    let p = macos_sdk_path(
+        std::env::var_os("GHOST_MACOS_SDK").map(PathBuf::from),
+        &data_home(),
+    );
+    p.is_dir().then_some(p)
+}
+
+fn failure_hint(failed: &[String], host_os: &str, sdk: Option<&Path>) -> String {
     // Cross-OS is what needs zig; a musl target from Linux links self-contained
     // with the bundled rust-lld, so don't send that case looking for it.
     let cross_os = failed
@@ -544,14 +592,24 @@ fn failure_hint(failed: &[String], host_os: &str) -> String {
              (needs `cargo install cargo-zigbuild` and zig on PATH)",
         );
     }
-    // Said only where it would otherwise be looked for. This hint used to send
-    // people after an Apple SDK, so the reassurance is aimed at whoever remembers
-    // that — and at anyone who reaches for one when a darwin link fails.
+    // A darwin prebuilt links CoreServices and CoreFoundation, so crossing to it
+    // needs an SDK. Nobody has to go to Apple for one: a Mac you can already ssh
+    // to is carrying it, and copying that directory here is the whole method.
     if host_os != "macos" && failed.iter().any(|t| t.contains("darwin")) {
-        hint.push_str(
-            ". No Apple SDK is involved — the staged binary links against no macOS \
-             framework",
-        );
+        match sdk {
+            Some(sdk) => hint.push_str(&format!(
+                ". It built against the SDK at {} — if that is the wrong one, point \
+                 GHOST_MACOS_SDK at another",
+                sdk.display()
+            )),
+            None => hint.push_str(&format!(
+                ". A darwin target also needs a macOS SDK, and none is at {}: copy \
+                 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk off a Mac you \
+                 already have (`ssh <mac> tar -czf - -C <that dir> MacOSX.sdk`), or \
+                 set GHOST_MACOS_SDK to one",
+                macos_sdk_path(None, &data_home()).display()
+            )),
+        }
     }
     hint
 }
@@ -581,15 +639,7 @@ fn prebuilt_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("GHOST_PREBUILT_DIR") {
         return PathBuf::from(d);
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            home.join(".local").join("share")
-        });
-    base.join("ghost").join("prebuilt")
+    data_home().join("ghost").join("prebuilt")
 }
 
 /// `version` from the `[package]` table of a `Cargo.toml`.
@@ -716,22 +766,21 @@ mod prebuilt_tests {
     }
 
     #[test]
-    fn a_failed_macos_target_sends_nobody_hunting_for_an_apple_sdk() {
-        // This hint used to say a darwin target needs Apple's SDK, and that the
-        // real answer was to build it on a Mac and copy the file over. That was
-        // true only because `fsevent-sys` pulled CoreServices and CoreFoundation
-        // into the staged binary; with the watcher on kqueue it links from Linux
-        // with zig and nothing else. Advice that sends someone to find a Mac — or
-        // an SDK they cannot license onto this machine — is worse than none, and
-        // it is how the prebuilts came to sit untouched for weeks.
-        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux");
+    fn a_failed_macos_target_says_where_its_sdk_should_be() {
+        // A darwin prebuilt links CoreServices and CoreFoundation (the watcher's
+        // FSEvents backend), so it needs an SDK — and the one thing this hint must
+        // never do is stay quiet about which. It briefly claimed no SDK was
+        // involved, which was true only while the watcher was on a backend that
+        // could not watch a session directory at all.
+        let sdk = Path::new("/somewhere/MacOSX.sdk");
+        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux", None);
         assert!(
-            !hint.contains("SDKROOT"),
-            "nothing to point at an SDK any more: {hint}"
+            hint.contains("GHOST_MACOS_SDK") && hint.contains("macos-sdk"),
+            "names the variable and the place it is looked for: {hint}"
         );
         assert!(
-            hint.contains("No Apple SDK is involved"),
-            "says so outright, where one would otherwise be hunted for: {hint}"
+            hint.contains("Mac you already have"),
+            "names where an SDK comes from — copying one is the whole method: {hint}"
         );
         assert!(
             hint.contains("GHOST_ZIGBUILD"),
@@ -742,9 +791,21 @@ mod prebuilt_tests {
             "names what to install: {hint}"
         );
 
+        // With one already in place the SDK is not the problem, so don't send
+        // anyone to fetch a second copy of what they have.
+        let hint = failure_hint(&["aarch64-apple-darwin".to_string()], "linux", Some(sdk));
+        assert!(
+            !hint.contains("Mac you already have"),
+            "an SDK that is present is not the missing piece: {hint}"
+        );
+        assert!(
+            hint.contains("/somewhere/MacOSX.sdk"),
+            "says which one it built against, so a wrong one can be spotted: {hint}"
+        );
+
         // A Linux target failing is the same story with one less step — no zig
         // needed for a musl target, which links with the bundled rust-lld.
-        let hint = failure_hint(&["x86_64-unknown-linux-musl".to_string()], "macos");
+        let hint = failure_hint(&["x86_64-unknown-linux-musl".to_string()], "macos", None);
         assert!(
             !hint.contains("SDK"),
             "a musl target needs no Apple SDK: {hint}"
@@ -752,6 +813,22 @@ mod prebuilt_tests {
         assert!(
             hint.contains("rustup target add"),
             "names what to install: {hint}"
+        );
+    }
+
+    #[test]
+    fn the_sdk_is_looked_for_beside_the_prebuilts_it_builds() {
+        // Found without being told, in a place that is not the source tree — the
+        // same reasoning as the prebuilt dir, and next to it.
+        assert_eq!(
+            macos_sdk_path(None, Path::new("/data")),
+            Path::new("/data/ghost/macos-sdk/MacOSX.sdk"),
+        );
+        // An explicit one wins, so a differently-versioned SDK can be pointed at
+        // without moving anything.
+        assert_eq!(
+            macos_sdk_path(Some("/opt/MacOSX15.sdk".into()), Path::new("/data")),
+            Path::new("/opt/MacOSX15.sdk"),
         );
     }
 

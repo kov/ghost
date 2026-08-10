@@ -9,16 +9,19 @@ description = "Run a terminal in the background and reattach without losing scro
 dirs = "6.0.0"
 libc = "0.2.186"
 nix = { version = "0.31.3", features = ["signal"] }
-# Watches the session directory for `ghost __watch` — which runs on the *remote*,
-# so this crate's macOS build is the staged prebuilt's. `macos_fsevent` (the
-# default) pulls `fsevent-sys`, and with it the CoreServices and CoreFoundation
-# frameworks, which only Apple's SDK carries: that single dependency is what made
-# a macOS prebuilt un-cross-buildable and left it stale. kqueue needs no
-# framework, so the darwin prebuilts now link from Linux with `GHOST_ZIGBUILD=1`
-# alone. It watches per-descriptor rather than subscribing to a tree, so it is the
-# weaker watcher on a large one — irrelevant here, where a session directory holds
-# a handful of entries and the watch is only a trigger to rescan (`watch.rs`).
-notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
+# Watches the session directory for `ghost __watch` and for the fleet's
+# set-change trigger. Left on the default `macos_fsevent` backend deliberately:
+# `macos_kqueue` cannot watch a session directory at all. kqueue watches per file
+# descriptor, so it must `open()` every entry — and these directories are full of
+# unix sockets, which `open()` refuses with ENOTSUP. The watch then fails to bind,
+# `__watch` exits before its first listing, and a mac's whole remote fleet goes
+# dark (measured on real hardware: "Operation not supported on socket (os error
+# 102)"). Every macOS build is affected, not just the staged prebuilt.
+#
+# The cost is that `fsevent-sys` needs the CoreServices and CoreFoundation
+# frameworks, so cross-building the darwin prebuilts needs a macOS SDK on hand
+# (see `xtask`) rather than zig alone.
+notify = "8.2"
 postcard = { version = "1.1.3", features = ["alloc"] }
 pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["event", "termios", "process", "fs", "stdio", "pipe"] }

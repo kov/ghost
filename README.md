@@ -254,12 +254,27 @@ being static they run on any remote regardless of its glibc. Crossing an *OS*
 boundary is linked through `cargo zigbuild` automatically — install it once with
 `cargo install cargo-zigbuild` and put zig on `PATH`.
 
-**A macOS prebuilt cross-builds from Linux with no Apple SDK.** `ghost-host` links
-against no macOS framework — the session watcher uses kqueue rather than FSEvents
-precisely so it doesn't (`ghost-vt`'s `notify` dependency). Keep it that way: a
-dependency that pulls in CoreFoundation or CoreServices makes the darwin prebuilts
-buildable only on a Mac, and a prebuilt nobody can rebuild is one that silently
-goes stale and starts staging an old host to remotes.
+**A macOS prebuilt cross-builds from Linux, against an SDK you copy off a Mac.**
+`ghost-host` links CoreServices and CoreFoundation, because the session watcher
+runs on FSEvents. It has to: the alternative backend, kqueue, watches per file
+descriptor and so must `open()` every entry in the directory it watches — and a
+session directory is full of unix sockets, which `open()` refuses. A kqueue watch
+there fails to bind at all, `ghost __watch` exits before its first listing, and
+every macOS ghost loses its fleet.
+
+So put an SDK at `$XDG_DATA_HOME/ghost/macos-sdk/MacOSX.sdk` (or point
+`GHOST_MACOS_SDK` at one) and xtask finds it with no flag to remember. Nobody
+needs an Apple account for this — any Mac you can already reach is carrying one:
+
+```sh
+mkdir -p ~/.local/share/ghost/macos-sdk
+ssh <mac> tar -czf - -C /Library/Developer/CommandLineTools/SDKs MacOSX.sdk \
+  | tar -xzf - -C ~/.local/share/ghost/macos-sdk
+```
+
+Without it the darwin targets fail and say so. That matters more than it sounds:
+a prebuilt nobody can rebuild silently goes stale and keeps staging an old host to
+remotes.
 
 The binary is a few MB and is the only thing staged to the remote. With no matching
 prebuilt ghost falls back to the ssh child, so a missing one never breaks a
