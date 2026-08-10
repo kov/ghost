@@ -14,6 +14,8 @@ members = [
     "ghost-renderer",
     "ghost-ui-harness",
     "ghost-ui",
+    # The headless synoik the windowed and fractional-scale tests run against.
+    "ghost-test-compositor",
     "ghost-shot",
     "xtask",
 ]

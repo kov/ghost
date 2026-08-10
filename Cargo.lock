@@ -1057,6 +1057,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-test-compositor"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+ "tempfile",
+]
+
+[[package]]
 name = "ghost-ui"
 version = "0.1.0"
 dependencies = [
@@ -1069,6 +1077,7 @@ dependencies = [
  "ghost-renderer",
  "ghost-shaper",
  "ghost-term",
+ "ghost-test-compositor",
  "ghost-ui-core",
  "ghost-ui-harness",
  "ghost-vt",

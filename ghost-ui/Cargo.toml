@@ -96,4 +96,6 @@ objc2-foundation = { version = "0.2", features = ["NSString"] }
 tempfile = "3"
 pty-process = "0.5.3"
 rustix = { version = "1.1.4", features = ["termios", "process"] }
+# The headless synoik the fractional-scale test measures ghost's frame against.
+ghost-test-compositor = { path = "../ghost-test-compositor" }
 serde_json = "1.0.150"

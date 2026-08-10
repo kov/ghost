@@ -1,0 +1,15 @@
+[package]
+name = "ghost-test-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stands a headless synoik up for a test, and reaps it: the compositor half of ghost's windowed and fractional-scale suites."
+publish = false
+
+[dependencies]
+# The compositor's private XDG_RUNTIME_DIR, so its socket cannot collide with a
+# real session's or with another run of the suite.
+tempfile = "3"
+# PR_SET_PDEATHSIG on the compositor, so an abort (or a ^C on cargo) cannot
+# orphan it.
+rustix = { version = "1.1.4", features = ["process"] }

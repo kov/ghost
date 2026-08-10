@@ -9,22 +9,15 @@
 //! window with it. That is the bug this test exists to keep dead, and it is
 //! invisible at integer scale, where every rounding agrees.
 //!
-//! It brings its own compositor, like `ghost-ui-harness/tests/windowed.rs` does —
-//! but **mutter**, not weston: weston 15 implements no `wp_fractional_scale_v1`
-//! and its `--scale` is an integer, so it cannot put a client at 1.25 at all.
-//! Mutter can, headless, over a private session bus: a virtual monitor, then
-//! `ApplyMonitorsConfig` at the scale we want. Both children are reaped on every
-//! way out (`Drop`, plus a kernel death-signal for the ways `Drop` cannot see).
+//! It brings its own compositor — a headless [`Synoik`] at the scale we name on
+//! its command line, which is also the compositor ghost is really used on. The
+//! scale change halfway through is one `synoik msg` call.
 //!
 //! The assertion is not "the process survived". `Graphics::render` now drops a
 //! scene whose size disagrees with its surface rather than draw it, so a
 //! regression would survive and merely go blank — the discriminating signals are
 //! that **no** frame was dropped and that every frame measured itself as
 //! `surface - geometry`.
-//!
-//! Linux-and-mutter only: without mutter (or `gdbus`, or `dbus-daemon`) the test
-//! says so and returns, because a fractional compositor is the one thing it
-//! cannot supply itself.
 #![cfg(target_os = "linux")]
 
 use std::io::Read;
@@ -34,195 +27,11 @@ use std::time::Duration;
 
 mod support;
 
-use support::{GHOST, wait_until};
+use ghost_test_compositor::{OUTPUT, Synoik, spawn_dying_with_us, wait_until};
+use support::GHOST;
 
-/// The virtual monitor's size, in device pixels.
+/// The virtual output's size, in device pixels.
 const MONITOR: (u32, u32) = (1600, 1000);
-
-/// The Wayland socket mutter is asked to serve on, inside its own runtime dir.
-const SOCKET: &str = "ghost-fractional";
-
-/// A headless mutter and the private session bus it needs, alive as long as this
-/// value is.
-///
-/// Both are children, so both have to be reaped on every way out of the test. A
-/// panic unwinds, which `Drop` covers; an abort or a `^C` on cargo does not, so
-/// each child is *also* told to die with us by the kernel. Nothing here looks a
-/// process up by name — that would match every mutter this user is running,
-/// including the one drawing their desktop.
-struct Compositor {
-    mutter: Option<Child>,
-    bus: Child,
-    /// Holds the runtime dir, the bus socket and the settings keyfile.
-    dir: tempfile::TempDir,
-}
-
-impl Drop for Compositor {
-    fn drop(&mut self) {
-        for child in self.mutter.iter_mut().chain(std::iter::once(&mut self.bus)) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Compositor {
-    /// Start a headless mutter with one virtual monitor, on a socket and a bus of
-    /// its own. `None` when the tools are not installed, or refuse to come up.
-    fn start() -> Option<Compositor> {
-        for tool in ["mutter", "dbus-daemon", "gdbus"] {
-            let missing = Command::new(tool)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_err();
-            if missing {
-                eprintln!("skipping: {tool} is not installed");
-                return None;
-            }
-        }
-        let dir = tempfile::tempdir().expect("a runtime dir");
-        // Mutter needs no settings from us: fractional monitor scales stopped
-        // being an experimental feature (`scale-monitor-framebuffer`, which
-        // mutter 50 no longer knows) and a virtual monitor offers 1.25 outright.
-        // It does need a config dir it can write, and it must not be the user's.
-        let cfg = dir.path().join("config");
-        std::fs::create_dir_all(&cfg).expect("config dir");
-
-        let bus_path = dir.path().join("bus");
-        let bus_addr = format!("unix:path={}", bus_path.display());
-        let bus = spawn_dying_with_us(
-            Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--nosyslog"])
-                .arg(format!("--address={bus_addr}")),
-        )?;
-        // Held from here on, so every early return below still reaps the bus.
-        let mut c = Compositor {
-            mutter: None,
-            bus,
-            dir,
-        };
-        if !wait_until(Duration::from_secs(10), || bus_path.exists()) {
-            eprintln!("skipping: the private session bus never came up");
-            return None;
-        }
-
-        c.mutter = Some(spawn_dying_with_us(
-            Command::new("mutter")
-                .args(["--headless", "--virtual-monitor"])
-                .arg(format!("{}x{}", MONITOR.0, MONITOR.1))
-                .arg(format!("--wayland-display={SOCKET}"))
-                .env("XDG_CONFIG_HOME", &cfg)
-                .env("XDG_RUNTIME_DIR", c.dir.path())
-                // Mutter's GIO otherwise activates gvfs on our private bus, and an
-                // activated service is nobody's child: it would outlive the bus,
-                // the test and its `Drop`, holding a fuse mount over a tempdir
-                // that is already gone.
-                .env("GIO_USE_VFS", "local")
-                .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr),
-        )?);
-        if !wait_until(Duration::from_secs(20), || c.display().exists()) {
-            eprintln!("skipping: mutter never came up headless");
-            return None;
-        }
-        Some(c)
-    }
-
-    /// The Wayland socket, as an absolute path — which is how a client is pointed
-    /// at it without also inheriting mutter's runtime dir (it needs its own, for
-    /// its sessions).
-    fn display(&self) -> PathBuf {
-        self.dir.path().join(SOCKET)
-    }
-
-    fn bus_address(&self) -> String {
-        format!("unix:path={}", self.dir.path().join("bus").display())
-    }
-
-    /// Ask mutter to put the monitor at `scale`. Returns whether it took — a scale
-    /// this mutter will not offer is a skip, not a failure.
-    fn set_scale(&self, scale: f64) -> bool {
-        // Mutter takes the display-config name on the bus a moment after it is
-        // serving Wayland, so the first read is a wait, not a question.
-        let mut state = None;
-        wait_until(Duration::from_secs(20), || {
-            state = self.display_config("GetCurrentState", &[]);
-            state.is_some()
-        });
-        let Some(state) = state else {
-            return false;
-        };
-        // `(uint32 <serial>, [...` — the serial is mutter's guard against
-        // configuring a monitor layout the caller has not seen.
-        let serial = state
-            .strip_prefix("(uint32 ")
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        // The mode is quoted in that same reply, as `1600x1000@60.000`.
-        let mode = state
-            .split('\'')
-            .find(|s| s.starts_with(&format!("{}x{}@", MONITOR.0, MONITOR.1)))
-            .map(str::to_owned);
-        let (Some(serial), Some(mode)) = (serial, mode) else {
-            eprintln!("could not read mutter's monitor state: {state}");
-            return false;
-        };
-        self.display_config(
-            "ApplyMonitorsConfig",
-            &[
-                &serial.to_string(),
-                // 1 = apply now, without writing it to any monitor config file.
-                "1",
-                &format!(
-                    "[(0, 0, {scale}, uint32 0, true, [('Meta-0', '{mode}', @a{{sv}} {{}})])]"
-                ),
-                "@a{sv} {}",
-            ],
-        )
-        .is_some()
-    }
-
-    fn display_config(&self, method: &str, args: &[&str]) -> Option<String> {
-        let out = Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.Mutter.DisplayConfig",
-                "--object-path",
-                "/org/gnome/Mutter/DisplayConfig",
-                "--method",
-            ])
-            .arg(format!("org.gnome.Mutter.DisplayConfig.{method}"))
-            .args(args)
-            .env("DBUS_SESSION_BUS_ADDRESS", self.bus_address())
-            .output()
-            .ok()?;
-        // Quiet on failure: `set_scale` polls this while mutter is still taking
-        // its name on the bus, and says so itself if it never arrives.
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    }
-}
-
-/// Spawn a child the kernel kills when this test process dies, however it dies —
-/// the backstop for every exit `Drop` cannot see. Set between fork and exec,
-/// because it is a property of the child.
-fn spawn_dying_with_us(cmd: &mut Command) -> Option<Child> {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `set_parent_process_death_signal` is a single syscall, which is all
-    // that may run between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
-                .map_err(std::io::Error::from)
-        });
-    }
-    cmd.spawn().ok()
-}
 
 /// One `frame measured` line: what a window last made of the surface it was given.
 #[derive(Debug, PartialEq)]
@@ -287,7 +96,7 @@ impl Drop for Ghost {
 
 impl Ghost {
     /// Launch the real binary against `compositor`, with dirs of its own.
-    fn start(compositor: &Compositor) -> Ghost {
+    fn start(compositor: &Synoik) -> Ghost {
         let dir = tempfile::tempdir().expect("a state dir");
         let mut g = Ghost {
             child: None,
@@ -388,13 +197,14 @@ impl Ghost {
 /// one — must never lay out a frame the surface they sit in cannot take.
 #[test]
 fn a_fractional_scale_never_lays_out_a_frame_the_surface_cannot_take() {
-    let Some(compositor) = Compositor::start() else {
-        return;
+    // A fractional compositor is the one thing this test cannot supply itself.
+    let compositor = match Synoik::start(MONITOR, 1.25) {
+        Ok(c) => c,
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
     };
-    if !compositor.set_scale(1.25) {
-        eprintln!("skipping: mutter would not scale the monitor by 1.25");
-        return;
-    }
 
     let mut ghost = Ghost::start(&compositor);
     assert!(
@@ -413,14 +223,17 @@ fn a_fractional_scale_never_lays_out_a_frame_the_surface_cannot_take() {
     }
     // Then move the ground under them: another scale resizes every surface, with
     // margins that round differently again (26 × 4/3 = 34.67).
-    if compositor.set_scale(4.0 / 3.0) {
-        assert!(
-            wait_until(Duration::from_secs(20), || {
-                ghost.measurements().iter().any(|m| m.scale > 1.3)
-            }),
-            "the windows re-measure themselves at the new scale"
-        );
-    }
+    assert!(
+        compositor.set_scale(4.0 / 3.0),
+        "synoik takes a scale change on {OUTPUT}: {}",
+        compositor.log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            ghost.measurements().iter().any(|m| m.scale > 1.3)
+        }),
+        "the windows re-measure themselves at the new scale"
+    );
 
     let seen = ghost.measurements();
     let mut scales: Vec<String> = seen.iter().map(|m| m.scale.to_string()).collect();
