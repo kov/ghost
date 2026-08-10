@@ -137,5 +137,16 @@ call so an ambient one cannot aim at the live desktop, and script against
 `Maximize`/`ToggleTiledLeft` rather than the niri column verbs this fork is
 replacing.
 
-None of it is released yet, so no test here depends on it until synoik pushes
-and the installed binary catches up.
+**Ported, 2026-08-10.** Both rigs now run on synoik and nothing else:
+`ghost-ui/tests/fractional_scale.rs` (mutter, a private session bus, `gdbus`
+and a serial-guarded `ApplyMonitorsConfig` all gone) and
+`ghost-ui-harness/tests/windowed.rs` (weston gone). The compositor half lives
+in `ghost-test-compositor/`, one crate both tests dev-depend on; `$SYNOIK`
+overrides which binary it runs, for working against a synoik newer than the
+installed one. A synoik that predates `--wayland-display` skips the tests with
+a message saying to update it.
+
+One cost to know about: the windowed dive takes ~12s under headless synoik
+where it took ~0.5s under headless weston, for the same 13 presented frames.
+The surface appears to receive no frame callbacks, so Fifo falls back to Mesa's
+one-second timeout and every present waits it out.
