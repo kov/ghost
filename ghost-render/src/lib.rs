@@ -109,6 +109,12 @@ pub struct CursorLayout {
     pub col: usize,
     pub row: usize,
     pub shape: CursorShape,
+    /// Draw the block as an outline rather than a filled cell: the keyboard is
+    /// pointed somewhere else, so the cursor says "this is where typing would
+    /// go", not "this is where it goes" — as gnome-terminal's does. Layout
+    /// itself never sets it (a `Vt` has no idea where the keyboard is); the
+    /// view that owns the window's focus does, on the frame it hands over.
+    pub hollow: bool,
 }
 
 /// A normalized linear text selection over the viewport grid, in 0-based
@@ -340,6 +346,8 @@ pub fn layout_frame_at_px(
         col: cursor.col,
         row: cursor.row,
         shape: cursor.shape,
+        // Focus is a window fact, not a terminal one — see [`CursorLayout::hollow`].
+        hollow: false,
     });
 
     // The window's lines: `view_at` yields exactly `rows`, so the slid window
@@ -782,6 +790,7 @@ mod tests {
                 col: 2,
                 row: 0,
                 shape: CursorShape::Block,
+                hollow: false,
             })
         );
     }

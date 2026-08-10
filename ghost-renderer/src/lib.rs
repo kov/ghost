@@ -4014,7 +4014,13 @@ impl Renderer {
                 // colours, so the cursor reverses *it* instead: a block in the
                 // theme background under a glyph in its foreground. It also has
                 // to be painted after the highlight, or the fill covers it.
-                let block_cursor = matches!(cursor_here.map(|c| c.shape), Some(CursorShape::Block));
+                // A cursor whose window has lost the keyboard is drawn as an
+                // outline instead (see [`CursorLayout::hollow`]) — so it reverses
+                // nothing: the cell keeps its own colours and the four edges are
+                // traced after the glyphs, with the other non-filling shapes.
+                let hollow = cursor_here.is_some_and(|c| c.hollow);
+                let block_cursor =
+                    matches!(cursor_here.map(|c| c.shape), Some(CursorShape::Block)) && !hollow;
                 let cursor_selected = block_cursor && selected(run.start_col);
                 let (block, glyph_color) = match (block_cursor, cursor_selected) {
                     (true, true) => (Some(cursor_rgba.unwrap_or(sel_text)), sel_fill),
@@ -4153,6 +4159,40 @@ impl Renderer {
                     fg
                 });
                 match cursor_here.map(|c| c.shape) {
+                    // The unfocused block: the same cell, traced rather than
+                    // filled. Only the block hollows out — a bar or an underline
+                    // is already a rule, with no inside to empty.
+                    Some(CursorShape::Block) if hollow => {
+                        let t = (metrics.line_height / 14.0).max(1.0);
+                        for r in [
+                            RectPx {
+                                x,
+                                y: row_y,
+                                w,
+                                h: t,
+                            },
+                            RectPx {
+                                x,
+                                y: row_y + metrics.line_height - t,
+                                w,
+                                h: t,
+                            },
+                            RectPx {
+                                x,
+                                y: row_y,
+                                w: t,
+                                h: metrics.line_height,
+                            },
+                            RectPx {
+                                x: x + w - t,
+                                y: row_y,
+                                w: t,
+                                h: metrics.line_height,
+                            },
+                        ] {
+                            glyphs.push(solid(r, caret));
+                        }
+                    }
                     Some(CursorShape::Underline) => {
                         let thickness = (metrics.line_height / 8.0).max(2.0);
                         glyphs.push(solid(

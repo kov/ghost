@@ -116,6 +116,47 @@ fn renders_ligature_line_to_image() {
 }
 
 #[test]
+fn an_unfocused_block_cursor_is_an_outline_not_a_filled_cell() {
+    // gnome-terminal's tell that the keyboard is pointed elsewhere: the block
+    // cursor becomes a hollow rectangle. The cell keeps its own colours — a
+    // hollow cursor reverses nothing — and the outline traces its four edges.
+    let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+    let mut vt = Vt::new(4, 1);
+    vt.feed_str("ab"); // cursor lands on the blank cell at col 2 (x 18..27)
+    let mut frame = layout_frame(&vt, METRICS);
+    let filled = render_frame(&frame, font, 15.0, Theme::default());
+    frame.cursor.as_mut().expect("a visible cursor").hollow = true;
+    let hollow = render_frame(&frame, font, 15.0, Theme::default());
+    write_png("ghost_hollow_cursor.png", &hollow);
+
+    let bright = |p: [u8; 4]| p[0] > 128 && p[1] > 128 && p[2] > 128;
+    assert!(
+        bright(px(&filled, 22, 9)),
+        "a focused block cursor fills its cell: {:?}",
+        px(&filled, 22, 9)
+    );
+    // Middle of the cell: the ordinary background, exactly as the untouched
+    // cell beside it (col 3, x 27..36).
+    assert_eq!(
+        px(&hollow, 22, 9),
+        px(&hollow, 31, 9),
+        "the inside of a hollow cursor is just the cell"
+    );
+    for (x, y, edge) in [
+        (22, 0, "top"),
+        (22, 17, "bottom"),
+        (18, 9, "left"),
+        (26, 9, "right"),
+    ] {
+        assert!(
+            bright(px(&hollow, x, y)),
+            "no {edge} edge on the hollow cursor: {:?}",
+            px(&hollow, x, y)
+        );
+    }
+}
+
+#[test]
 fn app_set_dynamic_colors_change_the_rendered_pixels() {
     let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
     // OSC 10/11/12: red default fg, navy default bg, green cursor. An inverse

@@ -425,7 +425,12 @@ struct Frozen {
 /// [`TerminalView`]'s frame memo. Two views/presents with an equal key produce a
 /// byte-identical frame, so the memo can hand back the same `Rc` and let
 /// `Rc::ptr_eq` stand in for a content compare.
-type FrameKey = (u64, u64, CellMetrics, usize, f32);
+///
+/// The trailing flag is the view's keyboard focus, which layout itself knows
+/// nothing about but the frame carries ([`ghost_render::CursorLayout::hollow`]):
+/// keying on it means a focus change mints a new `Rc`, so every freshness check
+/// downstream sees the frame it did change.
+type FrameKey = (u64, u64, CellMetrics, usize, f32, bool);
 
 /// How long a frozen view is kept without interaction before it lets go and
 /// snaps back to the live session. Long enough to read what you selected and
@@ -505,7 +510,7 @@ struct Presented {
     /// isn't a scroll *change* when the view returns to the presented offset — the
     /// one gap `moved` can't see. Diffing this against the current drawn cursor in
     /// [`Self::damage`] dirties just its row(s), no whole-view repaint.
-    cursor: Option<(usize, usize, u8)>,
+    cursor: Option<(usize, usize, u8, bool)>,
 }
 
 /// A cheap identity of one direct graphics placement — image id, placement id, cell
@@ -1508,18 +1513,25 @@ impl TerminalView {
         }
     }
 
-    /// The cursor as it is *drawn* right now — `(row, col, DECSCUSR shape)`, or
-    /// `None` when it isn't drawn: hidden (DECTCEM), or scrolled into history where
+    /// The cursor as it is *drawn* right now — `(row, col, DECSCUSR shape, hollow)`,
+    /// or `None` when it isn't drawn: hidden (DECTCEM), or scrolled into history where
     /// the live cursor is off screen. Snapshotted into [`Presented`] and diffed in
     /// [`Self::damage`]; the row is clamped so a shrink can't point past the bottom.
-    fn drawn_cursor(&self, state: &SessionState) -> Option<(usize, usize, u8)> {
+    /// Hollowness is part of it because losing the keyboard redraws the block as an
+    /// outline in place — a change on that row with no cell behind it.
+    fn drawn_cursor(&self, state: &SessionState) -> Option<(usize, usize, u8, bool)> {
         if self.scroll_offset != 0 || self.scroll_frac != 0.0 {
             return None;
         }
         let c = self.screen(state).vt().cursor();
         c.visible.then(|| {
             let row = c.row.min((state.rows as usize).saturating_sub(1));
-            (row, c.col, ghost_vt::query::decscusr_digit(c.shape))
+            (
+                row,
+                c.col,
+                ghost_vt::query::decscusr_digit(c.shape),
+                !self.focused,
+            )
         })
     }
 
@@ -1917,6 +1929,7 @@ impl TerminalView {
             self.effective_metrics(),
             self.scroll_offset,
             self.scroll_frac,
+            self.focused,
         );
         let mut memo = self.frame_memo.borrow_mut();
         if let Some((k, frame)) = memo.as_ref()
@@ -1924,13 +1937,24 @@ impl TerminalView {
         {
             return Rc::clone(frame);
         }
-        let frame = Rc::new(layout_frame_at_px(
+        let frame = Rc::new(self.lay_out_frame(state));
+        *memo = Some((key, Rc::clone(&frame)));
+        frame
+    }
+
+    /// Lay this view's frame out from scratch: the emulator's own layout, plus the
+    /// one thing on it the emulator cannot know — whether the window holding this
+    /// view has the keyboard (see [`ghost_render::CursorLayout::hollow`]).
+    fn lay_out_frame(&self, state: &SessionState) -> Frame {
+        let mut frame = layout_frame_at_px(
             self.screen(state).vt(),
             self.effective_metrics(),
             self.scroll_offset,
             self.scroll_frac,
-        ));
-        *memo = Some((key, Rc::clone(&frame)));
+        );
+        if let Some(c) = frame.cursor.as_mut() {
+            c.hollow = !self.focused;
+        }
         frame
     }
 
@@ -2310,7 +2334,14 @@ impl TerminalView {
     }
 
     fn focus(&mut self, state: &SessionState, focused: bool) -> Vec<Cmd> {
-        self.focused = focused;
+        let was = std::mem::replace(&mut self.focused, focused);
+        // The block cursor hollows out with the keyboard gone (and fills back in
+        // when it returns), which nothing else will repaint: no cell changed.
+        let mut cmds = if was != focused && self.drawn_cursor(state).is_some() {
+            vec![Cmd::Redraw]
+        } else {
+            Vec::new()
+        };
         if !focused {
             // Losing focus aborts any IME composition; clear it so we don't get
             // stuck swallowing input should the platform omit `Ime::Disabled`.
@@ -2324,18 +2355,18 @@ impl TerminalView {
                     if focused { "I" } else { "O" }
                 ),
             );
-            state.send(if focused {
+            cmds.extend(state.send(if focused {
                 b"\x1b[I".to_vec()
             } else {
                 b"\x1b[O".to_vec()
-            })
+            }));
         } else {
             crate::focus_trace::log(
                 state.session(),
                 format_args!("focus-event focused={focused} MUTED (1004 off)"),
             );
-            Vec::new()
         }
+        cmds
     }
 
     /// Resize this view to a new window size. `driving` marks the one window that
@@ -5329,15 +5360,18 @@ mod tests {
     #[test]
     fn focus_reports_only_when_enabled() {
         let mut m = model();
-        assert_eq!(m.update(UiEvent::Focus(true)), vec![]);
+        // Taking the keyboard repaints the cursor (block, not outline) but reports
+        // nothing while mode 1004 is off.
+        assert_eq!(m.update(UiEvent::Focus(true)), vec![Cmd::Redraw]);
         feed(&mut m, b"\x1b[?1004h");
+        // Focus we already had: no repaint, and the mode is on, so a report.
         assert_eq!(
             m.update(UiEvent::Focus(true)),
             vec![sent("alpha", b"\x1b[I")]
         );
         assert_eq!(
             m.update(UiEvent::Focus(false)),
-            vec![sent("alpha", b"\x1b[O")]
+            vec![Cmd::Redraw, sent("alpha", b"\x1b[O")]
         );
     }
 
@@ -6196,6 +6230,58 @@ mod tests {
         assert!(
             !cmds.contains(&Cmd::Redraw),
             "moving a hidden cursor changes no pixels: {cmds:?}"
+        );
+    }
+
+    /// The cursor the view's frame carries, if it draws one.
+    fn view_cursor(m: &TerminalModel) -> Option<ghost_render::CursorLayout> {
+        match m.view().terminals().next().expect("a single terminal item") {
+            SceneItem::Terminal { frame, .. } => frame.cursor,
+            other => panic!("the single view is one terminal item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cursor_hollows_out_while_the_window_lacks_keyboard_focus() {
+        let mut m = model();
+        feed(&mut m, b"hello");
+        m.update(UiEvent::Focus(true));
+        assert_eq!(
+            view_cursor(&m).map(|c| c.hollow),
+            Some(false),
+            "a focused window draws the solid block"
+        );
+        // The keyboard went elsewhere — a shell menu, another window. The cursor
+        // still says where typing would land, but not that it is landing there.
+        m.update(UiEvent::Focus(false));
+        assert_eq!(
+            view_cursor(&m).map(|c| c.hollow),
+            Some(true),
+            "an unfocused window draws the outline"
+        );
+        m.update(UiEvent::Focus(true));
+        assert_eq!(view_cursor(&m).map(|c| c.hollow), Some(false));
+    }
+
+    #[test]
+    fn a_focus_change_repaints_the_cursor_row() {
+        let mut m = model();
+        feed(&mut m, b"hello"); // visible cursor on row 0
+        m.update(UiEvent::Focus(true));
+        m.mark_presented();
+        assert!(matches!(view_damage(&m), TermDamage::None));
+
+        // Filled to hollow is a visible change on the cursor's row and nowhere
+        // else — without the repaint the glass keeps the solid block.
+        let cmds = m.update(UiEvent::Focus(false));
+        assert!(
+            cmds.contains(&Cmd::Redraw),
+            "hollowing the cursor must repaint it: {cmds:?}"
+        );
+        assert!(
+            matches!(view_damage(&m), TermDamage::Rows { lo: 0, hi: 0 }),
+            "focus damages the cursor's row, got {:?}",
+            view_damage(&m)
         );
     }
 
@@ -8155,12 +8241,7 @@ mod tests {
         /// Lay out the CURRENT session state directly, BYPASSING the view's frame
         /// memo — the ground truth the memoized frame must always equal.
         fn fresh_frame(m: &super::TerminalModel) -> Frame {
-            ghost_render::layout_frame_at_px(
-                m.state.screen().vt(),
-                m.view.effective_metrics(),
-                m.view.scroll_offset,
-                m.view.scroll_frac,
-            )
+            m.view.lay_out_frame(&m.state)
         }
 
         proptest! {
