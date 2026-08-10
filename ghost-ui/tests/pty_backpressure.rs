@@ -198,7 +198,28 @@ fn input_queued_while_the_child_slept_drains_intact_when_it_reads() {
     let _guard = ReapOnDrop { xdg, name };
 
     let out = ghost(xdg)
-        .args(["new", name, "-d", "--", "sh", "-c", "sleep 3; exec cat"])
+        // `stty -echo` so exactly one thing echoes the payload back: `cat`.
+        // With the terminal's own echo left on there are *two* streams — the
+        // line discipline echoes each line the moment the host writes it, while
+        // `cat` echoes it only once it reads it, seconds later — and they
+        // interleave. The marker could then arrive on the driver's stream while
+        // `cat` was still working through the middle of the payload, and the
+        // check below would run against a half-drained buffer and report lines
+        // "missing" that turned up milliseconds later. That was a ~1-in-6 flake
+        // whenever the sibling test ran alongside this one and starved it of
+        // CPU. Nothing was ever lost — measured — and nothing about the drain
+        // under test changes here: input takes the same path either way, and
+        // one in-order echo stream is what makes "the marker implies everything
+        // before it" true rather than merely usually true.
+        .args([
+            "new",
+            name,
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "stty -echo; sleep 3; exec cat",
+        ])
         .output()
         .unwrap();
     assert!(
