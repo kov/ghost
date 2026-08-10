@@ -37,39 +37,156 @@ const SOCKET: &str = "ghost-test";
 /// The name synoik gives the first `--output`.
 pub const OUTPUT: &str = "headless-1";
 
-/// The synoik to run: `$SYNOIK` if set, else whatever is on `PATH`.
+/// Where synoik comes from, and which one.
 ///
-/// The override is for working against a build of synoik that is newer than the
-/// installed one — which is how this rig gets tested at all while a capability
-/// is still fresh. Nothing committed here may know where anyone's checkout is.
-fn binary() -> PathBuf {
-    std::env::var_os("SYNOIK")
+/// `synoik.rev` is a full commit hash on purpose: a branch name would make the
+/// suite's compositor change under it without a commit anyone can point at.
+/// Moving the pin is a one-line change, made deliberately.
+const REPO: &str = "https://github.com/kov/synoik.git";
+const REV: &str = include_str!("../synoik.rev");
+
+/// Built without default features — `systemd`, `xdp-gnome-screencast` and
+/// `audio`, none of which a headless test rig uses, and the last two of which
+/// drag in pipewire's development headers. Verified to build and to serve both
+/// suites at [`REV`].
+const FEATURES: &[&str] = &["--no-default-features"];
+
+/// The synoik this rig runs: `$SYNOIK` if set, else our own build of [`REV`],
+/// cloned and built on demand.
+///
+/// It is deliberately *not* whatever is on `PATH`. The developer's installed
+/// synoik is the one drawing their desktop; it moves when they upgrade it, and
+/// a test suite whose compositor changes underneath it reports on something
+/// nobody chose. `$SYNOIK` stays as the override for working against a build
+/// that is ahead of the pin — which is how the pin gets moved.
+fn binary() -> Result<PathBuf, Missing> {
+    if let Some(own) = std::env::var_os("SYNOIK") {
+        return Ok(PathBuf::from(own));
+    }
+    provision()
+}
+
+/// Where our builds live: `target/synoik/<rev>/`, beside the workspace's own
+/// build output, so `cargo clean` takes it and nothing else does.
+///
+/// Derived from the manifest, never from the environment the tests are running
+/// in — this suite redirects `XDG_*` process-wide, and a cache path that
+/// followed it would land in a tempdir and rebuild synoik on every run.
+fn cache() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("synoik"))
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")))
+        .join("synoik")
+}
+
+/// Clone and build [`REV`], unless we already have it.
+///
+/// Two test binaries run concurrently under `cargo test --workspace` and both
+/// want this, so the whole thing is behind a lock file that outlives any one
+/// checkout — the loser waits for the winner's build rather than starting a
+/// second one on top of it.
+fn provision() -> Result<PathBuf, Missing> {
+    let rev = REV.trim();
+    let cache = cache();
+    let checkout = cache.join(rev);
+    let built = checkout.join("target/debug/synoik");
+    if built.exists() {
+        return Ok(built);
+    }
+    std::fs::create_dir_all(&cache).map_err(|e| Missing::Build(e.to_string()))?;
+
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cache.join("provision.lock"))
+        .map_err(|e| Missing::Build(e.to_string()))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| Missing::Build(e.to_string()))?;
+    // Whoever held the lock may have been building exactly this.
+    if built.exists() {
+        return Ok(built);
+    }
+
+    let log_path = cache.join(format!("{rev}.log"));
+    eprintln!(
+        "ghost-test-compositor: building synoik {} — first run only, a couple of \
+         minutes; log in {}",
+        &rev[..12],
+        log_path.display()
+    );
+    let log = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    };
+
+    if !checkout.join(".git").is_dir() {
+        // A half-finished clone from an interrupted run is worse than none.
+        let _ = std::fs::remove_dir_all(&checkout);
+        let cloned = Command::new("git")
+            .args(["clone", "--filter=blob:none", REPO])
+            .arg(&checkout)
+            // Never stop for credentials: a `cargo test` that has silently
+            // parked on a password prompt looks exactly like a hung test.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(log())
+            .stderr(log())
+            .status();
+        if !cloned.is_ok_and(|s| s.success()) {
+            return Err(Missing::Clone(log_path.display().to_string()));
+        }
+    }
+    let checked_out = Command::new("git")
+        .args(["checkout", "--detach", rev])
+        .current_dir(&checkout)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(log())
+        .stderr(log())
+        .status();
+    if !checked_out.is_ok_and(|s| s.success()) {
+        return Err(Missing::Clone(log_path.display().to_string()));
+    }
+
+    let build = Command::new("cargo")
+        .args(["build", "--locked", "--bin", "synoik"])
+        .args(FEATURES)
+        .current_dir(&checkout)
+        // Explicit, because an ambient one would send synoik's build output into
+        // ghost's target dir — where the next `cargo build` would fight it.
+        .env("CARGO_TARGET_DIR", checkout.join("target"))
+        .stdin(Stdio::null())
+        .stdout(log())
+        .stderr(log())
+        .status();
+    if !build.is_ok_and(|s| s.success()) {
+        return Err(Missing::Build(log_path.display().to_string()));
+    }
+    Ok(built)
 }
 
 /// Why a rig could not be stood up. Every one of these is a skip: the test is
 /// not being told anything about ghost.
 #[derive(Debug)]
 pub enum Missing {
-    /// No synoik on `PATH` (and no `$SYNOIK`).
-    NotInstalled,
-    /// A synoik that does not know the flags a test rig needs. `--wayland-display`
-    /// is the newest of them, so its absence stands for all of them.
-    TooOld,
-    /// It was started and never served.
+    /// synoik could not be fetched — no network, most likely. Carries the log.
+    Clone(String),
+    /// It was fetched and would not build. Carries the log.
+    Build(String),
+    /// It was built and never served.
     NeverCameUp,
 }
 
 impl std::fmt::Display for Missing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Missing::NotInstalled => write!(f, "synoik is not installed"),
-            Missing::TooOld => write!(
-                f,
-                "the installed synoik predates `--wayland-display`; update it \
-                 (or point $SYNOIK at a newer build)"
-            ),
+            Missing::Clone(log) => write!(f, "could not clone {REPO} — see {log}"),
+            Missing::Build(log) => write!(f, "synoik would not build — see {log}"),
             Missing::NeverCameUp => write!(f, "synoik never came up headless"),
         }
     }
@@ -103,15 +220,7 @@ impl Synoik {
     /// Start a headless synoik with one output of `size` at `scale`, on a socket
     /// of its own.
     pub fn start(size: (u32, u32), scale: f64) -> Result<Synoik, Missing> {
-        let synoik = binary();
-        let help = Command::new(&synoik).arg("--help").output();
-        let Ok(help) = help else {
-            return Err(Missing::NotInstalled);
-        };
-        let help = String::from_utf8_lossy(&help.stdout);
-        if !help.contains("--wayland-display") {
-            return Err(Missing::TooOld);
-        }
+        let synoik = binary()?;
 
         let dir = tempfile::tempdir().expect("a runtime dir");
         // Its own config dir, and not the developer's: synoik reads
@@ -142,7 +251,7 @@ impl Synoik {
                 .stderr(Stdio::from(out)),
         );
         if rig.child.is_none() {
-            return Err(Missing::NotInstalled);
+            return Err(Missing::NeverCameUp);
         }
 
         // Ready when it is there to connect to *and* it has said where its IPC
@@ -180,7 +289,7 @@ impl Synoik {
     /// desktop, and an inherited one would aim `msg action maximize` at whatever
     /// window they are actually using.
     pub fn msg(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new(binary())
+        let out = Command::new(binary().ok()?)
             .arg("msg")
             .args(args)
             .env("SYNOIK_SOCKET", &self.ipc)

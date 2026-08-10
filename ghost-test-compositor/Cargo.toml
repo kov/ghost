@@ -11,5 +11,5 @@ publish = false
 # real session's or with another run of the suite.
 tempfile = "3"
 # PR_SET_PDEATHSIG on the compositor, so an abort (or a ^C on cargo) cannot
-# orphan it.
-rustix = { version = "1.1.4", features = ["process"] }
+# orphan it; flock so two test binaries cannot build synoik at once.
+rustix = { version = "1.1.4", features = ["process", "fs"] }

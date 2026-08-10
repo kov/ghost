@@ -7,9 +7,9 @@
 //! and reaped by the test, so a plain `cargo test` runs it — no environment to
 //! set, and no window on anyone's desktop. It used to be opt-in behind
 //! `GHOST_UI_WINDOWED=1`, which meant nothing ran it and it rotted quietly
-//! against a model change. Synoik must be installed and recent enough; without
-//! it the test says so and returns, because a compositor is the one thing it
-//! cannot supply itself.
+//! against a model change. The compositor is ours: `ghost-test-compositor`
+//! clones and builds the pinned synoik rather than using whatever is installed,
+//! so nothing about this test moves when the developer upgrades their desktop.
 //!
 //! Presenting needs dmabuf, and headless synoik only advertises it off a real
 //! DRM render node — on lavapipe there is no dmabuf global at all, the client
@@ -17,10 +17,11 @@
 //! is an environment without a GPU, not a regression, so it is a skip too.
 //!
 //! It costs ~12s under headless synoik where it cost ~0.5s under headless
-//! weston, for the same 13 presented frames: the surface appears to get no
-//! frame callbacks, so Fifo falls back to Mesa's one-second timeout and every
-//! present waits it out. Reported upstream; the test is measuring the same
-//! thing either way, just slowly.
+//! weston, for the same 13 presented frames, and the reason is upstream and
+//! understood: synoik's headless backend never marks a surface as being on a
+//! primary scanout output, so frame callbacks arrive only from its 995ms
+//! overdue timer and Fifo waits that out on every present. A fix is in their
+//! hands; the test measures the same thing either way, just slowly.
 //!
 //! To watch it instead, against your own session:
 //!

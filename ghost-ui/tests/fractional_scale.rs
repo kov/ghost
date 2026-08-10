@@ -10,8 +10,9 @@
 //! invisible at integer scale, where every rounding agrees.
 //!
 //! It brings its own compositor — a headless [`Synoik`] at the scale we name on
-//! its command line, which is also the compositor ghost is really used on. The
-//! scale change halfway through is one `synoik msg` call.
+//! its command line, which is also the compositor ghost is really used on, and
+//! which the suite builds itself from a pinned commit rather than borrowing
+//! from the desktop. The scale change halfway through is one `synoik msg` call.
 //!
 //! The assertion is not "the process survived". `Graphics::render` now drops a
 //! scene whose size disagrees with its surface rather than draw it, so a

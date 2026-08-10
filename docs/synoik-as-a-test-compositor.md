@@ -141,12 +141,21 @@ replacing.
 `ghost-ui/tests/fractional_scale.rs` (mutter, a private session bus, `gdbus`
 and a serial-guarded `ApplyMonitorsConfig` all gone) and
 `ghost-ui-harness/tests/windowed.rs` (weston gone). The compositor half lives
-in `ghost-test-compositor/`, one crate both tests dev-depend on; `$SYNOIK`
-overrides which binary it runs, for working against a synoik newer than the
-installed one. A synoik that predates `--wayland-display` skips the tests with
-a message saying to update it.
+in `ghost-test-compositor/`, one crate both tests dev-depend on.
+
+**The suite builds its own synoik.** It is not whatever is installed: the rig
+clones `https://github.com/kov/synoik.git` at the commit in
+`ghost-test-compositor/synoik.rev`, builds it `--no-default-features` (no
+systemd, no pipewire) into `target/synoik/<rev>/`, and runs that. A developer's
+installed synoik is the one drawing their desktop and moves when they upgrade
+it; a suite whose compositor changes underneath it reports on something nobody
+chose. First run costs one clone and ~2 minutes of build, once per pinned rev
+and once more after a `cargo clean`; every run after is instant. No network (or
+a build failure) is a skip naming the log. `$SYNOIK` still overrides, which is
+how the pin gets moved.
 
 One cost to know about: the windowed dive takes ~12s under headless synoik
 where it took ~0.5s under headless weston, for the same 13 presented frames.
-The surface appears to receive no frame callbacks, so Fifo falls back to Mesa's
-one-second timeout and every present waits it out.
+Root-caused upstream: headless never sets a primary scanout output, so frame
+callbacks come only from synoik's 995ms overdue timer and Fifo waits it out on
+every present. A fix is synoik's to make; re-time this when it lands.
