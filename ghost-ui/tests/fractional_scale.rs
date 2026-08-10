@@ -115,6 +115,11 @@ impl Compositor {
                 .arg(format!("--wayland-display={SOCKET}"))
                 .env("XDG_CONFIG_HOME", &cfg)
                 .env("XDG_RUNTIME_DIR", c.dir.path())
+                // Mutter's GIO otherwise activates gvfs on our private bus, and an
+                // activated service is nobody's child: it would outlive the bus,
+                // the test and its `Drop`, holding a fuse mount over a tempdir
+                // that is already gone.
+                .env("GIO_USE_VFS", "local")
                 .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr),
         )?);
         if !wait_until(Duration::from_secs(20), || c.display().exists()) {
