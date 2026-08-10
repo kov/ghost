@@ -611,3 +611,43 @@ fn an_emptied_window_closes_alone_while_another_window_keeps_ghost_running() {
         support::kill_session("stays-b");
     });
 }
+
+/// Alt+N opens a *second* window; the one you pressed it in must still be there,
+/// still showing its own session. Asserted through the shortcut rather than by
+/// calling `open_launch_window` twice, because the report is about the key.
+#[test]
+fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("first-a", "echo first-a ready; exec cat");
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let a = app
+            .open_single_window(&fe, "first-a", g, None)
+            .expect("window A");
+        app.wake(&fe);
+
+        app.dispatch(
+            a,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("n".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+        app.wake(&fe);
+
+        let ids = app.window_ids();
+        assert_eq!(ids.len(), 2, "Alt+N opens a second window: {ids:?}");
+        assert!(
+            app.root(a).is_some_and(|r| r.foregrounds("first-a")),
+            "the window Alt+N was pressed in stays, still on its session"
+        );
+        support::kill_session("first-a");
+    });
+}
