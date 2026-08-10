@@ -1503,6 +1503,11 @@ impl RootModel {
         }
     }
 
+    /// Whether this window is carrying a failure the user has not dismissed.
+    pub fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
     /// Whether the details are unfolded right now.
     pub fn error_details_shown(&self) -> bool {
         self.error.as_ref().is_some_and(|e| e.shown)

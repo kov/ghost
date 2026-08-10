@@ -4637,6 +4637,7 @@ impl App {
                         let identity = w.root.client_identity();
                         if let Ok(s) = attach(&name, cols, rows, &identity) {
                             self.drive_with_client(&name, s);
+                            self.clear_failure(wid);
                         }
                     }
                 }
@@ -5787,6 +5788,7 @@ impl App {
         match event_loop.spawn_session(&name, vec![], Some(spec), None) {
             Ok(()) => {
                 if self.attach_into(wid, &name) {
+                    self.clear_failure(wid);
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                 }
             }
@@ -6173,6 +6175,7 @@ impl App {
         let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
         // Just spawned by the current staged binary → our own level.
         if self.attach_ssh_into(wid, &local_id, cmd, ghost_vt::protocol::PROTO_LEVEL) {
+            self.clear_failure(wid);
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
             self.remote_index.remove(&local_id);
@@ -8012,9 +8015,14 @@ impl App {
             .iter()
             .copied()
             .filter(|id| {
-                self.windows
-                    .get(id)
-                    .is_some_and(|w| w.root.is_fleet() && w.root.holds_nothing())
+                self.windows.get(id).is_some_and(|w| {
+                    // A window still holding an unread failure stays: it is the only
+                    // thing on screen saying why the session the user just asked for
+                    // never ran, and closing it would take that away at exactly the
+                    // moment it matters (the window would simply vanish, which is
+                    // what the affordance exists to stop).
+                    w.root.is_fleet() && w.root.holds_nothing() && !w.root.has_error()
+                })
             })
             .collect();
         if emptied.is_empty() {
@@ -8116,6 +8124,11 @@ impl App {
             // in the frame, instead of letting it end as a blank that never
             // explained itself.
             if let Some(why) = why {
+                eprintln!(
+                    "DBGAPP name={name} why={why} viewers={:?} driver={:?}",
+                    self.windows_viewing(&name).len(),
+                    self.pick_driver(&name)
+                );
                 for wid in self.windows_viewing(&name) {
                     self.report_failure(wid, "Could not start a session", &why);
                 }
@@ -10808,6 +10821,41 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_window_still_holding_a_failure_is_not_swept_away_with_it() {
+        // The window carrying the notice is the only thing on screen saying why
+        // nothing started — and the very failure that puts it there also leaves
+        // the window empty, which is what the sweep closes. Closing it would make
+        // the whole affordance vanish at the moment it matters.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group.clone(), None);
+
+            // An empty fleet window with nothing to return to is exactly what the
+            // sweep exists to close.
+            app.close_emptied_windows(&[wid], "never-was", &fe);
+            assert!(
+                !app.windows.contains_key(&wid),
+                "an empty window with nothing to return to closes"
+            );
+
+            let wid = app.open_fleet_window(&fe, group, None);
+            app.report_failure(wid, "Could not start a session", "no such shell");
+            app.close_emptied_windows(&[wid], "never-was", &fe);
+            assert!(
+                app.windows.contains_key(&wid),
+                "but one still saying why nothing started stays up"
+            );
+            let bar = chrome_of(&app, wid);
+            assert!(
+                bar.iter().any(|t| t.contains("Could not start a session")),
+                "and goes on saying it: {bar:?}"
+            );
+        });
     }
 
     #[test]
