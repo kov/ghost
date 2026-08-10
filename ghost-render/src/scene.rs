@@ -56,6 +56,8 @@ pub enum SceneId {
     Titlebar,
     /// One of the titlebar's window-control buttons.
     WindowButton,
+    /// The titlebar's "Details" button, offering the rest of a failure notice.
+    NoticeDetails,
 }
 
 /// Where a [`SceneItem::ChromeText`] sits in its box.

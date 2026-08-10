@@ -482,6 +482,10 @@ pub struct RootModel {
     /// ssh window before its first session): it swallows the keyboard into the
     /// entry and renders the prompt overlay instead of the live view.
     connect: Option<ConnectPrompt>,
+    /// Something this window tried to do and could not. Kept until the user has
+    /// seen it: the frame burns, and the whole of it waits behind the frame's
+    /// details button. See [`WindowError`].
+    error: Option<WindowError>,
     /// Whether the most recent [`view`](Self::view) actually painted the live
     /// foreground terminal — set by `view` in the branch it took, read by
     /// [`mark_presented`](Self::mark_presented) to decide whether clearing the
@@ -491,6 +495,22 @@ pub struct RootModel {
     /// the single source means a new full-window overlay suppresses the baseline
     /// advance automatically — no hand-maintained mirror of `view`'s early returns.
     foreground_painted: Cell<bool>,
+}
+
+/// Something the window tried and could not do — a session that would not
+/// start, a host that would not answer.
+///
+/// It is two texts on purpose. The `summary` is what fits in a titlebar and is
+/// all most failures need ("Could not start a session"); the `details` are the
+/// diagnostic behind it, which is usually long, usually ugly, and always the
+/// thing a bug report actually needs. Putting the second behind a button keeps
+/// the window readable without throwing the useful half away — the mistake the
+/// silent `eprintln!` made, from the other direction.
+struct WindowError {
+    summary: String,
+    details: String,
+    /// Whether the details are unfolded over the window right now.
+    shown: bool,
 }
 
 /// The stage of the "connect to a host over SSH" flow — a small state machine
@@ -564,6 +584,59 @@ const CONNECT_ERROR_HINT: &str = if cfg!(target_os = "macos") {
 } else {
     "Enter to retry · Esc to cancel · Ctrl+Shift+C or click to copy"
 };
+
+/// The way out of the unfolded failure details, and the way to take them with
+/// you.
+const ERROR_DETAILS_HINT: &str = if cfg!(target_os = "macos") {
+    "Esc to dismiss · ⌘C to copy"
+} else {
+    "Esc to dismiss · Ctrl+Shift+C to copy"
+};
+
+/// `text` broken into lines of at most `cols` characters, at whitespace where
+/// there is any and mid-word where there is not — a shell diagnostic is one long
+/// line as often as not, and running it off the edge of the window would hide
+/// the half that matters.
+fn wrap_to(text: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.lines() {
+        let mut line = String::new();
+        let mut width = 0;
+        for word in para.split_whitespace() {
+            let wl = word.chars().count();
+            if width > 0 && width + 1 + wl > cols {
+                out.push(std::mem::take(&mut line));
+                width = 0;
+            }
+            // A single word too long for the window is cut across lines rather
+            // than allowed to overhang.
+            if wl > cols {
+                let mut rest = word.chars().peekable();
+                while rest.peek().is_some() {
+                    let room = cols - width - usize::from(width > 0);
+                    if width > 0 {
+                        line.push(' ');
+                    }
+                    line.extend(rest.by_ref().take(room.max(1)));
+                    out.push(std::mem::take(&mut line));
+                    width = 0;
+                }
+                continue;
+            }
+            if width > 0 {
+                line.push(' ');
+                width += 1;
+            }
+            line.push_str(word);
+            width += wl;
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
 
 /// The "connect to a host over SSH" prompt state.
 struct ConnectPrompt {
@@ -795,6 +868,7 @@ impl RootModel {
             pad: 0.0,
             selection: SelectionConfig::default(),
             connect: None,
+            error: None,
             // Set by the first `view`, before the shell ever presents; no
             // `mark_presented` runs until then.
             foreground_painted: Cell::new(false),
@@ -840,6 +914,7 @@ impl RootModel {
             pad: 0.0,
             selection: SelectionConfig::default(),
             connect: None,
+            error: None,
             foreground_painted: Cell::new(false),
         }
     }
@@ -870,6 +945,7 @@ impl RootModel {
             pad: 0.0,
             selection: SelectionConfig::default(),
             connect: None,
+            error: None,
             foreground_painted: Cell::new(false),
         };
         (root, Sessions::new(), vec![Cmd::ListSessions, Cmd::Redraw])
@@ -1398,11 +1474,44 @@ impl RootModel {
     /// (see [`crate::frame::Titlebar::notice`]). Only the foreground view can be
     /// in one: a fleet tile has no freeze of its own, because a shift+drag never
     /// reaches one — it routes through [`FleetModel::update`], not a tile's view.
-    pub fn chrome_notice(&self) -> Option<&'static str> {
+    pub fn chrome_notice(&self) -> Option<crate::frame::Notice> {
+        // A failure outranks a mode: a mode is something the user just did and
+        // can undo, a failure is something they have not seen yet.
+        if let Some(e) = &self.error {
+            return Some(crate::frame::Notice::error(e.summary.clone()));
+        }
         match &self.mode {
-            Mode::Single { view, .. } => view.chrome_notice(),
+            Mode::Single { view, .. } => view.chrome_notice().map(crate::frame::Notice::mode),
             Mode::Fleet(_) => None,
         }
+    }
+
+    /// Report something this window could not do. `summary` is the line the frame
+    /// carries; `details` is everything else, kept for the details button.
+    pub fn report_error(&mut self, summary: impl Into<String>, details: impl Into<String>) {
+        self.error = Some(WindowError {
+            summary: summary.into(),
+            details: details.into(),
+            shown: false,
+        });
+    }
+
+    /// Unfold the failure's details over the window — the frame's details button.
+    pub fn show_error_details(&mut self) {
+        if let Some(e) = &mut self.error {
+            e.shown = true;
+        }
+    }
+
+    /// Whether the details are unfolded right now.
+    pub fn error_details_shown(&self) -> bool {
+        self.error.as_ref().is_some_and(|e| e.shown)
+    }
+
+    /// Forget the failure entirely — the user has read it, or the window has since
+    /// done successfully the thing that failed.
+    pub fn clear_error(&mut self) {
+        self.error = None;
     }
 
     pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
@@ -1454,6 +1563,17 @@ impl RootModel {
             UiEvent::Tick { now_ms } => self.tick_copied_flash(*now_ms),
             _ => Vec::new(),
         };
+        // Unfolded failure details are modal in the same way: Esc dismisses the
+        // failure outright (it has now been read), the copy chord lifts it, and
+        // nothing else reaches the view beneath.
+        if self.error_details_shown()
+            && matches!(
+                ev,
+                UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }
+            )
+        {
+            return self.error_details_input(ev);
+        }
         // The connect prompt is modal: while it is open it swallows keyboard,
         // text, and pointer input, so neither the typed host nor a stray click
         // reaches the view beneath it (a click on the error copies it). Resizes
@@ -2193,6 +2313,12 @@ impl RootModel {
         // whole window in the terminal's place — none paints it.
         self.foreground_painted.set(false);
 
+        // Unfolded failure details own the whole window: the user just asked for
+        // them, and Esc is one keystroke away.
+        if let Some(e) = self.error.as_ref().filter(|e| e.shown) {
+            return self.error_scene(e);
+        }
+
         // The connect prompt owns the whole window until it resolves.
         if let Some(prompt) = &self.connect {
             return self.connect_scene(prompt);
@@ -2497,6 +2623,96 @@ impl RootModel {
             w: tw,
             h: line_height,
         })
+    }
+
+    /// Input while the failure details are unfolded: Esc dismisses the failure
+    /// (having read it is the whole point of unfolding it), the copy chord lifts
+    /// the details to the clipboard, and everything else is swallowed.
+    fn error_details_input(&mut self, ev: UiEvent) -> Vec<Cmd> {
+        let UiEvent::Key {
+            key, mods, kind, ..
+        } = ev
+        else {
+            return Vec::new();
+        };
+        if !kind.is_down() {
+            return Vec::new();
+        }
+        if matches!(key, Key::Named(NamedKey::Escape)) {
+            self.clear_error();
+            return vec![Cmd::Redraw];
+        }
+        if matches!(classify_shortcut(&key, mods), Some(Shortcut::Copy))
+            && let Some(e) = &self.error
+        {
+            return vec![Cmd::WriteClipboard(e.details.clone())];
+        }
+        Vec::new()
+    }
+
+    /// The unfolded failure: a full-window scrim, the summary the frame was
+    /// carrying, the whole diagnostic under it wrapped to the window, and the way
+    /// out. Laid out at the modal scale like the connect overlay, and on the same
+    /// [`connect_metrics`](Self::connect_metrics), so the two read as one family.
+    fn error_scene(&self, err: &WindowError) -> Scene {
+        use crate::Rgba;
+        const SCRIM: Rgba = [0.06, 0.03, 0.03, 1.0];
+        const FG: Rgba = [0.97, 0.93, 0.92, 1.0];
+        const HINT: Rgba = [0.68, 0.62, 0.60, 1.0];
+        const ERR: Rgba = [0.95, 0.55, 0.45, 1.0];
+        const SCALE: f32 = CONNECT_SCALE;
+
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let m = self.connect_metrics();
+        let run = |s: &str| Run {
+            start_col: 0,
+            width_cols: s.chars().count(),
+            text: s.to_string(),
+            style: Style::default(),
+        };
+        let line = |y: f32, s: &str, color: Rgba| SceneItem::Text {
+            id: SceneId::NavBar,
+            rect: RectPx {
+                x: ((w - s.chars().count() as f32 * m.advance) * 0.5).max(0.0),
+                y,
+                w: (s.chars().count() as f32 * m.advance).max(1.0),
+                h: m.line_height,
+            },
+            runs: vec![run(s)],
+            metrics: m,
+            color,
+            scale: SCALE,
+        };
+
+        // How many characters fit across 90% of the window, at the modal scale.
+        let cols = ((w * 0.9) / m.advance).floor().max(20.0) as usize;
+        let body = wrap_to(&err.details, cols);
+
+        let mut items = vec![SceneItem::Rect {
+            id: SceneId::Sidebar,
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+            },
+            color: SCRIM,
+            radius: 0.0,
+        }];
+        // Centred on the whole block: summary, a blank, the body, a blank, the hint.
+        let total = (body.len() as f32 + 4.0) * m.line_height;
+        let mut y = ((h - total) * 0.5).max(0.0);
+        items.push(line(y, &err.summary, ERR));
+        y += m.line_height * 2.0;
+        for l in &body {
+            items.push(line(y, l, FG));
+            y += m.line_height;
+        }
+        items.push(line(y + m.line_height, ERROR_DETAILS_HINT, HINT));
+
+        let mut scene = Scene::new(self.size_px);
+        scene.layers.push(Layer::new(0, items));
+        scene
     }
 
     /// The "connect to a host" overlay: a full-window scrim, a title, and — by
@@ -5091,6 +5307,111 @@ mod tests {
         typed(&mut r, &"a".repeat(300));
         // Rendering drives the `field_w` computation; it must not panic.
         let _ = r.view();
+    }
+
+    #[test]
+    fn a_failure_burns_the_frame_and_keeps_the_rest_for_the_asking() {
+        // A summary in the frame is enough to know something went wrong; it is
+        // never enough to know what. So the whole of it is kept, one gesture away,
+        // and nothing of it is on screen until it is asked for.
+        let mut r = root();
+        let why = "ssh: connect to couve: No route to host";
+        r.report_error("Could not start a session", why);
+
+        let notice = r.chrome_notice().expect("the frame says something");
+        assert_eq!(notice.tone, crate::frame::NoticeTone::Error);
+        assert_eq!(notice.text, "Could not start a session");
+        assert!(
+            !scene_has(&r, "No route to host"),
+            "and it has not taken the window over to say it"
+        );
+
+        r.show_error_details();
+        assert!(scene_has(&r, why), "asking unfolds the whole story");
+        assert!(
+            scene_has(&r, "Could not start a session"),
+            "under the summary it belongs to"
+        );
+
+        // Esc puts the details away — and with them the failure itself: the user
+        // has now read it, and a window that stays red forever says nothing.
+        key(&mut r, Key::Named(NamedKey::Escape), Mods::NONE);
+        assert!(!scene_has(&r, why), "the details are gone");
+        assert!(
+            r.chrome_notice().is_none(),
+            "and the frame is a plain window again"
+        );
+    }
+
+    #[test]
+    fn a_long_diagnostic_wraps_into_the_window_rather_than_off_it() {
+        // Shell diagnostics arrive as one long line. Running it off the right
+        // edge would hide the half that names the actual failure.
+        let mut r = root();
+        let why = "ssh: Could not resolve hostname couve.local: \
+                   Name or service not known, and the fallback path \
+                   /Users/kov/.cache/ghost/bin/ghost-0.1.0-5da099f6 was not there either";
+        r.report_error("Could not start a session", why);
+        r.show_error_details();
+        let lines: Vec<String> = r
+            .view()
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|it| match it {
+                SceneItem::Text { runs, rect, .. } => Some((
+                    runs.iter().map(|r| r.text.clone()).collect::<String>(),
+                    *rect,
+                )),
+                _ => None,
+            })
+            .map(|(t, r)| {
+                assert!(
+                    r.x >= 0.0 && r.x + r.w <= SIZE.0 as f32,
+                    "every drawn line stays inside the window: {t:?} at {r:?}"
+                );
+                t
+            })
+            .collect();
+        assert!(
+            lines.len() > 3,
+            "the diagnostic took several lines: {lines:?}"
+        );
+        let rejoined = lines.join(" ");
+        for word in [
+            "couve.local:",
+            "/Users/kov/.cache/ghost/bin/ghost-0.1.0-5da099f6",
+        ] {
+            assert!(
+                rejoined.contains(word),
+                "{word} survived the wrap: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_details_can_be_lifted_to_the_clipboard() {
+        // The point of an error you can read is an error you can paste somewhere.
+        let mut r = root();
+        let why = "ssh: connect to couve: No route to host";
+        r.report_error("Could not start a session", why);
+        r.show_error_details();
+        let cmds = key(&mut r, Key::Char("c".into()), copy_mods());
+        assert!(
+            cmds.contains(&Cmd::WriteClipboard(why.to_string())),
+            "the copy chord copies what is shown: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_mode_the_window_is_in_never_hides_a_failure() {
+        // Both want the frame. A freeze is a thing the user just did and can undo;
+        // a failure is a thing they have not seen yet, so it outranks it.
+        let mut r = root();
+        r.report_error("Could not start a session", "why");
+        let notice = r.chrome_notice().expect("a notice");
+        assert_eq!(notice.tone, crate::frame::NoticeTone::Error);
+        assert_eq!(notice.text, "Could not start a session");
     }
 
     #[test]

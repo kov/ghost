@@ -2599,7 +2599,7 @@ impl Graphics {
             bg,
             fg,
             title: w.title.clone(),
-            notice: w.root.chrome_notice().map(str::to_string),
+            notice: w.root.chrome_notice(),
             font_px: desktop::desktop_font().px_size(scale),
             buttons: desktop::button_layout(),
             hovered: w.hovered_button,
@@ -4622,7 +4622,11 @@ impl App {
                     // no entry — this window becomes its driver. A spawn that failed
                     // has no host to attach to at all.
                     if let Err(e) = event_loop.spawn_session(&name, command, None, None) {
-                        eprintln!("ghost: could not start session {name}: {e}");
+                        self.report_failure(
+                            wid,
+                            "Could not start a session",
+                            format!("{name}: {e}"),
+                        );
                     } else if !self.sessions.contains_key(&name)
                         && let Some(w) = self.windows.get(&wid)
                     {
@@ -4701,10 +4705,11 @@ impl App {
                             ) {
                                 Ok(()) => {
                                     if self.attach_into(wid, &name) {
+                                        self.clear_failure(wid);
                                         self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                                     }
                                 }
-                                Err(e) => eprintln!("ghost: could not start a session: {e}"),
+                                Err(e) => self.report_failure(wid, "Could not start a session", e),
                             }
                         }
                     }
@@ -4978,6 +4983,19 @@ impl App {
         };
         let scale = gfx.window.scale_factor() as f32;
         let on_button = ghost_ui_core::frame::button_at(pos, &desktop::button_layout(), bar, scale);
+        // The details button belongs to the notice, not to the window controls,
+        // and it acts on press: there is nothing destructive behind it to arm.
+        let on_details = self
+            .windows
+            .get(&id)
+            .is_some_and(|w| ghost_ui_core::frame::details_at(pos, &gfx.titlebar(w), bar));
+        if button == PointerButton::Left && on_details {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.root.show_error_details();
+                w.request_redraw();
+            }
+            return true;
+        }
         match button {
             // The window menu is the right-click gesture on every desktop; the
             // compositor draws it, so it is the compositor's to open.
@@ -5385,6 +5403,32 @@ impl App {
         );
     }
 
+    /// Say, in the window's own frame, that something the user asked for did not
+    /// happen — and keep `details` for the frame's details button.
+    ///
+    /// Every call replaces an earlier one: what the user is owed is the reason
+    /// the thing they just tried failed, not a log. The message still goes to
+    /// stderr, which is where a terminal-attached run and the test suite read it.
+    fn report_failure(&mut self, wid: WindowId, summary: &str, details: impl std::fmt::Display) {
+        let details = details.to_string();
+        eprintln!("ghost: {summary}: {details}");
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.root.report_error(summary, details);
+            w.request_redraw();
+        }
+    }
+
+    /// The window got what it was asking for, so whatever failed before is stale.
+    /// Left alone while the details are unfolded — pulling the text out from under
+    /// someone reading it is worse than a moment of staleness.
+    fn clear_failure(&mut self, wid: WindowId) {
+        if let Some(w) = self.windows.get_mut(&wid)
+            && !w.root.error_details_shown()
+        {
+            w.root.clear_error();
+        }
+    }
+
     fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
         // Already driven somewhere in this process → adopt in place: the caller's
         // AdoptSession takes drivership, and no second client / rebuild is opened.
@@ -5410,7 +5454,7 @@ impl App {
                 true
             }
             Err(e) => {
-                eprintln!("could not attach to session '{name}': {e}");
+                self.report_failure(wid, "Could not attach to a session", format!("{name}: {e}"));
                 false
             }
         }
@@ -5449,7 +5493,11 @@ impl App {
                 true
             }
             Err(e) => {
-                eprintln!("could not attach to remote session '{name}': {e}");
+                self.report_failure(
+                    wid,
+                    "Could not attach to a remote session",
+                    format!("{name}: {e}"),
+                );
                 false
             }
         }
@@ -5740,7 +5788,7 @@ impl App {
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                 }
             }
-            Err(e) => eprintln!("ghost: could not start the ssh session: {e}"),
+            Err(e) => self.report_failure(wid, "Could not start the SSH session", e),
         }
     }
 
@@ -6098,7 +6146,7 @@ impl App {
             return;
         }
         if let Err(e) = result {
-            eprintln!("ghost: could not open a session on {target}: {e}");
+            self.report_failure(wid, "Could not open a session", format!("{target}: {e}"));
             return;
         }
         let host = self
@@ -6107,7 +6155,11 @@ impl App {
             .ok()
             .and_then(|m| m.get(&target).cloned());
         let Some(host) = host else {
-            eprintln!("ghost: lost the connection to {target} before attaching its new session");
+            self.report_failure(
+                wid,
+                "Lost the connection before attaching the new session",
+                target,
+            );
             return;
         };
         // Drive it under the composite id the watcher will discover it by, so the
@@ -6122,6 +6174,7 @@ impl App {
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
             self.remote_index.remove(&local_id);
+            // `attach_ssh_into` already reported why; this only says which host.
             eprintln!("ghost: opened a session on {target} but could not attach to it");
         }
     }
@@ -10696,7 +10749,46 @@ mod tests {
                 app.groups, groups_before,
                 "a session that never started must not be recorded as a member of anything"
             );
+            // And it says so. A window that swallowed the failure looked exactly
+            // like one where nothing had been asked for.
+            let bar = chrome_of(&app, wid);
+            assert!(
+                bar.iter().any(|t| t.contains("Could not start a session")),
+                "the frame reports the failure: {bar:?}"
+            );
+            assert!(
+                bar.iter().any(|t| t == ghost_ui_core::frame::DETAILS_LABEL),
+                "and offers the rest of it: {bar:?}"
+            );
         });
+    }
+
+    /// Every text a window's *frame* is drawing — the titlebar as the shell
+    /// composes it, which is where a notice lives.
+    fn chrome_of(app: &App, wid: crate::WindowId) -> Vec<String> {
+        let w = &app.windows[&wid];
+        let bar = ghost_ui_core::frame::Titlebar {
+            height_px: 35,
+            bg: [0.2, 0.2, 0.2, 1.0],
+            fg: [0.9, 0.9, 0.9, 1.0],
+            title: w.title.clone(),
+            notice: w.root.chrome_notice(),
+            font_px: 14.0,
+            buttons: ghost_ui_core::frame::ButtonLayout::parse(":minimize,maximize,close"),
+            hovered: None,
+            pressed: None,
+            maximized: false,
+            scale: 1.0,
+        };
+        ghost_ui_core::frame::with_titlebar(w.root.view(&app.states), &bar)
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|i| match i {
+                ghost_render::SceneItem::ChromeText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

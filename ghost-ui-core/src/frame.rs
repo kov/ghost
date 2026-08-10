@@ -161,11 +161,11 @@ pub struct Titlebar {
     /// The title's colour. The frame signals focus by dimming it.
     pub fg: Rgba,
     pub title: String,
-    /// A mode the window is in — drawn in place of the title, over a bar
-    /// [chilled](chilled) to make the mode obvious. `None` is the ordinary
-    /// window. The frame is where a mode belongs: it costs no content, reads at
-    /// a glance, and leaves the edges of the terminal alone.
-    pub notice: Option<String>,
+    /// What the window has to say for itself — a mode it is in, or a failure —
+    /// drawn in place of the title over a [tinted](notice_bg) bar. `None` is the
+    /// ordinary window. The frame is where this belongs: it costs no content,
+    /// reads at a glance, and leaves the edges of the terminal alone.
+    pub notice: Option<Notice>,
     /// Em size of the title, in physical px.
     pub font_px: f32,
     /// Which buttons, on which side — the desktop's choice.
@@ -180,22 +180,105 @@ pub struct Titlebar {
     pub scale: f32,
 }
 
-/// The cold the bar takes on behind a [notice](Titlebar::notice), and how far it
-/// is carried there.
+/// How loud a [`Notice`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeTone {
+    /// A mode the window is in — informational, and over when the user says so.
+    Mode,
+    /// Something went wrong. Drawn hot, and carrying details to unfold.
+    Error,
+}
+
+/// What the window is saying in place of its title.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub text: String,
+    pub tone: NoticeTone,
+}
+
+impl Notice {
+    pub fn mode(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: NoticeTone::Mode,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: NoticeTone::Error,
+        }
+    }
+}
+
+/// The colours a bar takes on behind a [notice](Titlebar::notice) — cold for a
+/// mode, hot for a failure — and how far each is carried there. The failure is
+/// mixed harder: it has to be unmistakable across the room, where a mode only
+/// has to be noticeable.
 const ICE: Rgba = [0.42, 0.72, 0.88, 1.0];
 const ICE_MIX: f32 = 0.45;
+const EMBER: Rgba = [0.86, 0.24, 0.20, 1.0];
+const EMBER_MIX: f32 = 0.55;
 
-/// A bar colour pulled towards ice. Mixed rather than replaced, so the result
-/// still belongs to the desktop's theme — a light bar chills light, a dark one
-/// dark — and the title colour the theme chose keeps its contrast.
+/// A bar colour pulled towards `to` by `mix`. Mixed rather than replaced, so the
+/// result still belongs to the desktop's theme — a light bar tints light, a dark
+/// one dark — and the title colour the theme chose keeps its contrast.
+fn tinted(bg: Rgba, to: Rgba, mix: f32) -> Rgba {
+    let m = |from: f32, to: f32| from + (to - from) * mix;
+    [m(bg[0], to[0]), m(bg[1], to[1]), m(bg[2], to[2]), bg[3]]
+}
+
 fn chilled(bg: Rgba) -> Rgba {
-    let mix = |from: f32, to: f32| from + (to - from) * ICE_MIX;
-    [
-        mix(bg[0], ICE[0]),
-        mix(bg[1], ICE[1]),
-        mix(bg[2], ICE[2]),
-        bg[3],
-    ]
+    tinted(bg, ICE, ICE_MIX)
+}
+
+/// The bar's colour under whatever notice it carries — its own, when there is
+/// none.
+pub fn notice_bg(bar: &Titlebar) -> Rgba {
+    match bar.notice.as_ref().map(|n| n.tone) {
+        Some(NoticeTone::Mode) => chilled(bar.bg),
+        Some(NoticeTone::Error) => tinted(bar.bg, EMBER, EMBER_MIX),
+        None => bar.bg,
+    }
+}
+
+/// What the details button says.
+pub const DETAILS_LABEL: &str = "Details";
+/// Its size, in logical pixels.
+const DETAILS_W: f32 = 62.0;
+const DETAILS_H: f32 = 20.0;
+
+/// Where the details button sits, when the bar carries a failure: at the inner
+/// edge of the right-hand button group, out of the heading's way (which
+/// [`with_frame`] shortens to match). `None` for every other bar — a mode has
+/// nothing further to say, and neither does an ordinary window.
+///
+/// One formula, used by both the drawing and the hit test, so a click can never
+/// land somewhere other than what it looked like it hit.
+pub fn details_rect(bar: &Titlebar, strip: RectPx) -> Option<RectPx> {
+    if bar.notice.as_ref()?.tone != NoticeTone::Error {
+        return None;
+    }
+    let gap = BUTTON_GAP * bar.scale;
+    let w = DETAILS_W * bar.scale;
+    let h = DETAILS_H * bar.scale;
+    let right = button_rects(&bar.buttons, strip, bar.scale)
+        .iter()
+        .filter(|(b, _)| bar.buttons.right.contains(b))
+        .map(|(_, r)| r.x)
+        .fold(strip.x + strip.w, f32::min);
+    Some(RectPx {
+        x: (right - gap - w).max(strip.x),
+        y: strip.y + (strip.h - h) * 0.5,
+        w,
+        h,
+    })
+}
+
+/// Whether `pos` falls on the details button.
+pub fn details_at(pos: PointPx, bar: &Titlebar, strip: RectPx) -> bool {
+    details_rect(bar, strip).is_some_and(|r| r.contains(pos.x as f32, pos.y as f32))
 }
 
 /// The layer depth the titlebar draws at. Above everything the model builds:
@@ -321,17 +404,19 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
     let mut items = vec![SceneItem::Rect {
         id: SceneId::Titlebar,
         rect: strip,
-        color: match bar.notice {
-            Some(_) => chilled(bar.bg),
-            None => bar.bg,
-        },
+        color: notice_bg(bar),
         radius: 0.0,
     }];
     let buttons = button_rects(&bar.buttons, strip, bar.scale);
-    // A notice stands in for the title: the mode the window is in matters more
-    // than its name for as long as it lasts, and the compositor still knows the
-    // real title, so the task switcher goes on naming the window properly.
-    let heading = bar.notice.as_ref().unwrap_or(&bar.title);
+    let details = details_rect(bar, strip);
+    // A notice stands in for the title: what the window is doing, or what went
+    // wrong, matters more than its name for as long as it lasts, and the
+    // compositor still knows the real title, so the task switcher goes on naming
+    // the window properly.
+    let heading = match &bar.notice {
+        Some(n) => &n.text,
+        None => &bar.title,
+    };
     if !heading.is_empty() {
         // Centred between the button groups rather than on the window, so a
         // title long enough to reach them stays clear of them — and a window
@@ -346,6 +431,9 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
             .filter(|(b, _)| bar.buttons.right.contains(b))
             .map(|(_, r)| r.x)
             .fold(strip.x + strip.w, f32::min);
+        // The details button, when there is one, is part of what the heading has
+        // to stay clear of.
+        let right = details.map_or(right, |d| right.min(d.x - BUTTON_GAP * bar.scale));
         items.push(SceneItem::ChromeText {
             id: SceneId::Titlebar,
             rect: RectPx {
@@ -355,6 +443,24 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
                 h: strip.h,
             },
             text: heading.clone(),
+            color: bar.fg,
+            size_px: bar.font_px,
+            align: TextAlign::Center,
+        });
+    }
+    // The details button: a pill in the bar's own foreground, so it reads as
+    // part of the frame rather than as content pasted onto it.
+    if let Some(rect) = details {
+        items.push(SceneItem::Rect {
+            id: SceneId::NoticeDetails,
+            rect,
+            color: [bar.fg[0], bar.fg[1], bar.fg[2], 0.16],
+            radius: rect.h * 0.5,
+        });
+        items.push(SceneItem::ChromeText {
+            id: SceneId::NoticeDetails,
+            rect,
+            text: DETAILS_LABEL.into(),
             color: bar.fg,
             size_px: bar.font_px,
             align: TextAlign::Center,
@@ -747,7 +853,7 @@ mod tests {
         // cold behind it. The buttons stay — a window in a mode is still a window.
         let plain = titlebar(35);
         let noticed = Titlebar {
-            notice: Some("paused".into()),
+            notice: Some(Notice::mode("paused")),
             ..plain.clone()
         };
         let before = with_titlebar(content(800, 565), &plain);
@@ -770,6 +876,106 @@ mod tests {
             window_buttons(&after),
             window_buttons(&before),
             "the window's buttons are not taken away by a notice"
+        );
+    }
+
+    #[test]
+    fn a_failure_burns_the_bar_and_offers_the_rest_of_the_story() {
+        // The same seam as a mode, in the other direction: a notice that reports a
+        // failure goes hot rather than cold, and — because a one-line summary is
+        // never the whole story — puts a button beside it that has the rest.
+        let plain = titlebar(35);
+        let bad = Titlebar {
+            notice: Some(Notice::error("Could not start a session")),
+            ..plain.clone()
+        };
+        let cold = Titlebar {
+            notice: Some(Notice::mode("paused")),
+            ..plain.clone()
+        };
+        let after = with_titlebar(content(800, 565), &bad);
+
+        let (hot, said) = bar_of(&after);
+        let (warm, _) = bar_of(&with_titlebar(content(800, 565), &plain));
+        let (chill, _) = bar_of(&with_titlebar(content(800, 565), &cold));
+        assert_eq!(
+            said,
+            vec!["Could not start a session".to_string()],
+            "the failure stands in for the title"
+        );
+        assert!(
+            hot[0] > hot[2] && hot[0] > warm[0],
+            "and it reads as hot — redder than it is blue, and than it was: {hot:?}"
+        );
+        assert_ne!(hot, chill, "a failure does not look like a mode");
+
+        let pill: Vec<_> = after
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|i| match i {
+                SceneItem::ChromeText { id, text, rect, .. } if *id == SceneId::NoticeDetails => {
+                    Some((text.clone(), *rect))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pill.len(),
+            1,
+            "exactly one way to ask for the details: {pill:?}"
+        );
+        assert_eq!(pill[0].0, DETAILS_LABEL);
+        let rect = details_rect(&bad, bar_strip(&after)).expect("an error offers details");
+        assert_eq!(
+            rect, pill[0].1,
+            "what is hit-tested is what was drawn — one formula, not two"
+        );
+        assert!(
+            details_rect(&cold, bar_strip(&after)).is_none(),
+            "a mode has no details to give"
+        );
+        assert!(
+            details_rect(&plain, bar_strip(&after)).is_none(),
+            "and an ordinary window has no notice at all"
+        );
+    }
+
+    /// The strip the bar of `scene` was drawn into.
+    fn bar_strip(scene: &Scene) -> RectPx {
+        scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                SceneItem::Rect { id, rect, .. } if *id == SceneId::Titlebar => Some(*rect),
+                _ => None,
+            })
+            .expect("a bar was drawn")
+    }
+
+    #[test]
+    fn the_details_button_takes_the_click_that_lands_on_it() {
+        let bad = Titlebar {
+            notice: Some(Notice::error("nope")),
+            buttons: ButtonLayout::parse(":minimize,maximize,close"),
+            ..titlebar(35)
+        };
+        let scene = with_titlebar(content(800, 565), &bad);
+        let strip = bar_strip(&scene);
+        let r = details_rect(&bad, strip).unwrap();
+        let mid = PointPx {
+            x: (r.x + r.w * 0.5) as f64,
+            y: (r.y + r.h * 0.5) as f64,
+        };
+        assert!(details_at(mid, &bad, strip), "the middle of the pill hits");
+        assert!(
+            !details_at(PointPx { x: 4.0, y: 17.0 }, &bad, strip),
+            "the far left of the bar is still the bar"
+        );
+        assert!(
+            button_at(mid, &bad.buttons, strip, bad.scale).is_none(),
+            "and the pill never sits under a window control"
         );
     }
 
