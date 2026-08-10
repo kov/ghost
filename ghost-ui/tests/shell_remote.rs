@@ -387,10 +387,13 @@ fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
     unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
 
     with_isolated_xdg(|_tmp| {
-        // A directory under the remote's own home, so its listing reports it as
-        // `~/proj` — exactly the form the shell has to hand back.
+        // A directory under the remote's own home — the case that used to be
+        // shortened to `~/proj` on the way out and had to be expanded back by
+        // whoever read it. It now crosses whole, so no reader has to know whose
+        // home a `~` stood for.
         let proj = remote.home().join("proj");
         std::fs::create_dir_all(&proj).expect("a directory on the remote");
+        let proj_reported = proj.to_str().expect("a printable path");
 
         let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
         let remote_ghost =
@@ -402,9 +405,9 @@ fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
                 .list_sessions(&remote_ghost)
                 .map(|s| s
                     .iter()
-                    .any(|i| i.name == "work" && i.cwd.as_deref() == Some("~/proj")))
+                    .any(|i| i.name == "work" && i.cwd.as_deref() == Some(proj_reported)))
                 .unwrap_or(false)),
-            "the session never came up on the remote in ~/proj: {:?}",
+            "the session never came up on the remote in {proj_reported}: {:?}",
             r.list_sessions(&remote_ghost)
         );
 
@@ -463,13 +466,14 @@ fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
             &fe,
         );
 
-        // A second session on the host — and working where its sibling is, which it
-        // can only be if the `~` was expanded over there.
+        // A second session on the host — and working where its sibling is, which
+        // it can only be if the directory made the round trip intact: read off
+        // that host's listing, handed back to it, and used there.
         let sibling = pump_until(&mut app, &fe, &q, Duration::from_secs(30), |_| {
             r.list_sessions(&remote_ghost)
                 .map(|s| {
                     s.iter()
-                        .any(|i| i.name != "work" && i.cwd.as_deref() == Some("~/proj"))
+                        .any(|i| i.name != "work" && i.cwd.as_deref() == Some(proj_reported))
                 })
                 .unwrap_or(false)
         });

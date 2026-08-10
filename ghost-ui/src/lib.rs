@@ -1450,6 +1450,20 @@ fn cwd_source<'a>(
     }
 }
 
+/// A reported directory in the only form it is safe to hand a host to start a
+/// session in: absolute, or nothing.
+///
+/// Every other form has to be *interpreted*, and the interpreting is done on the
+/// far side by a binary whose age we do not control. A host predating absolute
+/// listings reports `~/proj`; one predating `~` expansion takes that literally,
+/// cannot start the child, and dies quietly. So the wire carries whole paths and
+/// only whole paths — anything else drops the inheritance, which costs a new
+/// terminal in the default directory and nothing more. See
+/// [`App::inherited_spawn_cwd`].
+fn spawnable_cwd(reported: &str) -> Option<&str> {
+    Path::new(reported).is_absolute().then_some(reported)
+}
+
 /// The connected remote host a new inheriting session should be created *on*, if
 /// any — the inherited `connection`'s target when we already hold a live
 /// transport to it (`connected` = the currently-connected targets). `Some(target)`
@@ -4239,10 +4253,22 @@ impl App {
                 Cmd::ListSessions => {
                     // In bench mode the host isn't running; answer from the harness so
                     // a reconcile keeps the synthetic fleet populated.
-                    let infos = match &self.bench {
+                    let mut infos = match &self.bench {
                         Some(h) => h.session_list(),
                         None => session::list().unwrap_or_default(),
                     };
+                    // A listing carries whole paths so it can cross machines; the
+                    // `~` is put back here, at the last moment before they are
+                    // shown, and only for the sessions that are *ours* — this is
+                    // the one place we know the home they'd be shortened against
+                    // is the right one. The hosts' listings merged in below keep
+                    // their absolute paths: that `~` would be someone else's.
+                    for i in &mut infos {
+                        i.cwd = i
+                            .cwd
+                            .as_deref()
+                            .map(|c| session::display_path(Path::new(c)));
+                    }
                     let live = self.bench.is_none();
                     if live {
                         // Subscriptions and the dead-session sweep are local-only:
@@ -5738,8 +5764,9 @@ impl App {
     /// it current from the child's `/proc` cwd) and dropped if it has since gone —
     /// a vanished directory would fail the spawn outright, and no new terminal at
     /// all is a far worse answer than one in the wrong place. A remote directory
-    /// comes from its host's own listing, which reports it home-collapsed, so the
-    /// `~` travels back to the host that can expand it (`ghost new --cwd`).
+    /// comes from its host's own listing, whole: both sides speak absolute paths
+    /// and nothing is expanded anywhere, so no vintage of either can disagree
+    /// about what one means ([`spawnable_cwd`]).
     fn inherited_spawn_cwd(
         &self,
         wid: WindowId,
@@ -5756,12 +5783,14 @@ impl App {
                 // A host's stashed listing is namespaced (`<target>␟<real>`), so it
                 // is looked up by the composite id, not the name the host uses.
                 let composite = remote_fleet_id(target, session);
-                self.remote_infos
+                let reported = self
+                    .remote_infos
                     .get(target)?
                     .iter()
                     .find(|i| i.name == composite)?
                     .cwd
-                    .clone()
+                    .as_deref()?;
+                spawnable_cwd(reported).map(str::to_owned)
             }
         }
     }
@@ -8155,7 +8184,7 @@ mod tests {
         auth_error_message, choose_alpha_mode, choose_surface_format, config,
         connect_outcome_wanted, cwd_source, glass, home_launch_dir, inherited_connection,
         namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, session_reason, should_restore, startup_choice,
+        respawn_opts, restore_plan, session_reason, should_restore, spawnable_cwd, startup_choice,
         surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -10175,6 +10204,30 @@ mod tests {
 
         // Nothing in the foreground (an empty fleet window): nothing to inherit.
         assert_eq!(cwd_source(None, None, None), None);
+    }
+
+    /// A directory is only handed to a host that will read it the same way we
+    /// wrote it, which means an absolute path and nothing else.
+    ///
+    /// This is the guard against version skew, and it is not hypothetical: a host
+    /// too old to report absolute paths reports `~/proj`, and one too old to
+    /// expand a `~` then does `chdir("~/proj")` literally, fails to start the
+    /// child, and dies — after its `ghost new -d` has already printed "started
+    /// session" and exited 0. Sending nothing costs a new terminal in the wrong
+    /// directory; sending a `~` costs the session.
+    #[test]
+    fn only_an_absolute_directory_is_handed_to_a_host() {
+        assert_eq!(spawnable_cwd("/home/kov/proj"), Some("/home/kov/proj"));
+        assert_eq!(spawnable_cwd("/Users/kov/proj"), Some("/Users/kov/proj"));
+
+        // What a host older than absolute-path listings reports.
+        assert_eq!(spawnable_cwd("~/proj"), None);
+        assert_eq!(spawnable_cwd("~"), None);
+        // Nothing usable, and nothing that would be resolved against our own
+        // directory rather than the one the session is actually in.
+        assert_eq!(spawnable_cwd(""), None);
+        assert_eq!(spawnable_cwd("proj"), None);
+        assert_eq!(spawnable_cwd("../proj"), None);
     }
 
     fn info(name: &str, attached: bool) -> SessionInfo {

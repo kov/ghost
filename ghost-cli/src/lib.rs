@@ -9,6 +9,7 @@ use ghost_vt::client;
 use ghost_vt::connection::ConnectionSpec;
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
+use std::path::{Path, PathBuf};
 
 /// The `ghost` command line: background terminals you can reattach to, plus —
 /// with no subcommand — the windowed GPU terminal.
@@ -276,12 +277,23 @@ fn dispatch(command: Command) {
             {
                 fail(&format!("a session named '{name}' already exists"));
             }
+            let cwd = cwd.map(|c| {
+                let base = std::env::current_dir().unwrap_or_else(|e| {
+                    fail(&format!("cannot read the current directory: {e}"));
+                });
+                let dir = cli_cwd(&c, &base).unwrap_or_else(|e| fail(&e));
+                if !dir.is_dir() {
+                    fail(&format!("--cwd '{}' is not a directory", c.display()));
+                }
+                dir
+            });
             let record = (!no_record).then(|| ghost_vt::paths::recording_path(&name));
             let opts = SpawnOpts {
                 name: name.clone(),
                 command,
                 size: (80, 24),
-                cwd: cwd.map(|d| session::expand_home(&d)),
+                // Already made whole and checked, above.
+                cwd,
                 record,
                 seed_from,
                 scrollback,
@@ -593,6 +605,31 @@ fn ssh_child_fallback(
     }
 }
 
+/// The absolute directory a `--cwd` argument names, resolved against the
+/// directory the CLI itself was run from.
+///
+/// Whole paths are what cross the wire: a session's directory is read back by
+/// front-ends and by other machines' fleets, and a `~` shortened against a home
+/// only this machine knows is one the reader would have to expand against the
+/// wrong one. So nothing downstream expands anything — which leaves a literal
+/// `~`, from a caller who quoted it past their shell, as a directory name that
+/// does not exist. It used to be dropped in silence, the session landing
+/// wherever the launcher happened to be. Say so instead.
+///
+/// A *relative* path is resolved here rather than refused: this process is
+/// standing in the directory the user meant it against, and the host it hands
+/// the path to is not.
+fn cli_cwd(arg: &Path, base: &Path) -> Result<PathBuf, String> {
+    if arg.to_string_lossy().starts_with('~') {
+        return Err(format!(
+            "--cwd '{}' is not a directory: leave the ~ unquoted so the shell \
+             expands it, or pass the whole path",
+            arg.display()
+        ));
+    }
+    Ok(base.join(arg))
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("ghost: {msg}");
     std::process::exit(1);
@@ -602,6 +639,29 @@ fn fail(msg: &str) -> ! {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn a_quoted_tilde_is_refused_rather_than_quietly_ignored() {
+        let e = cli_cwd(Path::new("~/proj"), Path::new("/home/kov")).unwrap_err();
+        assert!(e.contains("~/proj"), "the message names the path: {e}");
+        assert!(e.contains("shell"), "and says who should expand it: {e}");
+    }
+
+    #[test]
+    fn a_relative_cwd_is_resolved_where_the_caller_stands() {
+        assert_eq!(
+            cli_cwd(Path::new("proj"), Path::new("/home/kov")).unwrap(),
+            Path::new("/home/kov/proj"),
+        );
+    }
+
+    #[test]
+    fn a_whole_path_crosses_untouched() {
+        assert_eq!(
+            cli_cwd(Path::new("/srv/work"), Path::new("/home/kov")).unwrap(),
+            Path::new("/srv/work"),
+        );
+    }
 
     #[test]
     fn bare_launch_parses_with_fresh_off() {

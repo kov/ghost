@@ -82,36 +82,34 @@ enum HostState {
 /// List live sessions, pruning directories whose host is gone.
 pub fn list() -> io::Result<Vec<SessionInfo>> {
     let mut out = list_in(&paths::runtime_dir())?;
-    // Enrich with the durable descriptor's cwd (display metadata, like the
-    // title): done here, not in `list_in`, so the directory-scan logic stays
-    // testable against a plain tempdir.
+    // Enrich with the durable descriptor's cwd: done here, not in `list_in`, so
+    // the directory-scan logic stays testable against a plain tempdir.
+    //
+    // Reported **whole**, exactly as the descriptor holds it. A listing crosses
+    // machines — a fleet reads other hosts' listings over ssh — and a directory
+    // that has been shortened against a home only this machine knows is one the
+    // reader has to expand back, against the wrong home, or hand around in a form
+    // the far side may not understand. Collapsing to `~` is a display concern and
+    // belongs where the display happens, next to the home it is collapsing
+    // against ([`display_path`]).
     for s in &mut out {
         s.cwd = crate::descriptor::read(&s.name)
             .and_then(|d| d.cwd)
-            .map(|p| display_path(&p));
+            .map(|p| p.to_string_lossy().into_owned());
     }
     Ok(out)
 }
 
 /// A path for human display: the user's home collapsed to `~`.
+///
+/// Only ever applied to a path belonging to **this** machine — a remote session's
+/// directory is that host's, and shortening `/Users/kov/proj` against a local
+/// `/home/kov` would either do nothing or, worse, lie.
 pub fn display_path(p: &Path) -> String {
     match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
         None => p.display().to_string(),
-    }
-}
-
-/// The inverse of [`display_path`]: expand a leading `~` against *this* machine's
-/// home. A listing's `cwd` is written for eyes, and it is the only form of a
-/// remote session's directory another machine ever sees — so when that machine
-/// asks this one for a session beside it (`ghost new --cwd '~/proj'`), the `~` is
-/// resolved here, where the home actually is. Anything else, `~user/…` included
-/// (nothing produces it), passes through untouched.
-pub fn expand_home(p: &Path) -> std::path::PathBuf {
-    match (dirs::home_dir(), p.strip_prefix("~")) {
-        (Some(home), Ok(rest)) => home.join(rest),
-        _ => p.to_path_buf(),
     }
 }
 
@@ -369,21 +367,17 @@ fn prune(name: &str) {
 mod tests {
     use super::*;
 
-    /// A remote ghost is asked to open a session beside one already on its host,
-    /// and the only form of that directory the asking machine has is the
-    /// home-collapsed one the listing showed it. Expanding it is the host's job:
-    /// nobody else knows what `~` is here.
+    /// Collapsing to `~` is for eyes only, and only ever for this machine's own
+    /// paths. There is deliberately no inverse: a directory that leaves here
+    /// leaves whole, so nothing downstream has to guess whose home a `~` meant.
     #[test]
-    fn a_displayed_path_round_trips_back_to_the_real_one() {
+    fn a_path_is_shortened_only_against_the_home_it_is_under() {
         let home = dirs::home_dir().expect("a home directory");
-        let real = home.join("proj/web");
-        assert_eq!(expand_home(Path::new(&display_path(&real))), real);
-        assert_eq!(expand_home(Path::new(&display_path(&home))), home);
-        // An absolute path outside home is already the whole truth, and `~user`
-        // is nobody's home to expand here — both pass through untouched.
-        for kept in ["/srv/build", "~ana/proj"] {
-            assert_eq!(expand_home(Path::new(kept)), Path::new(kept));
-        }
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&home.join("proj/web")), "~/proj/web");
+        // Outside this home — including another machine's home-shaped path —
+        // there is nothing to shorten and it is shown whole.
+        assert_eq!(display_path(Path::new("/srv/build")), "/srv/build");
     }
 
     #[test]
