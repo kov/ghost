@@ -2278,7 +2278,17 @@ impl Graphics {
 
         let caps = surface.get_capabilities(&adapter);
         let format = choose_surface_format(&caps.formats);
-        let win = window.inner_size();
+        // Take the room for the shadow BEFORE sizing the swapchain: the margins
+        // grow the surface with no configure to announce it, so a swapchain
+        // configured to the window we asked for would be a window's shadow
+        // short — and the model, sized off it, would lay out for a buffer that
+        // is already another size.
+        let edge = Self::window_edge(&window, !want_transparent, true);
+        let win = Self::shape_backdrop(&window, edge).unwrap_or_else(|| {
+            let s = window.inner_size();
+            (s.width, s.height)
+        });
+        let win = PhysicalSize::new(win.0, win.1);
         // A window can open bigger than the device can allocate a texture for; the
         // swapchain gives way rather than the process (see `presentable`).
         let (sw, sh) = ghost_renderer::presentable(
@@ -2330,9 +2340,7 @@ impl Graphics {
         }
         // Keep the frost grain a fixed logical size on HiDPI.
         renderer.set_scale_factor(window.scale_factor() as f32);
-        let edge = Self::window_edge(&window, !want_transparent, true);
         renderer.set_window_edge(edge);
-        Self::shape_backdrop(&window, edge);
 
         Graphics {
             window,
@@ -2406,13 +2414,31 @@ impl Graphics {
     fn margins_px(&self) -> ghost_ui_core::frame::FrameInset {
         let m = self.renderer.window_edge().margins;
         let scale = self.window.scale_factor() as f32;
-        let px = |v: f32| (v * scale).max(0.0).round() as u32;
-        ghost_ui_core::frame::FrameInset {
-            top: px(m.top),
-            right: px(m.right),
-            bottom: px(m.bottom),
-            left: px(m.left),
-        }
+        // Totals from the surface, sides from the margins: the window system
+        // grew the surface by the margins' logical total and rounded that once,
+        // so rounding each side here can claim a pixel the surface never gained
+        // — and the model, laid out in what is left, then composes back a pixel
+        // wider than the buffer (see `FrameInset::fit`).
+        ghost_ui_core::frame::FrameInset::fit(
+            [m.top, m.right, m.bottom, m.left],
+            scale,
+            self.size(),
+            self.geometry_px(),
+        )
+    }
+
+    /// The window inside this surface, in physical pixels, as the window system
+    /// itself measures it — the surface where nothing sits outside the window.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn geometry_px(&self) -> (u32, u32) {
+        use winit::platform::wayland::WindowExtWayland;
+        let g = self.window.geometry_size();
+        (g.width, g.height)
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn geometry_px(&self) -> (u32, u32) {
+        self.size()
     }
 
     /// The size of the window inside this surface: what the shell must lay the
@@ -2459,7 +2485,10 @@ impl Graphics {
     /// Re-decide the window edge after something it depends on moved: the window
     /// was maximized or restored, or focus came or went (the frame's shadow
     /// lightens in the backdrop, and the corner has to lighten with it).
-    fn refresh_window_edge(&mut self, focused: bool) {
+    /// Returns whether the surface changed size doing it — a margin change is a
+    /// resize with no configure behind it, so the caller has to relay the model
+    /// out itself.
+    fn refresh_window_edge(&mut self, focused: bool) -> bool {
         let edge = Self::window_edge(&self.window, self.target.opaque(), focused);
         self.renderer.set_window_edge(edge);
         // Changing the margins resizes the SURFACE — a maximized window drops
@@ -2486,7 +2515,9 @@ impl Graphics {
                 s.resize(w, h);
             }
             self.scene_cache.invalidate();
+            return true;
         }
+        false
     }
 
     /// Cut the compositor's backdrop effect to the corners we round.
@@ -2621,6 +2652,22 @@ impl Graphics {
         // swapchain forward and drop this frame — the `Resized` behind the
         // configure relays out the model, and `Lost` keeps the repaint pending.
         if self.sync_surface_to_window() {
+            return FrameOutcome::Lost;
+        }
+        // A scene that does not fit the buffer is not a frame to fix up: its
+        // scissors are the swapchain's own bounds, and wgpu treats one pixel of
+        // overrun as a fatal validation error — which aborts the process and
+        // takes every other window of this ghost with it. Drop the frame
+        // instead; the pacer retries, and whatever moved the surface under the
+        // model (a configure, a margin change) relays it out.
+        if scene.size_px != self.size() {
+            tracing::warn!(
+                target: "ghost::frame",
+                scene = ?scene.size_px,
+                surface = ?self.size(),
+                "dropped a frame laid out for another size"
+            );
+            self.scene_cache.invalidate();
             return FrameOutcome::Lost;
         }
         let outcome = self.target.render_frame(
@@ -6017,7 +6064,12 @@ impl App {
         let blur_supported = gfx
             .as_ref()
             .is_some_and(|g| backdrop_blur_supported(&g.window));
-        // Everything below sizes the MODEL, which lays out under our titlebar.
+        // Everything below sizes the MODEL, which lays out inside our shadow
+        // margins and under our titlebar — the same arithmetic every later
+        // resize does, taking the surface as the truth about both.
+        let (w, h) = gfx
+            .as_ref()
+            .map_or((w, h), |g| g.margins_px().window((w, h)));
         let h = h
             .saturating_sub(gfx.as_ref().map_or(0, |g| g.bar_px()))
             .max(1);
@@ -6561,7 +6613,12 @@ impl App {
         let blur_supported = gfx
             .as_ref()
             .is_some_and(|g| backdrop_blur_supported(&g.window));
-        // Everything below sizes the MODEL, which lays out under our titlebar.
+        // Everything below sizes the MODEL, which lays out inside our shadow
+        // margins and under our titlebar — the same arithmetic every later
+        // resize does, taking the surface as the truth about both.
+        let (w, h) = gfx
+            .as_ref()
+            .map_or((w, h), |g| g.margins_px().window((w, h)));
         let h = h
             .saturating_sub(gfx.as_ref().map_or(0, |g| g.bar_px()))
             .max(1);
@@ -7254,9 +7311,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // that in. Losing focus changes nothing else the shell draws, so
                 // without asking here the old corner stays on the glass until
                 // something unrelated redraws.
+                let mut resized = None;
                 if let Some(w) = self.windows.get_mut(&id) {
-                    if let Some(gfx) = w.gfx.as_mut() {
-                        gfx.refresh_window_edge(focused);
+                    if let Some(gfx) = w.gfx.as_mut()
+                        && gfx.refresh_window_edge(focused)
+                    {
+                        // The margins moved the surface with no configure to
+                        // announce it; the model has to be laid out in the
+                        // window that is left, or it composes back to a size
+                        // the buffer no longer is.
+                        resized = Some((gfx.size(), gfx.window.scale_factor()));
                     }
                     // A press whose release lands in another window leaves the
                     // button stuck "down" here, and a stuck button means the frame
@@ -7266,6 +7330,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     w.focused = focused;
                     w.pacer.request();
+                }
+                if let Some(((w_px, h_px), scale)) = resized {
+                    self.resize_model(id, w_px, h_px, scale, &fe);
                 }
                 self.dispatch(id, UiEvent::Focus(focused), &fe);
             }
