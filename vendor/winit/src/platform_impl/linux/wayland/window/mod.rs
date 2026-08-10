@@ -553,6 +553,27 @@ impl Window {
             .unwrap_or_default()
     }
 
+    /// Whether the compositor considers this window the active one
+    /// (`xdg_toplevel::State::Activated`). [vendored addition]
+    ///
+    /// This is what decorations follow, and it is NOT `has_focus`: a modal grab
+    /// — a shell menu, an on-screen keyboard, a layer-shell overlay — takes the
+    /// keyboard away (`wl_keyboard.leave`, which winit reports as
+    /// `WindowEvent::Focused(false)`) while leaving the toplevel activated, and
+    /// a window that repaints itself backdropped there is the only one on the
+    /// desktop that does.
+    ///
+    /// `false` before the first configure, when the compositor has not yet said.
+    pub fn is_activated(&self) -> bool {
+        self.window_state
+            .lock()
+            .unwrap()
+            .last_configure
+            .as_ref()
+            .map(|c| c.is_activated())
+            .unwrap_or_default()
+    }
+
     /// Whether the compositor has tiled this window against anything — a screen
     /// edge, another window, a tiling layout. [vendored addition]
     ///

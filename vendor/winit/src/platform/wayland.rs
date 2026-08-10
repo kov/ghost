@@ -199,6 +199,20 @@ pub trait WindowExtWayland {
     /// half or quarter snap tiles some edges and not others.
     fn is_tiled(&self) -> bool;
 
+    /// Whether the compositor considers this window the active one
+    /// (`xdg_toplevel::State::Activated`). Always `false` for an X11 window, and
+    /// before the first configure.
+    ///
+    /// This, not [`Window::has_focus`], is what a client-side-decorating window
+    /// should paint its titlebar and shadow from. The two differ whenever
+    /// something takes a modal grab — a shell menu, an input-method popup, an
+    /// on-screen keyboard: the keyboard leaves (so `has_focus` goes false) while
+    /// the toplevel stays activated, and a window that dims its decorations
+    /// there is the only one on the desktop doing so.
+    ///
+    /// [`Window::has_focus`]: crate::window::Window::has_focus
+    fn is_activated(&self) -> bool;
+
     /// Round the bottom corners of the backdrop effect ([`Window::set_blur`]) by
     /// `radius` logical pixels; 0 (the default) leaves it square.
     ///
@@ -325,6 +339,17 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => false,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.is_tiled(),
+        }
+    }
+
+    #[inline]
+    fn is_activated(&self) -> bool {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => false,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.is_activated(),
         }
     }
 

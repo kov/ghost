@@ -2074,6 +2074,24 @@ fn resize_direction(edge: ghost_ui_core::ResizeEdge) -> winit::window::ResizeDir
     }
 }
 
+/// What the window's decorations paint as focused, given what the window system
+/// says: `activated` — is this the *active* window — where it has such a notion,
+/// and keyboard focus where it doesn't.
+///
+/// The two are not the same thing, and the difference is visible every day. A
+/// modal grab (a shell menu, the on-screen keyboard, an input-method popup, a
+/// layer-shell overlay) routes the keyboard away from us — winit reports that as
+/// `WindowEvent::Focused(false)` — without the compositor deactivating anything:
+/// GNOME's own windows keep their active titlebars while the clock menu is open.
+/// A window that dims its decorations on the keyboard leave is the only one on
+/// the desktop that does. See `docs/titlebar-follows-keyboard-focus.md`.
+///
+/// Terminal focus reporting (DEC ?1004) and the cursor's hollowness stay on
+/// keyboard focus, which is what "the keyboard is pointed at me" means there.
+fn decoration_focus(activated: Option<bool>, keyboard: bool) -> bool {
+    activated.unwrap_or(keyboard)
+}
+
 /// Everything about a window that decides what its edge looks like — read off the
 /// real window by [`Graphics::window_edge`], so the decision itself
 /// ([`window_edge_for`]) is testable without one.
@@ -2082,7 +2100,8 @@ fn resize_direction(edge: ghost_ui_core::ResizeEdge) -> winit::window::ResizeDir
 struct EdgeState {
     /// The surface is opaque, so its alpha never reaches the compositor.
     opaque: bool,
-    /// The window has keyboard focus; the frame's shadow lightens without it.
+    /// The window is the active one ([`decoration_focus`]); the frame's shadow
+    /// lightens when it isn't.
     focused: bool,
     /// Maximized, fullscreen or tiled: no free outside corner to round.
     boxed_in: bool,
@@ -2461,6 +2480,29 @@ impl Graphics {
         WindowEdge::default()
     }
 
+    /// Whether the window system says this window is the *active* one, or `None`
+    /// where it has no notion of that apart from keyboard focus — see
+    /// [`decoration_focus`], which is the only place this should be read.
+    ///
+    /// Only an xdg toplevel carries activation: an X11 window (or a macOS one)
+    /// answers `None` so its keyboard focus keeps deciding, exactly as before.
+    fn os_activated(&self) -> Option<bool> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::WindowExtWayland;
+            if self.window.xdg_toplevel().is_some() {
+                return Some(self.window.is_activated());
+            }
+        }
+        None
+    }
+
+    /// What this window's decorations should paint as, right now: its activation
+    /// where the window system has it, else the keyboard focus it is given.
+    fn decorations_active(&self, keyboard: bool) -> bool {
+        decoration_focus(self.os_activated(), keyboard)
+    }
+
     /// Alpha of the window's outer border — see [`desktop::FrameColors::outline`].
     #[cfg(all(unix, not(target_os = "macos")))]
     fn frame_outline() -> f32 {
@@ -2550,7 +2592,7 @@ impl Graphics {
     ///
     /// The colours are the desktop's — see [`desktop::frame_colors`].
     fn titlebar(&self, w: &WindowState) -> ghost_ui_core::frame::Titlebar {
-        let (bg, fg) = Self::titlebar_colors(w.focused);
+        let (bg, fg) = Self::titlebar_colors(w.activated);
         let scale = self.window.scale_factor() as f32;
         ghost_ui_core::frame::Titlebar {
             height_px: self.bar_px(),
@@ -2581,7 +2623,8 @@ impl Graphics {
     }
 
     /// Re-decide the window edge after something it depends on moved: the window
-    /// was maximized or restored, or focus came or went (the frame's shadow
+    /// was maximized or restored, or it became (or stopped being) the active
+    /// window — [`decoration_focus`], not the keyboard (the frame's shadow
     /// lightens in the backdrop, and the corner has to lighten with it).
     /// Returns whether the surface changed size doing it — a margin change is a
     /// resize with no configure behind it, so the caller has to relay the model
@@ -2700,7 +2743,7 @@ impl Graphics {
         }
         // Maximizing squares the window's corners off — and every state change that
         // can do that reaches us as a resize.
-        self.refresh_window_edge(self.window.has_focus());
+        self.refresh_window_edge(self.decorations_active(self.window.has_focus()));
         // The reconfigured surface holds no drawn frame; force the next redraw.
         self.scene_cache.invalidate();
         self.log_measurements("resized");
@@ -3339,8 +3382,15 @@ struct WindowState {
     /// The window's title, as last set — the bar draws it, and the shell has to
     /// keep it because the model hands it over as a command and forgets it.
     title: String,
-    /// Whether the window has keyboard focus; the titlebar dims without it.
+    /// Whether the window has keyboard focus. Terminal focus reporting (DEC
+    /// ?1004) and the cursor's shape follow this; the decorations do NOT — see
+    /// [`Self::activated`].
     focused: bool,
+    /// Whether the window system considers this the *active* window, which is
+    /// what the titlebar and the shadow paint from ([`decoration_focus`]). A
+    /// modal grab takes the keyboard without deactivating us, so following
+    /// `focused` here dimmed the window every time a shell menu opened.
+    activated: bool,
     /// The titlebar button under the pointer, and the one a press landed on —
     /// a button acts on RELEASE, and only if the pointer is still on it, so a
     /// press dragged away is cancelled the way every toolkit's is.
@@ -4061,6 +4111,41 @@ impl App {
             }
         }
         self.workspace_dirty = true;
+    }
+
+    /// Bring window `wid`'s decorations in line with the window system's idea of
+    /// which window is active ([`decoration_focus`]), repainting if it moved.
+    ///
+    /// Called from the two places the answer can change: a focus event (where
+    /// keyboard focus is all the platform has) and a redraw (every configure
+    /// requests one, and activation arrives by configure). Cheap when nothing
+    /// moved — it is a compare against what we last painted.
+    fn sync_activation(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
+        let mut resized = None;
+        if let Some(w) = self.windows.get_mut(&wid) {
+            let keyboard = w.focused;
+            if let Some(gfx) = w.gfx.as_mut() {
+                let active = gfx.decorations_active(keyboard);
+                if active != w.activated {
+                    w.activated = active;
+                    // The frame's shadow lightens in the backdrop, so the corner
+                    // it hands us has to lighten with it. Nothing else the shell
+                    // draws changes, so without asking here the old corner stays
+                    // on the glass until something unrelated redraws.
+                    if gfx.refresh_window_edge(active) {
+                        // The margins moved the surface with no configure to
+                        // announce it; the model has to be laid out in the window
+                        // that is left, or it composes back to a size the buffer
+                        // no longer is.
+                        resized = Some((gfx.size(), gfx.window.scale_factor()));
+                    }
+                    w.pacer.request();
+                }
+            }
+        }
+        if let Some(((w_px, h_px), scale)) = resized {
+            self.resize_model(wid, w_px, h_px, scale, event_loop);
+        }
     }
 
     /// Resize window `wid`'s model to a *surface* size. The model lays out under
@@ -6307,6 +6392,9 @@ impl App {
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 title: String::new(),
                 focused: true,
+                // A window opens active; the first configure says otherwise if
+                // the compositor disagrees, before anything is drawn.
+                activated: true,
                 hovered_button: None,
                 pressed_button: None,
                 #[cfg(all(unix, not(target_os = "macos")))]
@@ -6890,6 +6978,9 @@ impl App {
                 pointer_pos: PointPx { x: 0.0, y: 0.0 },
                 title: String::new(),
                 focused: true,
+                // A window opens active; the first configure says otherwise if
+                // the compositor disagrees, before anything is drawn.
+                activated: true,
                 hovered_button: None,
                 pressed_button: None,
                 #[cfg(all(unix, not(target_os = "macos")))]
@@ -7265,6 +7356,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 let now_ms = self.now_ms();
                 let trace_on = tracing::enabled!(target: "ghost::render", tracing::Level::TRACE);
+                // Every configure asks for a redraw, and activation only ever
+                // arrives on one — a window activated or backdropped with no
+                // resize behind it (a shell menu opening and closing over us) is
+                // announced by nothing else. Ahead of the paint, so the frame
+                // about to be drawn is the one with the right decorations.
+                self.sync_activation(id, &fe);
                 if let Some(win) = self.windows.get_mut(&id) {
                     if trace_on {
                         win.render_trace.saw_redraw_event(now_ms);
@@ -7527,22 +7624,7 @@ impl ApplicationHandler<UserEvent> for App {
                         w.pacer.request();
                     }
                 }
-                // The frame's shadow lightens in the backdrop, so the corner it
-                // hands us has to lighten with it — and it needs a frame to do
-                // that in. Losing focus changes nothing else the shell draws, so
-                // without asking here the old corner stays on the glass until
-                // something unrelated redraws.
-                let mut resized = None;
                 if let Some(w) = self.windows.get_mut(&id) {
-                    if let Some(gfx) = w.gfx.as_mut()
-                        && gfx.refresh_window_edge(focused)
-                    {
-                        // The margins moved the surface with no configure to
-                        // announce it; the model has to be laid out in the
-                        // window that is left, or it composes back to a size
-                        // the buffer no longer is.
-                        resized = Some((gfx.size(), gfx.window.scale_factor()));
-                    }
                     // A press whose release lands in another window leaves the
                     // button stuck "down" here, and a stuck button means the frame
                     // never offers a resize handle again.
@@ -7552,9 +7634,10 @@ impl ApplicationHandler<UserEvent> for App {
                     w.focused = focused;
                     w.pacer.request();
                 }
-                if let Some(((w_px, h_px), scale)) = resized {
-                    self.resize_model(id, w_px, h_px, scale, &fe);
-                }
+                // On a window system where losing the keyboard IS being
+                // deactivated, this is where the decorations follow it over. On
+                // Wayland it changes nothing: activation arrives by configure.
+                self.sync_activation(id, &fe);
                 self.dispatch(id, UiEvent::Focus(focused), &fe);
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -8219,6 +8302,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::decoration_focus;
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
         App, CwdSource, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
@@ -8265,6 +8349,24 @@ mod tests {
         // instead of pacing it.
         assert!(surface_matches_window((0, 720), (1280, 720)));
         assert!(surface_matches_window((1280, 0), (1280, 720)));
+    }
+
+    #[test]
+    fn the_decorations_follow_activation_not_the_keyboard() {
+        // Open a shell menu — GNOME's quick settings, the clock popover, an
+        // on-screen keyboard, a layer-shell overlay — and the compositor takes a
+        // modal grab: the keyboard leaves us (`wl_keyboard.leave`, which winit
+        // reports as `Focused(false)`) while the toplevel stays `activated`.
+        // Every other window on the desktop keeps its active titlebar and
+        // shadow, and a window that dims there is the only one doing it.
+        assert!(decoration_focus(Some(true), false));
+        // The inverse misdraws too: the keyboard is ours, the activation is
+        // somebody else's, and we must paint the backdrop.
+        assert!(!decoration_focus(Some(false), true));
+        // Where the window system has no activation apart from keyboard focus
+        // (macOS, X11), its focus event *is* activation.
+        assert!(decoration_focus(None, true));
+        assert!(!decoration_focus(None, false));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
