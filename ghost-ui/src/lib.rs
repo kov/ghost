@@ -2342,7 +2342,7 @@ impl Graphics {
         renderer.set_scale_factor(window.scale_factor() as f32);
         renderer.set_window_edge(edge);
 
-        Graphics {
+        let gfx = Graphics {
             window,
             target: Target::Surface(SurfaceTarget::new(
                 surface,
@@ -2353,7 +2353,9 @@ impl Graphics {
             renderer,
             scene_cache: SceneCache::default(),
             fonts: font_setup().fonts,
-        }
+        };
+        gfx.log_measurements("created");
+        gfx
     }
 
     /// What the platform's window frame leaves for us to draw — see [`WindowEdge`].
@@ -2425,6 +2427,34 @@ impl Graphics {
             self.size(),
             self.geometry_px(),
         )
+    }
+
+    /// Say, once, how this window currently measures itself: the surface it was
+    /// handed, the window the window system says sits inside it, and the shadow's
+    /// share of the difference.
+    ///
+    /// The three have to agree to the pixel — a frame laid out in a window that is
+    /// a pixel bigger than the surface can hold is a scissor rect outside the
+    /// render target, which wgpu treats as fatal — and at a fractional scale they
+    /// are the easiest thing in the app to get wrong. So they are logged wherever
+    /// they are (re)decided, and `fractional_scale.rs` reads them back.
+    fn log_measurements(&self, at: &str) {
+        let (surface_w, surface_h) = self.size();
+        let (geometry_w, geometry_h) = self.geometry_px();
+        let m = self.margins_px();
+        tracing::debug!(
+            target: "ghost::frame",
+            at,
+            window = ?self.window.id(),
+            scale = self.window.scale_factor(),
+            surface_w,
+            surface_h,
+            geometry_w,
+            geometry_h,
+            inset_x = m.left + m.right,
+            inset_y = m.top + m.bottom,
+            "frame measured"
+        );
     }
 
     /// The window inside this surface, in physical pixels, as the window system
@@ -2515,6 +2545,7 @@ impl Graphics {
                 s.resize(w, h);
             }
             self.scene_cache.invalidate();
+            self.log_measurements("edge");
             return true;
         }
         false
@@ -2604,6 +2635,7 @@ impl Graphics {
         self.refresh_window_edge(self.window.has_focus());
         // The reconfigured surface holds no drawn frame; force the next redraw.
         self.scene_cache.invalidate();
+        self.log_measurements("resized");
     }
 
     /// Force the next present to fully re-render and re-raster the foreground, dropping

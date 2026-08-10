@@ -95,5 +95,5 @@ objc2-foundation = { version = "0.2", features = ["NSString"] }
 # The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.
 tempfile = "3"
 pty-process = "0.5.3"
-rustix = { version = "1.1.4", features = ["termios"] }
+rustix = { version = "1.1.4", features = ["termios", "process"] }
 serde_json = "1.0.150"
