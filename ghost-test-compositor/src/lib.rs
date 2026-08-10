@@ -21,9 +21,13 @@
 //! adapter will be compatible with the surface. A test that needs to present
 //! should treat that as a skip, not a failure.
 //!
-//! Linux-only, and a skip when synoik is missing or too old — [`Synoik::start`]
-//! says which, because "not installed" and "installed but predates the flags a
-//! rig needs" are different things to do something about.
+//! The synoik it runs is **ours**: cloned from GitHub at the commit in
+//! `synoik.rev` and built here, never the one installed on the machine — that
+//! one belongs to the developer's desktop and moves when they upgrade it.
+//!
+//! Linux-only, and a skip when it cannot be had — [`Missing`] says which of
+//! "could not clone it", "would not build" and "never came up", because those
+//! are three different things to do something about.
 #![cfg(target_os = "linux")]
 
 use std::io::Read;
@@ -167,7 +171,27 @@ fn provision() -> Result<PathBuf, Missing> {
     if !build.is_ok_and(|s| s.success()) {
         return Err(Missing::Build(log_path.display().to_string()));
     }
+    prune(&cache, rev);
     Ok(built)
+}
+
+/// Drop the builds of every rev but this one — a checkout of synoik and its
+/// target dir is some 5 GB, and moving the pin would otherwise leave the old
+/// one there forever.
+///
+/// Only ever removes a directory whose name is a full commit hash, directly
+/// under our own cache: the one shape we know we put there.
+fn prune(cache: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit());
+        if ours && name != keep && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Why a rig could not be stood up. Every one of these is a skip: the test is
@@ -349,4 +373,36 @@ pub fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     f()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`prune`] deletes builds of other revs and nothing else — it is the one
+    /// place here that removes a directory tree, so it is worth pinning that it
+    /// only ever recognises what we put there.
+    #[test]
+    fn prune_takes_other_revs_and_leaves_everything_else() {
+        let cache = tempfile::tempdir().expect("a cache dir");
+        let keep = "6600b12e2c7f98531838c449a9eb54346d05a397";
+        let other = "bcc73a6305e276ffc9b0df97c1168f15f1d3db8f";
+        for dir in [keep, other, "not-a-rev", "target"] {
+            std::fs::create_dir_all(cache.path().join(dir)).expect("dir");
+        }
+        std::fs::write(cache.path().join("provision.lock"), "").expect("lock");
+        std::fs::write(cache.path().join(format!("{other}.log")), "").expect("log");
+
+        prune(cache.path(), keep);
+
+        assert!(cache.path().join(keep).is_dir(), "the pinned rev stays");
+        assert!(!cache.path().join(other).exists(), "another rev goes");
+        assert!(
+            cache.path().join("not-a-rev").is_dir(),
+            "not ours to remove"
+        );
+        assert!(cache.path().join("target").is_dir(), "not ours to remove");
+        assert!(cache.path().join("provision.lock").is_file());
+        assert!(cache.path().join(format!("{other}.log")).is_file());
+    }
 }

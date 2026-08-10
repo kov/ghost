@@ -150,7 +150,8 @@ systemd, no pipewire) into `target/synoik/<rev>/`, and runs that. A developer's
 installed synoik is the one drawing their desktop and moves when they upgrade
 it; a suite whose compositor changes underneath it reports on something nobody
 chose. First run costs one clone and ~2 minutes of build, once per pinned rev
-and once more after a `cargo clean`; every run after is instant. No network (or
+and once more after a `cargo clean`; moving the pin drops the previous rev's
+build rather than leaving 5 GB behind; every run after is instant. No network (or
 a build failure) is a skip naming the log. `$SYNOIK` still overrides, which is
 how the pin gets moved.
 
@@ -160,8 +161,8 @@ Root-caused upstream: headless never sets a primary scanout output, so frame
 callbacks come only from synoik's 995ms overdue timer and Fifo waits it out on
 every present. Fixed in synoik `65c0cfaa`, which pins headless's scanout
 state to a real element pass: measured against that build the same dive takes
-0.34–0.45s, the weston number. It is not on the remote yet, so the pin — and
-this paragraph — move when it is.
+0.34–0.45s, the weston number. The pin is now synoik's `6600b12e`, which
+carries that fix, and the dive takes 0.40s against a clean clone of it.
 
 **Headless synoik is not a frame-rate reference**, and that fix is why. It
 moved a headless client from 1 fps to *unpaced*: callbacks go out once per
