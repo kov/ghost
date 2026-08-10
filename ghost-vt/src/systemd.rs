@@ -133,11 +133,15 @@ fn run_quiet(cmd: &mut Command) -> std::io::Result<String> {
     // life (a self-upgrade re-hands them across its `execv`), and a helper that
     // hung while holding a dup of the lock would keep a dead session looking
     // alive — `session::list` prunes exactly when that flock is free.
+    // Invoked as a raw syscall rather than through `libc::close_range`: the libc
+    // crate declares that wrapper for glibc only, and the Linux prebuilt is built
+    // against **musl** — so naming it compiles here and breaks the very binary
+    // staging copies to remotes. The syscall number is there for every Linux libc.
     // SAFETY: `close_range` is async-signal-safe, and the host is single-threaded
     // when this runs.
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(cmd, || {
-            libc::close_range(3, libc::c_uint::MAX, 0);
+            libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
             Ok(())
         });
     }

@@ -727,6 +727,66 @@ mod prebuilt_tests {
         assert_eq!(triple_to_name("riscv64gc-unknown-linux-gnu"), None);
         assert_eq!(triple_to_name("x86_64-pc-windows-msvc"), None);
     }
+
+    /// Whether `triple`'s std is installed, so a check for it can even be asked
+    /// for. Skipping on a missing target is the same bargain the
+    /// `desktop-file-validate` test makes: assert where the tool is there, stay
+    /// quiet where it is not.
+    fn target_installed(triple: &str) -> bool {
+        Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.trim() == triple)
+            })
+            .unwrap_or(false)
+    }
+
+    /// `ghost-host` — the binary staging copies to a remote — must *compile* for
+    /// every platform ghost is willing to stage to. It is easy to break without
+    /// noticing: the whole workspace builds for this machine, and a Linux-only
+    /// syscall reaching `ghost-vt` breaks only the cross targets, which nothing
+    /// here builds by default. That is how `libc::pipe2` left the macOS prebuilt
+    /// unbuildable — and so frozen at whatever vintage last built — while every
+    /// local build and test stayed green.
+    ///
+    /// A check, not a build: this catches the portability breakage, and asking
+    /// for a link as well would drag in `cargo-zigbuild` and a much longer test.
+    /// The link is exercised by actually cutting prebuilts (`cargo xtask
+    /// prebuilt`).
+    #[test]
+    fn the_staged_binary_compiles_for_every_platform_we_stage_to() {
+        let ws = workspace_dir();
+        // Every triple is checked before anything is asserted: these breakages
+        // come one per platform-specific symbol, and stopping at the first would
+        // hide the next behind a second full run.
+        let mut broken = Vec::new();
+        for triple in SUPPORTED_TRIPLES {
+            if !target_installed(triple) {
+                eprintln!("skipping {triple}: `rustup target add {triple}` to cover it");
+                continue;
+            }
+            let out = Command::new(cargo())
+                .current_dir(&ws)
+                .args(["check", "--target", triple, "-p", "ghost-host"])
+                .output()
+                .expect("run cargo check");
+            if !out.status.success() {
+                broken.push(format!(
+                    "--- {triple} ---\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "ghost-host does not compile for {} of the platforms it is staged to:\n{}",
+            broken.len(),
+            broken.join("\n")
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2617,6 +2617,58 @@ fn errno_now() -> libc::c_int {
 /// `argv` must be NUL-terminated and its pointers (and `exe`) must stay valid for
 /// the duration of the call, and `listener_fd`/`lock_fd` must be open in the
 /// calling process.
+/// A pipe whose ends are both close-on-exec, as `(read, write)`.
+///
+/// Linux opens it that way in one call. `pipe2` is a Linux extension, though, and
+/// naming it directly is what stopped `ghost-host` compiling for macOS at all —
+/// with the platform's prebuilt therefore frozen at whatever vintage last built.
+/// So the atomic call is an optimisation of the portable path, not the only path.
+#[cfg(target_os = "linux")]
+fn pipe_cloexec() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// [`pipe_cloexec`] where `pipe2` does not exist: open the pipe, then set the flag
+/// on each end.
+///
+/// The two steps cannot be made one, so between them the ends are briefly
+/// inheritable, and a `Command::spawn` racing on another thread can leak the write
+/// end into an unrelated child. That matters here beyond the usual fd hygiene: the
+/// parent reads this pipe until EOF to learn the exec succeeded, and a leaked
+/// write end holds it open, so the read waits on a process that has nothing to do
+/// with the host. Same pre-fork CLOEXEC window ghost already carries elsewhere,
+/// and the same bargain — the alternative is serialising every spawn in the
+/// process — narrowed here to the two syscalls below.
+///
+/// Compiled on Linux too (unused there outside tests) so the fallback that only
+/// *runs* on macOS is still covered by a suite that runs on Linux.
+#[cfg(any(not(target_os = "linux"), test))]
+fn pipe_cloexec_portable() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let err = io::Error::last_os_error();
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(err);
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pipe_cloexec() -> io::Result<(RawFd, RawFd)> {
+    pipe_cloexec_portable()
+}
+
 unsafe fn daemonize_and_exec(
     exe: &CStr,
     fallback: &CStr,
@@ -2627,11 +2679,7 @@ unsafe fn daemonize_and_exec(
     // The failure pipe. CLOEXEC is what makes it work in both directions: the
     // child writes an errno into it when something goes wrong, and a successful
     // `execv` closes it, so EOF — and only EOF — means the host is up.
-    let mut pipe_fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
+    let (rd, wr) = pipe_cloexec()?;
     // Park the write end clear of the two slots the child `dup2`s the listener and
     // the lock onto. Sitting on one of those, it would be closed by that `dup2`:
     // an exec that *succeeded* would still read as EOF, but a failing one would
@@ -2786,6 +2834,35 @@ mod tests {
     use super::*;
     use crate::connection::ConnectionSpec;
     use crate::record::DEFAULT_MAX_RECORDING_BYTES;
+
+    /// The `pipe2`-less fallback must produce what `pipe2` produces: a working
+    /// pipe whose *both* ends are close-on-exec. Only macOS runs it, but the flag
+    /// is the whole point of it — an end that stays inheritable is leaked into
+    /// every child spawned afterwards, and the write end leaking is what would
+    /// keep the parent's read blocked on an unrelated process instead of
+    /// reporting that the host is up. So it is checked here, where the suite runs.
+    #[test]
+    fn the_portable_pipe_closes_both_ends_on_exec() {
+        let (rd, wr) = pipe_cloexec_portable().expect("open a pipe");
+        for fd in [rd, wr] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "read back the descriptor flags");
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "fd {fd} must not survive an exec"
+            );
+        }
+        // And it is a pipe, not just two flagged descriptors: a byte written to
+        // one end arrives at the other.
+        assert_eq!(unsafe { libc::write(wr, [7u8].as_ptr().cast(), 1) }, 1);
+        let mut got = [0u8; 1];
+        assert_eq!(unsafe { libc::read(rd, got.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(got[0], 7);
+        for fd in [rd, wr] {
+            unsafe { libc::close(fd) };
+        }
+    }
 
     #[test]
     fn spawn_opts_with_a_connection_round_trip_through_postcard() {
