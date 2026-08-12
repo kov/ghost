@@ -187,6 +187,13 @@ impl Session {
     pub fn remove(self) {
         self.resource.remove();
     }
+
+    /// Let go of the session object while *preserving* the stored state — what
+    /// an ordinary quit wants, and what the spec asks for after `replaced`.
+    /// Consumes the session, since `destroy` is a destructor.
+    pub fn destroy(self) {
+        self.resource.destroy();
+    }
 }
 
 /// A client's handle on one named toplevel within a session.
@@ -220,7 +227,7 @@ impl Dispatch<XdgSessionManagerV1, (), WinitState> for SessionManager {
 
 impl Dispatch<XdgSessionV1, Arc<SessionShared>, WinitState> for SessionManager {
     fn event(
-        _: &mut WinitState,
+        state: &mut WinitState,
         _: &XdgSessionV1,
         event: <XdgSessionV1 as Proxy>::Event,
         shared: &Arc<SessionShared>,
@@ -234,7 +241,22 @@ impl Dispatch<XdgSessionV1, Arc<SessionShared>, WinitState> for SessionManager {
             // Nothing to record: the id we asked for is the id we got, and which
             // toplevels were actually restored is reported per toplevel.
             SessionEvent::Restored => {}
-            SessionEvent::Replaced => shared.replaced.store(true, Ordering::Relaxed),
+            SessionEvent::Replaced => {
+                // Flag first: the caller polls the shared state, which outlives
+                // the session object below, so this must be visible whether or
+                // not anything is still holding a `Session`.
+                shared.replaced.store(true, Ordering::Relaxed);
+                // Another client owns the id now and every request we could make
+                // on this object is inert, so the spec asks us to destroy it.
+                // Dropping it silently would also leave `WinitState::session`
+                // occupied, and the `in_use` guard in `open_session` would then
+                // refuse a fresh session for the rest of the process's life —
+                // closing the one recovery a replaced client actually has.
+                // `destroy`, never `remove`: the state belongs to the winner.
+                if let Some(session) = state.session.take() {
+                    session.destroy();
+                }
+            }
         }
     }
 }
