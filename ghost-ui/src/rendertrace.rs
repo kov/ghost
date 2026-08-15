@@ -13,21 +13,23 @@
 //! Clean loop with feeds still ongoing classifies [`StallClass::StaleNoPresent`]
 //! (an idle window is kept quiet by the gate's "feeds still ongoing" test instead).
 //!
-//! [`RenderTrace`] is a per-window watchdog + kick oracle + self-heal trigger. The
-//! shell timestamps the foreground repaint pipeline (redraw commands, release ticks,
-//! present outcomes, input) and, once per event-loop pass, folds in the core's
-//! [`TermTrace`] counters and asks [`RenderTrace::verdict`] whether the foreground is
-//! stalled. The insight: when stalled, the core keeps feeding (`feeds_seen` advances)
+//! [`RenderTrace`] is a per-window watchdog and kick oracle. It only ever REPORTS:
+//! nothing here forces a repaint, because a forced re-present papers over the bug
+//! this module exists to catch — a freeze that heals itself is a freeze nobody
+//! diagnoses. The shell timestamps the foreground repaint pipeline (redraw commands,
+//! release ticks, present outcomes, input) and, once per event-loop pass, folds in the
+//! core's [`TermTrace`] counters and asks [`RenderTrace::verdict`] whether the
+//! foreground is stalled. The insight: when stalled, the core keeps feeding (`feeds_seen` advances)
 //! while `last_present` freezes — and the classified verdict plus the raw field dump
 //! say WHICH gate is stuck. When a present finally lands after a stall (the user's
 //! recovering scroll), [`RenderTrace::saw_outcome`] reports it: the diff between what
 //! was stuck and what unstuck it is the diagnosis, self-reported at the moment of
 //! recovery.
 //!
-//! The fold/verdict runs every pass in a normal run (a few subtractions), so a
-//! stale-frame freeze self-heals in the wild: [`RenderTrace::self_heal_due`] asks the
-//! shell to force one corrective re-present when a `StaleNoPresent` stall is armed. The
-//! verbose per-line diagnostic dump is still gated to `RUST_LOG=ghost::render=trace`.
+//! The fold/verdict runs every pass in a normal run (a few subtractions), so a freeze
+//! in the wild is caught without any flag: the FIRST stall and the FIRST recovery per
+//! window are flagged [`RenderReport::first`] for the shell to log loudly, once each,
+//! with a pointer to `RUST_LOG=ghost::render=trace` for the continuing per-pass dump.
 //!
 //! Everything here is pure (an external millisecond clock), so the classifier is
 //! unit-tested without a window or GPU — the same shape as [`crate::pacer`].
@@ -48,11 +50,6 @@ const FEEDS_NOT_VISIBLE_MIN: u64 = 20;
 /// A continuing stall re-emits at most this often, so a persistent freeze leaves a
 /// periodic breadcrumb without flooding the log.
 const EMIT_EVERY_MS: u64 = 5_000;
-/// The self-heal fires at most this often while a stale-no-present stall persists —
-/// well past the frame budget so one corrective re-present lands and clears the stall
-/// before the next would fire, turning any residual freeze into a one-frame glitch
-/// rather than a repaint storm.
-const HEAL_COOLDOWN_MS: u64 = 2_000;
 
 /// The present pipeline's verdict for a foreground frame, mirrored from
 /// `ghost_renderer::FrameOutcome` so this module stays renderer-free.
@@ -88,7 +85,7 @@ pub enum StallClass {
     /// (feeds stopped) is excluded by the gate's "feeds still ongoing" test, not by
     /// trusting Clean. The residual false positive — a truly idempotent-active region
     /// (identical writes every feed, always Clean, screen genuinely current) — is rare
-    /// and benign (a warn under the trace flag, never a heal).
+    /// and benign — one report, never a corrective repaint.
     StaleNoPresent,
     /// The core produced visible changes but every present attempt comes back `Lost`
     /// — the surface isn't acquirable, so the platform (not our repaint pipeline) is
@@ -136,6 +133,10 @@ pub struct RenderReport {
     /// Clean presents since the last real `Presented` — a high count with a stale
     /// `present_ago` is the Clean-over-stale freeze signature.
     pub cleans_since_present: u64,
+    /// The first stall (or first recovery) reported for this window: the shell logs
+    /// these loudly, and everything after them at trace level, so a persistent freeze
+    /// leaves one visible breadcrumb instead of a stream.
+    pub first: bool,
 }
 
 impl std::fmt::Display for RenderReport {
@@ -203,7 +204,12 @@ pub struct RenderTrace {
     // Oracle + rate limiting.
     stalled: Option<(StallClass, u64)>,
     last_emit_ms: Option<u64>,
-    last_heal_ms: Option<u64>,
+    // Whether a stall / a recovery has already been reported for this window, so the
+    // shell can be loud exactly once for each and quiet thereafter. Not reset by the
+    // re-baselining in `poll`: "have we already told the user about this window" is a
+    // property of the run, not of the current foreground.
+    reported_stall: bool,
+    reported_recovery: bool,
 }
 
 impl RenderTrace {
@@ -256,21 +262,27 @@ impl RenderTrace {
         match outcome {
             // A frame was drawn: the surface now provably shows this scene. Advance the
             // real-present baseline, clear the Clean streak, and — as the kick oracle —
-            // report any armed stall this present just recovered (the user's scroll, a
-            // slide, or the self-heal when the scene finally differs).
+            // report any armed stall this present just recovered (the user's scroll, or
+            // a slide: whatever unstuck it is the diagnosis).
             Outcome::Presented => {
                 self.last_present_ms = Some(now_ms);
                 self.cleans_since_present = 0;
                 if let Some(c) = core {
                     self.visible_at_last_present = c.visible_feeds;
                 }
-                self.stalled.take().map(|(class, since)| {
+                let recovered = self.stalled.take();
+                let first = recovered.is_some() && !self.reported_recovery;
+                if recovered.is_some() {
+                    self.reported_recovery = true;
+                }
+                recovered.map(|(class, since)| {
                     self.build_report(
                         class,
                         now_ms,
                         now_ms.saturating_sub(since),
                         core,
                         pacer_pending,
+                        first,
                     )
                 })
             }
@@ -318,7 +330,6 @@ impl RenderTrace {
             Some(c) if visible => c,
             _ => {
                 self.stalled = None;
-                self.last_heal_ms = None;
                 self.last_core = TermTrace::default();
                 self.feeds_at_last_visible = 0;
                 self.visible_at_last_present = 0;
@@ -364,12 +375,15 @@ impl RenderTrace {
         if changed || due {
             self.last_emit_ms = Some(now_ms);
             let since = self.stalled.map_or(now_ms, |(_, s)| s);
+            let first = !self.reported_stall;
+            self.reported_stall = true;
             return Some(self.build_report(
                 class,
                 now_ms,
                 now_ms.saturating_sub(since),
                 Some(core),
                 pacer_pending,
+                first,
             ));
         }
         None
@@ -387,8 +401,8 @@ impl RenderTrace {
     ) -> Option<StallClass> {
         // A synchronized-output hold: healthy within the backstop, stuck past it.
         // Past `STALL_HOLD_MS` (a full second, versus the core's 150 ms backstop) a
-        // still-set hold means the release repaint never landed — a wedged present the
-        // self-healer forces past (see `self_heal_due`), not a benign in-flight frame.
+        // still-set hold means the release repaint never landed — a wedged present, not
+        // a benign in-flight frame.
         if core.sync_held {
             return self
                 .held_since_ms
@@ -449,40 +463,6 @@ impl RenderTrace {
         None
     }
 
-    /// While a repaint-owed stall is armed, ask the shell to force one corrective
-    /// re-present — at most once per [`HEAL_COOLDOWN_MS`], so a persistent freeze heals
-    /// promptly without a repaint storm. Returns `true` on the pass the shell should
-    /// invalidate its foreground cache and re-request a paint. Scoped to the two classes
-    /// a forced re-present actually fixes.
-    ///
-    /// [`StallClass::StaleNoPresent`] is visible output that never reached the glass.
-    /// [`StallClass::HeldTooLong`] is a synchronized-output hold still set a full second
-    /// past the 150 ms backstop: a hold now releases on a LANDED present, not on the
-    /// backstop tick (the core defers the repaint and clears its debt in
-    /// `mark_presented`), so a hold stuck this long is a wedged present just like
-    /// StaleNoPresent — a forced re-present composites and lands the deferred frame.
-    /// (Under the old tick-cleared latch a forced repaint couldn't end a hold, so this
-    /// was deliberately excluded; that rationale died with the latch.)
-    /// A `SurfaceLost` window is the platform withholding the drawable (nothing to heal).
-    /// Healing a true freeze repaints the burst; a false trigger (idempotent-active
-    /// content) just re-renders identical pixels — no flicker, since it re-renders rather
-    /// than reconfiguring.
-    pub fn self_heal_due(&mut self, now_ms: u64) -> bool {
-        if !matches!(
-            self.stalled,
-            Some((StallClass::StaleNoPresent | StallClass::HeldTooLong, _))
-        ) {
-            return false;
-        }
-        let due = self
-            .last_heal_ms
-            .is_none_or(|h| now_ms.saturating_sub(h) >= HEAL_COOLDOWN_MS);
-        if due {
-            self.last_heal_ms = Some(now_ms);
-        }
-        due
-    }
-
     fn build_report(
         &self,
         class: StallClass,
@@ -490,6 +470,7 @@ impl RenderTrace {
         stalled_for_ms: u64,
         core: Option<TermTrace>,
         pacer_pending: bool,
+        first: bool,
     ) -> RenderReport {
         let ago = |o: Option<u64>| o.map(|t| now_ms.saturating_sub(t));
         let c = core.unwrap_or(self.last_core);
@@ -512,6 +493,7 @@ impl RenderTrace {
             pending_tick: self.last_tick_scheduled_ms > self.last_tick_fired_ms,
             presents: c.presents_marked,
             cleans_since_present: self.cleans_since_present,
+            first,
         }
     }
 }
@@ -566,18 +548,6 @@ mod tests {
             .expect("a latched hold is a stall");
         assert_eq!(r.class, StallClass::HeldTooLong);
         assert!(r.held_for_ms.unwrap() >= 1_000);
-        // A hold now releases only on a LANDED present (the core defers the repaint and
-        // clears its debt in `mark_presented`, not on emitting the backstop Redraw). So
-        // a hold still set a full second past the 150 ms backstop means the release
-        // repaint never reached the glass — a wedged present, which a forced re-present
-        // is exactly what fixes. The self-healer therefore heals HeldTooLong too, once
-        // per cooldown, like StaleNoPresent.
-        assert!(
-            t.self_heal_due(1_100),
-            "a hold stuck a second past the backstop is a wedged present; force one \
-             corrective re-present"
-        );
-        assert!(!t.self_heal_due(1_200), "not again within the cooldown");
     }
 
     #[test]
@@ -617,34 +587,45 @@ mod tests {
         assert_eq!(r.class, StallClass::StaleNoPresent);
     }
 
+    /// The trace is a REPORTER, not a repairer: a stall it detects must leave the
+    /// screen exactly as it found it. All it hands the shell is a report — and the
+    /// first one for a window is flagged, so the shell can say it loudly once and
+    /// keep the rest at trace level instead of streaming a line every few seconds.
     #[test]
-    fn a_stale_no_present_stall_asks_for_one_self_heal_per_cooldown() {
+    fn the_first_report_is_flagged_and_later_ones_are_not() {
         let mut t = RenderTrace::new();
         t.saw_outcome(Outcome::Presented, 0, Some(core(1, 1, false)), false);
         t.poll(0, Some(core(1, 1, false)), false, false, true);
-        // A clean, un-stalled view never asks to heal.
-        assert!(!t.self_heal_due(500), "no stall, no heal");
         // Drive into a stale-no-present stall: visible feeds, no real present.
-        t.poll(2_600, Some(core(5, 5, false)), true, false, true)
+        let first = t
+            .poll(2_600, Some(core(5, 5, false)), true, false, true)
             .expect("stalled");
-        // The first ask heals; a second within the cooldown does not (no repaint storm).
         assert!(
-            t.self_heal_due(2_600),
-            "an armed stale-no-present asks for a heal"
+            first.first,
+            "the first stall report for a window is flagged"
         );
-        assert!(!t.self_heal_due(2_700), "not again within the cooldown");
-        // Still stalled past the cooldown: ask again.
-        t.poll(4_700, Some(core(8, 8, false)), true, false, true);
+        // A continuing stall keeps reporting on the interval, but only the first is
+        // loud — otherwise a persistent freeze floods the log.
+        let again = t
+            .poll(7_700, Some(core(8, 8, false)), true, false, true)
+            .expect("still stalled past the re-emit interval");
+        assert!(!again.first, "a repeat report is not flagged");
+        // Recovery has its own first-flag, so the diagnosis (what unstuck it) is
+        // reported loudly once even though the stall line already fired.
+        let recovered = t
+            .saw_outcome(Outcome::Presented, 7_800, Some(core(8, 8, false)), false)
+            .expect("the present recovers the armed stall");
         assert!(
-            t.self_heal_due(4_700),
-            "a persistent stall asks again after the cooldown"
+            recovered.first,
+            "the first recovery report for a window is flagged"
         );
-        // A recovering present clears the stall, so it stops asking to heal.
-        t.saw_outcome(Outcome::Presented, 4_800, Some(core(8, 8, false)), false);
-        assert!(
-            !t.self_heal_due(7_000),
-            "a recovered view does not ask to heal"
-        );
+        // A second stall + recovery round reports, quietly.
+        t.poll(10_400, Some(core(12, 12, false)), true, false, true)
+            .expect("stalled again");
+        let second = t
+            .saw_outcome(Outcome::Presented, 10_500, Some(core(12, 12, false)), false)
+            .expect("recovered again");
+        assert!(!second.first, "a repeat recovery report is not flagged");
     }
 
     #[test]
@@ -665,15 +646,12 @@ mod tests {
         );
         // Well past the quiet window, no feed since t=100: a naive feeds-ongoing gate
         // would miss this, but a visible feed that no Clean ever confirmed is still a
-        // stale screen — it must arm so the self-healer can force the repaint.
+        // stale screen — it must arm so the freeze is reported rather than passing
+        // for a healthy idle window.
         let r = t
             .poll(2_500, Some(core(2, 2, false)), true, false, true)
             .expect("a dropped final present with a quiet, unconfirmed tail is a stall");
         assert_eq!(r.class, StallClass::StaleNoPresent);
-        assert!(
-            t.self_heal_due(2_500),
-            "the armed stall asks the shell to force one corrective present"
-        );
     }
 
     #[test]

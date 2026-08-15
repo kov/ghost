@@ -2752,11 +2752,11 @@ impl Graphics {
     }
 
     /// Force the next present to fully re-render and re-raster the foreground, dropping
-    /// both the scene-equality skip and the "cached texture is current" assumption. The
-    /// self-heal calls this when the watchdog detects a stale-frame freeze (a present we
-    /// recorded that never reached the glass): the next paint is a full one, so the
-    /// stale texture is replaced. Re-renders rather than reconfiguring the swapchain, so
-    /// a false trigger just redraws identical pixels — no flicker.
+    /// both the scene-equality skip and the "cached texture is current" assumption.
+    ///
+    /// Called only where the PLATFORM has told us the backing store may be stale —
+    /// returning from occlusion, regaining focus — never on suspicion: the render trace
+    /// reports a freeze rather than papering over it.
     fn force_foreground_repaint(&mut self) {
         self.scene_cache.invalidate();
         self.renderer.invalidate_foreground();
@@ -7505,11 +7505,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 // `RUST_LOG=ghost::cache=trace`, alongside the renderer's.
                                 win.root.emit_cache_trace();
                                 // Advance the watchdog's real-present baseline (always, so
-                                // the self-heal in `about_to_wait` has an accurate view even
-                                // without the trace flag). The kick oracle: a present that
-                                // ends an armed stall reports the frozen state it just
-                                // recovered — logged only under the trace flag to keep a
-                                // normal run quiet.
+                                // the classifier in `about_to_wait` has an accurate view
+                                // even without the trace flag). The kick oracle: a present
+                                // that ends an armed stall reports the frozen state it just
+                                // recovered — the diff between what was stuck and what
+                                // unstuck it is the diagnosis. Loud for the first recovery
+                                // in a window, trace for the rest.
                                 let core = win.root.foreground_trace(&self.states);
                                 let pending = win.pacer.pending();
                                 if let Some(report) = win.render_trace.saw_outcome(
@@ -7517,14 +7518,22 @@ impl ApplicationHandler<UserEvent> for App {
                                     now_ms,
                                     core,
                                     pending,
-                                ) && trace_on
-                                {
-                                    tracing::warn!(
-                                        target: "ghost::render",
-                                        window = ?id,
-                                        %report,
-                                        "foreground render stall recovered"
-                                    );
+                                ) {
+                                    if report.first {
+                                        tracing::warn!(
+                                            target: "ghost::render",
+                                            window = ?id,
+                                            %report,
+                                            "foreground render stall recovered"
+                                        );
+                                    } else if trace_on {
+                                        tracing::trace!(
+                                            target: "ghost::render",
+                                            window = ?id,
+                                            %report,
+                                            "foreground render stall recovered"
+                                        );
+                                    }
                                 }
                                 // Frame-pacing instrumentation (GHOST_FRAME_STATS): record
                                 // this frame and print a summary when a dive ends.
@@ -7552,7 +7561,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // scene, so the pending repaint is satisfied. Record the
                                 // Clean (always): it does NOT advance the real-present
                                 // baseline, so a Clean loop over a stale frame stays visible
-                                // to the self-heal.
+                                // to the classifier.
                                 win.pacer.painted(now_ms);
                                 tracing::trace!(target: "ghost::present", window = ?id, t = now_ms, "clean");
                                 let core = win.root.foreground_trace(&self.states);
@@ -8346,10 +8355,12 @@ impl App {
                 w.request_redraw();
             }
             // Once per pass, fold the foreground gate state and classify. Runs always
-            // (not just under the trace flag) so a stale-frame freeze can self-heal in
-            // the wild — the fold/verdict is a few subtractions, and the diagnostic dump
-            // self-filters through the `trace!` level. The window id separates concurrent
-            // windows' tracks in a multi-window log.
+            // (not just under the trace flag) so a freeze in the wild is CAUGHT — the
+            // fold/verdict is a few subtractions. Nothing here repairs it: a forced
+            // re-present would hide the bug behind a one-frame glitch and leave it
+            // undiagnosed. The first stall per window is a warn (one line, with the
+            // pointer to the full dump); the rest are trace. The window id separates
+            // concurrent windows' tracks in a multi-window log.
             let core = w.root.foreground_trace(&self.states);
             let has_snapshot = w.gfx.as_ref().is_some_and(|g| g.renderer.has_snapshot());
             let pending = w.pacer.pending();
@@ -8358,26 +8369,17 @@ impl App {
                 .render_trace
                 .poll(now_ms, core, pending, has_snapshot, visible)
             {
-                tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
-            }
-            // Self-heal: when the watchdog sees a freeze a re-present can fix — a
-            // stale-no-present (visible output streaming, but no real present reached the
-            // glass — the Clean-over-stale texture staleness) or a synchronized hold
-            // stuck a second past its backstop (its deferred release repaint never
-            // landed) — force one full foreground re-present. Rate-limited to one per
-            // HEAL_COOLDOWN_MS, so a persistent freeze becomes a one-frame glitch and a
-            // false trigger just redraws identical pixels (no flicker). Warn so a
-            // recovery leaves a breadcrumb even without the trace flag.
-            if w.render_trace.self_heal_due(now_ms) {
-                if let Some(gfx) = w.gfx.as_mut() {
-                    gfx.force_foreground_repaint();
+                if report.first {
+                    tracing::warn!(
+                        target: "ghost::render",
+                        window = ?id,
+                        %report,
+                        "foreground render stall (scroll to unstick it; \
+                         RUST_LOG=ghost::render=trace for the full trace)"
+                    );
+                } else {
+                    tracing::trace!(target: "ghost::render", window = ?id, %report, "foreground render stall");
                 }
-                w.pacer.request();
-                tracing::warn!(
-                    target: "ghost::render",
-                    window = ?id,
-                    "forced a foreground re-present (watchdog: suspected stale frame)"
-                );
             }
         }
         self.assert_foreground_states_present("after wake");

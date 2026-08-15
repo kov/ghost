@@ -6728,8 +6728,8 @@ mod tests {
         // backgrounded is still answered (the reply must flow), but beta is NOT visible
         // — the foreground is alpha — so its content change must not repaint the window.
         // That churn is a full deep scene-compare ending in a Clean skip, up to 60x/s
-        // under a chatty background session; the foreground's own feeds and the
-        // self-heal drive its repaints.
+        // under a chatty background session; the foreground's own feeds drive its
+        // repaints.
         let cmds = r.update(UiEvent::SessionData {
             name: "beta".into(),
             bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),

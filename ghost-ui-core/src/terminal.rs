@@ -362,8 +362,8 @@ pub struct TerminalView {
     /// `true` under an open mode: the shell's re-present composites an identical scene,
     /// lands a `Clean` (which deliberately does not `mark_presented`), and the flag
     /// stays set — so `sync_held` reads held indefinitely. Harmless (the glass already
-    /// matches; the shell's self-heal just re-renders identical pixels, no flicker) and
-    /// unreachable from any real app, which closes its frame.
+    /// matches, so nothing is stale; the render trace reports a `held-too-long` stall
+    /// once) and unreachable from any real app, which closes its frame.
     redraw_owed: bool,
     /// Whether this session's window currently holds keyboard focus. Tracked so
     /// that when an app first enables focus reporting (DEC ?1004) we can report
