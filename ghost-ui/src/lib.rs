@@ -4574,7 +4574,7 @@ impl App {
                         remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         self.spawn_remote_session(wid, &target, &real, None);
-                    } else if self.respawn_dead(&id) && self.attach_into(wid, &id) {
+                    } else if self.respawn_dead(&id) && self.attach_into(wid, &id, event_loop) {
                         self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                     }
                 }
@@ -4707,7 +4707,7 @@ impl App {
                                 cwd.map(PathBuf::from),
                             ) {
                                 Ok(()) => {
-                                    if self.attach_into(wid, &name) {
+                                    if self.attach_into(wid, &name, event_loop) {
                                         self.clear_failure(wid);
                                         self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                                     }
@@ -4728,7 +4728,7 @@ impl App {
                         // (even by another window) is adopted in place (no second
                         // transport), the same-process take-over the shared map enables.
                         let held = self.sessions.contains_key(&id);
-                        if held || self.attach_into(wid, &id) {
+                        if held || self.attach_into(wid, &id, event_loop) {
                             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
                             // The adopt-in-place branch never went through `Cmd::Attach`,
                             // so without this the window that HAD the session kept
@@ -5214,6 +5214,7 @@ impl App {
         host: &RemoteHost,
         composite: &str,
         real: &str,
+        event_loop: &dyn Frontend,
     ) -> bool {
         host.remote.reap_wedged_master();
         if host
@@ -5227,7 +5228,13 @@ impl App {
         loop {
             let cmd = host.remote.pipe_command(&host.remote_ghost, real);
             // Freshly (re)created by the current staged binary → our own level.
-            if self.attach_ssh_into(wid, composite, cmd, ghost_vt::protocol::PROTO_LEVEL) {
+            if self.attach_ssh_into(
+                wid,
+                composite,
+                cmd,
+                ghost_vt::protocol::PROTO_LEVEL,
+                event_loop,
+            ) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -5375,7 +5382,7 @@ impl App {
         let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
         // A pre-existing session that dropped: honor its running host's level.
         let proto = host.remote.session_proto(&host.remote_ghost, &real);
-        if self.attach_ssh_into(wid, &name, cmd, proto) {
+        if self.attach_ssh_into(wid, &name, cmd, proto, event_loop) {
             ghost_ui_core::focus_trace::log(
                 &name,
                 format_args!("transport REATTACHED (fresh emulator, resync inbound)"),
@@ -5432,9 +5439,11 @@ impl App {
         }
     }
 
-    fn attach_into(&mut self, wid: WindowId, name: &str) -> bool {
+    fn attach_into(&mut self, wid: WindowId, name: &str, event_loop: &dyn Frontend) -> bool {
         // Already driven somewhere in this process → adopt in place: the caller's
         // AdoptSession takes drivership, and no second client / rebuild is opened.
+        // Announcing is still the caller's business there, not ours: another window
+        // may hold that client, and taking it is a take-over the user confirms.
         if self.sessions.contains_key(name) {
             return true;
         }
@@ -5454,6 +5463,15 @@ impl App {
                 // the shared mirror first so the replay lands clean (W1).
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
+                // This window's client, opened just now: tell it so before any listing
+                // can report the session attached with no owner attached to the news.
+                self.dispatch(
+                    wid,
+                    UiEvent::DriverGained {
+                        name: name.to_string(),
+                    },
+                    event_loop,
+                );
                 true
             }
             Err(e) => {
@@ -5480,6 +5498,7 @@ impl App {
         name: &str,
         cmd: std::process::Command,
         proto: u32,
+        event_loop: &dyn Frontend,
     ) -> bool {
         if self.sessions.contains_key(name) {
             return true;
@@ -5493,6 +5512,15 @@ impl App {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
+                // Ours, and said so before the host's next listing lands (see
+                // `attach_into`) — the race this closes was a remote restore.
+                self.dispatch(
+                    wid,
+                    UiEvent::DriverGained {
+                        name: name.to_string(),
+                    },
+                    event_loop,
+                );
                 true
             }
             Err(e) => {
@@ -5737,6 +5765,7 @@ impl App {
                     &local_id,
                     remote.pipe_command(&remote_ghost, &name),
                     ghost_vt::protocol::PROTO_LEVEL,
+                    event_loop,
                 ) {
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.root.end_connect();
@@ -5787,7 +5816,7 @@ impl App {
         // "is fallback" flag.
         match event_loop.spawn_session(&name, vec![], Some(spec), None) {
             Ok(()) => {
-                if self.attach_into(wid, &name) {
+                if self.attach_into(wid, &name, event_loop) {
                     self.clear_failure(wid);
                     self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
                 }
@@ -5865,8 +5894,8 @@ impl App {
             let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
             // A remembered session restored on its host: honor its running level.
             let proto = host.remote.session_proto(&host.remote_ghost, &real);
-            if !self.attach_ssh_into(wid, &composite, cmd, proto)
-                && !self.relaunch_remote_and_attach(wid, &host, &composite, &real)
+            if !self.attach_ssh_into(wid, &composite, cmd, proto, event_loop)
+                && !self.relaunch_remote_and_attach(wid, &host, &composite, &real, event_loop)
             {
                 // Host reachable but the session is gone AND could not be
                 // relaunched — leave the tile cold, as before.
@@ -6077,7 +6106,7 @@ impl App {
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
         // Taking over a discovered session: honor its running host's level.
         let proto = host.remote.session_proto(&host.remote_ghost, real);
-        if self.attach_ssh_into(wid, id, cmd, proto) {
+        if self.attach_ssh_into(wid, id, cmd, proto, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
         }
     }
@@ -6174,7 +6203,13 @@ impl App {
             .insert(local_id.clone(), (target.clone(), name.clone()));
         let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
         // Just spawned by the current staged binary → our own level.
-        if self.attach_ssh_into(wid, &local_id, cmd, ghost_vt::protocol::PROTO_LEVEL) {
+        if self.attach_ssh_into(
+            wid,
+            &local_id,
+            cmd,
+            ghost_vt::protocol::PROTO_LEVEL,
+            event_loop,
+        ) {
             self.clear_failure(wid);
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
@@ -7151,7 +7186,7 @@ impl App {
                             if m.dead {
                                 spawn_dead(&m.id);
                             }
-                            if self.attach_into(wid, &m.id) {
+                            if self.attach_into(wid, &m.id, event_loop) {
                                 self.dispatch(wid, UiEvent::AdoptSession(m.id), event_loop);
                             }
                         }

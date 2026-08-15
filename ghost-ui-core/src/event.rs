@@ -184,6 +184,18 @@ pub enum UiEvent {
     DriverLost {
         name: SessionId,
     },
+    /// The mirror image of [`DriverLost`](UiEvent::DriverLost): the shell opened (or
+    /// already holds) this window's client for `name`, so the window drives it from
+    /// now on. The shell is the only thing that knows *whose* client an attach
+    /// belongs to, and it must say so before any listing arrives: ownership is a
+    /// projection of tile locality, so an unannounced attach comes back in the host's
+    /// next listing as a bare `attached` flag with no owner — which a window reads as
+    /// "attached in another window", about its own session. Announcing it keeps the
+    /// tile ours, and leaves the double-attach guard free to mean what it says for
+    /// tiles that really are someone else's.
+    DriverGained {
+        name: SessionId,
+    },
     /// A driven session's transport dropped without the child exiting — a lost
     /// connection whose session may still be alive on the far side (a remote
     /// session over ssh). The tile enters a *reconnecting* hold (frozen, dimmed)

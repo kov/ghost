@@ -1633,6 +1633,22 @@ impl RootModel {
                 Mode::Single { .. } => Vec::new(),
             };
         }
+        // The shell opened (or already holds) this window's client for a session: it
+        // is ours from now on. This is the ONLY signal that says whose an attach is —
+        // a listing carries a bare `attached` flag with no owner — so without it a
+        // window reads its own fresh attach back as "attached in another window" and
+        // the adopt that follows trips the double-attach guard. Writing it down here
+        // is not a take-over: the shell is reporting a drivership it established, so
+        // no `Cmd::Attach` and no hand-over follow (`Fleet::note_driven`).
+        if let UiEvent::DriverGained { name } = &ev {
+            let name = name.clone();
+            let cmds = match &mut self.mode {
+                Mode::Fleet(f) => f.note_driven(&name),
+                Mode::Single { .. } => Vec::new(),
+            };
+            self.mine.insert(name);
+            return cmds;
+        }
         // Another window in this process took over a session this one drives (an
         // in-process adopt-in-place of an already-driven session). The shell fans this
         // exactly to the prior driver(s) at the take-over, so there is no group or
@@ -2048,30 +2064,20 @@ impl RootModel {
         self.pending_dive = None;
         self.pending_dive_in = None;
         self.anim = None;
-        // An adopt IS this window taking drivership, so claim the tile first — the
-        // same claim the take-over modal and a group open make before their dive.
-        // It has to land before anything else, park or dive: ownership is a
-        // projection of tile locality, so an unclaimed tile is bucketed by the next
-        // listing on the host's `attached` flag — which, once the shell has attached
-        // us (a restore reconnect does that before adopting), says "attached
-        // elsewhere" about our own session. The dive would then hit the
-        // double-attach guard in `extract` and abort the process, taking every
-        // window with it. Idempotent for a tile this window already drives.
-        let mut claim = match &mut self.mode {
-            Mode::Fleet(f) if f.locality_of(&id).is_some() => f.claim(&id),
-            _ => Vec::new(),
-        };
         // Opening a cold tile (a detached session we don't yet drive): size it to the
         // window and hold in the fleet until its first output makes the preview live,
         // then re-enter to dive into the now full-size, content-bearing tile. The shell
         // has already begun attaching; the resize commands reach the session through it.
         if let Mode::Fleet(f) = &mut self.mode
-            && let Some(cmds) = f.prepare_takeover(sessions, &id, self.size_px, self.scale)
+            && let Some(mut cmds) = f.prepare_takeover(sessions, &id, self.size_px, self.scale)
         {
+            // Don't claim ownership yet — the re-entry once the preview is live does
+            // that. Leaving the tile foreign keeps it put if a reconcile lands first.
+            // (An attach the shell has already made is not "foreign": it announces it
+            // with `DriverGained`, so this tile is ours before the wait even starts.)
             self.pending_dive_in = Some(id);
-            claim.extend(cmds);
-            claim.push(Cmd::Redraw);
-            return claim;
+            cmds.push(Cmd::Redraw);
+            return cmds;
         }
         let placeholder = Mode::Single {
             id: String::new(),
@@ -2080,7 +2086,7 @@ impl RootModel {
         let dur = self.anim_ms;
         let current = std::mem::replace(&mut self.mode, placeholder);
         let mut anim = None;
-        let (mut view, extracted) = match current {
+        let (mut view, mut cmds) = match current {
             Mode::Fleet(f) => {
                 // Carry the fleet's (possibly edited) groups — and identity,
                 // in case it adopted a closed group — out of the closing
@@ -2093,9 +2099,6 @@ impl RootModel {
                 anim = f
                     .dive_camera(&id)
                     .map(|to| Anim::dive(f.view(sessions), Transform::IDENTITY, to, dur));
-                // The claim above already flipped this tile to ours, so the extract
-                // adopts a session this window drives — never one the double-attach
-                // guard has to refuse.
                 let (_kept_id, kept_view, warm, cmds) =
                     f.into_single_adopting(sessions, id.clone(), self.size_px, self.scale);
                 // The states never left `sessions`; the fleet hands back only the
@@ -2127,10 +2130,6 @@ impl RootModel {
                 }
             }
         };
-        // The claim's commands lead: the shell must see the Attach (its ownership
-        // hand-over) before whatever the extract emits.
-        let mut cmds = claim;
-        cmds.extend(extracted);
         // Size the (possibly restored or fresh) foreground to the window. Adopting a
         // session *is* taking ownership (`self.mine.insert(id)` below), so this window
         // drives its grid from here on — it re-grids and SIGWINCHes even though `mine`
@@ -4212,17 +4211,20 @@ mod tests {
     /// A restored session the shell has already attached is adopted while its tile
     /// still has no output: the adopt parks, waiting for the first frame. If the
     /// host's next listing lands during that wait it reports the session attached —
-    /// *by us* — and an unclaimed tile is bucketed "attached elsewhere". The dive
-    /// that the first frame then releases hit the double-attach guard in `extract`
-    /// and aborted the whole app (every window lost, not just this one). The window
-    /// drives the session from the moment it asks for it, so the claim belongs at
-    /// the park, not at the landing.
+    /// *by us* — and a tile whose owner the window doesn't know is bucketed "attached
+    /// elsewhere". The dive that the first frame then released hit the double-attach
+    /// guard in `extract` and aborted the whole app (every window lost, not just this
+    /// one). The shell's `DriverGained` is what tells the window the attach was its
+    /// own, so its own session can never read as someone else's.
     #[test]
     fn a_parked_take_over_survives_a_listing_that_shows_our_own_attach() {
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
         r.update(UiEvent::SessionList(vec![sess("beta", false, 1)]));
-        // The shell attached beta into this window (a restore reconnect) and asks
-        // for it in the foreground.
+        // The shell attached beta into this window (a restore reconnect), says so,
+        // and asks for it in the foreground.
+        r.update(UiEvent::DriverGained {
+            name: "beta".into(),
+        });
         r.update(UiEvent::AdoptSession("beta".into()));
         assert!(
             r.is_fleet(),
@@ -4242,6 +4244,27 @@ mod tests {
             Some("beta"),
             "the adopted session is the foreground"
         );
+    }
+
+    /// The other half of the contract: a session attached in ANOTHER window — one
+    /// this window never attached and so never heard `DriverGained` for — is not
+    /// quietly taken. Taking one is a user decision (the confirm modal in
+    /// `Fleet::activate` claims it first); an adopt that reaches the extract without
+    /// that claim is a bug in the caller, and the guard says so rather than leaving
+    /// the session attached twice, in two groups.
+    #[test]
+    #[should_panic(expected = "attached in another window")]
+    fn adopting_a_session_attached_elsewhere_is_still_refused() {
+        let (mut r, _) = fleet(METRICS, SIZE, 1.0);
+        r.update(UiEvent::SessionList(vec![sess("beta", true, 1)]));
+        // Fed by an observer's mirror: the tile is live, so nothing parks and the
+        // adopt goes straight to the extract.
+        r.update(UiEvent::SessionData {
+            name: "beta".into(),
+            bytes: b"hi".to_vec(),
+            ended: false,
+        });
+        r.update(UiEvent::AdoptSession("beta".into()));
     }
 
     #[test]

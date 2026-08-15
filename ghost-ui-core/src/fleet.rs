@@ -2783,13 +2783,20 @@ impl FleetModel {
     /// other group (ownership moved here; the registry save follows from the
     /// sync). The inverse of [`Self::detach_session`].
     ///
-    /// Public to the root so an adopt claims before it extracts — see
-    /// [`Self::claim`].
-    pub(crate) fn claim(&mut self, id: &SessionId) -> Vec<Cmd> {
-        self.claim_session(id)
+    fn claim_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+        self.take_drivership(id, true)
     }
 
-    fn claim_session(&mut self, id: &SessionId) -> Vec<Cmd> {
+    /// Record that this window ALREADY drives `id` — the shell opened its client
+    /// and said so ([`UiEvent::DriverGained`]). The same tile flip as a claim, minus
+    /// the `Cmd::Attach`: there is nothing left to attach, and re-emitting one would
+    /// hand the session over to ourselves. Nothing here decides to take a session
+    /// from another window; it only writes down a drivership the shell established.
+    pub(crate) fn note_driven(&mut self, id: &SessionId) -> Vec<Cmd> {
+        self.take_drivership(id, false)
+    }
+
+    fn take_drivership(&mut self, id: &SessionId, attach: bool) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
@@ -2814,7 +2821,7 @@ impl FleetModel {
             .retain(|g| g.id == self.my_group.id || !g.members.is_empty());
         // A session already driven here needs no client work — the claim is
         // idempotent so a group open can claim every member uniformly.
-        if newly {
+        if newly && attach {
             cmds.push(Cmd::Attach(id.clone()));
         }
         cmds
