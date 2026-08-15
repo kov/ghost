@@ -9356,10 +9356,18 @@ mod tests {
     /// The built `ghost` binary sitting next to this test binary
     /// (`target/<profile>/ghost`, sibling of `deps/ghost-<hash>`), or `None` if it
     /// isn't there — `cargo test` builds it, so it normally is.
+    /// The `ghost` binary this test run built, for the tests that need a real host
+    /// on the other end. Searched up the test executable's ancestors rather than at
+    /// one fixed depth: where cargo puts a unit-test binary under `target/` varies
+    /// (`target/debug/deps/…` and `target/debug/build/<pkg>/<hash>/out/…` both
+    /// happen), and a hard-coded depth silently turns every test that needs the
+    /// binary into a no-op skip.
     fn ghost_binary() -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
-        let bin = exe.parent()?.parent()?.join("ghost");
-        bin.exists().then_some(bin)
+        exe.ancestors()
+            .skip(1)
+            .map(|dir| dir.join("ghost"))
+            .find(|bin| bin.is_file())
     }
 
     /// A fake `ssh` in a fresh dir: strips ssh options + the destination, then runs
@@ -11111,6 +11119,104 @@ mod tests {
                 "driving the reconnected session dove the window out of the fleet into its single view"
             );
             assert!(drained, "the target is drained from the pending set");
+        });
+    }
+
+    #[test]
+    fn a_restored_remote_survives_its_hosts_listing_landing_mid_dive() {
+        // The incident: a bare launch restored a window onto a remote session, the
+        // host was already listing it (a cold tile), so the adopt parked waiting for
+        // the session's first frame. The host's next listing then reported the
+        // session ATTACHED — by us, the attach this restore had just made — and an
+        // unclaimed tile reads that as "attached elsewhere". The frame arrived, the
+        // parked dive resumed, and the double-attach guard aborted the *process*:
+        // every window vanished, local ones included. Restoring a session we drive
+        // must survive our own attach showing up in a listing.
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+
+            let real = "restored-mid-dive";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), real, None)
+                .unwrap();
+
+            let group = app.mint_group();
+            let wid = app.open_fleet_window(&fe, group, None);
+            let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
+            // The host's first listing is already in: the window has a cold tile for
+            // the session, which is what makes the adopt below park instead of
+            // diving straight through.
+            app.dispatch(
+                wid,
+                ghost_ui_core::UiEvent::SessionList(namespace_remote_infos(
+                    "kov@box",
+                    vec![info(real, false)],
+                )),
+                &fe,
+            );
+            app.pending_remote_restores.insert(
+                "kov@box".to_string(),
+                vec![PendingRemote {
+                    wid,
+                    composite: composite.clone(),
+                    fleet: false,
+                    foreground: true,
+                }],
+            );
+
+            app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
+            // The listing catches up with the attach this restore just made.
+            app.dispatch(
+                wid,
+                ghost_ui_core::UiEvent::SessionList(namespace_remote_infos(
+                    "kov@box",
+                    vec![info(real, true)],
+                )),
+                &fe,
+            );
+            // The session's first frame releases the parked dive.
+            app.dispatch(
+                wid,
+                ghost_ui_core::UiEvent::SessionData {
+                    name: composite.clone(),
+                    bytes: b"hi".to_vec(),
+                    ended: false,
+                },
+                &fe,
+            );
+            let foreground = app.windows[&wid].root.foreground().cloned();
+
+            let _ = ghost_vt::session::kill_session(real);
+            // SAFETY: still within the lock; restore PATH for later tests.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert_eq!(
+                foreground.as_deref(),
+                Some(composite.as_str()),
+                "the restored remote session lands in the window's foreground"
+            );
         });
     }
 

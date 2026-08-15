@@ -2782,6 +2782,13 @@ impl FleetModel {
     /// tile, attach in the background, and take its membership away from any
     /// other group (ownership moved here; the registry save follows from the
     /// sync). The inverse of [`Self::detach_session`].
+    ///
+    /// Public to the root so an adopt claims before it extracts — see
+    /// [`Self::claim`].
+    pub(crate) fn claim(&mut self, id: &SessionId) -> Vec<Cmd> {
+        self.claim_session(id)
+    }
+
     fn claim_session(&mut self, id: &SessionId) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         if self.observing.remove(id) {
