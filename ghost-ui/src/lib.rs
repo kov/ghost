@@ -2755,8 +2755,8 @@ impl Graphics {
     /// both the scene-equality skip and the "cached texture is current" assumption.
     ///
     /// Called only where the PLATFORM has told us the backing store may be stale —
-    /// returning from occlusion, regaining focus — never on suspicion: the render trace
-    /// reports a freeze rather than papering over it.
+    /// coming back from occlusion — never on suspicion: the render trace reports a
+    /// freeze rather than papering over it.
     fn force_foreground_repaint(&mut self) {
         self.scene_cache.invalidate();
         self.renderer.invalidate_foreground();
@@ -7681,16 +7681,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // keep the previous one on blur (a stale id is filtered at use).
                 if focused {
                     self.focused = Some(id);
-                    // Belt and braces for platforms/WMs that don't report occlusion
-                    // (see `Occluded` above): regaining focus forces a fresh full frame
-                    // too, in case the backing store was discarded while unfocused.
-                    if let Some(w) = self.windows.get_mut(&id) {
-                        if let Some(gfx) = w.gfx.as_mut() {
-                            gfx.force_foreground_repaint();
-                        }
-                        w.pacer.request();
-                    }
                 }
+                // Focus changes what the frame looks like (decorations, cursor), so it
+                // asks for a repaint — but an ORDINARY one. It deliberately does NOT
+                // force a full re-render "in case" the backing store was discarded:
+                // losing focus is not a signal that it was, and a defensive full frame
+                // on every focus gain would hide a stale-texture bug the same way the
+                // deleted stall self-heal did. `Occluded` above is where a real
+                // discard is reported.
                 if let Some(w) = self.windows.get_mut(&id) {
                     // A press whose release lands in another window leaves the
                     // button stuck "down" here, and a stuck button means the frame

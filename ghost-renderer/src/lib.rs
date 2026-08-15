@@ -5626,7 +5626,7 @@ impl Renderer {
     /// Surface instead of a banded update — dropping the assumption that the cached
     /// texture matches the glass. The shell calls this (with a `SceneCache::invalidate`
     /// and a repaint request) where the platform tells it the backing store may be gone:
-    /// coming back from occlusion, regaining focus. Cheap — one bool — and the
+    /// coming back from occlusion. Cheap — one bool — and the
     /// per-session tile Surfaces survive, so it is not the sledgehammer of `set_theme`.
     pub fn invalidate_foreground(&mut self) {
         self.foreground_valid = false;
