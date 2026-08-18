@@ -915,6 +915,45 @@ fn the_wire_trace_is_armed_by_the_config_file() {
     });
 }
 
+/// Arming mid-run reaches the HOST too, not just the GUI. The session whose
+/// input is going missing has been running for days by the time anyone thinks to
+/// trace it — if the reload only armed this process, the half of the journey
+/// that happens inside the host would still be invisible exactly when it matters.
+#[test]
+fn arming_the_trace_mid_run_reaches_an_already_attached_host() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("traced-late", "exec cat");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "traced-late", g, None)
+            .expect("window");
+        app.wake(&fe);
+
+        // Attached first, armed second — the host is already up and serving.
+        support::write_ui_config("[diagnostics]\nwire_trace = true\n");
+        app.notify_config_changed();
+        app.wake(&fe);
+        app.dispatch(wid, UiEvent::Text("late".into()), &fe);
+        app.wake(&fe);
+
+        let path = ghost_vt::paths::wire_trace_path();
+        let armed = wait_until(Duration::from_secs(5), || {
+            app.wake(&fe);
+            std::fs::read_to_string(&path).is_ok_and(|l| l.contains("pty wrote"))
+        });
+        assert!(
+            armed,
+            "the reload must arm the running host's own trace; {} holds: {:?}",
+            path.display(),
+            std::fs::read_to_string(&path).unwrap_or_default()
+        );
+        support::kill_session("traced-late");
+    });
+}
+
 /// ...and stays off otherwise. A trace nobody asked for is a file quietly
 /// growing in the user's data dir, fed by every keystroke they type.
 #[test]

@@ -696,3 +696,109 @@ fn a_probed_wedged_transport_reconnects_without_waiting_for_the_keepalive() {
         wait_for_focus_reports(&mut rig, 2, Duration::from_secs(25));
     });
 }
+
+/// The trace crosses the ssh transport and lands on the machine the HOST runs on.
+/// This is the whole shape of the deployment it exists for: the GUI's own log ends
+/// at its write to the pipe, so without the host's half the last leg of a remote
+/// keystroke — the one that ends at the child's PTY — is unobserved on the only
+/// combination where the input actually goes missing.
+#[test]
+fn a_remote_hosts_trace_is_written_on_the_remote_machine() {
+    let Some(remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    // SAFETY: process-global, held under SERIAL for the duration (as ssh_reboot does).
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        // Armed before anything attaches, so the arming rides the handshake the
+        // way it does for a session opened while tracing is already on.
+        support::write_ui_config("[diagnostics]\nwire_trace = true\n");
+
+        let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+        let remote_ghost =
+            retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+        r.spawn_host(&remote_ghost, "traced", None)
+            .expect("spawn remote session");
+        assert!(
+            wait_until(Duration::from_secs(10), || r
+                .list_sessions(&remote_ghost)
+                .map(|s| s.iter().any(|i| i.name == "traced"))
+                .unwrap_or(false)),
+            "the session never came up on the remote"
+        );
+
+        let q: Arc<QueuedEvents> = Arc::default();
+        let sink: Arc<dyn EventSink> = q.clone();
+        let mut app = App::headless_with_sink(sink);
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+
+        let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            sees_tile(&app.root(wid).expect("window").view(app.states()), "traced")
+        });
+        assert!(
+            discovered,
+            "the remote session never appeared in the fleet: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::tile_center(&scene, "traced")
+            .unwrap_or_else(|| panic!("no card to click: {:?}", visible_text(&scene)));
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+            for ev in support::click_events(cx, cy) {
+                app.dispatch(wid, ev, &fe);
+            }
+        }
+        let attached = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            !app.root(wid).expect("window").is_fleet()
+        });
+        assert!(
+            attached,
+            "the window never opened the remote session: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        app.dispatch(wid, UiEvent::Text("remote-keystroke".into()), &fe);
+
+        // Over THERE: the host's own data dir, on the machine holding the PTY.
+        let there = remote
+            .data_home()
+            .join("ghost")
+            .join("trace")
+            .join("wire.log");
+        let traced = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |_| {
+            std::fs::read_to_string(&there).is_ok_and(|l| l.contains("pty wrote"))
+        });
+        assert!(
+            traced,
+            "the remote host must trace its own PTY drain at {}; it holds: {:?}",
+            there.display(),
+            std::fs::read_to_string(&there).unwrap_or_default()
+        );
+        let log = std::fs::read_to_string(&there).unwrap_or_default();
+        assert!(
+            log.contains("remote-keystroke"),
+            "and the payload it received: {log:?}"
+        );
+
+        // Here: the GUI's log is a DIFFERENT file, on this machine. Two halves,
+        // two files — correlating them is the point.
+        let here = ghost_vt::paths::wire_trace_path();
+        assert_ne!(here, there, "the two halves must not share a file");
+        assert!(
+            std::fs::read_to_string(&here).is_ok_and(|l| l.contains("wire remote-keystroke")),
+            "the GUI half records the send: {:?}",
+            std::fs::read_to_string(&here).unwrap_or_default()
+        );
+    });
+}

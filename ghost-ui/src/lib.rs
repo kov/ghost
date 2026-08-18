@@ -354,6 +354,9 @@ fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Sessio
     // than the host's previous one being applied and then walked back.
     s.report_theme(session_theme())?;
     s.report_policy(session_policy())?;
+    // Arm the host's half of the trace to match ours, so a session opened while
+    // tracing is on is traced end to end from its first keystroke.
+    s.report_trace(ghost_ui_core::trace::enabled())?;
     s.resize(cols, rows)?;
     s.hello(identity)?;
     Ok(s)
@@ -383,6 +386,9 @@ fn attach_over_ssh(
     // than the host's previous one being applied and then walked back.
     s.report_theme(session_theme())?;
     s.report_policy(session_policy())?;
+    // Arm the host's half of the trace to match ours, so a session opened while
+    // tracing is on is traced end to end from its first keystroke.
+    s.report_trace(ghost_ui_core::trace::enabled())?;
     s.resize(cols, rows)?;
     s.hello(identity)?;
     Ok(s)
@@ -4064,7 +4070,20 @@ impl App {
     fn reload_config(&mut self, cfg: &config::UiConfig, event_loop: &dyn Frontend) {
         // Editing `ui.toml` arms (or disarms) the wire trace under the running GUI,
         // which is the whole point of it being a setting rather than an env var.
-        ghost_ui_core::trace::set_enabled(cfg.wire_trace());
+        // Every attached host is told too, on and off alike: a session outlives the
+        // window that armed it, and the host holds the one segment this process
+        // cannot see — what its PTY drain accepted. Hosts predating the message
+        // ignore it (the send is gated), and a remote host writes on its own
+        // machine.
+        let tracing = cfg.wire_trace();
+        if tracing != ghost_ui_core::trace::enabled() {
+            ghost_ui_core::trace::set_enabled(tracing);
+            for (name, s) in self.sessions.iter_mut() {
+                if let Err(e) = s.report_trace(tracing) {
+                    ghost_ui_core::trace::log(name, format_args!("host trace arming FAILED: {e}"));
+                }
+            }
+        }
         let theme = cfg.theme();
         let colors = theme_colors(&theme);
         let pad = cfg.padding();
@@ -8135,6 +8154,15 @@ impl App {
     /// live loop runs, with no window server. Pump each session's one client and each
     /// read-only observer, fan the output into every viewing window, fan pushed
     /// session state, fire due ticks, and release paced repaints.
+    /// Signal that the config on disk changed, exactly as the watcher does — the
+    /// next [`wake`](Self::wake) re-reads `ui.toml` and re-applies it. Public for
+    /// the end-to-end tests, which write the file themselves and must not race
+    /// inotify to observe the reload.
+    pub fn notify_config_changed(&self) {
+        self.config_changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn wake(&mut self, fe: &dyn Frontend) {
         // A long wake-to-wake gap means we were parked — a slept laptop kills
         // remote TCP with nothing reaching the local master — so probe the

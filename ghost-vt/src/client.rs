@@ -494,6 +494,24 @@ impl Session {
         self.client.send(&ClientMsg::Policy(policy))
     }
 
+    /// Arm or disarm this host's own wire trace ([`ClientMsg::Trace`]) — what it
+    /// received for the child, and what its PTY drain accepted. Sent right after
+    /// attaching when the GUI has tracing on, and again whenever the setting
+    /// changes, so a host that has been up for days can be armed without being
+    /// restarted. The host writes on ITS machine, which for a remote session is
+    /// not where the GUI writes.
+    ///
+    /// Silently skipped on a host predating [`PROTO_TRACE`]
+    /// (crate::protocol::PROTO_TRACE): the unknown message would be a decode
+    /// error it treats as a broken connection, so an ungated send would end the
+    /// session instead of quietly tracing nothing.
+    pub fn report_trace(&mut self, on: bool) -> io::Result<()> {
+        if self.client.proto < crate::protocol::PROTO_TRACE {
+            return Ok(());
+        }
+        self.client.send(&ClientMsg::Trace { on })
+    }
+
     /// Identify this display client to the host ([`ClientMsg::Hello`]) so
     /// state subscribers can see *who* holds the display ([`AttachInfo`]
     /// (crate::protocol::AttachInfo)). Advisory, sent right after attaching

@@ -180,10 +180,19 @@ believed it was in (mouse protocol, cursor-key mode, kitty flags), whether the
 write succeeded, and how many bytes are still queued in ghost rather than with
 the child. Between the `key` line and the `wire` line that should follow it, the
 log separates "the keystroke never reached ghost" from "ghost consumed it" from
-"ghost sent it and the program ignored it". The file rolls at 8 MiB, keeping one
-previous generation — a program holding any-motion mouse tracking generates a
-report per cell the pointer crosses, so an armed trace is not quiet. Leave it off
-unless you are chasing something.
+"ghost sent it and the program ignored it".
+
+The session host keeps the other half. Told to trace by the window driving it, it
+logs what it received for the child and what its PTY write actually accepted
+(`host input …` / `pty wrote …`) — the difference between bytes queued in the
+host and bytes the child can read. It writes on **its own** machine, so a remote
+session leaves two files: the GUI's, here, and the host's, over there. Arming is
+live in both halves; a host that predates the message keeps quiet, so upgrade
+(`ghost __upgrade <id>`) or restart a long-running one to trace it.
+
+The file rolls at 8 MiB, keeping one previous generation — a program holding
+any-motion mouse tracking generates a report per cell the pointer crosses, so an
+armed trace is not quiet. Leave it off unless you are chasing something.
 
 Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
 frost, padding, and word characters to every open window without a restart. Font and the initial

@@ -209,6 +209,13 @@ impl RealRemote {
         self.remote_root.path().join("home")
     }
 
+    /// The remote's `$XDG_DATA_HOME` — where a process running over THERE writes
+    /// its own data (its recordings, its wire trace), which is not where the GUI
+    /// on this side writes.
+    pub fn data_home(&self) -> PathBuf {
+        self.remote_root.path().join("data")
+    }
+
     /// Make the remote go **silent**, the way a real reboot or network partition
     /// does: the peer stops responding with **no FIN/RST**, so the local
     /// ControlMaster can't tell the connection died — it wedges (TCP dead, process

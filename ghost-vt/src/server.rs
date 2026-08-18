@@ -1878,15 +1878,48 @@ fn host_main(
         // gone: there is nowhere to deliver these bytes, so drop them and let the
         // read path drive the clean, tail-complete exit — finalizing from here
         // could truncate output still buffered on the master.
+        // Traced on both outcomes, not just the bad one: on the day a keystroke
+        // goes missing, silence in the log must mean "not armed", never "the
+        // drain was fine". This is the only place that can say the bytes reached
+        // the child's PTY rather than the host's queue.
+        let traced = crate::trace::enabled() && !pty_out.is_empty();
         while !pty_out.is_empty() {
             match (&pty).write(&pty_out) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if traced {
+                        crate::trace::log(
+                            current_name,
+                            format_args!("pty took nothing left={}B", pty_out.len()),
+                        );
+                    }
+                    break;
+                }
                 Ok(n) => {
                     pty_out.drain(..n);
+                    if traced {
+                        crate::trace::log(
+                            current_name,
+                            format_args!("pty wrote {n}B left={}B", pty_out.len()),
+                        );
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if traced {
+                        crate::trace::log(
+                            current_name,
+                            format_args!("pty WOULD BLOCK left={}B", pty_out.len()),
+                        );
+                    }
+                    break;
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
+                Err(e) => {
+                    if traced {
+                        crate::trace::log(
+                            current_name,
+                            format_args!("pty GONE ({e}) dropped {}B", pty_out.len()),
+                        );
+                    }
                     pty_out.clear();
                     break;
                 }
@@ -2248,6 +2281,21 @@ fn handle_client_messages(
                     let _ = r.input(&bytes);
                 }
                 pty_out.extend_from_slice(&bytes);
+                // Logged at RECEIPT, like the recording — but unlike the
+                // recording it is followed by what the drain did with the bytes,
+                // so "the host got it" and "the child got it" stop being the
+                // same line. `queued` is the backlog including these bytes.
+                if crate::trace::enabled() {
+                    crate::trace::log(
+                        current_name,
+                        format_args!(
+                            "host input {} {}B queued={}",
+                            crate::trace::escape(&bytes),
+                            bytes.len(),
+                            pty_out.len()
+                        ),
+                    );
+                }
             }
             ClientMsg::Resize { cols, rows } => {
                 let _ = pty.resize(Size::new(rows, cols));
@@ -2261,6 +2309,7 @@ fn handle_client_messages(
                     c.resynced = true;
                 }
             }
+            ClientMsg::Trace { on } => crate::trace::set_enabled(on),
             ClientMsg::Detach => return Ok(Disposition::Drop),
             ClientMsg::Kill => return Ok(Disposition::Kill),
             ClientMsg::Rename(new) => {

@@ -12,7 +12,7 @@
 //! Armed two ways. `[diagnostics] wire_trace = true` in `ui.toml` is the one a
 //! user reaches for: it survives however the GUI was started (a desktop file has
 //! nobody to hand an env var to), it takes effect on the next config reload, and
-//! it writes to [`ghost_vt::paths::wire_trace_path`] — a path ghost picks, so
+//! it writes to [`crate::paths::wire_trace_path`] — a path ghost picks, so
 //! there is nothing to remember. `GHOST_FOCUS_TRACE=/path/to/file` still names a
 //! destination directly and wins over the config, for tests and one-off runs.
 //! Disarmed (the normal case), every hook costs one relaxed atomic load and one
@@ -48,7 +48,7 @@ static MOUSE_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// Arm or disarm the config-driven trace. Called at startup and on every config
 /// reload, so editing `ui.toml` turns it on under a running GUI.
 pub fn set_enabled(on: bool) {
-    let dest = on.then(ghost_vt::paths::wire_trace_path);
+    let dest = on.then(crate::paths::wire_trace_path);
     if let Ok(mut c) = CONFIGURED.lock() {
         *c = dest;
         ARMED.store(c.is_some(), Ordering::Relaxed);
@@ -165,8 +165,11 @@ fn roll_if_full(path: &std::path::Path) {
 /// it wrote. Serialized process-wide — the destination is an env var, so two
 /// capturing tests running at once would write into each other's file (and each
 /// other's assertions).
-#[cfg(test)]
-pub(crate) fn capture(f: impl FnOnce()) -> String {
+///
+/// Public because the crates whose tracing this covers are OTHER crates, and a
+/// `#[cfg(test)]` item is invisible across a crate boundary.
+#[doc(hidden)]
+pub fn capture(f: impl FnOnce()) -> String {
     use std::sync::atomic::AtomicU32;
     static LOCK: Mutex<()> = Mutex::new(());
     static NTH: AtomicU32 = AtomicU32::new(0);

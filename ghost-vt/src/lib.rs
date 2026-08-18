@@ -31,6 +31,7 @@ pub mod session;
 mod signals;
 pub mod systemd;
 pub mod terminfo;
+pub mod trace;
 pub mod transport;
 pub mod watch;
 

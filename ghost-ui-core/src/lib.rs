@@ -21,7 +21,9 @@ pub mod mouse;
 pub mod root;
 pub mod terminal;
 pub mod text_input;
-pub mod trace;
+/// The wire trace lives with the host (which traces its own PTY drain) so both
+/// halves share one format and one file; re-exported here for the view code.
+pub use ghost_vt::trace;
 pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};
