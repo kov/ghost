@@ -3109,6 +3109,14 @@ impl TerminalView {
     ) -> Vec<Cmd> {
         let proto = state.screen.vt().mouse_protocol();
         let sgr = state.screen.vt().mouse_sgr();
+        // The window is bigger than the grid — the padding, and the slack the last
+        // row and column leave — so a pointer out there addresses a cell one past
+        // the end. Clamp what goes on the wire (xterm and kitty do), and only there:
+        // the local paths clamp against the rendered window for themselves.
+        let cell = (
+            cell.0.clamp(1, state.cols.max(1)),
+            cell.1.clamp(1, state.rows.max(1)),
+        );
         let encoded = mouse::encode(proto, sgr, kind, button, held, cell.0, cell.1, mods);
         // The mouse stream is the one ghost generates unprompted — a program holding
         // any-motion tracking gets a report per cell the pointer crosses, whether or
@@ -5525,6 +5533,20 @@ mod tests {
             1.0,
         ));
         assert_eq!(cmds, vec![sent("alpha", b"\x1b[<0;1;1M")]);
+    }
+
+    #[test]
+    fn a_report_from_the_padding_is_clamped_to_the_grid() {
+        // The window is wider and taller than the grid it draws — the padding, and
+        // whatever slack the last row/column leaves. A pointer out there still has a
+        // cell address, and it is one past the end. xterm and kitty clamp; reporting
+        // col 81 of an 80-column grid hands the program a cell that does not exist.
+        let mut m = model();
+        // Any-motion tracking + SGR: a bare pointer move is reported.
+        feed(&mut m, b"\x1b[?1003h\x1b[?1006h");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        let cmds = m.update(ptr(PointerPhase::Motion, None, 10_000.0, 10_000.0));
+        assert_eq!(cmds, vec![sent("alpha", b"\x1b[<35;80;24M")]);
     }
 
     #[test]

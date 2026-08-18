@@ -9083,6 +9083,29 @@ mod tests {
     }
 
     #[test]
+    fn a_config_reload_arms_and_disarms_the_wire_trace() {
+        // The whole point of putting the switch in `ui.toml` is that a user chasing
+        // the bug does not have to relaunch the GUI to start recording, nor to stop.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            assert!(
+                !ghost_ui_core::trace::enabled(),
+                "off with no config saying otherwise"
+            );
+
+            let on = config::UiConfig::parse("[diagnostics]\nwire_trace = true\n").expect("parse");
+            app.reload_config(&on, &fe);
+            assert!(ghost_ui_core::trace::enabled(), "the edit arms it live");
+
+            let off =
+                config::UiConfig::parse("[diagnostics]\nwire_trace = false\n").expect("parse");
+            app.reload_config(&off, &fe);
+            assert!(!ghost_ui_core::trace::enabled(), "and disarms it live");
+        });
+    }
+
+    #[test]
     fn unique_session_name_prefixes_the_creator_host_and_increments() {
         // Session names are namespaced by *this* machine's host tag (so two
         // ghosts on different hosts sharing a home can't clash) followed by
