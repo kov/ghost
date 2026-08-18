@@ -116,7 +116,7 @@ fn an_os_focus_event_names_its_window_in_the_trace() {
         // a bare focus-out today.
         let path = tmp.join("focus-trace.log");
         // SAFETY: `with_isolated_xdg` holds the suite's env lock, so no other test
-        // reads or writes the environment concurrently; `focus_trace` re-reads the
+        // reads or writes the environment concurrently; `trace` re-reads the
         // var per event, so there is no latched state to leave behind.
         unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
         app.dispatch(single, UiEvent::Focus(false), &fe);
@@ -876,5 +876,69 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
 
         support::kill_session("watcher-a");
         support::kill_session("other-b");
+    });
+}
+
+/// The wire trace is turned on by a config edit, not by a different way of
+/// starting ghost — a GUI launched from a desktop file has nowhere to put an
+/// env var, and remembering to relaunch it specially is exactly what does not
+/// happen on the day the bug shows up. So `ui.toml` arms it, and the log lands
+/// at a path ghost picks rather than one the user has to supply.
+#[test]
+fn the_wire_trace_is_armed_by_the_config_file() {
+    with_isolated_xdg(|_tmp| {
+        support::write_ui_config("[diagnostics]\nwire_trace = true\n");
+        support::spawn_session_running("traced-1", "exec cat");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "traced-1", g, None)
+            .expect("window");
+        app.wake(&fe);
+        app.dispatch(wid, UiEvent::Text("hello".into()), &fe);
+        app.wake(&fe);
+
+        let path = ghost_vt::paths::wire_trace_path();
+        let log = wait_until(Duration::from_secs(5), || {
+            app.wake(&fe);
+            std::fs::read_to_string(&path).is_ok_and(|l| l.contains("hello"))
+        });
+        assert!(
+            log,
+            "typing must be traced to {}; it holds: {:?}",
+            path.display(),
+            std::fs::read_to_string(&path).unwrap_or_default()
+        );
+        support::kill_session("traced-1");
+    });
+}
+
+/// ...and stays off otherwise. A trace nobody asked for is a file quietly
+/// growing in the user's data dir, fed by every keystroke they type.
+#[test]
+fn the_wire_trace_writes_nothing_until_it_is_asked_for() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("untraced-1", "exec cat");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "untraced-1", g, None)
+            .expect("window");
+        app.wake(&fe);
+        app.dispatch(wid, UiEvent::Text("hello".into()), &fe);
+        app.wake(&fe);
+
+        let path = ghost_vt::paths::wire_trace_path();
+        assert!(
+            !path.exists(),
+            "nothing asked for a trace, so {} must not exist; it holds: {:?}",
+            path.display(),
+            std::fs::read_to_string(&path).unwrap_or_default()
+        );
+        support::kill_session("untraced-1");
     });
 }

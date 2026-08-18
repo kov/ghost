@@ -153,6 +153,9 @@ group = 1
 
 [zoom]
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
+
+[diagnostics]
+wire_trace = false      # log everything ghost sends a program; see below
 ```
 
 A translucent window is glass, and ghost picks how to render it rather than
@@ -168,6 +171,19 @@ is ignored on a compositor that blurs.
 The choice is live, not a launch-time decision: a compositor that withdraws blur
 mid-session (you switched the desktop effect off) hands the window back to frost,
 and switching it on takes it away again.
+
+`wire_trace` is for chasing input a program never acts on. With it on, every byte
+ghost sends a child — keystrokes, pasted text, mouse reports, query replies, the
+DEC ?1004 focus conversation — appends a timestamped line to
+`$XDG_DATA_HOME/ghost/trace/wire.log`, along with the terminal state ghost
+believed it was in (mouse protocol, cursor-key mode, kitty flags), whether the
+write succeeded, and how many bytes are still queued in ghost rather than with
+the child. Between the `key` line and the `wire` line that should follow it, the
+log separates "the keystroke never reached ghost" from "ghost consumed it" from
+"ghost sent it and the program ignored it". The file rolls at 8 MiB, keeping one
+previous generation — a program holding any-motion mouse tracking generates a
+report per cell the pointer crosses, so an armed trace is not quiet. Leave it off
+unless you are chasing something.
 
 Edits are hot-reloaded: saving `ui.toml` re-applies the color scheme, opacity,
 frost, padding, and word characters to every open window without a restart. Font and the initial

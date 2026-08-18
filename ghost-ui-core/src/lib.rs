@@ -14,7 +14,6 @@ pub mod cmd;
 pub mod encode;
 pub mod event;
 pub mod fleet;
-pub mod focus_trace;
 pub mod frame;
 pub mod group;
 pub mod input;
@@ -22,6 +21,7 @@ pub mod mouse;
 pub mod root;
 pub mod terminal;
 pub mod text_input;
+pub mod trace;
 pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};

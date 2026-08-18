@@ -797,12 +797,12 @@ pub fn feed_observed(
     // that was really unfocused. So name the drop in the same `wire` vocabulary the
     // shell uses (ok / WRITE FAILED / DROPPED), or the log shows a focus-out that
     // never left the process, right where a focus incident gets read.
-    if crate::focus_trace::enabled() {
+    if crate::trace::enabled() {
         for c in &dropped_child_effects {
             if let Cmd::SendInput { session, bytes } = c
-                && let Some(which) = crate::focus_trace::report_in(bytes)
+                && let Some(which) = crate::trace::report_in(bytes)
             {
-                crate::focus_trace::log(
+                crate::trace::log(
                     session,
                     format_args!("wire {which} DROPPED (observed mirror)"),
                 );
@@ -2044,7 +2044,7 @@ impl RootModel {
         };
         match self.foreground_mut(sessions) {
             Some((view, state)) => {
-                crate::focus_trace::log(
+                crate::trace::log(
                     state.session(),
                     format_args!("promotion reassert focused_win={focused}"),
                 );
@@ -3677,7 +3677,7 @@ mod tests {
     /// shell uses for a send, a failure, and a clientless session.
     #[test]
     fn an_observed_mirror_names_the_focus_report_it_drops() {
-        let log = crate::focus_trace::capture(|| {
+        let log = crate::trace::capture(|| {
             let mut sessions = Sessions::new();
             sessions.set_policy(SessionPolicy::allow_all());
             let (mut w, _, _) = RootModel::fleet(METRICS, SIZE, 1.0);

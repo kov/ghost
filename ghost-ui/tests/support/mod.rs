@@ -321,6 +321,14 @@ pub fn seen_tiles(scene: &ghost_render::Scene, candidates: &[&str]) -> Vec<Strin
         .collect()
 }
 
+/// Write `ui.toml` into the (isolated) config dir — the file a user edits to turn
+/// a setting on without changing how ghost is started.
+pub fn write_ui_config(text: &str) {
+    let dir = ghost_vt::paths::config_dir();
+    std::fs::create_dir_all(&dir).expect("config dir");
+    std::fs::write(dir.join("ui.toml"), text).expect("write ui.toml");
+}
+
 /// Leave behind exactly what a window that ran days ago leaves: a group in
 /// `groups.toml` remembering a member that is no longer running, with the
 /// descriptor and recording that make it resurrectable. This is the state that

@@ -1185,13 +1185,13 @@ impl SessionState {
             // exactly this and then swallows input until a focus change arrives.
             let focus_report_now = self.screen.vt().focus_report();
             if focus_report_now != focus_report_before {
-                crate::focus_trace::log(
+                crate::trace::log(
                     &self.session,
                     format_args!("mode 1004 {}", if focus_report_now { "ON" } else { "OFF" }),
                 );
             }
             if focus_report_now && !focus_report_before {
-                crate::focus_trace::log(
+                crate::trace::log(
                     &self.session,
                     format_args!(
                         "rising edge -> report {} (view focused={})",
@@ -2177,6 +2177,30 @@ impl TerminalView {
         // post-commit — a benign orphan `:3` under the kitty event-types flag, for
         // the rare commit key that carries a modifier; a press-tracking fix waits
         // for the broader IME work.)
+        // The key ghost believes it received, before any of the decisions below can
+        // swallow it. Paired with the `wire` line that follows (or its absence), this
+        // is what separates "the keystroke never reached ghost", "ghost consumed it",
+        // and "ghost sent it and the program ignored it" — three very different bugs
+        // that look identical from the far side of a wedged prompt.
+        if crate::trace::enabled() {
+            crate::trace::log(
+                state.session(),
+                format_args!(
+                    "key {kind:?} {key:?} mods={}{}{}{} app_cursor={} kitty_flags={:#x}{}",
+                    if mods.ctrl { "C" } else { "-" },
+                    if mods.alt { "A" } else { "-" },
+                    if mods.shift { "S" } else { "-" },
+                    if mods.sup { "U" } else { "-" },
+                    state.screen.vt().cursor_key_app_mode(),
+                    state.screen.vt().kitty_keyboard_flags(),
+                    if self.preedit.is_empty() {
+                        ""
+                    } else {
+                        " SWALLOWED (IME composing)"
+                    },
+                ),
+            );
+        }
         if !self.preedit.is_empty() {
             return Vec::new();
         }
@@ -2349,7 +2373,7 @@ impl TerminalView {
             self.preedit.clear();
         }
         if !state.screen.vt().focus_report() {
-            crate::focus_trace::log(
+            crate::trace::log(
                 state.session(),
                 format_args!("focus-event focused={focused} MUTED (1004 off)"),
             );
@@ -2361,13 +2385,13 @@ impl TerminalView {
         // focus-in for a focus it never lost — an event that did not happen. `top`
         // answers one with "Unknown command - try 'h' for help".
         if was == focused {
-            crate::focus_trace::log(
+            crate::trace::log(
                 state.session(),
                 format_args!("focus-event focused={focused} UNCHANGED (no report)"),
             );
             return cmds;
         }
-        crate::focus_trace::log(
+        crate::trace::log(
             state.session(),
             format_args!(
                 "focus-event focused={focused} -> report {}",
@@ -3085,7 +3109,32 @@ impl TerminalView {
     ) -> Vec<Cmd> {
         let proto = state.screen.vt().mouse_protocol();
         let sgr = state.screen.vt().mouse_sgr();
-        match mouse::encode(proto, sgr, kind, button, held, cell.0, cell.1, mods) {
+        let encoded = mouse::encode(proto, sgr, kind, button, held, cell.0, cell.1, mods);
+        // The mouse stream is the one ghost generates unprompted — a program holding
+        // any-motion tracking gets a report per cell the pointer crosses, whether or
+        // not anyone is clicking. The count makes that rate readable straight out of
+        // the log, and the mode says which report shape the program asked for.
+        if crate::trace::enabled() {
+            let (cols, rows) = (state.cols, state.rows);
+            let n = crate::trace::count_mouse_report();
+            crate::trace::log(
+                state.session(),
+                format_args!(
+                    "mouse #{n} {kind:?} btn={button:?} held={held} cell={},{} grid={cols}x{rows} \
+                     proto={proto:?} sgr={sgr} mods={}{}{} -> {}",
+                    cell.0,
+                    cell.1,
+                    if mods.ctrl { "C" } else { "-" },
+                    if mods.alt { "A" } else { "-" },
+                    if mods.shift { "S" } else { "-" },
+                    match &encoded {
+                        Some(b) => crate::trace::escape(b),
+                        None => "(suppressed by the active protocol)".to_string(),
+                    }
+                ),
+            );
+        }
+        match encoded {
             Some(bytes) => state.send(bytes),
             None => Vec::new(),
         }
@@ -5443,8 +5492,8 @@ mod tests {
     }
 
     #[test]
-    fn focus_trace_records_the_focus_conversation() {
-        let log = crate::focus_trace::capture(|| {
+    fn trace_records_the_focus_conversation() {
+        let log = crate::trace::capture(|| {
             let mut m = model();
             m.update(UiEvent::Focus(true));
             feed(&mut m, b"\x1b[?1004h"); // rising edge: mode ON + report I

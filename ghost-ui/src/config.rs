@@ -141,6 +141,7 @@ pub struct UiConfig {
     window: Window,
     font: Font,
     input: Input,
+    diagnostics: Diagnostics,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -251,6 +252,22 @@ impl Default for Input {
             option_as_meta: true,
         }
     }
+}
+
+/// Diagnostics that are off until asked for. Armed here rather than by an
+/// environment variable because a GUI is not started from a shell: by the time a
+/// bug shows up, relaunching it specially is exactly what nobody remembers to do.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Diagnostics {
+    /// Log every byte ghost sends a child — keystrokes, pasted text, mouse
+    /// reports, query replies, focus reports — with the terminal state ghost
+    /// believed it was in and what the write did, to
+    /// `$XDG_DATA_HOME/ghost/trace/wire.log` (rolled at 8 MiB). For chasing input
+    /// that a program never acts on: the log says whether ghost sent it, what
+    /// surrounded it, and whether it was still queued in this process. Off by
+    /// default; takes effect on the next config reload, no restart.
+    wire_trace: bool,
 }
 
 /// One content-aware double-click rule — see [`Input::selection_rules`].
@@ -409,6 +426,11 @@ impl UiConfig {
     /// edges. Non-finite falls back to the default; otherwise clamped to a sane range
     /// (0 opts out). The shell scales this by the device factor and hands it to the
     /// model, which insets the grid and lets the terminal background fill the border.
+    /// Whether to log everything ghost sends a child — see [`Diagnostics::wire_trace`].
+    pub fn wire_trace(&self) -> bool {
+        self.diagnostics.wire_trace
+    }
+
     pub fn padding(&self) -> f32 {
         if self.window.padding.is_finite() {
             self.window.padding.clamp(0.0, MAX_PADDING)

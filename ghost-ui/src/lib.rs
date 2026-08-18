@@ -1825,6 +1825,9 @@ fn interactive(fresh: bool, ssh_window: bool) {
             });
         });
     }
+    // Arm the wire trace if the config asks for it, before any window exists — the
+    // interesting bytes start flowing with the first attach.
+    ghost_ui_core::trace::set_enabled(config::UiConfig::load().wire_trace());
     let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let config_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3223,6 +3226,7 @@ impl App {
     /// never started. Use [`headless_with_sink`](App::headless_with_sink) to run them
     /// for real (against a real remote host) and drain their results yourself.
     pub fn headless() -> Self {
+        ghost_ui_core::trace::set_enabled(config::UiConfig::load().wire_trace());
         let saved = windows::load();
         App {
             windows: HashMap::new(),
@@ -4058,6 +4062,9 @@ impl App {
     /// resize). Triggered by the config watcher; takes `cfg` explicitly so tests
     /// drive it directly.
     fn reload_config(&mut self, cfg: &config::UiConfig, event_loop: &dyn Frontend) {
+        // Editing `ui.toml` arms (or disarms) the wire trace under the running GUI,
+        // which is the whole point of it being a setting rather than an env var.
+        ghost_ui_core::trace::set_enabled(cfg.wire_trace());
         let theme = cfg.theme();
         let colors = theme_colors(&theme);
         let pad = cfg.padding();
@@ -4204,14 +4211,14 @@ impl App {
         // reads as a bare focus-out. This is the line that says whether the window
         // you focused is the one that got the focus.
         if let UiEvent::Focus(focused) = &ev
-            && ghost_ui_core::focus_trace::enabled()
+            && ghost_ui_core::trace::enabled()
             && let Some(w) = self.windows.get(&wid)
         {
             let (mode, fg) = match w.root.single_foreground() {
                 Some(fg) => ("single", fg.as_str()),
                 None => ("fleet", "-"),
             };
-            ghost_ui_core::focus_trace::log(
+            ghost_ui_core::trace::log(
                 fg,
                 format_args!("os-focus win={wid:?} focused={focused} mode={mode}"),
             );
@@ -4255,36 +4262,47 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SendInput { session, bytes } => {
-                    // For the focus trace: what a focus report actually did on the
-                    // wire — sent, failed, or dropped for want of a client.
-                    let report = if ghost_ui_core::focus_trace::enabled() {
-                        ghost_ui_core::focus_trace::report_in(&bytes)
-                    } else {
-                        None
-                    };
+                    // What went out, and what the write did with it. A focus report
+                    // is named (`wire I ok`) because the focus conversation is read
+                    // as its own story; everything else is traced by its bytes.
+                    let traced = ghost_ui_core::trace::enabled();
+                    let what = traced
+                        .then(|| ghost_ui_core::trace::report_in(&bytes))
+                        .flatten()
+                        .map(str::to_string)
+                        .or_else(|| traced.then(|| ghost_ui_core::trace::escape(&bytes)));
                     // Input from any viewing window reaches the one process-wide client.
                     match self.sessions.get_mut(&session) {
                         Some(s) => {
                             let res = s.send_input(&bytes);
-                            if let Some(which) = report {
+                            if let Some(what) = what {
+                                // `pending` is the backpressure: `send_input` reports
+                                // success for whatever a non-blocking write refused
+                                // and queues the rest, so a wedged write path is
+                                // invisible from here without it. Non-zero means the
+                                // bytes are still in this process, not with the child.
+                                let pending = s.pending_input();
                                 match &res {
-                                    Ok(()) => ghost_ui_core::focus_trace::log(
+                                    Ok(()) => ghost_ui_core::trace::log(
                                         &session,
-                                        format_args!("wire {which} ok"),
+                                        format_args!(
+                                            "wire {what} ok {}B pending={pending}",
+                                            bytes.len()
+                                        ),
                                     ),
-                                    Err(e) => ghost_ui_core::focus_trace::log(
+                                    Err(e) => ghost_ui_core::trace::log(
                                         &session,
-                                        format_args!("wire {which} WRITE FAILED: {e}"),
+                                        format_args!("wire {what} WRITE FAILED: {e}"),
                                     ),
                                 }
                             }
                             let _ = res;
                         }
                         None => {
-                            if let Some(which) = report {
-                                ghost_ui_core::focus_trace::log(
+                            if let Some(what) = what {
+                                ghost_ui_core::trace::log(
                                     &session,
-                                    format_args!("wire {which} DROPPED (no client)"),
+                                    format_args!("wire {what} DROPPED (no client)"),
                                 );
                             }
                         }
@@ -5267,7 +5285,7 @@ impl App {
         };
         match event {
             StallEvent::Wedged { bytes, waited } => {
-                ghost_ui_core::focus_trace::log(
+                ghost_ui_core::trace::log(
                     name,
                     format_args!(
                         "input STALLED {bytes} bytes unwritten for {:.1}s -> probing transport",
@@ -5279,7 +5297,7 @@ impl App {
                 }
             }
             StallEvent::Drained { bytes, waited } => {
-                ghost_ui_core::focus_trace::log(
+                ghost_ui_core::trace::log(
                     name,
                     format_args!(
                         "input DRAINED {bytes} bytes after {:.1}s",
@@ -5383,7 +5401,7 @@ impl App {
         // A pre-existing session that dropped: honor its running host's level.
         let proto = host.remote.session_proto(&host.remote_ghost, &real);
         if self.attach_ssh_into(wid, &name, cmd, proto, event_loop) {
-            ghost_ui_core::focus_trace::log(
+            ghost_ui_core::trace::log(
                 &name,
                 format_args!("transport REATTACHED (fresh emulator, resync inbound)"),
             );
@@ -8125,7 +8143,7 @@ impl App {
         let now = Instant::now();
         let parked = now.duration_since(self.last_wake_at);
         if parked >= SUSPEND_PROBE_GAP {
-            ghost_ui_core::focus_trace::log(
+            ghost_ui_core::trace::log(
                 "*",
                 format_args!(
                     "suspend gap {}s -> probing remote transports",
@@ -8179,7 +8197,7 @@ impl App {
             // torn down — its session may still be alive on the far side. A local EOF
             // (the host process is gone) is a genuine end, as before.
             if end == PumpEnd::Disconnected && is_remote_id(&name) {
-                ghost_ui_core::focus_trace::log(
+                ghost_ui_core::trace::log(
                     &name,
                     format_args!("transport DISCONNECTED (holding for reconnect)"),
                 );
@@ -8651,7 +8669,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wedged_input_queue_names_itself_in_the_focus_trace() {
+    fn a_wedged_input_queue_names_itself_in_the_trace() {
         // What the next incident should read like without any reconstruction:
         // one line when the write path stops taking bytes, one when it resumes.
         let log = with_isolated_xdg(|| {

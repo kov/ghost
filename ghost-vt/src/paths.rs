@@ -160,6 +160,20 @@ pub fn recording_path(name: &str) -> PathBuf {
     recordings_dir().join(format!("{name}.ghostrec"))
 }
 
+/// The directory holding diagnostic traces (`<data>/ghost/trace`). Ghost picks
+/// this rather than taking a path from the user: the trace is armed by a config
+/// edit, and a GUI started from a desktop file has nobody to hand it a path.
+pub fn trace_dir() -> PathBuf {
+    data_dir().join("trace")
+}
+
+/// The wire trace's log — every byte ghost sends a child, and why. One file for
+/// the machine; each line names the process and session it belongs to, so two
+/// ghosts writing at once stay legible.
+pub fn wire_trace_path() -> PathBuf {
+    trace_dir().join("wire.log")
+}
+
 /// A short, filesystem-safe tag for *this* machine — the creator's short
 /// hostname — used to namespace the session names the GUI mints so two ghosts
 /// on different machines sharing a home (or reconnecting a remote fleet) can't
