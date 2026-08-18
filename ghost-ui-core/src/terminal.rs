@@ -2348,25 +2348,37 @@ impl TerminalView {
             // stuck swallowing input should the platform omit `Ime::Disabled`.
             self.preedit.clear();
         }
-        if state.screen.vt().focus_report() {
-            crate::focus_trace::log(
-                state.session(),
-                format_args!(
-                    "focus-event focused={focused} -> report {}",
-                    if focused { "I" } else { "O" }
-                ),
-            );
-            cmds.extend(state.send(if focused {
-                b"\x1b[I".to_vec()
-            } else {
-                b"\x1b[O".to_vec()
-            }));
-        } else {
+        if !state.screen.vt().focus_report() {
             crate::focus_trace::log(
                 state.session(),
                 format_args!("focus-event focused={focused} MUTED (1004 off)"),
             );
+            return cmds;
         }
+        // Only a real change is an event. A view coming forward is re-forwarded the
+        // window's focus ([`RootModel::reassert_foreground_focus`]) even though the
+        // window never lost the keyboard, and reporting that would hand the program a
+        // focus-in for a focus it never lost — an event that did not happen. `top`
+        // answers one with "Unknown command - try 'h' for help".
+        if was == focused {
+            crate::focus_trace::log(
+                state.session(),
+                format_args!("focus-event focused={focused} UNCHANGED (no report)"),
+            );
+            return cmds;
+        }
+        crate::focus_trace::log(
+            state.session(),
+            format_args!(
+                "focus-event focused={focused} -> report {}",
+                if focused { "I" } else { "O" }
+            ),
+        );
+        cmds.extend(state.send(if focused {
+            b"\x1b[I".to_vec()
+        } else {
+            b"\x1b[O".to_vec()
+        }));
         cmds
     }
 
@@ -5359,21 +5371,23 @@ mod tests {
     }
 
     #[test]
-    fn focus_reports_only_when_enabled() {
+    fn focus_reports_only_a_real_change_while_enabled() {
         let mut m = model();
         // Taking the keyboard repaints the cursor (block, not outline) but reports
         // nothing while mode 1004 is off.
         assert_eq!(m.update(UiEvent::Focus(true)), vec![Cmd::Redraw]);
         feed(&mut m, b"\x1b[?1004h");
-        // Focus we already had: no repaint, and the mode is on, so a report.
-        assert_eq!(
-            m.update(UiEvent::Focus(true)),
-            vec![sent("alpha", b"\x1b[I")]
-        );
+        // Focus we already had is not an event. A view is re-forwarded the window's
+        // focus every time it comes forward, and a program told it gained a focus it
+        // never lost hears something that did not happen.
+        assert_eq!(m.update(UiEvent::Focus(true)), Vec::<Cmd>::new());
+        // Losing it is a change, so it reports (and repaints the hollowed cursor)...
         assert_eq!(
             m.update(UiEvent::Focus(false)),
             vec![Cmd::Redraw, sent("alpha", b"\x1b[O")]
         );
+        // ...and losing it again is not.
+        assert_eq!(m.update(UiEvent::Focus(false)), Vec::<Cmd>::new());
     }
 
     #[test]

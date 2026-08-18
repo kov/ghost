@@ -2032,7 +2032,9 @@ impl RootModel {
     /// window's focus did not change — so the new foreground is focused exactly
     /// when the window is. Forwarding keeps its `focused` flag truthful (a later
     /// DEC ?1004 enable then reports the right state) and hands a focus-reporting
-    /// app the ESC[I / ESC[O a real terminal sends as its view comes forward.
+    /// app the ESC[I its view coming forward earns — paired with the ESC[O the
+    /// session it displaced got on its way out ([`Self::adopt`]). Only a real
+    /// change reports: re-forwarding focus a view never lost is not an event.
     fn reassert_foreground_focus(&mut self, sessions: &mut Sessions) -> Vec<Cmd> {
         let focused = self.focused_win;
         // Focus never re-grids, but `update` wants the drivership bit anyway.
@@ -2115,6 +2117,18 @@ impl RootModel {
                 if old == id {
                     (view, Vec::new())
                 } else {
+                    // The window stops showing `old`, so its program is told it is no
+                    // longer the visible one — the DEC ?1004 focus-out tmux and kitty
+                    // send when a pane stops being the one on screen. Without it a
+                    // session's focus state only ever climbs to "focused", and the
+                    // focus-in it hears coming back is one it never lost focus for.
+                    let mut view = view;
+                    let gone = match sessions.get_mut(&old) {
+                        Some(state) => {
+                            view.update(state, UiEvent::Focus(false), self.mine.contains(&old))
+                        }
+                        None => Vec::new(),
+                    };
                     // Stow the outgoing foreground's view as a warm mirror (its state
                     // stays put in the registry); restore the target's view if we have
                     // one (instant, no re-attach), else mint a fresh state + view.
@@ -2126,7 +2140,7 @@ impl RootModel {
                             Box::new(TerminalView::new(self.metrics, 1, 1))
                         }
                     };
-                    (view, Vec::new())
+                    (view, gone)
                 }
             }
         };

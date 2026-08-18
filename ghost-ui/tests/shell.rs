@@ -706,3 +706,175 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
         support::kill_session("first-a");
     });
 }
+
+/// The rendered occurrences of `needle` on a session's screen.
+fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
+    app.states()
+        .text_of(id)
+        .map(|lines| lines.join("\n").matches(needle).count())
+        .unwrap_or(0)
+}
+
+/// A key press, as the window receives one.
+fn press(key: ghost_ui_core::Key, mods: ghost_ui_core::Mods) -> UiEvent {
+    UiEvent::Key {
+        key,
+        mods,
+        kind: ghost_ui_core::KeyEventKind::Press,
+        alts: None,
+    }
+}
+
+/// Dive into `name` the way the user does — click its card in the fleet — and
+/// wait until the window really is showing it.
+fn open_card(app: &mut App, wid: winit::window::WindowId, fe: &HeadlessFrontend, name: &str) {
+    let listed = wait_until(Duration::from_secs(10), || {
+        reconcile(app, wid, fe);
+        app.wake(fe);
+        sees_tile(&app.root(wid).expect("window").view(app.states()), name)
+    });
+    assert!(
+        listed,
+        "{name} never appeared in the fleet: {:?}",
+        visible_text(&app.root(wid).expect("window").view(app.states()))
+    );
+    let scene = app.root(wid).expect("window").view(app.states());
+    let (x, y) = support::tile_center(&scene, name)
+        .unwrap_or_else(|| panic!("no card to click for {name}: {:?}", visible_text(&scene)));
+    for ev in support::click_events(x, y) {
+        app.dispatch(wid, ev, fe);
+    }
+    let opened = wait_until(Duration::from_secs(10), || {
+        app.wake(fe);
+        app.root(wid).is_some_and(|r| r.foregrounds(name))
+    });
+    assert!(
+        opened,
+        "clicking {name}'s card never opened it: {:?}",
+        visible_text(&app.root(wid).expect("window").view(app.states()))
+    );
+}
+
+/// Ctrl-Tab away from a session and back must read to its program as a real
+/// focus change: `ESC[O` as the window stops showing it, `ESC[I` when it comes
+/// back — the pair tmux and kitty send when a pane stops being the visible one.
+///
+/// Ghost sent only the `ESC[I`. A program that never heard it lost focus was
+/// handed a focus-in for a focus it never lost, once per switch — `top` answers
+/// each with "Unknown command - try 'h' for help", and an app tracking
+/// visibility could never learn it was hidden.
+///
+/// The child echoes every byte it is sent visibly (`cat -v` renders ESC as
+/// `^[`), with `stty -echo` so the pty's line discipline can't echo the reports
+/// as well: each visible `^[[I` / `^[[O` is one report the program really got.
+#[test]
+fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("watcher-a", "exec sh");
+        support::spawn_session_running("other-b", "exec cat");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        // The window holds the keyboard throughout, so every report below is the
+        // *switch* talking and never the OS taking focus away.
+        app.dispatch(wid, UiEvent::Focus(true), &fe);
+
+        // Two cards clicked, with F9 back to the overview between them, leaves the
+        // window owning both sessions with watcher-a in front — what makes Ctrl-Tab
+        // a switch rather than a no-op.
+        open_card(&mut app, wid, &fe, "other-b");
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Named(ghost_ui_core::NamedKey::F9),
+                ghost_ui_core::Mods::NONE,
+            ),
+            &fe,
+        );
+        app.wake(&fe);
+        open_card(&mut app, wid, &fe, "watcher-a");
+
+        // The program subscribes to focus reporting and then echoes every byte it
+        // is sent. `-icanon` so a report — which carries no newline — reaches it
+        // instead of sitting in the line discipline's buffer, and `-echo` so the
+        // pty can't echo the reports as well: every visible `^[[I` / `^[[O` below
+        // is one report the program really received.
+        app.dispatch(
+            wid,
+            UiEvent::Text("stty -echo -icanon; printf '\\033[?1004h'; exec cat -v\r".into()),
+            &fe,
+        );
+        // The `?1004h` rising edge reports at once — into the shell, which is still
+        // between `printf` and `exec`. So the wire is proven with a marker instead:
+        // until this echoes back, a silent screen means "no child", not "no report".
+        app.dispatch(wid, UiEvent::Text("PING".into()), &fe);
+        let echoing = wait_until(Duration::from_secs(20), || {
+            app.wake(&fe);
+            rendered_count(&app, "watcher-a", "PING") >= 1
+        });
+        assert!(
+            echoing,
+            "the child never came up echoing what it is sent: {:?}",
+            app.states().text_of("watcher-a")
+        );
+
+        // Everything up to here is the baseline; this test is about the round trip.
+        let ins = rendered_count(&app, "watcher-a", "^[[I");
+        let outs = rendered_count(&app, "watcher-a", "^[[O");
+
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Named(ghost_ui_core::NamedKey::Tab),
+                ghost_ui_core::Mods::CTRL,
+            ),
+            &fe,
+        );
+        let told_hidden = wait_until(Duration::from_secs(10), || {
+            app.wake(&fe);
+            rendered_count(&app, "watcher-a", "^[[O") > outs
+        });
+        assert!(
+            told_hidden,
+            "switching away must tell the program it is no longer shown (ESC[O); \
+             its screen: {:?}",
+            app.states().text_of("watcher-a")
+        );
+
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Named(ghost_ui_core::NamedKey::Tab),
+                ghost_ui_core::Mods::CTRL | ghost_ui_core::Mods::SHIFT,
+            ),
+            &fe,
+        );
+        let told_shown = wait_until(Duration::from_secs(10), || {
+            app.wake(&fe);
+            rendered_count(&app, "watcher-a", "^[[I") > ins
+        });
+        assert!(
+            told_shown,
+            "switching back must tell the program it is shown again (ESC[I); \
+             its screen: {:?}",
+            app.states().text_of("watcher-a")
+        );
+
+        // Exactly one report each way: a spurious extra is the same bug wearing
+        // the other hat (the program hears a focus event that never happened).
+        assert_eq!(
+            (
+                rendered_count(&app, "watcher-a", "^[[O") - outs,
+                rendered_count(&app, "watcher-a", "^[[I") - ins,
+            ),
+            (1, 1),
+            "one focus-out leaving and one focus-in returning, no more: {:?}",
+            app.states().text_of("watcher-a")
+        );
+
+        support::kill_session("watcher-a");
+        support::kill_session("other-b");
+    });
+}
