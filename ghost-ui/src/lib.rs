@@ -1655,9 +1655,15 @@ fn choice_summary(
     )
 }
 
-/// Take a window-opening decision and record it. Every door into a new window —
-/// a launch, Alt-N, a request forwarded from a second `ghost` — reads the same
-/// inputs but not at the same moment, so each one names itself in `trigger`.
+/// Take a window-opening decision and record it. The same three-way choice is
+/// read at moments that see different state — a launch, a new window (Alt-N,
+/// the menu, a request forwarded from a second `ghost`), and an emptied window
+/// deciding whether to stay — and `trigger` says which one this line is, since
+/// the outcome alone does not distinguish them.
+///
+/// Only a launch ever passes a `requested` name: a window opened at runtime
+/// "acts like the first one" but carries no `$GHOST_SESSION`, which is a
+/// launch-only override, so it always takes the plain decision.
 fn log_choice(
     trigger: &str,
     requested: Option<&str>,
@@ -1671,16 +1677,6 @@ fn log_choice(
         choice_summary(trigger, requested, sessions, groups, &choice)
     );
     choice
-}
-
-/// The startup decision for a window opened at runtime via File > New Window / Cmd-N.
-/// A new window "acts like the first one", but carries no `$GHOST_SESSION` request
-/// (that is a launch-only override), so it always takes the plain-launch decision.
-fn new_window_choice(
-    sessions: &[session::SessionInfo],
-    groups: &[ghost_ui_core::Group],
-) -> StartupChoice {
-    startup_choice(None, sessions, groups)
 }
 
 /// Whether a bare launch should recreate the windows open at last quit: only
@@ -6800,7 +6796,7 @@ impl App {
                     }
                 }
             }
-            // new_window_choice never asks to attach a specific session, but keep the
+            // A new window never asks to attach a specific session, but keep the
             // match exhaustive: an explicit name would open that session's single view.
             StartupChoice::Attach(name) => {
                 let group = self.mint_group();
@@ -8257,7 +8253,10 @@ impl App {
         for g in &mut groups {
             g.members.retain(|m| m != ended);
         }
-        if !matches!(new_window_choice(&sessions, &groups), StartupChoice::Spawn) {
+        if !matches!(
+            log_choice("emptied window", None, &sessions, &groups),
+            StartupChoice::Spawn
+        ) {
             return;
         }
         // Forget the ended session for good before the window that remembered it goes:
@@ -8608,8 +8607,8 @@ mod tests {
         LastExit, PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, StartupChoice,
         auth_error_message, choose_alpha_mode, choose_surface_format, config,
         connect_outcome_wanted, cwd_source, glass, home_launch_dir, inherited_connection,
-        namespace_remote_infos, new_window_choice, password_prompt, remote_spawn_target,
-        respawn_opts, restore_plan, session_reason, should_restore, spawnable_cwd, startup_choice,
+        log_choice, namespace_remote_infos, password_prompt, remote_spawn_target, respawn_opts,
+        restore_plan, session_reason, should_restore, spawnable_cwd, startup_choice,
         surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -11802,18 +11801,21 @@ mod tests {
         // decision — the fleet when there is a session to return to, a fresh session
         // otherwise — and never attaches to one specific session.
         assert!(matches!(
-            new_window_choice(&[info("a", false)], &[]),
+            log_choice("new window", None, &[info("a", false)], &[]),
             StartupChoice::Fleet
         ));
-        assert!(matches!(new_window_choice(&[], &[]), StartupChoice::Spawn));
         assert!(matches!(
-            new_window_choice(&[info("a", true)], &[]),
+            log_choice("new window", None, &[], &[]),
+            StartupChoice::Spawn
+        ));
+        assert!(matches!(
+            log_choice("new window", None, &[info("a", true)], &[]),
             StartupChoice::Spawn
         ));
         // An old window's remembered dead member must not turn every Alt-N into a
         // fleet: this is the regression `tests/shell.rs` reproduces end-to-end.
         assert!(matches!(
-            new_window_choice(&[], &[group("g1", &["gone"])]),
+            log_choice("new window", None, &[], &[group("g1", &["gone"])]),
             StartupChoice::Spawn
         ));
     }
