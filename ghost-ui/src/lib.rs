@@ -1529,18 +1529,148 @@ fn startup_choice(
     sessions: &[session::SessionInfo],
     groups: &[ghost_ui_core::Group],
 ) -> StartupChoice {
-    let listed = |name: &String| sessions.iter().any(|s| &s.name == name);
     // A remote member nothing lists right now: its host is away, and the tile holds
     // (and reconnects) rather than relaunching. See [`App::begin_reconnect`].
-    let awaiting_remote = groups
-        .iter()
-        .flat_map(|g| &g.members)
-        .any(|m| is_remote_id(m) && !listed(m));
+    let awaiting = !awaiting_remote(sessions, groups).is_empty();
     match requested {
         Some(name) => StartupChoice::Attach(name),
-        None if sessions.iter().any(|s| !s.attached) || awaiting_remote => StartupChoice::Fleet,
+        None if sessions.iter().any(|s| !s.attached) || awaiting => StartupChoice::Fleet,
         None => StartupChoice::Spawn,
     }
+}
+
+/// Why a window-opening decision came out the way it did — the single input that
+/// forced it, so a log line says more than the outcome.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ChoiceReason {
+    /// `$GHOST_SESSION` named a session; nothing else was consulted.
+    Requested,
+    /// A listed session is detached, so there is something to return to.
+    DetachedSession,
+    /// A group remembers a remote member no listing carries: its host is away
+    /// and the fleet is where the tile waits for it.
+    AwaitingRemote,
+    /// Nothing to return to — spawn.
+    NothingToReturnTo,
+}
+
+/// The reason [`startup_choice`] would give for its answer over the same inputs.
+/// Kept beside it (not folded into its return) so the decision itself stays a
+/// plain three-way value at every call site.
+fn choice_reason(
+    requested: Option<&str>,
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> ChoiceReason {
+    if requested.is_some() {
+        return ChoiceReason::Requested;
+    }
+    if sessions.iter().any(|s| !s.attached) {
+        return ChoiceReason::DetachedSession;
+    }
+    if awaiting_remote(sessions, groups).is_empty() {
+        ChoiceReason::NothingToReturnTo
+    } else {
+        ChoiceReason::AwaitingRemote
+    }
+}
+
+/// The remembered remote members no listing carries — the set that sends a launch
+/// (and every Alt-N) into the fleet to wait for their hosts. Named because it is
+/// the one input a user cannot see: `groups.toml` grows a member per window that
+/// ever ran, and one whose host is merely unreachable keeps voting forever.
+fn awaiting_remote(
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> Vec<String> {
+    let mut out: Vec<String> = groups
+        .iter()
+        .flat_map(|g| &g.members)
+        .filter(|m| is_remote_id(m) && !sessions.iter().any(|s| &&s.name == m))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// One line recording a window-opening decision and the state it was taken over.
+/// Emitted at `info` on `ghost::window`, which the default filter lets through:
+/// the failure it exists for — a new window landing on a fleet with nothing to
+/// attach to — is intermittent, so the evidence has to already be in the log by
+/// the time it is noticed, not behind a flag the user would have had to arm.
+///
+/// `trigger` says which door the window came through (a launch, Alt-N, a
+/// forwarded request), because those read the same inputs but not at the same
+/// moment.
+fn choice_summary(
+    trigger: &str,
+    requested: Option<&str>,
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+    choice: &StartupChoice,
+) -> String {
+    // `␟` is invisible in a log; a composite id reads as `<host>:<session>`.
+    let show = |id: &str| id.replace(REMOTE_ID_SEP, ":");
+    let list = |v: Vec<String>| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    let listed = list(
+        sessions
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}({})",
+                    show(&s.name),
+                    if s.attached { "attached" } else { "detached" }
+                )
+            })
+            .collect(),
+    );
+    let awaiting = list(
+        awaiting_remote(sessions, groups)
+            .iter()
+            .map(|m| show(m))
+            .collect(),
+    );
+    let decision = match choice {
+        StartupChoice::Attach(name) => format!("attach {}", show(name)),
+        StartupChoice::Spawn => "spawn".to_string(),
+        StartupChoice::Fleet => "fleet".to_string(),
+    };
+    let reason = match choice_reason(requested, sessions, groups) {
+        ChoiceReason::Requested => "requested",
+        ChoiceReason::DetachedSession => "a detached session to return to",
+        ChoiceReason::AwaitingRemote => "a remembered remote member whose host is away",
+        ChoiceReason::NothingToReturnTo => "nothing to return to",
+    };
+    format!(
+        "{trigger}: requested={} listed=[{listed}] awaiting-remote=[{awaiting}] \
+         -> {decision} ({reason})",
+        requested.map_or("none", |r| r)
+    )
+}
+
+/// Take a window-opening decision and record it. Every door into a new window —
+/// a launch, Alt-N, a request forwarded from a second `ghost` — reads the same
+/// inputs but not at the same moment, so each one names itself in `trigger`.
+fn log_choice(
+    trigger: &str,
+    requested: Option<&str>,
+    sessions: &[session::SessionInfo],
+    groups: &[ghost_ui_core::Group],
+) -> StartupChoice {
+    let choice = startup_choice(requested.map(str::to_owned), sessions, groups);
+    tracing::info!(
+        target: "ghost::window",
+        "{}",
+        choice_summary(trigger, requested, sessions, groups, &choice)
+    );
+    choice
 }
 
 /// The startup decision for a window opened at runtime via File > New Window / Cmd-N.
@@ -1730,7 +1860,10 @@ fn interactive(fresh: bool, ssh_window: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                // The window-opening decision is on by default (one line per
+                // window, and the only record of an intermittent bad choice);
+                // everything else stays off until `RUST_LOG` asks for it.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ghost::window=info")),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -1790,7 +1923,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         } else {
             match requested {
                 Some(name) => Startup::Single(name),
-                None => match startup_choice(None, &sessions, &groups) {
+                None => match log_choice("launch", None, &sessions, &groups) {
                     StartupChoice::Attach(name) => Startup::Single(name),
                     StartupChoice::Fleet => Startup::Fleet,
                     StartupChoice::Spawn => {
@@ -6644,7 +6777,7 @@ impl App {
         for r in self.remote_infos.values() {
             sessions.extend(r.iter().cloned());
         }
-        match new_window_choice(&sessions, &self.groups) {
+        match log_choice("new window", None, &sessions, &self.groups) {
             StartupChoice::Fleet => {
                 let group = self.mint_group();
                 self.open_fleet_window(event_loop, group, None);
@@ -11683,6 +11816,75 @@ mod tests {
             new_window_choice(&[], &[group("g1", &["gone"])]),
             StartupChoice::Spawn
         ));
+    }
+
+    #[test]
+    fn a_window_decision_records_the_state_it_was_taken_over() {
+        use super::choice_summary;
+        // The line has to carry every input the decision reads, because the bad
+        // outcome (a window on a fleet with nothing to attach to) is intermittent:
+        // whoever reads the log afterwards cannot re-observe the state.
+        let away = format!("kov@box{REMOTE_ID_SEP}work");
+        let sessions = [info("a", true)];
+        let groups = [group("g1", &[&away])];
+        let line = choice_summary(
+            "new window",
+            None,
+            &sessions,
+            &groups,
+            &StartupChoice::Fleet,
+        );
+        assert!(line.starts_with("new window: "), "{line}");
+        assert!(line.contains("requested=none"), "{line}");
+        assert!(line.contains("listed=[a(attached)]"), "{line}");
+        // The unit separator is invisible in a log, so a composite reads host:name.
+        assert!(line.contains("awaiting-remote=[kov@box:work]"), "{line}");
+        assert!(line.contains("-> fleet"), "{line}");
+        assert!(
+            line.contains("a remembered remote member whose host is away"),
+            "the line names the input that forced it: {line}"
+        );
+    }
+
+    #[test]
+    fn a_window_decision_names_whichever_input_forced_it() {
+        use super::choice_summary;
+        // A detached session outranks everything but an explicit request...
+        let detached = [info("a", false)];
+        let line = choice_summary("launch", None, &detached, &[], &StartupChoice::Fleet);
+        assert!(line.contains("listed=[a(detached)]"), "{line}");
+        assert!(line.contains("a detached session to return to"), "{line}");
+        // ...an explicit `$GHOST_SESSION` outranks the state entirely...
+        let line = choice_summary(
+            "launch",
+            Some("x"),
+            &detached,
+            &[],
+            &StartupChoice::Attach("x".into()),
+        );
+        assert!(line.contains("requested=x"), "{line}");
+        assert!(line.contains("-> attach x (requested)"), "{line}");
+        // ...and with nothing to return to, the line says so rather than staying
+        // silent about why a window spawned.
+        let line = choice_summary("new window", None, &[], &[], &StartupChoice::Spawn);
+        assert!(line.contains("listed=[none]"), "{line}");
+        assert!(line.contains("awaiting-remote=[none]"), "{line}");
+        assert!(line.contains("-> spawn (nothing to return to)"), "{line}");
+    }
+
+    #[test]
+    fn awaiting_remote_counts_only_unlisted_remote_members() {
+        use super::awaiting_remote;
+        let away = format!("kov@box{REMOTE_ID_SEP}work");
+        let here = format!("kov@near{REMOTE_ID_SEP}live");
+        let groups = [group("g1", &[&away, &here, "dead-local"])];
+        // A listed remote is reachable; a dead LOCAL member never counts (that is
+        // the regression `new_window_mirrors_a_plain_launch` guards).
+        let sessions = [info(&here, true)];
+        assert_eq!(awaiting_remote(&sessions, &groups), vec![away.clone()]);
+        // The same member remembered by two groups is one thing to wait for.
+        let twice = [group("g1", &[&away]), group("g2", &[&away])];
+        assert_eq!(awaiting_remote(&[], &twice), vec![away]);
     }
 
     #[test]
