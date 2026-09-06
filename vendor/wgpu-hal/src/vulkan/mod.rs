@@ -239,6 +239,39 @@ impl Surface {
     /// - If the device doesn't [support present timing](wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING).
     ///
     /// [VK_GOOGLE_display_timing]: https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_GOOGLE_display_timing.html
+    /// Name the regions of the image that changed, for this surface's next
+    /// [presentation](crate::Queue::present()) only.
+    ///
+    /// Without this a present carries no `VkPresentRegionsKHR`, which means "all
+    /// of it changed": on Wayland the WSI then posts
+    /// `wl_surface.damage_buffer(0, 0, INT32_MAX, INT32_MAX)` and the compositor
+    /// recomposites the whole window — for a one-glyph frame, and again for every
+    /// blur or effect layer stacked behind it.
+    ///
+    /// The rects describe the acquired image, so the caller must have drawn a
+    /// complete frame into it as usual; this only narrows what the presentation
+    /// engine is *told* about. Rects are clamped to the swapchain extent, and
+    /// zero-area rects are dropped.
+    ///
+    /// Returns whether the claim was taken. It is `false`, and the next present
+    /// damages everything, when the device has no `VK_KHR_incremental_present`,
+    /// when the surface is unconfigured or backed by a DXGI swapchain, or when
+    /// nothing survived clamping — so a caller can pass what it knows and never
+    /// has to check first. Unlike [`Self::set_next_present_time`] this never
+    /// panics: it is called per frame on a hot path.
+    ///
+    /// [VK_KHR_incremental_present]: https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_incremental_present.html
+    pub fn set_next_present_damage(&self, rects: &[crate::PresentDamageRect]) -> bool {
+        let mut swapchain = self.swapchain.write();
+        swapchain
+            .as_mut()
+            .and_then(|s| {
+                s.as_any_mut()
+                    .downcast_mut::<swapchain::NativeSwapchain>()
+            })
+            .is_some_and(|s| s.set_next_present_damage(rects))
+    }
+
     #[track_caller]
     pub fn set_next_present_time(&self, present_timing: vk::PresentTimeGOOGLE) {
         let mut swapchain = self.swapchain.write();

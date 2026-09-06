@@ -1997,6 +1997,19 @@ pub struct SurfaceCapabilities {
     pub composite_alpha_modes: Vec<wgt::CompositeAlphaMode>,
 }
 
+/// A region of a surface image that changed since the last present.
+///
+/// In swapchain-image pixels, origin top-left — the same space as the surface
+/// configuration's `extent`. See
+/// [`vulkan::Surface::set_next_present_damage`](crate::vulkan::Surface::set_next_present_damage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentDamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug)]
 pub struct AcquiredSurfaceTexture<A: Api> {
     pub texture: A::SurfaceTexture,

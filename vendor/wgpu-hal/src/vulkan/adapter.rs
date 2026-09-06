@@ -1164,6 +1164,15 @@ impl PhysicalDeviceProperties {
         // Require `VK_KHR_swapchain`
         extensions.push(khr::swapchain::NAME);
 
+        // Optional `VK_KHR_incremental_present`, so a present can name the regions
+        // that actually changed (`Surface::set_next_present_damage`). Enabling it
+        // changes nothing on its own — it only makes `VkPresentRegionsKHR` legal to
+        // chain onto `vkQueuePresentKHR` — so it is taken whenever it is there
+        // rather than gated behind a `Features` bit.
+        if self.supports_extension(khr::incremental_present::NAME) {
+            extensions.push(khr::incremental_present::NAME);
+        }
+
         if self.device_api_version < vk::API_VERSION_1_1 {
             // Require `VK_KHR_maintenance1`
             extensions.push(khr::maintenance1::NAME);

@@ -273,6 +273,11 @@ impl Surface for NativeSurface {
             next_acquire_index: 0,
             present_semaphores,
             next_present_time: None,
+            next_present_damage: None,
+            supports_incremental_present: device
+                .shared
+                .enabled_extensions
+                .contains(&khr::incremental_present::NAME),
         }))
     }
 
@@ -334,6 +339,20 @@ pub(crate) struct NativeSwapchain {
     /// This must only be set if [`wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING`] is enabled, and
     /// so the VK_GOOGLE_display_timing extension is present.
     next_present_time: Option<vk::PresentTimeGOOGLE>,
+
+    /// The regions of the image that changed since the last present, set in the
+    /// next call to [`present()`](crate::Queue::present()) and cleared by it.
+    ///
+    /// `None` — the default — presents with no `VkPresentRegionsKHR`, which means
+    /// "assume everything changed" and is what every present did before this
+    /// existed. See [`Surface::set_next_present_damage`].
+    ///
+    /// [`Surface::set_next_present_damage`]: crate::vulkan::Surface::set_next_present_damage
+    next_present_damage: Option<Vec<vk::RectLayerKHR>>,
+
+    /// Whether `VK_KHR_incremental_present` is enabled on the device, and so
+    /// whether `next_present_damage` can be honoured at all.
+    supports_incremental_present: bool,
 }
 
 impl Swapchain for NativeSwapchain {
@@ -559,6 +578,23 @@ impl Swapchain for NativeSwapchain {
             .image_indices(&image_indices)
             .wait_semaphores(&wait_semaphores);
 
+        // The regions that changed since the last present, if the caller named any.
+        // An empty list is deliberately NOT sent: `rectangleCount = 0` is ambiguous
+        // across revisions of the extension, and "nothing changed" is a present the
+        // caller should not have made. Taken unconditionally so a stale claim can
+        // never outlive the frame it describes, even where the extension is absent.
+        let mut present_regions;
+        let regions;
+        let damage = self.next_present_damage.take();
+        let vk_info = match damage.as_deref() {
+            Some(rects) if self.supports_incremental_present && !rects.is_empty() => {
+                regions = [vk::PresentRegionKHR::default().rectangles(rects)];
+                present_regions = vk::PresentRegionsKHR::default().regions(&regions);
+                vk_info.push_next(&mut present_regions)
+            }
+            _ => vk_info,
+        };
+
         let mut display_timing;
         let present_times;
         let vk_info = if let Some(present_time) = self.next_present_time.take() {
@@ -611,6 +647,45 @@ impl Swapchain for NativeSwapchain {
 impl NativeSwapchain {
     pub(crate) fn as_raw(&self) -> vk::SwapchainKHR {
         self.raw
+    }
+
+    /// Name the regions of the image that changed, for the next present only.
+    ///
+    /// Returns whether they will be honoured: `false` where the device has no
+    /// `VK_KHR_incremental_present`, in which case the next present damages
+    /// everything, exactly as it did before this existed.
+    ///
+    /// Rects are in swapchain-image pixels and are clamped to the swapchain
+    /// extent here; zero-area rects are dropped, and a call that leaves nothing
+    /// is treated as "no claim" (a full present) rather than as "nothing changed".
+    pub fn set_next_present_damage(&mut self, rects: &[crate::PresentDamageRect]) -> bool {
+        if !self.supports_incremental_present {
+            return false;
+        }
+        let (max_w, max_h) = (self.config.extent.width, self.config.extent.height);
+        let clamped: Vec<vk::RectLayerKHR> = rects
+            .iter()
+            .filter_map(|r| {
+                let x = r.x.min(max_w);
+                let y = r.y.min(max_h);
+                let w = r.width.min(max_w - x);
+                let h = r.height.min(max_h - y);
+                (w > 0 && h > 0).then(|| {
+                    vk::RectLayerKHR::default()
+                        .offset(vk::Offset2D {
+                            x: x as i32,
+                            y: y as i32,
+                        })
+                        .extent(vk::Extent2D {
+                            width: w,
+                            height: h,
+                        })
+                        .layer(0)
+                })
+            })
+            .collect();
+        self.next_present_damage = (!clamped.is_empty()).then_some(clamped);
+        self.next_present_damage.is_some()
     }
 
     pub fn set_next_present_time(&mut self, present_timing: vk::PresentTimeGOOGLE) {
