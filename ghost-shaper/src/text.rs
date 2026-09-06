@@ -335,7 +335,7 @@ fn shape_varied(font: FontRef<'_>, text: &str, size_px: f32, style: TextStyle) -
         .builder(font)
         .size(size_px)
         .variations(style.variations())
-        .features(&[("calt", 1), ("liga", 1)])
+        .features([("calt", 1), ("liga", 1)])
         .build();
     shaper.add_str(text);
 

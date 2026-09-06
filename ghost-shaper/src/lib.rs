@@ -269,7 +269,7 @@ pub fn shape(font: FontRef, text: &str, size_px: f32) -> Vec<ShapedGlyph> {
     let mut shaper = ctx
         .builder(font)
         .size(size_px)
-        .features(&[("calt", 1), ("liga", 1)])
+        .features([("calt", 1), ("liga", 1)])
         .build();
     shaper.add_str(text);
 
