@@ -7,6 +7,11 @@
 //! color resolution are handled here; glyph shaping (with ligatures) comes from
 //! `ghost-shaper`.
 
+// `wgpu::Device`/`Queue` reach wgpu-core's `Global`, whose auto-trait proof walks
+// the whole resource hub; the default 128 frames are not enough to close it, and
+// the overflow is a deny-by-default future-incompat lint under `-D warnings`.
+#![recursion_limit = "256"]
+
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
