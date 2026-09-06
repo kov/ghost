@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ghost_render::Scene;
 use ghost_shaper::FontSet;
 
-use crate::{Damage, Renderer, SceneCache};
+use crate::{Damage, PresentDamage, Renderer, SceneCache};
 
 /// Where a frame is drawn. See the module docs.
 pub enum Target {
@@ -53,6 +53,17 @@ pub struct SurfaceTarget {
     /// repaint in full — a band would blend with the preserved pixels, not replace
     /// them. Mirrors the compositor alpha decision the app makes at window creation.
     opaque: bool,
+    /// The surface size the last successful present committed; `None` when the last
+    /// `render_frame` did not present (lost/outdated), or the swapchain has been
+    /// reconfigured since.
+    ///
+    /// Both are damage triggers. A reconfigured swapchain has all-new images, so
+    /// nothing of the previous frame carries over; and a frame drawn into a
+    /// per-session Surface but never presented leaves that Surface a change ahead
+    /// of the screen — the next band covers only the newer change, so claiming just
+    /// that would leave the earlier one stale on the compositor's copy. Same shape
+    /// as the foreground-render-stall class, one layer up.
+    last_presented: Option<(u32, u32)>,
 }
 
 impl SurfaceTarget {
@@ -69,6 +80,7 @@ impl SurfaceTarget {
             config,
             device,
             opaque,
+            last_presented: None,
         }
     }
 
@@ -87,6 +99,8 @@ impl SurfaceTarget {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
+        // New swapchain, new images: nothing of the last frame survives in them.
+        self.last_presented = None;
     }
 
     /// Acquire the next swapchain image's view, reconfiguring and returning `None` if
@@ -124,8 +138,56 @@ impl SurfaceTarget {
         };
         renderer.blit_snapshot_to_view(&view, self.config.width, self.config.height);
         pre_present(self.config.width, self.config.height);
+        // A snapshot blit repaints the window with something else entirely: claim
+        // nothing for it, and let the frame after it claim nothing either.
+        self.last_presented = None;
         frame_tex.present();
         true
+    }
+
+    /// Tell the presentation engine which part of the image the frame about to be
+    /// presented changed, so a compositor recomposites that much instead of the
+    /// window, everything stacked behind it, and the desktop under those.
+    ///
+    /// Best-effort by construction: a no-op on every backend but Vulkan, and on
+    /// Vulkan without `VK_KHR_incremental_present`, where the present goes on
+    /// damaging everything exactly as it always did. Nothing may depend on it
+    /// having happened.
+    fn claim_damage(&self, damage: PresentDamage) {
+        let PresentDamage::Rects(rects) = damage else {
+            return;
+        };
+        // Nothing to claim is not "nothing changed": a frame whose every changed
+        // rect clamped away still presented, so let it damage everything.
+        if rects.is_empty() {
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+        {
+            let rects: Vec<_> = rects
+                .iter()
+                .map(|&[x, y, width, height]| wgpu::hal::PresentDamageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .collect();
+            // SAFETY: we call one `&self` setter on the hal surface and drop the
+            // guard immediately, touching no resource's lifetime. The guard must go
+            // before `present`, which takes the same swapchain lock.
+            let taken = unsafe { self.surface.as_hal::<wgpu::hal::api::Vulkan>() }
+                .is_some_and(|hal| hal.set_next_present_damage(&rects));
+            tracing::trace!(
+                target: "ghost::present",
+                rects = ?rects.len(),
+                first = ?rects.first(),
+                taken,
+                "claimed present damage"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+        let _ = rects;
     }
 }
 
@@ -202,14 +264,29 @@ impl Target {
                     // Accepted the scene above but couldn't present it; forget it so
                     // the next request fully redraws onto the reconfigured surface.
                     cache.invalidate();
+                    s.last_presented = None;
                     return FrameOutcome::Lost;
                 };
                 let size = (s.config.width, s.config.height);
                 let t_build = Instant::now();
                 renderer.present_scene(&view, size, scene, font, font_px);
                 let build = t_build.elapsed();
+                // What the scene diff localized, minus the two things it cannot see:
+                // whether the *window edge* changed under it (the caller holds that,
+                // having asked `take_edge_dirty`), and whether the frame this one
+                // follows ever reached the screen — an accepted-but-unpresented
+                // frame leaves the next diff describing only the newer change, so
+                // claiming it would strand the earlier one on the compositor's copy.
+                let damage = match cache.changed_rects() {
+                    Some(rects) if !edge_changed && s.last_presented == Some(size) => {
+                        PresentDamage::Rects(rects.to_vec())
+                    }
+                    _ => PresentDamage::Full,
+                };
+                s.claim_damage(damage);
                 let t_present = Instant::now();
                 pre_present(size.0, size.1);
+                s.last_presented = Some(size);
                 frame_tex.present();
                 FrameOutcome::Presented {
                     build,

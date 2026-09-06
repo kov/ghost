@@ -1714,6 +1714,7 @@ pub enum Damage {
 #[derive(Default)]
 pub struct SceneCache {
     last: Option<(Scene, f32)>,
+    changed: Option<Vec<[u32; 4]>>,
 }
 
 impl SceneCache {
@@ -1722,13 +1723,35 @@ impl SceneCache {
     /// comparison is exact `PartialEq` — never a hash — so `None` can never be a false
     /// positive that strands a stale frame.
     pub fn damage(&mut self, scene: &Scene, font_px: f32) -> Damage {
+        // Recomputed on every call, so [`changed_rects`](Self::changed_rects) can
+        // only ever describe the verdict just returned.
+        self.changed = None;
         match scene_damage(self.last.as_ref(), scene, font_px) {
             RawDamage::Identical => Damage::None,
             RawDamage::Full => {
+                self.changed = self
+                    .last
+                    .as_ref()
+                    .and_then(|(prev, px)| {
+                        (*px == font_px).then(|| scene_changed_rects(prev, scene))
+                    })
+                    .flatten();
                 self.last = Some((scene.clone(), font_px));
                 Damage::Full
             }
         }
+    }
+
+    /// Where the scene the last [`damage`](Self::damage) call accepted differs from
+    /// the one presented before it, in window pixels — `None` when the difference
+    /// has no bound smaller than the window, which is the only safe default.
+    ///
+    /// Separate from the [`Damage`] verdict because they answer different questions
+    /// to different consumers: that one decides whether to draw at all, this one
+    /// only narrows what the *presentation engine* is told afterwards, and a caller
+    /// ignoring it loses efficiency, never correctness.
+    pub fn changed_rects(&self) -> Option<&[[u32; 4]]> {
+        self.changed.as_deref()
     }
 
     /// Forget the last scene so the next [`damage`](Self::damage) is `Full`. The caller
@@ -1738,6 +1761,7 @@ impl SceneCache {
     /// images undefined) is fully repainted.
     pub fn invalidate(&mut self) {
         self.last = None;
+        self.changed = None;
     }
 }
 
@@ -1773,6 +1797,21 @@ fn lone_terminal(scene: &Scene) -> Option<LoneTerminal<'_>> {
         } => Some((*session, frame, *selection, *damage, *rect)),
         _ => None,
     }
+}
+
+/// What a present actually changed on the swapchain image.
+///
+/// Not a drawing decision — the frame is composited in full either way, and that
+/// is *why* naming a subset is safe here (the untouched pixels of the acquired
+/// image are correct, so no buffer-age tracking is needed). It only narrows what
+/// the presentation engine is told, which is what a Wayland compositor turns
+/// into the region it recomposites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresentDamage {
+    /// Everything, or not known to be less. The present carries no regions.
+    Full,
+    /// Only these rects of the swapchain image, `[x, y, w, h]` in physical pixels.
+    Rects(Vec<[u32; 4]>),
 }
 
 /// Whether `new` differs from the last presented scene `prev` (at `font_px`). No prior
@@ -1860,6 +1899,97 @@ fn items_equivalent(a: &SceneItem, b: &SceneItem) -> bool {
         ) => ia == ib && sa == sb && ra == rb && sela == selb && da == db && Rc::ptr_eq(fa, fb),
         _ => a == b,
     }
+}
+
+/// Where `new` differs from the last presented scene `prev`, in window pixels, or
+/// `None` when that cannot be pinned down and the present must claim everything.
+///
+/// This is a diff of what the frame *shows*, not of what it redrew — the two are
+/// deliberately different. A steady full-window terminal rebuilds every glyph
+/// inline each frame and a fleet tile blits a texture patched only in its band;
+/// either way the pixels outside a changed row are the pixels that were there
+/// before, and that is what the presentation engine is being told.
+///
+/// Structure must match exactly and every layer's camera must have HELD — a
+/// camera that moved redraws its whole layer — so this only ever narrows a steady
+/// view. The camera need not be at identity, though: a resting single view sits
+/// at whatever the zoom animation last left, so requiring identity would give up
+/// on the case this exists for. A changed item contributes its whole rect unless
+/// it is a terminal whose only change is content the model localized to rows —
+/// the same [`TermDamage`] claim the per-Surface band already trusts, and under
+/// the same verification (see `ensure_surface`'s verify mode). An under-reported
+/// row now leaves a stale *screen*, not just a stale texture.
+fn scene_changed_rects(prev: &Scene, new: &Scene) -> Option<Vec<[u32; 4]>> {
+    if prev.size_px != new.size_px || prev.layers.len() != new.layers.len() {
+        return None;
+    }
+    let (sw, sh) = new.size_px;
+    let mut rects = Vec::new();
+    for (la, lb) in prev.layers.iter().zip(&new.layers) {
+        if la.z != lb.z
+            || la.opacity != lb.opacity
+            || la.transform != lb.transform
+            || la.items.len() != lb.items.len()
+        {
+            return None;
+        }
+        for (ia, ib) in la.items.iter().zip(&lb.items) {
+            if items_equivalent(ia, ib) {
+                continue;
+            }
+            // The item's own claim is in layer space; the camera puts it on screen.
+            let band = lb.transform.apply_rect(item_changed_rect(ia, ib)?);
+            rects.push(clamp_scissor(band, sw, sh));
+        }
+    }
+    Some(rects)
+}
+
+/// The window-pixel rect a changed item confined its change to, or `None` for a
+/// change with no smaller bound than the item — which, since an item's own rect
+/// is not necessarily all it draws (a chrome shadow, a frost), is treated as
+/// "everything" rather than as the item's rect.
+///
+/// Only one case is localizable: a terminal whose id, session, rect, selection
+/// and dimming all held, changed only in content, and whose model claims rows
+/// `[lo, hi]`. Rows sit at `line_height` from the item's (padding-inset) top,
+/// grown by a row each way so a glyph overhanging its row's box is inside the
+/// claim — the same expansion the banded Surface build uses.
+fn item_changed_rect(a: &SceneItem, b: &SceneItem) -> Option<RectPx> {
+    let (
+        SceneItem::Terminal {
+            id: ia,
+            session: sa,
+            rect: ra,
+            selection: sela,
+            dim: da,
+            ..
+        },
+        SceneItem::Terminal {
+            id: ib,
+            session: sb,
+            rect: rb,
+            frame,
+            selection: selb,
+            dim: db,
+            damage: TermDamage::Rows { lo, hi },
+            ..
+        },
+    ) = (a, b)
+    else {
+        return None;
+    };
+    if ia != ib || sa != sb || ra != rb || sela != selb || da != db {
+        return None;
+    }
+    let lh = frame.metrics.line_height;
+    let top = rb.y + (lo.saturating_sub(1) as f32) * lh;
+    Some(RectPx {
+        x: rb.x,
+        y: top,
+        w: rb.w,
+        h: ((hi - lo + 3) as f32 * lh).min(rb.y + rb.h - top).max(0.0),
+    })
 }
 
 /// A persistent terminal renderer: device, pipeline, glyph atlas and cache are
@@ -7580,6 +7710,129 @@ mod tests {
         let mut c2 = SceneCache::default();
         assert_eq!(c2.damage(&with_chrome("x\r\ny"), 15.0), Damage::Full);
         assert_eq!(c2.damage(&with_chrome("x\r\nY"), 15.0), Damage::Full);
+    }
+
+    /// What a present tells the compositor it changed, when the change is one row
+    /// of a terminal drawn under chrome — a real ghost window, whose titlebar keeps
+    /// it off the lone-terminal fast path entirely.
+    #[test]
+    fn changed_rects_bounds_a_row_change_and_gives_up_on_everything_else() {
+        let term = |f: &Rc<Frame>, damage, selection, dim| SceneItem::Terminal {
+            id: SceneId::Root,
+            session: session_key("single"),
+            rect: RectPx {
+                x: 0.0,
+                y: 20.0,
+                w: 180.0,
+                h: 70.0,
+            },
+            frame: Rc::clone(f),
+            selection,
+            dim,
+            damage,
+        };
+        let titlebar = SceneItem::Rect {
+            id: SceneId::Tile(1),
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 180.0,
+                h: 20.0,
+            },
+            color: [1.0, 1.0, 1.0, 1.0],
+            radius: 0.0,
+        };
+        let scene = |item: SceneItem| Scene {
+            size_px: (180, 90),
+            layers: vec![
+                Layer::new(0, vec![item]),
+                Layer::new(1, vec![titlebar.clone()]),
+            ],
+        };
+
+        let f = Rc::new(frame(20, 5, "hi"));
+        let lh = f.metrics.line_height;
+        let mut c = SceneCache::default();
+
+        // Nothing presented yet: the first frame claims everything.
+        assert_eq!(
+            c.damage(&scene(term(&f, TermDamage::All, None, false)), 15.0),
+            Damage::Full
+        );
+        assert_eq!(c.changed_rects(), None);
+
+        // A row rewritten in place — the spinner. The claim is that row and its two
+        // neighbours (overhang), offset by the terminal's inset top, and nothing else
+        // in the window: the titlebar held.
+        let f2 = Rc::new(frame(20, 5, "hi"));
+        assert_eq!(
+            c.damage(
+                &scene(term(&f2, TermDamage::Rows { lo: 2, hi: 2 }, None, false)),
+                15.0
+            ),
+            Damage::Full
+        );
+        let want = clamp_scissor(
+            RectPx {
+                x: 0.0,
+                y: 20.0 + lh,
+                w: 180.0,
+                h: 3.0 * lh,
+            },
+            180,
+            90,
+        );
+        assert_eq!(c.changed_rects(), Some(&[want][..]));
+        // It is a band, not the window.
+        assert!(want[3] < 70, "{want:?} should not span the terminal");
+
+        // A whole-view change (a scroll, a resize, a palette swap) has no bound.
+        let f3 = Rc::new(frame(20, 5, "hi"));
+        assert_eq!(
+            c.damage(&scene(term(&f3, TermDamage::All, None, false)), 15.0),
+            Damage::Full
+        );
+        assert_eq!(c.changed_rects(), None);
+
+        // Neither does a change to anything but content, even alongside a row claim:
+        // a selection repaints rows the model never marked.
+        let sel = Some(Selection::new((0, 0), (0, 1)));
+        let f4 = Rc::new(frame(20, 5, "hi"));
+        assert_eq!(
+            c.damage(
+                &scene(term(&f4, TermDamage::Rows { lo: 2, hi: 2 }, sel, false)),
+                15.0
+            ),
+            Damage::Full
+        );
+        assert_eq!(c.changed_rects(), None);
+
+        // An identical scene presents nothing, so it describes nothing.
+        assert_eq!(
+            c.damage(
+                &scene(term(&f4, TermDamage::Rows { lo: 2, hi: 2 }, sel, false)),
+                15.0
+            ),
+            Damage::None
+        );
+        assert_eq!(c.changed_rects(), None);
+
+        // Chrome moving over a held terminal: the terminal's `Rc` is unchanged, so
+        // the only differing item is the titlebar, which bounds nothing.
+        let mut moved = scene(term(&f4, TermDamage::None, sel, false));
+        moved.layers[1].items[0] = SceneItem::Rect {
+            id: SceneId::Tile(1),
+            rect: RectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 180.0,
+                h: 24.0,
+            },
+            color: [1.0, 1.0, 1.0, 1.0],
+            radius: 0.0,
+        };
+        assert_eq!(c.damage(&moved, 15.0), Damage::Full);
+        assert_eq!(c.changed_rects(), None);
     }
 
     #[test]
