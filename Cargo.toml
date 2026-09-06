@@ -86,6 +86,20 @@ debug = true
 # libadwaita-fitted shadow curve and the Adwaita palette, were adopted outright
 # (ghost-renderer/src/shadow.rs and ghost-ui/src/desktop.rs). winit's
 # `wayland-csd-adwaita` feature is off for the same reason.
+#
+# Vendored wgpu-hal 29.0.3 carrying one local patch, to be reported upstream
+# and then dropped:
+# - No way to reach `VK_KHR_incremental_present`. `vkQueuePresentKHR` with no
+#   `VkPresentRegionsKHR` makes Mesa's Wayland WSI post
+#   `wl_surface.damage_buffer(0, 0, INT32_MAX, INT32_MAX)` on every commit, so a
+#   one-glyph spinner tick repaints the whole window on the compositor — and a
+#   translucent ghost window is composited twice (itself plus its
+#   `ext-background-effect-v1` backdrop), neither able to declare an opaque
+#   region. `Surface::set_next_present_damage` stashes rects for the next
+#   present, exactly mirroring the existing `set_next_present_time`, and the
+#   device extension is enabled whenever the adapter has it — see
+#   vendor/wgpu-hal/src/vulkan/.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 wgpu-core = { path = "vendor/wgpu-core" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
