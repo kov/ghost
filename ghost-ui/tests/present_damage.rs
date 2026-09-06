@@ -53,15 +53,35 @@ struct Rect {
 }
 
 impl Rect {
-    /// Whether this rect claims everything. The WSI's no-regions default is
-    /// literally `INT32_MAX`, but a rect merely covering the whole surface is
-    /// the same cost to the compositor, so anything output-sized counts too.
-    fn is_full(&self) -> bool {
-        self.x <= 0
-            && self.y <= 0
-            && self.w >= i64::from(MONITOR.0)
-            && self.h >= i64::from(MONITOR.1)
+    /// Whether this rect claims everything of a `buffer`-sized swapchain image.
+    /// The WSI's no-regions default is literally `INT32_MAX`, but a rect merely
+    /// covering the whole buffer costs the compositor exactly the same, so it
+    /// counts too — which is why this is measured against the buffer the WSI
+    /// actually made and not against the output: a window is far smaller than
+    /// the screen, and a claim of the whole *window* would slip past an
+    /// output-sized bar while being precisely the bug.
+    fn is_full(&self, buffer: (i64, i64)) -> bool {
+        self.x <= 0 && self.y <= 0 && self.w >= buffer.0 && self.h >= buffer.1
     }
+}
+
+/// The size of the swapchain images the Vulkan WSI created, in buffer pixels —
+/// the coordinate space `damage_buffer` speaks. Its lines look like
+/// `{mesa vk display queue}  -> zwp_linux_buffer_params_v1#58.create_immed(new id wl_buffer#57, 780, 527, 875713112, 0)`;
+/// the queue tag is what tells them from the `wl_shm` buffers the decorations
+/// draw into, which are a different size and irrelevant here.
+fn buffer_size(log: &str) -> Option<(i64, i64)> {
+    log.lines()
+        .filter(|l| l.contains("{mesa vk display queue}"))
+        .find_map(|line| {
+            let (_, rest) = line.split_once(".create_immed(")?;
+            let (args, _) = rest.split_once(')')?;
+            let mut n = args
+                .split(',')
+                .skip(1)
+                .map(|a| a.trim().parse::<i64>().ok());
+            Some((n.next()??, n.next()??))
+        })
 }
 
 /// Every `damage_buffer` request in a `WAYLAND_DEBUG=1` log, in order.
@@ -195,12 +215,14 @@ fn a_one_cell_change_damages_less_than_the_whole_surface() {
         "the spinner keeps presenting"
     );
 
-    let rects = ghost.rects();
+    let log = ghost.log();
+    let buffer = buffer_size(&log).expect("the WSI created a swapchain buffer");
+    let rects = damage_rects(&log);
     let steady = &rects[opening..];
-    let partial = steady.iter().filter(|r| !r.is_full()).count();
+    let partial = steady.iter().filter(|r| !r.is_full(buffer)).count();
     eprintln!(
         "present damage: {} requests, {} of them partial in the steady {} \
-         (first steady rect {:?})",
+         (buffer {buffer:?}, first steady rect {:?})",
         rects.len(),
         partial,
         steady.len(),

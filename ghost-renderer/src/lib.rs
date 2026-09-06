@@ -1951,16 +1951,19 @@ fn scene_changed_rects(prev: &Scene, new: &Scene) -> Option<Vec<[u32; 4]>> {
 /// "everything" rather than as the item's rect.
 ///
 /// Only one case is localizable: a terminal whose id, session, rect, selection
-/// and dimming all held, changed only in content, and whose model claims rows
-/// `[lo, hi]`. Rows sit at `line_height` from the item's (padding-inset) top,
-/// grown by a row each way so a glyph overhanging its row's box is inside the
-/// claim — the same expansion the banded Surface build uses.
+/// and dimming all held, changed only in content, carries no images either side,
+/// and whose model claims rows `[lo, hi]`. Rows sit at `line_height` from the
+/// item's (padding-inset) top, grown by a row each way so a glyph overhanging its
+/// row's box is inside the claim — the same expansion the banded Surface build
+/// uses. The image bar is `ensure_surface`'s: nothing has ever leaned on a `Rows`
+/// claim bounding an image placement, and this is not the place to start.
 fn item_changed_rect(a: &SceneItem, b: &SceneItem) -> Option<RectPx> {
     let (
         SceneItem::Terminal {
             id: ia,
             session: sa,
             rect: ra,
+            frame: fa,
             selection: sela,
             dim: da,
             ..
@@ -1980,6 +1983,9 @@ fn item_changed_rect(a: &SceneItem, b: &SceneItem) -> Option<RectPx> {
         return None;
     };
     if ia != ib || sa != sb || ra != rb || sela != selb || da != db {
+        return None;
+    }
+    if !fa.images.is_empty() || !frame.images.is_empty() {
         return None;
     }
     let lh = frame.metrics.line_height;
@@ -7817,9 +7823,42 @@ mod tests {
         );
         assert_eq!(c.changed_rects(), None);
 
+        // An image on either side gives up, exactly as the banded Surface render
+        // does: nothing has ever relied on a row claim bounding a placement.
+        let mut imaged = frame(20, 5, "hi");
+        imaged.images.push(ghost_render::ImagePlacement {
+            image_id: 1,
+            col: 0,
+            row: 0,
+            cols: 4,
+            rows: 2,
+            z: 0,
+            uv: [0.0, 0.0, 1.0, 1.0],
+        });
+        let f5 = Rc::new(imaged);
+        assert_eq!(
+            c.damage(
+                &scene(term(&f5, TermDamage::Rows { lo: 2, hi: 2 }, sel, false)),
+                15.0
+            ),
+            Damage::Full
+        );
+        assert_eq!(c.changed_rects(), None);
+        // ... and so does the frame that follows it, which still has the image
+        // behind it even once the new one is clean.
+        let f6 = Rc::new(frame(20, 5, "hi"));
+        assert_eq!(
+            c.damage(
+                &scene(term(&f6, TermDamage::Rows { lo: 2, hi: 2 }, sel, false)),
+                15.0
+            ),
+            Damage::Full
+        );
+        assert_eq!(c.changed_rects(), None);
+
         // Chrome moving over a held terminal: the terminal's `Rc` is unchanged, so
         // the only differing item is the titlebar, which bounds nothing.
-        let mut moved = scene(term(&f4, TermDamage::None, sel, false));
+        let mut moved = scene(term(&f6, TermDamage::None, sel, false));
         moved.layers[1].items[0] = SceneItem::Rect {
             id: SceneId::Tile(1),
             rect: RectPx {
