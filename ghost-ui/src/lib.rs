@@ -2418,9 +2418,17 @@ impl Graphics {
             f64::from(cols) * f64::from(m.advance) + 2.0 * f64::from(pad),
             f64::from(rows) * f64::from(m.line_height) + 2.0 * f64::from(pad) + bar,
         );
-        // Request a transparent window only when the theme is translucent, so an
-        // opaque setup never pays the compositor's alpha-blending cost.
-        let want_transparent = theme.bg_alpha < 1.0;
+        // Whether the BACKGROUND is translucent. Blur and frost ride on this and on
+        // nothing else: behind an opaque background there is no backdrop to show
+        // through (see `glass`).
+        let bg_translucent = theme.bg_alpha < 1.0;
+        // Whether the SURFACE carries any non-opaque pixel, which is a different
+        // question and the one the compositor is asking. While ghost draws its own
+        // frame it also carries a shadow margin (see `window_shadow`), which is
+        // nothing but alpha. Declaring such a surface opaque tells the compositor
+        // not to blend it, and the premultiplied black shadow then composites as a
+        // black border around the window.
+        let want_transparent = bg_translucent || own_frame;
         // Bench mode measures the render path at a realistic size, so open maximized
         // (the small default grid would understate per-frame raster cost).
         let maximized = std::env::var_os("GHOST_BENCH").is_some();
@@ -2435,7 +2443,7 @@ impl Graphics {
             .with_inner_size(size)
             .with_maximized(maximized)
             .with_transparent(want_transparent)
-            .with_blur(glass(want_transparent, false, 0.0).blur);
+            .with_blur(glass(bg_translucent, false, 0.0).blur);
         #[cfg(all(unix, not(target_os = "macos")))]
         let attrs = if own_frame {
             attrs.with_decorations(false)
@@ -2471,7 +2479,7 @@ impl Graphics {
         // `theme.frost` arrives holding the configured density; keep it only where
         // the compositor isn't blurring for us, so glass is never drawn twice.
         theme.frost = glass(
-            want_transparent,
+            bg_translucent,
             backdrop_blur_supported(&window),
             theme.frost,
         )
