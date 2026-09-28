@@ -3669,7 +3669,8 @@ impl WindowState {
 
 /// The thin imperative shell: owns the world (live windows, the clipboard, the
 /// clock), holds the pure models, and shuttles `UiEvent`s in and `Cmd`s out.
-/// Each window owns its own session clients (see [`WindowState::sessions`]).
+/// Session state, clients and observers are process-wide (`states`, `sessions`,
+/// `observers`); windows hold only views onto them.
 pub struct App {
     /// Live windows by id; each owns its GPU surface and pure model.
     windows: HashMap<WindowId, WindowState>,
@@ -4742,7 +4743,7 @@ impl App {
                     // Bring a dead session back and step into it. A REMOTE tile is
                     // recreated on ITS HOST over the transport, never as a local
                     // shell — route by the self-describing composite id (like
-                    // Cmd::Kill below); `spawn_remote_session` recreates + attaches +
+                    // Cmd::Kill above); `spawn_remote_session` recreates + attaches +
                     // adopts, the remote counterpart of the local branch here.
                     if let Some((target, real)) =
                         remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
@@ -6705,10 +6706,6 @@ impl App {
         wid
     }
 
-    /// Open a new window showing the "connect to a host" prompt (Cmd+S /
-    /// Ctrl+Shift+S): a fresh fleet window on its own group, flipped into the
-    /// connect state so it captures a `[user@]host` and, on submit, becomes an
-    /// ssh window (see the `Cmd::ConnectSshWindow` handler).
     /// Open the windows this launch asked for (consuming [`App::startup`]).
     /// Returns whether anything opened — `false` means there is nothing to show
     /// and the process should exit.
@@ -6741,6 +6738,10 @@ impl App {
         true
     }
 
+    /// Open a new window showing the "connect to a host" prompt (Cmd+S /
+    /// Ctrl+Shift+S): a fresh fleet window on its own group, flipped into the
+    /// connect state so it captures a `[user@]host` and, on submit, becomes an
+    /// ssh window (see the `Cmd::ConnectSshWindow` handler).
     fn open_connect_window(&mut self, event_loop: &dyn Frontend) {
         let group = self.mint_group();
         let wid = self.open_fleet_window(event_loop, group, None);
@@ -6892,12 +6893,6 @@ impl App {
         }
     }
 
-    /// Remove a window; its session clients/observers/states are process-wide and
-    /// outlive it, so a last-viewer prune ([`reconcile_source`](Self::reconcile_source))
-    /// drops only those no surviving window views — the "close = detach" default,
-    /// refcounted across windows. A session another window still drives or previews
-    /// keeps its one live source (its driver downgraded to a mirror if this window was
-    /// the driver and another only previews it).
     /// The window was asked to close — by its own button, or by the desktop.
     /// Closing is detaching: dropping the window drops its session clients and
     /// the hosts keep the sessions running. The last window out shuts down.
@@ -6934,6 +6929,12 @@ impl App {
         self.session = event_loop.open_session(reason, remembered);
     }
 
+    /// Remove a window; its session clients/observers/states are process-wide and
+    /// outlive it, so a last-viewer prune ([`reconcile_source`](Self::reconcile_source))
+    /// drops only those no surviving window views — the "close = detach" default,
+    /// refcounted across windows. A session another window still drives or previews
+    /// keeps its one live source (its driver downgraded to a mirror if this window was
+    /// the driver and another only previews it).
     fn close_window(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
         // A closed window is forgotten, the way a browser forgets a closed tab:
         // only what was open at the quit comes back. Group ids are durable (a
@@ -7008,7 +7009,7 @@ impl App {
             }
         }
         // A reconnecting session's client is dropped while it holds, so it no longer
-        // appears in `w.sessions` — but its host must stay so the probe can reach it
+        // appears in `self.sessions` — but its host must stay so the probe can reach it
         // and `finish_reattach` can find it. Keep it in use until the hold clears.
         for (_, name) in self.reconnecting.keys() {
             if let Some((target, _)) = remote_id_parts(name) {
@@ -8079,12 +8080,6 @@ impl App {
         fallback
     }
 
-    /// Feed a driven session's output into the ONE shared emulator once and fan the
-    /// reaction to every window viewing it: the [`pick_driver`](Self::pick_driver)
-    /// window supplies the ingest geometry and answers the child; the rest fold the
-    /// same outcome as observers. A client with no driving view (transitional) is fed
-    /// as observed so any previewer still updates. Commands are buffered while the
-    /// window borrows are live, then executed.
     /// Every window currently showing `name`, in any mode.
     fn windows_viewing(&self, name: &str) -> Vec<WindowId> {
         self.windows
@@ -8094,6 +8089,12 @@ impl App {
             .collect()
     }
 
+    /// Feed a driven session's output into the ONE shared emulator once and fan the
+    /// reaction to every window viewing it: the [`pick_driver`](Self::pick_driver)
+    /// window supplies the ingest geometry and answers the child; the rest fold the
+    /// same outcome as observers. A client with no driving view (transitional) is fed
+    /// as observed so any previewer still updates. Commands are buffered while the
+    /// window borrows are live, then executed.
     fn feed_driven_to_windows(&mut self, name: &str, bytes: &[u8], ended: bool, fe: &dyn Frontend) {
         let driver_wid = self.pick_driver(name);
         let mut buffered: Vec<(WindowId, Vec<Cmd>)> = Vec::new();
@@ -8288,12 +8289,6 @@ impl App {
         }
     }
 
-    /// The once-per-wake work behind [`ApplicationHandler::about_to_wait`], taken
-    /// over the abstract [`Frontend`] rather than winit's `ActiveEventLoop` — so a
-    /// headless test can drive the very same session pump/feed/tick/repaint pass the
-    /// live loop runs, with no window server. Pump each session's one client and each
-    /// read-only observer, fan the output into every viewing window, fan pushed
-    /// session state, fire due ticks, and release paced repaints.
     /// Signal that the config on disk changed, exactly as the watcher does — the
     /// next [`wake`](Self::wake) re-reads `ui.toml` and re-applies it. Public for
     /// the end-to-end tests, which write the file themselves and must not race
@@ -8303,6 +8298,12 @@ impl App {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The once-per-wake work behind [`ApplicationHandler::about_to_wait`], taken
+    /// over the abstract [`Frontend`] rather than winit's `ActiveEventLoop` — so a
+    /// headless test can drive the very same session pump/feed/tick/repaint pass the
+    /// live loop runs, with no window server. Pump each session's one client and each
+    /// read-only observer, fan the output into every viewing window, fan pushed
+    /// session state, fire due ticks, and release paced repaints.
     pub fn wake(&mut self, fe: &dyn Frontend) {
         // A long wake-to-wake gap means we were parked — a slept laptop kills
         // remote TCP with nothing reaching the local master — so probe the
@@ -8352,11 +8353,6 @@ impl App {
             // in the frame, instead of letting it end as a blank that never
             // explained itself.
             if let Some(why) = why {
-                eprintln!(
-                    "DBGAPP name={name} why={why} viewers={:?} driver={:?}",
-                    self.windows_viewing(&name).len(),
-                    self.pick_driver(&name)
-                );
                 for wid in self.windows_viewing(&name) {
                     self.report_failure(wid, "Could not start a session", &why);
                 }

@@ -2207,13 +2207,12 @@ impl FleetModel {
     /// background activity, revert a dead mirror to a placeholder, repaint on a progress
     /// change — but the outcome is applied, not produced.
     ///
-    /// A tile is only ever an *observing* view (a session it drove would be its Single
-    /// foreground, not a tile), so the outcome folds with `driving = false`, and the
-    /// per-view apply never speaks for the child (any stray `SendInput` is dropped —
-    /// the driver's ingest already answered, once). Runs outside the `update` wrapper,
-    /// so it refreshes its own dirtied preview frame; it deliberately does NOT prune the
-    /// registry (`update`'s per-window `retain` would delete a state another window still
-    /// views once `Sessions` is shared).
+    /// A tile never resizes the window, even when this window drives its session (a
+    /// ThisWindow tile), so the outcome folds with `driving = false`, and the per-view
+    /// apply never speaks for the child (any stray `SendInput` is dropped — the shared
+    /// ingest already answered, once). Runs outside the `update` wrapper, so it
+    /// refreshes its own dirtied preview frame; it never prunes the registry, which
+    /// another window may still be viewing — the shell owns that prune.
     pub(crate) fn apply_shared_to_tile(
         &mut self,
         sessions: &Sessions,
@@ -2801,10 +2800,11 @@ impl FleetModel {
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
         }
-        // Ownership is a projection of the tile's locality (the root re-derives
-        // `mine` from the fleet's ThisWindow tiles after each update); flipping
-        // the tile IS the claim. `newly` — whether an Attach is owed — is whether
-        // the tile wasn't already ours (idempotent for an already-driven member).
+        // Flipping the tile to ThisWindow is the claim as the overview shows it;
+        // the root records the ownership in its `mine` when it sees the emitted
+        // `Cmd::Attach` (or, for `note_driven`, from the `DriverGained` it is
+        // handling). `newly` — whether an Attach is owed — is whether the tile
+        // wasn't already ours (idempotent for an already-driven member).
         let newly = if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
             let was_mine = t.locality == Locality::ThisWindow;
             t.locality = Locality::ThisWindow;
@@ -2848,7 +2848,7 @@ impl FleetModel {
         if self.observing.remove(id) {
             cmds.push(Cmd::Unobserve(id.clone()));
         }
-        // Removing the tile drops the session from the root's re-derived `mine`.
+        // The caller's `Cmd::Kill` is what drops the session from the root's `mine`.
         self.marked.remove(id);
         self.killed.insert(id.clone());
         self.tiles.retain(|t| &t.id != id);
@@ -2978,8 +2978,9 @@ impl FleetModel {
     /// commands (the client drop and the observation).
     fn detach_session(&mut self, id: &SessionId) -> Vec<Cmd> {
         let mut cmds = vec![Cmd::Detach(id.clone())];
-        // Flipping the tile off ThisWindow IS the release: the root re-derives
-        // `mine` from the fleet's ThisWindow tiles after this update.
+        // Flipping the tile off ThisWindow is the release as the overview shows
+        // it; the root drops the session from its `mine` when it sees the
+        // `Cmd::Detach` (`release_detached`).
         if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
             t.locality = Locality::Detached;
         }
