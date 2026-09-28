@@ -1543,13 +1543,12 @@ impl RootModel {
 
     pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         let cmds = self.update_dispatch(sessions, ev);
-        // Mirror ownership changes into the window's single `mine` set at the one
-        // boundary every command crosses (finding #18): a fleet claim emits a
-        // Cmd::Attach — the session became driven here — and a kill emits a
-        // Cmd::Kill — it's gone. The fleet owns no ownership set of its own, so
-        // this seam is where its claims and kills reach the window. (A detach's
-        // release, which also drops the warm mirror and its state, is handled in
-        // `release_detached`.)
+        // A kill emits a Cmd::Kill — the session is gone, so this window no longer
+        // drives it. This is the boundary every command crosses (finding #18), so a
+        // fleet-side kill reaches the window's `mine` here. (A detach's release,
+        // which also drops the warm mirror and its state, is handled in
+        // `release_detached`.) A fleet claim's Cmd::Attach grants nothing: the
+        // window drives the session once the shell says so (`UiEvent::Driving`).
         //
         // The attach's resync/reseed contract — rebuild the mirror to a fresh
         // emulator so the incoming resync (whole screen AND scrollback) doesn't
@@ -1560,14 +1559,8 @@ impl RootModel {
         // and there'd be no resync to refill it. So the shell rebuilds exactly when
         // a resync is inbound; the core only tracks ownership.
         for c in &cmds {
-            match c {
-                Cmd::Attach(id) => {
-                    self.mine.insert(id.clone());
-                }
-                Cmd::Kill(id) => {
-                    self.mine.remove(id);
-                }
-                _ => {}
+            if let Cmd::Kill(id) = c {
+                self.mine.remove(id);
             }
         }
         cmds
@@ -1655,35 +1648,22 @@ impl RootModel {
                 Mode::Single { .. } => Vec::new(),
             };
         }
-        // The shell opened (or already holds) this window's client for a session: it
-        // is ours from now on. This is the ONLY signal that says whose an attach is —
-        // a listing carries a bare `attached` flag with no owner — so without it a
-        // window reads its own fresh attach back as "attached in another window" and
-        // the adopt that follows trips the double-attach guard. Writing it down here
-        // is not a take-over: the shell is reporting a drivership it established, so
-        // no `Cmd::Attach` and no hand-over follow (`Fleet::note_driven`).
-        if let UiEvent::DriverGained { name } = &ev {
+        // The shell's word on drivership (see `UiEvent::Driving`). Granted: the
+        // session is ours — no `Cmd::Attach` follows, there is nothing left to attach
+        // (`Fleet::note_driven`). Taken back: let go completely. A session shows in
+        // exactly ONE place, so if it was our foreground we switch away — to another
+        // session of ours, or to the fleet — reusing the path a session ending takes;
+        // a warm background mirror of it is dropped.
+        if let UiEvent::Driving { name, driving } = &ev {
             let name = name.clone();
-            let cmds = match &mut self.mode {
-                Mode::Fleet(f) => f.note_driven(&name),
-                Mode::Single { .. } => Vec::new(),
-            };
-            self.mine.insert(name);
-            return cmds;
-        }
-        // Another window in this process took over a session this one drives (an
-        // in-process adopt-in-place of an already-driven session). The shell fans this
-        // exactly to the prior driver(s) at the take-over, so there is no group or
-        // predicate guesswork: it is an unambiguous "this session is someone else's
-        // now" signal, and this window lets go of it completely.
-        //
-        // A session shows in exactly ONE place. So if it was our foreground we switch
-        // away — to another session of ours, or to the fleet — reusing the same path a
-        // session ending takes; a warm background mirror of it is dropped. Keeping it
-        // on screen would leave two windows displaying and typing into one session
-        // while the fleet already showed it as attached elsewhere.
-        if let UiEvent::DriverLost { name } = &ev {
-            let name = name.clone();
+            if *driving {
+                let cmds = match &mut self.mode {
+                    Mode::Fleet(f) => f.note_driven(&name),
+                    Mode::Single { .. } => Vec::new(),
+                };
+                self.mine.insert(name);
+                return cmds;
+            }
             if matches!(&self.mode, Mode::Single { id, .. } if *id == name) {
                 // Ownership must go before the switch: `foreground_ended` picks the
                 // next session out of `mine`, and this one is no longer ours.
@@ -2098,7 +2078,7 @@ impl RootModel {
             // Don't claim ownership yet — the re-entry once the preview is live does
             // that. Leaving the tile foreign keeps it put if a reconcile lands first.
             // (An attach the shell has already made is not "foreign": it announces it
-            // with `DriverGained`, so this tile is ours before the wait even starts.)
+            // with `UiEvent::Driving`, so this tile is ours before the wait even starts.)
             self.pending_dive_in = Some(id);
             cmds.push(Cmd::Redraw);
             return cmds;
@@ -3594,8 +3574,9 @@ mod tests {
         // Another window takes alpha over; the shell fans the loss.
         a.update(
             &mut sessions,
-            UiEvent::DriverLost {
+            UiEvent::Driving {
                 name: "alpha".into(),
+                driving: false,
             },
         );
 
@@ -3623,8 +3604,9 @@ mod tests {
 
         a.update(
             &mut sessions,
-            UiEvent::DriverLost {
+            UiEvent::Driving {
                 name: "alpha".into(),
+                driving: false,
             },
         );
 
@@ -3635,7 +3617,7 @@ mod tests {
     }
 
     /// The take-over handoff (5c item 3): a window driving a session, told via the fanned
-    /// [`DriverLost`](UiEvent::DriverLost) that another window took it over in-process,
+    /// [`Driving`](UiEvent::Driving) that another window took it over in-process,
     /// relinquishes grid ownership of it — its resize no longer re-grids the one shared
     /// child. The signal is scoped to the one named session: a window's *other* driven
     /// sessions are untouched.
@@ -3656,8 +3638,9 @@ mod tests {
         // Another window took over alpha; the shell fans the loss to A.
         let cmds = a.update(
             &mut sessions,
-            UiEvent::DriverLost {
+            UiEvent::Driving {
                 name: "alpha".into(),
+                driving: false,
             },
         );
         assert!(
@@ -3970,12 +3953,12 @@ mod tests {
 
     #[test]
     fn a_fleet_side_claim_reaches_the_window_record_before_the_dive_lands() {
-        // Finding #18: `mine` had two owners — RootModel's and the fleet's. A
-        // group open claims its background members NOW (Cmd::Attach), but the
-        // adopt that switches the foreground round-trips through the shell. If a
-        // crash or quit persists `window_record()` in that gap — it reads the
-        // ownership set — the claim must already be there, or restore silently
-        // loses the just-claimed member. One owner makes that structural.
+        // A group open asks for its background members NOW (Cmd::Attach), but the
+        // adopt that switches the foreground waits for the first frame. If a crash
+        // or quit persists `window_record()` in that gap — it reads the ownership
+        // set — the member must already be there, or restore silently loses it.
+        // The shell attaches it while running the group open's commands and
+        // grants it (`UiEvent::Driving`) before the dive.
         let mut r = root(); // owns "alpha"
         dive_out(&mut r, &[sess("alpha", true, 1), sess("gamma", false, 3)]);
         settle(&mut r);
@@ -4000,6 +3983,11 @@ mod tests {
             cmds.contains(&Cmd::Attach("gamma".into())),
             "the group open claims the background member now: {cmds:?}"
         );
+        // The shell attached it.
+        r.update(UiEvent::Driving {
+            name: "gamma".into(),
+            driving: true,
+        });
         assert!(r.is_fleet(), "the adopt has not round-tripped yet");
         assert!(
             r.window_record()
@@ -4008,6 +3996,40 @@ mod tests {
             "a fleet-side claim must reach the window record immediately, not \
              wait for the fleet to close: {:?}",
             r.window_record().attached
+        );
+    }
+
+    #[test]
+    fn asking_to_attach_a_member_is_not_driving_it() {
+        // A group open asks the shell to attach its detached member. Until the
+        // shell has a client for it, the window does not drive it: an attach that
+        // fails must leave nothing behind that says this window holds the session.
+        let mut r = root(); // owns "alpha"
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("gamma", false, 3)]);
+        settle(&mut r);
+        r.update(UiEvent::GroupsLoaded(vec![crate::Group {
+            id: "g-web".into(),
+            name: "web".into(),
+            color: 0,
+            members: vec!["alpha".into(), "gamma".into()],
+            connection: None,
+        }]));
+        let cmds = key(
+            &mut r,
+            Key::Named(NamedKey::Enter),
+            Mods {
+                ctrl: true,
+                ..Mods::NONE
+            },
+        );
+        let gamma = SessionId::local("gamma");
+        assert!(
+            cmds.contains(&Cmd::Attach(gamma.clone())),
+            "precondition: the group open asks for gamma: {cmds:?}"
+        );
+        assert!(
+            !r.drives(&gamma),
+            "a request to attach is not a client: gamma is not driven yet"
         );
     }
 
@@ -4282,7 +4304,7 @@ mod tests {
     /// *by us* — and a tile whose owner the window doesn't know is bucketed "attached
     /// elsewhere". The dive that the first frame then released hit the double-attach
     /// guard in `extract` and aborted the whole app (every window lost, not just this
-    /// one). The shell's `DriverGained` is what tells the window the attach was its
+    /// one). The shell's `UiEvent::Driving` is what tells the window the attach was its
     /// own, so its own session can never read as someone else's.
     #[test]
     fn a_parked_take_over_survives_a_listing_that_shows_our_own_attach() {
@@ -4290,8 +4312,9 @@ mod tests {
         r.update(UiEvent::SessionList(listed(vec![sess("beta", false, 1)])));
         // The shell attached beta into this window (a restore reconnect), says so,
         // and asks for it in the foreground.
-        r.update(UiEvent::DriverGained {
+        r.update(UiEvent::Driving {
             name: "beta".into(),
+            driving: true,
         });
         r.update(UiEvent::AdoptSession("beta".into()));
         assert!(
@@ -4315,7 +4338,7 @@ mod tests {
     }
 
     /// The other half of the contract: a session attached in ANOTHER window — one
-    /// this window never attached and so never heard `DriverGained` for — is not
+    /// this window never attached and so was never told it drives — is not
     /// quietly taken. Taking one is a user decision (the confirm modal in
     /// `Fleet::activate` claims it first); an adopt that reaches the extract without
     /// that claim is a bug in the caller, and the guard says so rather than leaving

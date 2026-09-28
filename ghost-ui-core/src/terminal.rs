@@ -1803,15 +1803,14 @@ impl TerminalView {
             }
             // A lone terminal ignores enumeration, subscription, and group
             // state, and never sees `AdoptSession`, the fanned `SessionEnded`
-            // lifecycle, or the `DriverLost`/`DriverGained` pair (drivership lives
-            // on `RootModel`, which handles all of those).
+            // lifecycle, or `Driving` (drivership lives on `RootModel`, which
+            // handles all of those).
             UiEvent::SessionList(_)
             | UiEvent::AdoptSession(_)
             | UiEvent::SessionPush { .. }
             | UiEvent::SessionsChanged
             | UiEvent::SessionEnded { .. }
-            | UiEvent::DriverLost { .. }
-            | UiEvent::DriverGained { .. }
+            | UiEvent::Driving { .. }
             | UiEvent::GroupsLoaded(_)
             | UiEvent::DeadSessions(_) => Vec::new(),
         }

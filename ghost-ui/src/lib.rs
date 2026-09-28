@@ -3597,30 +3597,38 @@ impl App {
         }
     }
 
-    /// `wid` now holds `id`'s client: make it the session's one driver. The host is
-    /// told when the driver changes — the one client now speaks for `wid`, so the
-    /// host names that window as the holder. Any other window still driving the
-    /// session is made to let go by the next [`Self::reconcile_sources`].
+    /// `wid` now holds `id`'s client: make it the session's one driver, and tell the
+    /// window so (`UiEvent::Driving`) — before any listing can report the session
+    /// attached with no owner attached to the news. The host is told when the driver
+    /// changes: the one client now speaks for `wid`, so the host names that window
+    /// as the holder. Any other window still driving the session is made to let go
+    /// by the next [`Self::reconcile_sources`].
     ///
-    /// Every shell path that gives a window a client writes this — an attach, and a
-    /// take-over that adopts a client this process already holds — so a window
-    /// that merely claims a session (an attach that then failed) never takes it
-    /// from the one holding it.
-    fn set_driver(&mut self, wid: WindowId, id: &SessionId) {
-        if self.drivers.insert(id.clone(), wid) == Some(wid) {
-            return;
-        }
-        if let Some(identity) = self.windows.get(&wid).map(|w| w.root.client_identity())
+    /// Every shell path that gives a window a client calls this — an attach, and a
+    /// take-over that adopts a client this process already holds (which opens no
+    /// client, so nothing else would announce it). It is the only way a window
+    /// comes to drive a session: one that merely asked to attach (an attach that
+    /// then failed) never takes the session from the one holding it.
+    fn set_driver(&mut self, wid: WindowId, id: &SessionId, fe: &dyn Frontend) {
+        if self.drivers.insert(id.clone(), wid) != Some(wid)
+            && let Some(identity) = self.windows.get(&wid).map(|w| w.root.client_identity())
             && let Some(client) = self.sessions.get_mut(id)
         {
             let _ = client.hello(&identity);
+        }
+        if self.windows.get(&wid).is_some_and(|w| !w.root.drives(id)) {
+            let ev = UiEvent::Driving {
+                name: id.clone(),
+                driving: true,
+            };
+            self.dispatch(wid, ev, fe);
         }
     }
 
     /// Keep each session's one driver: a session nobody drives has none; a driver
     /// that let go (or closed) is replaced by [`Self::pick_driver`]'s choice among
-    /// the windows still driving it; every other window driving it is told it lost
-    /// the session (`UiEvent::DriverLost`). A session shows in exactly one place, so
+    /// the windows still driving it; every other window driving it is told it no
+    /// longer does (`UiEvent::Driving`). A session shows in exactly one place, so
     /// the loser switches its foreground away — or drops to the fleet — and only the
     /// driver re-grids the one shared child.
     fn reconcile_drivers(&mut self, fe: &dyn Frontend) {
@@ -3639,7 +3647,7 @@ impl App {
                     let Some(d) = self.choose_driver(&id) else {
                         continue;
                     };
-                    self.set_driver(d, &id);
+                    self.set_driver(d, &id, fe);
                     d
                 }
             };
@@ -3650,7 +3658,11 @@ impl App {
             );
         }
         for (wid, id) in losers {
-            self.dispatch(wid, UiEvent::DriverLost { name: id }, fe);
+            let ev = UiEvent::Driving {
+                name: id,
+                driving: false,
+            };
+            self.dispatch(wid, ev, fe);
         }
     }
 
@@ -4353,7 +4365,7 @@ impl App {
                     // nothing, and must not end the session in a window still holding
                     // it (for instance through a remote reconnect hold).
                     if self.sessions.contains_key(&id) {
-                        self.set_driver(wid, &id);
+                        self.set_driver(wid, &id, event_loop);
                     }
                 }
                 Cmd::SaveGroups(new_groups) => {
@@ -5226,7 +5238,7 @@ impl App {
         // Already driven somewhere in this process → adopt in place: no second
         // client / rebuild is opened, and the one held client becomes this window's.
         if self.sessions.contains_key(name) {
-            self.announce_take_over(wid, name, event_loop);
+            self.set_driver(wid, name, event_loop);
             return true;
         }
         let Some(w) = self.windows.get(&wid) else {
@@ -5252,14 +5264,7 @@ impl App {
                 // the shared mirror first so the replay lands clean (W1).
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
-                self.set_driver(wid, name);
-                // This window's client, opened just now: tell it so before any listing
-                // can report the session attached with no owner attached to the news.
-                self.dispatch(
-                    wid,
-                    UiEvent::DriverGained { name: name.clone() },
-                    event_loop,
-                );
+                self.set_driver(wid, name, event_loop);
                 true
             }
             Err(e) => {
@@ -5290,7 +5295,7 @@ impl App {
     ) -> bool {
         // Held already: adopted in place, as in `attach_into`.
         if self.sessions.contains_key(name) {
-            self.announce_take_over(wid, name, event_loop);
+            self.set_driver(wid, name, event_loop);
             return true;
         }
         let Some(w) = self.windows.get(&wid) else {
@@ -5302,14 +5307,9 @@ impl App {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
-                self.set_driver(wid, name);
-                // Ours, and said so before the host's next listing lands (see
-                // `attach_into`) — the race this closes was a remote restore.
-                self.dispatch(
-                    wid,
-                    UiEvent::DriverGained { name: name.clone() },
-                    event_loop,
-                );
+                // Ours, and said so before the host's next listing lands — the race
+                // this closes was a remote restore.
+                self.set_driver(wid, name, event_loop);
                 true
             }
             Err(e) => {
@@ -5915,7 +5915,7 @@ impl App {
         // connection down (the one `attach_remote_into` needs to open a new one).
         let held = self.sessions.contains_key(id);
         if held {
-            self.announce_take_over(wid, id, event_loop);
+            self.set_driver(wid, id, event_loop);
         }
         if held || self.attach_remote_into(wid, id, target, real, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
@@ -6525,19 +6525,6 @@ impl App {
         }
     }
 
-    /// Tell `wid` that the client this process already holds for `id` is now its own:
-    /// a take-over that adopts in place opens no client, so nothing else announces
-    /// it. The window may have claimed it already (a confirmed take-over flips the
-    /// tile first); it may not have, when a listing still showed the session free.
-    /// Without the news the window would show a session it does not drive, and the
-    /// source reconcile would demote its client to a read-only mirror.
-    fn announce_take_over(&mut self, wid: WindowId, id: &SessionId, event_loop: &dyn Frontend) {
-        self.set_driver(wid, id);
-        if self.windows.get(&wid).is_some_and(|w| !w.root.drives(id)) {
-            self.dispatch(wid, UiEvent::DriverGained { name: id.clone() }, event_loop);
-        }
-    }
-
     /// Install `s` as the driving client for `id`, first dropping any read-only
     /// observer of the same session. A client is the authoritative feed source; an
     /// observer left in place would be a SECOND source into the one shared emulator —
@@ -6956,7 +6943,7 @@ impl App {
                 pending_fallback: None,
             },
         );
-        self.set_driver(wid, &id);
+        self.set_driver(wid, &id, event_loop);
         // Sync the model's viewport to the real surface size *and* device scale
         // before the first paint — this drives the NDC mapping, the scissor
 

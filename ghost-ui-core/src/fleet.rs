@@ -2764,7 +2764,7 @@ impl FleetModel {
     }
 
     /// Record that this window ALREADY drives `id` — the shell opened its client
-    /// and said so ([`UiEvent::DriverGained`]). The same tile flip as a claim, minus
+    /// and said so ([`UiEvent::Driving`]). The same tile flip as a claim, minus
     /// the `Cmd::Attach`: there is nothing left to attach, and re-emitting one would
     /// hand the session over to ourselves. Nothing here decides to take a session
     /// from another window; it only writes down a drivership the shell established.
@@ -2775,10 +2775,10 @@ impl FleetModel {
     fn take_drivership(&mut self, id: &SessionId, attach: bool) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         // Flipping the tile to ThisWindow is the claim as the overview shows it;
-        // the root records the ownership in its `mine` when it sees the emitted
-        // `Cmd::Attach` (or, for `note_driven`, from the `DriverGained` it is
-        // handling). `newly` — whether an Attach is owed — is whether the tile
-        // wasn't already ours (idempotent for an already-driven member).
+        // the root records the ownership in its `mine` only when the shell grants
+        // it (`UiEvent::Driving`, which `note_driven` is handling). `newly` —
+        // whether an Attach is owed — is whether the tile wasn't already ours
+        // (idempotent for an already-driven member).
         let newly = if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
             let was_mine = t.locality == Locality::ThisWindow;
             t.locality = Locality::ThisWindow;

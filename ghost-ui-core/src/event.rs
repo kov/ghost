@@ -193,27 +193,22 @@ pub enum UiEvent {
     SessionEnded {
         name: SessionId,
     },
-    /// Another window in this process took over a session this one drives (an
-    /// in-process adopt-in-place, e.g. clicking a session's tile in another window's
-    /// fleet). Only one window may own a shared session's grid, so the shell fans this
-    /// to the prior driver(s) at the take-over: relinquish drivership (drop it from
-    /// `mine`) so only the new owner re-grids and SIGWINCHes the one shared child. The
-    /// losing window keeps its live view and its input — drivership gates *only* grid
-    /// mutation ([`RootModel::drives`]).
-    DriverLost {
+    /// The shell's word on whether this window drives `name` — the only way a
+    /// session enters or leaves the window's driven set. The shell grants it once it
+    /// holds a client for the window (an attach, or adopting a client this process
+    /// already holds), and takes it back when another window takes the session
+    /// over. A window never grants itself one: asking to attach (`Cmd::Attach`)
+    /// is not driving, since the attach can fail.
+    ///
+    /// Granted, it must arrive before any listing: a listing's bare `attached`
+    /// flag has no owner, so an unannounced attach would read as "attached in
+    /// another window", about the window's own session. Taken back, the window lets
+    /// go completely: a session shows in one place, so its foreground switches
+    /// away and a warm mirror is dropped, and only the new driver re-grids the
+    /// shared child.
+    Driving {
         name: SessionId,
-    },
-    /// The mirror image of [`DriverLost`](UiEvent::DriverLost): the shell opened (or
-    /// already holds) this window's client for `name`, so the window drives it from
-    /// now on. The shell is the only thing that knows *whose* client an attach
-    /// belongs to, and it must say so before any listing arrives: ownership is a
-    /// projection of tile locality, so an unannounced attach comes back in the host's
-    /// next listing as a bare `attached` flag with no owner — which a window reads as
-    /// "attached in another window", about its own session. Announcing it keeps the
-    /// tile ours, and leaves the double-attach guard free to mean what it says for
-    /// tiles that really are someone else's.
-    DriverGained {
-        name: SessionId,
+        driving: bool,
     },
     /// A driven session's transport dropped without the child exiting — a lost
     /// connection whose session may still be alive on the far side (a remote
