@@ -98,22 +98,36 @@ fn new_session(xdg: &Path, name: &str) {
 /// `ghost kill` on a session whose host is still coming up — its lock held, its
 /// pid not written yet — must leave it alone. Wiping the directory would strand
 /// a running host no `ghost` command can reach: its socket and lock are gone.
+/// Its descriptor stays too: the host is running, and relaunching it after a
+/// reboot depends on it.
 #[test]
 fn kill_never_wipes_a_session_whose_host_is_still_starting() {
     use rustix::fs::{FlockOperation, flock};
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path();
+    let data = xdg.join("data");
     let dir = xdg.join("ghost").join("starting");
     std::fs::create_dir_all(&dir).unwrap();
     // Holding the flock stands in for the host: liveness is read from the lock.
     let lock = std::fs::File::create(dir.join("lock")).unwrap();
     flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+    let descriptor = data.join("ghost").join("sessions").join("starting.json");
+    std::fs::create_dir_all(descriptor.parent().unwrap()).unwrap();
+    std::fs::write(&descriptor, "{}").unwrap();
 
-    let _ = ghost(xdg).args(["kill", "starting"]).output().unwrap();
+    let _ = ghost(xdg)
+        .env("XDG_DATA_HOME", &data)
+        .args(["kill", "starting"])
+        .output()
+        .unwrap();
 
     assert!(
         dir.join("lock").exists(),
         "a kill wiped the directory of a session whose host holds its lock"
+    );
+    assert!(
+        descriptor.exists(),
+        "a kill discarded the descriptor of a session whose host is running"
     );
     drop(lock);
 }

@@ -193,7 +193,7 @@ fn list_in_with(
             HostState::Starting => {} // keep, but not yet listable
             HostState::Dead => {
                 judged_dead(&path);
-                prune_in(runtime_dir, &path, |dir| {
+                let _ = prune_in(runtime_dir, &path, |dir| {
                     matches!(host_state(dir), HostState::Dead)
                 });
             }
@@ -294,13 +294,16 @@ fn runtime_lock(runtime_dir: &Path) -> io::Result<std::fs::File> {
 
 /// Remove the session directory `dir` if `dead` still judges it so under the
 /// runtime lock — the judgement a caller made before taking it may be stale.
-fn prune_in(runtime_dir: &Path, dir: &Path, dead: impl FnOnce(&Path) -> bool) {
+/// Returns whether it judged the session dead.
+fn prune_in(runtime_dir: &Path, dir: &Path, dead: impl FnOnce(&Path) -> bool) -> bool {
     let Ok(_runtime) = runtime_lock(runtime_dir) else {
-        return; // cannot serialize against a spawn: leave it to the next pass
+        return false; // cannot serialize against a spawn: leave it to the next pass
     };
-    if dead(dir) {
+    let dead = dead(dir);
+    if dead {
         let _ = std::fs::remove_dir_all(dir);
     }
+    dead
 }
 
 /// Whether a host holds the liveness lock in `dir`. A missing lock file is not
@@ -351,9 +354,12 @@ pub fn kill_session(name: &str) -> io::Result<bool> {
     let pid = match read_pid(name) {
         Some(pid) if pid_alive(pid) => pid,
         _ => {
-            // Killing an already-dead session is how it gets forgotten.
-            prune(name);
-            discard(name);
+            // Killing an already-dead session is how it gets forgotten. One
+            // whose host is still coming up (no pid yet) is not dead: leave it
+            // and its traces be.
+            if prune(name) {
+                discard(name);
+            }
             return Ok(false);
         }
     };
@@ -377,8 +383,11 @@ pub fn kill_session(name: &str) -> io::Result<bool> {
              left intact — try again"
         )));
     }
-    prune(name);
-    discard(name);
+    // A new host may have claimed the name since this one died; its traces are
+    // its own now.
+    if prune(name) {
+        discard(name);
+    }
     Ok(true)
 }
 
@@ -409,7 +418,7 @@ pub fn restart_session(name: &str) -> io::Result<()> {
     }
     // The host removes its own sock/lock/pid on exit; prune as a backstop so the
     // respawn binds a fresh socket and lock under the same name.
-    prune(name);
+    let _ = prune(name);
     crate::server::spawn(restart_opts(name))
 }
 
@@ -472,13 +481,15 @@ fn pid_alive(pid: i32) -> bool {
     }
 }
 
-fn prune(name: &str) {
+/// Remove `name`'s runtime directory unless a host holds its lock; returns
+/// whether it did.
+fn prune(name: &str) -> bool {
     // The whole session directory (sock + lock + pid) goes at once — unless a
     // host holds its lock: one still starting (no pid yet), or a new one that
     // claimed the name since its last host died.
     prune_in(&paths::runtime_dir(), &paths::session_dir(name), |dir| {
         !lock_held(dir)
-    });
+    })
 }
 
 #[cfg(test)]
