@@ -4571,6 +4571,12 @@ impl App {
                     // rebuild here would double-drive or blank a session another window
                     // still views (there'd be no resync to refill it).
                     if !self.sessions.contains_key(&id)
+                        && let Some((target, real)) = self.remote_index.get(&id).cloned()
+                    {
+                        // A remote member attaches over its host's transport, the
+                        // same way a take-over of it does.
+                        self.attach_remote_into(wid, &id, &target, &real, event_loop);
+                    } else if !self.sessions.contains_key(&id)
                         && let Some(w) = self.windows.get(&wid)
                     {
                         // Handshake at the window's real grid (see `attach_into`).
@@ -4587,7 +4593,7 @@ impl App {
                         }
                     }
                     // Hand over only when this process now holds a client for it: an
-                    // attach that opened nothing (a remote id here, a dead host) took
+                    // attach that opened nothing (a dead host, a lost connection) took
                     // nothing, and must not end the session in a window still holding
                     // it (for instance through a remote reconnect hold).
                     if self.sessions.contains_key(&id) {
@@ -6313,10 +6319,21 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let held = self.sessions.contains_key(id);
-        if held {
+        if held || self.attach_remote_into(wid, id, target, real, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
-            return;
         }
+    }
+
+    /// Attach the remote session `real` on `target` as `id`, driven from window
+    /// `wid`, over the host's open transport. Returns whether it attached.
+    fn attach_remote_into(
+        &mut self,
+        wid: WindowId,
+        id: &str,
+        target: &str,
+        real: &str,
+        event_loop: &dyn Frontend,
+    ) -> bool {
         let host = self
             .remotes
             .lock()
@@ -6324,14 +6341,12 @@ impl App {
             .and_then(|m| m.get(target).cloned());
         let Some(host) = host else {
             eprintln!("ghost: no live connection to {target} to open its session");
-            return;
+            return false;
         };
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
-        // Taking over a discovered session: honor its running host's level.
+        // Attaching a discovered session: honor its running host's level.
         let proto = host.remote.session_proto(&host.remote_ghost, real);
-        if self.attach_ssh_into(wid, id, cmd, proto, event_loop) {
-            self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
-        }
+        self.attach_ssh_into(wid, id, cmd, proto, event_loop)
     }
 
     /// Create a NEW session on a connected remote host (inheritance-over-remote):
@@ -10553,7 +10568,9 @@ mod tests {
                 &fe,
             );
 
-            // Window B asks to attach it; no client can be opened for it here.
+            // The connection to the host is gone with it, so window B's attach can
+            // open no client.
+            app.remotes.lock().unwrap().remove("kov@box");
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             app.exec(b, vec![ghost_ui_core::Cmd::Attach(composite.clone())], &fe);
@@ -10574,6 +10591,98 @@ mod tests {
             assert!(
                 still_held,
                 "a failed attach must not hand the session away from the window holding it"
+            );
+        });
+    }
+
+    /// Opening a group whose members live on a remote host takes over the first
+    /// and attaches the rest. Each must really be attached from this window — the
+    /// host names the window as its holder — or the tile shows a live-looking
+    /// view whose input goes nowhere.
+    #[test]
+    fn opening_a_remote_group_attaches_every_member_from_the_window() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            let names = ["rg-1", "rg-2"];
+            for name in names {
+                remote
+                    .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                    .unwrap();
+            }
+            let listing = || ghost_vt::session::list().unwrap_or_default();
+            let mut spun = 0;
+            while listing().len() < names.len() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteSessions {
+                    target: "kov@box".to_string(),
+                    infos: namespace_remote_infos("kov@box", listing()),
+                },
+            );
+            let [first, second] = names.map(|n| format!("kov@box{REMOTE_ID_SEP}{n}"));
+
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            let identity = app.windows[&w].root.client_identity();
+            app.exec(
+                w,
+                vec![
+                    ghost_ui_core::Cmd::TakeOver(first),
+                    ghost_ui_core::Cmd::Attach(second),
+                ],
+                &fe,
+            );
+            let holder = |name: &str| {
+                listing()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.holder)
+            };
+            let mut held = [None, None];
+            for _ in 0..100 {
+                held = names.map(holder);
+                if held.iter().all(|h| h.is_some()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            for name in names {
+                let _ = ghost_vt::session::kill_session(name);
+            }
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert_eq!(
+                held,
+                [Some(identity.clone()), Some(identity)],
+                "every member of the opened group is held by the window"
             );
         });
     }
