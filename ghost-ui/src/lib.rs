@@ -3795,6 +3795,35 @@ impl App {
         }
     }
 
+    /// Reattach local session `id` after its host upgraded itself in place, at its
+    /// driver's grid and under its driver's identity, replacing the dropped client.
+    /// The successor accepts at once (the listening socket survives the exec); a
+    /// short grace covers a slow one. The successor resyncs the whole screen, so the
+    /// shared state is rebuilt for it first. Returns whether it reattached.
+    fn reattach_upgraded(&mut self, id: &SessionId) -> bool {
+        let Some(local) = id.local_name() else {
+            return false;
+        };
+        let Some(w) = self.pick_driver(id).and_then(|d| self.windows.get(&d)) else {
+            return false;
+        };
+        let (cols, rows) = w.root.grid();
+        let identity = w.root.client_identity();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let s = loop {
+            match attach(local, cols, rows, &identity) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return false,
+            }
+        };
+        self.states.resize_observed(id, cols, rows);
+        self.drive_with_client(id, s);
+        true
+    }
+
     /// Keep each session's one driver: a session nobody drives has none; a driver
     /// that let go (or closed) is replaced by [`Self::pick_driver`]'s choice among
     /// the windows still driving it; every other window driving it is told it no
@@ -8234,6 +8263,23 @@ impl App {
                 dropped.push((name, bytes));
                 continue;
             }
+            // A local host that upgraded itself in place closed our connection but
+            // kept the session: reattach to its successor instead of ending it. The
+            // old host's last bytes land before the rebuild the successor's resync needs.
+            let mut bytes = bytes;
+            if end == PumpEnd::Disconnected
+                && self
+                    .sessions
+                    .get(&name)
+                    .is_some_and(|s| s.host_reexecuted())
+            {
+                if !bytes.is_empty() {
+                    self.feed_driven_to_windows(&name, &std::mem::take(&mut bytes), false, fe);
+                }
+                if self.reattach_upgraded(&name) {
+                    continue;
+                }
+            }
             let ended = end.is_end();
             if ended {
                 // Drop the dead client before the fan so a stale query-reply is
@@ -10480,6 +10526,187 @@ mod tests {
     /// the host reconnects, B's restore finds the client already held in this
     /// process and takes the session over — so A must let it go, not keep driving
     /// it beside B.
+    /// A host that upgrades itself in place (re-execs under a newer binary, keeping
+    /// its child) closes the window's connection, but the session is not over: the
+    /// window reattaches to the successor and keeps showing and driving it.
+    #[test]
+    fn a_window_keeps_its_session_across_a_host_self_upgrade() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "upg-keep";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'BEFORE\\n'; exec cat",
+                ])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, group, None)
+                .expect("the window attaches");
+            let id = SessionId::local(name);
+            let shows = |app: &App, marker: &str| {
+                app.states
+                    .text_of(&id)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains(marker)))
+            };
+            let mut spun = 0;
+            while !shows(&app, "BEFORE") && spun < 100 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let precondition = shows(&app, "BEFORE");
+
+            let upgraded =
+                ghost_vt::client::upgrade_session(name, Some(ghost_bin.display().to_string()));
+            for _ in 0..25 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let still_foreground = app
+                .windows
+                .get(&a)
+                .is_some_and(|w| w.root.foreground() == Some(&id));
+            app.exec(
+                a,
+                vec![ghost_ui_core::Cmd::SendInput {
+                    session: id.clone(),
+                    bytes: b"AFTER\n".to_vec(),
+                }],
+                &fe,
+            );
+            let mut spun = 0;
+            while !shows(&app, "AFTER") && spun < 150 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let fed = shows(&app, "AFTER");
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(precondition, "precondition: the window shows the session");
+            assert!(
+                upgraded.is_ok(),
+                "precondition: the host upgraded: {upgraded:?}"
+            );
+            assert!(still_foreground, "the window still shows the session");
+            assert!(
+                fed,
+                "and drives it: input reaches the successor, output comes back"
+            );
+        });
+    }
+
+    /// The same for a preview: a fleet mirroring a session nobody drives keeps
+    /// mirroring it after its host upgraded itself in place.
+    #[test]
+    fn a_preview_keeps_mirroring_across_a_host_self_upgrade() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "upg-preview";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args([
+                    "new",
+                    name,
+                    "-d",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf 'BEFORE\\n'; sleep 1; printf 'AFTER\\n'; exec cat",
+                ])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let b = app.open_fleet_window(&fe, group, None);
+            let id = SessionId::local(name);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
+            let shows = |app: &App, marker: &str| {
+                app.states
+                    .text_of(&id)
+                    .is_some_and(|rows| rows.iter().any(|l| l.contains(marker)))
+            };
+            let mut spun = 0;
+            while !shows(&app, "BEFORE") && spun < 40 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                spun += 1;
+            }
+            let precondition = shows(&app, "BEFORE") && !shows(&app, "AFTER");
+
+            let upgraded =
+                ghost_vt::client::upgrade_session(name, Some(ghost_bin.display().to_string()));
+            let mut spun = 0;
+            while !shows(&app, "AFTER") && spun < 150 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let mirrored = shows(&app, "AFTER");
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(
+                precondition,
+                "precondition: the preview mirrors the session"
+            );
+            assert!(
+                upgraded.is_ok(),
+                "precondition: the host upgraded: {upgraded:?}"
+            );
+            assert!(
+                mirrored,
+                "the preview mirrors output the successor forwards"
+            );
+        });
+    }
+
     /// A session's group lives on its host: a window that takes a session into
     /// its group tells the host, so every listing — `ghost ls`, another ghost
     /// process, this one after a crash — names the group, not just this UI's

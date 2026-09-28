@@ -352,6 +352,17 @@ impl Session {
         Self::from_client(Client::connect_path(sock)?, name, cols, rows)
     }
 
+    /// Whether this local session's connection dropped because its host upgraded
+    /// itself in place (see [`upgrade_session`]) rather than ending: the host still
+    /// holds its liveness lock and its exec generation moved past the one this
+    /// connection was made at. The same test the CLI attach reconnects on (see
+    /// [`try_reconnect`]); an unchanged generation is a take-over or an end, never
+    /// something to reattach across. Always false for a remote session.
+    pub fn host_reexecuted(&self) -> bool {
+        crate::session::host_is_live(&self.name)
+            && gen_at(&paths::socket_path(&self.name)) > self.client.generation
+    }
+
     fn from_client(mut client: Client, name: &str, cols: u16, rows: u16) -> io::Result<Session> {
         client.send(&ClientMsg::Resize { cols, rows })?;
         Ok(Session {
