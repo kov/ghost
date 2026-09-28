@@ -1004,7 +1004,19 @@ fn client_identity() -> String {
 /// are discovered one way. Dropping the handle drops the watch, which ends the
 /// thread.
 struct LocalFeed {
-    _watcher: notify::RecommendedWatcher,
+    /// Dropped first (see `Drop`), which ends the thread's stream.
+    watcher: Option<notify::RecommendedWatcher>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LocalFeed {
+    /// Wait for the thread, so no listing (which prunes) outlives the feed.
+    fn drop(&mut self) {
+        self.watcher.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl LocalFeed {
@@ -1012,13 +1024,16 @@ impl LocalFeed {
     /// leaves listings to a synchronous read each time one is wanted.
     fn start(sink: Arc<dyn EventSink>) -> Option<Self> {
         let (watcher, changes) = ghost_vt::watch::watch_set().ok()?;
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("ghost-local-feed".into())
             .spawn(move || {
                 changes.stream(|sessions| sink.post(UserEvent::LocalSessions(sessions.to_vec())))
             })
             .ok()?;
-        Some(Self { _watcher: watcher })
+        Some(Self {
+            watcher: Some(watcher),
+            thread: Some(thread),
+        })
     }
 }
 
