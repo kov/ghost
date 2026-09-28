@@ -1033,6 +1033,18 @@ impl RootModel {
         matches!(&self.mode, Mode::Fleet(f) if f.has_tile(name))
     }
 
+    /// The sessions this window previews live without driving them: its fleet's
+    /// live tiles that another window, another client, or nobody holds. This is
+    /// the window's standing request for a read-only mirror of each; the shell
+    /// keeps exactly one per session however many windows ask, and drops it when
+    /// none do. Empty outside the fleet.
+    pub fn previews(&self) -> Vec<SessionId> {
+        match &self.mode {
+            Mode::Fleet(f) => f.previews().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The text of a fleet tile's cached preview frame — what the overview renders
     /// for `name`, as opposed to the live emulator screen. For assertions on whether
     /// a preview is seeded. `None` unless this window is in fleet mode with that tile.

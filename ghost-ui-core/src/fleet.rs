@@ -412,6 +412,13 @@ impl Tile {
             &self.display_name
         }
     }
+
+    /// Whether the tile is a live preview: a session running somewhere that this
+    /// window does not drive, whose screen reaches it through a read-only mirror.
+    /// A dead tile plays back its recording instead.
+    fn previewed(&self) -> bool {
+        !self.dead && self.locality != Locality::ThisWindow
+    }
 }
 
 struct Tile {
@@ -528,11 +535,6 @@ pub struct FleetModel {
     /// readable tile size regardless of session count and scrolls when it overflows
     /// the viewport, rather than shrinking previews to fit.
     scroll_y: f32,
-    /// Sessions this fleet asked the shell to observe (`Cmd::Observe`) — every
-    /// tile the window doesn't drive, so its preview is a live read-only
-    /// mirror. Unobserved when the tile goes, the window takes the session
-    /// over, or the fleet closes.
-    observing: HashSet<SessionId>,
     /// Multi-selected tiles (Space / Ctrl-click), the input to bulk actions.
     /// Cleared by Escape — which marks claim ahead of the fleet toggle.
     marked: HashSet<SessionId>,
@@ -726,7 +728,6 @@ impl FleetModel {
             renaming_group: None,
             preedit: String::new(),
             scroll_y: 0.0,
-            observing: HashSet::new(),
             marked: HashSet::new(),
             killed: HashSet::new(),
             show_elsewhere: false,
@@ -1044,6 +1045,12 @@ impl FleetModel {
         self.tiles.iter().any(|t| t.id == id)
     }
 
+    /// The sessions this fleet shows as live previews — what it wants the shell
+    /// to keep a read-only mirror of (see [`Tile::previewed`]).
+    pub(crate) fn previews(&self) -> impl Iterator<Item = &SessionId> {
+        self.tiles.iter().filter(|t| t.previewed()).map(|t| &t.id)
+    }
+
     /// The driving geometry of `id`'s tile view, if the fleet holds one — the geometry
     /// source when a session is driven while its window sits in the fleet overview (a
     /// live `ThisWindow` tile). The tile's preview rect stands in for the window here (a
@@ -1177,10 +1184,9 @@ impl FleetModel {
         scale: f32,
     ) -> Extracted {
         let metrics = self.metrics;
-        // Leaving the overview closes every live mirror; the single view's
-        // sessions are fed by their own clients, and a re-opened fleet
-        // re-observes from a fresh snapshot.
-        let mut cmds: Vec<Cmd> = self.observing.iter().cloned().map(Cmd::Unobserve).collect();
+        // Leaving the overview stops previewing: the shell drops each mirror no
+        // other window still previews, and a re-opened fleet previews afresh.
+        let mut cmds: Vec<Cmd> = Vec::new();
         let mut kept: Option<(SessionId, TerminalView)> = None;
         let mut warm = Vec::new();
         for tile in self.tiles {
@@ -1395,9 +1401,6 @@ impl FleetModel {
             keep
         });
         for id in gone {
-            if self.observing.remove(&id) {
-                cmds.push(Cmd::Unobserve(id.clone()));
-            }
             self.marked.remove(&id);
             cmds.push(Cmd::Detach(id));
         }
@@ -1501,20 +1504,6 @@ impl FleetModel {
                 t.cwd = info.cwd.clone();
                 t.host = info.connection.as_ref().map(|c| c.target());
                 dirty = true;
-            }
-        }
-
-        // Live mirrors: observe every session this window doesn't drive, and
-        // drop the observation of any it now does (its own client feeds it).
-        // A dead tile has no session to observe; its preview comes from the
-        // recording, fed by the shell.
-        for tile in &self.tiles {
-            let foreign = !tile.dead && tile.locality != Locality::ThisWindow;
-            if foreign && !self.observing.contains(&tile.id) {
-                self.observing.insert(tile.id.clone());
-                cmds.push(Cmd::Observe(tile.id.clone()));
-            } else if !foreign && self.observing.remove(&tile.id) {
-                cmds.push(Cmd::Unobserve(tile.id.clone()));
             }
         }
 
@@ -1647,10 +1636,11 @@ impl FleetModel {
         push: SessionPush,
     ) -> Vec<Cmd> {
         let focused = self.focused.as_ref() == Some(id);
-        let observed = self.observing.contains(id);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) else {
             return Vec::new();
         };
+        // Whether the tile is a preview, as it stood before this push.
+        let observed = tile.previewed();
         let mut dirty = false;
         match push {
             SessionPush::Snapshot(SessionState {
@@ -2130,10 +2120,10 @@ impl FleetModel {
         let background = self.focused.as_ref() != Some(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
-        let observation_ended = ended && self.observing.remove(name);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
             return Vec::new();
         };
+        let observation_ended = ended && tile.previewed();
         // Whether this window DRIVES the session (has a client for it) or only
         // observes it — a ThisWindow tile is driven. An observed tile has no
         // write path, so its emulator's query replies must be dropped in the
@@ -2212,10 +2202,10 @@ impl FleetModel {
         let background = self.focused.as_ref() != Some(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
-        let observation_ended = outcome.ended() && self.observing.remove(name);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == name) else {
             return Vec::new();
         };
+        let observation_ended = outcome.ended() && tile.previewed();
         let Some(state) = sessions.get(name) else {
             return Vec::new();
         };
@@ -2784,9 +2774,6 @@ impl FleetModel {
 
     fn take_drivership(&mut self, id: &SessionId, attach: bool) -> Vec<Cmd> {
         let mut cmds = Vec::new();
-        if self.observing.remove(id) {
-            cmds.push(Cmd::Unobserve(id.clone()));
-        }
         // Flipping the tile to ThisWindow is the claim as the overview shows it;
         // the root records the ownership in its `mine` when it sees the emitted
         // `Cmd::Attach` (or, for `note_driven`, from the `DriverGained` it is
@@ -2819,7 +2806,7 @@ impl FleetModel {
     fn kill_sessions(&mut self, ids: &[SessionId]) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         for id in ids {
-            cmds.extend(self.forget_session(id));
+            self.forget_session(id);
             cmds.push(Cmd::Kill(id.clone()));
         }
         cmds
@@ -2830,11 +2817,7 @@ impl FleetModel {
     /// every group (the registry sync persists and broadcasts the
     /// forgetting), and the name is suppressed against racing listings until
     /// one confirms the session gone.
-    fn forget_session(&mut self, id: &SessionId) -> Vec<Cmd> {
-        let mut cmds = Vec::new();
-        if self.observing.remove(id) {
-            cmds.push(Cmd::Unobserve(id.clone()));
-        }
+    fn forget_session(&mut self, id: &SessionId) {
         // The caller's `Cmd::Kill` is what drops the session from the root's `mine`.
         self.marked.remove(id);
         self.killed.insert(id.clone());
@@ -2846,7 +2829,6 @@ impl FleetModel {
         // everything a window drives drops its entry, like detaching
         // everything does; the identity stays for the next claim).
         self.groups.retain(|g| !g.members.is_empty());
-        cmds
     }
 
     /// Attach `ids` to this window in the background (no foreground switch),
@@ -2959,22 +2941,18 @@ impl FleetModel {
             .collect()
     }
 
-    /// Release `id` from this window: drop ownership, flip its tile to
-    /// Detached, and observe it so the preview stays a live mirror — the
+    /// Release `id` from this window: drop ownership and flip its tile to
+    /// Detached, which makes it a preview the shell keeps a live mirror of — the
     /// inverse of the claim in [`Self::open_group_cmds`]. Returns the shell
-    /// commands (the client drop and the observation).
+    /// command that drops the client.
     fn detach_session(&mut self, id: &SessionId) -> Vec<Cmd> {
-        let mut cmds = vec![Cmd::Detach(id.clone())];
         // Flipping the tile off ThisWindow is the release as the overview shows
         // it; the root drops the session from its `mine` when it sees the
         // `Cmd::Detach` (`release_detached`).
         if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
             t.locality = Locality::Detached;
         }
-        if self.observing.insert(id.clone()) {
-            cmds.push(Cmd::Observe(id.clone()));
-        }
-        cmds
+        vec![Cmd::Detach(id.clone())]
     }
 
     /// Run a card button's action: detach immediately, confirm a kill, or open an
@@ -4365,6 +4343,13 @@ mod tests {
         infos.into_iter().map(crate::Listed::local).collect()
     }
 
+    /// The sessions the fleet asks the shell to mirror, in tile order.
+    fn previews(m: &Fleet) -> Vec<SessionId> {
+        let mut ids: Vec<SessionId> = m.previews().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// A listing of these sessions, each as its own host lists it.
     fn listed_ids(ids: &[SessionId]) -> Vec<crate::Listed> {
         ids.iter()
@@ -4487,16 +4472,6 @@ mod tests {
         fn into_single(self, size_px: (u32, u32), scale: f32) -> Extracted {
             let Fleet { m, mut s, mine: _ } = self;
             m.into_single(&mut s, size_px, scale)
-        }
-
-        fn into_single_keeping(
-            self,
-            target: Option<SessionId>,
-            size_px: (u32, u32),
-            scale: f32,
-        ) -> Extracted {
-            let Fleet { m, mut s, mine: _ } = self;
-            m.into_single_keeping(&mut s, target, size_px, scale)
         }
 
         fn into_single_adopting(self, id: SessionId, size_px: (u32, u32), scale: f32) -> Extracted {
@@ -4921,9 +4896,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::Unobserve("a".into()),
                 Cmd::Attach("a".into()),
-                Cmd::Unobserve("c".into()),
                 Cmd::Attach("c".into()),
                 Cmd::TakeOver("a".into()),
                 Cmd::Redraw,
@@ -5016,9 +4989,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::Unobserve("a".into()),
                 Cmd::Attach("a".into()),
-                Cmd::Unobserve("c".into()),
                 Cmd::Attach("c".into()),
                 Cmd::TakeOver("a".into()),
                 Cmd::Redraw,
@@ -5098,15 +5069,18 @@ mod tests {
             cmds,
             vec![
                 Cmd::Detach("a".into()),
-                Cmd::Observe("a".into()),
                 Cmd::Detach("c".into()),
-                Cmd::Observe("c".into()),
                 Cmd::Redraw,
             ],
             "detaching is not ungrouping — no registry churn"
         );
         assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
         assert_eq!(m.locality_of(&"c".into()), Some(Locality::Detached));
+        assert_eq!(
+            previews(&m),
+            ["a", "b", "c"],
+            "released sessions become live previews"
+        );
         assert!(
             m.groups()
                 .iter()
@@ -5509,8 +5483,8 @@ mod tests {
             "the dead member still renders in my block"
         );
         assert!(
-            !cmds.contains(&Cmd::Observe("c".into())),
-            "a dead session cannot be observed: {cmds:?}"
+            !previews(&m).contains(&"c".into()),
+            "a dead session has nothing to mirror"
         );
         assert_eq!(
             saved_members(&cmds, "w1"),
@@ -5563,8 +5537,8 @@ mod tests {
             "the button detaches: {cmds:?}"
         );
         assert!(
-            cmds.contains(&Cmd::Observe("a".into())),
-            "the released session is observed so its preview stays live: {cmds:?}"
+            previews(&m).contains(&"a".into()),
+            "the released session is previewed, so its tile stays live"
         );
         assert_eq!(
             m.locality_of(&"a".into()),
@@ -5794,12 +5768,12 @@ mod tests {
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
         list(&mut m, &["a"]); // c dies
         assert!(m.tiles.iter().find(|t| t.id == "c").unwrap().dead);
-        let cmds = list(&mut m, &["a", "c"]); // c returns
+        list(&mut m, &["a", "c"]); // c returns
         let c = m.tiles.iter().find(|t| t.id == "c").unwrap();
         assert!(!c.dead, "a live listing revives the tile");
         assert!(
-            cmds.contains(&Cmd::Observe("c".into())),
-            "the revived session is mirrored again: {cmds:?}"
+            previews(&m).contains(&"c".into()),
+            "the revived session is mirrored again"
         );
     }
 
@@ -5942,8 +5916,8 @@ mod tests {
         let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
         assert!(cmds.contains(&Cmd::Detach("a".into())), "{cmds:?}");
         assert!(
-            cmds.contains(&Cmd::Observe("a".into())),
-            "the released session keeps a live preview: {cmds:?}"
+            previews(&m).contains(&"a".into()),
+            "the released session keeps a live preview"
         );
         assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
         assert_eq!(saved_members(&cmds, "w1"), Some(vec![SessionId::from("b")]));
@@ -6681,47 +6655,27 @@ mod tests {
     }
 
     #[test]
-    fn the_fleet_observes_sessions_it_does_not_drive() {
+    fn the_fleet_previews_sessions_it_does_not_drive() {
         let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".into()]));
-        let cmds = m.update(UiEvent::SessionList(listed(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
         ])));
-        assert!(
-            cmds.contains(&Cmd::Observe("b".into())),
-            "the foreign tile gets a live mirror; got {cmds:?}"
+        assert_eq!(
+            previews(&m),
+            ["b"],
+            "the foreign tile wants a live mirror; the driven one is already live"
         );
-        assert!(
-            !cmds.contains(&Cmd::Observe("a".into())),
-            "a driven session is already live — observing it would double-feed"
-        );
-        // A second reconcile doesn't re-observe.
-        let cmds = m.update(UiEvent::SessionList(listed(vec![
-            sinfo("a", true),
-            info("b"),
-        ])));
-        assert!(!cmds.iter().any(|c| matches!(c, Cmd::Observe(_))));
     }
 
     #[test]
-    fn a_vanished_session_is_unobserved() {
+    fn a_vanished_session_is_no_longer_previewed() {
         let mut m = fleet();
         list(&mut m, &["b"]);
-        let cmds = list(&mut m, &[]);
-        assert!(cmds.contains(&Cmd::Unobserve("b".into())));
-        // Re-listing it re-observes.
-        let cmds = list(&mut m, &["b"]);
-        assert!(cmds.contains(&Cmd::Observe("b".into())));
-    }
-
-    #[test]
-    fn leaving_the_fleet_drops_every_observation() {
-        let mut m = fleet();
-        widen(&mut m);
-        list(&mut m, &["b", "c"]);
-        let (_, _, _, cmds) = m.into_single_keeping(None, WIDE, 1.0);
-        assert!(cmds.contains(&Cmd::Unobserve("b".into())));
-        assert!(cmds.contains(&Cmd::Unobserve("c".into())));
+        list(&mut m, &[]);
+        assert!(previews(&m).is_empty());
+        list(&mut m, &["b"]);
+        assert_eq!(previews(&m), ["b"], "re-listing it previews it again");
     }
 
     #[test]
@@ -6782,9 +6736,9 @@ mod tests {
             ended: true,
         });
         assert!(!tile(&m, "b").fed, "a dead mirror is a placeholder again");
-        // The next reconcile re-observes it (the session may still exist).
-        let cmds = list(&mut m, &["b"]);
-        assert!(cmds.contains(&Cmd::Observe("b".into())));
+        // Still listed, it is still a preview the shell may source again.
+        list(&mut m, &["b"]);
+        assert_eq!(previews(&m), ["b"]);
     }
 
     #[test]

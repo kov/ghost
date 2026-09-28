@@ -53,17 +53,12 @@ pub enum Cmd {
     WritePrimary(String),
     /// Enumerate sessions; the shell replies `UiEvent::SessionList`.
     ListSessions,
-    /// Open / close a session socket (e.g. for a fleet tile preview).
+    /// Drive / release a session from this window. A fleet preview needs no
+    /// command: the shell mirrors whatever [`RootModel::previews`] lists.
+    ///
+    /// [`RootModel::previews`]: crate::RootModel::previews
     Attach(SessionId),
     Detach(SessionId),
-    /// Open a read-only observation of a session — a live fleet preview. The
-    /// shell replies with `UiEvent::SessionPush`es (grid, state) and mirrored
-    /// output as `UiEvent::SessionData`; it never resizes or steals the
-    /// session.
-    Observe(SessionId),
-    /// Close a session's observation (its tile is gone, driven by this
-    /// window now, or the fleet closed).
-    Unobserve(SessionId),
     /// Kill a session and its process (the shell sends `ClientMsg::Kill`).
     Kill(SessionId),
     /// Bring a dead-but-remembered session back: the shell respawns it under

@@ -1711,6 +1711,10 @@ fn interactive(fresh: bool, ssh_window: bool) {
         states: Sessions::new(),
         sessions: HashMap::new(),
         observers: HashMap::new(),
+        observe_failed: HashSet::new(),
+        unsourced: Vec::new(),
+        exec_depth: 0,
+        reconciling: false,
         dead_fed: HashSet::new(),
         clipboard: None,
         start: Instant::now(),
@@ -3108,6 +3112,10 @@ impl App {
             states: Sessions::new(),
             sessions: HashMap::new(),
             observers: HashMap::new(),
+            observe_failed: HashSet::new(),
+            unsourced: Vec::new(),
+            exec_depth: 0,
+            reconciling: false,
             dead_fed: HashSet::new(),
             clipboard: None,
             start: Instant::now(),
@@ -3412,12 +3420,27 @@ pub struct App {
     /// drops it (the "close = detach" default). One of the three feed sources fanned
     /// into [`Self::states`]: the driven half.
     sessions: HashMap<SessionId, Session>,
-    /// Read-only mirrors of sessions previewed but driven nowhere in this process
-    /// (`Cmd::Observe` — a session attached elsewhere, or on a remote host), keyed by
-    /// id. Deduped against [`Self::sessions`]: a session with a local client is never
-    /// also observed (that would double-feed its one emulator). The observed feed
-    /// source; last-viewer-gated on teardown like the clients.
+    /// Read-only mirrors of sessions previewed but driven nowhere in this process (a
+    /// session attached elsewhere, or on a remote host), keyed by id. Deduped against
+    /// [`Self::sessions`]: a session with a local client is never also observed (that
+    /// would double-feed its one emulator). The observed feed source, kept matched to
+    /// the windows' previews by [`Self::reconcile_sources`].
     observers: HashMap<SessionId, Subscriber>,
+    /// Previews whose mirror could not be opened, or opened and then ended. Not tried
+    /// again until the next listing, so a session that refuses observers costs one
+    /// attempt per listing rather than one per dispatch (a remote one opens an ssh
+    /// channel each time).
+    observe_failed: HashSet<SessionId>,
+    /// Previews a reconcile left with no source, to be told to their viewers as an
+    /// ended mirror (the tile reverts to a placeholder) by the next
+    /// [`Self::reconcile_sources`].
+    unsourced: Vec<SessionId>,
+    /// How deep [`Self::exec`] is nested: the outermost call reconciles sources once
+    /// its commands (and everything they dispatched) have run.
+    exec_depth: u32,
+    /// Set while [`Self::reconcile_sources`] runs, so the dispatches it makes don't
+    /// start another pass inside it.
+    reconciling: bool,
     /// Dead sessions whose recording has been played into the shared state already,
     /// so the periodic sweep doesn't re-feed the same last screen every tick.
     /// Process-wide: the recording replays once, fanned to every window's tile.
@@ -4073,6 +4096,11 @@ impl App {
                 format_args!("os-focus win={wid:?} focused={focused} mode={mode}"),
             );
         }
+        // A listing is the retry point for a preview whose mirror failed: the session
+        // it names may be observable again.
+        if matches!(ev, UiEvent::SessionList(_)) {
+            self.observe_failed.clear();
+        }
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
             None => return,
@@ -4107,7 +4135,18 @@ impl App {
         let _ = ctx;
     }
 
+    /// Execute `wid`'s commands. The outermost call then reconciles every session's
+    /// feed source against what the windows now drive and preview.
     pub fn exec(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
+        self.exec_depth += 1;
+        self.exec_cmds(wid, cmds, event_loop);
+        self.exec_depth -= 1;
+        if self.exec_depth == 0 {
+            self.reconcile_sources(event_loop);
+        }
+    }
+
+    fn exec_cmds(&mut self, wid: WindowId, cmds: Vec<Cmd>, event_loop: &dyn Frontend) {
         let now_ms = self.now_ms();
         for cmd in cmds {
             match cmd {
@@ -4281,87 +4320,6 @@ impl App {
                     // it (for instance through a remote reconnect hold).
                     if self.sessions.contains_key(&id) {
                         self.hand_over(wid, &id, event_loop);
-                    }
-                }
-                Cmd::Observe(id) if id.is_remote() => {
-                    // Live remote preview: observe the session over its host's
-                    // transport, feeding the tile exactly like a local observer.
-                    if self.bench.is_none()
-                        // Never observe a session anything in THIS PROCESS already
-                        // drives or observes: a second feed source double-feeds the one
-                        // shared emulator, garbling it unhealably (finding #7). The maps
-                        // are process-wide now, so this dedup is process-wide — the whole
-                        // point of the collapse (a preview of an in-process-driven
-                        // session borrows the driver's state, opens no mirror).
-                        && !self.observers.contains_key(&id)
-                        && !self.sessions.contains_key(&id)
-                        && let Some((target, real)) = id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
-                    {
-                        match self.observe_remote(&target, &real) {
-                            Some(sub) => {
-                                self.observers.insert(id, sub);
-                            }
-                            // No live connection (host gone) or a failed channel:
-                            // report the mirror dead so the tile reverts to a
-                            // placeholder and a later reconcile retries.
-                            //
-                            // Deliberately single-window: this reaches only the window
-                            // that emitted the Observe. If another window also previews
-                            // this session, its tile keeps the last frame until the next
-                            // `SessionList` reconcile drops it (in every window at once) —
-                            // a sub-second, self-healing display lag, never a wrong shared
-                            // state (the dedup above guarantees no second feed source). The
-                            // multi-view fan (`end_session_in_views`) is not worth its cost
-                            // here; see the "one model, many views" 5c notes (item 4).
-                            None => self.dispatch(
-                                wid,
-                                UiEvent::SessionData {
-                                    name: id,
-                                    bytes: Vec::new(),
-                                    ended: true,
-                                },
-                                event_loop,
-                            ),
-                        }
-                    }
-                }
-                Cmd::Observe(id) => {
-                    if self.bench.is_none()
-                        // Process-wide dedup — see the remote arm above (finding #7).
-                        // A session driven or already observed anywhere in this process
-                        // is never given a second feed source.
-                        && !self.observers.contains_key(&id)
-                        && !self.sessions.contains_key(&id)
-                    {
-                        match Subscriber::observe(id.name()) {
-                            Ok(sub) => {
-                                self.observers.insert(id, sub);
-                            }
-                            // An old host or a dying session: report the
-                            // mirror dead so the fleet reverts the tile to a
-                            // placeholder and retries on a later reconcile.
-                            // Single-window on purpose, same as the remote arm above: a
-                            // co-previewer's tile self-heals on the next reconcile.
-                            Err(_) => self.dispatch(
-                                wid,
-                                UiEvent::SessionData {
-                                    name: id,
-                                    bytes: Vec::new(),
-                                    ended: true,
-                                },
-                                event_loop,
-                            ),
-                        }
-                    }
-                }
-                Cmd::Unobserve(id) => {
-                    // Last-viewer-gate (W5): the observer is the ONE shared feed source
-                    // for this session now, so a fleet closing must not kill it while
-                    // another window still previews it. Drop it only when no window
-                    // views `id` any more. (Symmetric to the Observe dedup: creation is
-                    // deduped, destruction is refcounted by the live viewer set.)
-                    if !self.windows.values().any(|w| w.root.views(&id)) {
-                        self.observers.remove(&id);
                     }
                 }
                 Cmd::SaveGroups(new_groups) => {
@@ -4581,6 +4539,9 @@ impl App {
                         // (even by another window) is adopted in place (no second
                         // transport), the same-process take-over the shared map enables.
                         let held = self.sessions.contains_key(&id);
+                        if held {
+                            self.announce_take_over(wid, &id, event_loop);
+                        }
                         if held || self.attach_into(wid, &id, event_loop) {
                             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
                             // The adopt-in-place branch never went through `Cmd::Attach`,
@@ -5694,9 +5655,8 @@ impl App {
             }
             let real = id.name().to_string();
             // A window SAVED in the fleet overview comes back in it: its tile goes
-            // live through the fleet's own observe path (`register_remote` above
-            // started the watcher; `reconcile` will `Cmd::Observe` this foreign
-            // tile). Do NOT attach+adopt here — adopting dives out of the fleet
+            // live as a preview (`register_remote` above started the watcher, and
+            // the source reconcile mirrors the foreign tile). Do NOT attach+adopt here — adopting dives out of the fleet
             // into the session, and driving without adopting double-feeds the tile
             // (owned pump + observer). Only a single-view window (a lone remote
             // session) drives+foregrounds it. We key on the SAVED mode, not the
@@ -5947,6 +5907,9 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let held = self.sessions.contains_key(id);
+        if held {
+            self.announce_take_over(wid, id, event_loop);
+        }
         if held || self.attach_remote_into(wid, id, target, real, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
             self.hand_over(wid, id, event_loop);
@@ -6470,45 +6433,100 @@ impl App {
         }
     }
 
-    /// Reconcile a session's ONE process-wide feed source against its live viewers —
-    /// the seam that keeps "exactly one source per session, fanned to every viewer"
-    /// true across every open/close. Run after any change to who drives or views `id`:
+    /// Reconcile every session's feed source with what the windows drive and preview:
+    /// each session anything holds a source for or previews gets
+    /// [`reconcile_source`](Self::reconcile_source). Then tell viewers about previews
+    /// left without a source. Runs after the outermost [`exec`](Self::exec) and once
+    /// per wake, so a window only says what it shows and never asks for mirrors.
+    fn reconcile_sources(&mut self, fe: &dyn Frontend) {
+        if self.reconciling {
+            return;
+        }
+        self.reconciling = true;
+        let mut ids: HashSet<SessionId> = self
+            .sessions
+            .keys()
+            .chain(self.observers.keys())
+            .cloned()
+            .collect();
+        for w in self.windows.values() {
+            ids.extend(w.root.previews());
+        }
+        for id in &ids {
+            self.reconcile_source(id);
+        }
+        for id in std::mem::take(&mut self.unsourced) {
+            if !self.observers.contains_key(&id) && !self.sessions.contains_key(&id) {
+                self.feed_observed_to_viewers(&id, &[], true, fe);
+            }
+        }
+        self.reconciling = false;
+    }
+
+    /// Reconcile a session's ONE process-wide feed source against its windows — the
+    /// seam that keeps "exactly one source per session, fanned to every viewer" true
+    /// across every open/close:
+    /// - a window drives it → the client is the source; drop any observer (a driver
+    ///   plus an observer would double-feed the one emulator, finding #7). Checked
+    ///   first: a client just opened for a window is driven before that window shows
+    ///   it, and must not be dropped in between.
     /// - no window views it → drop the client, observer, shared state, and dead-replay
     ///   mark (the last-viewer prune; the session detaches on its host and lives on for
     ///   a later reattach).
-    /// - a window drives it → the client is the source; drop any observer (a driver
-    ///   plus an observer would double-feed the one emulator, finding #7).
-    /// - viewed but driven nowhere → the source must be a read-only mirror: if a client
-    ///   lingers (its driver just left/closed) detach it and downgrade to an observer so
-    ///   previewers keep updating; open one if none exists yet. A remote session downgrades
-    ///   to an observer over its host's transport (`observe_remote`), not a local socket —
-    ///   the fleet's own reconcile can't heal it (it optimistically believes it already
-    ///   observes a session it deduped away), so this is the one seam that re-sources it.
+    /// - viewed but driven nowhere → the source must be a read-only mirror. A client
+    ///   left behind (its driver just released or closed) is detached and downgraded to
+    ///   an observer, so previewers keep updating; a window previewing a session with no
+    ///   source gets one. A remote session is observed over its host's transport. A
+    ///   mirror that cannot be opened is not retried before the next listing, and its
+    ///   viewers are told (see [`Self::unsourced`]).
     fn reconcile_source(&mut self, id: &SessionId) {
-        let driven = self.windows.values().any(|w| w.root.drives(id));
-        let viewed = self.windows.values().any(|w| w.root.views(id));
-        if !viewed {
+        if self.windows.values().any(|w| w.root.drives(id)) {
+            self.observers.remove(id);
+            return;
+        }
+        if !self.windows.values().any(|w| w.root.views(id)) {
             self.sessions.remove(id);
             self.observers.remove(id);
             self.states.discard(id);
             self.dead_fed.remove(id);
             return;
         }
-        if driven {
-            self.observers.remove(id);
+        let had_client = self.sessions.remove(id).is_some();
+        if self.observers.contains_key(id) || self.bench.is_some() {
             return;
         }
-        let had_client = self.sessions.remove(id).is_some();
-        if had_client || !self.observers.contains_key(id) {
-            // A remote id whose host dropped finds nothing to observe over: it
-            // keeps its last frame, and a later reconnect re-sources it.
-            let sub = match id.target() {
-                Some(target) => self.observe_remote(target, id.name()),
-                None => Subscriber::observe(id.name()).ok(),
-            };
-            if let Some(sub) = sub {
+        let previewed = self
+            .windows
+            .values()
+            .any(|w| w.root.previews().contains(id));
+        if !(had_client || previewed) || self.observe_failed.contains(id) {
+            return;
+        }
+        // A remote id whose host dropped finds nothing to observe over.
+        let sub = match id.target() {
+            Some(target) => self.observe_remote(target, id.name()),
+            None => Subscriber::observe(id.name()).ok(),
+        };
+        match sub {
+            Some(sub) => {
                 self.observers.insert(id.clone(), sub);
             }
+            None => {
+                self.observe_failed.insert(id.clone());
+                self.unsourced.push(id.clone());
+            }
+        }
+    }
+
+    /// Tell `wid` that the client this process already holds for `id` is now its own:
+    /// a take-over that adopts in place opens no client, so nothing else announces
+    /// it. The window may have claimed it already (a confirmed take-over flips the
+    /// tile first); it may not have, when a listing still showed the session free.
+    /// Without the news the window would show a session it does not drive, and the
+    /// source reconcile would demote its client to a read-only mirror.
+    fn announce_take_over(&mut self, wid: WindowId, id: &SessionId, event_loop: &dyn Frontend) {
+        if self.windows.get(&wid).is_some_and(|w| !w.root.drives(id)) {
+            self.dispatch(wid, UiEvent::DriverGained { name: id.clone() }, event_loop);
         }
     }
 
@@ -8129,6 +8147,7 @@ impl App {
             }
             if p.ended {
                 self.observers.remove(&name);
+                self.observe_failed.insert(name.clone());
                 self.end_session_in_views(&name, fe);
             }
         }
@@ -8146,6 +8165,8 @@ impl App {
         // Pushed session state (subscriptions) and set-change hints (the
         // runtime-dir watch), fanned out to every window.
         self.pump_subscriptions(fe);
+        // Whatever this wake's pumps changed, every preview has its one source.
+        self.reconcile_sources(fe);
         // Reap shared states nothing references any more (a session that vanished with
         // its tile, leaving no view and no source) — the process-wide replacement for
         // the fleet's old per-window prune, run once all this wake's reconciles landed.
@@ -9741,8 +9762,8 @@ mod tests {
             let precondition = sees(&app);
 
             // The host's Resized echo lands on B (the app-wide subscription fan). Its
-            // fleet believes it observes X (it emitted an Observe the shell deduped),
-            // so pre-fix this rebuilt and blanked the shared emulator.
+            // tile is a preview of X, which A's client feeds, so a rebuild here would
+            // blank the shared emulator A drives.
             app.dispatch(
                 b,
                 ghost_ui_core::UiEvent::SessionPush {
@@ -10105,6 +10126,85 @@ mod tests {
             assert!(
                 state_alive,
                 "the shared state survives the remote driver leaving"
+            );
+        });
+    }
+
+    /// A preview whose source could not be opened is sourced again once its host
+    /// lists the session. Window B previews a remote session that window A drives
+    /// (sharing A's client). A closes while the host's transport is down, so the
+    /// downgrade to an observer finds nothing to observe over. The host comes back
+    /// and lists the session to B: its preview must get a live source again, not
+    /// stay frozen on the last frame.
+    #[test]
+    fn a_preview_left_without_a_source_is_resourced_when_its_host_lists_it_again() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+
+            let ga = app.mint_group();
+            let a = app.open_fleet_window(&fe, ga, None);
+            let name = "rs-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                a,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
+            let remote_id = SessionId::remote("kov@box", name);
+            let driven = app.sessions.contains_key(&remote_id);
+
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let listed = remote_listing("kov@box", &[info(name, true)]);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+
+            // The transport drops, and A closes: nothing to downgrade B's preview over.
+            let conn = app.host_mut("kov@box").conn.take();
+            app.close_window(a, &fe);
+            let unsourced = !app.observers.contains_key(&remote_id);
+
+            // The host is back and lists the session to B.
+            app.host_mut("kov@box").conn = conn;
+            let listed = remote_listing("kov@box", &[info(name, false)]);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+            let resourced = app.observers.contains_key(&remote_id);
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(driven, "precondition: A drives the remote session");
+            assert!(unsourced, "precondition: the downgrade found no transport");
+            assert!(
+                resourced,
+                "B's preview is sourced again once its host lists the session"
             );
         });
     }

@@ -80,7 +80,11 @@ into the child or end the session.
 - The App keeps one `Subscriber` per local session in `subs` for state pushes and
   fans each push to every window as `UiEvent::SessionPush`.
 - Fleet previews of sessions this process does not drive use `Observe`; the
-  observer's output feeds the one shared emulator for that session.
+  observer's output feeds the one shared emulator for that session. Windows do
+  not request observers: each reports the sessions it previews, and after every
+  batch of commands the App reconciles one source per session (a client if a
+  window drives it, else an observer if a window previews it, else nothing). A
+  failed observer is retried at the next listing.
 - **Set changes, local and remote alike,** come from one watch
   (`watch::watch_set` + `SetChanges::stream`): the runtime tree recursively plus
   the descriptors dir, `Access` events ignored (a listing's own reads would
