@@ -42,9 +42,9 @@ A client gates each verb on the host's feature level from the session's `proto`
 marker (`PROTO_SUBSCRIBE = 3`, `PROTO_OBSERVE = 4`); a host below it is polled
 through the marker files instead.
 
-A subscriber or observer never sends `Resize`, so it never becomes the display
-client and never resizes the PTY. This is a client convention: the host does not
-reject a `Resize` from a subscriber.
+A subscriber or observer only watches. The host ignores `Resize`, `Input` and
+`Kill` from one, so it can never become the display client, resize the PTY, type
+into the child or end the session.
 
 ## Host behaviour
 

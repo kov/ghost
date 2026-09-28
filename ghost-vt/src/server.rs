@@ -1745,11 +1745,9 @@ fn host_main(
                     Err(_) => Disposition::Drop,
                 };
                 match disposition {
-                    Disposition::Kill => {
-                        kill_child(&mut child);
-                        return Ok(0);
-                    }
-                    Disposition::Drop => {} // drop s
+                    // A watcher's Kill is refused in `handle_client_messages`, so
+                    // none arrives here; a watcher never ends the session.
+                    Disposition::Kill | Disposition::Drop => {} // drop s
                     Disposition::Keep => kept.push(s),
                 }
             }
@@ -1790,8 +1788,11 @@ fn host_main(
                     Err(_) => Disposition::Drop,
                 };
                 match disposition {
+                    // An explicit kill throws the session away whoever asks, the
+                    // same as the display client's (see `discard_traces`).
                     Disposition::Kill => {
                         kill_child(&mut child);
+                        discard_traces(current_name, opts.record.as_deref());
                         return Ok(0);
                     }
                     Disposition::Drop => {} // drop p
@@ -2284,6 +2285,12 @@ fn handle_client_messages(
 ) -> io::Result<Disposition> {
     for msg in msgs {
         match msg {
+            // A watcher (subscriber or observer) only watches: the verbs that change
+            // the session — typing into it, re-gridding it, ending it — belong to the
+            // display client and to control connections. Checked per message, since
+            // a batch can carry the `Observe` that makes this connection a watcher.
+            ClientMsg::Input(_) | ClientMsg::Resize { .. } | ClientMsg::Kill
+                if c.subscribed || c.observing => {}
             ClientMsg::Input(bytes) => {
                 if let Some(r) = recorder
                     && !hidden_prompt(pty)

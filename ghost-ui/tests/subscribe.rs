@@ -614,3 +614,147 @@ fn past_the_subscriber_cap_the_oldest_subscriber_is_dropped() {
     assert!(second_kept, "only the oldest is dropped");
     assert!(newest_kept, "the newest subscriber is kept");
 }
+
+/// Open a raw observer connection (the verb, not the typed wrapper) so the test
+/// can also send what a watcher must not: `Resize`, `Input`, `Kill`.
+fn raw_observer(sock: &Path) -> Client {
+    let mut c = Client::connect_path(sock).expect("observer connect");
+    c.send(&ClientMsg::Observe).unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+    c
+}
+
+/// Pump `c` until a `Resized` event arrives and return its grid, or `None` on
+/// EOF / timeout. Re-sending `Observe` makes the host answer with the session's
+/// current grid, after everything sent before it on this connection.
+fn next_grid(c: &mut Client, timeout: Duration) -> Option<(u16, u16)> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let msgs = match c.recv_ready() {
+            Ok(Some(msgs)) => msgs,
+            Ok(None) => return None,
+            Err(_) => continue,
+        };
+        for msg in msgs {
+            if let ServerMsg::Event(SessionEvent::Resized { cols, rows }) = msg {
+                return Some((cols, rows));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn an_observers_resize_does_not_regrid_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observer-resize-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut obs = raw_observer(&sock);
+    let before = next_grid(&mut obs, Duration::from_secs(5)).expect("initial grid");
+    obs.send(&ClientMsg::Resize { cols: 41, rows: 11 }).unwrap();
+    obs.send(&ClientMsg::Observe).unwrap();
+    let after = next_grid(&mut obs, Duration::from_secs(5)).expect("grid after resize");
+
+    assert_ne!(
+        before,
+        (41, 11),
+        "precondition: the session starts at another size"
+    );
+    assert_eq!(after, before, "a watcher must not re-grid the session");
+}
+
+#[test]
+fn an_observers_input_never_reaches_the_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observer-input-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(
+        xdg,
+        name,
+        "stty -echo; read line; echo \"GOT:$line.\"; sleep 60",
+    )
+    .join("sock");
+
+    let mut obs = raw_observer(&sock);
+    obs.send(&ClientMsg::Input(b"watcher\r".to_vec())).unwrap();
+    // A real display client types next; whichever line the child reads first
+    // is what it prints.
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    display
+        .send(&ClientMsg::Input(b"driver\r".to_vec()))
+        .unwrap();
+
+    let mut out = Vec::new();
+    let got = wait_until(Duration::from_secs(5), || {
+        if let Ok(Some(msgs)) = obs.recv_ready() {
+            for m in msgs {
+                if let ServerMsg::Output(b) = m {
+                    out.extend_from_slice(&b);
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).contains("GOT:")
+    });
+    let text = String::from_utf8_lossy(&out).into_owned();
+
+    assert!(got, "the child printed nothing; output: {text:?}");
+    assert!(
+        text.contains("GOT:driver."),
+        "only the display client's input may reach the child; output: {text:?}"
+    );
+}
+
+#[test]
+fn an_observers_kill_leaves_the_session_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "observer-kill-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut obs = raw_observer(&sock);
+    next_grid(&mut obs, Duration::from_secs(5)).expect("initial grid");
+    obs.send(&ClientMsg::Kill).unwrap();
+    obs.send(&ClientMsg::Observe).unwrap();
+    let answered = next_grid(&mut obs, Duration::from_secs(5)).is_some();
+
+    assert!(answered, "the host ended the session on a watcher's Kill");
+    assert!(ls(xdg).contains(name), "the session is still listed");
+}
+
+#[test]
+fn a_kill_from_a_control_connection_discards_the_session_like_a_display_kill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "control-kill-test";
+    let _guard = KillOnDrop { xdg, name };
+    spawn_session(xdg, name, "sleep 60");
+    let data = xdg.join("data").join("ghost");
+    let descriptor = data.join("sessions").join(format!("{name}.json"));
+    let recording = data.join("recordings").join(format!("{name}.ghostrec"));
+    assert!(
+        wait_until(Duration::from_secs(5), || descriptor.exists()),
+        "precondition: the session wrote its descriptor"
+    );
+    let recorded = recording.exists();
+
+    // A control connection: no Resize, so never the display client.
+    let sock = xdg.join("run").join("ghost").join(name).join("sock");
+    let mut control = Client::connect_path(&sock).expect("control connect");
+    control.send(&ClientMsg::Kill).unwrap();
+    let gone = wait_until(Duration::from_secs(5), || !ls(xdg).contains(name));
+
+    assert!(recorded, "precondition: the session records");
+    assert!(gone, "a control connection's Kill ends the session");
+    assert!(
+        !descriptor.exists() && !recording.exists(),
+        "an explicit kill throws the session away: descriptor and recording go"
+    );
+}
