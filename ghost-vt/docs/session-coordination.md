@@ -32,9 +32,15 @@ tests pin the ordinals).
   `ServerMsg::Event(SessionEvent)` as state changes.
 - `ClientMsg::Observe` — a subscription that also receives output: `Snapshot`,
   `Event(Resized)` with the real grid, a full resync, then live `Output`.
-- `ClientMsg::Hello { client }` — an opaque identity the host echoes back in
-  `AttachInfo.client` while that connection holds the display. The GUI sends
-  `ghost-ui:<group-id>`.
+- `ClientMsg::Attach { cols, rows, client }` — attach as the display client,
+  naming it, in one message (`PROTO_ATTACH = 8`). The identity names the client
+  kind and its machine: `ghost-ui@<machine>:<group-id>` for a window,
+  `cli@<machine>` for a terminal attach. The host echoes it in
+  `AttachInfo.client` and writes it into the `attached` marker.
+- `ClientMsg::Hello { client }` — the same identity, sent after a `Resize` by
+  clients (or to hosts) predating `Attach`. Between the two messages the host
+  holds a display client with no identity, so subscribers can see a transient
+  `Attached(None)`.
 - `SessionEvent`: `Bell`, `TitleChanged`, `Attached(AttachInfo)`, `Detached`,
   `Activity`, `Renamed`, `Resized { cols, rows }`.
 
@@ -55,8 +61,9 @@ into the child or end the session.
   bell). The `bell` marker file keeps its old meaning: set only while nobody is
   attached, cleared on attach.
 - **Markers.** `attached` and `bell` are still written for listing and for
-  clients below `PROTO_SUBSCRIBE`. `SessionInfo.attached` in a listing is a bool;
-  *who* holds the display is only available through a subscription.
+  clients below `PROTO_SUBSCRIBE`. The `attached` marker's contents are the
+  holder's identity, so a listing reports `SessionInfo.holder` as well as
+  `attached`.
 - **Flow control.** `Activity` is sent only to a subscriber with nothing queued.
   An observer's output stops being queued past `OBSERVER_MAX_PENDING` (256 KiB);
   the observer is marked lagged, and once its queue drains it is re-seeded with
@@ -80,7 +87,7 @@ into the child or end the session.
 ## Open
 
 - Remote sessions get no state subscription, and the observer pump forwards only
-  `Resized`, so a remote session's holder identity and live bell never reach the
-  fleet; it sees only the listing's `attached` bool.
+  `Resized`, so a remote session's live bell never reaches the fleet. Its holder
+  is in the listing (`holder`), which the fleet does not read yet.
 - Bell count and per-client bell preferences are frontend concerns layered on
   `SessionEvent::Bell`.

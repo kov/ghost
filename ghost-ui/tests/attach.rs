@@ -1263,3 +1263,43 @@ fn a_child_that_cannot_be_started_says_why_before_the_session_ends() {
         term.screen()
     );
 }
+
+/// The session's `holder` as `ghost ls --json` reports it.
+fn listed_holder(xdg: &Path, name: &str) -> Option<String> {
+    let out = ghost(xdg).args(["ls", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.as_array()?
+        .iter()
+        .find(|s| s["name"] == name)?
+        .get("holder")?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test]
+fn a_cli_attach_names_this_machine_as_the_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-cli-holder";
+    let _guard = KillOnDrop { xdg, name };
+
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "cat"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "`ghost new` failed");
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let _term = Attached::new(xdg, name, 80, 24);
+    let want = format!("cli@{}", ghost_vt::paths::host_tag());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            listed_holder(xdg, name).as_deref() == Some(want.as_str())
+        }),
+        "the listing never named {want}; got {:?}",
+        listed_holder(xdg, name)
+    );
+}

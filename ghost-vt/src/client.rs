@@ -461,6 +461,14 @@ impl Session {
         self.client.send(&ClientMsg::Resize { cols, rows })
     }
 
+    /// Complete the attach handshake of a deferred attach at `cols`x`rows`,
+    /// naming this display client `identity` (see [`ClientMsg::Attach`]). A host
+    /// predating [`PROTO_ATTACH`](crate::protocol::PROTO_ATTACH) gets the resize
+    /// and then the identity, as two messages.
+    pub fn attach_as(&mut self, cols: u16, rows: u16, identity: &str) -> io::Result<()> {
+        send_attach(&mut self.client, cols, rows, identity)
+    }
+
     /// Report this client's theme colors. The host keeps them as the session's
     /// last-attached colors, answering the child's color queries with them
     /// while detached.
@@ -659,7 +667,7 @@ fn reconnect_in_place(
     };
     *client = new;
     *prompt = None;
-    send_resize(client, stdin)?;
+    send_attach_at_size(client, stdin)?;
     Ok(true)
 }
 
@@ -673,9 +681,9 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
     // Raw mode, restored on return via the guard's Drop.
     let _raw = RawMode::enable(stdin)?;
 
-    // Sync the session to our current size immediately. The first resize is also
-    // the attach handshake that promotes us to the host's display client.
-    send_resize(&mut client, stdin)?;
+    // Attach at our current size immediately: the handshake that promotes us to
+    // the host's display client, naming this machine.
+    send_attach_at_size(&mut client, stdin)?;
 
     let sfd = signals::make(&[Signal::SIGWINCH])?;
     let mut detacher = Detacher::with_default_prefix();
@@ -1067,6 +1075,36 @@ fn term_size(fd: BorrowedFd<'_>) -> (u16, u16) {
     tcgetwinsize(fd)
         .map(|ws| (ws.ws_col, ws.ws_row))
         .unwrap_or((80, 24))
+}
+
+/// Attach as the display client at `cols`x`rows`, named `identity`: one
+/// [`ClientMsg::Attach`], or `Resize` then `Hello` for a host predating it.
+fn send_attach(client: &mut Client, cols: u16, rows: u16, identity: &str) -> io::Result<()> {
+    if client.proto >= crate::protocol::PROTO_ATTACH {
+        return client.send(&ClientMsg::Attach {
+            cols,
+            rows,
+            client: identity.to_string(),
+        });
+    }
+    client.send(&ClientMsg::Resize { cols, rows })?;
+    if client.proto >= crate::protocol::PROTO_SUBSCRIBE {
+        client.send(&ClientMsg::Hello {
+            client: identity.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// The identity a terminal attach names itself by: `cli@<machine>`.
+fn cli_identity() -> String {
+    format!("cli@{}", paths::host_tag())
+}
+
+/// The first message of a terminal attach: attach at the terminal's current size.
+fn send_attach_at_size(client: &mut Client, fd: BorrowedFd<'_>) -> io::Result<()> {
+    let (cols, rows) = term_size(fd);
+    send_attach(client, cols, rows, &cli_identity())
 }
 
 fn send_resize(client: &mut Client, fd: BorrowedFd<'_>) -> io::Result<()> {

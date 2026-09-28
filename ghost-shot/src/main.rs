@@ -1213,6 +1213,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         cwd: None,
         size: None,
         connection: None,
+        holder: None,
     }
 }
 

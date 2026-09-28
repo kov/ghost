@@ -443,6 +443,13 @@ fn probe_reply_speaks_our_protocol(reply: &str) -> bool {
         .is_some_and(|proto| proto >= crate::protocol::PROTO_LEVEL)
 }
 
+/// The level assumed for a remote session whose host's level could not be read.
+/// Everything below [`PROTO_ATTACH`](crate::protocol::PROTO_ATTACH) is sent
+/// optimistically, but the attach handshake falls back to `Resize` then `Hello`:
+/// a host that skipped an `Attach` it predates would never promote the client,
+/// leaving it frozen, while a current host accepts the older handshake too.
+const UNREAD_SESSION_PROTO: u32 = crate::protocol::PROTO_ATTACH - 1;
+
 /// One multiplexed ssh connection to a host, for the transport initiator.
 pub struct RemoteSsh {
     spec: ConnectionSpec,
@@ -915,17 +922,16 @@ impl RemoteSsh {
     /// attach/observe must gate its post-marker messages on THIS, not the binary's
     /// level, or an old host drops the client on a message it can't decode.
     ///
-    /// Falls back to the initiator's own [`PROTO_LEVEL`](crate::protocol::PROTO_LEVEL)
-    /// when the read fails — an older remote binary lacks `__proto` (unknown
-    /// subcommand), which leaves today's optimistic assumption in place rather than
-    /// silently disabling features against a genuinely-current host; the read only
-    /// changes behavior where it succeeds and reports a *lower* level.
+    /// Falls back to [`UNREAD_SESSION_PROTO`] when the read fails (an older remote
+    /// binary lacks `__proto`): optimistic for every feature up to the attach
+    /// handshake, which an older host could not complete if it were sent the
+    /// combined [`Attach`](crate::protocol::ClientMsg::Attach).
     ///
     /// Bounded ([`PROTO_READ_TIMEOUT`]): a caller runs this on the event loop, and a
     /// silently-dead master (reboot/partition, no FIN/RST) would otherwise hang the
     /// tiny read until ssh's keepalive gives up (~45s), freezing every window — the
     /// same bound [`probe`](Self::probe)/[`negotiate`](Self::negotiate) apply. A
-    /// timeout is a failed read, so it falls back to `PROTO_LEVEL`.
+    /// timeout is a failed read, so it falls back the same way.
     pub fn session_proto(&self, remote_ghost: &str, name: &str) -> u32 {
         let level = || -> Option<u32> {
             let mut child = self
@@ -943,7 +949,7 @@ impl RemoteSsh {
             child.stdout.take()?.read_to_string(&mut buf).ok()?;
             buf.trim().parse().ok()
         };
-        level().unwrap_or(crate::protocol::PROTO_LEVEL)
+        level().unwrap_or(UNREAD_SESSION_PROTO)
     }
 
     /// Kill a remote session by id over the shared connection (`<remote_ghost>

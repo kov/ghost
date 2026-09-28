@@ -3867,6 +3867,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None,
+            holder: None,
         }
     }
 
@@ -4078,7 +4079,7 @@ mod tests {
     fn adopting_a_closed_group_rebinds_the_window_identity() {
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
         r.set_my_group(crate::Group::auto("w1".into(), 0));
-        assert_eq!(r.client_identity(), "ghost-ui:w1");
+        assert_eq!(r.client_identity(), crate::group::window_identity("w1"));
         r.update(UiEvent::GroupsLoaded(vec![crate::Group {
             id: "g2".into(),
             name: "green".into(),
@@ -4108,7 +4109,7 @@ mod tests {
         );
         assert_eq!(
             r.client_identity(),
-            "ghost-ui:g2",
+            crate::group::window_identity("g2"),
             "the adopted identity is what the attaches will report"
         );
     }
@@ -4376,6 +4377,7 @@ mod tests {
                 cwd: None,
                 size: None,
                 connection: None,
+                holder: None,
             }
         }
         let mut r = root(); // owns "alpha"
@@ -5115,6 +5117,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None,
+            holder: None,
         }
     }
 

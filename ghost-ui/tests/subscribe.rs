@@ -758,3 +758,118 @@ fn a_kill_from_a_control_connection_discards_the_session_like_a_display_kill() {
         "an explicit kill throws the session away: descriptor and recording go"
     );
 }
+
+/// The session's `holder` as `ghost ls --json` reports it.
+fn listed_holder(xdg: &Path, name: &str) -> Option<String> {
+    let out = ghost(xdg).args(["ls", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.as_array()?
+        .iter()
+        .find(|s| s["name"] == name)?
+        .get("holder")?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test]
+fn an_attach_names_its_holder_in_the_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-holder-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Attach {
+            cols: 80,
+            rows: 24,
+            client: "test@box:win-1-1".into(),
+        })
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            listed_holder(xdg, name).as_deref() == Some("test@box:win-1-1")
+        }),
+        "the listing never named the holder; got {:?}",
+        listed_holder(xdg, name)
+    );
+    drop(display);
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_holder(xdg, name)
+            .is_none()),
+        "a detached session still names a holder"
+    );
+}
+
+#[test]
+fn an_attach_is_announced_with_its_identity_from_the_first_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "attach-announce-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut sub = Subscriber::connect_path(&sock).expect("subscriber connect");
+    let mut got_snapshot = false;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            got_snapshot |= sub.pump().unwrap().snapshot.is_some();
+            got_snapshot
+        }),
+        "no snapshot"
+    );
+
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Attach {
+            cols: 80,
+            rows: 24,
+            client: "test@box:win-1-1".into(),
+        })
+        .unwrap();
+
+    let mut attached = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        for e in sub.pump().unwrap().events {
+            if let SessionEvent::Attached(info) = e {
+                attached.push(info.client);
+            }
+        }
+        !attached.is_empty()
+    });
+    assert_eq!(
+        attached.first(),
+        Some(&Some("test@box:win-1-1".to_string())),
+        "the first Attached event must already carry the identity; got {attached:?}"
+    );
+}
+
+#[test]
+fn a_resize_then_hello_still_names_the_holder_in_the_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "legacy-holder-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    // What a client predating `Attach` sends.
+    let mut display = Client::connect_path(&sock).expect("display connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    display
+        .send(&ClientMsg::Hello {
+            client: "ghost-ui:win-9-9".into(),
+        })
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            listed_holder(xdg, name).as_deref() == Some("ghost-ui:win-9-9")
+        }),
+        "the listing never named the holder; got {:?}",
+        listed_holder(xdg, name)
+    );
+}

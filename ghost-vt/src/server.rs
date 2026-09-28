@@ -1321,6 +1321,8 @@ fn host_main(
     // file, so discovery can report it. Tracked here to touch the filesystem only
     // on the attach/detach transitions, not every loop turn.
     let mut attached_marked = false;
+    // The identity last written into the `attached` marker.
+    let mut marked_holder: Option<String> = None;
     // Bell count last reflected into the marker, so a fresh ring is spotted by a
     // change rather than re-touching the filesystem every loop turn.
     let mut last_bell_count = 0u64;
@@ -2043,9 +2045,22 @@ fn host_main(
         // Reconcile the attach marker with the display client's presence. All the
         // ways `client` can change this turn (handshake takeover, detach, drop,
         // flush error) have run by now, so a single check here covers them.
-        let now_attached = client.as_ref().is_some_and(|c| c.resynced);
+        let now_holder = client
+            .as_ref()
+            .filter(|c| c.resynced)
+            .map(|c| c.hello.clone().unwrap_or_default());
+        let now_attached = now_holder.is_some();
+        // A client predating `Attach` names itself after it attached: rewrite the
+        // marker when the identity arrives, not only when attachment flips.
+        if now_attached && now_holder != marked_holder {
+            set_attached_marker(current_name, now_holder.as_deref());
+            marked_holder = now_holder.clone();
+        }
         if now_attached != attached_marked {
-            set_attached_marker(current_name, now_attached);
+            if !now_attached {
+                set_attached_marker(current_name, None);
+                marked_holder = None;
+            }
             if now_attached {
                 // Attaching is "switching to" the session: any unseen-bell
                 // notification is now seen, so clear its marker.
@@ -2289,8 +2304,18 @@ fn handle_client_messages(
             // the session — typing into it, re-gridding it, ending it — belong to the
             // display client and to control connections. Checked per message, since
             // a batch can carry the `Observe` that makes this connection a watcher.
-            ClientMsg::Input(_) | ClientMsg::Resize { .. } | ClientMsg::Kill
+            ClientMsg::Input(_)
+            | ClientMsg::Resize { .. }
+            | ClientMsg::Attach { .. }
+            | ClientMsg::Kill
                 if c.subscribed || c.observing => {}
+            // `Hello` and the first `Resize` in one message: the identity is in
+            // place before the resize promotes this connection, so the display
+            // client is never announced without it.
+            ClientMsg::Attach { cols, rows, client } => {
+                c.hello = Some(client);
+                apply_resize(c, pty, screen, recorder, cols, rows);
+            }
             ClientMsg::Input(bytes) => {
                 if let Some(r) = recorder
                     && !hidden_prompt(pty)
@@ -2314,18 +2339,7 @@ fn handle_client_messages(
                     );
                 }
             }
-            ClientMsg::Resize { cols, rows } => {
-                let _ = pty.resize(Size::new(rows, cols));
-                screen.resize(cols, rows);
-                if let Some(r) = recorder {
-                    let _ = r.resize(cols, rows);
-                }
-                // First resize completes the attach handshake: repaint at size.
-                if !c.resynced {
-                    c.queue_output(screen.resync());
-                    c.resynced = true;
-                }
-            }
+            ClientMsg::Resize { cols, rows } => apply_resize(c, pty, screen, recorder, cols, rows),
             ClientMsg::Trace { on } => crate::trace::set_enabled(on),
             ClientMsg::Detach => return Ok(Disposition::Drop),
             ClientMsg::Kill => return Ok(Disposition::Kill),
@@ -2441,16 +2455,44 @@ fn handle_client_messages(
     Ok(Disposition::Keep)
 }
 
-/// Create or remove the session's `attached` marker. Best-effort: the marker is
-/// advisory (discovery falls back to "detached" if it is missing), and a host
-/// that exits without clearing it leaves it inside a directory that the next
-/// `list` prunes wholesale, so a stale marker is never read for a live session.
-fn set_attached_marker(name: &str, attached: bool) {
+/// Re-grid the PTY, screen and recording. The first resize from a connection
+/// completes its attach handshake: it gets a repaint at the new size and becomes
+/// eligible for promotion to the display client.
+fn apply_resize(
+    c: &mut Client,
+    pty: &pty_process::blocking::Pty,
+    screen: &mut Screen,
+    recorder: &mut Option<crate::record::FileRecorder>,
+    cols: u16,
+    rows: u16,
+) {
+    let _ = pty.resize(Size::new(rows, cols));
+    screen.resize(cols, rows);
+    if let Some(r) = recorder {
+        let _ = r.resize(cols, rows);
+    }
+    if !c.resynced {
+        c.queue_output(screen.resync());
+        c.resynced = true;
+    }
+}
+
+/// Write or remove the session's `attached` marker. Its presence means a display
+/// client is attached; its contents are that client's identity (empty when it
+/// never gave one), which a listing reports as the session's holder. Best-effort:
+/// the marker is advisory (discovery falls back to "detached" if it is missing),
+/// and a host that exits without clearing it leaves it inside a directory that
+/// the next `list` prunes wholesale, so a stale marker is never read for a live
+/// session.
+fn set_attached_marker(name: &str, holder: Option<&str>) {
     let path = paths::attached_path(name);
-    if attached {
-        let _ = std::fs::File::create(&path);
-    } else {
-        let _ = std::fs::remove_file(&path);
+    match holder {
+        Some(who) => {
+            let _ = std::fs::write(&path, who);
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 

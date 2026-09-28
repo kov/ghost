@@ -4542,6 +4542,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None,
+            holder: None,
         }
     }
 

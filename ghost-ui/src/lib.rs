@@ -357,8 +357,7 @@ fn attach(name: &str, cols: u16, rows: u16, identity: &str) -> io::Result<Sessio
     // Arm the host's half of the trace to match ours, so a session opened while
     // tracing is on is traced end to end from its first keystroke.
     s.report_trace(ghost_ui_core::trace::enabled())?;
-    s.resize(cols, rows)?;
-    s.hello(identity)?;
+    s.attach_as(cols, rows, identity)?;
     Ok(s)
 }
 
@@ -389,8 +388,7 @@ fn attach_over_ssh(
     // Arm the host's half of the trace to match ours, so a session opened while
     // tracing is on is traced end to end from its first keystroke.
     s.report_trace(ghost_ui_core::trace::enabled())?;
-    s.resize(cols, rows)?;
-    s.hello(identity)?;
+    s.attach_as(cols, rows, identity)?;
     Ok(s)
 }
 
@@ -997,7 +995,11 @@ fn auth_error_message(buf: &str) -> String {
 /// headless bench harness); real windows report their group-derived identity
 /// ([`ghost_ui_core::group::window_identity`]) instead.
 fn client_identity() -> String {
-    format!("ghost-ui:{}", std::process::id())
+    format!(
+        "ghost-ui@{}:{}",
+        ghost_vt::paths::host_tag(),
+        std::process::id()
+    )
 }
 
 /// Watch the session runtime dir and raise `flag` on any change — the
@@ -10116,6 +10118,60 @@ mod tests {
         });
     }
 
+    /// A window attaching a session names itself to the host, so a listing says the
+    /// session is held by that window on this machine.
+    #[test]
+    fn a_window_attach_names_the_window_and_machine_holding_it() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "window-holder";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let holder = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.holder)
+            };
+            let mut spun = 0;
+            while holder().is_none() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let want = ghost_ui_core::group::window_identity(&group.id);
+            let opened = app.open_single_window(&fe, name, group, None).is_some();
+            let mut named = None;
+            for _ in 0..100 {
+                named = holder().flatten();
+                if named.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(opened, "the window attaches the session");
+            assert_eq!(
+                named,
+                Some(want),
+                "the listing names the window and machine"
+            );
+        });
+    }
+
     /// The reverse handoff: a session PREVIEWED first (a read-only observer) then
     /// DRIVEN. Attaching a client is the observed→driven UPGRADE — it must REPLACE the
     /// observer, never coexist with it. Two live feed sources into the one shared
@@ -10811,6 +10867,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None,
+            holder: None,
         }
     }
 
@@ -10860,6 +10917,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None, // the remote host reports it as local-to-itself
+            holder: None,
         };
         let renamed = SessionInfo {
             name: "raw-id".into(),

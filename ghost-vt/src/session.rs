@@ -52,6 +52,11 @@ pub struct SessionInfo {
     /// [`crate::connection`]); `None` for a local session. Lets a fleet mark
     /// remote sessions. Read from the host's `meta`.
     pub connection: Option<crate::connection::ConnectionSpec>,
+    /// Who holds the display, as the display client identified itself (e.g.
+    /// `ghost-ui@couve:win-4121-3`, `cli@couve`), read from the `attached`
+    /// marker's contents. `None` when detached, or when the holder never said
+    /// (a client or host predating [`PROTO_ATTACH`](crate::protocol::PROTO_ATTACH)).
+    pub holder: Option<String>,
 }
 
 impl SessionInfo {
@@ -148,18 +153,23 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
         match host_state(&path) {
             HostState::Live(pid) => {
                 let meta = crate::meta::read(&path.join("meta")).unwrap_or_default();
+                // Present = attached; its contents name who holds the display.
+                let holder = std::fs::read_to_string(path.join("attached"))
+                    .ok()
+                    .map(|s| s.trim().to_string());
                 out.push(SessionInfo {
                     name,
                     pid,
                     created_at: Some(meta.created_at).filter(|&t| t != 0),
                     title: meta.title,
                     command: meta.command,
-                    attached: path.join("attached").exists(),
+                    attached: holder.is_some(),
                     bell: path.join("bell").exists(),
                     display_name: meta.display_name,
                     cwd: None, // filled by [`list`] from the descriptor
                     size: Some(meta.size).filter(|&s| s != (0, 0)),
                     connection: meta.connection,
+                    holder: holder.filter(|h| !h.is_empty()),
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -449,6 +459,7 @@ mod tests {
             cwd: None,
             size: None,
             connection: None,
+            holder: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
@@ -471,6 +482,7 @@ mod tests {
             cwd: Some("~/proj".into()),
             size: Some((120, 40)),
             connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
+            holder: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: SessionInfo = serde_json::from_str(&json).unwrap();

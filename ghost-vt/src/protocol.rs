@@ -104,6 +104,17 @@ pub enum ClientMsg {
     /// never send one. A detached host keeps its last arming — the log rolls, so
     /// the standing cost is bounded.
     Trace { on: bool },
+    /// Attach as the display client in one message: the grid of the first
+    /// [`Self::Resize`] and the identity of [`Self::Hello`] together, so the host
+    /// never promotes a display client whose identity it does not know yet. The
+    /// identity names the kind of client and its machine, e.g.
+    /// `ghost-ui@couve:win-4121-3` or `cli@couve`. Sent from
+    /// [`PROTO_ATTACH`]; an older host gets `Resize` then `Hello`.
+    Attach {
+        cols: u16,
+        rows: u16,
+        client: String,
+    },
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -207,7 +218,7 @@ pub enum ServerMsg {
 /// level 0. Bump this when appending a message clients send unprompted — or
 /// when an existing message's *semantics* change in a way clients must gate on
 /// — and add a `PROTO_*` constant for it.
-pub const PROTO_LEVEL: u32 = 7;
+pub const PROTO_LEVEL: u32 = 8;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
@@ -260,6 +271,14 @@ pub const PROTO_TRACE: u32 = 7;
 
 const _: () = assert!(PROTO_TRACE > PROTO_UPGRADE);
 const _: () = assert!(PROTO_LEVEL >= PROTO_TRACE);
+
+/// Feature level at which the host understands [`ClientMsg::Attach`] and names
+/// the display client's identity in the session's `attached` marker, so a
+/// listing can say who holds a session ([`crate::session::SessionInfo::holder`]).
+pub const PROTO_ATTACH: u32 = 8;
+
+const _: () = assert!(PROTO_ATTACH > PROTO_TRACE);
+const _: () = assert!(PROTO_LEVEL >= PROTO_ATTACH);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
@@ -422,6 +441,14 @@ mod tests {
         );
         assert_eq!(wire_tag(&ClientMsg::Upgrade { path: None }), 11);
         assert_eq!(wire_tag(&ClientMsg::Trace { on: true }), 12);
+        assert_eq!(
+            wire_tag(&ClientMsg::Attach {
+                cols: 0,
+                rows: 0,
+                client: String::new()
+            }),
+            13
+        );
     }
 
     #[test]

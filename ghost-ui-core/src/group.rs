@@ -71,18 +71,26 @@ pub struct Group {
 }
 
 /// The window-group id embedded in a display client's self-reported identity
-/// (`ghost-ui:<group-id>`, sent in the attach hello), if it carries one.
-/// Identities from other kinds of clients — or from ghost-ui builds
-/// predating window groups, whose suffix is a bare pid — simply name no
-/// known group and bucket as generic "attached elsewhere".
+/// (`ghost-ui@<machine>:<group-id>`, sent when it attaches), if it carries one
+/// from THIS machine. Group ids are `win-<pid>-<seq>`, so another machine can
+/// mint the same one; its windows name no local group. The older
+/// `ghost-ui:<group-id>` form, from UIs predating machine names, is taken as
+/// local. Identities from other kinds of clients — or from ghost-ui builds
+/// predating window groups, whose suffix is a bare pid — name no known group and
+/// bucket as generic "attached elsewhere".
 pub fn holder_group(client: &str) -> Option<GroupId> {
-    client.strip_prefix("ghost-ui:").map(str::to_string)
+    if let Some(gid) = client.strip_prefix("ghost-ui:") {
+        return Some(gid.to_string());
+    }
+    let (machine, gid) = client.strip_prefix("ghost-ui@")?.split_once(':')?;
+    (machine == ghost_vt::paths::host_tag()).then(|| gid.to_string())
 }
 
-/// A window's identity string for the attach hello, embedding its group id
-/// so other windows' fleets can bucket the session under its block.
+/// A window's identity string for its attach, naming this machine and the
+/// window's group id so other windows' fleets can bucket the session under its
+/// block, and a listing can say where the session is held.
 pub fn window_identity(group_id: &str) -> String {
-    format!("ghost-ui:{group_id}")
+    format!("ghost-ui@{}:{group_id}", ghost_vt::paths::host_tag())
 }
 
 impl Group {
@@ -113,6 +121,28 @@ mod tests {
         assert_eq!(holder_group(&id), Some("win-4321-2".to_string()));
         // Foreign identities name no group.
         assert_eq!(holder_group("weird-client"), None);
+    }
+
+    #[test]
+    fn a_window_identity_names_this_machine() {
+        let host = ghost_vt::paths::host_tag();
+        assert_eq!(
+            window_identity("win-4321-2"),
+            format!("ghost-ui@{host}:win-4321-2")
+        );
+    }
+
+    #[test]
+    fn a_group_id_from_another_machine_names_no_local_group() {
+        // Group ids are `win-<pid>-<seq>`, so two machines can mint the same one;
+        // a window on another machine must not be bucketed under ours.
+        let foreign = format!("ghost-ui@not-{}:win-4321-2", ghost_vt::paths::host_tag());
+        assert_eq!(holder_group(&foreign), None);
+        // An identity from a UI predating machine names is taken as local.
+        assert_eq!(
+            holder_group("ghost-ui:win-4321-2"),
+            Some("win-4321-2".to_string())
+        );
     }
 
     #[test]
