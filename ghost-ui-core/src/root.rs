@@ -1021,6 +1021,11 @@ impl RootModel {
         self.mine.contains(name)
     }
 
+    /// Every session this window drives (see [`Self::drives`]).
+    pub fn driven(&self) -> impl Iterator<Item = &SessionId> {
+        self.mine.iter()
+    }
+
     /// Whether this window shows `name` in any slot — the foreground `Single` view, a
     /// `warm` background mirror, or a fleet tile. The shell's process-wide feed fan
     /// uses this to find every window a session's one shared feed must reach. Unlike

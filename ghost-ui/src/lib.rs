@@ -1713,6 +1713,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         observers: HashMap::new(),
         observe_failed: HashSet::new(),
         unsourced: Vec::new(),
+        drivers: HashMap::new(),
         exec_depth: 0,
         reconciling: false,
         dead_fed: HashSet::new(),
@@ -3114,6 +3115,7 @@ impl App {
             observers: HashMap::new(),
             observe_failed: HashSet::new(),
             unsourced: Vec::new(),
+            drivers: HashMap::new(),
             exec_depth: 0,
             reconciling: false,
             dead_fed: HashSet::new(),
@@ -3435,6 +3437,11 @@ pub struct App {
     /// ended mirror (the tile reverts to a placeholder) by the next
     /// [`Self::reconcile_sources`].
     unsourced: Vec<SessionId>,
+    /// The one window driving each session: the geometry source and the holder its
+    /// host is told about. Written by every shell path that gives a window a client
+    /// ([`Self::set_driver`]); [`Self::reconcile_sources`] then makes any other
+    /// window still driving the session let go, and re-picks when the driver stops.
+    drivers: HashMap<SessionId, WindowId>,
     /// How deep [`Self::exec`] is nested: the outermost call reconciles sources once
     /// its commands (and everything they dispatched) have run.
     exec_depth: u32,
@@ -3590,33 +3597,60 @@ impl App {
         }
     }
 
-    /// `wid` now holds `id`: tell every OTHER window that was driving it to let it go
-    /// (`UiEvent::DriverLost`). A session shows in exactly one place, so the loser
-    /// switches its foreground away — or drops to the fleet — rather than keeping a
-    /// live view of a session it no longer owns; only the new holder re-grids the one
-    /// shared child.
+    /// `wid` now holds `id`'s client: make it the session's one driver. The host is
+    /// told when the driver changes — the one client now speaks for `wid`, so the
+    /// host names that window as the holder. Any other window still driving the
+    /// session is made to let go by the next [`Self::reconcile_sources`].
     ///
-    /// A fresh attach (no prior driver) finds no losers; only a real cross-window
-    /// take-over does. Every take-over route must call this: `Cmd::Attach`, and
-    /// `Cmd::TakeOver` of a local or remote session, including the adopt-in-place
-    /// branches that skip attaching because this process already holds the client.
-    ///
-    /// The host is told too: the one client now speaks for `wid`, so it names
-    /// that window as the holder.
-    fn hand_over(&mut self, wid: WindowId, id: &SessionId, event_loop: &dyn Frontend) {
+    /// Every shell path that gives a window a client writes this — an attach, and a
+    /// take-over that adopts a client this process already holds — so a window
+    /// that merely claims a session (an attach that then failed) never takes it
+    /// from the one holding it.
+    fn set_driver(&mut self, wid: WindowId, id: &SessionId) {
+        if self.drivers.insert(id.clone(), wid) == Some(wid) {
+            return;
+        }
         if let Some(identity) = self.windows.get(&wid).map(|w| w.root.client_identity())
             && let Some(client) = self.sessions.get_mut(id)
         {
             let _ = client.hello(&identity);
         }
-        let losers: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(owid, w)| **owid != wid && w.root.drives(id))
-            .map(|(owid, _)| *owid)
-            .collect();
-        for owid in losers {
-            self.dispatch(owid, UiEvent::DriverLost { name: id.clone() }, event_loop);
+    }
+
+    /// Keep each session's one driver: a session nobody drives has none; a driver
+    /// that let go (or closed) is replaced by [`Self::pick_driver`]'s choice among
+    /// the windows still driving it; every other window driving it is told it lost
+    /// the session (`UiEvent::DriverLost`). A session shows in exactly one place, so
+    /// the loser switches its foreground away — or drops to the fleet — and only the
+    /// driver re-grids the one shared child.
+    fn reconcile_drivers(&mut self, fe: &dyn Frontend) {
+        let mut driving: HashMap<SessionId, Vec<WindowId>> = HashMap::new();
+        for (wid, w) in &self.windows {
+            for id in w.root.driven() {
+                driving.entry(id.clone()).or_default().push(*wid);
+            }
+        }
+        self.drivers.retain(|id, _| driving.contains_key(id));
+        let mut losers: Vec<(WindowId, SessionId)> = Vec::new();
+        for (id, wids) in driving {
+            let driver = match self.drivers.get(&id) {
+                Some(d) if wids.contains(d) => *d,
+                _ => {
+                    let Some(d) = self.choose_driver(&id) else {
+                        continue;
+                    };
+                    self.set_driver(d, &id);
+                    d
+                }
+            };
+            losers.extend(
+                wids.into_iter()
+                    .filter(|w| *w != driver)
+                    .map(|w| (w, id.clone())),
+            );
+        }
+        for (wid, id) in losers {
+            self.dispatch(wid, UiEvent::DriverLost { name: id }, fe);
         }
     }
 
@@ -4314,12 +4348,12 @@ impl App {
                             self.drive_with_client(&id, s);
                         }
                     }
-                    // Hand over only when this process now holds a client for it: an
+                    // Drive it only when this process now holds a client for it: an
                     // attach that opened nothing (a dead host, a lost connection) took
                     // nothing, and must not end the session in a window still holding
                     // it (for instance through a remote reconnect hold).
                     if self.sessions.contains_key(&id) {
-                        self.hand_over(wid, &id, event_loop);
+                        self.set_driver(wid, &id);
                     }
                 }
                 Cmd::SaveGroups(new_groups) => {
@@ -4534,21 +4568,12 @@ impl App {
                     {
                         self.take_over_remote(wid, &id, &target, &real, event_loop);
                     } else {
-                        // Switch the window to `id`'s single view. Attach only if the
-                        // process holds no client yet — a session already driven here
-                        // (even by another window) is adopted in place (no second
-                        // transport), the same-process take-over the shared map enables.
-                        let held = self.sessions.contains_key(&id);
-                        if held {
-                            self.announce_take_over(wid, &id, event_loop);
-                        }
-                        if held || self.attach_into(wid, &id, event_loop) {
+                        // Switch the window to `id`'s single view. A session already
+                        // driven here (even by another window) is adopted in place (no
+                        // second transport), the same-process take-over the shared map
+                        // enables; `attach_into` opens a client only when none is held.
+                        if self.attach_into(wid, &id, event_loop) {
                             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
-                            // The adopt-in-place branch never went through `Cmd::Attach`,
-                            // so without this the window that HAD the session kept
-                            // showing it: taking over another window's foreground left
-                            // two windows on one session.
-                            self.hand_over(wid, &id, event_loop);
                         }
                     }
                 }
@@ -5221,11 +5246,10 @@ impl App {
     }
 
     fn attach_into(&mut self, wid: WindowId, name: &SessionId, event_loop: &dyn Frontend) -> bool {
-        // Already driven somewhere in this process → adopt in place: the caller's
-        // AdoptSession takes drivership, and no second client / rebuild is opened.
-        // Announcing is still the caller's business there, not ours: another window
-        // may hold that client, and taking it is a take-over the user confirms.
+        // Already driven somewhere in this process → adopt in place: no second
+        // client / rebuild is opened, and the one held client becomes this window's.
         if self.sessions.contains_key(name) {
+            self.announce_take_over(wid, name, event_loop);
             return true;
         }
         let Some(w) = self.windows.get(&wid) else {
@@ -5251,6 +5275,7 @@ impl App {
                 // the shared mirror first so the replay lands clean (W1).
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
+                self.set_driver(wid, name);
                 // This window's client, opened just now: tell it so before any listing
                 // can report the session attached with no owner attached to the news.
                 self.dispatch(
@@ -5286,7 +5311,9 @@ impl App {
         proto: u32,
         event_loop: &dyn Frontend,
     ) -> bool {
+        // Held already: adopted in place, as in `attach_into`.
         if self.sessions.contains_key(name) {
+            self.announce_take_over(wid, name, event_loop);
             return true;
         }
         let Some(w) = self.windows.get(&wid) else {
@@ -5298,6 +5325,7 @@ impl App {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
+                self.set_driver(wid, name);
                 // Ours, and said so before the host's next listing lands (see
                 // `attach_into`) — the race this closes was a remote restore.
                 self.dispatch(
@@ -5906,13 +5934,14 @@ impl App {
         real: &str,
         event_loop: &dyn Frontend,
     ) {
+        // A client held already is adopted in place, even with the host's
+        // connection down (the one `attach_remote_into` needs to open a new one).
         let held = self.sessions.contains_key(id);
         if held {
             self.announce_take_over(wid, id, event_loop);
         }
         if held || self.attach_remote_into(wid, id, target, real, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
-            self.hand_over(wid, id, event_loop);
         }
     }
 
@@ -6443,6 +6472,7 @@ impl App {
             return;
         }
         self.reconciling = true;
+        self.reconcile_drivers(fe);
         let mut ids: HashSet<SessionId> = self
             .sessions
             .keys()
@@ -6525,6 +6555,7 @@ impl App {
     /// Without the news the window would show a session it does not drive, and the
     /// source reconcile would demote its client to a read-only mirror.
     fn announce_take_over(&mut self, wid: WindowId, id: &SessionId, event_loop: &dyn Frontend) {
+        self.set_driver(wid, id);
         if self.windows.get(&wid).is_some_and(|w| !w.root.drives(id)) {
             self.dispatch(wid, UiEvent::DriverGained { name: id.clone() }, event_loop);
         }
@@ -6909,7 +6940,7 @@ impl App {
         // a client plus an observer is the finding-#7 double-feed (see
         // [`drive_with_client`](Self::drive_with_client), the upgrade this open mirrors).
         self.observers.remove(&id);
-        self.sessions.entry(id).or_insert(session);
+        self.sessions.entry(id.clone()).or_insert(session);
 
         self.windows.insert(
             wid,
@@ -6948,8 +6979,10 @@ impl App {
                 pending_fallback: None,
             },
         );
+        self.set_driver(wid, &id);
         // Sync the model's viewport to the real surface size *and* device scale
         // before the first paint — this drives the NDC mapping, the scissor
+
         // clamp, and the cell metrics, and its `Cmd::Redraw` requests that paint.
         // (No earlier `request_redraw`: it would race a frame at the default 1x
         // scale against glyphs the renderer rasterizes at `size_px() * scale`.)
@@ -7745,12 +7778,21 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
-    /// Deterministically choose the ONE window that drives `name` — the geometry
-    /// source and reconnect owner for its shared feed. Prefer the window showing it as
-    /// its Single foreground (a take-over claimant foregrounds it), else any window
-    /// that drives it, else none. Stable across wakes so a transient two-driver steal
-    /// doesn't flip the child's query answers (HashMap order is nondeterministic).
+    /// The ONE window that drives `name` — the geometry source and reconnect owner
+    /// for its shared feed: its recorded driver ([`Self::drivers`]) while that window
+    /// still drives it, else [`Self::choose_driver`]'s pick.
     fn pick_driver(&self, name: &SessionId) -> Option<WindowId> {
+        match self.drivers.get(name) {
+            Some(wid) if self.windows.get(wid).is_some_and(|w| w.root.drives(name)) => Some(*wid),
+            _ => self.choose_driver(name),
+        }
+    }
+
+    /// Deterministically choose a driver for `name` among the windows driving it.
+    /// Prefer the window showing it as its Single foreground (a take-over claimant
+    /// foregrounds it), else any window that drives it, else none. Stable across
+    /// wakes (HashMap order is nondeterministic).
+    fn choose_driver(&self, name: &SessionId) -> Option<WindowId> {
         let mut fallback = None;
         for (wid, w) in &self.windows {
             if w.root.drives(name) {
@@ -10293,6 +10335,77 @@ mod tests {
                 still_held,
                 "a failed attach must not hand the session away from the window holding it"
             );
+        });
+    }
+
+    /// A session has one driver however a window came to hold it. Window A drives a
+    /// remote session; window B was saved showing it and waits for its host. When
+    /// the host reconnects, B's restore finds the client already held in this
+    /// process and takes the session over — so A must let it go, not keep driving
+    /// it beside B.
+    #[test]
+    fn a_restore_that_finds_its_session_held_takes_it_from_the_other_window() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+
+            let ga = app.mint_group();
+            let a = app.open_fleet_window(&fe, ga, None);
+            let name = "rh-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                a,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
+            let remote_id = SessionId::remote("kov@box", name);
+            let drove_first = app.windows[&a].root.drives(&remote_id);
+
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            app.host_mut("kov@box").pending_restores = vec![PendingRemote {
+                wid: b,
+                id: remote_id.clone(),
+                fleet: false,
+                foreground: true,
+            }];
+            app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
+            let a_drives = app.windows[&a].root.drives(&remote_id);
+            let b_drives = app.windows[&b].root.drives(&remote_id);
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(drove_first, "precondition: A drives the remote session");
+            assert!(b_drives, "the restored window drives its session");
+            assert!(!a_drives, "the window that had it lets it go");
         });
     }
 
