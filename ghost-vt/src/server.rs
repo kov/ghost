@@ -128,6 +128,10 @@ const CWD_MAX_DEFER: Duration = Duration::from_secs(1);
 /// that connects but never sends its first message.
 const MAX_PENDING: usize = 8;
 
+/// Cap on subscribers (state watchers and observers) one host keeps. A new one
+/// past it replaces the oldest.
+pub const MAX_SUBSCRIBERS: usize = 32;
+
 /// Cap on an observer's outbound backlog. Past this the host stops queueing
 /// live output for it (state events still flow — they are small and bounded)
 /// and re-seeds it with a resync when it drains, so a slow or stalled observer
@@ -1819,6 +1823,12 @@ fn host_main(
                             client = Some(p);
                         } else if p.subscribed {
                             subscribers.push(p); // state observer, kept for pushes
+                            // Bounded: the newest watcher is the one someone is
+                            // looking at, so it replaces the oldest (dropping it
+                            // closes its connection — the watcher sees EOF).
+                            if subscribers.len() > MAX_SUBSCRIBERS {
+                                subscribers.remove(0);
+                            }
                         } else {
                             still_pending.push(p); // control / not yet identified
                         }

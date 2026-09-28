@@ -573,3 +573,44 @@ fn the_snapshot_reports_the_identified_display_client() {
 
     drop(display);
 }
+
+#[test]
+fn past_the_subscriber_cap_the_oldest_subscriber_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "subscriber-cap-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    let session_dir = spawn_session(xdg, name, "sleep 60");
+    let sock = session_dir.join("sock");
+
+    // Subscribe one at a time, each confirmed by its snapshot, so the host has
+    // them in a known order: `subs[0]` is the oldest.
+    let cap = ghost_vt::server::MAX_SUBSCRIBERS;
+    let mut subs = Vec::new();
+    for i in 0..=cap {
+        let mut sub = Subscriber::connect_path(&sock).expect("subscriber connect");
+        let mut got = false;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                got |= sub.pump().unwrap().snapshot.is_some();
+                got
+            }),
+            "subscriber {i} got no snapshot"
+        );
+        subs.push(sub);
+    }
+
+    let oldest_dropped = wait_until(Duration::from_secs(5), || {
+        subs[0].pump().map(|p| p.ended).unwrap_or(true)
+    });
+    let second_kept = !subs[1].pump().unwrap().ended;
+    let newest_kept = !subs[cap].pump().unwrap().ended;
+
+    assert!(
+        oldest_dropped,
+        "one subscriber past the cap must drop the oldest"
+    );
+    assert!(second_kept, "only the oldest is dropped");
+    assert!(newest_kept, "the newest subscriber is kept");
+}
