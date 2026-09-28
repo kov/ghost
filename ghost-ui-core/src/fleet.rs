@@ -1564,7 +1564,7 @@ impl FleetModel {
             .collect();
         for g in &mut self.groups {
             let before = g.members.len();
-            // Remote members (<target>␟<real>) live by the same rule: the
+            // Remote members live by the same rule: the
             // shell's remote sweep names them in every state worth keeping —
             // waiting while the host is unreachable, relaunchable while the
             // connected host still remembers them (or while its remembered-set
@@ -4360,14 +4360,17 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 mod tests {
     use ghost_vt::session::SessionInfo;
 
-    /// A listing of sessions named as the tests write them: a bare name is
-    /// local, a `<target>␟<name>` composite remote.
+    /// A local listing of these sessions.
     fn listed(infos: Vec<SessionInfo>) -> Vec<crate::Listed> {
-        infos
-            .into_iter()
-            .map(|info| crate::Listed {
-                id: SessionId::parse_composite(&info.name),
-                info,
+        infos.into_iter().map(crate::Listed::local).collect()
+    }
+
+    /// A listing of these sessions, each as its own host lists it.
+    fn listed_ids(ids: &[SessionId]) -> Vec<crate::Listed> {
+        ids.iter()
+            .map(|id| crate::Listed {
+                id: id.clone(),
+                info: info(id.name()),
             })
             .collect()
     }
@@ -4754,17 +4757,14 @@ mod tests {
     }
 
     /// Seed a foreign group into the registry, as a shell broadcast would.
-    fn seed_group(m: &mut Fleet, gid: &str, name: &str, members: &[&str]) {
+    fn seed_group<M: Clone + Into<SessionId>>(m: &mut Fleet, gid: &str, name: &str, members: &[M]) {
         let mut groups: Vec<Group> = m.groups().to_vec();
         groups.retain(|g| g.id != gid);
         groups.push(Group {
             id: gid.to_string(),
             name: name.to_string(),
             color: 1,
-            members: members
-                .iter()
-                .map(|s| SessionId::parse_composite(s))
-                .collect(),
+            members: members.iter().cloned().map(Into::into).collect(),
             connection: None,
         });
         m.update(UiEvent::GroupsLoaded(groups));
@@ -5055,9 +5055,11 @@ mod tests {
     #[test]
     fn r_on_a_live_remote_tile_confirms_then_restarts_it_under_the_new_ghost() {
         let mut m = fleet();
-        let remote = format!("h{}work", crate::group::REMOTE_ID_SEP);
+        let remote = SessionId::remote("h", "work");
         // A live remote tile (a listed session is live), focused by the listing.
-        m.update(UiEvent::SessionList(listed(vec![info(&remote)])));
+        m.update(UiEvent::SessionList(listed_ids(std::slice::from_ref(
+            &remote,
+        ))));
         // `r` reuses the relaunch verb: on a LIVE remote tile it offers a restart
         // under the current ghost — destructive (the running program is lost), so
         // it is confirmed first rather than acting immediately.
@@ -5068,13 +5070,7 @@ mod tests {
         );
         // Confirm (Space) → the shell restarts the remote host under the new binary.
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
-        assert_eq!(
-            cmds,
-            vec![
-                Cmd::RestartRemote(SessionId::parse_composite(&remote)),
-                Cmd::Redraw
-            ]
-        );
+        assert_eq!(cmds, vec![Cmd::RestartRemote(remote.clone()), Cmd::Redraw]);
     }
 
     #[test]
@@ -5371,9 +5367,13 @@ mod tests {
         );
     }
 
-    fn dead_info(name: &str, display: &str, command: &[&str]) -> crate::event::DeadSession {
+    fn dead_info(
+        name: impl Into<SessionId>,
+        display: &str,
+        command: &[&str],
+    ) -> crate::event::DeadSession {
         crate::event::DeadSession {
-            name: SessionId::parse_composite(name),
+            name: name.into(),
             display_name: display.to_string(),
             command: command.iter().map(|s| s.to_string()).collect(),
             cwd: None,
@@ -5383,9 +5383,9 @@ mod tests {
 
     /// A remembered member on a host we cannot reach (see
     /// [`crate::DeadState::AwaitingHost`]).
-    fn awaiting_info(name: &str, target: &str) -> crate::event::DeadSession {
+    fn awaiting_info(name: impl Into<SessionId>, target: &str) -> crate::event::DeadSession {
         crate::event::DeadSession {
-            name: SessionId::parse_composite(name),
+            name: name.into(),
             display_name: String::new(),
             command: Vec::new(),
             cwd: None,
@@ -5403,21 +5403,21 @@ mod tests {
     fn a_member_awaiting_its_host_is_drawn_waiting_and_offers_no_relaunch() {
         let mut m = my_fleet(&[]);
         widen(&mut m);
-        let composite = format!("kov@box{}work", crate::REMOTE_ID_SEP);
-        seed_group(&mut m, "w9", "blue", &[&composite]);
+        let remote_id = SessionId::remote("kov@box", "work");
+        seed_group(&mut m, "w9", "blue", &[&remote_id]);
         m.update(UiEvent::DeadSessions(vec![awaiting_info(
-            &composite, "kov@box",
+            &remote_id, "kov@box",
         )]));
 
         let tile = m
             .tiles
             .iter()
-            .find(|t| t.id == composite)
+            .find(|t| t.id == remote_id)
             .expect("a remembered remote member gets a tile even with its host away");
         assert!(tile.dead, "there is no live session to attach to");
         assert_eq!(tile.awaiting_host.as_deref(), Some("kov@box"));
         assert!(
-            m.layout().iter().any(|(_, id, _)| *id == composite),
+            m.layout().iter().any(|(_, id, _)| *id == remote_id),
             "and it is laid out, or the fleet is empty to the user"
         );
 
@@ -5454,15 +5454,15 @@ mod tests {
     fn a_host_that_returns_without_the_session_makes_its_tile_relaunchable() {
         let mut m = my_fleet(&[]);
         widen(&mut m);
-        let composite = format!("kov@box{}work", crate::REMOTE_ID_SEP);
-        seed_group(&mut m, "w9", "blue", &[&composite]);
+        let remote_id = SessionId::remote("kov@box", "work");
+        seed_group(&mut m, "w9", "blue", &[&remote_id]);
         m.update(UiEvent::DeadSessions(vec![awaiting_info(
-            &composite, "kov@box",
+            &remote_id, "kov@box",
         )]));
         // The host is back; its listing does not carry `work`.
-        m.update(UiEvent::DeadSessions(vec![dead_info(&composite, "", &[])]));
+        m.update(UiEvent::DeadSessions(vec![dead_info(&remote_id, "", &[])]));
 
-        let tile = m.tiles.iter().find(|t| t.id == composite).expect("tile");
+        let tile = m.tiles.iter().find(|t| t.id == remote_id).expect("tile");
         assert_eq!(
             tile.awaiting_host, None,
             "the wait is over — the host answered"
@@ -6486,10 +6486,12 @@ mod tests {
         // side of the transport.
         let mut m = my_fleet(&[]);
         widen(&mut m);
-        let remote = format!("box{}work", crate::group::REMOTE_ID_SEP);
+        let remote = SessionId::remote("box", "work");
         seed_group(&mut m, "g-remote", "remote", &[&remote]);
         // Host reachable: the watcher lists the session, so it is a live tile.
-        list(&mut m, &[&remote]);
+        m.update(UiEvent::SessionList(listed_ids(std::slice::from_ref(
+            &remote,
+        ))));
         assert!(
             m.tiles.iter().any(|t| t.id == remote && !t.dead),
             "precondition: the remote session is live"
@@ -6506,8 +6508,7 @@ mod tests {
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "g-remote"
-                    && g.members.contains(&SessionId::parse_composite(&remote))),
+                .any(|g| g.id == "g-remote" && g.members.contains(&remote)),
             "a member named waiting survives the outage: {:?}",
             m.groups()
         );
@@ -7102,7 +7103,7 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x"]);
-        seed_group(&mut m, "g3", "orange", &[]);
+        seed_group::<&str>(&mut m, "g3", "orange", &[]);
         m.update(UiEvent::SessionList(listed(vec![
             sinfo("x", true),
             info("d"),

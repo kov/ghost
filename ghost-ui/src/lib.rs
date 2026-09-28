@@ -46,10 +46,7 @@ mod resize;
 #[cfg(target_os = "linux")]
 mod windows;
 
-use hosts::{
-    HostLink, LocalFeed, RemoteHost, remote_fleet_id, remote_id_owned, remote_id_parts,
-    remote_listing, start_remote_watcher,
-};
+use hosts::{HostLink, LocalFeed, RemoteHost, remote_listing, start_remote_watcher};
 use instance::LastExit;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -1350,7 +1347,7 @@ fn choice_summary(
     groups: &[ghost_ui_core::Group],
     choice: &StartupChoice,
 ) -> String {
-    // `␟` is invisible in a log; a composite id reads as `<host>:<session>`.
+    // A remote id reads as `<host>:<session>`.
     let show = |id: &SessionId| id.to_string();
     let list = |v: Vec<String>| {
         if v.is_empty() {
@@ -3463,7 +3460,7 @@ pub struct App {
     /// Every remote host the App knows about, keyed by target.
     hosts: HashMap<String, HostLink>,
     /// Remote sessions whose transport dropped and are holding in the reconnecting
-    /// state, keyed by `(window, composite id)`. Each value is the stop flag for its
+    /// state, keyed by `(window, session id)`. Each value is the stop flag for its
     /// background probe thread (`spawn_reconnect_probe`): set it and drop the entry
     /// to cancel (the window closed, or the session reattached). Presence also
     /// dedupes — a repeated drop won't start a second probe. See
@@ -3626,7 +3623,7 @@ impl App {
                 .map(|p| &p.id),
         );
         for member in remembered {
-            if let Some((target, _)) = remote_id_parts(member)
+            if let Some((target, _)) = member.as_remote()
                 && !connected.contains(target)
             {
                 wanted.insert(target.to_string());
@@ -3662,7 +3659,7 @@ impl App {
     /// Every remembered **remote** member that no host is currently serving, and
     /// why — the remote half of the dead sweep.
     ///
-    /// A remote member (`<target>␟<real>`) has no local descriptor and no local
+    /// A remote member has no local descriptor and no local
     /// recording, so the local sweep can never name it. Without this it had no tile
     /// at all whenever its host was unreachable: the window that was driving it
     /// showed an empty fleet, which is what "a remote reboot loses my sessions"
@@ -3687,7 +3684,7 @@ impl App {
                 .map(|p| &p.id),
         );
         for member in remembered {
-            let Some((target, real)) = remote_id_parts(member) else {
+            let Some((target, real)) = member.as_remote() else {
                 continue;
             };
             if out.iter().any(|d| d.name == member) {
@@ -4254,7 +4251,8 @@ impl App {
                     // rebuild here would double-drive or blank a session another window
                     // still views (there'd be no resync to refill it).
                     if !self.sessions.contains_key(&id)
-                        && let Some((target, real)) = remote_id_owned(&id)
+                        && let Some((target, real)) =
+                            id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         // A remote member attaches over its host's transport, the
                         // same way a take-over of it does.
@@ -4297,7 +4295,7 @@ impl App {
                         // session borrows the driver's state, opens no mirror).
                         && !self.observers.contains_key(&id)
                         && !self.sessions.contains_key(&id)
-                        && let Some((target, real)) = remote_id_owned(&id)
+                        && let Some((target, real)) = id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         match self.observe_remote(&target, &real) {
                             Some(sub) => {
@@ -4409,7 +4407,7 @@ impl App {
                     // whose host dropped — is neither driven nor listed, so the
                     // index does not hold it and gating on it would misroute the
                     // kill to the local path (bogus socket, kill silently dropped).
-                    if let Some((target, real)) = remote_id_parts(&id) {
+                    if let Some((target, real)) = id.as_remote() {
                         self.spawn_remote_kill(target, real);
                     }
                     self.reconcile_source(&id);
@@ -4423,11 +4421,11 @@ impl App {
                 Cmd::Recreate(id) => {
                     // Bring a dead session back and step into it. A REMOTE tile is
                     // recreated on ITS HOST over the transport, never as a local
-                    // shell — route by the self-describing composite id (like
+                    // shell — route by the self-describing remote id (like
                     // Cmd::Kill above); `spawn_remote_session` recreates + attaches +
                     // adopts, the remote counterpart of the local branch here.
                     if let Some((target, real)) =
-                        remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
+                        id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         self.spawn_remote_session(wid, &target, &real, None);
                     } else if self.respawn_dead(&id) && self.attach_into(wid, &id, event_loop) {
@@ -4444,7 +4442,7 @@ impl App {
                     // (a remote reboot wipes the host's sessions — this is what brings
                     // them back).
                     if let Some((target, real)) =
-                        remote_id_parts(&id).map(|(t, r)| (t.to_string(), r.to_string()))
+                        id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
                     {
                         self.respawn_remote_dead(&target, &real);
                     } else {
@@ -4457,7 +4455,7 @@ impl App {
                     // host's death drops any client driving it; the existing
                     // reconnect path then re-attaches to the fresh host — reading its
                     // new (current) proto level. Route by the self-describing id.
-                    if let Some((target, real)) = remote_id_parts(&id) {
+                    if let Some((target, real)) = id.as_remote() {
                         self.spawn_remote_restart(target, real);
                     }
                 }
@@ -4468,7 +4466,7 @@ impl App {
                     // id carries its own host+name, so it never falls through to the
                     // local path (whose bogus socket would report a misleading "older
                     // ghost" error). On refusal the fleet's optimistic label reverts.
-                    if let Some((target, real)) = remote_id_parts(&session) {
+                    if let Some((target, real)) = session.as_remote() {
                         self.spawn_remote_rename(target, real, &name);
                     } else if let Err(e) = ghost_vt::client::rename(session.name(), &name) {
                         eprintln!("ghost: rename failed: {e}");
@@ -4573,7 +4571,9 @@ impl App {
                 Cmd::TakeOver(id) => {
                     // A remote tile attaches over its host's transport; a local one
                     // over its unix socket.
-                    if let Some((target, real)) = remote_id_owned(&id) {
+                    if let Some((target, real)) =
+                        id.as_remote().map(|(t, r)| (t.to_string(), r.to_string()))
+                    {
                         self.take_over_remote(wid, &id, &target, &real, event_loop);
                     } else {
                         // Switch the window to `id`'s single view. Attach only if the
@@ -5062,7 +5062,7 @@ impl App {
         &mut self,
         wid: WindowId,
         host: &RemoteHost,
-        composite: &SessionId,
+        id: &SessionId,
         real: &str,
         event_loop: &dyn Frontend,
     ) -> bool {
@@ -5078,13 +5078,7 @@ impl App {
         loop {
             let cmd = host.remote.pipe_command(&host.remote_ghost, real);
             // Freshly (re)created by the current staged binary → our own level.
-            if self.attach_ssh_into(
-                wid,
-                composite,
-                cmd,
-                ghost_vt::protocol::PROTO_LEVEL,
-                event_loop,
-            ) {
+            if self.attach_ssh_into(wid, id, cmd, ghost_vt::protocol::PROTO_LEVEL, event_loop) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -5577,12 +5571,12 @@ impl App {
             ConnectOutcome::Transport { remote_ghost } => {
                 // Retain the host so the fleet polls its other sessions too.
                 self.register_remote(&spec, &remote_ghost);
-                // Drive it under the SAME composite id the watcher will discover it
-                // by (`<target>␟<name>`), so the window recognizes its own session
+                // Drive it under the SAME remote id the watcher will discover it
+                // by, so the window recognizes its own session
                 // as this-window in the fleet instead of as a foreign duplicate. The
                 // transport still addresses the bare remote name.
                 let target = spec.target();
-                let local_id = remote_fleet_id(&target, &name);
+                let local_id = SessionId::remote(target.as_str(), name.as_str());
                 let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec) else {
                     return self.connect_fail(wid, "could not open the ssh connection".into());
                 };
@@ -5813,7 +5807,7 @@ impl App {
 
     /// The ssh connection an owned foreground session `id` carries, if any — read
     /// from stored data, never a live command line. A session driven over the
-    /// transport (`<target>␟<real>`) has no local descriptor, so its spec comes
+    /// transport has no local descriptor, so its spec comes
     /// from the live remote host; a local session (including an `ssh` child) reads
     /// its stored descriptor.
     fn foreground_connection(&self, id: &SessionId) -> Option<ConnectionSpec> {
@@ -6029,7 +6023,7 @@ impl App {
 
     /// Attach a new remote session whose off-loop `ghost new -d` just finished (see
     /// [`spawn_remote_session`](Self::spawn_remote_session)): drive it as this-window
-    /// under the composite id the watcher will discover it by. A window closed while
+    /// under the remote id the watcher will discover it by. A window closed while
     /// the spawn ran drops the result — the created session persists on the host and
     /// surfaces in the fleet like any other detached one.
     fn finish_remote_session_spawn(
@@ -6056,10 +6050,10 @@ impl App {
             );
             return;
         };
-        // Drive it under the composite id the watcher will discover it by, so the
+        // Drive it under the remote id the watcher will discover it by, so the
         // window owns its own new session in the fleet (the transport uses the bare
         // name); see [`finish_connect`](Self::finish_connect).
-        let local_id = remote_fleet_id(&target, &name);
+        let local_id = SessionId::remote(target.as_str(), name.as_str());
         let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
         // Just spawned by the current staged binary → our own level.
         if self.attach_ssh_into(
@@ -6650,11 +6644,11 @@ impl App {
                 targets.insert(spec.target());
             }
         }
-        // A driven remote session's id is `<target>␟<real>`; read the target straight
+        // Read a driven remote session's target straight
         // off the process-wide client set (not via the index, which a poll failure can
         // clear).
         for name in self.sessions.keys() {
-            if let Some((target, _)) = remote_id_parts(name) {
+            if let Some((target, _)) = name.as_remote() {
                 targets.insert(target.to_string());
             }
         }
@@ -6662,7 +6656,7 @@ impl App {
         // window drives it right now (the session went cold during an outage).
         for g in &self.groups {
             for m in &g.members {
-                if let Some((target, _)) = remote_id_parts(m) {
+                if let Some((target, _)) = m.as_remote() {
                     targets.insert(target.to_string());
                 }
             }
@@ -6671,7 +6665,7 @@ impl App {
         // appears in `self.sessions` — but its host must stay so the probe can reach it
         // and `finish_reattach` can find it. Keep it in use until the hold clears.
         for (_, name) in self.reconnecting.keys() {
-            if let Some((target, _)) = remote_id_parts(name) {
+            if let Some((target, _)) = name.as_remote() {
                 targets.insert(target.to_string());
             }
         }
@@ -8905,7 +8899,7 @@ mod tests {
         // A config hot-reload fans the new model-side settings out to EVERY open
         // window. (The gfx-side keys — opacity/frost/blur — have no headless seam;
         // this covers the plumbing and the multi-window fan-out, which is the logic
-        // worth guarding. Surface/composite behaviour is a ghost-renderer golden.)
+        // worth guarding. Surface/remote_id behaviour is a ghost-renderer golden.)
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
@@ -9097,7 +9091,7 @@ mod tests {
     }
 
     #[test]
-    fn on_user_event_merges_a_remote_listing_under_composite_ids() {
+    fn on_user_event_merges_a_remote_listing_under_remote_ids() {
         // The real shell handles a watcher delivery headlessly: a host's listing is
         // stashed and its ids resolve back to (target, real) — the identity path a
         // past bug broke (a window mistook its own remote session for a foreign
@@ -9136,12 +9130,12 @@ mod tests {
         // names, fetched over the transport) is what tells the two apart.
         with_isolated_xdg(|| {
             let mut app = App::headless();
-            let composite = SessionId::remote("kov@box", "work");
+            let remote_id = SessionId::remote("kov@box", "work");
             app.groups = vec![ghost_ui_core::Group {
                 id: "w1".into(),
                 name: "blue".into(),
                 color: 0,
-                members: vec![composite.clone()],
+                members: vec![remote_id.clone()],
                 connection: None,
             }];
             // The host is connected and its listing does not name the member.
@@ -9152,7 +9146,7 @@ mod tests {
             let dead = app.remembered_remotes();
             assert_eq!(
                 dead.iter().map(|d| &d.name).collect::<Vec<_>>(),
-                vec![&composite],
+                vec![&remote_id],
                 "with no remembered-set, a not-listed member stays relaunchable"
             );
             assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
@@ -9173,7 +9167,7 @@ mod tests {
             let dead = app.remembered_remotes();
             assert_eq!(
                 dead.iter().map(|d| &d.name).collect::<Vec<_>>(),
-                vec![&composite],
+                vec![&remote_id],
                 "a member the host still remembers is relaunchable"
             );
             assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
@@ -9189,12 +9183,12 @@ mod tests {
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
-            let composite = SessionId::remote("kov@box", "work");
+            let remote_id = SessionId::remote("kov@box", "work");
             app.groups = vec![ghost_ui_core::Group {
                 id: "w1".into(),
                 name: "blue".into(),
                 color: 0,
-                members: vec![composite.clone()],
+                members: vec![remote_id.clone()],
                 connection: None,
             }];
             app.on_user_event(
@@ -9226,7 +9220,7 @@ mod tests {
             assert_eq!(
                 dead.iter().map(|d| (&d.name, &d.state)).collect::<Vec<_>>(),
                 vec![(
-                    &composite,
+                    &remote_id,
                     &ghost_ui_core::DeadState::AwaitingHost("kov@box".to_string())
                 )],
                 "a member of an unreachable host waits for it"
@@ -9478,8 +9472,8 @@ mod tests {
                 &fe,
             );
 
-            let composite = SessionId::remote("kov@box", name);
-            let adopted = app.sessions.contains_key(&composite);
+            let remote_id = SessionId::remote("kov@box", name);
+            let adopted = app.sessions.contains_key(&remote_id);
 
             // The orphan kill is best-effort off-thread; poll until it's gone.
             let gone = wait_until(false, name);
@@ -9507,7 +9501,7 @@ mod tests {
     fn spawn_remote_session_opens_a_real_session_on_the_host_over_the_shim() {
         // The full inheritance-over-remote flow, end to end and offscreen: the real
         // shell creates a session ON a host over the (shimmed) transport and drives
-        // it as this-window under the composite id — a real `ghost new -d` + attach
+        // it as this-window under the remote_id id — a real `ghost new -d` + attach
         // through `ghost __pipe`, no GPU and no network.
         let Some(ghost_bin) = ghost_binary() else {
             eprintln!("skipping: no `ghost` binary next to the test binary");
@@ -9554,8 +9548,8 @@ mod tests {
                 &fe,
             );
 
-            let composite = SessionId::remote("kov@box", name);
-            let held = app.sessions.contains_key(&composite);
+            let remote_id = SessionId::remote("kov@box", name);
+            let held = app.sessions.contains_key(&remote_id);
 
             // Tear the real host down before asserting, so a failure never leaks it.
             let _ = ghost_vt::session::kill_session(name);
@@ -10012,7 +10006,7 @@ mod tests {
     }
 
     /// The REMOTE twin of the driver-close downgrade (5c item 2): window A drives a
-    /// remote session (a composite `<host>␟<name>` id over the ssh transport) and window
+    /// remote session (over the ssh transport) and window
     /// B previews it in its fleet, sharing A's one client (no second mirror). When A
     /// closes, the shared remote client is orphaned — but B still previews it, so the
     /// shell downgrades the source to a read-only REMOTE observer (over the host's
@@ -10061,9 +10055,9 @@ mod tests {
                 Ok(()),
                 &fe,
             );
-            let composite = SessionId::remote("kov@box", name);
+            let remote_id = SessionId::remote("kov@box", name);
             assert!(
-                app.sessions.contains_key(&composite),
+                app.sessions.contains_key(&remote_id),
                 "precondition: A drives the remote session over the transport"
             );
 
@@ -10074,7 +10068,7 @@ mod tests {
             let listed = remote_listing("kov@box", &[info(name, true)]);
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(listed), &fe);
             assert!(
-                app.windows[&b].root.views(&composite),
+                app.windows[&b].root.views(&remote_id),
                 "precondition: B previews the remote session"
             );
             assert_eq!(
@@ -10086,9 +10080,9 @@ mod tests {
             // A closes. B still previews the now-driverless remote session.
             app.close_window(a, &fe);
 
-            let downgraded = app.observers.contains_key(&composite);
+            let downgraded = app.observers.contains_key(&remote_id);
             let host_kept = app.connected_targets().contains("kov@box");
-            let state_alive = app.states.text_of(&composite).is_some();
+            let state_alive = app.states.text_of(&remote_id).is_some();
 
             // Tear the real (shimmed-local) session down and restore PATH before asserting.
             let _ = ghost_vt::session::kill_session(name);
@@ -10162,15 +10156,15 @@ mod tests {
                 Ok(()),
                 &fe,
             );
-            let composite = SessionId::remote("kov@box", name);
-            let drove_first = app.windows[&a].root.drives(&composite);
+            let remote_id = SessionId::remote("kov@box", name);
+            let drove_first = app.windows[&a].root.drives(&remote_id);
 
             // The transport drops: the pump removes the client and holds the session.
-            app.sessions.remove(&composite);
+            app.sessions.remove(&remote_id);
             app.dispatch(
                 a,
                 ghost_ui_core::UiEvent::SessionDisconnected {
-                    name: composite.clone(),
+                    name: remote_id.clone(),
                 },
                 &fe,
             );
@@ -10180,9 +10174,9 @@ mod tests {
             app.host_mut("kov@box").conn = None;
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
-            app.exec(b, vec![ghost_ui_core::Cmd::Attach(composite.clone())], &fe);
-            let opened = app.sessions.contains_key(&composite);
-            let still_held = app.windows[&a].root.drives(&composite);
+            app.exec(b, vec![ghost_ui_core::Cmd::Attach(remote_id.clone())], &fe);
+            let opened = app.sessions.contains_key(&remote_id);
+            let still_held = app.windows[&a].root.drives(&remote_id);
 
             let _ = ghost_vt::session::kill_session(name);
             // SAFETY: still within the lock.
@@ -10301,25 +10295,25 @@ mod tests {
                     infos: listing(),
                 },
             );
-            let composite = SessionId::remote("kov@box", name);
+            let remote_id = SessionId::remote("kov@box", name);
 
             let ga = app.mint_group();
             let a = app.open_fleet_window(&fe, ga, None);
             app.exec(
                 a,
-                vec![ghost_ui_core::Cmd::TakeOver(composite.clone())],
+                vec![ghost_ui_core::Cmd::TakeOver(remote_id.clone())],
                 &fe,
             );
-            let a_drove = app.windows[&a].root.drives(&composite);
+            let a_drove = app.windows[&a].root.drives(&remote_id);
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let want = app.windows[&b].root.client_identity();
             app.exec(
                 b,
-                vec![ghost_ui_core::Cmd::TakeOver(composite.clone())],
+                vec![ghost_ui_core::Cmd::TakeOver(remote_id.clone())],
                 &fe,
             );
-            let a_still = app.windows[&a].root.drives(&composite);
+            let a_still = app.windows[&a].root.drives(&remote_id);
             let holder = || {
                 listing()
                     .into_iter()
@@ -10665,28 +10659,6 @@ mod tests {
             );
             assert!(survived, "the take-over must not blank the shared emulator");
         });
-    }
-
-    #[test]
-    fn a_remote_id_always_routes_control_actions_over_the_transport() {
-        // A plain id renames/kills over its local control socket.
-        assert!(
-            super::remote_id_parts(&"plain-session".into()).is_none(),
-            "a local id has no host parts"
-        );
-        // A namespaced remote id is self-describing: its host + real name come from
-        // the id itself, so a rename or kill ALWAYS routes over the transport even
-        // if the index has since dropped it — never the local path (whose bogus
-        // socket reports a misleading "older ghost" error). Kill matters most for a
-        // COLD remote tile (its host dropped, so it is neither driven nor listed —
-        // exactly the ids the index does not hold), whose manual kill is the one
-        // cleanup for a lingering dead remote member.
-        let composite = SessionId::remote("kov@box", "work");
-        assert_eq!(
-            super::remote_id_parts(&composite),
-            Some(("kov@box", "work")),
-            "a remote id recovers (target, real) from the composite itself"
-        );
     }
 
     #[test]
@@ -11285,7 +11257,7 @@ mod tests {
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
-            let rem = remote("work"); // kov@box␟work
+            let rem = remote("work");
             app.groups = vec![group("g1", &[&rem])];
             let records = vec![record("g1", 80, 24, true, None, &[&rem])];
             app.restore_workspace(&fe, records);
@@ -11315,7 +11287,7 @@ mod tests {
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
-            let rem = remote("work"); // kov@box␟work
+            let rem = remote("work");
             app.groups = vec![group("g1", &[&rem])];
             let records = vec![record("g1", 80, 24, true, None, &[&rem])];
             app.restore_workspace(&fe, records);
@@ -11432,16 +11404,16 @@ mod tests {
             // remote queued carrying its SAVED single mode (false = drive, not observe).
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let composite = SessionId::remote("kov@box", real);
+            let remote_id = SessionId::remote("kov@box", real);
             app.host_mut("kov@box").pending_restores = vec![PendingRemote {
                 wid,
-                id: composite.clone(),
+                id: remote_id.clone(),
                 fleet: false,
                 foreground: true,
             }];
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
-            let held = app.sessions.contains_key(&composite);
+            let held = app.sessions.contains_key(&remote_id);
             let single = !app.windows[&wid].root.is_fleet();
             let drained = !app
                 .hosts
@@ -11506,7 +11478,7 @@ mod tests {
 
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let composite = SessionId::remote("kov@box", real);
+            let remote_id = SessionId::remote("kov@box", real);
             // The host's first listing is already in: the window has a cold tile for
             // the session, which is what makes the adopt below park instead of
             // diving straight through.
@@ -11520,7 +11492,7 @@ mod tests {
             );
             app.host_mut("kov@box").pending_restores = vec![PendingRemote {
                 wid,
-                id: composite.clone(),
+                id: remote_id.clone(),
                 fleet: false,
                 foreground: true,
             }];
@@ -11536,7 +11508,7 @@ mod tests {
             app.dispatch(
                 wid,
                 ghost_ui_core::UiEvent::SessionData {
-                    name: composite.clone(),
+                    name: remote_id.clone(),
                     bytes: b"hi".to_vec(),
                     ended: false,
                 },
@@ -11555,7 +11527,7 @@ mod tests {
 
             assert_eq!(
                 foreground.as_ref(),
-                Some(&composite),
+                Some(&remote_id),
                 "the restored remote session lands in the window's foreground"
             );
         });
@@ -11702,7 +11674,7 @@ mod tests {
 
     #[test]
     fn a_remote_foreground_inherits_ssh_from_the_live_host() {
-        // A session driven over the transport is keyed by a composite id and has NO
+        // A session driven over the transport is keyed by a remote_id id and has NO
         // local descriptor, so `descriptor::read` finds nothing. Its connection —
         // what a new session (Cmd+T) branching off it inherits — must resolve from
         // the live remote host instead, so a non-ssh window whose foreground is a
@@ -11711,9 +11683,9 @@ mod tests {
             let mut app = App::headless();
             let spec = ConnectionSpec::parse_target("kov@box").unwrap();
             app.register_remote(&spec, "ghost");
-            let composite = SessionId::remote("kov@box", "work");
+            let remote_id = SessionId::remote("kov@box", "work");
             assert_eq!(
-                app.foreground_connection(&composite),
+                app.foreground_connection(&remote_id),
                 Some(spec),
                 "the remote foreground's host resolves from the live transport"
             );
@@ -11948,7 +11920,7 @@ mod tests {
         assert!(line.starts_with("new window: "), "{line}");
         assert!(line.contains("requested=none"), "{line}");
         assert!(line.contains("listed=[a(attached)]"), "{line}");
-        // The unit separator is invisible in a log, so a composite reads host:name.
+        // A remote id reads host:name in a log.
         assert!(line.contains("awaiting-remote=[kov@box:work]"), "{line}");
         assert!(line.contains("-> fleet"), "{line}");
         assert!(

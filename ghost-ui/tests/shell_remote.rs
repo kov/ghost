@@ -146,8 +146,8 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         // its runtime dir is wiped, so the session is truly gone.
         remote.reboot();
 
-        // The composite id the window knows it by (`<target>␟work`).
-        let composite = app
+        // The id the window knows it by.
+        let remote_id = app
             .groups()
             .iter()
             .flat_map(|g| &g.members)
@@ -159,7 +159,7 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         // screen, dimmed — the visible "I am waiting, not gone" — and never ends it.
         let holding = pump_until(&mut app, &fe, &q, Duration::from_secs(120), |app| {
             let scene = app.root(wid).expect("window").view(app.states());
-            support::session_dimmed(&scene, &composite) == Some(true)
+            support::session_dimmed(&scene, &remote_id) == Some(true)
         });
         assert!(
             holding,
@@ -167,14 +167,14 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
              screen, dimmed; drawn={:?} shows={:?}",
             support::session_dimmed(
                 &app.root(wid).expect("window").view(app.states()),
-                &composite
+                &remote_id
             ),
             visible_text(&app.root(wid).expect("window").view(app.states()))
         );
 
         // And it is still remembered, so nothing about it has been thrown away.
         assert!(
-            app.groups().iter().any(|g| g.members.contains(&composite)),
+            app.groups().iter().any(|g| g.members.contains(&remote_id)),
             "the session must stay remembered across the outage: {:?}",
             app.groups()
         );
@@ -227,7 +227,7 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
             app.dispatch(wid, UiEvent::SessionsChanged, &fe);
             let scene = app.root(wid).expect("window").view(app.states());
             // A live tile draws a terminal preview; a dead card draws none.
-            support::session_dimmed(&scene, &composite).is_some() && !sees_text(&scene, "relaunch")
+            support::session_dimmed(&scene, &remote_id).is_some() && !sees_text(&scene, "relaunch")
         });
         assert!(
             revived,
@@ -501,7 +501,7 @@ struct FocusRig {
     q: Arc<QueuedEvents>,
     wid: winit::window::WindowId,
     /// The id (`<target>` + `focus`) the window knows the session by.
-    composite: SessionId,
+    remote_id: SessionId,
 }
 
 /// Stand up the shell driving remote session "focus", whose child has enabled
@@ -564,7 +564,7 @@ fn rig_focus_child(remote: &RealRemote) -> FocusRig {
         visible_text(&app.root(wid).expect("window").view(app.states()))
     );
 
-    let composite = app
+    let remote_id = app
         .groups()
         .iter()
         .flat_map(|g| &g.members)
@@ -584,12 +584,12 @@ fn rig_focus_child(remote: &RealRemote) -> FocusRig {
     // The ?1004 rising edge reports the current focus state to the child —
     // the already-fixed baseline, proven across the ssh transport.
     let baseline = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
-        rendered_count(app, &composite, "^[[I") >= 1
+        rendered_count(app, &remote_id, "^[[I") >= 1
     });
     assert!(
         baseline,
         "enabling ?1004 never reported focus to the remote child: {:?}",
-        app.states().text_of(&composite)
+        app.states().text_of(&remote_id)
     );
 
     FocusRig {
@@ -597,7 +597,7 @@ fn rig_focus_child(remote: &RealRemote) -> FocusRig {
         fe,
         q,
         wid,
-        composite,
+        remote_id,
     }
 }
 
@@ -610,28 +610,28 @@ fn wait_for_focus_reports(rig: &mut FocusRig, want: usize, timeout: Duration) {
         fe,
         q,
         wid,
-        composite,
+        remote_id,
     } = rig;
     let mut last_dim = None;
     let retold = pump_until(app, fe, q, timeout, |app| {
         let scene = app.root(*wid).expect("window").view(app.states());
-        let dim = support::session_dimmed(&scene, composite);
+        let dim = support::session_dimmed(&scene, remote_id);
         if dim != last_dim {
             eprintln!("shell_remote: dim {last_dim:?} -> {dim:?}");
             last_dim = dim;
         }
-        rendered_count(app, composite, "^[[I") >= want
+        rendered_count(app, remote_id, "^[[I") >= want
     });
     if !retold {
         // A marker renders only if the transport is live again.
         app.dispatch(*wid, UiEvent::Text("PING\r".into()), fe);
         let alive = pump_until(app, fe, q, Duration::from_secs(10), |app| {
-            rendered_count(app, composite, "PING") >= 1
+            rendered_count(app, remote_id, "PING") >= 1
         });
         panic!(
             "the child was never (re-)told the focus state (want {want} reports; \
              transport live again: {alive}): {:?}",
-            app.states().text_of(composite)
+            app.states().text_of(remote_id)
         );
     }
 }

@@ -1,6 +1,6 @@
 //! What the App knows about the machines hosting sessions: a remote host's
-//! connection and state ([`HostLink`]), the composite ids its sessions are known
-//! by locally, the per-host `ghost __watch` stream, and the local feed that
+//! connection and state ([`HostLink`]), how its listing becomes remote session
+//! ids, the per-host `ghost __watch` stream, and the local feed that
 //! discovers this machine's sessions through the same watch.
 
 use super::*;
@@ -78,21 +78,6 @@ impl HostLink {
     }
 }
 
-/// The id of remote session `real` on `target`.
-pub(crate) fn remote_fleet_id(target: &str, real: &str) -> SessionId {
-    SessionId::remote(target, real)
-}
-
-/// A remote session's `(target, real name)`; `None` for a local one.
-pub(crate) fn remote_id_parts(id: &SessionId) -> Option<(&str, &str)> {
-    id.target().map(|target| (target, id.name()))
-}
-
-/// [`remote_id_parts`], owned.
-pub(crate) fn remote_id_owned(id: &SessionId) -> Option<(String, String)> {
-    remote_id_parts(id).map(|(target, real)| (target.to_string(), real.to_string()))
-}
-
 /// Floor between reconnect attempts of a host's watch stream, so a host whose
 /// `ghost __watch` exits at once can't spin.
 const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
@@ -103,7 +88,7 @@ const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
 const REMOTE_WATCH_MAX_FAILURES: u32 = 3;
 
 /// A remote host's listing as the local fleet knows it: each session under its
-/// fleet id, its host's name for it (or its display name) shown as its display
+/// remote id, its host's name for it (or its display name) shown as its display
 /// name, and tagged with the host's connection so it renders as a remote tile
 /// badged with the host.
 pub(crate) fn remote_listing(
@@ -120,7 +105,7 @@ pub(crate) fn remote_listing(
             }
             info.connection = spec.clone();
             ghost_ui_core::Listed {
-                id: remote_fleet_id(target, &i.name),
+                id: SessionId::remote(target, i.name.as_str()),
                 info,
             }
         })

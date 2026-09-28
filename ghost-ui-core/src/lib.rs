@@ -36,7 +36,7 @@ pub use fleet::{FleetModel, Locality};
 pub use frame::{FrameGrab, ResizeEdge, resize_edge_at};
 /// The scheme's default fg/bg the models report to OSC 10/11 color queries.
 pub use ghost_vt::query::ThemeColors;
-pub use group::{Group, REMOTE_ID_SEP, is_remote_id};
+pub use group::Group;
 pub use input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
 pub use root::{RootModel, Sessions, feed_observed, feed_shared};
 pub use terminal::{

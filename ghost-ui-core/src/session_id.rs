@@ -3,9 +3,12 @@
 //! Focus, input routing and every per-session map key on this, never a list
 //! index — so reordering tiles can't silently retarget input.
 
-use crate::group::REMOTE_ID_SEP;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+
+/// Separates target from name in the composite form: the unit separator, a
+/// byte neither a target nor a session name ever contains.
+const REMOTE_ID_SEP: char = '\u{1f}';
 
 /// Which machine hosts a session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -59,6 +62,11 @@ impl SessionId {
             Host::Local => None,
             Host::Remote(target) => Some(target),
         }
+    }
+
+    /// A remote session's `(target, name)`; `None` for a local one.
+    pub fn as_remote(&self) -> Option<(&str, &str)> {
+        self.target().map(|target| (target, self.name.as_str()))
     }
 
     /// The name of a session on *this* machine; `None` for a remote one. What
@@ -131,27 +139,27 @@ impl PartialEq<SessionId> for &SessionId {
     }
 }
 
-// Tests compare ids with the strings they were written as: a bare name is a
-// local session, a `<target>␟<name>` composite a remote one. Test-only, so
-// production code cannot compare an id with a string.
+// Tests compare ids with the strings they were written as, which — as with
+// `From<&str>` — name local sessions. Test-only, so production code cannot
+// compare an id with a string.
 #[cfg(test)]
 impl PartialEq<str> for SessionId {
     fn eq(&self, other: &str) -> bool {
-        *self == SessionId::parse_composite(other)
+        self.local_name() == Some(other)
     }
 }
 
 #[cfg(test)]
 impl PartialEq<&str> for SessionId {
     fn eq(&self, other: &&str) -> bool {
-        *self == SessionId::parse_composite(other)
+        self.local_name() == Some(*other)
     }
 }
 
 #[cfg(test)]
 impl PartialEq<String> for SessionId {
     fn eq(&self, other: &String) -> bool {
-        *self == SessionId::parse_composite(other)
+        self.local_name() == Some(other.as_str())
     }
 }
 
