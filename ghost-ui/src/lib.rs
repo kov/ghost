@@ -1479,6 +1479,17 @@ enum Startup {
     Connect,
 }
 
+/// `groups` without their members: what `groups.toml` keeps.
+fn attributes_of(groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Group> {
+    groups
+        .iter()
+        .map(|g| ghost_ui_core::Group {
+            members: Vec::new(),
+            ..g.clone()
+        })
+        .collect()
+}
+
 /// The group `id` is a member of in `groups`, if any.
 fn group_of(
     groups: &[ghost_ui_core::Group],
@@ -3526,9 +3537,10 @@ pub struct App {
     /// fanned out to every window; sessions on older hosts simply stay covered
     /// by the fleet's slow floor tick.
     subs: HashMap<SessionId, Subscriber>,
-    /// The authoritative user-defined session groups: loaded from the data dir
-    /// at startup, updated (and persisted) on every `Cmd::SaveGroups`, and
+    /// The session groups and their members: updated on every `Cmd::SaveGroups`
+    /// and from the groups hosts report ([`Self::learn_host_groups`]), and
     /// broadcast to windows as `UiEvent::GroupsLoaded` so they stay in step.
+    /// `groups.toml` keeps only their attributes; the hosts keep membership.
     groups: Vec<ghost_ui_core::Group>,
     /// Set when a listing arrives (the local feed, a host's watcher) or anything
     /// else changes what one would say; drained on the loop to hint an immediate
@@ -3668,9 +3680,13 @@ impl App {
     /// session has no host to tell, and an unreachable one is not told.
     fn tell_host_group(&mut self, id: &SessionId, group: Option<ghost_ui_core::group::GroupId>) {
         match id.as_remote() {
-            None => {
-                let _ = ghost_vt::client::set_group(id.name(), group.as_deref());
-            }
+            None => match ghost_vt::client::set_group(id.name(), group.as_deref()) {
+                // An older host keeps no group, and writes its own descriptor.
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+                // No host to reach — a dead session: its descriptor keeps the group.
+                Err(_) => ghost_vt::descriptor::set_group(id.name(), group.as_deref()),
+            },
             Some((target, real)) => {
                 let Some(host) = self.connection(target) else {
                     return;
@@ -3689,6 +3705,11 @@ impl App {
         self.told_groups.insert(id.clone(), group);
     }
 
+    /// Persist the registry's groups' attributes (see [`groups`]).
+    fn keep_group_attrs(&self) {
+        groups::save(&attributes_of(&self.groups));
+    }
+
     /// Fold the groups a listing's hosts report into the registry. The host is the
     /// authority on a session's group, except while it has not yet reported back
     /// what this App told it: a listing can land before the host applied the
@@ -3699,20 +3720,48 @@ impl App {
     /// registry's group instead, once, which also migrates a membership only the
     /// registry knew.
     fn learn_host_groups(&mut self, listing: &[Listed], fe: &dyn Frontend) {
+        let reported = listing.iter().map(|l| (l.id.clone(), l.info.group.clone()));
+        self.learn_groups(reported.collect(), fe);
+    }
+
+    /// The groups the descriptors of this machine's dead sessions keep — a host
+    /// that is gone still says, through the file it leaves, which group its session
+    /// was in — folded in as [`Self::learn_host_groups`] folds a listing's. `live`
+    /// names the sessions whose hosts are running: their own word is the listing's.
+    fn learn_dead_groups(&mut self, live: &HashSet<&str>, fe: &dyn Frontend) {
+        let reported: Vec<(SessionId, Option<ghost_ui_core::group::GroupId>)> =
+            ghost_vt::descriptor::all_names()
+                .into_iter()
+                .filter(|n| !live.contains(n.as_str()))
+                .filter_map(|n| {
+                    let group = ghost_vt::descriptor::read(&n)?.group;
+                    Some((SessionId::local(n), group))
+                })
+                .collect();
+        self.learn_groups(reported, fe);
+    }
+
+    /// Fold what hosts (or a dead session's descriptor) report as each session's
+    /// group into the registry (see [`Self::learn_host_groups`]).
+    fn learn_groups(
+        &mut self,
+        reported: Vec<(SessionId, Option<ghost_ui_core::group::GroupId>)>,
+        fe: &dyn Frontend,
+    ) {
         let mut groups = self.groups.clone();
         let mut untold: Vec<(SessionId, ghost_ui_core::group::GroupId)> = Vec::new();
-        for l in listing {
-            if let Some(told) = self.told_groups.get(&l.id) {
-                if *told == l.info.group {
-                    self.told_groups.remove(&l.id);
+        for (id, hosted) in reported {
+            if let Some(told) = self.told_groups.get(&id) {
+                if *told == hosted {
+                    self.told_groups.remove(&id);
                 }
                 continue;
             }
-            let ours = group_of(&groups, &l.id);
-            match &l.info.group {
+            let ours = group_of(&groups, &id);
+            match &hosted {
                 Some(hosted) if ours.as_ref() != Some(hosted) => {
                     for g in &mut groups {
-                        g.members.retain(|m| *m != l.id);
+                        g.members.retain(|m| *m != id);
                     }
                     let at = match groups.iter().position(|g| g.id == *hosted) {
                         Some(at) => at,
@@ -3723,11 +3772,11 @@ impl App {
                             groups.len() - 1
                         }
                     };
-                    groups[at].members.push(l.id.clone());
+                    groups[at].members.push(id);
                 }
                 None => {
                     if let Some(ours) = ours {
-                        untold.push((l.id.clone(), ours));
+                        untold.push((id, ours));
                     }
                 }
                 Some(_) => {}
@@ -3737,8 +3786,8 @@ impl App {
             self.tell_host_group(&id, Some(group));
         }
         if groups != self.groups {
-            groups::save(&groups);
             self.groups = groups.clone();
+            self.keep_group_attrs();
             let wids: Vec<WindowId> = self.windows.keys().copied().collect();
             for wid in wids {
                 self.dispatch(wid, UiEvent::GroupsLoaded(groups.clone()), fe);
@@ -3939,6 +3988,7 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let live_names: HashSet<&str> = live.iter().map(|i| i.name.as_str()).collect();
+        self.learn_dead_groups(&live_names, event_loop);
         let is_live = |id: &SessionId| id.local_name().is_some_and(|n| live_names.contains(n));
         let mut dead: Vec<ghost_ui_core::DeadSession> = self.remembered_remotes();
         for name in self.groups.iter().flat_map(|g| &g.members) {
@@ -4501,9 +4551,9 @@ impl App {
                         // Persist the full membership, remote sessions included, so a
                         // group is remembered across a restart and its remote members
                         // rejoin it on reconnect (see restore).
-                        groups::save(&new_groups);
                         self.tell_hosts_their_groups(&new_groups);
                         self.groups = new_groups.clone();
+                        self.keep_group_attrs();
                         let others: Vec<WindowId> = self
                             .windows
                             .keys()
@@ -8089,8 +8139,8 @@ impl App {
         // `groups.toml` — and a remote one would send every later launch into a fleet
         // waiting for a session that ended here.
         if groups != self.groups {
-            groups::save(&groups);
             self.groups = groups.clone();
+            self.keep_group_attrs();
             let others: Vec<WindowId> = self.windows.keys().copied().collect();
             for other in others {
                 self.dispatch(other, UiEvent::GroupsLoaded(groups.clone()), fe);
@@ -10548,6 +10598,116 @@ mod tests {
         });
     }
 
+    /// A group keeps the name and color the user gave it across a restart. They live
+    /// in `groups.toml`; its members come from the hosts. Opening a window before
+    /// any listing makes it save the groups it can see — none of them has a member
+    /// yet — and the saved group must still come back under its own name once the
+    /// listing names its sessions.
+    #[test]
+    fn a_group_its_hosts_bring_back_keeps_its_saved_name() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let web = ghost_ui_core::Group {
+                id: "win-earlier-3".into(),
+                name: "web".into(),
+                color: 3,
+                members: Vec::new(),
+                connection: None,
+            };
+            crate::groups::save(std::slice::from_ref(&web));
+            let name = "grp-named";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let mut spun = 0;
+            while ghost_vt::client::set_group(name, Some(&web.id)).is_err() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let hosted = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.group)
+            };
+            let mut spun = 0;
+            while hosted().is_none() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            app.exec(w, vec![ghost_ui_core::Cmd::ListSessions], &fe);
+            let back = app.groups().iter().find(|g| g.id == web.id).cloned();
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            let back = back.expect("the session's group is in the registry");
+            assert!(
+                back.members.contains(&SessionId::local(name)),
+                "with the session in it: {back:?}"
+            );
+            assert_eq!(
+                back.name, "web",
+                "under the name the user gave it: {back:?}"
+            );
+        });
+    }
+
+    /// A session whose host is gone (a reboot) keeps its group in its descriptor, so
+    /// after a restart it is still a dead member of that group, ready to relaunch —
+    /// `groups.toml` no longer lists members.
+    #[test]
+    fn a_dead_session_rejoins_its_group_from_its_descriptor() {
+        with_isolated_xdg(|| {
+            let web = ghost_ui_core::Group {
+                id: "win-earlier-4".into(),
+                name: "web".into(),
+                color: 1,
+                members: Vec::new(),
+                connection: None,
+            };
+            crate::groups::save(std::slice::from_ref(&web));
+            let name = "grp-dead";
+            ghost_vt::descriptor::write(
+                name,
+                &ghost_vt::descriptor::Descriptor {
+                    command: vec!["sh".into()],
+                    group: Some(web.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            app.exec(w, vec![ghost_ui_core::Cmd::ListSessions], &fe);
+            let rejoined = app
+                .groups()
+                .iter()
+                .find(|g| g.id == web.id)
+                .is_some_and(|g| g.members.contains(&SessionId::local(name)));
+
+            assert!(
+                rejoined,
+                "the dead session is a member of its group: {:?}",
+                app.groups()
+            );
+        });
+    }
+
     /// The same for a remote session: its host, reached over the transport, keeps
     /// the group of the window that took it.
     #[test]
@@ -11710,14 +11870,15 @@ mod tests {
 
     #[test]
     fn a_remote_session_and_its_group_are_remembered_across_a_save() {
-        // Remote (transport) sessions used to be stripped from persistence, so a
-        // restart forgot them and — worse — the groups they belonged to. They are
-        // now first-class: adopting one records it in the window's group (→ persisted
-        // groups.toml) and as the window's foreground (→ persisted windows.toml).
+        // A remote (transport) session is first-class in persistence: adopting one
+        // records it as the window's foreground (→ windows.toml), which is what a
+        // restart restores it from, and its window's group (→ groups.toml) keeps its
+        // attributes. Its membership lives on its host, not in the file.
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
             let group = app.mint_group();
+            let gid = group.id.clone();
             let wid = app.open_fleet_window(&fe, group, None);
             let rem = SessionId::remote("kov@box", "work");
             app.dispatch(wid, ghost_ui_core::UiEvent::AdoptSession(rem.clone()), &fe);
@@ -11725,8 +11886,8 @@ mod tests {
 
             let groups = super::groups::load();
             assert!(
-                groups.iter().any(|g| g.members.contains(&rem)),
-                "the remote session is remembered as a group member: {groups:?}"
+                groups.iter().any(|g| g.id == gid),
+                "the window's group is remembered: {groups:?}"
             );
             let records = super::windows::load().windows;
             assert!(
