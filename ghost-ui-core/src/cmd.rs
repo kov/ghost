@@ -83,11 +83,6 @@ pub enum Cmd {
         session: SessionId,
         name: String,
     },
-    /// Spawn a new session (take-over / new window).
-    Spawn {
-        name: SessionId,
-        command: Vec<String>,
-    },
     /// Open a new window. The shell creates it in the fleet overview (it starts
     /// owning no session); the user spawns or takes one over from there.
     NewWindow,

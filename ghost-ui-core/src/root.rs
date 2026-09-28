@@ -5980,7 +5980,7 @@ mod tests {
         assert!(
             !cmds
                 .iter()
-                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::Spawn { .. } | Cmd::TakeOver(_))),
+                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::TakeOver(_))),
             "switching to a warm session needs no re-attach: {cmds:?}"
         );
         assert_eq!(
@@ -6593,7 +6593,7 @@ mod tests {
         assert!(
             !cmds
                 .iter()
-                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::TakeOver(_) | Cmd::Spawn { .. })),
+                .any(|c| matches!(c, Cmd::Attach(_) | Cmd::TakeOver(_))),
             "the next session is already attached; no re-attach: {cmds:?}"
         );
     }

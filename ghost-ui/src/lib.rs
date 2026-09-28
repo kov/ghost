@@ -4464,29 +4464,6 @@ impl App {
                         eprintln!("ghost: rename failed: {e}");
                     }
                 }
-                Cmd::Spawn { name, command } => {
-                    // Best-effort attach; a later reconcile re-attaches if it lost the
-                    // race. A freshly-spawned name is new, so the shared client map has
-                    // no entry — this window becomes its driver. A spawn that failed
-                    // has no host to attach to at all.
-                    if let Err(e) = event_loop.spawn_session(name.name(), command, None, None) {
-                        self.report_failure(
-                            wid,
-                            "Could not start a session",
-                            format!("{name}: {e}"),
-                        );
-                    } else if !self.sessions.contains_key(&name)
-                        && let Some(w) = self.windows.get(&wid)
-                    {
-                        // Handshake at the window's real grid (see `attach_into`).
-                        let (cols, rows) = w.root.grid();
-                        let identity = w.root.client_identity();
-                        if let Ok(s) = attach(name.name(), cols, rows, &identity) {
-                            self.drive_with_client(&name, s);
-                            self.clear_failure(wid);
-                        }
-                    }
-                }
                 Cmd::NewWindow => self.open_launch_window(event_loop),
                 Cmd::NewSshWindow => self.open_connect_window(event_loop),
                 Cmd::NewSshSession => self.open_connect_session(wid),
