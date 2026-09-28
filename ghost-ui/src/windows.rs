@@ -75,9 +75,35 @@ mod tests {
             cols,
             rows,
             fleet,
-            foreground: (!fleet).then(|| "alpha".to_string()),
+            foreground: (!fleet).then(|| "alpha".into()),
             attached: vec!["alpha".into()],
         }
+    }
+
+    /// A `windows.toml` written before session ids were typed loads into typed
+    /// ids and is written back byte for byte.
+    #[test]
+    fn a_workspace_with_a_remote_session_loads_typed_and_saves_unchanged() {
+        let text = "[sessions]\n\n\
+                    [[window]]\n\
+                    group_id = \"w1\"\n\
+                    cols = 80\n\
+                    rows = 24\n\
+                    fleet = false\n\
+                    foreground = \"kov@box\\u001Fwork\"\n\
+                    attached = [\n    \"alpha\",\n    \"kov@box\\u001Fwork\",\n]\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(file_in(dir.path()), text).unwrap();
+
+        let workspace = load_from(dir.path());
+        let remote = ghost_ui_core::SessionId::remote("kov@box", "work");
+        assert_eq!(workspace.windows[0].foreground, Some(remote.clone()));
+        assert_eq!(
+            workspace.windows[0].attached,
+            vec![ghost_ui_core::SessionId::local("alpha"), remote]
+        );
+        save_in(dir.path(), &workspace).unwrap();
+        assert_eq!(std::fs::read_to_string(file_in(dir.path())).unwrap(), text);
     }
 
     #[test]

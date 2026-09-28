@@ -62,8 +62,8 @@ use ghost_renderer::{
 };
 use ghost_ui_core::{
     CellMetrics, Cmd, Key, KeyEventKind, Listed, Mods, NamedKey, PointPx, PointerButton,
-    PointerPhase, RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WheelDelta,
-    WindowRecord,
+    PointerPhase, RootModel, Scene, SessionId, SessionPush, Sessions, TerminalModel, UiEvent,
+    WheelDelta, WindowRecord,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -398,11 +398,6 @@ fn attach_over_ssh(
     Ok(s)
 }
 
-/// The unit separator (and the `is_remote_id` predicate) are canonical in
-/// `ghost_ui_core` now — the fleet reasons about remote membership too — and
-/// re-exported here so this module's id helpers read unchanged.
-use ghost_ui_core::{REMOTE_ID_SEP, is_remote_id};
-
 /// Where a background worker posts its result for the main loop to apply.
 ///
 /// Everything ghost does off the event loop — watching a host's session set,
@@ -676,7 +671,7 @@ impl InputStall {
 }
 
 /// Probe a dropped remote session's host in the background until it is reachable
-/// again and the session `real` still exists, then post
+/// again and the session `id` still exists, then post
 /// [`UserEvent::RemoteReattachReady`] so the main loop re-attaches at the current
 /// grid. Retries forever with a capped backoff — a partition of minutes or days
 /// recovers when the host returns — reaping the wedged master each round (a silent
@@ -687,8 +682,7 @@ fn spawn_reconnect_probe(
     sink: Arc<dyn EventSink>,
     host: RemoteHost,
     wid: WindowId,
-    name: String,
-    real: String,
+    name: SessionId,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
@@ -701,7 +695,7 @@ fn spawn_reconnect_probe(
             host.remote.reap_wedged_master();
             match host.remote.list_sessions(&host.remote_ghost) {
                 // Host reachable and the session survived: re-attach and resync.
-                Ok(list) if list.iter().any(|i| i.name == real) => {
+                Ok(list) if list.iter().any(|i| i.name == name.name()) => {
                     let _ = sink.post(UserEvent::RemoteReattachReady { wid, name });
                     return;
                 }
@@ -973,7 +967,7 @@ fn capture(path: PathBuf) {
     .expect("spawn session");
 
     let mut session = attach_retry(&name, COLS, ROWS);
-    let mut model = TerminalModel::new(name.clone(), COLS, ROWS, metrics());
+    let mut model = TerminalModel::new(SessionId::local(name.as_str()), COLS, ROWS, metrics());
 
     // Optionally feed input first, to exercise the keystroke path (the child is
     // typically `cat`, which echoes it back through the PTY).
@@ -995,7 +989,7 @@ fn capture(path: PathBuf) {
                 Instant::now()
             };
             let cmds = model.update(UiEvent::SessionData {
-                name: name.clone(),
+                name: SessionId::local(name.as_str()),
                 bytes,
                 ended,
             });
@@ -1084,7 +1078,7 @@ fn esctest_host() {
     .expect("spawn esctest session");
 
     let mut session = attach_retry(&name, ECOLS, EROWS);
-    let mut model = TerminalModel::new(name.clone(), ECOLS, EROWS, metrics());
+    let mut model = TerminalModel::new(SessionId::local(name.as_str()), ECOLS, EROWS, metrics());
     // esctest is measuring the terminal, not the user's preferences: it drives the
     // window ops, the title stack, the palette and the rest, and a conformance
     // number that quietly fell because we decided some of it was unsafe for a
@@ -1112,7 +1106,7 @@ fn esctest_host() {
         let ended = end.is_end();
         if !bytes.is_empty() || ended {
             let cmds = model.update(UiEvent::SessionData {
-                name: name.clone(),
+                name: SessionId::local(name.as_str()),
                 bytes,
                 ended,
             });
@@ -1200,18 +1194,19 @@ enum CwdSource<'a> {
 ///   winning over a local foreground, or a cross-host take-over);
 /// - a local spawn while the foreground lives on a remote host.
 fn cwd_source<'a>(
-    foreground: Option<&'a str>,
+    foreground: Option<&'a SessionId>,
     connection: Option<&ConnectionSpec>,
     remote_target: Option<&'a str>,
 ) -> Option<CwdSource<'a>> {
     let fg = foreground?;
-    match (remote_target, remote_id_parts(fg)) {
+    match (remote_target, fg.target()) {
         // Branching off a remote session onto its own host.
-        (Some(target), Some((fg_target, session))) if target == fg_target => {
-            Some(CwdSource::Remote { target, session })
-        }
+        (Some(target), Some(fg_target)) if target == fg_target => Some(CwdSource::Remote {
+            target,
+            session: fg.name(),
+        }),
         // Both local, and staying local: the ordinary new-terminal case.
-        (None, None) if connection.is_none() => Some(CwdSource::Local(fg)),
+        (None, None) if connection.is_none() => Some(CwdSource::Local(fg.name())),
         _ => None,
     }
 }
@@ -1327,11 +1322,11 @@ fn choice_reason(
 /// (and every Alt-N) into the fleet to wait for their hosts. Named because it is
 /// the one input a user cannot see: `groups.toml` grows a member per window that
 /// ever ran, and one whose host is merely unreachable keeps voting forever.
-fn awaiting_remote(sessions: &[Listed], groups: &[ghost_ui_core::Group]) -> Vec<String> {
-    let mut out: Vec<String> = groups
+fn awaiting_remote(sessions: &[Listed], groups: &[ghost_ui_core::Group]) -> Vec<SessionId> {
+    let mut out: Vec<SessionId> = groups
         .iter()
         .flat_map(|g| &g.members)
-        .filter(|m| is_remote_id(m) && !sessions.iter().any(|s| &&s.id == m))
+        .filter(|m| m.is_remote() && !sessions.iter().any(|s| &s.id == m))
         .cloned()
         .collect();
     out.sort();
@@ -1356,7 +1351,7 @@ fn choice_summary(
     choice: &StartupChoice,
 ) -> String {
     // `␟` is invisible in a log; a composite id reads as `<host>:<session>`.
-    let show = |id: &str| id.replace(REMOTE_ID_SEP, ":");
+    let show = |id: &SessionId| id.to_string();
     let list = |v: Vec<String>| {
         if v.is_empty() {
             "none".to_string()
@@ -1380,14 +1375,9 @@ fn choice_summary(
             })
             .collect(),
     );
-    let awaiting = list(
-        awaiting_remote(sessions, groups)
-            .iter()
-            .map(|m| show(m))
-            .collect(),
-    );
+    let awaiting = list(awaiting_remote(sessions, groups).iter().map(show).collect());
     let decision = match choice {
-        StartupChoice::Attach(name) => format!("attach {}", show(name)),
+        StartupChoice::Attach(name) => format!("attach {name}"),
         StartupChoice::Spawn => "spawn".to_string(),
         StartupChoice::Fleet => "fleet".to_string(),
     };
@@ -1437,7 +1427,7 @@ fn should_restore(fresh: bool, requested: Option<&str>, workspace: &[WindowRecor
 
 /// One member a restored window should drive.
 struct PlanMember {
-    id: String,
+    id: SessionId,
     /// The session's host is not currently alive, so it must be relaunched
     /// (shell + seeded recording) before attaching.
     dead: bool,
@@ -1456,11 +1446,11 @@ struct WindowPlan {
     fleet: bool,
     /// The window's saved foreground session, if it was one of the driven set —
     /// so a remote reconnect knows whether to foreground it or keep it warm.
-    foreground: Option<String>,
+    foreground: Option<SessionId>,
     /// Local members to attach now (dead ones relaunched first).
     locals: Vec<PlanMember>,
-    /// Remote (transport) member ids (`<target>␟<real>`) to reconnect + re-adopt.
-    remotes: Vec<String>,
+    /// Remote member ids to reconnect + re-adopt.
+    remotes: Vec<SessionId>,
 }
 
 /// A remote member a startup restore is waiting to re-adopt into a window once
@@ -1468,8 +1458,8 @@ struct WindowPlan {
 /// [`App::finish_remote_reconnect`]).
 struct PendingRemote {
     wid: WindowId,
-    /// The composite id `<target>␟<real>`.
-    composite: String,
+    /// The session to re-adopt.
+    id: SessionId,
     /// The window was saved in the fleet overview → observe the tile in place
     /// (the fleet's own observe path); else drive it into the single view.
     fleet: bool,
@@ -1502,12 +1492,12 @@ fn restore_plan(
     sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
 ) -> Vec<WindowPlan> {
-    let alive = |id: &str| sessions.iter().any(|s| s.id == id);
+    let alive = |id: &SessionId| sessions.iter().any(|s| s.id == id);
     records
         .iter()
         .filter_map(|rec| {
             let group = groups.iter().find(|g| g.id == rec.group_id)?.clone();
-            let mut ids: Vec<String> = rec.attached.clone();
+            let mut ids: Vec<SessionId> = rec.attached.clone();
             // Foreground last, but only if it was actually one of the driven set.
             if let Some(fg) = &rec.foreground
                 && ids.iter().any(|a| a == fg)
@@ -1519,8 +1509,8 @@ fn restore_plan(
             // re-adopted asynchronously (never spawned locally); locals attach now,
             // dead ones relaunched. `partition` preserves the foreground-last order
             // within each list.
-            let (remotes, locals): (Vec<String>, Vec<String>) =
-                ids.into_iter().partition(|id| is_remote_id(id));
+            let (remotes, locals): (Vec<SessionId>, Vec<SessionId>) =
+                ids.into_iter().partition(|id| id.is_remote());
             let locals: Vec<PlanMember> = locals
                 .into_iter()
                 .map(|id| PlanMember {
@@ -1579,14 +1569,14 @@ fn respawn_opts(id: &str, d: &ghost_vt::descriptor::Descriptor, recording: PathB
 
 /// Relaunch a dead session `id`'s host from its descriptor (see [`respawn_opts`]).
 /// Best-effort: a failed spawn is logged and the caller simply skips it.
-fn spawn_dead(id: &str) -> bool {
+fn spawn_dead(id: &SessionId) -> bool {
     // A remote session belongs to its host; it can never be a local process. Guard
     // the one chokepoint every relaunch/restore path funnels through, so no bogus
-    // local shell is ever spawned under a composite id (see `is_remote_id`).
-    if is_remote_id(id) {
+    // local shell is ever spawned for a remote id.
+    let Some(id) = id.local_name() else {
         eprintln!("ghost: refusing to locally relaunch remote session '{id}'");
         return false;
-    }
+    };
     let d = ghost_vt::descriptor::read(id).unwrap_or_default();
     let recording = ghost_vt::paths::recording_path(id);
     match server::spawn(respawn_opts(id, &d, recording)) {
@@ -3424,18 +3414,18 @@ pub struct App {
     /// from any viewing window reaches the one client; the last viewer letting go
     /// drops it (the "close = detach" default). One of the three feed sources fanned
     /// into [`Self::states`]: the driven half.
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<SessionId, Session>,
     /// Read-only mirrors of sessions previewed but driven nowhere in this process
     /// (`Cmd::Observe` — a session attached elsewhere, or on a remote host), keyed by
     /// id. Deduped against [`Self::sessions`]: a session with a local client is never
     /// also observed (that would double-feed its one emulator). The observed feed
     /// source; last-viewer-gated on teardown like the clients.
-    observers: HashMap<String, Subscriber>,
+    observers: HashMap<SessionId, Subscriber>,
     /// Dead sessions whose recording has been played into the shared state already,
     /// so the periodic sweep doesn't re-feed the same last screen every tick.
     /// Process-wide: the recording replays once, fanned to every window's tile.
     /// A name is cleared when its session lives again (a fresh death re-feeds).
-    dead_fed: HashSet<String>,
+    dead_fed: HashSet<SessionId>,
     /// Lazily-opened system clipboard for copy/paste (shared).
     clipboard: Option<arboard::Clipboard>,
     /// Start of the monotonic clock injected into models via `Tick`.
@@ -3478,12 +3468,12 @@ pub struct App {
     /// to cancel (the window closed, or the session reattached). Presence also
     /// dedupes — a repeated drop won't start a second probe. See
     /// [`begin_reconnect`](App::begin_reconnect) / [`finish_reattach`](App::finish_reattach).
-    reconnecting: HashMap<(WindowId, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    reconnecting: HashMap<(WindowId, SessionId), std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Per-session watch on input that was accepted but not yet written (see
     /// [`InputStall`]). Kept here rather than on the `Session` so the verdict is
     /// the shell's — it is the shell that can name it and probe the transport.
     /// Pruned with the sessions themselves each wake.
-    input_stalls: HashMap<String, InputStall>,
+    input_stalls: HashMap<SessionId, InputStall>,
     /// When the event loop last ran, to spot a suspend: a wake-to-wake gap over
     /// [`SUSPEND_PROBE_GAP`] triggers a probe of the remote transports.
     last_wake_at: Instant,
@@ -3491,7 +3481,7 @@ pub struct App {
     /// (reconciled against every session list). Pushed snapshots/events are
     /// fanned out to every window; sessions on older hosts simply stay covered
     /// by the fleet's slow floor tick.
-    subs: HashMap<String, Subscriber>,
+    subs: HashMap<SessionId, Subscriber>,
     /// The authoritative user-defined session groups: loaded from the data dir
     /// at startup, updated (and persisted) on every `Cmd::SaveGroups`, and
     /// broadcast to windows as `UiEvent::GroupsLoaded` so they stay in step.
@@ -3568,12 +3558,14 @@ impl App {
     fn sync_subscriptions(&mut self, infos: &[ghost_vt::session::SessionInfo]) {
         let names: std::collections::HashSet<&str> =
             infos.iter().map(|i| i.name.as_str()).collect();
-        self.subs.retain(|name, _| names.contains(name.as_str()));
+        self.subs
+            .retain(|id, _| id.local_name().is_some_and(|n| names.contains(n)));
         for info in infos {
-            if !self.subs.contains_key(&info.name)
+            let id = SessionId::local(info.name.as_str());
+            if !self.subs.contains_key(&id)
                 && let Ok(sub) = Subscriber::connect(&info.name)
             {
-                self.subs.insert(info.name.clone(), sub);
+                self.subs.insert(id, sub);
             }
         }
     }
@@ -3591,7 +3583,7 @@ impl App {
     ///
     /// The host is told too: the one client now speaks for `wid`, so it names
     /// that window as the holder.
-    fn hand_over(&mut self, wid: WindowId, id: &str, event_loop: &dyn Frontend) {
+    fn hand_over(&mut self, wid: WindowId, id: &SessionId, event_loop: &dyn Frontend) {
         if let Some(identity) = self.windows.get(&wid).map(|w| w.root.client_identity())
             && let Some(client) = self.sessions.get_mut(id)
         {
@@ -3604,13 +3596,7 @@ impl App {
             .map(|(owid, _)| *owid)
             .collect();
         for owid in losers {
-            self.dispatch(
-                owid,
-                UiEvent::DriverLost {
-                    name: id.to_string(),
-                },
-                event_loop,
-            );
+            self.dispatch(owid, UiEvent::DriverLost { name: id.clone() }, event_loop);
         }
     }
 
@@ -3637,7 +3623,7 @@ impl App {
             self.hosts
                 .values()
                 .flat_map(|h| &h.pending_restores)
-                .map(|p| &p.composite),
+                .map(|p| &p.id),
         );
         for member in remembered {
             if let Some((target, _)) = remote_id_parts(member)
@@ -3698,13 +3684,13 @@ impl App {
             self.hosts
                 .values()
                 .flat_map(|h| &h.pending_restores)
-                .map(|p| &p.composite),
+                .map(|p| &p.id),
         );
         for member in remembered {
             let Some((target, real)) = remote_id_parts(member) else {
                 continue;
             };
-            if out.iter().any(|d| &d.name == member) {
+            if out.iter().any(|d| d.name == member) {
                 continue;
             }
             match self.hosts.get(target).and_then(|h| h.listing.as_ref()) {
@@ -3766,19 +3752,20 @@ impl App {
         event_loop: &dyn Frontend,
     ) {
         let live_names: HashSet<&str> = live.iter().map(|i| i.name.as_str()).collect();
+        let is_live = |id: &SessionId| id.local_name().is_some_and(|n| live_names.contains(n));
         let mut dead: Vec<ghost_ui_core::DeadSession> = self.remembered_remotes();
         for name in self.groups.iter().flat_map(|g| &g.members) {
-            if live_names.contains(name.as_str())
-                || is_remote_id(name)
-                || dead.iter().any(|d| &d.name == name)
-            {
+            let Some(local) = name.local_name() else {
+                continue; // remote members are judged against their host above
+            };
+            if live_names.contains(local) || dead.iter().any(|d| d.name == name) {
                 continue;
             }
             // The descriptor is the resurrection ticket: a member without one
             // was discarded (killed, or its child exited — possibly from
             // another process, whose registry save we never saw). Not naming
             // it here is what tells the fleet to drop its membership.
-            let Some(d) = ghost_vt::descriptor::read(name) else {
+            let Some(d) = ghost_vt::descriptor::read(local) else {
                 continue;
             };
             dead.push(ghost_ui_core::DeadSession {
@@ -3793,13 +3780,18 @@ impl App {
         // A session alive again may die again later: let it re-feed then. The mark is
         // process-wide now (the recording replays once into the one shared state,
         // fanned to every window's tile), so a live session clears it for all.
-        self.dead_fed.retain(|n| !live_names.contains(n.as_str()));
+        self.dead_fed.retain(|n| !is_live(n));
         for d in dead {
             let fresh = self.dead_fed.insert(d.name.clone());
             if !fresh {
                 continue;
             }
-            let Ok(rec) = ghost_vt::record::read(&ghost_vt::paths::recording_path(&d.name)) else {
+            // Recordings are local: a remote dead tile has none here.
+            let Some(rec) = d
+                .name
+                .local_name()
+                .and_then(|n| ghost_vt::record::read(&ghost_vt::paths::recording_path(n)).ok())
+            else {
                 continue; // never recorded: the tile stays a placeholder
             };
             let s = screen::Screen::from_recording(&rec, 0);
@@ -3830,9 +3822,14 @@ impl App {
             }
             self.feed_observed_to_viewers(&d.name, &s.resync(), false, event_loop);
         }
-        let grouped: HashSet<&String> = self.groups.iter().flat_map(|g| &g.members).collect();
+        let grouped: HashSet<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| &g.members)
+            .filter_map(|m| m.local_name())
+            .collect();
         for name in ghost_vt::descriptor::all_names() {
-            if !live_names.contains(name.as_str()) && !grouped.contains(&name) {
+            if !live_names.contains(name.as_str()) && !grouped.contains(name.as_str()) {
                 ghost_vt::descriptor::remove(&name);
             }
         }
@@ -3846,7 +3843,7 @@ impl App {
                     (Some(ext), Some(stem)) if ext == "ghostrec" => stem.to_string(),
                     _ => continue,
                 };
-                if !live_names.contains(name.as_str()) && !grouped.contains(&name) {
+                if !live_names.contains(name.as_str()) && !grouped.contains(name.as_str()) {
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -3857,7 +3854,7 @@ impl App {
     /// window's fleet keeps its own tiles). A subscription ending usually
     /// means the session died: drop it and hint a re-enumeration.
     fn pump_subscriptions(&mut self, event_loop: &dyn Frontend) {
-        let mut pushes: Vec<(String, SessionPush)> = Vec::new();
+        let mut pushes: Vec<(SessionId, SessionPush)> = Vec::new();
         let mut any_ended = false;
         self.subs.retain(|name, sub| {
             let p = sub.pump().unwrap_or_default();
@@ -4071,8 +4068,8 @@ impl App {
             && let Some(w) = self.windows.get(&wid)
         {
             let (mode, fg) = match w.root.single_foreground() {
-                Some(fg) => ("single", fg.as_str()),
-                None => ("fleet", "-"),
+                Some(fg) => ("single", fg.to_string()),
+                None => ("fleet", "-".to_string()),
             };
             ghost_ui_core::trace::log(
                 fg,
@@ -4268,7 +4265,9 @@ impl App {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
                         let identity = w.root.client_identity();
-                        if let Ok(s) = attach(&id, cols, rows, &identity) {
+                        if let Some(local) = id.local_name()
+                            && let Ok(s) = attach(local, cols, rows, &identity)
+                        {
                             // A fresh transport means a resync (whole screen AND
                             // scrollback) is inbound: rebuild the shared mirror first so
                             // the replay lands on an empty emulator instead of doubling
@@ -4286,7 +4285,7 @@ impl App {
                         self.hand_over(wid, &id, event_loop);
                     }
                 }
-                Cmd::Observe(id) if is_remote_id(&id) => {
+                Cmd::Observe(id) if id.is_remote() => {
                     // Live remote preview: observe the session over its host's
                     // transport, feeding the tile exactly like a local observer.
                     if self.bench.is_none()
@@ -4336,7 +4335,7 @@ impl App {
                         && !self.observers.contains_key(&id)
                         && !self.sessions.contains_key(&id)
                     {
-                        match Subscriber::observe(&id) {
+                        match Subscriber::observe(id.name()) {
                             Ok(sub) => {
                                 self.observers.insert(id, sub);
                             }
@@ -4402,7 +4401,7 @@ impl App {
                     // read-only mirror if another window only previews it.
                     self.reconcile_source(&id);
                 }
-                Cmd::Kill(id) if is_remote_id(&id) => {
+                Cmd::Kill(id) if id.is_remote() => {
                     // Kill the remote session over its host's transport (off-loop),
                     // then reconcile the shared source; the watcher drops the tile.
                     // Route by the id itself, like Rename below: a remote id is
@@ -4418,7 +4417,7 @@ impl App {
                 Cmd::Kill(id) => {
                     // Kill the session and its process, then reconcile the shared source
                     // (the client is dropped; a dead tile falls back to its recording).
-                    let _ = session::kill_session(&id);
+                    let _ = session::kill_session(id.name());
                     self.reconcile_source(&id);
                 }
                 Cmd::Recreate(id) => {
@@ -4471,7 +4470,7 @@ impl App {
                     // ghost" error). On refusal the fleet's optimistic label reverts.
                     if let Some((target, real)) = remote_id_parts(&session) {
                         self.spawn_remote_rename(target, real, &name);
-                    } else if let Err(e) = ghost_vt::client::rename(&session, &name) {
+                    } else if let Err(e) = ghost_vt::client::rename(session.name(), &name) {
                         eprintln!("ghost: rename failed: {e}");
                     }
                 }
@@ -4480,7 +4479,7 @@ impl App {
                     // race. A freshly-spawned name is new, so the shared client map has
                     // no entry — this window becomes its driver. A spawn that failed
                     // has no host to attach to at all.
-                    if let Err(e) = event_loop.spawn_session(&name, command, None, None) {
+                    if let Err(e) = event_loop.spawn_session(name.name(), command, None, None) {
                         self.report_failure(
                             wid,
                             "Could not start a session",
@@ -4492,7 +4491,7 @@ impl App {
                         // Handshake at the window's real grid (see `attach_into`).
                         let (cols, rows) = w.root.grid();
                         let identity = w.root.client_identity();
-                        if let Ok(s) = attach(&name, cols, rows, &identity) {
+                        if let Ok(s) = attach(name.name(), cols, rows, &identity) {
                             self.drive_with_client(&name, s);
                             self.clear_failure(wid);
                         }
@@ -4560,9 +4559,10 @@ impl App {
                                 cwd.map(PathBuf::from),
                             ) {
                                 Ok(()) => {
-                                    if self.attach_into(wid, &name, event_loop) {
+                                    let id = SessionId::local(name);
+                                    if self.attach_into(wid, &id, event_loop) {
                                         self.clear_failure(wid);
-                                        self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                                        self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                                     }
                                 }
                                 Err(e) => self.report_failure(wid, "Could not start a session", e),
@@ -4601,7 +4601,8 @@ impl App {
                     if let Some(gfx) = self.windows.get_mut(&wid).and_then(|w| w.gfx.as_mut()) {
                         // The same key the scene names this session's terminals by, so
                         // the image resolves against the session that transmitted it.
-                        let key = ghost_render::scene::session_key(&session);
+                        let key = ghost_render::scene::session_key(&session.to_composite());
+
                         gfx.renderer.upload_image(key, id, width, height, &rgba);
                     }
                 }
@@ -5016,7 +5017,7 @@ impl App {
     /// `descriptor.command` — a relaunch restores context, it does not re-run what
     /// died (which could be anything, and re-running it unbidden is the surprise
     /// we avoid). The child is deferred to the first attach (`start_on_attach`).
-    fn respawn_dead(&mut self, id: &str) -> bool {
+    fn respawn_dead(&mut self, id: &SessionId) -> bool {
         if !spawn_dead(id) {
             return false;
         }
@@ -5061,7 +5062,7 @@ impl App {
         &mut self,
         wid: WindowId,
         host: &RemoteHost,
-        composite: &str,
+        composite: &SessionId,
         real: &str,
         event_loop: &dyn Frontend,
     ) -> bool {
@@ -5105,10 +5106,10 @@ impl App {
     /// waited on whatever happened to clear the path (ssh's own keepalive, the
     /// user quitting). A probe here is cheap, deduped, and off-loop, and its worst
     /// case is a reconnect that resyncs the same screen.
-    fn note_input_queue(&mut self, name: &str, pending: usize, now: Instant) {
+    fn note_input_queue(&mut self, name: &SessionId, pending: usize, now: Instant) {
         let Some(event) = self
             .input_stalls
-            .entry(name.to_string())
+            .entry(name.clone())
             .or_default()
             .observe(pending, now)
         else {
@@ -5123,7 +5124,7 @@ impl App {
                         waited.as_secs_f32()
                     ),
                 );
-                if is_remote_id(name) {
+                if name.is_remote() {
                     self.probe_remote_transports();
                 }
             }
@@ -5171,22 +5172,20 @@ impl App {
     /// [`UserEvent::RemoteReattachReady`]. Idempotent — a session already holding
     /// (a repeated drop before the probe finishes) is left alone. The tile's visible
     /// hold is set by the `SessionDisconnected` the caller already dispatched.
-    fn begin_reconnect(&mut self, wid: WindowId, name: String) {
+    fn begin_reconnect(&mut self, wid: WindowId, name: SessionId) {
         if self.reconnecting.contains_key(&(wid, name.clone())) {
             return;
         }
-        let Some((target, real)) =
-            remote_id_parts(&name).map(|(t, r)| (t.to_string(), r.to_string()))
-        else {
+        let Some(target) = name.target() else {
             return;
         };
-        let host = self.connection(&target);
+        let host = self.connection(target);
         let (Some(host), Some(sink)) = (host, self.sink.clone()) else {
             return;
         };
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.reconnecting.insert((wid, name.clone()), stop.clone());
-        spawn_reconnect_probe(sink, host, wid, name, real, stop);
+        spawn_reconnect_probe(sink, host, wid, name, stop);
     }
 
     /// The probe says a reconnecting session's host is back and the session still
@@ -5195,27 +5194,20 @@ impl App {
     /// resync repaints the recovered screen. If the attach races and fails (the
     /// session vanished in the gap), keep holding and re-probe. Stale readys — the
     /// window closed, or we're no longer holding this — are dropped.
-    fn finish_reattach(&mut self, wid: WindowId, name: String, event_loop: &dyn Frontend) {
+    fn finish_reattach(&mut self, wid: WindowId, name: SessionId, event_loop: &dyn Frontend) {
         let Some(stop) = self.reconnecting.get(&(wid, name.clone())).cloned() else {
             return;
         };
         let dead_end = |app: &mut Self| {
             app.reconnecting.remove(&(wid, name.clone()));
         };
-        let Some((target, real)) =
-            remote_id_parts(&name).map(|(t, r)| (t.to_string(), r.to_string()))
-        else {
+        let Some(host) = name.target().and_then(|t| self.connection(t)) else {
             dead_end(self);
             return;
         };
-        let host = self.connection(&target);
-        let Some(host) = host else {
-            dead_end(self);
-            return;
-        };
-        let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
+        let cmd = host.remote.pipe_command(&host.remote_ghost, name.name());
         // A pre-existing session that dropped: honor its running host's level.
-        let proto = host.remote.session_proto(&host.remote_ghost, &real);
+        let proto = host.remote.session_proto(&host.remote_ghost, name.name());
         if self.attach_ssh_into(wid, &name, cmd, proto, event_loop) {
             ghost_ui_core::trace::log(
                 &name,
@@ -5225,14 +5217,14 @@ impl App {
             self.dispatch(wid, UiEvent::SessionReattached { name }, event_loop);
         } else if let Some(sink) = self.sink.clone() {
             // Raced: keep the hold, probe again from the floor.
-            spawn_reconnect_probe(sink, host, wid, name, real, stop);
+            spawn_reconnect_probe(sink, host, wid, name, stop);
         }
     }
 
     /// The probe reached the host but the session is gone (a reboot wiped it): end
     /// the reconnecting hold as a normal exit, so the window falls back to the fleet
     /// where the now-dead session can be relaunched. Waiting couldn't recover it.
-    fn end_reconnect_gone(&mut self, wid: WindowId, name: String, event_loop: &dyn Frontend) {
+    fn end_reconnect_gone(&mut self, wid: WindowId, name: SessionId, event_loop: &dyn Frontend) {
         if let Some(stop) = self.reconnecting.remove(&(wid, name.clone())) {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5273,7 +5265,7 @@ impl App {
         }
     }
 
-    fn attach_into(&mut self, wid: WindowId, name: &str, event_loop: &dyn Frontend) -> bool {
+    fn attach_into(&mut self, wid: WindowId, name: &SessionId, event_loop: &dyn Frontend) -> bool {
         // Already driven somewhere in this process → adopt in place: the caller's
         // AdoptSession takes drivership, and no second client / rebuild is opened.
         // Announcing is still the caller's business there, not ours: another window
@@ -5291,7 +5283,14 @@ impl App {
         // mid-screen (see `RootModel::grid`).
         let (cols, rows) = w.root.grid();
         let identity = w.root.client_identity();
-        match attach(name, cols, rows, &identity) {
+        let attached = match name.local_name() {
+            Some(local) => attach(local, cols, rows, &identity),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a remote session attaches over its host's transport",
+            )),
+        };
+        match attached {
             Ok(s) => {
                 // Fresh transport → a resync (screen + scrollback) is inbound: rebuild
                 // the shared mirror first so the replay lands clean (W1).
@@ -5301,9 +5300,7 @@ impl App {
                 // can report the session attached with no owner attached to the news.
                 self.dispatch(
                     wid,
-                    UiEvent::DriverGained {
-                        name: name.to_string(),
-                    },
+                    UiEvent::DriverGained { name: name.clone() },
                     event_loop,
                 );
                 true
@@ -5329,7 +5326,7 @@ impl App {
     fn attach_ssh_into(
         &mut self,
         wid: WindowId,
-        name: &str,
+        name: &SessionId,
         cmd: std::process::Command,
         proto: u32,
         event_loop: &dyn Frontend,
@@ -5342,7 +5339,7 @@ impl App {
         };
         let (cols, rows) = w.root.grid();
         let identity = w.root.client_identity();
-        match attach_over_ssh(cmd, name, cols, rows, &identity, proto) {
+        match attach_over_ssh(cmd, &name.to_composite(), cols, rows, &identity, proto) {
             Ok(s) => {
                 self.states.resize_observed(name, cols, rows);
                 self.drive_with_client(name, s);
@@ -5350,9 +5347,7 @@ impl App {
                 // `attach_into`) — the race this closes was a remote restore.
                 self.dispatch(
                     wid,
-                    UiEvent::DriverGained {
-                        name: name.to_string(),
-                    },
+                    UiEvent::DriverGained { name: name.clone() },
                     event_loop,
                 );
                 true
@@ -5648,9 +5643,10 @@ impl App {
         // "is fallback" flag.
         match event_loop.spawn_session(&name, vec![], Some(spec), None) {
             Ok(()) => {
-                if self.attach_into(wid, &name, event_loop) {
+                let id = SessionId::local(name);
+                if self.attach_into(wid, &id, event_loop) {
                     self.clear_failure(wid);
-                    self.dispatch(wid, UiEvent::AdoptSession(name), event_loop);
+                    self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                 }
             }
             Err(e) => self.report_failure(wid, "Could not start the SSH session", e),
@@ -5694,7 +5690,7 @@ impl App {
         };
         for PendingRemote {
             wid,
-            composite,
+            id,
             fleet: saved_fleet,
             foreground,
         } in pending
@@ -5702,10 +5698,7 @@ impl App {
             if !self.windows.contains_key(&wid) {
                 continue;
             }
-            let Some((_, real)) = remote_id_parts(&composite) else {
-                continue;
-            };
-            let real = real.to_string();
+            let real = id.name().to_string();
             // A window SAVED in the fleet overview comes back in it: its tile goes
             // live through the fleet's own observe path (`register_remote` above
             // started the watcher; `reconcile` will `Cmd::Observe` this foreign
@@ -5723,8 +5716,8 @@ impl App {
             let cmd = host.remote.pipe_command(&host.remote_ghost, &real);
             // A remembered session restored on its host: honor its running level.
             let proto = host.remote.session_proto(&host.remote_ghost, &real);
-            if !self.attach_ssh_into(wid, &composite, cmd, proto, event_loop)
-                && !self.relaunch_remote_and_attach(wid, &host, &composite, &real, event_loop)
+            if !self.attach_ssh_into(wid, &id, cmd, proto, event_loop)
+                && !self.relaunch_remote_and_attach(wid, &host, &id, &real, event_loop)
             {
                 // Host reachable but the session is gone AND could not be
                 // relaunched — leave the tile cold, as before.
@@ -5732,7 +5725,7 @@ impl App {
             }
             if foreground {
                 // The window's saved foreground: adopt it to the front.
-                self.dispatch(wid, UiEvent::AdoptSession(composite), event_loop);
+                self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
             } else {
                 // A background member (a lone remote in a window that also drives a
                 // local foreground, or another remote): adopt it into the window's
@@ -5744,7 +5737,7 @@ impl App {
                     .windows
                     .get(&wid)
                     .and_then(|w| w.root.foreground().cloned());
-                self.dispatch(wid, UiEvent::AdoptSession(composite), event_loop);
+                self.dispatch(wid, UiEvent::AdoptSession(id), event_loop);
                 if let Some(keep) = keep {
                     self.dispatch(wid, UiEvent::AdoptSession(keep), event_loop);
                 }
@@ -5774,9 +5767,7 @@ impl App {
         // Clone the foreground id out first so the `&self.windows` borrow ends
         // before `foreground_connection` takes its own `&self`.
         let fg_id = w.root.foreground().cloned();
-        let foreground = fg_id
-            .as_deref()
-            .and_then(|id| self.foreground_connection(id));
+        let foreground = fg_id.as_ref().and_then(|id| self.foreground_connection(id));
         inherited_connection(group.as_ref(), foreground.as_ref())
     }
 
@@ -5798,7 +5789,7 @@ impl App {
         connection: Option<&ConnectionSpec>,
         remote_target: Option<&str>,
     ) -> Option<String> {
-        let fg = self.windows.get(&wid)?.root.foreground()?.as_str();
+        let fg = self.windows.get(&wid)?.root.foreground()?;
         match cwd_source(Some(fg), connection, remote_target)? {
             CwdSource::Local(id) => {
                 let cwd = ghost_vt::descriptor::read(id)?.cwd?;
@@ -5825,11 +5816,13 @@ impl App {
     /// transport (`<target>␟<real>`) has no local descriptor, so its spec comes
     /// from the live remote host; a local session (including an `ssh` child) reads
     /// its stored descriptor.
-    fn foreground_connection(&self, id: &str) -> Option<ConnectionSpec> {
-        if let Some((target, _)) = remote_id_parts(id) {
-            return self.connection(target).map(|h| h.remote.spec().clone());
+    fn foreground_connection(&self, id: &SessionId) -> Option<ConnectionSpec> {
+        match id.local_name() {
+            Some(local) => ghost_vt::descriptor::read(local).and_then(|d| d.connection),
+            None => self
+                .connection(id.target()?)
+                .map(|h| h.remote.spec().clone()),
         }
-        ghost_vt::descriptor::read(id).and_then(|d| d.connection)
     }
 
     /// Retain a connected host so the fleet tracks its sessions, and start its
@@ -5954,14 +5947,14 @@ impl App {
     fn take_over_remote(
         &mut self,
         wid: WindowId,
-        id: &str,
+        id: &SessionId,
         target: &str,
         real: &str,
         event_loop: &dyn Frontend,
     ) {
         let held = self.sessions.contains_key(id);
         if held || self.attach_remote_into(wid, id, target, real, event_loop) {
-            self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
+            self.dispatch(wid, UiEvent::AdoptSession(id.clone()), event_loop);
             self.hand_over(wid, id, event_loop);
         }
     }
@@ -5971,7 +5964,7 @@ impl App {
     fn attach_remote_into(
         &mut self,
         wid: WindowId,
-        id: &str,
+        id: &SessionId,
         target: &str,
         real: &str,
         event_loop: &dyn Frontend,
@@ -6497,7 +6490,7 @@ impl App {
     ///   to an observer over its host's transport (`observe_remote`), not a local socket —
     ///   the fleet's own reconcile can't heal it (it optimistically believes it already
     ///   observes a session it deduped away), so this is the one seam that re-sources it.
-    fn reconcile_source(&mut self, id: &str) {
+    fn reconcile_source(&mut self, id: &SessionId) {
         let driven = self.windows.values().any(|w| w.root.drives(id));
         let viewed = self.windows.values().any(|w| w.root.views(id));
         if !viewed {
@@ -6513,17 +6506,14 @@ impl App {
         }
         let had_client = self.sessions.remove(id).is_some();
         if had_client || !self.observers.contains_key(id) {
-            let sub = if let Some((target, real)) = remote_id_owned(id) {
-                self.observe_remote(&target, &real)
-            } else if !is_remote_id(id) {
-                Subscriber::observe(id).ok()
-            } else {
-                // A remote id with no live index entry (its host dropped): nothing to
-                // observe over. Leave the last frame; a later reconnect re-sources it.
-                None
+            // A remote id whose host dropped finds nothing to observe over: it
+            // keeps its last frame, and a later reconnect re-sources it.
+            let sub = match id.target() {
+                Some(target) => self.observe_remote(target, id.name()),
+                None => Subscriber::observe(id.name()).ok(),
             };
             if let Some(sub) = sub {
-                self.observers.insert(id.to_string(), sub);
+                self.observers.insert(id.clone(), sub);
             }
         }
     }
@@ -6538,9 +6528,9 @@ impl App {
     /// remote reconnect, window construction) routes the insert through here so the
     /// dedup can never be forgotten at one site. The observer's `Subscriber` drops with
     /// it, closing its transport.
-    fn drive_with_client(&mut self, id: &str, s: Session) {
+    fn drive_with_client(&mut self, id: &SessionId, s: Session) {
         self.observers.remove(id);
-        self.sessions.insert(id.to_string(), s);
+        self.sessions.insert(id.clone(), s);
     }
 
     /// Drop shared states nothing references any more — a session that vanished (killed
@@ -6615,7 +6605,7 @@ impl App {
             event_loop.forget_toplevel(&w.root.window_record().group_id);
         }
         self.windows.remove(&wid);
-        let touched: Vec<String> = self
+        let touched: Vec<SessionId> = self
             .sessions
             .keys()
             .chain(self.observers.keys())
@@ -6816,7 +6806,7 @@ impl App {
     }
 
     /// Session ids this process holds a live client for (the driven set).
-    pub fn driven_ids(&self) -> Vec<String> {
+    pub fn driven_ids(&self) -> Vec<SessionId> {
         self.sessions.keys().cloned().collect()
     }
 }
@@ -6873,7 +6863,8 @@ impl App {
                 return None;
             }
         };
-        let mut model = TerminalModel::new(name.to_string(), cols, rows, metrics());
+        let id = SessionId::local(name);
+        let mut model = TerminalModel::new(id.clone(), cols, rows, metrics());
         // Seed the display name so a labeled session titles the window with its
         // label from the first frame (best-effort; a reconcile would fix it too).
         if let Some(info) = self.local_listing().into_iter().find(|s| s.name == name) {
@@ -6905,8 +6896,9 @@ impl App {
         // way this window DRIVES `name`, so drop any read-only observer of it first —
         // a client plus an observer is the finding-#7 double-feed (see
         // [`drive_with_client`](Self::drive_with_client), the upgrade this open mirrors).
-        self.observers.remove(name);
-        self.sessions.entry(name.to_string()).or_insert(session);
+        self.observers.remove(&id);
+        self.sessions.entry(id).or_insert(session);
+
         self.windows.insert(
             wid,
             WindowState {
@@ -7026,7 +7018,8 @@ impl App {
                 if first.dead {
                     spawn_dead(&first.id);
                 }
-                match self.open_single_window(event_loop, &first.id, group.clone(), size) {
+                let first_name = first.id.name().to_string();
+                match self.open_single_window(event_loop, &first_name, group.clone(), size) {
                     Some(wid) => {
                         for m in locals {
                             if m.dead {
@@ -7046,13 +7039,13 @@ impl App {
         // Queue remote members to attach once their host reconnects (kicked by
         // `reconnect_restored_remotes`, drained by `finish_remote_reconnect`).
         for id in remotes {
-            let Some((target, _)) = remote_id_parts(&id) else {
+            let Some(target) = id.target().map(str::to_string) else {
                 continue;
             };
-            let is_foreground = foreground.as_deref() == Some(id.as_str());
-            self.host_mut(target).pending_restores.push(PendingRemote {
+            let is_foreground = foreground.as_ref() == Some(&id);
+            self.host_mut(&target).pending_restores.push(PendingRemote {
                 wid,
-                composite: id,
+                id,
                 fleet,
                 foreground: is_foreground,
             });
@@ -7745,7 +7738,7 @@ impl App {
     /// its Single foreground (a take-over claimant foregrounds it), else any window
     /// that drives it, else none. Stable across wakes so a transient two-driver steal
     /// doesn't flip the child's query answers (HashMap order is nondeterministic).
-    fn pick_driver(&self, name: &str) -> Option<WindowId> {
+    fn pick_driver(&self, name: &SessionId) -> Option<WindowId> {
         let mut fallback = None;
         for (wid, w) in &self.windows {
             if w.root.drives(name) {
@@ -7759,7 +7752,7 @@ impl App {
     }
 
     /// Every window currently showing `name`, in any mode.
-    fn windows_viewing(&self, name: &str) -> Vec<WindowId> {
+    fn windows_viewing(&self, name: &SessionId) -> Vec<WindowId> {
         self.windows
             .iter()
             .filter(|(_, w)| w.root.views(name))
@@ -7773,7 +7766,13 @@ impl App {
     /// same outcome as observers. A client with no driving view (transitional) is fed
     /// as observed so any previewer still updates. Commands are buffered while the
     /// window borrows are live, then executed.
-    fn feed_driven_to_windows(&mut self, name: &str, bytes: &[u8], ended: bool, fe: &dyn Frontend) {
+    fn feed_driven_to_windows(
+        &mut self,
+        name: &SessionId,
+        bytes: &[u8],
+        ended: bool,
+        fe: &dyn Frontend,
+    ) {
         let driver_wid = self.pick_driver(name);
         let mut buffered: Vec<(WindowId, Vec<Cmd>)> = Vec::new();
         {
@@ -7828,7 +7827,7 @@ impl App {
     /// like [`feed_driven_to_windows`](Self::feed_driven_to_windows).
     fn feed_observed_to_viewers(
         &mut self,
-        name: &str,
+        name: &SessionId,
         bytes: &[u8],
         ended: bool,
         fe: &dyn Frontend,
@@ -7861,7 +7860,7 @@ impl App {
     /// ownership are released — then prune the shared source once the last viewer let
     /// go. The final frame already rendered in each view via the feed that carried
     /// `ended`; this is only the reaction the per-window dispatch used to run inline.
-    fn end_session_in_views(&mut self, name: &str, fe: &dyn Frontend) {
+    fn end_session_in_views(&mut self, name: &SessionId, fe: &dyn Frontend) {
         let viewers: Vec<WindowId> = self
             .windows
             .iter()
@@ -7882,13 +7881,7 @@ impl App {
             })
             .collect();
         for wid in viewers {
-            self.dispatch(
-                wid,
-                UiEvent::SessionEnded {
-                    name: name.to_string(),
-                },
-                fe,
-            );
+            self.dispatch(wid, UiEvent::SessionEnded { name: name.clone() }, fe);
         }
         self.reconcile_source(name);
         self.close_emptied_windows(&foregrounding, name, fe);
@@ -7905,7 +7898,12 @@ impl App {
     /// — intended, not incidental: exiting the shell in your only window with nothing
     /// detached anywhere leaves ghost nothing to be, exactly as closing that window by
     /// hand does.
-    fn close_emptied_windows(&mut self, candidates: &[WindowId], ended: &str, fe: &dyn Frontend) {
+    fn close_emptied_windows(
+        &mut self,
+        candidates: &[WindowId],
+        ended: &SessionId,
+        fe: &dyn Frontend,
+    ) {
         let emptied: Vec<WindowId> = candidates
             .iter()
             .copied()
@@ -8010,9 +8008,9 @@ impl App {
         // matter how many windows view it — and fan each one's output into the ONE
         // shared emulator and out to every window showing it (the driven half of the
         // "one model, many views" feed).
-        let driven: Vec<String> = self.sessions.keys().cloned().collect();
-        let mut dropped: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut ended_driven: Vec<String> = Vec::new();
+        let driven: Vec<SessionId> = self.sessions.keys().cloned().collect();
+        let mut dropped: Vec<(SessionId, Vec<u8>)> = Vec::new();
+        let mut ended_driven: Vec<SessionId> = Vec::new();
         for name in driven {
             // The pump is also where a `flush_pending` retries input the transport
             // refused, so the depth AFTER it is what is really stuck (see
@@ -8036,7 +8034,7 @@ impl App {
             // A REMOTE session whose transport dropped is held and reconnected, not
             // torn down — its session may still be alive on the far side. A local EOF
             // (the host process is gone) is a genuine end, as before.
-            if end == PumpEnd::Disconnected && is_remote_id(&name) {
+            if end == PumpEnd::Disconnected && name.is_remote() {
                 ghost_ui_core::trace::log(
                     &name,
                     format_args!("transport DISCONNECTED (holding for reconnect)"),
@@ -8096,7 +8094,8 @@ impl App {
         // shared state once and fans to every previewing tile; its `Resized` re-seeds
         // the shared state at the new grid (only the shell may, keyed to this genuine
         // observer stream) before the resync that follows heals the content.
-        let observed: Vec<String> = self.observers.keys().cloned().collect();
+        let observed: Vec<SessionId> = self.observers.keys().cloned().collect();
+
         debug_assert!(
             self.observers
                 .keys()
@@ -8284,17 +8283,17 @@ mod tests {
     use super::menu::{ConnectOutcome, UserEvent};
     use super::{
         App, CwdSource, Glass, HeadlessFrontend, INPUT_STALL_GRACE, INPUT_STALL_PROBE, InputStall,
-        LastExit, PendingRemote, REMOTE_ID_SEP, SessionReason, StallEvent, StartupChoice,
-        auth_error_message, choose_alpha_mode, choose_surface_format, config,
-        connect_outcome_wanted, cwd_source, glass, home_launch_dir, inherited_connection,
-        log_choice, password_prompt, remote_spawn_target, respawn_opts, restore_plan,
-        session_reason, should_restore, spawnable_cwd, startup_choice, surface_matches_window,
-        theme_colors,
+        LastExit, PendingRemote, SessionReason, StallEvent, StartupChoice, auth_error_message,
+        choose_alpha_mode, choose_surface_format, config, connect_outcome_wanted, cwd_source,
+        glass, home_launch_dir, inherited_connection, log_choice, password_prompt,
+        remote_spawn_target, respawn_opts, restore_plan, session_reason, should_restore,
+        spawnable_cwd, startup_choice, surface_matches_window, theme_colors,
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
-    use crate::hosts::{remote_id_parts, remote_listing};
+    use crate::hosts::remote_listing;
     use ghost_ui_core::Listed;
+    use ghost_ui_core::SessionId;
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
@@ -8522,9 +8521,9 @@ mod tests {
             unsafe { std::env::set_var("GHOST_FOCUS_TRACE", &path) };
             let mut app = App::headless();
             let t0 = Instant::now();
-            app.note_input_queue("s1", 34, t0);
-            app.note_input_queue("s1", 34, t0 + INPUT_STALL_PROBE);
-            app.note_input_queue("s1", 0, t0 + Duration::from_secs(24));
+            app.note_input_queue(&"s1".into(), 34, t0);
+            app.note_input_queue(&"s1".into(), 34, t0 + INPUT_STALL_PROBE);
+            app.note_input_queue(&"s1".into(), 0, t0 + Duration::from_secs(24));
             unsafe { std::env::remove_var("GHOST_FOCUS_TRACE") };
             std::fs::read_to_string(&path).unwrap_or_default()
         });
@@ -9137,7 +9136,7 @@ mod tests {
         // names, fetched over the transport) is what tells the two apart.
         with_isolated_xdg(|| {
             let mut app = App::headless();
-            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            let composite = SessionId::remote("kov@box", "work");
             app.groups = vec![ghost_ui_core::Group {
                 id: "w1".into(),
                 name: "blue".into(),
@@ -9152,8 +9151,8 @@ mod tests {
             // the fetch hasn't landed), stay conservative: relaunchable, as before.
             let dead = app.remembered_remotes();
             assert_eq!(
-                dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-                vec![composite.as_str()],
+                dead.iter().map(|d| &d.name).collect::<Vec<_>>(),
+                vec![&composite],
                 "with no remembered-set, a not-listed member stays relaunchable"
             );
             assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
@@ -9173,8 +9172,8 @@ mod tests {
                 Some(std::iter::once("work".to_string()).collect());
             let dead = app.remembered_remotes();
             assert_eq!(
-                dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-                vec![composite.as_str()],
+                dead.iter().map(|d| &d.name).collect::<Vec<_>>(),
+                vec![&composite],
                 "a member the host still remembers is relaunchable"
             );
             assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
@@ -9190,7 +9189,7 @@ mod tests {
         with_isolated_xdg(|| {
             let mut app = App::headless();
             let fe = HeadlessFrontend::new();
-            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            let composite = SessionId::remote("kov@box", "work");
             app.groups = vec![ghost_ui_core::Group {
                 id: "w1".into(),
                 name: "blue".into(),
@@ -9225,11 +9224,9 @@ mod tests {
             );
             let dead = app.remembered_remotes();
             assert_eq!(
-                dead.iter()
-                    .map(|d| (d.name.as_str(), &d.state))
-                    .collect::<Vec<_>>(),
+                dead.iter().map(|d| (&d.name, &d.state)).collect::<Vec<_>>(),
                 vec![(
-                    composite.as_str(),
+                    &composite,
                     &ghost_ui_core::DeadState::AwaitingHost("kov@box".to_string())
                 )],
                 "a member of an unreachable host waits for it"
@@ -9346,7 +9343,7 @@ mod tests {
                 id: "w1".into(),
                 name: "blue".into(),
                 color: 0,
-                members: vec![format!("kov@c{REMOTE_ID_SEP}work")],
+                members: vec![SessionId::remote("kov@c", "work")],
                 connection: None,
             }];
             assert!(
@@ -9481,7 +9478,7 @@ mod tests {
                 &fe,
             );
 
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let composite = SessionId::remote("kov@box", name);
             let adopted = app.sessions.contains_key(&composite);
 
             // The orphan kill is best-effort off-thread; poll until it's gone.
@@ -9557,7 +9554,7 @@ mod tests {
                 &fe,
             );
 
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let composite = SessionId::remote("kov@box", name);
             let held = app.sessions.contains_key(&composite);
 
             // Tear the real host down before asserting, so a failure never leaks it.
@@ -9631,7 +9628,7 @@ mod tests {
                 .open_single_window(&fe, name, group_a, None)
                 .expect("window A attaches the session");
             assert!(
-                app.sessions.contains_key(name),
+                app.sessions.contains_key(&name.into()),
                 "window A drives the session it attached"
             );
 
@@ -9652,7 +9649,7 @@ mod tests {
             // emulator lives in `app.states`; B's tile borrows it — no second stream.
             let b_sees_marker = |app: &App| {
                 app.states
-                    .text_of(name)
+                    .text_of(&name.into())
                     .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
             };
             let mut spun = 0;
@@ -9738,7 +9735,7 @@ mod tests {
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
-                    .text_of(name)
+                    .text_of(&name.into())
                     .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
             };
             let mut spun = 0;
@@ -9755,7 +9752,7 @@ mod tests {
             app.dispatch(
                 b,
                 ghost_ui_core::UiEvent::SessionPush {
-                    name: name.to_string(),
+                    name: name.into(),
                     push: ghost_ui_core::SessionPush::Event(
                         ghost_vt::protocol::SessionEvent::Resized { cols: 30, rows: 10 },
                     ),
@@ -9841,7 +9838,7 @@ mod tests {
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
-                    .text_of(name)
+                    .text_of(&name.into())
                     .is_some_and(|rows| rows.iter().any(|l| l.contains("SHARED-MARKER")))
             };
             let mut spun = 0;
@@ -9855,14 +9852,17 @@ mod tests {
                 "precondition: the shared state holds the marker"
             );
             assert_eq!(app.observers.len(), 0, "precondition: no second mirror");
-            assert!(app.sessions.contains_key(name), "precondition: A drives it");
+            assert!(
+                app.sessions.contains_key(&name.into()),
+                "precondition: A drives it"
+            );
 
             // A closes. B still previews X in its fleet.
             app.close_window(a, &fe);
 
             let survived = sees(&app);
-            let dropped_client = !app.sessions.contains_key(name);
-            let downgraded = app.observers.contains_key(name);
+            let dropped_client = !app.sessions.contains_key(&name.into());
+            let downgraded = app.observers.contains_key(&name.into());
 
             let _ = ghost_vt::session::kill_session(name);
 
@@ -9985,16 +9985,17 @@ mod tests {
             let b = app.open_fleet_window(&fe, gb, None);
             let list = ghost_vt::session::list().unwrap_or_default();
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
-            let observed_first = app.observers.contains_key(name);
-            let undriven_first = !app.sessions.contains_key(name);
+            let observed_first = app.observers.contains_key(&name.into());
+            let undriven_first = !app.sessions.contains_key(&name.into());
 
             // A now drives X (open_single_window attaches a client). The upgrade must
             // drop B's observer so the session has exactly one source: A's client,
             // fanned to B's tile from the shared state.
             let ga = app.mint_group();
             let a = app.open_single_window(&fe, name, ga, None);
-            let driven = app.sessions.contains_key(name);
-            let both = app.observers.contains_key(name) && app.sessions.contains_key(name);
+            let driven = app.sessions.contains_key(&name.into());
+            let both =
+                app.observers.contains_key(&name.into()) && app.sessions.contains_key(&name.into());
 
             let _ = ghost_vt::session::kill_session(name);
 
@@ -10060,7 +10061,7 @@ mod tests {
                 Ok(()),
                 &fe,
             );
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let composite = SessionId::remote("kov@box", name);
             assert!(
                 app.sessions.contains_key(&composite),
                 "precondition: A drives the remote session over the transport"
@@ -10161,7 +10162,7 @@ mod tests {
                 Ok(()),
                 &fe,
             );
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let composite = SessionId::remote("kov@box", name);
             let drove_first = app.windows[&a].root.drives(&composite);
 
             // The transport drops: the pump removes the client and holds the session.
@@ -10238,7 +10239,7 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let want = app.windows[&b].root.client_identity();
-            app.exec(b, vec![ghost_ui_core::Cmd::TakeOver(name.to_string())], &fe);
+            app.exec(b, vec![ghost_ui_core::Cmd::TakeOver(name.into())], &fe);
             let mut named = None;
             for _ in 0..100 {
                 named = holder().flatten();
@@ -10300,7 +10301,7 @@ mod tests {
                     infos: listing(),
                 },
             );
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let composite = SessionId::remote("kov@box", name);
 
             let ga = app.mint_group();
             let a = app.open_fleet_window(&fe, ga, None);
@@ -10397,7 +10398,7 @@ mod tests {
                     infos: listing(),
                 },
             );
-            let [first, second] = names.map(|n| format!("kov@box{REMOTE_ID_SEP}{n}"));
+            let [first, second] = names.map(|n| SessionId::remote("kov@box", n));
 
             let group = app.mint_group();
             let w = app.open_fleet_window(&fe, group, None);
@@ -10405,8 +10406,8 @@ mod tests {
             app.exec(
                 w,
                 vec![
-                    ghost_ui_core::Cmd::TakeOver(first),
-                    ghost_ui_core::Cmd::Attach(second),
+                    ghost_ui_core::Cmd::TakeOver(first.clone()),
+                    ghost_ui_core::Cmd::Attach(second.clone()),
                 ],
                 &fe,
             );
@@ -10499,7 +10500,7 @@ mod tests {
                 .expect("window A attaches");
             let a_has_marker = |app: &App| {
                 app.states
-                    .text_of(name)
+                    .text_of(&name.into())
                     .is_some_and(|rows| rows.iter().any(|l| l.contains("IDLE-MARKER")))
             };
             let mut spun = 0;
@@ -10521,7 +10522,7 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
 
-            let preview = app.windows[&b].root.tile_frame_text(name);
+            let preview = app.windows[&b].root.tile_frame_text(&name.into());
             let observers_len = app.observers.len();
 
             let _ = ghost_vt::session::kill_session(name);
@@ -10601,7 +10602,7 @@ mod tests {
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
-                    .text_of(name)
+                    .text_of(&name.into())
                     .is_some_and(|rows| rows.iter().any(|l| l.contains("HANDOFF-MARKER")))
             };
             let mut spun = 0;
@@ -10615,11 +10616,11 @@ mod tests {
                 "precondition: the shared state holds the marker"
             );
             assert!(
-                app.windows[&a].root.drives(name),
+                app.windows[&a].root.drives(&name.into()),
                 "precondition: A drives X"
             );
             assert!(
-                !app.windows[&b].root.drives(name),
+                !app.windows[&b].root.drives(&name.into()),
                 "precondition: B only previews X"
             );
 
@@ -10646,9 +10647,9 @@ mod tests {
             app.dispatch(b, key(Key::Named(NamedKey::Enter)), &fe);
             app.dispatch(b, key(Key::Named(NamedKey::Space)), &fe);
 
-            let a_drives = app.windows[&a].root.drives(name);
-            let b_drives = app.windows[&b].root.drives(name);
-            let a_still_views = app.windows[&a].root.views(name);
+            let a_drives = app.windows[&a].root.drives(&name.into());
+            let b_drives = app.windows[&b].root.drives(&name.into());
+            let a_still_views = app.windows[&a].root.views(&name.into());
             let survived = sees(&app);
 
             let _ = ghost_vt::session::kill_session(name);
@@ -10670,7 +10671,7 @@ mod tests {
     fn a_remote_id_always_routes_control_actions_over_the_transport() {
         // A plain id renames/kills over its local control socket.
         assert!(
-            super::remote_id_parts("plain-session").is_none(),
+            super::remote_id_parts(&"plain-session".into()).is_none(),
             "a local id has no host parts"
         );
         // A namespaced remote id is self-describing: its host + real name come from
@@ -10680,7 +10681,7 @@ mod tests {
         // COLD remote tile (its host dropped, so it is neither driven nor listed —
         // exactly the ids the index does not hold), whose manual kill is the one
         // cleanup for a lingering dead remote member.
-        let composite = format!("kov@box{REMOTE_ID_SEP}work");
+        let composite = SessionId::remote("kov@box", "work");
         assert_eq!(
             super::remote_id_parts(&composite),
             Some(("kov@box", "work")),
@@ -10716,11 +10717,11 @@ mod tests {
     #[test]
     fn a_directory_is_inherited_only_from_a_sibling_on_the_same_machine() {
         let spec = ConnectionSpec::parse_target("kov@box").expect("valid target");
-        let remote_fg = format!("kov@box{REMOTE_ID_SEP}work");
+        let remote_fg = SessionId::remote("kov@box", "work");
 
         // Local to local — the ordinary new-terminal case.
         assert_eq!(
-            cwd_source(Some("alpha"), None, None),
+            cwd_source(Some(&"alpha".into()), None, None),
             Some(CwdSource::Local("alpha"))
         );
 
@@ -10737,13 +10738,13 @@ mod tests {
         // An inherited connection with no transport: the new session is a local
         // `ssh <host>` child, so the foreground's local directory says nothing
         // about where that remote shell should start.
-        assert_eq!(cwd_source(Some("ssh-box"), Some(&spec), None), None);
+        assert_eq!(cwd_source(Some(&"ssh-box".into()), Some(&spec), None), None);
 
         // A spawn routed onto a host the foreground is not on (a group connection
         // winning, or a cross-host take-over), and its mirror image — a local
         // spawn while the foreground lives elsewhere.
         assert_eq!(
-            cwd_source(Some("alpha"), Some(&spec), Some("kov@box")),
+            cwd_source(Some(&"alpha".into()), Some(&spec), Some("kov@box")),
             None
         );
         assert_eq!(
@@ -10785,11 +10786,12 @@ mod tests {
         infos.into_iter().map(Listed::local).collect()
     }
 
-    /// One listed session under `id`, a local name or a remote composite.
-    fn listed(id: &str, attached: bool) -> Listed {
-        match remote_id_parts(id) {
-            Some((target, real)) => remote_listing(target, &[info(real, attached)]).remove(0),
-            None => Listed::local(info(id, attached)),
+    /// One listed session under `id`, as its host would list it.
+    fn listed(id: impl Into<SessionId>, attached: bool) -> Listed {
+        let id = id.into();
+        match id.target() {
+            Some(target) => remote_listing(target, &[info(id.name(), attached)]).remove(0),
+            None => Listed::local(info(id.name(), attached)),
         }
     }
 
@@ -10870,51 +10872,58 @@ mod tests {
         // The id is prefixed with the target (so it can't collide with a local
         // session or another host), the host's own name is kept, and the
         // connection is set to this host.
-        assert_eq!(out[0].id, format!("kov@box{REMOTE_ID_SEP}work"));
+        assert_eq!(out[0].id, SessionId::remote("kov@box", "work"));
         assert_eq!(out[0].info.name, "work");
         assert_eq!(out[0].info.connection.as_ref().unwrap().target(), "kov@box");
         // A session with no display name shows its real id; a renamed one keeps
         // its label — never the namespaced id.
         assert_eq!(out[0].info.display_name, "work");
-        assert_eq!(out[1].id, format!("kov@box{REMOTE_ID_SEP}raw-id"));
+        assert_eq!(out[1].id, SessionId::remote("kov@box", "raw-id"));
         assert_eq!(out[1].info.display_name, "editor");
     }
 
-    fn group(id: &str, members: &[&str]) -> ghost_ui_core::Group {
+    fn group<M: Clone + Into<SessionId>>(id: &str, members: &[M]) -> ghost_ui_core::Group {
         ghost_ui_core::Group {
             id: id.to_string(),
             name: "blue".to_string(),
             color: 0,
-            members: members.iter().map(|m| m.to_string()).collect(),
+            members: members.iter().cloned().map(Into::into).collect(),
             connection: None,
         }
     }
 
-    fn record(
+    fn record<A: Clone + Into<SessionId>>(
         group_id: &str,
         cols: u16,
         rows: u16,
         fleet: bool,
-        fg: Option<&str>,
-        att: &[&str],
+        fg: Option<SessionId>,
+        att: &[A],
     ) -> WindowRecord {
         WindowRecord {
             group_id: group_id.into(),
             cols,
             rows,
             fleet,
-            foreground: fg.map(str::to_string),
-            attached: att.iter().map(|s| s.to_string()).collect(),
+            foreground: fg,
+            attached: att.iter().cloned().map(Into::into).collect(),
         }
     }
 
     #[test]
     fn restore_plan_reclaims_groups_orders_foreground_last_and_flags_dead() {
         let records = [
-            record("win-1", 120, 40, false, Some("beta"), &["alpha", "beta"]),
+            record(
+                "win-1",
+                120,
+                40,
+                false,
+                Some("beta".into()),
+                &["alpha", "beta"],
+            ),
             // Group pruned from the registry → this window can't be restored.
-            record("win-9", 80, 24, false, Some("ghost"), &["ghost"]),
-            record("win-2", 90, 30, true, Some("gamma"), &["gamma"]),
+            record("win-9", 80, 24, false, Some("ghost".into()), &["ghost"]),
+            record("win-2", 90, 30, true, Some("gamma".into()), &["gamma"]),
         ];
         let sessions = [listed("alpha", false), listed("beta", false)]; // gamma is dead
         let groups = [
@@ -10929,7 +10938,7 @@ mod tests {
         assert_eq!(w1.group.id, "win-1");
         assert_eq!((w1.cols, w1.rows), (120, 40));
         assert!(!w1.fleet);
-        let ids: Vec<&str> = w1.locals.iter().map(|m| m.id.as_str()).collect();
+        let ids: Vec<&str> = w1.locals.iter().map(|m| m.id.name()).collect();
         assert_eq!(ids, vec!["alpha", "beta"], "foreground (beta) ordered last");
         assert!(w1.locals.iter().all(|m| !m.dead), "both sessions are alive");
 
@@ -10947,8 +10956,8 @@ mod tests {
         // grid is clamped to a range a window can actually be — a restored one
         // took a path around that clamp and was used verbatim.
         let records = [
-            record("win-1", 125, 0, false, Some("alpha"), &["alpha"]),
-            record("win-2", 60000, 40, false, Some("beta"), &["beta"]),
+            record("win-1", 125, 0, false, Some("alpha".into()), &["alpha"]),
+            record("win-2", 60000, 40, false, Some("beta".into()), &["beta"]),
         ];
         let sessions = [listed("alpha", false), listed("beta", false)];
         let groups = [group("win-1", &["alpha"]), group("win-2", &["beta"])];
@@ -10963,8 +10972,8 @@ mod tests {
         );
     }
 
-    fn remote(sess: &str) -> String {
-        format!("kov@box{REMOTE_ID_SEP}{sess}")
+    fn remote(sess: &str) -> SessionId {
+        SessionId::remote("kov@box", sess)
     }
 
     #[test]
@@ -10976,11 +10985,21 @@ mod tests {
         let rem = remote("work");
         let rem2 = remote("build");
         let records = [
-            record("win-1", 80, 24, false, Some(&rem), &["alpha", &rem]),
+            record(
+                "win-1",
+                80,
+                24,
+                false,
+                Some(rem.clone()),
+                &["alpha".into(), rem.clone()],
+            ),
             record("win-2", 80, 24, true, None, &[&rem2]),
         ];
         let sessions = [listed("alpha", false)];
-        let groups = [group("win-1", &["alpha", &rem]), group("win-2", &[&rem2])];
+        let groups = [
+            group("win-1", &["alpha".into(), rem.clone()]),
+            group("win-2", &[&rem2]),
+        ];
 
         let plans = restore_plan(&records, &sessions, &groups);
         assert_eq!(
@@ -10990,7 +11009,7 @@ mod tests {
         );
 
         let w1 = &plans[0];
-        let locals: Vec<&str> = w1.locals.iter().map(|m| m.id.as_str()).collect();
+        let locals: Vec<&str> = w1.locals.iter().map(|m| m.id.name()).collect();
         assert_eq!(
             locals,
             vec!["alpha"],
@@ -11174,7 +11193,7 @@ mod tests {
 
             // An empty fleet window with nothing to return to is exactly what the
             // sweep exists to close.
-            app.close_emptied_windows(&[wid], "never-was", &fe);
+            app.close_emptied_windows(&[wid], &"never-was".into(), &fe);
             assert!(
                 !app.windows.contains_key(&wid),
                 "an empty window with nothing to return to closes"
@@ -11182,7 +11201,7 @@ mod tests {
 
             let wid = app.open_fleet_window(&fe, group, None);
             app.report_failure(wid, "Could not start a session", "no such shell");
-            app.close_emptied_windows(&[wid], "never-was", &fe);
+            app.close_emptied_windows(&[wid], &"never-was".into(), &fe);
             assert!(
                 app.windows.contains_key(&wid),
                 "but one still saying why nothing started stays up"
@@ -11208,11 +11227,11 @@ mod tests {
             let fe = HeadlessFrontend::new();
             // One restorable window (remote-only, so it opens as a fleet without
             // spawning anything) and one whose group is gone.
-            let rem = format!("kov@box{REMOTE_ID_SEP}work");
+            let rem = SessionId::remote("kov@box", "work");
             app.groups = vec![group("win-live", &[&rem])];
             let records = vec![
                 record("win-live", 80, 24, true, None, &[&rem]),
-                record("win-gone", 80, 24, true, Some("ghost"), &["ghost"]),
+                record("win-gone", 80, 24, true, Some("ghost".into()), &["ghost"]),
             ];
             app.restore_workspace(&fe, records);
             assert_eq!(
@@ -11239,7 +11258,7 @@ mod tests {
             let fe = HeadlessFrontend::new();
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let rem = format!("kov@box{REMOTE_ID_SEP}work");
+            let rem = SessionId::remote("kov@box", "work");
             app.dispatch(wid, ghost_ui_core::UiEvent::AdoptSession(rem.clone()), &fe);
             app.save_workspace();
 
@@ -11252,8 +11271,7 @@ mod tests {
             assert!(
                 records
                     .iter()
-                    .any(|r| r.foreground.as_deref() == Some(rem.as_str())
-                        || r.attached.contains(&rem)),
+                    .any(|r| r.foreground.as_ref() == Some(&rem) || r.attached.contains(&rem)),
                 "the remote session is remembered in its window: {records:?}"
             );
         });
@@ -11283,7 +11301,7 @@ mod tests {
                 .expect("its host is queued for reconnect")
                 .pending_restores;
             assert!(
-                pending.iter().any(|p| p.composite == rem),
+                pending.iter().any(|p| p.id == rem),
                 "the remote member is queued, not spawned locally"
             );
         });
@@ -11339,13 +11357,13 @@ mod tests {
             app.host_mut("kov@box").pending_restores = vec![
                 PendingRemote {
                     wid,
-                    composite: one.clone(),
+                    id: one.clone(),
                     fleet: true,
                     foreground: false,
                 },
                 PendingRemote {
                     wid,
-                    composite: two.clone(),
+                    id: two.clone(),
                     fleet: true,
                     foreground: false,
                 },
@@ -11414,10 +11432,10 @@ mod tests {
             // remote queued carrying its SAVED single mode (false = drive, not observe).
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
+            let composite = SessionId::remote("kov@box", real);
             app.host_mut("kov@box").pending_restores = vec![PendingRemote {
                 wid,
-                composite: composite.clone(),
+                id: composite.clone(),
                 fleet: false,
                 foreground: true,
             }];
@@ -11488,7 +11506,7 @@ mod tests {
 
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
+            let composite = SessionId::remote("kov@box", real);
             // The host's first listing is already in: the window has a cold tile for
             // the session, which is what makes the adopt below park instead of
             // diving straight through.
@@ -11502,7 +11520,7 @@ mod tests {
             );
             app.host_mut("kov@box").pending_restores = vec![PendingRemote {
                 wid,
-                composite: composite.clone(),
+                id: composite.clone(),
                 fleet: false,
                 foreground: true,
             }];
@@ -11536,8 +11554,8 @@ mod tests {
             }
 
             assert_eq!(
-                foreground.as_deref(),
-                Some(composite.as_str()),
+                foreground.as_ref(),
+                Some(&composite),
                 "the restored remote session lands in the window's foreground"
             );
         });
@@ -11580,19 +11598,19 @@ mod tests {
 
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
-            let fg = format!("kov@box{REMOTE_ID_SEP}fg-1");
-            let bg = format!("kov@box{REMOTE_ID_SEP}bg-1");
+            let fg = SessionId::remote("kov@box", "fg-1");
+            let bg = SessionId::remote("kov@box", "bg-1");
             // Saved single (drive): fg is the foreground, bg a background member.
             app.host_mut("kov@box").pending_restores = vec![
                 PendingRemote {
                     wid,
-                    composite: fg.clone(),
+                    id: fg.clone(),
                     fleet: false,
                     foreground: true,
                 },
                 PendingRemote {
                     wid,
-                    composite: bg.clone(),
+                    id: bg.clone(),
                     fleet: false,
                     foreground: false,
                 },
@@ -11618,8 +11636,8 @@ mod tests {
                 "both remote sessions are attached over the transport"
             );
             assert_eq!(
-                foreground.as_deref(),
-                Some(fg.as_str()),
+                foreground.as_ref(),
+                Some(&fg),
                 "the saved foreground stays in front; the background reconnect must not steal it"
             );
         });
@@ -11627,7 +11645,14 @@ mod tests {
 
     #[test]
     fn should_restore_only_on_a_bare_launch_with_a_saved_workspace() {
-        let saved = [record("win-1", 80, 24, false, Some("alpha"), &["alpha"])];
+        let saved = [record(
+            "win-1",
+            80,
+            24,
+            false,
+            Some("alpha".into()),
+            &["alpha"],
+        )];
 
         // The one case that restores: bare launch, not fresh, workspace present.
         assert!(should_restore(false, None, &saved));
@@ -11686,7 +11711,7 @@ mod tests {
             let mut app = App::headless();
             let spec = ConnectionSpec::parse_target("kov@box").unwrap();
             app.register_remote(&spec, "ghost");
-            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            let composite = SessionId::remote("kov@box", "work");
             assert_eq!(
                 app.foreground_connection(&composite),
                 Some(spec),
@@ -11694,11 +11719,11 @@ mod tests {
             );
             // A remote id for a host we hold no transport to → nothing to inherit.
             assert_eq!(
-                app.foreground_connection(&format!("gone@host{REMOTE_ID_SEP}x")),
+                app.foreground_connection(&SessionId::remote("gone@host", "x")),
                 None
             );
             // A plain local id with no descriptor → nothing (the pre-existing path).
-            assert_eq!(app.foreground_connection("local-only"), None);
+            assert_eq!(app.foreground_connection(&"local-only".into()), None);
         });
     }
 
@@ -11850,14 +11875,14 @@ mod tests {
         // A remote member nothing lists is waiting on its host, not dead: it comes
         // back with its state when the host returns, so the fleet — where the tile
         // holds and reconnects — is the right place to land.
-        let away = [group("g1", &[&format!("kov@box{REMOTE_ID_SEP}work")])];
+        let away = [group("g1", &[&SessionId::remote("kov@box", "work")])];
         assert!(matches!(
             startup_choice(None, &[], &away),
             StartupChoice::Fleet
         ));
         // ...but not once that host is connected and the session is listed and held:
         // then it is an ordinary attached-elsewhere session.
-        let listed = [listed(&format!("kov@box{REMOTE_ID_SEP}work"), true)];
+        let listed = [listed(SessionId::remote("kov@box", "work"), true)];
         assert!(matches!(
             startup_choice(None, &listed, &away),
             StartupChoice::Spawn
@@ -11910,7 +11935,7 @@ mod tests {
         // The line has to carry every input the decision reads, because the bad
         // outcome (a window on a fleet with nothing to attach to) is intermittent:
         // whoever reads the log afterwards cannot re-observe the state.
-        let away = format!("kov@box{REMOTE_ID_SEP}work");
+        let away = SessionId::remote("kov@box", "work");
         let sessions = [listed("a", true)];
         let groups = [group("g1", &[&away])];
         let line = choice_summary(
@@ -11961,9 +11986,12 @@ mod tests {
     #[test]
     fn awaiting_remote_counts_only_unlisted_remote_members() {
         use super::awaiting_remote;
-        let away = format!("kov@box{REMOTE_ID_SEP}work");
-        let here = format!("kov@near{REMOTE_ID_SEP}live");
-        let groups = [group("g1", &[&away, &here, "dead-local"])];
+        let away = SessionId::remote("kov@box", "work");
+        let here = SessionId::remote("kov@near", "live");
+        let groups = [group(
+            "g1",
+            &[away.clone(), here.clone(), "dead-local".into()],
+        )];
         // A listed remote is reachable; a dead LOCAL member never counts (that is
         // the regression `new_window_mirrors_a_plain_launch` guards).
         let sessions = [listed(&here, true)];

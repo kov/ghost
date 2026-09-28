@@ -76,22 +76,22 @@ impl Sessions {
     /// one-owner world without reaching for the crate-private `into_parts`.
     pub fn adopt(&mut self, model: TerminalModel) -> TerminalView {
         let (state, view) = model.into_parts();
-        self.insert(state.session().to_string(), state);
+        self.insert(state.session().clone(), state);
         view
     }
 
-    pub(crate) fn get(&self, id: &str) -> Option<&SessionState> {
+    pub(crate) fn get(&self, id: &SessionId) -> Option<&SessionState> {
         self.map.get(id)
     }
 
     /// The rendered rows of session `id`'s screen, if held — the visible viewport as
     /// lines of text. For the shell to read what a session currently shows (tests,
     /// diagnostics) without reaching through a view.
-    pub fn text_of(&self, id: &str) -> Option<Vec<String>> {
+    pub fn text_of(&self, id: &SessionId) -> Option<Vec<String>> {
         self.map.get(id).map(|s| s.screen().vt().text())
     }
 
-    pub(crate) fn get_mut(&mut self, id: &str) -> Option<&mut SessionState> {
+    pub(crate) fn get_mut(&mut self, id: &SessionId) -> Option<&mut SessionState> {
         self.map.get_mut(id)
     }
 
@@ -115,18 +115,18 @@ impl Sessions {
     /// window closing, a fleet diving out, a background mirror ending — can never
     /// delete a state another window still renders. The core has no `remove` of its
     /// own; every path that used to reap here reaped a foregrounded session.
-    pub fn discard(&mut self, id: &str) {
+    pub fn discard(&mut self, id: &SessionId) {
         self.map.remove(id);
     }
 
     /// Whether this window holds a state for `id`.
-    pub fn contains(&self, id: &str) -> bool {
+    pub fn contains(&self, id: &SessionId) -> bool {
         self.map.contains_key(id)
     }
 
     /// The ids of every held state — the shell's iteration order for its last-viewer
     /// prune of orphaned states (a session that vanished with no view and no source).
-    pub fn ids(&self) -> Vec<String> {
+    pub fn ids(&self) -> Vec<SessionId> {
         self.map.keys().cloned().collect()
     }
 
@@ -134,13 +134,18 @@ impl Sessions {
     /// policy) if this window doesn't hold it yet. A dead entry of the same name is
     /// replaced by a fresh one first — a reused session name must never resurrect
     /// the ended session's stale screen.
-    pub(crate) fn get_or_mint(&mut self, id: &str, cols: u16, rows: u16) -> &mut SessionState {
+    pub(crate) fn get_or_mint(
+        &mut self,
+        id: &SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> &mut SessionState {
         if self.map.get(id).is_some_and(SessionState::ended) {
             self.map.remove(id);
         }
         let (theme, policy) = (self.theme, self.policy);
-        self.map.entry(id.to_string()).or_insert_with(|| {
-            let mut state = SessionState::new(id.to_string(), cols, rows);
+        self.map.entry(id.clone()).or_insert_with(|| {
+            let mut state = SessionState::new(id.clone(), cols, rows);
             let _ = state.set_theme(theme); // a fresh state has no 2031 subscriber
             state.set_policy(policy);
             state
@@ -153,18 +158,18 @@ impl Sessions {
     /// observed-resize path throws the mirror away and re-seeds it from the resync,
     /// exactly as the old whole-model rebuild did. A no-op-shaped mint when the id is
     /// new (there's nothing to carry).
-    pub(crate) fn rebuild(&mut self, id: &str, cols: u16, rows: u16) {
+    pub(crate) fn rebuild(&mut self, id: &SessionId, cols: u16, rows: u16) {
         let display_name = self
             .map
             .get(id)
             .map(|s| s.display_name().to_string())
             .unwrap_or_default();
         let (theme, policy) = (self.theme, self.policy);
-        let mut state = SessionState::new(id.to_string(), cols, rows);
+        let mut state = SessionState::new(id.clone(), cols, rows);
         let _ = state.set_theme(theme);
         state.set_policy(policy);
         state.set_display_name(display_name);
-        self.map.insert(id.to_string(), state);
+        self.map.insert(id.clone(), state);
     }
 
     /// Re-seed an *observed* session's shared state at `cols`×`rows` — the shell's
@@ -174,7 +179,7 @@ impl Sessions {
     /// the state if absent. The per-window fleet arm no longer rebuilds — under the
     /// process-wide registry only the shell may, keyed to a genuine observer stream, so
     /// a session a window merely previews-while-driven-elsewhere is never blanked.
-    pub fn resize_observed(&mut self, id: &str, cols: u16, rows: u16) {
+    pub fn resize_observed(&mut self, id: &SessionId, cols: u16, rows: u16) {
         self.rebuild(id, cols, rows);
     }
 
@@ -726,7 +731,7 @@ pub fn feed_shared(
     sessions: &mut Sessions,
     driver: &mut RootModel,
     observers: &mut [&mut RootModel],
-    name: &str,
+    name: &SessionId,
     bytes: &[u8],
     ended: bool,
 ) -> (Vec<Cmd>, Vec<Vec<Cmd>>) {
@@ -779,7 +784,7 @@ pub fn feed_shared(
 pub fn feed_observed(
     sessions: &mut Sessions,
     viewers: &mut [&mut RootModel],
-    name: &str,
+    name: &SessionId,
     bytes: &[u8],
     ended: bool,
 ) -> Vec<Vec<Cmd>> {
@@ -844,7 +849,7 @@ impl RootModel {
         size_px: (u32, u32),
     ) -> (Self, Sessions) {
         let (state, view) = model.into_parts();
-        let id = state.session().to_string();
+        let id = state.session().clone();
         let mut sessions = Sessions::new();
         sessions.insert(id.clone(), state);
         let root = RootModel {
@@ -887,7 +892,7 @@ impl RootModel {
     /// session; written in its final shape so promotion is deleting the attribute.
     #[cfg(test)]
     fn viewing(
-        name: &str,
+        name: &SessionId,
         cols: u16,
         rows: u16,
         metrics: CellMetrics,
@@ -895,7 +900,7 @@ impl RootModel {
     ) -> Self {
         RootModel {
             mode: Mode::Single {
-                id: name.to_string(),
+                id: name.clone(),
                 view: Box::new(TerminalView::new(metrics, cols, rows)),
             },
             metrics,
@@ -1012,7 +1017,7 @@ impl RootModel {
     /// re-gridding the shared emulator and SIGWINCHing the child). Input delivery, feed
     /// reaction, and rendering are identical either way. Sourced from `mine` today;
     /// enablement will repoint it at the App-level connection owner in one place.
-    pub fn drives(&self, name: &str) -> bool {
+    pub fn drives(&self, name: &SessionId) -> bool {
         self.mine.contains(name)
     }
 
@@ -1021,7 +1026,7 @@ impl RootModel {
     /// uses this to find every window a session's one shared feed must reach. Unlike
     /// [`Self::view_of`], this DOES count fleet tiles (a tile is a view of the session
     /// even though its feed routes through [`FleetModel`], not a bare `apply_feed`).
-    pub fn views(&self, name: &str) -> bool {
+    pub fn views(&self, name: &SessionId) -> bool {
         if self.view_of(name).is_some() {
             return true;
         }
@@ -1031,7 +1036,7 @@ impl RootModel {
     /// The text of a fleet tile's cached preview frame — what the overview renders
     /// for `name`, as opposed to the live emulator screen. For assertions on whether
     /// a preview is seeded. `None` unless this window is in fleet mode with that tile.
-    pub fn tile_frame_text(&self, name: &str) -> Option<Vec<String>> {
+    pub fn tile_frame_text(&self, name: &SessionId) -> Option<Vec<String>> {
         match &self.mode {
             Mode::Fleet(f) => f.tile_frame_text(name),
             _ => None,
@@ -1050,7 +1055,7 @@ impl RootModel {
     /// fleet tile). The shell prefers a foregrounding window when it must pick the one
     /// driver of a session two windows transiently claim during a take-over steal, so
     /// the geometry/query-answer source is stable across wakes.
-    pub fn foregrounds(&self, name: &str) -> bool {
+    pub fn foregrounds(&self, name: &SessionId) -> bool {
         matches!(&self.mode, Mode::Single { id, .. } if id == name)
     }
 
@@ -1080,7 +1085,7 @@ impl RootModel {
     /// through here instead — else a session driven while its window sits in the fleet
     /// overview would ingest against no geometry and stop feeding. (A fleet tile answers
     /// pixel queries with its preview rect — a pre-existing documented edge.)
-    pub(crate) fn driving_geometry_of(&self, name: &str) -> Option<DrivingGeometry> {
+    pub(crate) fn driving_geometry_of(&self, name: &SessionId) -> Option<DrivingGeometry> {
         if let Some(v) = self.view_of(name) {
             return Some(v.driving_geometry());
         }
@@ -1096,7 +1101,7 @@ impl RootModel {
     /// `apply_feed` (frame-cache refresh, deferred-dive completion), so a bare
     /// `apply_feed` on a tile would leave its preview stale. Used by the shared-feed
     /// fan-out ([`feed_shared`]) to source the driving geometry.
-    pub(crate) fn view_of(&self, name: &str) -> Option<&TerminalView> {
+    pub(crate) fn view_of(&self, name: &SessionId) -> Option<&TerminalView> {
         if let Mode::Single { id, view } = &self.mode
             && id == name
         {
@@ -1114,7 +1119,7 @@ impl RootModel {
     fn apply_shared_feed(
         &mut self,
         sessions: &Sessions,
-        name: &str,
+        name: &SessionId,
         outcome: &FeedOutcome,
         driving: bool,
     ) -> Vec<Cmd> {
@@ -1156,15 +1161,15 @@ impl RootModel {
     /// Without it a take-over of a session that isn't currently printing left the
     /// window parked in the fleet forever: it had claimed the session, but never
     /// showed it.
-    pub fn complete_pending_dive(&mut self, sessions: &mut Sessions, name: &str) -> Vec<Cmd> {
-        if self.pending_dive_in.as_deref() != Some(name) {
+    pub fn complete_pending_dive(&mut self, sessions: &mut Sessions, name: &SessionId) -> Vec<Cmd> {
+        if self.pending_dive_in.as_ref() != Some(name) {
             return Vec::new();
         }
         if !matches!(&self.mode, Mode::Fleet(f) if f.tile_fed(name)) {
             return Vec::new();
         }
         self.pending_dive_in = None;
-        self.adopt(sessions, name.to_string())
+        self.adopt(sessions, name.clone())
     }
 
     /// Apply `ev` to the active view — the foreground view against its state, or the
@@ -1207,7 +1212,7 @@ impl RootModel {
     /// of the fleet's tile sync — persisting the registry when it changes.
     /// Ownership moved here, so the session also leaves every other group;
     /// an emptied one dissolves.
-    fn claim_member(&mut self, id: &str) -> Vec<Cmd> {
+    fn claim_member(&mut self, id: &SessionId) -> Vec<Cmd> {
         let mut changed = false;
         for g in &mut self.groups {
             if g.id != self.my_group.id && g.members.iter().any(|m| m == id) {
@@ -1225,10 +1230,10 @@ impl RootModel {
                     return Vec::new();
                 }
             }
-            Some(g) => g.members.push(id.to_string()),
+            Some(g) => g.members.push(id.clone()),
             None => {
                 let mut g = self.my_group.clone();
-                g.members = vec![id.to_string()];
+                g.members = vec![id.clone()];
                 self.groups.push(g);
             }
         }
@@ -1773,7 +1778,7 @@ impl RootModel {
                 Mode::Fleet(f) => f.update(sessions, &self.mine, ev),
                 Mode::Single { .. } => unreachable!(),
             };
-            if self.pending_dive_in.as_deref() == Some(name.as_str())
+            if self.pending_dive_in.as_ref() == Some(&name)
                 && matches!(&self.mode, Mode::Fleet(f) if f.tile_fed(&name))
             {
                 self.pending_dive_in = None;
@@ -1890,7 +1895,7 @@ impl RootModel {
             UiEvent::SessionPush {
                 name,
                 push: crate::SessionPush::Event(ghost_vt::protocol::SessionEvent::Bell),
-            } if !self.focused_win && self.mine.contains(name.as_str()));
+            } if !self.focused_win && self.mine.contains(name));
         let mut cmds = self.drive(sessions, ev);
         self.mirror_fleet_identity();
         self.release_detached(&cmds);
@@ -1962,7 +1967,7 @@ impl RootModel {
     /// Start the deferred dive-out pull-back over the now-complete fleet: zoom from
     /// the framed session (filling the window) back to the whole grid. A no-op if the
     /// session has no tile (e.g. it ended while we waited).
-    fn launch_dive_out(&mut self, sessions: &mut Sessions, framed: &str) -> Vec<Cmd> {
+    fn launch_dive_out(&mut self, sessions: &mut Sessions, framed: &SessionId) -> Vec<Cmd> {
         let Mode::Fleet(f) = &self.mode else {
             return Vec::new();
         };
@@ -2082,7 +2087,7 @@ impl RootModel {
             return cmds;
         }
         let placeholder = Mode::Single {
-            id: String::new(),
+            id: SessionId::local(""),
             view: Box::new(TerminalView::new(self.metrics, 1, 1)),
         };
         let dur = self.anim_ms;
@@ -2211,11 +2216,11 @@ impl RootModel {
 
         // Pick the next session in the same forward order Ctrl-Tab walks: the
         // first survivor sorted after the one that exited, wrapping to the first.
-        let mut survivors: Vec<String> = self.mine.iter().cloned().collect();
+        let mut survivors: Vec<SessionId> = self.mine.iter().cloned().collect();
         survivors.sort();
         let next = survivors
             .iter()
-            .find(|n| n.as_str() > gone.as_str())
+            .find(|n| **n > gone)
             .or_else(|| survivors.first())
             .cloned();
 
@@ -3046,9 +3051,9 @@ impl RootModel {
     /// What this window is showing: the foreground session's id, or `None` in the
     /// fleet overview. The label the shell's present/render traces need to say WHICH
     /// window a line is about — a bare `WindowId` names nothing a human can act on.
-    pub fn showing(&self) -> Option<&str> {
+    pub fn showing(&self) -> Option<&SessionId> {
         match &self.mode {
-            Mode::Single { id, .. } => Some(id.as_str()),
+            Mode::Single { id, .. } => Some(id),
             Mode::Fleet(_) => None,
         }
     }
@@ -3075,7 +3080,7 @@ impl RootModel {
         // Swap the mode out behind a cheap placeholder so we can move the owned
         // model/fleet into the conversion.
         let placeholder = Mode::Single {
-            id: String::new(),
+            id: SessionId::local(""),
             view: Box::new(TerminalView::new(self.metrics, 1, 1)),
         };
         // A new transition cancels any in-flight dive or slide (a still-waiting
@@ -3129,7 +3134,7 @@ impl RootModel {
                 // adopting a foreign tile — which would attach that session here
                 // while it's still attached in its own window, in two groups.
                 // Choosing a specific tile to open is Enter/click, not F9/Esc.
-                let Some(target) = f.owned_tile(self.primary.as_deref()) else {
+                let Some(target) = f.owned_tile(self.primary.as_ref()) else {
                     self.mode = Mode::Fleet(f);
                     return Vec::new();
                 };
@@ -3266,7 +3271,7 @@ mod tests {
     }
 
     fn root() -> Win {
-        let m = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let m = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         let (root, sessions) = RootModel::single(m, METRICS, SIZE);
         Win { root, sessions }
     }
@@ -3310,10 +3315,10 @@ mod tests {
         // One shared registry; mint alpha's state once (both windows reference it).
         let mut sessions = Sessions::new();
         sessions.set_policy(SessionPolicy::allow_all()); // so a DSR is answered
-        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
         // Two windows onto the SAME shared state: A drives, B is a second view.
-        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
-        let mut b = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut a = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
+        let mut b = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
 
         // Warm both past the unconditional first-frame `All`, then present so each
         // window's damage baseline is the settled screen.
@@ -3321,7 +3326,7 @@ mod tests {
             &mut sessions,
             &mut a,
             &mut [&mut b],
-            "alpha",
+            &"alpha".into(),
             b"line one\r\n",
             false,
         );
@@ -3333,7 +3338,7 @@ mod tests {
             &mut sessions,
             &mut a,
             &mut [&mut b],
-            "alpha",
+            &"alpha".into(),
             b"hi\x1b[6n",
             false,
         );
@@ -3369,11 +3374,11 @@ mod tests {
     #[test]
     fn an_observer_windows_input_still_reaches_the_shared_session() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
         // A pure observer: it shows alpha but does not drive it (`mine` is empty).
-        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut observer = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         assert!(
-            !observer.mine.contains("alpha"),
+            !observer.mine.contains(&"alpha".into()),
             "the observer does not own the session"
         );
         assert_eq!(
@@ -3400,16 +3405,16 @@ mod tests {
     #[test]
     fn an_ended_background_mirror_never_reaps_a_session_another_window_shows() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
-        sessions.get_or_mint("beta", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
+        sessions.get_or_mint(&"beta".into(), 80, 24);
 
         // Window A: a live single view of alpha (it drives + foregrounds it).
-        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut a = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         a.mine.insert("alpha".into());
 
         // Window B: foregrounds beta, but still holds alpha as a warm background mirror
         // (drove alpha, then Ctrl-Tabbed to beta) — a second view onto shared alpha.
-        let mut b = RootModel::viewing("beta", 80, 24, METRICS, SIZE);
+        let mut b = RootModel::viewing(&"beta".into(), 80, 24, METRICS, SIZE);
         b.mine.insert("beta".into());
         b.mine.insert("alpha".into());
         b.warm
@@ -3425,13 +3430,16 @@ mod tests {
             },
         );
 
-        assert!(!b.warm.contains_key("alpha"), "B drops its own dead mirror");
         assert!(
-            !b.mine.contains("alpha"),
+            !b.warm.contains_key(&"alpha".into()),
+            "B drops its own dead mirror"
+        );
+        assert!(
+            !b.mine.contains(&"alpha".into()),
             "B releases its ownership of alpha"
         );
         assert!(
-            sessions.contains("alpha"),
+            sessions.contains(&"alpha".into()),
             "alpha's shared state survives — window A still foregrounds it"
         );
         // A, still `Single{alpha}`, focuses (Cmd-`) without tripping the invariant guard.
@@ -3448,13 +3456,13 @@ mod tests {
     #[test]
     fn only_the_driving_window_re_grids_the_shared_session_on_resize() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
         // A drives alpha (it owns it); B merely observes it (empty `mine`).
-        let mut driver = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut driver = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         driver.mine.insert("alpha".into());
-        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut observer = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
 
-        let before = sessions.get("alpha").unwrap().dims();
+        let before = sessions.get(&"alpha".into()).unwrap().dims();
         assert_eq!(before, (80, 24));
 
         // The observer's window grows to a bigger size. Its own geometry follows, but
@@ -3469,7 +3477,7 @@ mod tests {
             },
         );
         assert_eq!(
-            sessions.get("alpha").unwrap().dims(),
+            sessions.get(&"alpha".into()).unwrap().dims(),
             before,
             "an observer resize must not re-grid the shared session"
         );
@@ -3493,7 +3501,7 @@ mod tests {
             },
         );
         assert_eq!(
-            sessions.get("alpha").unwrap().dims(),
+            sessions.get(&"alpha".into()).unwrap().dims(),
             (160, 48),
             "the driver's resize re-grids the shared session"
         );
@@ -3513,18 +3521,18 @@ mod tests {
     #[test]
     fn only_the_driving_window_re_grids_the_shared_session_on_zoom() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
-        let mut driver = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
+        let mut driver = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         driver.mine.insert("alpha".into());
-        let mut observer = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut observer = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
 
-        let before = sessions.get("alpha").unwrap().dims();
+        let before = sessions.get(&"alpha".into()).unwrap().dims();
         assert_eq!(before, (80, 24));
 
         // Zoom in on the observer: bigger glyphs, but the shared grid is the driver's.
         let obs = observer.update(&mut sessions, UiEvent::SetZoom(1.5));
         assert_eq!(
-            sessions.get("alpha").unwrap().dims(),
+            sessions.get(&"alpha".into()).unwrap().dims(),
             before,
             "an observer zoom must not re-grid the shared session"
         );
@@ -3537,7 +3545,7 @@ mod tests {
         // SIGWINCHes (1.5x on a 9px advance / 18px line over 720x432 → 53x16).
         let drv = driver.update(&mut sessions, UiEvent::SetZoom(1.5));
         assert_ne!(
-            sessions.get("alpha").unwrap().dims(),
+            sessions.get(&"alpha".into()).unwrap().dims(),
             before,
             "the driver's zoom re-grids the shared session"
         );
@@ -3556,15 +3564,15 @@ mod tests {
     #[test]
     fn losing_the_foreground_to_another_window_switches_this_one_away() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
-        sessions.get_or_mint("beta", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
+        sessions.get_or_mint(&"beta".into(), 80, 24);
         // A shows alpha and also drives beta as a warm background mirror.
-        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut a = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         a.mine.insert("alpha".into());
         a.mine.insert("beta".into());
         a.warm
             .insert("beta".into(), TerminalView::new(METRICS, 80, 24));
-        assert_eq!(a.single_foreground().map(String::as_str), Some("alpha"));
+        assert_eq!(a.single_foreground(), Some(&"alpha".into()));
 
         // Another window takes alpha over; the shell fans the loss.
         a.update(
@@ -3575,12 +3583,14 @@ mod tests {
         );
 
         assert_eq!(
-            a.single_foreground().map(String::as_str),
+            a.single_foreground()
+                .map(SessionId::to_composite)
+                .as_deref(),
             Some("beta"),
             "the loser switches to its remaining session"
         );
         assert!(
-            !a.views("alpha"),
+            !a.views(&"alpha".into()),
             "and stops showing the session it no longer holds"
         );
     }
@@ -3590,8 +3600,8 @@ mod tests {
     #[test]
     fn losing_its_only_session_drops_the_window_to_the_fleet() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
-        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
+        let mut a = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         a.mine.insert("alpha".into());
 
         a.update(
@@ -3615,14 +3625,14 @@ mod tests {
     #[test]
     fn a_driver_relinquishes_grid_ownership_when_told_another_window_took_over() {
         let mut sessions = Sessions::new();
-        sessions.get_or_mint("alpha", 80, 24);
-        sessions.get_or_mint("beta", 80, 24);
+        sessions.get_or_mint(&"alpha".into(), 80, 24);
+        sessions.get_or_mint(&"beta".into(), 80, 24);
         // A drives alpha (its foreground) and beta.
-        let mut a = RootModel::viewing("alpha", 80, 24, METRICS, SIZE);
+        let mut a = RootModel::viewing(&"alpha".into(), 80, 24, METRICS, SIZE);
         a.mine.insert("alpha".into());
         a.mine.insert("beta".into());
         assert!(
-            a.drives("alpha") && a.drives("beta"),
+            a.drives(&"alpha".into()) && a.drives(&"beta".into()),
             "precondition: A drives both sessions"
         );
 
@@ -3639,17 +3649,17 @@ mod tests {
         );
 
         assert!(
-            !a.drives("alpha"),
+            !a.drives(&"alpha".into()),
             "the old driver relinquishes the taken-over session"
         );
         assert!(
-            a.drives("beta"),
+            a.drives(&"beta".into()),
             "the handoff is scoped to the named session; others stay driven"
         );
 
         // alpha's grid is no longer A's to author: resizing A's window (alpha is the
         // foreground) must not re-grid the shared child or SIGWINCH it.
-        let before = sessions.get("alpha").unwrap().dims();
+        let before = sessions.get(&"alpha".into()).unwrap().dims();
         let cmds = a.update(
             &mut sessions,
             UiEvent::Resize {
@@ -3659,7 +3669,7 @@ mod tests {
             },
         );
         assert_eq!(
-            sessions.get("alpha").unwrap().dims(),
+            sessions.get(&"alpha".into()).unwrap().dims(),
             before,
             "a relinquished foreground's resize must not re-grid the shared session"
         );
@@ -3691,7 +3701,13 @@ mod tests {
             );
             // The previewed program subscribes to focus events: a rising edge, so the
             // ingest produces a report — which this feed has no write path for.
-            let outs = feed_observed(&mut sessions, &mut [&mut w], "x", b"\x1b[?1004h", false);
+            let outs = feed_observed(
+                &mut sessions,
+                &mut [&mut w],
+                &"x".into(),
+                b"\x1b[?1004h",
+                false,
+            );
             let sends: usize = outs
                 .iter()
                 .flatten()
@@ -3735,14 +3751,23 @@ mod tests {
             &mut sessions,
             UiEvent::SessionList(listed(vec![sess("x", false, 1)])),
         );
-        assert!(sessions.get("x").is_some(), "the observed state is minted");
+        assert!(
+            sessions.get(&"x".into()).is_some(),
+            "the observed state is minted"
+        );
 
         // A burst that prints "hi" AND asks the cursor position (DSR `\x1b[6n`).
-        let outs = feed_observed(&mut sessions, &mut [&mut w], "x", b"hi\x1b[6n", false);
+        let outs = feed_observed(
+            &mut sessions,
+            &mut [&mut w],
+            &"x".into(),
+            b"hi\x1b[6n",
+            false,
+        );
 
         // The mirror emulator DID process the burst — the cursor sits past "hi" (col 3,
         // 1-based) — so the DSR was seen and a reply was due...
-        let text = sessions.get("x").unwrap().screen().vt().text();
+        let text = sessions.get(&"x".into()).unwrap().screen().vt().text();
         assert!(
             text[0].starts_with("hi"),
             "the mirror ingested the burst: {text:?}"
@@ -3770,12 +3795,12 @@ mod tests {
     #[test]
     fn showing_names_the_foreground_session_and_nothing_in_the_fleet() {
         let mut r = root(); // single view of alpha
-        assert_eq!(r.showing(), Some("alpha"));
+        assert_eq!(r.showing(), Some(&"alpha".into()));
 
         // It tracks the mode rather than being set once: a child exit drops the
         // window to the fleet, where there is no single foreground to name.
         r.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: Vec::new(),
             ended: true,
         });
@@ -3791,7 +3816,7 @@ mod tests {
     fn a_disconnected_foreground_holds_reconnecting_but_an_exit_drops_to_the_fleet() {
         let mut r = root(); // single view of alpha
         r.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"live".to_vec(),
             ended: false,
         });
@@ -3800,7 +3825,7 @@ mod tests {
         // A dropped connection must NOT fall back to the fleet the way an exit does
         // — it holds the single view, dimmed, while the shell re-attaches.
         r.update(UiEvent::SessionDisconnected {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
         });
         assert!(
             !r.is_fleet(),
@@ -3813,13 +3838,13 @@ mod tests {
 
         // Reattach clears the hold; the resync then repaints live.
         r.update(UiEvent::SessionReattached {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
         });
         assert!(!foreground_dimmed(&r));
 
         // Contrast — a genuine child exit still tears down to the fleet overview.
         r.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: Vec::new(),
             ended: true,
         });
@@ -3916,7 +3941,7 @@ mod tests {
         assert_eq!((rec.cols, rec.rows), r.grid(), "sized to the window grid");
         assert!(rec.cols > 0 && rec.rows > 0);
         assert!(!rec.fleet, "single view");
-        assert_eq!(rec.foreground.as_deref(), Some("alpha"));
+        assert_eq!(rec.foreground, Some("alpha".into()));
         assert_eq!(rec.attached, vec!["alpha".to_string()]);
         // Diving to the fleet flips the mode; the owned set and group persist.
         dive_out(&mut r, &[sess("alpha", true, 1)]);
@@ -3960,7 +3985,9 @@ mod tests {
         );
         assert!(r.is_fleet(), "the adopt has not round-tripped yet");
         assert!(
-            r.window_record().attached.contains(&"gamma".to_string()),
+            r.window_record()
+                .attached
+                .contains(&SessionId::local("gamma")),
             "a fleet-side claim must reach the window record immediately, not \
              wait for the fleet to close: {:?}",
             r.window_record().attached
@@ -3987,7 +4014,7 @@ mod tests {
             "no foreign session is adopted as foreground"
         );
         assert!(
-            !r.mine.contains("ghost-mac"),
+            !r.mine.contains(&"ghost-mac".into()),
             "the foreign session is not claimed by this window"
         );
         assert!(
@@ -4002,7 +4029,7 @@ mod tests {
             r.is_fleet(),
             "Esc with no owned session also stays in the fleet"
         );
-        assert!(r.primary.is_none() && !r.mine.contains("ghost-mac"));
+        assert!(r.primary.is_none() && !r.mine.contains(&"ghost-mac".into()));
     }
 
     #[test]
@@ -4130,7 +4157,7 @@ mod tests {
         let cmds = r.update(UiEvent::AdoptSession("beta".into()));
         assert!(
             cmds.iter().any(|c| matches!(c, Cmd::SaveGroups(gs)
-                if gs.iter().any(|g| g.id == "w1" && g.members.contains(&"beta".to_string())))),
+                if gs.iter().any(|g| g.id == "w1" && g.members.contains(&SessionId::local("beta"))))),
             "adopting a session persists its membership: {cmds:?}"
         );
     }
@@ -4173,13 +4200,13 @@ mod tests {
             members: vec!["alpha".into()],
             connection: None,
         }]));
-        assert!(r.mine.contains("alpha"));
+        assert!(r.mine.contains(&"alpha".into()));
         // The driven, grouped member dies: the fleet keeps a dead tile and
         // emits a Detach for the window's client — which must also release
         // the root's ownership, or the next fleet would claim the corpse.
         r.update(UiEvent::SessionList(listed(vec![sess("beta", false, 2)])));
         assert!(
-            !r.mine.contains("alpha"),
+            !r.mine.contains(&"alpha".into()),
             "a session this window no longer drives is not ours"
         );
     }
@@ -4222,12 +4249,12 @@ mod tests {
         r.update(UiEvent::AdoptSession("alpha".into()));
         assert!(!r.is_fleet(), "opening the group lands in the single view");
         assert_eq!(
-            r.primary.as_deref(),
-            Some("alpha"),
+            r.primary,
+            Some("alpha".into()),
             "the group's FIRST member is the foreground"
         );
         assert!(
-            r.mine.contains("gamma"),
+            r.mine.contains(&"gamma".into()),
             "the other member is attached to this window (Ctrl-Tab reaches it)"
         );
     }
@@ -4264,7 +4291,7 @@ mod tests {
         });
         assert!(!r.is_fleet(), "the parked dive lands in the single view");
         assert_eq!(
-            r.foreground().map(String::as_str),
+            r.foreground().map(SessionId::to_composite).as_deref(),
             Some("beta"),
             "the adopted session is the foreground"
         );
@@ -4433,7 +4460,7 @@ mod tests {
         // The handshake size must equal what a freshly-adopted model resizes
         // itself to at the same geometry — otherwise the host would reflow
         // between the handshake and the model's first resize.
-        let mut m = TerminalModel::new("x".to_string(), 1, 1, METRICS);
+        let mut m = TerminalModel::new("x".into(), 1, 1, METRICS);
         m.update(UiEvent::Resize {
             w_px: 1600,
             h_px: 900,
@@ -4629,7 +4656,7 @@ mod tests {
 
         // Dive IN (open the tile): the on-screen target grows monotonically back to
         // the whole window, landing in the single view.
-        r.update(UiEvent::AdoptSession("alpha".to_string()));
+        r.update(UiEvent::AdoptSession("alpha".into()));
         let base = 30_000u64;
         let inn: Vec<RectPx> = [0u64, 25, 50, 75]
             .iter()
@@ -4760,14 +4787,14 @@ mod tests {
 
         // Own two sessions; foreground = beta. Both fed so they render as live tiles.
         let mut r = root(); // single view of alpha
-        r.update(UiEvent::AdoptSession("beta".to_string())); // foreground beta, alpha warm
+        r.update(UiEvent::AdoptSession("beta".into())); // foreground beta, alpha warm
         r.update(UiEvent::SessionData {
-            name: "beta".to_string(),
+            name: "beta".into(),
             bytes: b"beta".to_vec(),
             ended: false,
         });
         r.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"alpha".to_vec(),
             ended: false,
         });
@@ -4812,10 +4839,10 @@ mod tests {
         // Window owns alpha (older) and beta (newer); beta is the foreground. Both
         // fed so they render as live preview tiles.
         let mut r = root(); // single view of alpha
-        r.update(UiEvent::AdoptSession("beta".to_string()));
+        r.update(UiEvent::AdoptSession("beta".into()));
         for n in ["alpha", "beta"] {
             r.update(UiEvent::SessionData {
-                name: n.to_string(),
+                name: n.into(),
                 bytes: n.as_bytes().to_vec(),
                 ended: false,
             });
@@ -6108,7 +6135,7 @@ mod tests {
     /// Feed a session an OSC 2 window-title change.
     fn set_title(r: &mut Win, name: &str, title: &str) -> Vec<Cmd> {
         r.update(UiEvent::SessionData {
-            name: name.to_string(),
+            name: name.into(),
             bytes: format!("\x1b]2;{title}\x07").into_bytes(),
             ended: false,
         })
@@ -6170,10 +6197,10 @@ mod tests {
             "",
             "the foreground honours the window's policy"
         );
-        assert!(r.warm.contains_key("alpha"), "alpha is warm");
+        assert!(r.warm.contains_key(&"alpha".into()), "alpha is warm");
         assert_eq!(
             r.sessions
-                .get("alpha")
+                .get(&"alpha".into())
                 .expect("alpha's state")
                 .screen()
                 .vt()
@@ -6261,7 +6288,7 @@ mod tests {
         // The freshly-minted observed preview carries the window's theme...
         assert_eq!(
             r.sessions
-                .get("gamma")
+                .get(&"gamma".into())
                 .expect("gamma's state")
                 .effective_theme()
                 .bg,
@@ -6429,7 +6456,7 @@ mod tests {
     }
 
     /// The session the single view currently routes input to.
-    fn foreground(r: &mut Win) -> String {
+    fn foreground(r: &mut Win) -> SessionId {
         match r.update(UiEvent::Text("x".into())).into_iter().next() {
             Some(Cmd::SendInput { session, .. }) => session,
             other => panic!("expected SendInput, got {other:?}"),

@@ -116,7 +116,7 @@ pub fn count_mouse_report() -> u64 {
 /// Append one `<unix-ms> <hh:mm:ss.mmm>Z [<pid>] <session> <event>` line.
 /// `session` is the id the event concerns, or `"*"` for app-wide events. The
 /// clock is UTC; the pid separates two ghosts sharing the file.
-pub fn log(session: &str, event: std::fmt::Arguments<'_>) {
+pub fn log(session: impl std::fmt::Display, event: std::fmt::Arguments<'_>) {
     let Some(path) = destination() else {
         return;
     };

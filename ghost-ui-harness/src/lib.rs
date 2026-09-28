@@ -91,7 +91,7 @@ impl Harness {
         metrics: CellMetrics,
         size_px: (u32, u32),
     ) -> Self {
-        let model = TerminalModel::new(name.to_string(), cols, rows, metrics);
+        let model = TerminalModel::new(ghost_ui_core::SessionId::local(name), cols, rows, metrics);
         let (root, states) = RootModel::single(model, metrics, size_px);
         let mut h = Self::wrap(root, states);
         h.inject(UiEvent::Resize {

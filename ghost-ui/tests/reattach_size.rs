@@ -18,7 +18,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ghost_render::CellMetrics;
-use ghost_ui_core::{TerminalModel, UiEvent};
+use ghost_ui_core::{SessionId, TerminalModel, UiEvent};
 use ghost_vt::client::Session;
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
@@ -160,7 +160,7 @@ impl GuiClient {
         GuiClient {
             name: name.to_string(),
             session,
-            model: TerminalModel::new(name.to_string(), model_size.0, model_size.1, METRICS),
+            model: TerminalModel::new(SessionId::local(name), model_size.0, model_size.1, METRICS),
         }
     }
 
@@ -186,7 +186,7 @@ impl GuiClient {
         }
         if !bytes.is_empty() || ended {
             self.model.update(UiEvent::SessionData {
-                name: self.name.clone(),
+                name: SessionId::local(self.name.as_str()),
                 bytes,
                 ended,
             });

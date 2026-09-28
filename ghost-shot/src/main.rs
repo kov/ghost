@@ -17,7 +17,8 @@ use std::collections::HashSet;
 use ghost_render::CellMetrics;
 use ghost_renderer::{Damage, Rendered, Renderer, SceneCache, Theme};
 use ghost_ui_core::{
-    FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, Sessions, TerminalModel, UiEvent,
+    FleetModel, Key, KeyEventKind, Mods, NamedKey, RootModel, SessionId, Sessions, TerminalModel,
+    UiEvent,
 };
 use ghost_vt::session::SessionInfo;
 
@@ -224,11 +225,11 @@ fn bench(tiles: usize, frames: usize) {
     // AdoptSession), each producing a full screen of output.
     for i in 0..tiles {
         let name = format!("s{i}");
-        root.update(&mut states, UiEvent::AdoptSession(name.clone()));
+        root.update(&mut states, UiEvent::AdoptSession(name.clone().into()));
         root.update(
             &mut states,
             UiEvent::SessionData {
-                name,
+                name: name.into(),
                 bytes: dense_screen().into_bytes(),
                 ended: false,
             },
@@ -300,11 +301,11 @@ fn bench_resize(tiles: usize, steps: usize) {
     );
     for i in 0..tiles {
         let name = format!("s{i}");
-        root.update(&mut states, UiEvent::AdoptSession(name.clone()));
+        root.update(&mut states, UiEvent::AdoptSession(name.clone().into()));
         root.update(
             &mut states,
             UiEvent::SessionData {
-                name,
+                name: name.into(),
                 bytes: dense_screen().into_bytes(),
                 ended: false,
             },
@@ -427,7 +428,7 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
     use std::time::Instant;
 
     let name = "bench";
-    let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
+    let model = TerminalModel::new(name.into(), 1, 1, METRICS);
     let (mut root, mut states) = RootModel::single(model, METRICS, size);
     root.update(
         &mut states,
@@ -444,7 +445,7 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
     root.update(
         &mut states,
         UiEvent::SessionData {
-            name: name.to_string(),
+            name: name.into(),
             bytes: dense_screen_sized(cols, rows).into_bytes(),
             ended: false,
         },
@@ -467,7 +468,7 @@ fn bench_single(size: (u32, u32), scale: f32, frames: usize) {
         root.update(
             &mut states,
             UiEvent::SessionData {
-                name: name.to_string(),
+                name: name.into(),
                 bytes: line.into_bytes(),
                 ended: false,
             },
@@ -518,7 +519,7 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
     // One char written at (mid, cycling column) per frame — only row `mid` changes.
     let keystroke = |i: usize| format!("\x1b[{};{}Hx", mid, (i % cols) + 1).into_bytes();
 
-    let model = TerminalModel::new(name.to_string(), 1, 1, METRICS);
+    let model = TerminalModel::new(name.into(), 1, 1, METRICS);
     let (mut root, mut states) = RootModel::single(model, METRICS, size);
     root.update(
         &mut states,
@@ -531,7 +532,7 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
     root.update(
         &mut states,
         UiEvent::SessionData {
-            name: name.to_string(),
+            name: name.into(),
             bytes: dense_screen_sized(cols, rows).into_bytes(),
             ended: false,
         },
@@ -548,7 +549,7 @@ fn bench_type(size: (u32, u32), scale: f32, frames: usize) {
         root.update(
             states,
             UiEvent::SessionData {
-                name: name.to_string(),
+                name: name.into(),
                 bytes: keystroke(i),
                 ended: false,
             },
@@ -625,14 +626,14 @@ fn bench_dive(size: (u32, u32), scale: f32, count: usize) {
     let mut h = Harness::fleet(METRICS, size, scale);
     h.set_sessions(sessions);
     for n in &names[..attached_n] {
-        h.inject(UiEvent::AdoptSession(n.clone()));
+        h.inject(UiEvent::AdoptSession(n.clone().into()));
         h.inject(UiEvent::SessionData {
-            name: n.clone(),
+            name: n.clone().into(),
             bytes: dense_screen().into_bytes(),
             ended: false,
         });
     }
-    h.inject(UiEvent::AdoptSession(target.clone())); // land in the single view
+    h.inject(UiEvent::AdoptSession(target.clone().into())); // land in the single view
 
     // Drive the in-flight dive to completion, one frame per ~60fps tick, timing the
     // real per-frame work (model `view` + damage + full-surface redraw). Returns
@@ -665,14 +666,14 @@ fn bench_dive(size: (u32, u32), scale: f32, count: usize) {
     let mut clock = drive(&mut h, 1_000).3;
     h.inject(f9());
     clock = drive(&mut h, clock).3;
-    h.inject(UiEvent::AdoptSession(target.clone()));
+    h.inject(UiEvent::AdoptSession(target.clone().into()));
     clock = drive(&mut h, clock).3;
 
     // Measured passes.
     h.inject(f9()); // single -> fleet
     let (ro, xo, fo, c) = drive(&mut h, clock);
     clock = c;
-    h.inject(UiEvent::AdoptSession(target)); // fleet -> single
+    h.inject(UiEvent::AdoptSession(target.into())); // fleet -> single
     let (ri, xi, fi, _) = drive(&mut h, clock);
 
     println!(
@@ -782,10 +783,10 @@ fn calibration_screen(cols: u16, rows: u16) -> String {
 /// (and how card size adapts to the session count) at any size.
 fn calib_scene(size: (u32, u32), count: usize) -> ghost_render::Scene {
     let names: Vec<String> = (0..count.max(1)).map(|i| format!("calib-{i:02}")).collect();
-    let mine: HashSet<String> = names.iter().cloned().collect();
+    let mine: HashSet<SessionId> = names.iter().map(SessionId::local).collect();
     let mut sessions = Sessions::new();
-    let primary = TerminalModel::new(names[0].clone(), 80, 24, METRICS);
-    let primary_id = names[0].clone();
+    let primary = TerminalModel::new(names[0].clone().into(), 80, 24, METRICS);
+    let primary_id = SessionId::local(names[0].as_str());
     let primary_view = sessions.adopt(primary);
     let (mut fleet, _) = FleetModel::adopting(
         &sessions,
@@ -836,15 +837,18 @@ fn calib_tui() {
 /// border, and scaled live previews.
 fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     let size = (1400u32, 1200u32);
-    let mine: HashSet<String> = ["edit", "build"].into_iter().map(String::from).collect();
+    let mine: HashSet<SessionId> = ["edit", "build"]
+        .into_iter()
+        .map(SessionId::local)
+        .collect();
 
     // The focused/primary tile carries real content via `adopting`.
     let mut sessions = Sessions::new();
-    let primary = TerminalModel::new("edit".to_string(), 80, 24, METRICS);
+    let primary = TerminalModel::new("edit".into(), 80, 24, METRICS);
     let primary_view = sessions.adopt(primary);
     let (mut fleet, _) = FleetModel::adopting(
         &sessions,
-        "edit".to_string(),
+        "edit".into(),
         primary_view,
         Vec::new(),
         METRICS,
@@ -877,7 +881,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
         &mut sessions,
         &mine,
         UiEvent::SessionPush {
-            name: "prod".to_string(),
+            name: "prod".into(),
             push: ghost_ui_core::SessionPush::Event(ghost_vt::protocol::SessionEvent::Resized {
                 cols: 100,
                 rows: 50,
@@ -903,21 +907,21 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
             id: "win-shot-0".to_string(),
             name: "blue".to_string(),
             color: 0,
-            members: vec!["edit".to_string(), "build".to_string(), "db".to_string()],
+            members: vec!["edit".into(), "build".into(), "db".into()],
             connection: None,
         },
         ghost_ui_core::Group {
             id: "win-shot-1".to_string(),
             name: "green".to_string(),
             color: 1,
-            members: vec!["logs".to_string()],
+            members: vec!["logs".into()],
             connection: None,
         },
         ghost_ui_core::Group {
             id: "win-shot-2".to_string(),
             name: "purple".to_string(),
             color: 3,
-            members: vec!["batch".to_string()],
+            members: vec!["batch".into()],
             connection: None,
         },
     ]);
@@ -925,7 +929,7 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
         &mut sessions,
         &mine,
         UiEvent::DeadSessions(vec![ghost_ui_core::DeadSession {
-            name: "db".to_string(),
+            name: "db".into(),
             display_name: String::new(),
             command: vec!["psql".to_string(), "prod".to_string()],
             cwd: Some("~/ops".to_string()),
@@ -1008,7 +1012,7 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
     // pattern for any beyond. The border/fill is flush to the window-sized grid, so a
     // tile's extent (and which session it is) reads unambiguously at any zoom.
     for (i, n) in names.iter().enumerate() {
-        root.update(&mut states, UiEvent::AdoptSession(n.clone()));
+        root.update(&mut states, UiEvent::AdoptSession(n.clone().into()));
         let content = match i {
             0 => solid_screen(0, 200, 0),
             1 => solid_screen(220, 0, 0),
@@ -1019,14 +1023,14 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
         root.update(
             &mut states,
             UiEvent::SessionData {
-                name: n.clone(),
+                name: n.clone().into(),
                 bytes: content.into_bytes(),
                 ended: false,
             },
         );
     }
     // Make the target the foreground so a dive-out pulls back from it.
-    root.update(&mut states, UiEvent::AdoptSession(target.clone()));
+    root.update(&mut states, UiEvent::AdoptSession(target.clone().into()));
 
     // `base` is well past the settle ticks so its first tick cleanly stamps the start.
     let base = 10_000u64;
@@ -1034,7 +1038,7 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
         root.update(&mut states, key(NamedKey::F9)); // → fleet (dive-out)
         root.update(&mut states, UiEvent::Tick { now_ms: 0 });
         root.update(&mut states, UiEvent::Tick { now_ms: 1_000 }); // settle it
-        root.update(&mut states, UiEvent::AdoptSession(target)); // dive into the target tile
+        root.update(&mut states, UiEvent::AdoptSession(target.into())); // dive into the target tile
     } else {
         root.update(&mut states, key(NamedKey::F9)); // single → fleet (dive-out)
         // The host keeps reconciling mid-dive; with the cache seeded above this is a
@@ -1167,14 +1171,14 @@ fn contact_sheet(
 /// The single-terminal view, for comparison / regression on the same content.
 fn single_scene() -> (ghost_render::Scene, u32, u32) {
     let size = (1100u32, 700u32);
-    let mut model = TerminalModel::new("edit".to_string(), 80, 24, METRICS);
+    let mut model = TerminalModel::new("edit".into(), 80, 24, METRICS);
     model.update(UiEvent::Resize {
         w_px: size.0,
         h_px: size.1,
         scale: 1.0,
     });
     model.update(UiEvent::SessionData {
-        name: "edit".to_string(),
+        name: "edit".into(),
         bytes: EDIT.as_bytes().to_vec(),
         ended: false,
     });
@@ -1185,7 +1189,7 @@ fn single_scene() -> (ghost_render::Scene, u32, u32) {
 fn feed(
     fleet: &mut FleetModel,
     sessions: &mut Sessions,
-    mine: &HashSet<String>,
+    mine: &HashSet<SessionId>,
     name: &str,
     content: &str,
 ) {
@@ -1193,7 +1197,7 @@ fn feed(
         sessions,
         mine,
         UiEvent::SessionData {
-            name: name.to_string(),
+            name: name.into(),
             bytes: content.as_bytes().to_vec(),
             ended: false,
         },
@@ -1326,7 +1330,7 @@ mod tests {
 
         // A single session sized to the window; learn its grid from the scene.
         let (mut root, mut states) = RootModel::single(
-            TerminalModel::new("m".to_string(), 80, 24, METRICS),
+            TerminalModel::new("m".into(), 80, 24, METRICS),
             METRICS,
             size,
         );
@@ -1347,7 +1351,7 @@ mod tests {
         root.update(
             &mut states,
             UiEvent::SessionData {
-                name: "m".to_string(),
+                name: "m".into(),
                 bytes: corner_markers(cols, rows).into_bytes(),
                 ended: false,
             },

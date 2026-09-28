@@ -22,7 +22,7 @@ impl Listed {
     /// A session of this machine: its id is its name.
     pub fn local(info: SessionInfo) -> Self {
         Self {
-            id: info.name.clone(),
+            id: SessionId::local(info.name.clone()),
             info,
         }
     }

@@ -78,26 +78,18 @@ impl HostLink {
     }
 }
 
-/// The fleet id for remote session `real` on `target` — the composite a remote
-/// session is known by *locally* (window client key, `mine`, fleet tile id), so a
-/// session this window drives over the transport and the same session the watcher
-/// discovers share one identity. Recovered to `(target, real)` by
-/// [`remote_id_parts`]; only the transport layer uses the bare `real` id.
-pub(crate) fn remote_fleet_id(target: &str, real: &str) -> String {
-    format!("{target}{REMOTE_ID_SEP}{real}")
+/// The id of remote session `real` on `target`.
+pub(crate) fn remote_fleet_id(target: &str, real: &str) -> SessionId {
+    SessionId::remote(target, real)
 }
 
-/// How a session id should be reached for a control action (rename/kill). A
-/// remote id is *self-describing* — [`remote_fleet_id`] formats it as
-/// `<target>␟<real>` — so its host and real name are recovered from the id itself,
-/// never from a lookup that could lag. A remote id is thus ALWAYS routed over the transport, never spoken to a local control socket (a
-/// bogus local socket yields a misleading "hosted by an older ghost" error).
-pub(crate) fn remote_id_parts(id: &str) -> Option<(&str, &str)> {
-    id.split_once(REMOTE_ID_SEP)
+/// A remote session's `(target, real name)`; `None` for a local one.
+pub(crate) fn remote_id_parts(id: &SessionId) -> Option<(&str, &str)> {
+    id.target().map(|target| (target, id.name()))
 }
 
 /// [`remote_id_parts`], owned.
-pub(crate) fn remote_id_owned(id: &str) -> Option<(String, String)> {
+pub(crate) fn remote_id_owned(id: &SessionId) -> Option<(String, String)> {
     remote_id_parts(id).map(|(target, real)| (target.to_string(), real.to_string()))
 }
 

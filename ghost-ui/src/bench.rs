@@ -22,7 +22,7 @@
 //! `GHOST_BENCH_DIVES` is still honoured). Pair with `GHOST_FRAME_STATS=1` to print
 //! each animation's drop summary.
 
-use ghost_ui_core::{KeyEventKind, UiEvent};
+use ghost_ui_core::{KeyEventKind, SessionId, UiEvent};
 use ghost_vt::session::SessionInfo;
 
 /// Milliseconds to hold between animations — long enough for the previous one's
@@ -221,15 +221,17 @@ impl Harness {
     pub fn setup_events(&self) -> Vec<UiEvent> {
         let mut evs = vec![UiEvent::SessionList(self.listing())];
         for n in &self.names {
-            evs.push(UiEvent::AdoptSession(n.clone()));
+            evs.push(UiEvent::AdoptSession(SessionId::local(n.as_str())));
             evs.push(UiEvent::SessionData {
-                name: n.clone(),
+                name: SessionId::local(n.as_str()),
                 bytes: dense_block(0),
                 ended: false,
             });
         }
         evs.push(UiEvent::SessionList(self.listing()));
-        evs.push(UiEvent::AdoptSession(self.target.clone()));
+        evs.push(UiEvent::AdoptSession(SessionId::local(
+            self.target.as_str(),
+        )));
         evs
     }
 
@@ -243,7 +245,7 @@ impl Harness {
         if self.mode == Bench::Stream {
             self.stream_tick += 1;
             return vec![Action::Dispatch(UiEvent::SessionData {
-                name: self.target.clone(),
+                name: SessionId::local(self.target.as_str()),
                 bytes: dense_block(self.stream_tick),
                 ended: false,
             })];
@@ -343,7 +345,9 @@ impl Harness {
                     Phase::Single
                 };
                 // Dive IN to the target tile (fleet → single).
-                vec![Action::Dispatch(UiEvent::AdoptSession(self.target.clone()))]
+                vec![Action::Dispatch(UiEvent::AdoptSession(SessionId::local(
+                    self.target.as_str(),
+                )))]
             }
             Phase::Done => vec![Action::Exit],
         }

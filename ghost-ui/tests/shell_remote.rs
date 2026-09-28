@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ghost_ui::{App, EventSink, HeadlessFrontend, QueuedEvents};
-use ghost_ui_core::UiEvent;
+use ghost_ui_core::{SessionId, UiEvent};
 use ghost_vt::remote::RemoteSsh;
 use support::remote::{RealRemote, retry_some};
 use support::{sees_text, sees_tile, visible_text, wait_until, with_isolated_xdg};
@@ -137,7 +137,7 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
         assert!(
             app.groups()
                 .iter()
-                .any(|g| g.members.iter().any(|m| m.ends_with("work"))),
+                .any(|g| g.members.iter().any(|m| m.name() == "work")),
             "driving it makes it the window's own: {:?}",
             app.groups()
         );
@@ -151,7 +151,7 @@ fn a_window_survives_its_remote_hosts_reboot_and_keeps_the_session_recoverable()
             .groups()
             .iter()
             .flat_map(|g| &g.members)
-            .find(|m| m.ends_with("work"))
+            .find(|m| m.name() == "work")
             .expect("the window remembers its remote session")
             .clone();
 
@@ -311,7 +311,7 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
         assert!(
             app.groups()
                 .iter()
-                .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral"))),
+                .any(|g| g.members.iter().any(|m| m.name() == "ephemeral")),
             "driving it makes it the window's own: {:?}",
             app.groups()
         );
@@ -351,7 +351,7 @@ fn a_remote_sessions_clean_exit_is_forgotten_not_offered_for_relaunch() {
         assert!(
             !app.groups()
                 .iter()
-                .any(|g| g.members.iter().any(|m| m.ends_with("ephemeral"))),
+                .any(|g| g.members.iter().any(|m| m.name() == "ephemeral")),
             "a cleanly-exited remote session must not stay remembered: {:?}",
             app.groups()
         );
@@ -486,7 +486,7 @@ fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
 }
 
 /// How many times `needle` is rendered on session `id`'s screen.
-fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
+fn rendered_count(app: &App, id: &SessionId, needle: &str) -> usize {
     app.states()
         .text_of(id)
         .map(|lines| lines.join("\n").matches(needle).count())
@@ -500,8 +500,8 @@ struct FocusRig {
     fe: HeadlessFrontend,
     q: Arc<QueuedEvents>,
     wid: winit::window::WindowId,
-    /// The composite id (`<target>\u{241f}focus`) the window knows the session by.
-    composite: String,
+    /// The id (`<target>` + `focus`) the window knows the session by.
+    composite: SessionId,
 }
 
 /// Stand up the shell driving remote session "focus", whose child has enabled
@@ -568,7 +568,7 @@ fn rig_focus_child(remote: &RealRemote) -> FocusRig {
         .groups()
         .iter()
         .flat_map(|g| &g.members)
-        .find(|m| m.ends_with("focus"))
+        .find(|m| m.name() == "focus")
         .expect("the window remembers its remote session")
         .clone();
 

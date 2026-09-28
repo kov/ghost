@@ -374,7 +374,7 @@ impl Locality {
     }
 }
 
-fn locality_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Locality {
+fn locality_for(mine: &HashSet<SessionId>, id: &SessionId, attached: bool) -> Locality {
     if mine.contains(id) {
         Locality::ThisWindow
     } else if attached {
@@ -397,8 +397,8 @@ fn locality_for(mine: &HashSet<SessionId>, id: &str, attached: bool) -> Locality
 /// fresh fleet is built (each F9 / dive-back). A handle tie-break therefore lets
 /// tied tiles swap slots between rebuilds; the globally-unique, stable name never
 /// does.
-fn tile_order_key(t: &Tile) -> (i64, &str) {
-    (t.created_at.unwrap_or(i64::MAX), t.id.as_str())
+fn tile_order_key(t: &Tile) -> (i64, &SessionId) {
+    (t.created_at.unwrap_or(i64::MAX), &t.id)
 }
 
 impl Tile {
@@ -407,7 +407,7 @@ impl Tile {
     /// renders (and the rename seeds) without borrowing the session state.
     fn display(&self) -> &str {
         if self.display_name.is_empty() {
-            &self.id
+            self.id.name()
         } else {
             &self.display_name
         }
@@ -875,8 +875,8 @@ impl FleetModel {
 
     // ---- projections (for the shell + tests) ----
 
-    pub fn focused(&self) -> Option<&str> {
-        self.focused.as_deref()
+    pub fn focused(&self) -> Option<&SessionId> {
+        self.focused.as_ref()
     }
 
     /// The session a toggle-back (F9/Esc) should return to: `prefer` when it is an
@@ -886,8 +886,8 @@ impl FleetModel {
     /// another window. Opening a specific tile is Enter/click ([`adopt`]), not this.
     ///
     /// [`adopt`]: crate::RootModel
-    pub fn owned_tile(&self, prefer: Option<&str>) -> Option<SessionId> {
-        let is_owned = |id: &str| {
+    pub fn owned_tile(&self, prefer: Option<&SessionId>) -> Option<SessionId> {
+        let is_owned = |id: &SessionId| {
             self.tiles
                 .iter()
                 .any(|t| t.id == id && t.locality == Locality::ThisWindow)
@@ -895,7 +895,7 @@ impl FleetModel {
         if let Some(p) = prefer
             && is_owned(p)
         {
-            return Some(p.to_string());
+            return Some(p.clone());
         }
         self.tiles
             .iter()
@@ -915,7 +915,7 @@ impl FleetModel {
     }
 
     /// The screen text of a tile, for assertions.
-    pub fn tile_text(&self, sessions: &Sessions, id: &str) -> Option<Vec<String>> {
+    pub fn tile_text(&self, sessions: &Sessions, id: &SessionId) -> Option<Vec<String>> {
         self.tiles
             .iter()
             .find(|t| t.id == id)
@@ -928,7 +928,7 @@ impl FleetModel {
     /// screen. They diverge exactly when the frame is stale or unbuilt (a blank
     /// preview over a live session), so this is the observable for the
     /// idle-preview seed. `None` when the tile is absent or its frame is unbuilt.
-    pub fn tile_frame_text(&self, id: &str) -> Option<Vec<String>> {
+    pub fn tile_frame_text(&self, id: &SessionId) -> Option<Vec<String>> {
         let frame = self.tiles.iter().find(|t| t.id == id)?.frame.as_ref()?;
         Some(
             frame
@@ -939,14 +939,14 @@ impl FleetModel {
         )
     }
 
-    pub fn locality_of(&self, id: &str) -> Option<Locality> {
+    pub fn locality_of(&self, id: &SessionId) -> Option<Locality> {
         self.tiles.iter().find(|t| t.id == id).map(|t| t.locality)
     }
 
     /// The on-screen preview rect of a tile (post-scroll), exactly as [`view`](Self::view)
     /// draws the little terminal — the box the session's frame is fit into.
     /// `None` if the tile isn't present.
-    pub fn preview_rect(&self, id: &str) -> Option<RectPx> {
+    pub fn preview_rect(&self, id: &SessionId) -> Option<RectPx> {
         let (_, placements, band, _) = self.sections_layout();
         let (_, _, mut rect) = placements.into_iter().find(|(_, i, _)| i == id)?;
         rect.y -= self.scroll_y;
@@ -959,7 +959,7 @@ impl FleetModel {
     /// to a fixed aspect — is the camera target for the fleet-zoom, so a full zoom
     /// lands the session at native size and matches the live single view, with no
     /// scale jump at the dive boundary. `None` if the tile isn't present.
-    pub fn dive_target_rect(&self, id: &str) -> Option<RectPx> {
+    pub fn dive_target_rect(&self, id: &SessionId) -> Option<RectPx> {
         let preview = self.preview_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
         let (cols, rows) = tile.grid;
@@ -988,7 +988,7 @@ impl FleetModel {
     /// which fills the window and so stretches a frame whose native width is a few
     /// pixels shy of the window) makes the dive's endpoint line up with the single
     /// view pixel-for-pixel. `None` if the tile isn't present.
-    pub fn dive_camera(&self, id: &str) -> Option<Transform> {
+    pub fn dive_camera(&self, id: &SessionId) -> Option<Transform> {
         let from = self.dive_target_rect(id)?;
         let tile = self.tiles.iter().find(|t| t.id == id)?;
         let (cols, rows) = tile.grid;
@@ -1033,14 +1033,14 @@ impl FleetModel {
 
     /// Whether `id`'s tile is showing a live preview (it has had output fed in).
     /// `false` if the tile is a cold placeholder, or absent.
-    pub fn tile_fed(&self, id: &str) -> bool {
+    pub fn tile_fed(&self, id: &SessionId) -> bool {
         self.tiles.iter().any(|t| t.id == id && t.fed)
     }
 
     /// Whether this fleet holds a tile for `id` at all (live, cold, or dead). The
     /// shell's shared feed fan uses it to count a fleet window among a session's
     /// viewers — a tile is a view even though its feed routes through the fleet.
-    pub(crate) fn has_tile(&self, id: &str) -> bool {
+    pub(crate) fn has_tile(&self, id: &SessionId) -> bool {
         self.tiles.iter().any(|t| t.id == id)
     }
 
@@ -1051,7 +1051,7 @@ impl FleetModel {
     /// geometry to ingest against instead of stalling.
     pub(crate) fn tile_driving_geometry(
         &self,
-        id: &str,
+        id: &SessionId,
     ) -> Option<crate::terminal::DrivingGeometry> {
         self.tiles
             .iter()
@@ -1067,7 +1067,7 @@ impl FleetModel {
     pub fn prepare_takeover(
         &mut self,
         sessions: &mut Sessions,
-        id: &str,
+        id: &SessionId,
         size_px: (u32, u32),
         scale: f32,
     ) -> Option<Vec<Cmd>> {
@@ -1122,7 +1122,7 @@ impl FleetModel {
         scale: f32,
     ) -> Extracted {
         let keep = target
-            .filter(|id| self.tiles.iter().any(|t| &t.id == id))
+            .filter(|id| self.tiles.iter().any(|t| t.id == id))
             .or_else(|| {
                 self.tiles
                     .iter()
@@ -1139,7 +1139,7 @@ impl FleetModel {
         self.extract(
             sessions,
             keep.clone(),
-            keep.unwrap_or_default(),
+            keep.unwrap_or_else(|| SessionId::local("")),
             size_px,
             scale,
         )
@@ -1364,16 +1364,13 @@ impl FleetModel {
     ) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         let mut dirty = false;
-        let new_ids: HashSet<&str> = infos.iter().map(|l| l.id.as_str()).collect();
+        let new_ids: HashSet<&SessionId> = infos.iter().map(|l| &l.id).collect();
         // A listing that still names a session killed here is a race with its
         // dying host: keep suppressing it. One that no longer names it
         // confirms the death and frees the name.
-        self.killed.retain(|k| new_ids.contains(k.as_str()));
-        let grouped: HashSet<&str> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
-            .collect();
+        self.killed.retain(|k| new_ids.contains(k));
+        let grouped: HashSet<&SessionId> =
+            self.groups.iter().flat_map(|g| g.members.iter()).collect();
 
         // Sessions that disappeared: a group member is remembered as a dead
         // tile (its content stays; the shell refreshes it from the recording);
@@ -1381,7 +1378,7 @@ impl FleetModel {
         // dissolved out from under it.
         let mut gone = Vec::new();
         for t in &mut self.tiles {
-            if !new_ids.contains(t.id.as_str()) && grouped.contains(t.id.as_str()) && !t.dead {
+            if !new_ids.contains(&t.id) && grouped.contains(&t.id) && !t.dead {
                 t.dead = true;
                 t.locality = Locality::Detached;
                 t.frame_dirty = true; // the card meta now says "exited"
@@ -1390,8 +1387,7 @@ impl FleetModel {
             }
         }
         self.tiles.retain(|t| {
-            let keep =
-                new_ids.contains(t.id.as_str()) || (t.dead && grouped.contains(t.id.as_str()));
+            let keep = new_ids.contains(&t.id) || (t.dead && grouped.contains(&t.id));
             if !keep {
                 gone.push(t.id.clone());
                 dirty = true;
@@ -1416,7 +1412,7 @@ impl FleetModel {
                 continue;
             }
             let locality = locality_for(mine, id, info.attached);
-            if let Some(tile) = self.tiles.iter_mut().find(|t| &t.id == id) {
+            if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) {
                 // A just-committed rename defends its optimistic label: don't let a
                 // listing that hasn't caught up (a remote rename still in flight)
                 // revert it. Confirm-and-clear when the listing shows the new name;
@@ -1526,7 +1522,7 @@ impl FleetModel {
         if self
             .focused
             .as_ref()
-            .is_none_or(|f| !self.tiles.iter().any(|t| &t.id == f))
+            .is_none_or(|f| !self.tiles.iter().any(|t| t.id == f))
         {
             self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
         }
@@ -1559,12 +1555,12 @@ impl FleetModel {
         // instead of lingering as an unresurrectable ghost. The sweep always
         // follows the listing that seeded the live tiles, so absence here is
         // evidence, not a not-yet-seeded gap.
-        let named: HashSet<&str> = dead.iter().map(|d| d.name.as_str()).collect();
-        let live: HashSet<&str> = self
+        let named: HashSet<&SessionId> = dead.iter().map(|d| &d.name).collect();
+        let live: HashSet<&SessionId> = self
             .tiles
             .iter()
             .filter(|t| !t.dead)
-            .map(|t| t.id.as_str())
+            .map(|t| &t.id)
             .collect();
         for g in &mut self.groups {
             let before = g.members.len();
@@ -1575,8 +1571,7 @@ impl FleetModel {
             // is unknown) — so a passing network blip never leaves one unnamed.
             // An unnamed remote member means its connected host neither lists
             // nor remembers it (the user ended it there): forget it here too.
-            g.members
-                .retain(|m| live.contains(m.as_str()) || named.contains(m.as_str()));
+            g.members.retain(|m| live.contains(m) || named.contains(m));
             dirty |= g.members.len() != before;
         }
         self.groups
@@ -1584,15 +1579,11 @@ impl FleetModel {
         // Keep a dead tile that is still a group member (a swept-but-remembered local
         // one, or a remote one gone cold) so it stays visible for respawn/reconnect;
         // drop the rest (a dead tile whose membership just went).
-        let grouped: HashSet<&str> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.members.iter().map(|s| s.as_str()))
-            .collect();
+        let grouped: HashSet<&SessionId> =
+            self.groups.iter().flat_map(|g| g.members.iter()).collect();
         let before = self.tiles.len();
-        self.tiles.retain(|t| {
-            !t.dead || named.contains(t.id.as_str()) || grouped.contains(t.id.as_str())
-        });
+        self.tiles
+            .retain(|t| !t.dead || named.contains(&t.id) || grouped.contains(&t.id));
         dirty |= self.tiles.len() != before;
         for d in dead {
             if !self.groups.iter().any(|g| g.members.contains(&d.name)) {
@@ -1652,10 +1643,10 @@ impl FleetModel {
         &mut self,
         sessions: &mut Sessions,
         mine: &HashSet<SessionId>,
-        id: &str,
+        id: &SessionId,
         push: SessionPush,
     ) -> Vec<Cmd> {
-        let focused = self.focused.as_deref() == Some(id);
+        let focused = self.focused.as_ref() == Some(id);
         let observed = self.observing.contains(id);
         let Some(tile) = self.tiles.iter_mut().find(|t| t.id == id) else {
             return Vec::new();
@@ -1772,9 +1763,9 @@ impl FleetModel {
         // the dead ones it remembers, in the stable spatial order (see
         // [`tile_order_key`]). Other groups' members render by locality for
         // now — their own blocks come with per-window identity.
-        let my_members: HashSet<&str> = self
+        let my_members: HashSet<&SessionId> = self
             .group(&self.my_group.id)
-            .map(|g| g.members.iter().map(|s| s.as_str()).collect())
+            .map(|g| g.members.iter().collect())
             .unwrap_or_default();
         let mut segments: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
         let mut mine_tiles: Vec<&Tile> = self
@@ -1782,17 +1773,17 @@ impl FleetModel {
             .iter()
             .filter(|t| {
                 if t.dead {
-                    my_members.contains(t.id.as_str())
+                    my_members.contains(&t.id)
                 } else {
                     // Detached members stay in the block: a group survives
                     // letting go of a session (detach is not ungrouping).
                     t.locality == Locality::ThisWindow
-                        || (t.locality == Locality::Detached && my_members.contains(t.id.as_str()))
+                        || (t.locality == Locality::Detached && my_members.contains(&t.id))
                 }
             })
             .collect();
         mine_tiles.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
-        let in_my_block: HashSet<&str> = mine_tiles.iter().map(|t| t.id.as_str()).collect();
+        let in_my_block: HashSet<&SessionId> = mine_tiles.iter().map(|t| &t.id).collect();
         if !mine_tiles.is_empty() {
             segments.push((
                 Band::Group {
@@ -1822,7 +1813,7 @@ impl FleetModel {
             w: 0.0,
             h: 0.0,
         }; // block rects are filled in during placement
-        let mut placed: HashSet<&str> = in_my_block.clone();
+        let mut placed: HashSet<&SessionId> = in_my_block.clone();
         let mut open_blocks: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
         let mut closed_blocks: Vec<(Band, Vec<&Tile>, f32)> = Vec::new();
         for g in &self.groups {
@@ -1834,7 +1825,7 @@ impl FleetModel {
                 .tiles
                 .iter()
                 .filter(|t| {
-                    if placed.contains(t.id.as_str()) {
+                    if placed.contains(&t.id) {
                         return false;
                     }
                     if self.holder_target(t).as_deref() == Some(g.id.as_str()) {
@@ -1848,7 +1839,7 @@ impl FleetModel {
                 continue;
             }
             for t in &ts {
-                placed.insert(t.id.as_str());
+                placed.insert(&t.id);
             }
             let band = Band::Group {
                 id: g.id.clone(),
@@ -1866,9 +1857,7 @@ impl FleetModel {
         let mut detached: Vec<&Tile> = self
             .tiles
             .iter()
-            .filter(|t| {
-                !t.dead && t.locality == Locality::Detached && !placed.contains(t.id.as_str())
-            })
+            .filter(|t| !t.dead && t.locality == Locality::Detached && !placed.contains(&t.id))
             .collect();
         detached.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
         if !detached.is_empty() {
@@ -1879,9 +1868,7 @@ impl FleetModel {
         let mut elsewhere: Vec<&Tile> = self
             .tiles
             .iter()
-            .filter(|t| {
-                !t.dead && t.locality == Locality::Elsewhere && !placed.contains(t.id.as_str())
-            })
+            .filter(|t| !t.dead && t.locality == Locality::Elsewhere && !placed.contains(&t.id))
             .collect();
         elsewhere.sort_by(|a, b| tile_order_key(a).cmp(&tile_order_key(b)));
         // Attached-elsewhere content — other windows' open groups and the
@@ -2120,7 +2107,7 @@ impl FleetModel {
         let (_, placements, _, _) = self.sections_layout();
         let Some((_, _, rect)) = placements
             .iter()
-            .find(|(_, id, _)| Some(id.as_str()) == self.focused.as_deref())
+            .find(|(_, id, _)| Some(id) == self.focused.as_ref())
         else {
             return;
         };
@@ -2136,11 +2123,11 @@ impl FleetModel {
     fn session_data(
         &mut self,
         sessions: &mut Sessions,
-        name: &str,
+        name: &SessionId,
         bytes: Vec<u8>,
         ended: bool,
     ) -> Vec<Cmd> {
-        let background = self.focused.as_deref() != Some(name);
+        let background = self.focused.as_ref() != Some(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
         let observation_ended = ended && self.observing.remove(name);
@@ -2164,7 +2151,7 @@ impl FleetModel {
         let cmds = tile.view.update(
             state,
             UiEvent::SessionData {
-                name: name.to_string(),
+                name: name.clone(),
                 bytes,
                 ended,
             },
@@ -2219,10 +2206,10 @@ impl FleetModel {
     pub(crate) fn apply_shared_to_tile(
         &mut self,
         sessions: &Sessions,
-        name: &str,
+        name: &SessionId,
         outcome: &FeedOutcome,
     ) -> Vec<Cmd> {
-        let background = self.focused.as_deref() != Some(name);
+        let background = self.focused.as_ref() != Some(name);
         // A dead mirror reverts its tile to a placeholder; the next reconcile
         // re-observes if the session still exists.
         let observation_ended = outcome.ended() && self.observing.remove(name);
@@ -2293,7 +2280,7 @@ impl FleetModel {
         let placements = self.layout();
         let Some((_, _, cur)) = placements
             .iter()
-            .find(|(_, id, _)| Some(id.as_str()) == self.focused.as_deref())
+            .find(|(_, id, _)| Some(id) == self.focused.as_ref())
             .cloned()
         else {
             // No valid focus yet: fall back to the first tile.
@@ -2305,7 +2292,7 @@ impl FleetModel {
         let (cx, cy) = (cur.x + cur.w / 2.0, cur.y + cur.h / 2.0);
         let mut best: Option<(f32, SessionId)> = None;
         for (_, id, r) in &placements {
-            if Some(id.as_str()) == self.focused.as_deref() {
+            if Some(id) == self.focused.as_ref() {
                 continue;
             }
             let (dx, dy) = (r.x + r.w / 2.0 - cx, r.y + r.h / 2.0 - cy);
@@ -2364,7 +2351,7 @@ impl FleetModel {
             } if kind.is_down() && matches!(key, Key::Named(NamedKey::Enter)) => {
                 // Ctrl-Enter opens the focused tile's whole group; plain Enter
                 // (or an ungrouped tile) opens just the tile.
-                let group = self.focused.as_deref().and_then(|id| self.group_of(id));
+                let group = self.focused.as_ref().and_then(|id| self.group_of(id));
                 match group.filter(|_| mods.ctrl) {
                     Some(gid) => self.open_group(&gid),
                     None => self.activate(self.focused.clone()),
@@ -2457,7 +2444,7 @@ impl FleetModel {
                 };
                 let dead: Vec<Cmd> = targets
                     .iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && t.dead))
+                    .filter(|id| self.tiles.iter().any(|t| t.id == *id && t.dead))
                     .cloned()
                     .map(Cmd::Resurrect)
                     .collect();
@@ -2473,10 +2460,7 @@ impl FleetModel {
                 // verb — restart is transport-only.
                 let live_remote: Vec<SessionId> = targets
                     .into_iter()
-                    .filter(|id| {
-                        crate::group::is_remote_id(id)
-                            && self.tiles.iter().any(|t| &t.id == id && !t.dead)
-                    })
+                    .filter(|id| id.is_remote() && self.tiles.iter().any(|t| t.id == id && !t.dead))
                     .collect();
                 if live_remote.is_empty() {
                     return Vec::new();
@@ -2513,7 +2497,7 @@ impl FleetModel {
                 // Ctrl-Delete kills the focused tile's whole group (dead
                 // remnants included, like the header chip).
                 if mods.ctrl
-                    && let Some(gid) = self.focused.as_deref().and_then(|id| self.group_of(id))
+                    && let Some(gid) = self.focused.as_ref().and_then(|id| self.group_of(id))
                 {
                     self.pending = Some(Pending {
                         target: PendingTarget::Group(gid),
@@ -2527,7 +2511,7 @@ impl FleetModel {
                 let targets: Vec<SessionId> = self
                     .key_targets()
                     .into_iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == id))
+                    .filter(|id| self.tiles.iter().any(|t| t.id == id))
                     .collect();
                 if targets.is_empty() {
                     return Vec::new();
@@ -2614,7 +2598,7 @@ impl FleetModel {
     }
 
     /// The group `id` belongs to, if any.
-    fn group_of(&self, id: &str) -> Option<GroupId> {
+    fn group_of(&self, id: &SessionId) -> Option<GroupId> {
         self.groups
             .iter()
             .find(|g| g.members.iter().any(|m| m == id))
@@ -2629,7 +2613,7 @@ impl FleetModel {
             .map(|g| {
                 g.members
                     .iter()
-                    .filter(|id| self.tiles.iter().any(|t| &t.id == *id && !t.dead))
+                    .filter(|id| self.tiles.iter().any(|t| t.id == *id && !t.dead))
                     .cloned()
                     .collect()
             })
@@ -2650,7 +2634,7 @@ impl FleetModel {
                     .filter(|id| {
                         self.tiles
                             .iter()
-                            .any(|t| &t.id == *id && t.dead && t.awaiting_host.is_none())
+                            .any(|t| t.id == *id && t.dead && t.awaiting_host.is_none())
                     })
                     .cloned()
                     .collect()
@@ -2808,7 +2792,7 @@ impl FleetModel {
         // `Cmd::Attach` (or, for `note_driven`, from the `DriverGained` it is
         // handling). `newly` — whether an Attach is owed — is whether the tile
         // wasn't already ours (idempotent for an already-driven member).
-        let newly = if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+        let newly = if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
             let was_mine = t.locality == Locality::ThisWindow;
             t.locality = Locality::ThisWindow;
             !was_mine
@@ -2854,7 +2838,7 @@ impl FleetModel {
         // The caller's `Cmd::Kill` is what drops the session from the root's `mine`.
         self.marked.remove(id);
         self.killed.insert(id.clone());
-        self.tiles.retain(|t| &t.id != id);
+        self.tiles.retain(|t| t.id != id);
         for g in &mut self.groups {
             g.members.retain(|m| m != id);
         }
@@ -2873,7 +2857,7 @@ impl FleetModel {
         let targets: Vec<SessionId> = ids
             .into_iter()
             .filter(|id| {
-                self.tiles.iter().any(|t| &t.id == id && !t.dead)
+                self.tiles.iter().any(|t| t.id == id && !t.dead)
                     && self.locality_of(id) != Some(Locality::ThisWindow)
             })
             .collect();
@@ -2907,13 +2891,13 @@ impl FleetModel {
     /// a dead one is forgotten — membership was all that kept it. The
     /// registry save follows from the sync.
     fn ungroup_session(&mut self, id: &SessionId) -> Vec<Cmd> {
-        let dead = self.tiles.iter().any(|t| &t.id == id && t.dead);
+        let dead = self.tiles.iter().any(|t| t.id == id && t.dead);
         for g in &mut self.groups {
             g.members.retain(|m| m != id);
         }
         self.groups.retain(|g| !g.members.is_empty());
         if dead {
-            self.tiles.retain(|t| &t.id != id);
+            self.tiles.retain(|t| t.id != id);
             Vec::new()
         } else if self.locality_of(id) == Some(Locality::ThisWindow) {
             self.detach_session(id)
@@ -2927,7 +2911,7 @@ impl FleetModel {
         if self
             .focused
             .as_ref()
-            .is_some_and(|f| !self.tiles.iter().any(|t| &t.id == f))
+            .is_some_and(|f| !self.tiles.iter().any(|t| t.id == f))
         {
             self.focused = self.layout().into_iter().next().map(|(_, id, _)| id);
         }
@@ -2947,7 +2931,7 @@ impl FleetModel {
     /// tile's group — or just the focused tile when it belongs to none,
     /// mirroring how Ctrl-Enter degrades to Enter.
     fn focused_group_targets(&self) -> Vec<SessionId> {
-        match self.focused.as_deref().and_then(|id| self.group_of(id)) {
+        match self.focused.as_ref().and_then(|id| self.group_of(id)) {
             Some(gid) => self.present_members(&gid),
             None => self.focused.clone().into_iter().collect(),
         }
@@ -2957,7 +2941,7 @@ impl FleetModel {
     /// members — for the verbs that act on remembered corpses too
     /// (ungroup forgets them, kill discards them).
     fn focused_group_all_members(&self) -> Vec<SessionId> {
-        match self.focused.as_deref().and_then(|id| self.group_of(id)) {
+        match self.focused.as_ref().and_then(|id| self.group_of(id)) {
             Some(gid) => self
                 .group(&gid)
                 .map(|g| g.members.clone())
@@ -2984,7 +2968,7 @@ impl FleetModel {
         // Flipping the tile off ThisWindow is the release as the overview shows
         // it; the root drops the session from its `mine` when it sees the
         // `Cmd::Detach` (`release_detached`).
-        if let Some(t) = self.tiles.iter_mut().find(|t| &t.id == id) {
+        if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
             t.locality = Locality::Detached;
         }
         if self.observing.insert(id.clone()) {
@@ -3039,7 +3023,7 @@ impl FleetModel {
                     .iter()
                     .find(|t| t.id == id)
                     .map(|t| t.display().to_string())
-                    .unwrap_or_else(|| id.clone());
+                    .unwrap_or_else(|| id.name().to_string());
                 self.renaming = Some(Renaming {
                     buffer: TextInput::new(seed),
                     id,
@@ -3198,7 +3182,7 @@ impl FleetModel {
     /// Whether `id`'s tile is a remembered corpse — dead, nothing running. A
     /// kill of one is a *discard* (throwing away the saved screen), and the
     /// confirm should say so instead of claiming something will be killed.
-    fn is_corpse(&self, id: &str) -> bool {
+    fn is_corpse(&self, id: &SessionId) -> bool {
         self.tiles.iter().any(|t| t.id == id && t.dead)
     }
 
@@ -3294,9 +3278,9 @@ impl FleetModel {
         let shown = self
             .tiles
             .iter()
-            .find(|t| &t.id == id)
+            .find(|t| t.id == id)
             .map(|t| t.display().to_string())
-            .unwrap_or_else(|| id.clone());
+            .unwrap_or_else(|| id.name().to_string());
         match p.action {
             PendingAction::Kill if self.is_corpse(id) => (
                 format!("Discard {shown}? (its saved screen is lost)"),
@@ -3417,7 +3401,7 @@ impl FleetModel {
                         // only later. The host stays authoritative: the mark clears
                         // when a listing confirms the new name, or after the timeout
                         // if it refused it.
-                        let label = if name == r.id {
+                        let label = if name == r.id.name() {
                             String::new() // renaming back to the id unlabels
                         } else {
                             name.clone()
@@ -3543,7 +3527,7 @@ impl FleetModel {
             .filter(|id| {
                 self.tiles
                     .iter()
-                    .find(|t| &&t.id == id)
+                    .find(|t| &t.id == id)
                     .is_none_or(|t| t.dead || t.locality != Locality::Elsewhere)
             })
             .cloned()
@@ -3735,11 +3719,11 @@ impl FleetModel {
     /// Dropped anywhere else, a member of my block is released: a driven
     /// session detaches, a dead one is forgotten. Foreign and closed blocks
     /// are not drop targets — the card just snaps home.
-    fn drop_tile(&mut self, id: &str, px: f32, py: f32) -> Vec<Cmd> {
+    fn drop_tile(&mut self, id: &SessionId, px: f32, py: f32) -> Vec<Cmd> {
         let set: Vec<SessionId> = if self.marked.contains(id) {
             self.marked_in_order()
         } else {
-            vec![id.to_string()]
+            vec![id.clone()]
         };
         let (headers, _, _, _) = self.sections_layout();
         let over_mine = headers.iter().any(|(b, _)| {
@@ -3769,9 +3753,9 @@ impl FleetModel {
         cmds
     }
 
-    fn toggle_mark(&mut self, id: &str) {
+    fn toggle_mark(&mut self, id: &SessionId) {
         if !self.marked.remove(id) {
-            self.marked.insert(id.to_string());
+            self.marked.insert(id.clone());
         }
     }
 
@@ -3952,7 +3936,7 @@ impl FleetModel {
             let state = sessions
                 .get(&tile.id)
                 .expect("fleet tile has a session state");
-            let focused = self.focused.as_deref() == Some(id.as_str());
+            let focused = self.focused.as_ref() == Some(&id);
             let (header, preview, buttons) = card_layout(rect, band);
 
             // The whole card on a solid panel, so it reads as one unit.
@@ -4031,7 +4015,7 @@ impl FleetModel {
                     .unwrap_or_else(|| Rc::new(layout_frame(state.screen().vt(), metrics)));
                 out.push(SceneItem::Terminal {
                     id: SceneId::Tile(handle),
-                    session: ghost_render::session_key(&tile.id),
+                    session: ghost_render::session_key(&tile.id.to_composite()),
                     rect: preview,
                     frame,
                     selection: if focused {
@@ -4291,14 +4275,14 @@ fn placeholder_hint(loc: Locality) -> &'static str {
 /// always the shell there, so it's noise; the cwd and pid are omitted when
 /// unknown.
 fn card_meta(
-    id: &str,
+    name: &str,
     command: &[String],
     pid: i32,
     cwd: Option<String>,
     progress: Option<ghost_term::Progress>,
     host: Option<&str>,
 ) -> String {
-    let mut s = id.to_string();
+    let mut s = name.to_string();
     // Mark a remote session with its connection target right after the name, so
     // one can tell which host it lives on (and remote tiles apart from local).
     if let Some(host) = host {
@@ -4376,9 +4360,16 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 mod tests {
     use ghost_vt::session::SessionInfo;
 
-    /// A listing of this machine's sessions.
+    /// A listing of sessions named as the tests write them: a bare name is
+    /// local, a `<target>␟<name>` composite remote.
     fn listed(infos: Vec<SessionInfo>) -> Vec<crate::Listed> {
-        infos.into_iter().map(crate::Listed::local).collect()
+        infos
+            .into_iter()
+            .map(|info| crate::Listed {
+                id: SessionId::parse_composite(&info.name),
+                info,
+            })
+            .collect()
     }
     use super::*;
     use crate::TerminalModel;
@@ -4440,12 +4431,12 @@ mod tests {
             mine: HashSet<SessionId>,
         ) -> (Self, Vec<Cmd>) {
             let mut s = Sessions::new();
-            let primary_id = primary.session().to_string();
+            let primary_id = primary.session().clone();
             let primary_view = s.adopt(primary);
             let warm: Vec<(SessionId, TerminalView)> = warm
                 .into_iter()
                 .map(|model| {
-                    let id = model.session().to_string();
+                    let id = model.session().clone();
                     (id, s.adopt(model))
                 })
                 .collect();
@@ -4487,7 +4478,7 @@ mod tests {
         }
 
         fn tile_text(&self, id: &str) -> Option<Vec<String>> {
-            self.m.tile_text(&self.s, id)
+            self.m.tile_text(&self.s, &SessionId::from(id))
         }
 
         fn into_single(self, size_px: (u32, u32), scale: f32) -> Extracted {
@@ -4527,7 +4518,7 @@ mod tests {
         /// The session state behind a tile — for the assertions that once read it off
         /// the tile's whole model (screen text, title, remembered display name).
         fn state(&self, id: &str) -> Option<&SessionState> {
-            self.s.get(id)
+            self.s.get(&SessionId::from(id))
         }
 
         /// Set the policy on every held session, as the window's `set_policy` does
@@ -4580,7 +4571,7 @@ mod tests {
 
     fn data(m: &mut Fleet, name: &str, bytes: &[u8]) -> Vec<Cmd> {
         m.update(UiEvent::SessionData {
-            name: name.to_string(),
+            name: name.into(),
             bytes: bytes.to_vec(),
             ended: false,
         })
@@ -4672,13 +4663,13 @@ mod tests {
     }
 
     /// Session ids in laid-out order (section order, then within-section order).
-    fn order(m: &Fleet) -> Vec<String> {
+    fn order(m: &Fleet) -> Vec<SessionId> {
         m.layout().into_iter().map(|(_, id, _)| id).collect()
     }
 
     fn push(m: &mut Fleet, name: &str, p: SessionPush) -> Vec<Cmd> {
         m.update(UiEvent::SessionPush {
-            name: name.to_string(),
+            name: name.into(),
             push: p,
         })
     }
@@ -4720,7 +4711,7 @@ mod tests {
         list(&mut m, &["a", "b"]);
         key(&mut m, Key::Named(NamedKey::Space));
         assert!(
-            m.marked.contains("a"),
+            m.marked.contains(&"a".into()),
             "focus defaults to a; Space marks it"
         );
         key(&mut m, Key::Named(NamedKey::Space));
@@ -4734,7 +4725,7 @@ mod tests {
         list(&mut m, &["a", "b"]);
         let pos = centre_of(&m, "b");
         let cmds = press_ctrl(&mut m, pos);
-        assert!(m.marked.contains("b"));
+        assert!(m.marked.contains(&"b".into()));
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "a marking click must not open the tile"
@@ -4757,7 +4748,7 @@ mod tests {
     /// This window's fleet: `mine` pre-owned, with a minted group identity —
     /// what the root hands a real fleet.
     fn my_fleet(mine: &[&str]) -> Fleet {
-        let mut m = Fleet::new(METRICS, SIZE, mine.iter().map(|s| s.to_string()).collect());
+        let mut m = Fleet::new(METRICS, SIZE, mine.iter().map(|&s| s.into()).collect());
         m.set_my_group(Group::auto("w1".into(), 0));
         m
     }
@@ -4770,7 +4761,10 @@ mod tests {
             id: gid.to_string(),
             name: name.to_string(),
             color: 1,
-            members: members.iter().map(|s| s.to_string()).collect(),
+            members: members
+                .iter()
+                .map(|s| SessionId::parse_composite(s))
+                .collect(),
             connection: None,
         });
         m.update(UiEvent::GroupsLoaded(groups));
@@ -4778,7 +4772,7 @@ mod tests {
 
     /// My group's persisted members according to the LAST save in `cmds`
     /// (`None` when nothing was saved).
-    fn saved_members(cmds: &[Cmd], gid: &str) -> Option<Vec<String>> {
+    fn saved_members(cmds: &[Cmd], gid: &str) -> Option<Vec<SessionId>> {
         cmds.iter().rev().find_map(|c| match c {
             Cmd::SaveGroups(gs) => Some(
                 gs.iter()
@@ -4811,7 +4805,7 @@ mod tests {
         // Membership is persisted without being asked.
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["a".to_string()]),
+            Some(vec![SessionId::from("a")]),
             "the automatic group saves its membership: {cmds:?}"
         );
         // The block is outlined in the group color, heavier than the 1px
@@ -4839,9 +4833,9 @@ mod tests {
         // Claiming a session creates the entry; detaching keeps it (the
         // member just goes cold in the block); the throw-away kill is what
         // finally removes membership and dissolves the emptied entry.
-        m.mine.insert("a".to_string());
+        m.mine.insert("a".into());
         let cmds = list(&mut m, &["a", "b"]);
-        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["a".to_string()]));
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec![SessionId::from("a")]));
         let r = button_rect(&m, "a", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(
@@ -4851,7 +4845,7 @@ mod tests {
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "w1" && g.members.contains(&"a".to_string()))
+                .any(|g| g.id == "w1" && g.members.contains(&SessionId::local("a")))
         );
         let r = button_rect(&m, "a", Button::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -4883,8 +4877,8 @@ mod tests {
             let pos = centre_of(m, id);
             press_ctrl(m, pos);
         }
-        assert_eq!(m.focused.as_deref(), Some(id));
-        assert!(!m.marked.contains(id));
+        assert_eq!(m.focused, Some(SessionId::from(id)));
+        assert!(!m.marked.contains(&SessionId::from(id)));
     }
 
     /// The rect of `button` on group `gid`'s header band.
@@ -4936,11 +4930,11 @@ mod tests {
                 Cmd::SaveGroups(m.groups().to_vec()),
             ]
         );
-        assert_eq!(m.locality_of("c"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"c".into()), Some(Locality::ThisWindow));
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "w1" && g.members.contains(&"c".to_string())),
+                .any(|g| g.id == "w1" && g.members.contains(&SessionId::local("c"))),
             "the claimed member joins this window's group: {:?}",
             m.groups()
         );
@@ -4965,10 +4959,10 @@ mod tests {
         let cmds = ctrl_enter(&mut m);
         let mine = saved_members(&cmds, "w1").expect("the merge saves the registry");
         assert!(
-            mine.contains(&"a".to_string()),
+            mine.contains(&SessionId::from("a")),
             "the take-over target's membership moves with the open: {mine:?}"
         );
-        assert!(mine.contains(&"c".to_string()), "{mine:?}");
+        assert!(mine.contains(&SessionId::from("c")), "{mine:?}");
         let last_save = cmds
             .iter()
             .rev()
@@ -4980,7 +4974,7 @@ mod tests {
         assert!(
             last_save
                 .iter()
-                .all(|g| g.id == "w1" || !g.members.contains(&"a".to_string())),
+                .all(|g| g.id == "w1" || !g.members.contains(&SessionId::local("a"))),
             "the member belongs to no other group after the move: {last_save:?}"
         );
     }
@@ -5074,7 +5068,13 @@ mod tests {
         );
         // Confirm (Space) → the shell restarts the remote host under the new binary.
         let cmds = key(&mut m, Key::Named(NamedKey::Space));
-        assert_eq!(cmds, vec![Cmd::RestartRemote(remote.clone()), Cmd::Redraw]);
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::RestartRemote(SessionId::parse_composite(&remote)),
+                Cmd::Redraw
+            ]
+        );
     }
 
     #[test]
@@ -5109,8 +5109,8 @@ mod tests {
             ],
             "detaching is not ungrouping — no registry churn"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
-        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"c".into()), Some(Locality::Detached));
         assert!(
             m.groups()
                 .iter()
@@ -5167,11 +5167,14 @@ mod tests {
                 .all(|l| l != "web" && l != "Attached elsewhere"),
             "hidden by default: {labels:?}"
         );
-        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
-        assert!(laid.contains(&"d".to_string()), "the pool stays: {laid:?}");
+        let laid: Vec<SessionId> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        assert!(
+            laid.contains(&SessionId::from("d")),
+            "the pool stays: {laid:?}"
+        );
         for hidden in ["a", "b", "x"] {
             assert!(
-                !laid.contains(&hidden.to_string()),
+                !laid.contains(&SessionId::from(hidden)),
                 "{hidden} is not laid out while hidden: {laid:?}"
             );
         }
@@ -5187,18 +5190,18 @@ mod tests {
             labels.iter().any(|l| l == "web") && labels.iter().any(|l| l == "Attached elsewhere"),
             "revealed: {labels:?}"
         );
-        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        let laid: Vec<SessionId> = m.layout().into_iter().map(|(_, id, _)| id).collect();
         for shown in ["a", "b", "x", "d"] {
             assert!(
-                laid.contains(&shown.to_string()),
+                laid.contains(&SessionId::from(shown)),
                 "{shown} revealed: {laid:?}"
             );
         }
         // Clicking again re-hides.
         let r = toggle_rect(&m).expect("the toggle stays while revealed");
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
-        let laid: Vec<String> = m.layout().into_iter().map(|(_, id, _)| id).collect();
-        assert!(!laid.contains(&"a".to_string()), "re-hidden: {laid:?}");
+        let laid: Vec<SessionId> = m.layout().into_iter().map(|(_, id, _)| id).collect();
+        assert!(!laid.contains(&SessionId::from("a")), "re-hidden: {laid:?}");
     }
 
     /// The reveal toggle's band, if one renders.
@@ -5264,7 +5267,7 @@ mod tests {
         seed_group(&mut m, "g-p", "purple", &["batch"]); // closed: [attach all, dissolve, kill]
         // A portrait mirror makes the card — and so the block — narrow.
         m.update(UiEvent::SessionPush {
-            name: "batch".to_string(),
+            name: "batch".into(),
             push: SessionPush::Event(SessionEvent::Resized { cols: 20, rows: 50 }),
         });
         let (headers, _, _, _) = m.sections_layout();
@@ -5370,7 +5373,7 @@ mod tests {
 
     fn dead_info(name: &str, display: &str, command: &[&str]) -> crate::event::DeadSession {
         crate::event::DeadSession {
-            name: name.to_string(),
+            name: SessionId::parse_composite(name),
             display_name: display.to_string(),
             command: command.iter().map(|s| s.to_string()).collect(),
             cwd: None,
@@ -5382,7 +5385,7 @@ mod tests {
     /// [`crate::DeadState::AwaitingHost`]).
     fn awaiting_info(name: &str, target: &str) -> crate::event::DeadSession {
         crate::event::DeadSession {
-            name: name.to_string(),
+            name: SessionId::parse_composite(name),
             display_name: String::new(),
             command: Vec::new(),
             cwd: None,
@@ -5546,13 +5549,13 @@ mod tests {
 
     #[test]
     fn the_detach_button_releases_the_session_and_keeps_a_live_preview() {
-        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".into()]));
         widen(&mut m);
         m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
         ])));
-        assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::ThisWindow));
         let r = button_rect(&m, "a", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(
@@ -5564,13 +5567,13 @@ mod tests {
             "the released session is observed so its preview stays live: {cmds:?}"
         );
         assert_eq!(
-            m.locality_of("a"),
+            m.locality_of(&"a".into()),
             Some(Locality::Detached),
             "the tile moves out of This window immediately"
         );
         // The next listing (host confirms the client is gone) keeps it there.
         m.update(UiEvent::SessionList(listed(vec![info("a"), info("b")])));
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
     }
 
     #[test]
@@ -5728,7 +5731,7 @@ mod tests {
         );
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["a".to_string()]),
+            Some(vec![SessionId::from("a")]),
             "its membership is persisted away: {cmds:?}"
         );
         // The other half of the footer still relaunches.
@@ -5846,7 +5849,7 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "the press alone opens nothing (it may become a drag): {cmds:?}"
         );
-        assert_eq!(m.focused(), Some("a"), "focus lands on the press");
+        assert_eq!(m.focused(), Some(&"a".into()), "focus lands on the press");
         let cmds = pointer_phase(&mut m, PointerPhase::Release, cx, cy);
         assert!(
             cmds.contains(&Cmd::TakeOver("a".into())),
@@ -5895,10 +5898,10 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
             "a drag is not a click — no foreground switch: {cmds:?}"
         );
-        assert_eq!(m.locality_of("d"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"d".into()), Some(Locality::ThisWindow));
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["a".to_string(), "d".to_string()]),
+            Some(vec![SessionId::from("a"), SessionId::from("d")]),
             "the claim persists: {cmds:?}"
         );
     }
@@ -5922,7 +5925,7 @@ mod tests {
         );
         let cmds = key(&mut m, Key::Named(NamedKey::Space)); // confirm
         assert!(cmds.contains(&Cmd::Attach("x".into())), "{cmds:?}");
-        assert_eq!(m.locality_of("x"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"x".into()), Some(Locality::ThisWindow));
     }
 
     #[test]
@@ -5942,8 +5945,8 @@ mod tests {
             cmds.contains(&Cmd::Observe("a".into())),
             "the released session keeps a live preview: {cmds:?}"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
-        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["b".to_string()]));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec![SessionId::from("b")]));
     }
 
     #[test]
@@ -5962,7 +5965,7 @@ mod tests {
             !m.tiles.iter().any(|t| t.id == "a"),
             "membership was all that kept the dead tile"
         );
-        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["b".to_string()]));
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec![SessionId::from("b")]));
     }
 
     #[test]
@@ -5993,7 +5996,7 @@ mod tests {
             "{cmds:?}"
         );
         assert_eq!(m.groups(), &before[..], "no membership changed");
-        assert_eq!(m.locality_of("d"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"d".into()), Some(Locality::Detached));
     }
 
     #[test]
@@ -6080,7 +6083,7 @@ mod tests {
                 .any(|c| matches!(c, Cmd::Detach(id) if id == "d")),
             "already-detached marks are skipped: {cmds:?}"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
         assert!(m.marked.is_empty());
     }
 
@@ -6114,13 +6117,13 @@ mod tests {
             cmds.contains(&Cmd::Attach("d".into())),
             "a attaches the focused tile: {cmds:?}"
         );
-        assert_eq!(m.locality_of("d"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"d".into()), Some(Locality::ThisWindow));
         let cmds = key(&mut m, Key::Char("d".to_string()));
         assert!(
             cmds.contains(&Cmd::Detach("d".into())),
             "d releases the focused tile: {cmds:?}"
         );
-        assert_eq!(m.locality_of("d"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"d".into()), Some(Locality::Detached));
         focus(&mut m, "m0");
         let cmds = key(&mut m, Key::Named(NamedKey::Delete));
         assert!(m.modal_open(), "a kill is confirmed: {cmds:?}");
@@ -6151,7 +6154,7 @@ mod tests {
         assert!(!m.tiles.iter().any(|t| t.id == "z"), "the corpse is gone");
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["a".to_string()]),
+            Some(vec![SessionId::from("a")]),
             "the membership goes with it: {cmds:?}"
         );
     }
@@ -6195,8 +6198,8 @@ mod tests {
             cmds.contains(&Cmd::Detach("a".into())) && cmds.contains(&Cmd::Detach("c".into())),
             "every driven member releases: {cmds:?}"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
-        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"c".into()), Some(Locality::Detached));
         assert!(
             m.groups().iter().any(|g| g.id == "w1"),
             "detaching keeps the group: {:?}",
@@ -6242,10 +6245,10 @@ mod tests {
         );
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["c".to_string()]),
+            Some(vec![SessionId::from("c")]),
             "the membership goes: {cmds:?}"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
         let block = my_block_rect(&m);
         let r = tile_rect(&m, "a");
         assert!(
@@ -6269,7 +6272,7 @@ mod tests {
             !m.tiles.iter().any(|t| t.id == "z"),
             "membership was all that kept the corpse"
         );
-        assert_eq!(saved_members(&cmds, "w1"), Some(vec!["a".to_string()]));
+        assert_eq!(saved_members(&cmds, "w1"), Some(vec![SessionId::from("a")]));
     }
 
     #[test]
@@ -6300,8 +6303,8 @@ mod tests {
             Some(Vec::new()),
             "the entry dissolves: {cmds:?}"
         );
-        assert_eq!(m.locality_of("a"), Some(Locality::Detached));
-        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"c".into()), Some(Locality::Detached));
     }
 
     #[test]
@@ -6406,7 +6409,7 @@ mod tests {
         assert!(cmds.contains(&Cmd::Kill("a".into())), "{cmds:?}");
         assert_eq!(
             saved_members(&cmds, "w1"),
-            Some(vec!["c".to_string()]),
+            Some(vec![SessionId::from("c")]),
             "the membership goes with the kill: {cmds:?}"
         );
         assert!(
@@ -6503,7 +6506,8 @@ mod tests {
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "g-remote" && g.members.contains(&remote)),
+                .any(|g| g.id == "g-remote"
+                    && g.members.contains(&SessionId::parse_composite(&remote))),
             "a member named waiting survives the outage: {:?}",
             m.groups()
         );
@@ -6677,17 +6681,17 @@ mod tests {
 
     #[test]
     fn the_fleet_observes_sessions_it_does_not_drive() {
-        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".into()]));
         let cmds = m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
         ])));
         assert!(
-            cmds.contains(&Cmd::Observe("b".to_string())),
+            cmds.contains(&Cmd::Observe("b".into())),
             "the foreign tile gets a live mirror; got {cmds:?}"
         );
         assert!(
-            !cmds.contains(&Cmd::Observe("a".to_string())),
+            !cmds.contains(&Cmd::Observe("a".into())),
             "a driven session is already live — observing it would double-feed"
         );
         // A second reconcile doesn't re-observe.
@@ -6703,10 +6707,10 @@ mod tests {
         let mut m = fleet();
         list(&mut m, &["b"]);
         let cmds = list(&mut m, &[]);
-        assert!(cmds.contains(&Cmd::Unobserve("b".to_string())));
+        assert!(cmds.contains(&Cmd::Unobserve("b".into())));
         // Re-listing it re-observes.
         let cmds = list(&mut m, &["b"]);
-        assert!(cmds.contains(&Cmd::Observe("b".to_string())));
+        assert!(cmds.contains(&Cmd::Observe("b".into())));
     }
 
     #[test]
@@ -6715,8 +6719,8 @@ mod tests {
         widen(&mut m);
         list(&mut m, &["b", "c"]);
         let (_, _, _, cmds) = m.into_single_keeping(None, WIDE, 1.0);
-        assert!(cmds.contains(&Cmd::Unobserve("b".to_string())));
-        assert!(cmds.contains(&Cmd::Unobserve("c".to_string())));
+        assert!(cmds.contains(&Cmd::Unobserve("b".into())));
+        assert!(cmds.contains(&Cmd::Unobserve("c".into())));
     }
 
     #[test]
@@ -6772,14 +6776,14 @@ mod tests {
         data(&mut m, "b", b"live");
         assert!(tile(&m, "b").fed);
         m.update(UiEvent::SessionData {
-            name: "b".to_string(),
+            name: "b".into(),
             bytes: vec![],
             ended: true,
         });
         assert!(!tile(&m, "b").fed, "a dead mirror is a placeholder again");
         // The next reconcile re-observes it (the session may still exist).
         let cmds = list(&mut m, &["b"]);
-        assert!(cmds.contains(&Cmd::Observe("b".to_string())));
+        assert!(cmds.contains(&Cmd::Observe("b".into())));
     }
 
     #[test]
@@ -6961,11 +6965,11 @@ mod tests {
             "the whole group opens here: {cmds:?}"
         );
         // The claimed member is ThisWindow under the adopted identity.
-        assert_eq!(m.locality_of("y"), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"y".into()), Some(Locality::ThisWindow));
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "g2" && g.members.contains(&"y".to_string())),
+                .any(|g| g.id == "g2" && g.members.contains(&SessionId::local("y"))),
             "membership stays under the adopted entry: {:?}",
             m.groups()
         );
@@ -6993,7 +6997,7 @@ mod tests {
         assert!(
             m.groups()
                 .iter()
-                .any(|g| g.id == "w1" && g.members.contains(&"y".to_string())),
+                .any(|g| g.id == "w1" && g.members.contains(&SessionId::local("y"))),
             "claimed members join my group: {:?}",
             m.groups()
         );
@@ -7268,15 +7272,15 @@ mod tests {
 
     #[test]
     fn tiles_are_split_into_attach_state_sections() {
-        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".into()]));
         m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", false), // ours -> Attached
             sinfo("b", true),  // attached elsewhere
             sinfo("c", false), // detached
         ])));
-        assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
-        assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
-        assert_eq!(m.locality_of("c"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::ThisWindow));
+        assert_eq!(m.locality_of(&"b".into()), Some(Locality::Elsewhere));
+        assert_eq!(m.locality_of(&"c".into()), Some(Locality::Detached));
         m.show_elsewhere = true;
         // Three headers, stacked top to bottom: this window's group first,
         // then the detached pool (the likeliest tiles to grab), then —
@@ -7314,11 +7318,11 @@ mod tests {
         let mut m = fleet();
         list(&mut m, &["a", "b", "c", "d"]); // one section, 2x2 grid: a b / c d
         widen(&mut m);
-        assert_eq!(m.focused(), Some("a")); // top-left
+        assert_eq!(m.focused(), Some(&"a".into())); // top-left
         key(&mut m, Key::Named(NamedKey::ArrowDown));
         assert_eq!(
             m.focused(),
-            Some("c"),
+            Some(&"c".into()),
             "Down moves to the tile below, not the next in order"
         );
         // Right is the horizontal neighbour.
@@ -7326,16 +7330,12 @@ mod tests {
         list(&mut m, &["a", "b", "c", "d"]);
         widen(&mut m);
         key(&mut m, Key::Named(NamedKey::ArrowRight));
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
     }
 
     #[test]
     fn arrow_down_crosses_into_the_next_section() {
-        let mut m = Fleet::new(
-            METRICS,
-            SIZE,
-            HashSet::from(["a1".to_string(), "a2".to_string()]),
-        );
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a1".into(), "a2".into()]));
         m.update(UiEvent::SessionList(listed(vec![
             sinfo("a1", false),
             sinfo("a2", false),
@@ -7343,8 +7343,8 @@ mod tests {
             sinfo("d2", false),
         ])));
         widen(&mut m);
-        assert_eq!(m.focused(), Some("a1"));
-        assert_eq!(m.locality_of("a1"), Some(Locality::ThisWindow));
+        assert_eq!(m.focused(), Some(&"a1".into()));
+        assert_eq!(m.locality_of(&"a1".into()), Some(Locality::ThisWindow));
         key(&mut m, Key::Named(NamedKey::ArrowDown));
         assert_eq!(
             m.locality_of(m.focused().unwrap()),
@@ -7437,7 +7437,7 @@ mod tests {
         // The fleet never attaches sessions itself.
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::Attach(_))));
         assert_eq!(m.tile_count(), 2);
-        assert_eq!(m.focused(), Some("a")); // first tile focused by default
+        assert_eq!(m.focused(), Some(&"a".into())); // first tile focused by default
 
         let cmds = list(&mut m, &["a"]);
         assert!(cmds.contains(&Cmd::Detach("b".into())));
@@ -7467,7 +7467,7 @@ mod tests {
         // A window-sized session has the window's aspect (1400:900 ≈ 1.56), which is
         // not the card's fixed 80×24 preview-box aspect (≈ 1.67).
         let win = (1400u32, 900u32);
-        let mut primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mut primary = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         primary.update(UiEvent::Resize {
             w_px: win.0,
             h_px: win.1,
@@ -7475,12 +7475,16 @@ mod tests {
         });
         let (cols, rows) = primary.dims();
         let session_aspect = (cols as f32 * METRICS.advance) / (rows as f32 * METRICS.line_height);
-        let mine = HashSet::from(["alpha".to_string()]);
+        let mine = HashSet::from(["alpha".into()]);
         let (f, _) = Fleet::adopting(primary, Vec::new(), METRICS, win, 1.0, mine);
 
         let aspect = |r: RectPx| r.w / r.h;
-        let target = f.dive_target_rect("alpha").expect("the tile is present");
-        let preview = f.preview_rect("alpha").expect("the tile is present");
+        let target = f
+            .dive_target_rect(&"alpha".into())
+            .expect("the tile is present");
+        let preview = f
+            .preview_rect(&"alpha".into())
+            .expect("the tile is present");
 
         // The dive aims at where the content is actually drawn, so a cover-zoom lands
         // the session at native size (matching the live single view) — no boundary pop.
@@ -7516,15 +7520,17 @@ mod tests {
         // half the tile's physical size, so the zoom collapsed toward 1x — the dive
         // "didn't resize, just slid". The camera scale must be scale-invariant.
         let camera_scale = |win: (u32, u32), scale: f32| -> f32 {
-            let mut primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+            let mut primary = TerminalModel::new("alpha".into(), 80, 24, METRICS);
             primary.update(UiEvent::Resize {
                 w_px: win.0,
                 h_px: win.1,
                 scale: f64::from(scale),
             });
-            let mine = HashSet::from(["alpha".to_string()]);
+            let mine = HashSet::from(["alpha".into()]);
             let (f, _) = Fleet::adopting(primary, Vec::new(), METRICS, win, scale, mine);
-            f.dive_camera("alpha").expect("the tile is present").scale
+            f.dive_camera(&"alpha".into())
+                .expect("the tile is present")
+                .scale
         };
         // Same logical window (1400x900), rendered at 1x and at 2x (HiDPI doubles the
         // physical size and the cell size together, so the logical grid is identical).
@@ -7744,15 +7750,15 @@ mod tests {
         let mut m = fleet();
         list(&mut m, &["a", "b"]);
         widen(&mut m);
-        assert_eq!(m.focused(), Some("a"));
+        assert_eq!(m.focused(), Some(&"a".into()));
         let cmds = key(&mut m, Key::Named(NamedKey::ArrowRight));
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
         assert_eq!(cmds, vec![Cmd::Redraw]); // focus only, nothing forwarded
         // Clamped at the end (no wrap on arrows).
         key(&mut m, Key::Named(NamedKey::ArrowRight));
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
         key(&mut m, Key::Named(NamedKey::ArrowLeft));
-        assert_eq!(m.focused(), Some("a"));
+        assert_eq!(m.focused(), Some(&"a".into()));
     }
 
     /// Click (press + release in place) at the centre of `id`'s tile.
@@ -7815,7 +7821,7 @@ mod tests {
         let mut m = fleet();
         list(&mut m, &["a", "b"]); // both detached
         let cmds = press(&mut m, "b");
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
         assert!(
             cmds.contains(&Cmd::TakeOver("b".into())),
             "clicking a detached tile opens it: {cmds:?}"
@@ -7824,7 +7830,7 @@ mod tests {
 
     #[test]
     fn clicking_the_detach_button_detaches_instead_of_opening() {
-        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".into()]));
         m.update(UiEvent::SessionList(listed(vec![
             info("a"),
             sinfo("b", true),
@@ -8203,7 +8209,7 @@ mod tests {
         a.attached = true; // attached by another window
         m.update(UiEvent::SessionList(listed(vec![a])));
         reveal(&mut m);
-        assert_eq!(m.locality_of("a"), Some(Locality::Elsewhere));
+        assert_eq!(m.locality_of(&"a".into()), Some(Locality::Elsewhere));
         let cmds = press(&mut m, "a");
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::TakeOver(_))),
@@ -8440,7 +8446,7 @@ mod tests {
         assert_eq!(badges(&m), 1);
         // Focusing b clears its activity badge.
         key(&mut m, Key::Named(NamedKey::ArrowRight));
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
         assert_eq!(badges(&m), 0);
     }
 
@@ -8894,7 +8900,7 @@ mod tests {
             scale: 1.0,
         });
         list_many(&mut m, 6); // single column (narrow), taller than 500px
-        assert_eq!(m.focused(), Some("s0"));
+        assert_eq!(m.focused(), Some(&"s0".into()));
         assert_eq!(m.scroll_y, 0.0);
 
         let view_h = 500.0;
@@ -8903,7 +8909,7 @@ mod tests {
             let (_, placements, _, _) = m.sections_layout();
             let (_, _, r) = placements
                 .into_iter()
-                .find(|(_, id, _)| Some(id.as_str()) == m.focused())
+                .find(|(_, id, _)| Some(id) == m.focused())
                 .unwrap();
             let (top, bottom) = (r.y - m.scroll_y, r.y + r.h - m.scroll_y);
             assert!(
@@ -8959,7 +8965,7 @@ mod tests {
         let mut m = fleet();
         list(&mut m, &["a", "b", "c"]); // focus "a"
         key(&mut m, Key::Named(NamedKey::Tab)); // a -> b
-        assert_eq!(m.focused(), Some("b"));
+        assert_eq!(m.focused(), Some(&"b".into()));
         // Shift+Tab steps back and wraps.
         let cmds = m.update(UiEvent::Key {
             key: Key::Named(NamedKey::Tab),
@@ -8967,7 +8973,7 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         });
-        assert_eq!(m.focused(), Some("a"));
+        assert_eq!(m.focused(), Some(&"a".into()));
         assert_eq!(cmds, vec![Cmd::Redraw]); // focus only, never SendInput
         // Wrapping backward past the start lands on the last tile.
         m.update(UiEvent::Key {
@@ -8976,7 +8982,7 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         });
-        assert_eq!(m.focused(), Some("c"));
+        assert_eq!(m.focused(), Some(&"c".into()));
     }
 
     #[test]
@@ -8999,7 +9005,7 @@ mod tests {
     fn a_driven_tile_still_answers_a_query() {
         // A session this window DRIVES, previewed in the fleet, keeps its write
         // path: its emulator's query replies must still flow out as SendInput.
-        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
+        let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".into()]));
         list(&mut m, &["b"]); // in `mine` → a driven tile
         let cmds = data(&mut m, "b", b"\x1b[6n");
         assert!(
@@ -9023,8 +9029,11 @@ mod tests {
             !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
             "the fleet must not attach any session: {cmds:?}"
         );
-        assert_eq!(m.locality_of("foreign"), Some(Locality::Elsewhere));
-        assert_eq!(m.locality_of("mine-detached"), Some(Locality::Detached));
+        assert_eq!(m.locality_of(&"foreign".into()), Some(Locality::Elsewhere));
+        assert_eq!(
+            m.locality_of(&"mine-detached".into()),
+            Some(Locality::Detached)
+        );
         assert_eq!(m.tile_count(), 2); // both shown, as placeholder tiles
     }
 
@@ -9036,7 +9045,7 @@ mod tests {
         // (in two groups); the guard crashes rather than silently corrupt state.
         let mut f = fleet();
         f.update(UiEvent::SessionList(listed(vec![sinfo("ghost-mac", true)])));
-        let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
+        let _ = f.into_single_adopting("ghost-mac".into(), SIZE, 1.0);
     }
 
     #[test]
@@ -9049,23 +9058,26 @@ mod tests {
         let mut f = fleet(); // owns nothing
         widen(&mut f);
         f.update(UiEvent::SessionList(listed(vec![sinfo("ghost-mac", true)])));
-        assert_eq!(f.locality_of("ghost-mac"), Some(Locality::Elsewhere));
+        assert_eq!(
+            f.locality_of(&"ghost-mac".into()),
+            Some(Locality::Elsewhere)
+        );
         reveal(&mut f); // the "attached elsewhere" pool is folded by default
         focus(&mut f, "ghost-mac");
         // Enter opens the take-over confirm modal; Space confirms it.
         key(&mut f, Key::Named(NamedKey::Enter));
         let cmds = key(&mut f, Key::Named(NamedKey::Space));
         assert!(
-            cmds.contains(&Cmd::TakeOver("ghost-mac".to_string())),
+            cmds.contains(&Cmd::TakeOver("ghost-mac".into())),
             "confirming steals the held session: {cmds:?}"
         );
         assert_eq!(
-            f.locality_of("ghost-mac"),
+            f.locality_of(&"ghost-mac".into()),
             Some(Locality::ThisWindow),
             "the take-over must claim the tile before the dive"
         );
         // Proof the guard is satisfied: extracting it as the foreground no longer panics.
-        let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
+        let _ = f.into_single_adopting("ghost-mac".into(), SIZE, 1.0);
     }
 
     /// The fleet-dive reaper behind the macOS "window drops its foreground session
@@ -9077,32 +9089,32 @@ mod tests {
     /// session, which aborted at `drive`'s `expect` on its next input.
     #[test]
     fn diving_out_of_the_fleet_never_reaps_a_foreign_session_another_window_drives() {
-        let mine = HashSet::from(["alpha".to_string()]);
-        let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mine = HashSet::from(["alpha".into()]);
+        let primary = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(listed(vec![
             info("alpha"),
             sinfo("beta", true),
         ])));
         assert_eq!(
-            f.locality_of("beta"),
+            f.locality_of(&"beta".into()),
             Some(Locality::Elsewhere),
             "beta is attached in another window"
         );
         // Model the shared registry: beta's state exists because the OTHER window
         // drives it in its foreground.
-        f.s.get_or_mint("beta", 80, 24);
+        f.s.get_or_mint(&"beta".into(), 80, 24);
 
         // Dive back into our own "alpha", dropping the foreign beta tile.
         let (_extracted, sessions) =
-            f.into_single_adopting_with_sessions("alpha".to_string(), SIZE, 1.0);
+            f.into_single_adopting_with_sessions("alpha".into(), SIZE, 1.0);
 
         assert!(
-            sessions.contains("alpha"),
+            sessions.contains(&"alpha".into()),
             "the adopted foreground survives"
         );
         assert!(
-            sessions.contains("beta"),
+            sessions.contains(&"beta".into()),
             "beta's shared state survives — the other window still foregrounds it"
         );
     }
@@ -9110,8 +9122,8 @@ mod tests {
     #[test]
     fn into_single_keeps_the_owned_session_even_when_focus_moved() {
         // The window owns "alpha"; the fleet also previews a foreign "beta".
-        let mine = HashSet::from(["alpha".to_string()]);
-        let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mine = HashSet::from(["alpha".into()]);
+        let primary = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
         f.update(UiEvent::SessionList(listed(vec![
             info("alpha"),
@@ -9124,7 +9136,7 @@ mod tests {
             kind: KeyEventKind::Press,
             alts: None,
         });
-        assert_eq!(f.focused(), Some("beta"));
+        assert_eq!(f.focused(), Some(&"beta".into()));
         // Toggling back returns the OWNED session and detaches nothing — the
         // other sessions stay attached (warm) for Ctrl-Tab and live previews.
         let (kept_id, _view, _warm, cmds) = f.into_single(SIZE, 1.0);

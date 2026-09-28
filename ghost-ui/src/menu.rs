@@ -109,14 +109,14 @@ pub enum UserEvent {
     /// at the window's current grid (see `App::finish_reattach`).
     RemoteReattachReady {
         wid: winit::window::WindowId,
-        name: String,
+        name: ghost_ui_core::SessionId,
     },
     /// A dropped remote session's host came back but the session is gone (the host
     /// rebooted): posted by the probe so the main loop ends the reconnecting hold
     /// (see `App::end_reconnect_gone`).
     RemoteSessionGone {
         wid: winit::window::WindowId,
-        name: String,
+        name: ghost_ui_core::SessionId,
     },
     /// Opening a new session on an already-connected remote host finished off the
     /// event loop (the `ghost new -d` over the transport is a blocking `ssh` round

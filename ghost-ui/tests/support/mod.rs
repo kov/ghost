@@ -264,8 +264,8 @@ pub fn tile_center(scene: &ghost_render::Scene, name: &str) -> Option<(f64, f64)
 
 /// Whether the session's viewport is drawn **dimmed** — how a window shows that it
 /// is holding a frozen screen while it reconnects. `None` if it isn't drawn at all.
-pub fn session_dimmed(scene: &ghost_render::Scene, name: &str) -> Option<bool> {
-    let key = ghost_render::scene::session_key(name);
+pub fn session_dimmed(scene: &ghost_render::Scene, id: &ghost_ui_core::SessionId) -> Option<bool> {
+    let key = ghost_render::scene::session_key(&id.to_composite());
     scene
         .layers
         .iter()

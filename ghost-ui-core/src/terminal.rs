@@ -793,7 +793,7 @@ impl SessionState {
     /// Enter or leave the reconnecting hold for `name` (a no-op for another
     /// session). A redraw repaints the dim; the reconnected resync repaints the
     /// recovered screen. Never sets `ended` — the session isn't gone.
-    fn set_reconnecting(&mut self, name: &str, on: bool) -> Vec<Cmd> {
+    fn set_reconnecting(&mut self, name: &SessionId, on: bool) -> Vec<Cmd> {
         if name != self.session || self.reconnecting == on {
             return Vec::new();
         }
@@ -811,18 +811,18 @@ impl SessionState {
     /// background/foreground switches.
     pub(crate) fn title(&self) -> String {
         let title = self.screen.title();
-        let label = (!self.display_name.is_empty() && self.display_name != self.session)
+        let label = (!self.display_name.is_empty() && self.display_name != self.session.name())
             .then_some(self.display_name.as_str());
         match (label, title.is_empty()) {
             (Some(label), false) => format!("{label} — {title}"),
             (Some(label), true) => label.to_string(),
             (None, false) => title.to_string(),
-            (None, true) => self.session.clone(),
+            (None, true) => self.session.to_string(),
         }
     }
 
     /// The session id these effects target.
-    pub(crate) fn session(&self) -> &str {
+    pub(crate) fn session(&self) -> &SessionId {
         &self.session
     }
 
@@ -853,7 +853,7 @@ impl SessionState {
     /// labeled, else its immutable id.
     pub(crate) fn display(&self) -> &str {
         if self.display_name.is_empty() {
-            &self.session
+            self.session.name()
         } else {
             &self.display_name
         }
@@ -1395,7 +1395,7 @@ impl TerminalModel {
     }
 
     /// The session id these effects target (see [`SessionState::session`]).
-    pub fn session(&self) -> &str {
+    pub fn session(&self) -> &SessionId {
         self.state.session()
     }
 }
@@ -1970,7 +1970,7 @@ impl TerminalView {
         };
         let mut items = vec![SceneItem::Terminal {
             id: SceneId::Root,
-            session: ghost_render::session_key(state.session()),
+            session: ghost_render::session_key(&state.session().to_composite()),
             rect,
             frame,
             selection: self.selection(state),
@@ -2477,7 +2477,7 @@ impl TerminalView {
     fn session_data(
         &mut self,
         state: &mut SessionState,
-        name: &str,
+        name: &SessionId,
         bytes: &[u8],
         ended: bool,
     ) -> Vec<Cmd> {
@@ -2731,7 +2731,7 @@ impl TerminalView {
             }
             let generation = image.generation;
             cmds.push(Cmd::UploadImage {
-                session: state.session().to_string(),
+                session: state.session().clone(),
                 id,
                 width: image.width,
                 height: image.height,
@@ -3780,7 +3780,7 @@ mod tests {
     };
 
     fn model() -> TerminalModel {
-        let mut m = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mut m = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         // Exercise the mechanisms under a permissive policy — the *default*
         // policy's denials (title read-back, program resize, window take-over)
         // are pinned by their own tests here and in `ghost_term::policy`.
@@ -3792,7 +3792,7 @@ mod tests {
     /// the model answers a query with).
     fn reply_to(m: &mut TerminalModel, bytes: &[u8]) -> String {
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: bytes.to_vec(),
             ended: false,
         });
@@ -3818,14 +3818,14 @@ mod tests {
         // Maximizing takes the grid to the display, asks the window to follow, and
         // tells the child its new size — and `CSI 18 t` now answers with it.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[9;1t".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::SetMaximized(true)));
         assert!(cmds.iter().any(|c| matches!(c, Cmd::ResizeWindow { .. })));
         assert!(cmds.contains(&Cmd::Resize {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             cols: 200,
             rows: 50,
         }));
@@ -3833,7 +3833,7 @@ mod tests {
 
         // Restoring puts back the grid it had, not a guess.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[9;0t".to_vec(),
             ended: false,
         });
@@ -3862,7 +3862,7 @@ mod tests {
         let mut m = model();
         m.set_action_policy(ActionPolicy::deny_all());
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             // A clipboard write, a minimize — and a plain print, which is the
             // session's own screen and never a policy matter.
             bytes: b"\x1b]52;c;aGVsbG8=\x07\x1b[2thello".to_vec(),
@@ -3886,9 +3886,9 @@ mod tests {
         // A fresh model keeps the safe default (unlike the `model()` helper, which
         // opts into allow_all): a program may still put text on the clipboard, but
         // may no longer take the window over (iconify) unprompted.
-        let mut m = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mut m = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]52;c;aGVsbG8=\x07\x1b[2t".to_vec(),
             ended: false,
         });
@@ -3965,7 +3965,7 @@ mod tests {
         );
 
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[2t".to_vec(),
             ended: false,
         });
@@ -3976,14 +3976,14 @@ mod tests {
 
         // Full-screen fills the display and toggles back to the grid it had.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[10;1t".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::SetFullscreen(true)));
         assert_eq!(reply_to(&mut m, b"\x1b[18t"), "\x1b[8;50;200t");
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[10;2t".to_vec(),
             ended: false,
         });
@@ -4014,12 +4014,12 @@ mod tests {
     fn decslpp_sets_the_page_height_and_the_window_follows() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[30t".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::Resize {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             cols: 80,
             rows: 30,
         }));
@@ -4046,7 +4046,7 @@ mod tests {
 
     fn feed(m: &mut TerminalModel, bytes: &[u8]) {
         m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: bytes.to_vec(),
             ended: false,
         });
@@ -4077,7 +4077,7 @@ mod tests {
 
     fn sent(session: &str, bytes: &[u8]) -> Cmd {
         Cmd::SendInput {
-            session: session.to_string(),
+            session: session.into(),
             bytes: bytes.to_vec(),
         }
     }
@@ -4361,7 +4361,7 @@ mod tests {
         // follows the program, and the window is asked to grow to fit it (80 * 9 =
         // 720 px wide becomes 132 * 9 = 1188; the height is unchanged).
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?40h\x1b[?3h".to_vec(),
             ended: false,
         });
@@ -4377,7 +4377,7 @@ mod tests {
         // The child learns its new width too (xterm SIGWINCHes after DECCOLM).
         assert!(
             cmds.contains(&Cmd::Resize {
-                session: "alpha".to_string(),
+                session: "alpha".into(),
                 cols: 132,
                 rows: 24,
             }),
@@ -4386,7 +4386,7 @@ mod tests {
 
         // Back to 80 columns: the window is asked to shrink again.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?3l".to_vec(),
             ended: false,
         });
@@ -4417,7 +4417,7 @@ mod tests {
         assert_eq!(m.state.screen.dimensions(), (80, 24));
         assert_eq!((m.state.cols, m.state.rows), (80, 24));
         assert!(cmds.contains(&Cmd::Resize {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             cols: 80,
             rows: 24,
         }));
@@ -4434,7 +4434,7 @@ mod tests {
         // DECCOLM is gated on ?40 (off by default): the sequence is inert, so the
         // window must not be jostled.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?3h".to_vec(),
             ended: false,
         });
@@ -4675,7 +4675,7 @@ mod tests {
 
     /// A model with a deliberately narrow grid, so a modest token soft-wraps.
     fn narrow_model(cols: u16) -> TerminalModel {
-        let mut m = TerminalModel::new("alpha".to_string(), cols, 6, METRICS);
+        let mut m = TerminalModel::new("alpha".into(), cols, 6, METRICS);
         m.set_policy(ghost_term::SessionPolicy::allow_all());
         m
     }
@@ -4988,7 +4988,7 @@ mod tests {
         // The app enables kitty disambiguate (flag 1) on its PTY, then queries.
         feed(&mut m, b"\x1b[>1u");
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?u".to_vec(),
             ended: false,
         });
@@ -5287,7 +5287,7 @@ mod tests {
             cmds,
             vec![
                 Cmd::Resize {
-                    session: "alpha".to_string(),
+                    session: "alpha".into(),
                     cols: 40,
                     rows: 10
                 },
@@ -5309,7 +5309,7 @@ mod tests {
             scale: 2.0,
         });
         assert!(cmds.contains(&Cmd::Resize {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             cols: 40,
             rows: 12
         }));
@@ -5454,7 +5454,7 @@ mod tests {
         // case: an app enables ?1004h after it is already in the foreground).
         m.update(UiEvent::Focus(true));
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?1004h".to_vec(),
             ended: false,
         });
@@ -5471,7 +5471,7 @@ mod tests {
         let mut m = model();
         m.update(UiEvent::Focus(false));
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?1004h".to_vec(),
             ended: false,
         });
@@ -5489,7 +5489,7 @@ mod tests {
         // A second feed that does not touch ?1004 must not re-report focus —
         // only the rising edge of the mode does.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"x".to_vec(),
             ended: false,
         });
@@ -5554,7 +5554,7 @@ mod tests {
         let mut m = model();
         // Device status report query -> the model answers it.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"hi\x1b[6n".to_vec(),
             ended: false,
         });
@@ -5579,7 +5579,7 @@ mod tests {
 
         // The transport drops: enter the hold (frozen + dimmed), never `ended`.
         let cmds = m.update(UiEvent::SessionDisconnected {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
         });
         assert_eq!(cmds, vec![Cmd::Redraw]);
         assert!(m.reconnecting());
@@ -5595,7 +5595,7 @@ mod tests {
 
         // Reattaching clears the hold; the host's resync then repaints normally.
         let cmds = m.update(UiEvent::SessionReattached {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
         });
         assert_eq!(cmds, vec![Cmd::Redraw]);
         assert!(!m.reconnecting());
@@ -5606,7 +5606,7 @@ mod tests {
     fn a_disconnect_for_another_session_is_ignored() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionDisconnected {
-            name: "other".to_string(),
+            name: "other".into(),
         });
         assert!(cmds.is_empty());
         assert!(!m.reconnecting());
@@ -5616,7 +5616,7 @@ mod tests {
     fn content_feed_redraws() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"hello".to_vec(),
             ended: false,
         });
@@ -5630,7 +5630,7 @@ mod tests {
         // nothing is decoded, no cell is written, so `Screen::feed` reports zero
         // dirty rows and there is nothing to repaint.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: vec![0xf0],
             ended: false,
         });
@@ -5707,7 +5707,7 @@ mod tests {
         // The reset lands in a quiet batch: nothing new to draw *except* the deferred
         // palette remap the hold has been sitting on.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026l".to_vec(),
             ended: false,
         });
@@ -5742,7 +5742,7 @@ mod tests {
     /// move the reply into a view, or the repaint into the ingest, and it fails.
     #[test]
     fn one_ingest_reaches_every_view_but_answers_the_child_once() {
-        let mut state = SessionState::new("alpha".to_string(), 80, 24);
+        let mut state = SessionState::new("alpha".into(), 80, 24);
         state.set_policy(ghost_term::SessionPolicy::allow_all());
         let mut a = TerminalView::new(METRICS, 80, 24);
         let mut b = TerminalView::new(METRICS, 80, 24);
@@ -5799,7 +5799,7 @@ mod tests {
     /// observer's window size with the driver's, corrupting its layout math.
     #[test]
     fn a_deccolm_resizes_only_the_driving_views_window() {
-        let mut state = SessionState::new("alpha".to_string(), 80, 24);
+        let mut state = SessionState::new("alpha".into(), 80, 24);
         state.set_policy(ghost_term::SessionPolicy::allow_all());
         let mut driver = TerminalView::new(METRICS, 80, 24);
         let mut observer = TerminalView::new(METRICS, 80, 24);
@@ -5849,7 +5849,7 @@ mod tests {
         let mut m = model();
         // The hold opens mid-frame: the backstop tick is scheduled once.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026hhello".to_vec(),
             ended: false,
         });
@@ -5861,7 +5861,7 @@ mod tests {
         // model): no tick ever reaches this one. The next batch also ends inside
         // the open frame — swallowed, and it must leave a release pending.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"world".to_vec(),
             ended: false,
         });
@@ -6010,7 +6010,7 @@ mod tests {
     fn osc52_writes_reach_the_system_clipboard_cmds() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]52;c;aGVsbG8=\x07".to_vec(), // "hello"
             ended: false,
         });
@@ -6019,7 +6019,7 @@ mod tests {
             "no clipboard write: {cmds:?}"
         );
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]52;p;cHJpbWFyeQ==\x07".to_vec(), // "primary"
             ended: false,
         });
@@ -6029,7 +6029,7 @@ mod tests {
         );
         // The read form gets no reply — nothing goes back to the app.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]52;c;?\x07".to_vec(),
             ended: false,
         });
@@ -6055,7 +6055,7 @@ mod tests {
         // full-screen apps, whose differential renderers move the cursor without
         // rewriting the cell.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[3;1H".to_vec(),
             ended: false,
         });
@@ -6077,7 +6077,7 @@ mod tests {
         // held — no redraw — and a release timeout is scheduled in case the
         // app never closes the frame.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026hhello".to_vec(),
             ended: false,
         });
@@ -6097,7 +6097,7 @@ mod tests {
         // release always in flight (see
         // `a_feed_swallowed_by_an_open_hold_re_arms_the_release_backstop`).
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b" world".to_vec(),
             ended: false,
         });
@@ -6110,7 +6110,7 @@ mod tests {
         // The frame closes: one redraw presents the accumulated content, even
         // though the closing feed itself changed no viewport row.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026l".to_vec(),
             ended: false,
         });
@@ -6124,7 +6124,7 @@ mod tests {
     fn synchronized_output_hold_times_out() {
         let mut m = model();
         m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026hhello".to_vec(),
             ended: false,
         });
@@ -6164,7 +6164,7 @@ mod tests {
         // Hiding the cursor (DECTCEM reset) erases its block — a visible change on its
         // row even though no cell content moved.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?25l".to_vec(),
             ended: false,
         });
@@ -6309,7 +6309,7 @@ mod tests {
         // With the cursor hidden nothing is drawn at it, so a bare move paints no
         // pixels and must not force a repaint.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[3;1H".to_vec(),
             ended: false,
         });
@@ -6461,7 +6461,7 @@ mod tests {
         // the rows it covered now render without it. No cell was written and no
         // image was *uploaded*, so nothing else will trigger the repaint.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Ga=d,d=a\x1b\\".to_vec(),
             ended: false,
         });
@@ -6577,7 +6577,7 @@ mod tests {
         let mut m = model();
         let feed_cmds = |m: &mut TerminalModel, b: &[u8]| {
             m.update(UiEvent::SessionData {
-                name: "alpha".to_string(),
+                name: "alpha".into(),
                 bytes: b.to_vec(),
                 ended: false,
             })
@@ -6600,7 +6600,7 @@ mod tests {
         m.set_display_name("build box".to_string());
         assert_eq!(m.title(), "build box", "the display name beats the id");
         m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]2;vim\x07".to_vec(),
             ended: false,
         });
@@ -6622,7 +6622,7 @@ mod tests {
         let mut m = model(); // session "alpha"
         let feed_cmds = |m: &mut TerminalModel, b: &[u8]| {
             m.update(UiEvent::SessionData {
-                name: "alpha".to_string(),
+                name: "alpha".into(),
                 bytes: b.to_vec(),
                 ended: false,
             })
@@ -6642,7 +6642,7 @@ mod tests {
     fn session_data_for_another_session_is_ignored() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "beta".to_string(),
+            name: "beta".into(),
             bytes: b"nope".to_vec(),
             ended: false,
         });
@@ -6654,13 +6654,13 @@ mod tests {
         let mut m = model();
         // a=T: transmit a 2x1 RGB image (id 5) and display it.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
             ended: false,
         });
         // The pixels are uploaded out of band, RGBA (red, green, opaque).
         assert!(cmds.contains(&Cmd::UploadImage {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             id: 5,
             width: 2,
             height: 1,
@@ -6671,7 +6671,7 @@ mod tests {
 
         // Later plain output does not re-upload the same image.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"x".to_vec(),
             ended: false,
         });
@@ -6686,7 +6686,7 @@ mod tests {
     fn two_sessions_upload_the_same_image_id_as_two_images() {
         let upload = |m: &mut TerminalModel, session: &str, pixels: &str| {
             m.update(UiEvent::SessionData {
-                name: session.to_string(),
+                name: session.into(),
                 bytes: format!("\x1b_Gi=1,a=T,f=24,s=2,v=1;{pixels}\x1b\\").into_bytes(),
                 ended: false,
             })
@@ -6701,9 +6701,9 @@ mod tests {
         };
 
         // Both sessions transmit id 1: "alpha" red-then-green, "beta" blue-then-blue.
-        let mut alpha = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
+        let mut alpha = TerminalModel::new("alpha".into(), 80, 24, METRICS);
         let (a_session, a_id, a_rgba) = upload(&mut alpha, "alpha", "/wAAAP8A");
-        let mut beta = TerminalModel::new("beta".to_string(), 80, 24, METRICS);
+        let mut beta = TerminalModel::new("beta".into(), 80, 24, METRICS);
         let (b_session, b_id, b_rgba) = upload(&mut beta, "beta", "AAD/AAD/");
 
         assert_eq!((a_id, b_id), (1, 1), "both programs chose id 1");
@@ -6721,12 +6721,12 @@ mod tests {
         let mut m = model();
         // a=T: transmit a 2x1 RGB image (id 5, red|green) and display it.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::UploadImage {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             id: 5,
             width: 2,
             height: 1,
@@ -6737,7 +6737,7 @@ mod tests {
         // renderer still holds the OLD pixels, so the model must send the new ones.
         // Keying uploads on the id alone leaves the image stale on screen forever.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Gi=5,a=T,f=24,s=2,v=1;AAD/AP8A\x1b\\".to_vec(),
             ended: false,
         });
@@ -6760,13 +6760,13 @@ mod tests {
         let mut bytes = b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\\x1b[38;2;0;0;7m".to_vec();
         bytes.extend("\u{10eeee}\u{10eeee}".as_bytes());
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes,
             ended: false,
         });
         // Even with no direct placement, the placeholder reference triggers upload.
         assert!(cmds.contains(&Cmd::UploadImage {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             id: 7,
             width: 2,
             height: 1,
@@ -6774,7 +6774,7 @@ mod tests {
         }));
         // And it uploads once: a later redraw-causing feed does not re-upload.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"x".to_vec(),
             ended: false,
         });
@@ -6789,13 +6789,13 @@ mod tests {
         let mut bytes = b"\x1b[38;2;0;0;7m".to_vec();
         bytes.extend("\u{10eeee}\r\n".as_bytes());
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes,
             ended: false,
         });
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::UploadImage { .. })));
         m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: vec![b'\n'; 30], // push the placeholder line into scrollback
             ended: false,
         });
@@ -6803,12 +6803,12 @@ mod tests {
         // Now the image arrives. The placeholder is in scrollback, not the live
         // viewport, but the freshly-stored image must still upload.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Gi=7,a=t,f=24,s=2,v=1;/wAAAP8A\x1b\\".to_vec(),
             ended: false,
         });
         assert!(cmds.contains(&Cmd::UploadImage {
-            session: "alpha".to_string(),
+            session: "alpha".into(),
             id: 7,
             width: 2,
             height: 1,
@@ -6820,7 +6820,7 @@ mod tests {
     fn session_data_answers_a_graphics_query_without_uploading() {
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b_Gi=31,a=q,f=24,s=1,v=1;AAAA\x1b\\".to_vec(),
             ended: false,
         });
@@ -6834,7 +6834,7 @@ mod tests {
         let mut m = model();
         assert!(!m.ended());
         m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: vec![],
             ended: true,
         });
@@ -7646,7 +7646,7 @@ mod tests {
             ..ThemeColors::default()
         });
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]11;?\x1b\\\x1b]10;?\x07".to_vec(),
             ended: false,
         });
@@ -7666,7 +7666,7 @@ mod tests {
         // the cursor color back in the same feed — replies must reflect
         // post-feed state: the override for bg, the theme default for cursor.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]11;#204060\x07\x1b]11;?\x07\x1b]12;?\x07".to_vec(),
             ended: false,
         });
@@ -7695,7 +7695,7 @@ mod tests {
         // A color-only feed dirties no rows, but the default bg is every
         // pixel: it must repaint and report whole-view damage.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]11;#204060\x07".to_vec(),
             ended: false,
         });
@@ -7727,7 +7727,7 @@ mod tests {
         // report whole-view damage; banding only the (zero) written rows would leave
         // the rest of the texture in the old palette.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]4;1;#204060\x07".to_vec(),
             ended: false,
         });
@@ -7742,7 +7742,7 @@ mod tests {
 
         // OSC 104 reset (index 1 back to the theme default) is the same recolor.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]104;1\x07".to_vec(),
             ended: false,
         });
@@ -7758,7 +7758,7 @@ mod tests {
         let mut m = model();
         // Ghost's default theme is dark.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?996n".to_vec(),
             ended: false,
         });
@@ -7768,7 +7768,7 @@ mod tests {
         );
         // An app-set light background flips the answer.
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b]11;#ffffff\x07\x1b[?996n".to_vec(),
             ended: false,
         });
@@ -7804,7 +7804,7 @@ mod tests {
         // set), as `Cmd::SendInput` on the session.
         let mut m = model();
         let cmds = m.update(UiEvent::SessionData {
-            name: "alpha".to_string(),
+            name: "alpha".into(),
             bytes: b"\x1b[?2026h\x1b[?2026$p".to_vec(),
             ended: false,
         });
@@ -8191,7 +8191,7 @@ mod tests {
                         Op::Feed(bytes) => {
                             let (before, _) = frame_and_damage(&m);
                             let cmds = m.update(UiEvent::SessionData {
-                                name: "alpha".to_string(),
+                                name: "alpha".into(),
                                 bytes,
                                 ended: false,
                             });
@@ -8350,7 +8350,7 @@ mod tests {
                     match op {
                         Op::Feed(bytes) => {
                             m.update(UiEvent::SessionData {
-                                name: "alpha".to_string(),
+                                name: "alpha".into(),
                                 bytes,
                                 ended: false,
                             });

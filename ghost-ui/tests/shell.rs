@@ -82,9 +82,10 @@ fn a_member_whose_descriptor_is_gone_is_forgotten_not_shown() {
             visible_text(&scene)
         );
         assert!(
-            !app.groups()
+            !app.groups().iter().any(|g| g
+                .members
                 .iter()
-                .any(|g| g.members.iter().any(|m| m == "discarded-1")),
+                .any(|m| m.local_name() == Some("discarded-1"))),
             "the sweep must forget it, or it haunts every later launch: {:?}",
             app.groups()
         );
@@ -175,7 +176,7 @@ fn a_cleanly_exited_session_is_not_offered_for_relaunch() {
             .expect("window");
         app.wake(&fe);
         assert!(
-            app.root(wid).expect("window").foregrounds("done-1"),
+            app.root(wid).expect("window").foregrounds(&"done-1".into()),
             "precondition: the window drives the session"
         );
 
@@ -208,7 +209,7 @@ fn a_cleanly_exited_session_is_not_offered_for_relaunch() {
         assert!(
             !app.groups()
                 .iter()
-                .any(|g| g.members.iter().any(|m| m == "done-1")),
+                .any(|g| g.members.iter().any(|m| m.local_name() == Some("done-1"))),
             "its membership goes with it: {:?}",
             app.groups()
         );
@@ -420,7 +421,7 @@ fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
             .expect("first window");
         app.wake(&fe);
         assert!(
-            app.root(a).expect("A").foregrounds("shared-1"),
+            app.root(a).expect("A").foregrounds(&"shared-1".into()),
             "precondition: A shows the session"
         );
 
@@ -476,7 +477,7 @@ fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
         // output, so let the loop run as it would live.
         let landed = wait_until(Duration::from_secs(5), || {
             app.wake(&fe);
-            app.root(b).expect("B").foregrounds("shared-1")
+            app.root(b).expect("B").foregrounds(&"shared-1".into())
         });
         assert!(
             landed,
@@ -484,7 +485,7 @@ fn taking_over_another_windows_foreground_moves_it_out_of_that_window() {
             visible_text(&app.root(b).expect("B").view(app.states()))
         );
         assert!(
-            !app.root(a).expect("A").foregrounds("shared-1"),
+            !app.root(a).expect("A").foregrounds(&"shared-1".into()),
             "A must not still show a session B now owns: {:?}",
             visible_text(&app.root(a).expect("A").view(app.states()))
         );
@@ -512,7 +513,7 @@ fn the_last_session_exiting_closes_the_window_when_nothing_is_attachable() {
             .expect("window");
         app.wake(&fe);
         assert!(
-            app.root(wid).expect("window").foregrounds("solo-1"),
+            app.root(wid).expect("window").foregrounds(&"solo-1".into()),
             "precondition: the window drives the session"
         );
 
@@ -604,7 +605,8 @@ fn an_emptied_window_closes_alone_while_another_window_keeps_ghost_running() {
             "A must close once its only session exits and nothing is attachable"
         );
         assert!(
-            app.root(b).is_some_and(|r| r.foregrounds("stays-b")),
+            app.root(b)
+                .is_some_and(|r| r.foregrounds(&"stays-b".into())),
             "B keeps its own session"
         );
         assert!(!fe.exited(), "ghost stays running while a window remains");
@@ -700,7 +702,8 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
         let ids = app.window_ids();
         assert_eq!(ids.len(), 2, "Alt+N opens a second window: {ids:?}");
         assert!(
-            app.root(a).is_some_and(|r| r.foregrounds("first-a")),
+            app.root(a)
+                .is_some_and(|r| r.foregrounds(&"first-a".into())),
             "the window Alt+N was pressed in stays, still on its session"
         );
         support::kill_session("first-a");
@@ -710,7 +713,7 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
 /// The rendered occurrences of `needle` on a session's screen.
 fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
     app.states()
-        .text_of(id)
+        .text_of(&id.into())
         .map(|lines| lines.join("\n").matches(needle).count())
         .unwrap_or(0)
 }
@@ -746,7 +749,7 @@ fn open_card(app: &mut App, wid: winit::window::WindowId, fe: &HeadlessFrontend,
     }
     let opened = wait_until(Duration::from_secs(10), || {
         app.wake(fe);
-        app.root(wid).is_some_and(|r| r.foregrounds(name))
+        app.root(wid).is_some_and(|r| r.foregrounds(&name.into()))
     });
     assert!(
         opened,
@@ -817,7 +820,7 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
         assert!(
             echoing,
             "the child never came up echoing what it is sent: {:?}",
-            app.states().text_of("watcher-a")
+            app.states().text_of(&"watcher-a".into())
         );
 
         // Everything up to here is the baseline; this test is about the round trip.
@@ -840,7 +843,7 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
             told_hidden,
             "switching away must tell the program it is no longer shown (ESC[O); \
              its screen: {:?}",
-            app.states().text_of("watcher-a")
+            app.states().text_of(&"watcher-a".into())
         );
 
         app.dispatch(
@@ -859,7 +862,7 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
             told_shown,
             "switching back must tell the program it is shown again (ESC[I); \
              its screen: {:?}",
-            app.states().text_of("watcher-a")
+            app.states().text_of(&"watcher-a".into())
         );
 
         // Exactly one report each way: a spurious extra is the same bug wearing
@@ -871,7 +874,7 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
             ),
             (1, 1),
             "one focus-out leaving and one focus-in returning, no more: {:?}",
-            app.states().text_of("watcher-a")
+            app.states().text_of(&"watcher-a".into())
         );
 
         support::kill_session("watcher-a");

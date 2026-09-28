@@ -19,6 +19,7 @@ pub mod group;
 pub mod input;
 pub mod mouse;
 pub mod root;
+pub mod session_id;
 pub mod terminal;
 pub mod text_input;
 /// The wire trace lives with the host (which traces its own PTY drain) so both
@@ -44,9 +45,7 @@ pub use terminal::{
 };
 pub use workspace::{WindowRecord, WorkspaceSnapshot};
 
-/// A session's stable identity (its name). Focus and input routing key on this,
-/// never a list index — so reordering tiles can't silently retarget input.
-pub type SessionId = String;
+pub use session_id::{Host, SessionId};
 
 // The shared layout/scene vocabulary, re-exported so the app and shell import
 // it from one place (the core) rather than reaching into ghost-render directly.

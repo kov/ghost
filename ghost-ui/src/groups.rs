@@ -65,6 +65,31 @@ pub fn save(groups: &[Group]) {
 mod tests {
     use super::*;
 
+    /// A `groups.toml` written before session ids were typed — a remote member
+    /// stored as its `<target>␟<name>` composite — loads into typed ids and is
+    /// written back byte for byte.
+    #[test]
+    fn a_groups_file_with_a_remote_member_loads_typed_and_saves_unchanged() {
+        let text = "[[group]]\n\
+                    id = \"w1\"\n\
+                    name = \"blue\"\n\
+                    color = 0\n\
+                    members = [\n    \"alpha\",\n    \"kov@box\\u001Fwork\",\n]\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(file_in(dir.path()), text).unwrap();
+
+        let groups = load_from(dir.path());
+        assert_eq!(
+            groups[0].members,
+            vec![
+                ghost_ui_core::SessionId::local("alpha"),
+                ghost_ui_core::SessionId::remote("kov@box", "work"),
+            ]
+        );
+        save_in(dir.path(), &groups).unwrap();
+        assert_eq!(std::fs::read_to_string(file_in(dir.path())).unwrap(), text);
+    }
+
     #[test]
     fn groups_round_trip_through_the_toml_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -143,6 +168,9 @@ mod tests {
         assert!(loaded.iter().all(|g| !g.id.is_empty()));
         assert_ne!(loaded[0].id, loaded[1].id);
         assert_eq!(loaded[0].name, "web");
-        assert_eq!(loaded[0].members, vec!["alpha".to_string()]);
+        assert_eq!(
+            loaded[0].members,
+            vec![ghost_ui_core::SessionId::local("alpha")]
+        );
     }
 }
