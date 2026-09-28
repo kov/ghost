@@ -344,6 +344,7 @@ pub fn remember_dead_member(group_id: &str, name: &str) {
             display_name: String::new(),
             connection: None,
             policy: Default::default(),
+            group: None,
         },
     )
     .expect("write descriptor");

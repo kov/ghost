@@ -200,6 +200,7 @@ impl Harness {
                 size: None,
                 connection: None,
                 holder: None,
+                group: None,
             })
             .collect()
     }

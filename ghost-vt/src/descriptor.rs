@@ -41,6 +41,10 @@ pub struct Descriptor {
     /// behavior, which is what those sessions were running.
     #[serde(default)]
     pub policy: ghost_term::TerminalPolicy,
+    /// The group this session belongs to, kept past the host's exit so a dead
+    /// session is still remembered as part of its group. `None` when ungrouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Where `name`'s descriptor lives.
@@ -103,6 +107,18 @@ pub fn set_display_name(name: &str, display_name: &str) {
     }
 }
 
+/// Refresh just the group of an existing descriptor. A session whose child
+/// hasn't started yet has no descriptor; the eventual spawn copies the group
+/// from `meta`.
+pub fn set_group(name: &str, group: Option<&str>) {
+    if let Some(mut d) = read(name)
+        && d.group.as_deref() != group
+    {
+        d.group = group.map(str::to_string);
+        let _ = write(name, &d);
+    }
+}
+
 /// Refresh just the working directory of an existing descriptor.
 pub fn set_cwd(name: &str, cwd: &std::path::Path) {
     if let Some(mut d) = read(name)
@@ -129,6 +145,7 @@ mod tests {
             display_name: "build-box".into(),
             connection: None,
             policy: ghost_term::TerminalPolicy::default(),
+            group: None,
         };
         let json = serde_json::to_vec(&d).unwrap();
         let back: Descriptor = serde_json::from_slice(&json).unwrap();
@@ -154,6 +171,7 @@ mod tests {
             display_name: String::new(),
             connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
             policy: ghost_term::TerminalPolicy::default(),
+            group: None,
         };
         let json = serde_json::to_vec(&d).unwrap();
         let back: Descriptor = serde_json::from_slice(&json).unwrap();

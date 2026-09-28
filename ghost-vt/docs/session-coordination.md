@@ -41,8 +41,13 @@ tests pin the ordinals).
   clients (or to hosts) predating `Attach`. Between the two messages the host
   holds a display client with no identity, so subscribers can see a transient
   `Attached(None)`.
+- `ClientMsg::SetGroup(Option<String>)` — put the session in a group, or take
+  it out (`PROTO_ATTACH`). The host keeps the group id in `meta` (so listings
+  report `SessionInfo.group`) and in the durable descriptor (so the membership
+  outlives the host, and a relaunched session comes back in its group). A
+  watcher's is ignored.
 - `SessionEvent`: `Bell`, `TitleChanged`, `Attached(AttachInfo)`, `Detached`,
-  `Activity`, `Renamed`, `Resized { cols, rows }`.
+  `Activity`, `Renamed`, `Resized { cols, rows }`, `GroupChanged`.
 
 A client gates each verb on the host's feature level from the session's `proto`
 marker (`PROTO_SUBSCRIBE = 3`, `PROTO_OBSERVE = 4`); a host below it is polled

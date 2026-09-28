@@ -10868,6 +10868,7 @@ mod tests {
             size: None,
             connection: None,
             holder: None,
+            group: None,
         }
     }
 
@@ -10918,6 +10919,7 @@ mod tests {
             size: None,
             connection: None, // the remote host reports it as local-to-itself
             holder: None,
+            group: None,
         };
         let renamed = SessionInfo {
             name: "raw-id".into(),

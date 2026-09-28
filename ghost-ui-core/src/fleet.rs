@@ -1725,6 +1725,9 @@ impl FleetModel {
                 }
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
+            // Group membership still lives in the UI's own registry; the host's
+            // copy is not read yet.
+            SessionPush::Event(SessionEvent::GroupChanged(_)) => {}
             // The observed session's real grid (observation start, or the
             // display client resized it). Reset the tile's own view to that size —
             // the resync that follows the event re-seeds its content. Driven
@@ -4543,6 +4546,7 @@ mod tests {
             size: None,
             connection: None,
             holder: None,
+            group: None,
         }
     }
 

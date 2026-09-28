@@ -1176,6 +1176,9 @@ fn host_main(
         .map(|d| d.policy)
         .or_else(|| crate::meta::read(&paths::meta_path(current_name)).map(|m| m.policy))
         .unwrap_or_default();
+    // Its group likewise: relaunching a remembered session brings it back into
+    // the group it was in.
+    let inherited_group = crate::descriptor::read(current_name).and_then(|d| d.group);
     // A self-upgrade keeps the SAME session — its identity must survive the swap.
     // Reuse the running host's on-disk `meta` (creation time — the fleet's sort
     // key — display-name label, title, size) rather than minting a fresh one that
@@ -1201,6 +1204,7 @@ fn host_main(
             size: opts.size,
             connection: opts.connection.clone(),
             policy: inherited_policy,
+            group: inherited_group,
         },
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
@@ -1333,6 +1337,9 @@ fn host_main(
     // Dual-written with the marker files, which stay authoritative for polling
     // clients during the migration.
     let mut last_state = crate::protocol::SessionState::default();
+    // The group last announced to subscribers (not part of `SessionState`,
+    // whose layout older subscribers decode).
+    let mut last_group = meta.group.clone();
     // The grid the subscribers last saw. A change (the display client resized
     // the PTY) re-grids every observer's mirror, with a resync to re-seed it —
     // a reflow cannot be patched from outside.
@@ -2099,6 +2106,10 @@ fn host_main(
             let grid = screen.dimensions();
             let regridded = grid != last_grid;
             last_grid = grid;
+            let regrouped = meta.group != last_group;
+            if regrouped {
+                last_group = meta.group.clone();
+            }
             if regridded {
                 // Keep the discoverable grid size current (coalesced: only an
                 // actual change rewrites the file), so a fleet that has never
@@ -2128,6 +2139,9 @@ fn host_main(
                 }
                 if now_state.display_name != last_state.display_name {
                     events.push(SessionEvent::Renamed(now_state.display_name.clone()));
+                }
+                if regrouped {
+                    events.push(SessionEvent::GroupChanged(meta.group.clone()));
                 }
                 match (&last_state.attached, &now_state.attached) {
                     (before, Some(info)) if before.as_ref() != Some(info) => {
@@ -2312,6 +2326,16 @@ fn handle_client_messages(
             // `Hello` and the first `Resize` in one message: the identity is in
             // place before the resize promotes this connection, so the display
             // client is never announced without it.
+            ClientMsg::SetGroup(_) if c.subscribed || c.observing => {}
+            // Kept in `meta` for listings and in the descriptor so the membership
+            // outlives this host; subscribers hear of it from the end-of-turn diff.
+            ClientMsg::SetGroup(group) => {
+                if meta.group != group {
+                    meta.group = group;
+                    let _ = crate::meta::write(&paths::meta_path(current_name), meta);
+                    crate::descriptor::set_group(current_name, meta.group.as_deref());
+                }
+            }
             ClientMsg::Attach { cols, rows, client } => {
                 c.hello = Some(client);
                 apply_resize(c, pty, screen, recorder, cols, rows);
@@ -2733,6 +2757,7 @@ fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path:
             display_name: meta.display_name.clone(),
             connection: meta.connection.clone(),
             policy: meta.policy,
+            group: meta.group.clone(),
         },
     );
 }

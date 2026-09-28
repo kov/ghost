@@ -1214,6 +1214,7 @@ fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
         size: None,
         connection: None,
         holder: None,
+        group: None,
     }
 }
 

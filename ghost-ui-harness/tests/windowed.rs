@@ -73,6 +73,7 @@ fn info(name: &str, attached: bool, created_at: i64) -> SessionInfo {
         size: None,
         connection: None,
         holder: None,
+        group: None,
     }
 }
 

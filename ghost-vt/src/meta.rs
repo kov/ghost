@@ -50,6 +50,11 @@ pub struct Meta {
     /// parses — as the old behavior, which is what those sessions were running.
     #[serde(default)]
     pub policy: ghost_term::TerminalPolicy,
+    /// The group this session belongs to ([`ClientMsg::SetGroup`]
+    /// (crate::protocol::ClientMsg::SetGroup)), `None` when ungrouped. Copied into
+    /// the durable descriptor so the membership outlives the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -82,6 +87,7 @@ mod tests {
             size: (120, 60),
             connection: None,
             policy: ghost_term::TerminalPolicy::default(),
+            group: None,
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));

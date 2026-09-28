@@ -57,6 +57,10 @@ pub struct SessionInfo {
     /// marker's contents. `None` when detached, or when the holder never said
     /// (a client or host predating [`PROTO_ATTACH`](crate::protocol::PROTO_ATTACH)).
     pub holder: Option<String>,
+    /// The group the session belongs to (see
+    /// [`ClientMsg::SetGroup`](crate::protocol::ClientMsg::SetGroup)), read from
+    /// the host's `meta`. `None` when ungrouped.
+    pub group: Option<String>,
 }
 
 impl SessionInfo {
@@ -170,6 +174,7 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
                     size: Some(meta.size).filter(|&s| s != (0, 0)),
                     connection: meta.connection,
                     holder: holder.filter(|h| !h.is_empty()),
+                    group: meta.group,
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -460,6 +465,7 @@ mod tests {
             size: None,
             connection: None,
             holder: None,
+            group: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
@@ -483,6 +489,7 @@ mod tests {
             size: Some((120, 40)),
             connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
             holder: None,
+            group: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: SessionInfo = serde_json::from_str(&json).unwrap();
@@ -508,6 +515,7 @@ mod tests {
                 size: (120, 60),
                 policy: ghost_term::TerminalPolicy::default(),
                 connection: None,
+                group: None,
             },
         )
         .unwrap();

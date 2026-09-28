@@ -899,6 +899,23 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     }
 }
 
+/// Put session `name` in `group`, or take it out of any (`None`), over a control
+/// connection that leaves an attached display client undisturbed. The host keeps
+/// the group in the session's metadata and descriptor; listings and subscribers
+/// see the change, so there is no reply to wait for. Refused for a host predating
+/// [`PROTO_ATTACH`](crate::protocol::PROTO_ATTACH), which would skip the message.
+pub fn set_group(name: &str, group: Option<&str>) -> io::Result<()> {
+    if session_proto(name) < crate::protocol::PROTO_ATTACH {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("session '{name}' is hosted by an older ghost that has no groups"),
+        ));
+    }
+    let mut conn = Conn::connect(&paths::socket_path(name))
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot reach session '{name}': {e}")))?;
+    conn.send(&ClientMsg::SetGroup(group.map(str::to_string)))
+}
+
 /// Rename a session non-interactively (the `ghost rename` command). Connects to
 /// the session by its immutable id and asks the host to set its display name,
 /// returning the host's verdict. A label change only — the session's files and

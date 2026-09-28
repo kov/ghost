@@ -115,6 +115,12 @@ pub enum ClientMsg {
         rows: u16,
         client: String,
     },
+    /// Put the session in a group, or take it out of any (`None`). The host keeps
+    /// the group id in the session's metadata and durable descriptor, so every
+    /// listing reports it and it outlives the host, and pushes
+    /// [`SessionEvent::GroupChanged`]. Sent from [`PROTO_ATTACH`] by the display
+    /// client or a control connection; a watcher's is ignored.
+    SetGroup(Option<String>),
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -165,6 +171,9 @@ pub enum SessionEvent {
     /// it. Appended after `PROTO_SUBSCRIBE` shipped: level-3 subscribers skip
     /// the unknown frame without losing the stream.
     Resized { cols: u16, rows: u16 },
+    /// The session joined a group, or left its group (`None`)
+    /// ([`ClientMsg::SetGroup`]).
+    GroupChanged(Option<String>),
 }
 
 /// Messages sent from the session host to an attach client.
@@ -449,6 +458,7 @@ mod tests {
             }),
             13
         );
+        assert_eq!(wire_tag(&ClientMsg::SetGroup(None)), 14);
     }
 
     #[test]
@@ -489,6 +499,7 @@ mod tests {
         assert_eq!(wire_tag(&SessionEvent::Activity), 4);
         assert_eq!(wire_tag(&SessionEvent::Renamed(String::new())), 5);
         assert_eq!(wire_tag(&SessionEvent::Resized { cols: 0, rows: 0 }), 6);
+        assert_eq!(wire_tag(&SessionEvent::GroupChanged(None)), 7);
     }
 
     #[test]

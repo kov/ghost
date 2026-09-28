@@ -3868,6 +3868,7 @@ mod tests {
             size: None,
             connection: None,
             holder: None,
+            group: None,
         }
     }
 
@@ -4378,6 +4379,7 @@ mod tests {
                 size: None,
                 connection: None,
                 holder: None,
+                group: None,
             }
         }
         let mut r = root(); // owns "alpha"
@@ -5118,6 +5120,7 @@ mod tests {
             size: None,
             connection: None,
             holder: None,
+            group: None,
         }
     }
 

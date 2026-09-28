@@ -873,3 +873,172 @@ fn a_resize_then_hello_still_names_the_holder_in_the_listing() {
         listed_holder(xdg, name)
     );
 }
+
+/// End the session's host the way a reboot does (SIGTERM), which keeps its
+/// descriptor and recording so it can be relaunched; `ghost kill` would discard
+/// them. Waits until the session is no longer listed.
+fn terminate_host(xdg: &Path, name: &str) {
+    let pid = std::fs::read_to_string(xdg.join("run").join("ghost").join(name).join("pid"))
+        .expect("host pid");
+    let ok = Command::new("kill")
+        .args(["-TERM", pid.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "SIGTERM the host");
+    assert!(
+        wait_until(Duration::from_secs(5), || !ls(xdg).contains(name)),
+        "the host did not exit"
+    );
+}
+
+/// The session's `group` as `ghost ls --json` reports it.
+fn listed_group(xdg: &Path, name: &str) -> Option<String> {
+    let out = ghost(xdg).args(["ls", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.as_array()?
+        .iter()
+        .find(|s| s["name"] == name)?
+        .get("group")?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test]
+fn a_sessions_group_is_listed_and_can_be_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-listed-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut control = Client::connect_path(&sock).expect("control connect");
+    control
+        .send(&ClientMsg::SetGroup(Some("win-1-1".into())))
+        .unwrap();
+    let joined = wait_until(Duration::from_secs(5), || {
+        listed_group(xdg, name).as_deref() == Some("win-1-1")
+    });
+    control.send(&ClientMsg::SetGroup(None)).unwrap();
+    let left = wait_until(Duration::from_secs(5), || listed_group(xdg, name).is_none());
+
+    assert!(joined, "the listing never named the group");
+    assert!(left, "the listing still names a group after it was cleared");
+}
+
+#[test]
+fn a_sessions_group_outlives_its_host_in_the_descriptor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-durable-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+    let descriptor = xdg
+        .join("data")
+        .join("ghost")
+        .join("sessions")
+        .join(format!("{name}.json"));
+    assert!(
+        wait_until(Duration::from_secs(5), || descriptor.exists()),
+        "precondition: the session wrote its descriptor"
+    );
+
+    let mut control = Client::connect_path(&sock).expect("control connect");
+    control
+        .send(&ClientMsg::SetGroup(Some("win-2-2".into())))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            listed_group(xdg, name).as_deref() == Some("win-2-2")
+        }),
+        "precondition: the group was set"
+    );
+    drop(control);
+
+    // A host that dies uncleanly keeps its descriptor (the session can be
+    // relaunched); the group must be in it.
+    terminate_host(xdg, name);
+    let d: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&descriptor).expect("descriptor kept")).unwrap();
+    assert_eq!(d["group"], "win-2-2", "the descriptor keeps the group");
+}
+
+#[test]
+fn a_subscriber_is_told_when_the_session_changes_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-event-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut sub = Subscriber::connect_path(&sock).expect("subscriber connect");
+    let mut got_snapshot = false;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            got_snapshot |= sub.pump().unwrap().snapshot.is_some();
+            got_snapshot
+        }),
+        "no snapshot"
+    );
+    let mut control = Client::connect_path(&sock).expect("control connect");
+    control
+        .send(&ClientMsg::SetGroup(Some("win-3-3".into())))
+        .unwrap();
+
+    let mut events = Vec::new();
+    let told = wait_until(Duration::from_secs(5), || {
+        events.extend(sub.pump().unwrap().events);
+        events.contains(&SessionEvent::GroupChanged(Some("win-3-3".into())))
+    });
+    assert!(told, "no GroupChanged event; got {events:?}");
+}
+
+#[test]
+fn a_watcher_cannot_change_a_sessions_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-watcher-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut obs = raw_observer(&sock);
+    next_grid(&mut obs, Duration::from_secs(5)).expect("initial grid");
+    obs.send(&ClientMsg::SetGroup(Some("win-4-4".into())))
+        .unwrap();
+    // Re-observing answers after the SetGroup has been handled.
+    obs.send(&ClientMsg::Observe).unwrap();
+    next_grid(&mut obs, Duration::from_secs(5)).expect("grid after SetGroup");
+
+    assert_eq!(listed_group(xdg, name), None, "a watcher set the group");
+}
+
+#[test]
+fn a_relaunched_session_comes_back_in_its_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-relaunch-test";
+    let _guard = KillOnDrop { xdg, name };
+    let sock = spawn_session(xdg, name, "sleep 60").join("sock");
+
+    let mut control = Client::connect_path(&sock).expect("control connect");
+    control
+        .send(&ClientMsg::SetGroup(Some("win-5-5".into())))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            listed_group(xdg, name).as_deref() == Some("win-5-5")
+        }),
+        "precondition: the group was set"
+    );
+    drop(control);
+    // An unclean end keeps the descriptor; a new host under the same name is
+    // that session relaunched.
+    terminate_host(xdg, name);
+    spawn_session(xdg, name, "sleep 60");
+
+    assert_eq!(
+        listed_group(xdg, name).as_deref(),
+        Some("win-5-5"),
+        "the relaunched session is back in its group"
+    );
+}
