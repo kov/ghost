@@ -18,7 +18,6 @@ use nix::sys::signal::Signal;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, open};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
@@ -325,7 +324,6 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     // no lock behind — state a listing has to prune and a group registry can pick
     // up. `exec` is the running image; `argv0` is only what `ps` shows.
     let (exec, argv0) = host_exec_target(&std::env::current_exe()?);
-    paths::ensure_session_dir(&opts.name)?;
 
     // A host outlives its client by design; make it outlive the *login* too. The
     // host parks itself outside the graphical session once it is running (see
@@ -334,28 +332,14 @@ pub fn spawn(opts: SpawnOpts) -> io::Result<()> {
     // and idempotent; see `systemd` for why neither half needs privilege.
     crate::systemd::ensure_linger();
 
-    // Acquire the session's lifetime lock. Held by the host across the fork+exec
-    // and for its whole life (the kernel releases it on exit or crash), this lock
-    // is the single source of truth for liveness: `session::list` prunes a
-    // directory exactly when its lock is free. Taking it here also *is* the atomic
-    // "already exists" check — a live host of this name still holds it. We create
-    // it before binding the socket so a session is never observable without it.
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(paths::lock_path(&opts.name))?;
-    match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {}
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("session '{}' already exists", opts.name),
-            ));
-        }
-        Err(e) => return Err(io::Error::from(e)),
-    }
+    // Claim the name: make the session directory and take its lifetime lock.
+    // Held by the host across the fork+exec and for its whole life (the kernel
+    // releases it on exit or crash), this lock is the single source of truth for
+    // liveness: `session::list` prunes a directory exactly when its lock is free.
+    // Taking it also *is* the atomic "already exists" check — a live host of this
+    // name still holds it. Taken before the socket binds so a session is never
+    // observable without it.
+    let lock = crate::session::claim(&opts.name)?;
 
     // Declare which protocol feature level this host speaks, so clients built
     // later know which optional messages are safe to send it. Written before

@@ -287,7 +287,7 @@ impl RealRemote {
         let sessions = self.remote_root.path().join("run").join("ghost");
         wait_until(Duration::from_secs(5), || {
             std::fs::read_dir(&sessions)
-                .map(|mut d| d.next().is_none())
+                .map(|mut d| !d.any(|e| e.is_ok_and(|e| e.path().is_dir())))
                 .unwrap_or(true)
         });
     }

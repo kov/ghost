@@ -7,6 +7,10 @@
 //! host exits or crashes. Discovery reads liveness from whether that lock can be
 //! taken — no timing or pid-liveness guessing — and prunes only directories whose
 //! lock is free (their host is gone).
+//!
+//! Claiming a name for a new host and pruning a dead one are serialized by one
+//! more lock, `<runtime>/.lock`, so a prune judged against a dead host can never
+//! remove the directory of a host that claimed the name since.
 
 use crate::paths;
 use rustix::fs::{FlockOperation, flock};
@@ -138,6 +142,15 @@ pub fn shorten_under(p: &Path, home: &Path) -> String {
 /// [`list`], but over an explicit runtime directory (so it can be tested against
 /// a tempdir rather than the process's real XDG location).
 fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
+    list_in_with(runtime_dir, |_| {})
+}
+
+/// [`list_in`], calling `judged_dead` with a directory's path between judging it
+/// dead and pruning it — where a test holds the gap open.
+fn list_in_with(
+    runtime_dir: &Path,
+    mut judged_dead: impl FnMut(&Path),
+) -> io::Result<Vec<SessionInfo>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(runtime_dir) {
         Ok(entries) => entries,
@@ -179,7 +192,10 @@ fn list_in(runtime_dir: &Path) -> io::Result<Vec<SessionInfo>> {
             }
             HostState::Starting => {} // keep, but not yet listable
             HostState::Dead => {
-                let _ = std::fs::remove_dir_all(&path);
+                judged_dead(&path);
+                prune_in(runtime_dir, &path, |dir| {
+                    matches!(host_state(dir), HostState::Dead)
+                });
             }
         }
     }
@@ -226,6 +242,76 @@ fn host_state(session_dir: &Path) -> HostState {
         },
         // Odd error testing the lock: don't prune.
         Err(_) => HostState::Starting,
+    }
+}
+
+/// Take `name` for a new host: make its directory and take its liveness lock,
+/// returning the held lock. A lock already held means a live host has the name
+/// ([`io::ErrorKind::AlreadyExists`]).
+pub(crate) fn claim(name: &str) -> io::Result<std::fs::File> {
+    claim_in(&paths::runtime_dir(), name)
+}
+
+/// [`claim`] under an explicit runtime directory.
+///
+/// Done under the runtime directory's lock, which a prune also takes around
+/// judging a directory dead and removing it — so a prune never lands between
+/// this making the directory and taking its lock, nor after it did.
+fn claim_in(runtime_dir: &Path, name: &str) -> io::Result<std::fs::File> {
+    let _runtime = runtime_lock(runtime_dir)?;
+    let dir = runtime_dir.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("lock"))?;
+    match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(lock),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("session '{name}' already exists"),
+        )),
+        Err(e) => Err(io::Error::from(e)),
+    }
+}
+
+/// Hold the runtime directory's own lock, `<runtime>/.lock`, for the life of the
+/// returned file. It serializes claiming a session name against pruning one.
+/// Hosts from builds predating it never take it.
+fn runtime_lock(runtime_dir: &Path) -> io::Result<std::fs::File> {
+    std::fs::create_dir_all(runtime_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(runtime_dir.join(".lock"))?;
+    flock(&lock, FlockOperation::LockExclusive)?;
+    Ok(lock)
+}
+
+/// Remove the session directory `dir` if `dead` still judges it so under the
+/// runtime lock — the judgement a caller made before taking it may be stale.
+fn prune_in(runtime_dir: &Path, dir: &Path, dead: impl FnOnce(&Path) -> bool) {
+    let Ok(_runtime) = runtime_lock(runtime_dir) else {
+        return; // cannot serialize against a spawn: leave it to the next pass
+    };
+    if dead(dir) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Whether a host holds the liveness lock in `dir`. A missing lock file is not
+/// held; an error probing it counts as held, so nothing live gets removed.
+fn lock_held(dir: &Path) -> bool {
+    match std::fs::File::open(dir.join("lock")) {
+        Ok(lock) => !matches!(
+            flock(&lock, FlockOperation::NonBlockingLockExclusive),
+            Ok(())
+        ),
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
     }
 }
 
@@ -387,8 +473,12 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 fn prune(name: &str) {
-    // The whole session directory (sock + lock + pid) goes at once.
-    let _ = std::fs::remove_dir_all(paths::session_dir(name));
+    // The whole session directory (sock + lock + pid) goes at once — unless a
+    // host holds its lock: one still starting (no pid yet), or a new one that
+    // claimed the name since its last host died.
+    prune_in(&paths::runtime_dir(), &paths::session_dir(name), |dir| {
+        !lock_held(dir)
+    });
 }
 
 #[cfg(test)]
@@ -448,6 +538,49 @@ mod tests {
         // Hold the lock fds until the assertions are done.
         drop(live_lock);
         drop(starting_lock);
+    }
+
+    /// A listing judges a directory dead from its free lock, then prunes it. A
+    /// spawn of the same name landing between the two must survive: the prune
+    /// would otherwise delete a live host's socket and lock out from under it.
+    #[test]
+    fn a_listing_never_prunes_a_session_claimed_after_judging_it_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("again");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("lock")).unwrap(); // unheld: dead
+
+        let mut held = None;
+        let names: Vec<String> = list_in_with(root, |_| {
+            held = Some(claim_in(root, "again").expect("claim the dead name"));
+        })
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+        assert!(names.is_empty(), "no pid yet, so nothing is listed");
+        assert!(
+            dir.join("lock").exists(),
+            "a listing pruned a session claimed after it judged the name dead"
+        );
+        drop(held);
+    }
+
+    /// Claiming a name takes it the way a spawn does: a second claim while the
+    /// first is held says the session already exists.
+    #[test]
+    fn a_claimed_name_cannot_be_claimed_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = claim_in(tmp.path(), "one").unwrap();
+        let second = claim_in(tmp.path(), "one").map(drop);
+        assert_eq!(
+            second.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        drop(first);
+        claim_in(tmp.path(), "one").expect("a released name can be claimed");
     }
 
     #[test]

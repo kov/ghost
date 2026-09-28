@@ -400,9 +400,10 @@ fn a_session_that_becomes_listable_mid_scan_is_still_streamed() {
     )
     .unwrap();
 
-    // Let the scan finish, and with it the initial (still empty) listing.
-    drop(release);
-
+    // The scan finishes on its own now, with the initial (still empty)
+    // listing. The writer stays open: the scan judges the blocker dead and
+    // re-checks its lock before pruning, and that second open of the FIFO would
+    // park again with no writer.
     assert!(
         wait_for(&rx, Duration::from_secs(5), |s| {
             s.iter().any(|i| i.name == *late)
@@ -411,6 +412,7 @@ fn a_session_that_becomes_listable_mid_scan_is_still_streamed() {
          never streamed — the change landed before the watcher was registered, \
          so nothing will report it until the 30s heartbeat"
     );
+    drop(release);
 }
 
 /// Kill a session by name on drop, so a failing assertion still cleans up.

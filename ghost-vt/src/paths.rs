@@ -52,13 +52,6 @@ pub fn session_dir(name: &str) -> PathBuf {
     runtime_dir().join(name)
 }
 
-/// Create the session's directory (and the runtime root) if needed; return it.
-pub fn ensure_session_dir(name: &str) -> std::io::Result<PathBuf> {
-    let dir = session_dir(name);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// Path of the control socket for the named session.
 pub fn socket_path(name: &str) -> PathBuf {
     session_dir(name).join("sock")
