@@ -1199,6 +1199,14 @@ impl Terminal {
         self.cursor.row = self.saved_ctx.cursor_row;
         self.pen = self.saved_ctx.pen;
         self.origin_mode = self.saved_ctx.origin_mode;
+        // Restored under origin mode, the position is held to the region's bottom
+        // and right edges but may stay above or left of it (xterm's `CursorSet`).
+        if self.origin_mode {
+            self.cursor.row = self.cursor.row.min(self.bottom_margin);
+            if self.left_right_margin_mode {
+                self.cursor.col = self.cursor.col.min(self.right_margin);
+            }
+        }
         // DECRC restores the cursor, pen, origin mode and charset — NOT auto-wrap
         // mode (xterm; esctest SaveRestoreCursor_Wrap). It does clear the pending
         // wrap, as resetting the last-column state is part of the restore.
@@ -1485,8 +1493,24 @@ impl Terminal {
 
     // buffer switching
 
+    /// In origin mode, bring a cursor left outside the region back into it. A
+    /// screen switch does this (a deliberate departure from xterm, which carries
+    /// the cursor across as is): the only way the cursor can then sit outside the
+    /// region is a restore of the *active* screen's slot, which `dump` replays.
+    /// Carried across a switch, it came from the other screen's slot, and no dump
+    /// can put it back — see `dump_inner`'s cursor setup.
+    fn clamp_cursor_into_origin_region(&mut self) {
+        if self.origin_mode {
+            self.cursor.row = self.cursor.row.clamp(self.top_margin, self.bottom_margin);
+            if self.left_right_margin_mode {
+                self.cursor.col = self.cursor.col.clamp(self.left_margin, self.right_margin);
+            }
+        }
+    }
+
     fn switch_to_alternate_buffer(&mut self) {
         if let BufferType::Primary = self.active_buffer_type {
+            self.clamp_cursor_into_origin_region();
             self.active_buffer_type = BufferType::Alternate;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
             self.swap_kitty_kbd_screen_state();
@@ -1499,6 +1523,7 @@ impl Terminal {
 
     fn switch_to_primary_buffer(&mut self) {
         if let BufferType::Alternate = self.active_buffer_type {
+            self.clamp_cursor_into_origin_region();
             self.active_buffer_type = BufferType::Primary;
             mem::swap(&mut self.saved_ctx, &mut self.alternate_saved_ctx);
             self.swap_kitty_kbd_screen_state();
@@ -4848,6 +4873,70 @@ mod tests {
 
         assert_save_restore(Decsc, Decrc);
         assert_save_restore(Scosc, Scorc);
+    }
+
+    /// A cursor saved in origin mode, then restored under margins set since:
+    /// xterm's `CursorSet` bounds the row by the bottom margin and the column by
+    /// the right one, but lets it stay above/left of the region.
+    #[test]
+    fn decrc_in_origin_mode_clamps_below_and_right_of_the_region_like_xterm() {
+        // Below the region: clamped up to the bottom margin.
+        let mut term = Terminal::new((10, 8), None);
+        term.execute(Decset(dec_modes([DecMode::Origin])));
+        term.execute(Cup(8, 1));
+        term.execute(Decsc);
+        term.execute(Decstbm(2, 5));
+        term.execute(Decrc);
+        assert_eq!(term.cursor(), (0, 4), "row held to the bottom margin");
+
+        // Above the region: kept where it was saved.
+        let mut term = Terminal::new((10, 8), None);
+        term.execute(Decset(dec_modes([DecMode::Origin])));
+        term.execute(Decsc);
+        term.execute(Decstbm(3, 6));
+        term.execute(Decrc);
+        assert_eq!(term.cursor(), (0, 0), "row above the region survives");
+
+        // Right of the left/right margins: clamped to the right margin.
+        let mut term = Terminal::new((10, 8), None);
+        term.execute(Decset(dec_modes([DecMode::LeftRightMargin])));
+        term.execute(Decset(dec_modes([DecMode::Origin])));
+        term.execute(Cup(1, 10));
+        term.execute(Decsc);
+        term.execute(Decslrm(2, 5));
+        term.execute(Decrc);
+        assert_eq!(term.cursor(), (4, 0), "column held to the right margin");
+    }
+
+    /// Switching screens in origin mode brings a cursor left outside the region
+    /// back into it. Only a restore of the *active* screen's slot can then put
+    /// the cursor outside, which a dump can replay — a restore of the other
+    /// screen's slot, carried across the switch, is a state no dump can reach.
+    #[test]
+    fn switching_screens_in_origin_mode_brings_the_cursor_into_the_region() {
+        // Origin mode on, rows 3–6 the region, the cursor restored above it.
+        fn above_the_region(term: &mut Terminal) {
+            term.execute(Decstbm(1, 8));
+            term.execute(Decset(dec_modes([DecMode::Origin])));
+            term.execute(Decsc);
+            term.execute(Decstbm(3, 6));
+            term.execute(Decrc);
+            assert_eq!(term.cursor(), (0, 0), "precondition: above the region");
+        }
+
+        for (enter, leave) in [
+            (DecMode::AltScreenBuffer, DecMode::AltScreenBuffer),
+            (DecMode::SaveCursorAltScreenBuffer, DecMode::AltScreenBuffer),
+        ] {
+            let mut term = Terminal::new((10, 8), None);
+            above_the_region(&mut term);
+            term.execute(Decset(dec_modes([enter])));
+            assert_eq!(term.cursor(), (0, 2), "entering the alt screen, {enter:?}");
+
+            above_the_region(&mut term);
+            term.execute(Decrst(dec_modes([leave])));
+            assert_eq!(term.cursor(), (0, 2), "leaving the alt screen, {leave:?}");
+        }
     }
 
     #[test]

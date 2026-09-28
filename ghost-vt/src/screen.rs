@@ -490,6 +490,41 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_restored_above_the_origin_mode_margins_survives_a_reseed() {
+        // Origin mode on, then a saved cursor restored above a later scroll region:
+        // the cursor sits outside the margins, which no CUP under DECOM can reach.
+        let mut host = Screen::new(24, 8, 100);
+        host.feed(b"\x1b[?6h\x1b[?1049h\x1b[2B\x1b[?1049h\x1b[2;6r\x1b[?1049l\x1b[?47h");
+
+        let mut client = Screen::new(24, 8, 100);
+        client.feed(&host.resync());
+        assert_eq!(client.cursor(), host.cursor(), "the reseeded cursor");
+
+        // And the two keep agreeing once live output moves it.
+        host.feed(b"x\r\n");
+        client.feed(b"x\r\n");
+        assert_eq!(client.cursor(), host.cursor(), "after shared output");
+        assert_eq!(screen_text(&client), screen_text(&host));
+    }
+
+    #[test]
+    fn a_cursor_carried_back_from_the_alt_screen_above_the_margins_survives_a_reseed() {
+        // The mirror case: the cursor is restored above the region on the alt
+        // screen, then carried back to the primary, whose own slot is inside it.
+        let mut host = Screen::new(24, 8, 100);
+        host.feed(b"\x1b[?6h\x1b7\x1b[?47h\x1b7\x1b[2;6r\x1b[?47l\x1b7\x1b[?47h\x1b8\x1b[?47l");
+
+        let mut client = Screen::new(24, 8, 100);
+        client.feed(&host.resync());
+        assert_eq!(client.cursor(), host.cursor(), "the reseeded cursor");
+
+        host.feed(b"x\r\n");
+        client.feed(b"x\r\n");
+        assert_eq!(client.cursor(), host.cursor(), "after shared output");
+        assert_eq!(screen_text(&client), screen_text(&host));
+    }
+
+    #[test]
     fn feed_reports_changed_rows_as_a_damage_hint() {
         let mut s = Screen::new(20, 4, 100);
 
