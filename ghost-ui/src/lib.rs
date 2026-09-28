@@ -409,8 +409,8 @@ use ghost_ui_core::{REMOTE_ID_SEP, is_remote_id};
 /// The fleet id for remote session `real` on `target` — the composite a remote
 /// session is known by *locally* (window client key, `mine`, fleet tile id), so a
 /// session this window drives over the transport and the same session the watcher
-/// discovers share one identity. Recovered to `(target, real)` via
-/// `App.remote_index`; only the transport layer uses the bare `real` id.
+/// discovers share one identity. Recovered to `(target, real)` by
+/// [`remote_id_parts`]; only the transport layer uses the bare `real` id.
 fn remote_fleet_id(target: &str, real: &str) -> String {
     format!("{target}{REMOTE_ID_SEP}{real}")
 }
@@ -418,11 +418,15 @@ fn remote_fleet_id(target: &str, real: &str) -> String {
 /// How a session id should be reached for a control action (rename/kill). A
 /// remote id is *self-describing* — [`remote_fleet_id`] formats it as
 /// `<target>␟<real>` — so its host and real name are recovered from the id itself,
-/// with no dependence on `remote_index` staying populated. A remote id is thus
-/// ALWAYS routed over the transport, never spoken to a local control socket (a
+/// never from a lookup that could lag. A remote id is thus ALWAYS routed over the transport, never spoken to a local control socket (a
 /// bogus local socket yields a misleading "hosted by an older ghost" error).
 fn remote_id_parts(id: &str) -> Option<(&str, &str)> {
     id.split_once(REMOTE_ID_SEP)
+}
+
+/// [`remote_id_parts`], owned.
+fn remote_id_owned(id: &str) -> Option<(String, String)> {
+    remote_id_parts(id).map(|(target, real)| (target.to_string(), real.to_string()))
 }
 
 /// Floor between reconnect attempts of a host's watch stream, so a host whose
@@ -1992,7 +1996,6 @@ fn interactive(fresh: bool, ssh_window: bool) {
         remote_infos: HashMap::new(),
         remote_envs: HashMap::new(),
         remote_remembered: HashMap::new(),
-        remote_index: HashMap::new(),
         remote_watchers: HashMap::new(),
         pending_remote_restores: HashMap::new(),
         reconnecting: HashMap::new(),
@@ -3397,7 +3400,6 @@ impl App {
             remote_infos: HashMap::new(),
             remote_envs: HashMap::new(),
             remote_remembered: HashMap::new(),
-            remote_index: HashMap::new(),
             remote_watchers: HashMap::new(),
             pending_remote_restores: HashMap::new(),
             reconnecting: HashMap::new(),
@@ -3759,10 +3761,6 @@ pub struct App {
     /// belongs to — but the rest is what the far side is, answered in the one
     /// exchange where it speaks for itself.
     remote_envs: HashMap<String, ghost_vt::remote::HostEnv>,
-    /// Maps a namespaced remote fleet id back to `(target, real id)`, so a
-    /// take-over/observe of a remote tile reaches the right host and session.
-    /// Rebuilt whenever `remote_infos` changes.
-    remote_index: HashMap<String, (String, String)>,
     /// One live `ghost __watch` stream per connected host, keyed by target: the
     /// push that keeps `remote_infos` fresh. Dropping an entry stops its thread,
     /// so a watcher ends exactly when its host leaves `remotes` (window close /
@@ -4579,7 +4577,7 @@ impl App {
                     // rebuild here would double-drive or blank a session another window
                     // still views (there'd be no resync to refill it).
                     if !self.sessions.contains_key(&id)
-                        && let Some((target, real)) = self.remote_index.get(&id).cloned()
+                        && let Some((target, real)) = remote_id_owned(&id)
                     {
                         // A remote member attaches over its host's transport, the
                         // same way a take-over of it does.
@@ -4608,7 +4606,7 @@ impl App {
                         self.hand_over(wid, &id, event_loop);
                     }
                 }
-                Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
+                Cmd::Observe(id) if is_remote_id(&id) => {
                     // Live remote preview: observe the session over its host's
                     // transport, feeding the tile exactly like a local observer.
                     if self.bench.is_none()
@@ -4620,7 +4618,7 @@ impl App {
                         // session borrows the driver's state, opens no mirror).
                         && !self.observers.contains_key(&id)
                         && !self.sessions.contains_key(&id)
-                        && let Some((target, real)) = self.remote_index.get(&id).cloned()
+                        && let Some((target, real)) = remote_id_owned(&id)
                     {
                         match self.observe_remote(&target, &real) {
                             Some(sub) => {
@@ -4899,7 +4897,7 @@ impl App {
                 Cmd::TakeOver(id) => {
                     // A remote tile attaches over its host's transport; a local one
                     // over its unix socket.
-                    if let Some((target, real)) = self.remote_index.get(&id).cloned() {
+                    if let Some((target, real)) = remote_id_owned(&id) {
                         self.take_over_remote(wid, &id, &target, &real, event_loop);
                     } else {
                         // Switch the window to `id`'s single view. Attach only if the
@@ -5933,8 +5931,6 @@ impl App {
                 // transport still addresses the bare remote name.
                 let target = spec.target();
                 let local_id = remote_fleet_id(&target, &name);
-                self.remote_index
-                    .insert(local_id.clone(), (target, name.clone()));
                 let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec) else {
                     return self.connect_fail(wid, "could not open the ssh connection".into());
                 };
@@ -6052,10 +6048,6 @@ impl App {
                 continue;
             };
             let real = real.to_string();
-            // Index the composite id either way so its tile can route over the
-            // transport (the fleet's observe path, or a later take-over dive).
-            self.remote_index
-                .insert(composite.clone(), (target.clone(), real.clone()));
             // A window SAVED in the fleet overview comes back in it: its tile goes
             // live through the fleet's own observe path (`register_remote` above
             // started the watcher; `reconcile` will `Cmd::Observe` this foreign
@@ -6287,33 +6279,6 @@ impl App {
         merged
     }
 
-    /// Rebuild the namespaced-id → `(target, real id)` index from the current
-    /// remote listings, so a take-over of a remote tile reaches the right session.
-    fn rebuild_remote_index(&mut self) {
-        self.remote_index.clear();
-        for (target, infos) in &self.remote_infos {
-            let prefix = format!("{target}{REMOTE_ID_SEP}");
-            for i in infos {
-                if let Some(real) = i.name.strip_prefix(&prefix) {
-                    self.remote_index
-                        .insert(i.name.clone(), (target.clone(), real.to_string()));
-                }
-            }
-        }
-        // Keep every remote session a window is actively driving, even one its
-        // host hasn't listed yet (a fresh connect/spawn indexes it before the
-        // watcher reports it). Without this, a rebuild triggered by another host's
-        // push would drop the driven id and its rename/kill/observe would misroute
-        // to the local path. The composite id carries its own (target, real).
-        for id in self.sessions.keys() {
-            if let Some((target, real)) = id.split_once(REMOTE_ID_SEP) {
-                self.remote_index
-                    .entry(id.clone())
-                    .or_insert_with(|| (target.to_string(), real.to_string()));
-            }
-        }
-    }
-
     /// Take over a remote session (a fleet tile on a connected host) into window
     /// `wid`: attach it over the host's transport — reusing the open master — and
     /// switch the window to its single view. `id` is the fleet-namespaced id;
@@ -6446,8 +6411,6 @@ impl App {
         // window owns its own new session in the fleet (the transport uses the bare
         // name); see [`finish_connect`](Self::finish_connect).
         let local_id = remote_fleet_id(&target, &name);
-        self.remote_index
-            .insert(local_id.clone(), (target.clone(), name.clone()));
         let cmd = host.remote.pipe_command(&host.remote_ghost, &name);
         // Just spawned by the current staged binary → our own level.
         if self.attach_ssh_into(
@@ -6460,7 +6423,6 @@ impl App {
             self.clear_failure(wid);
             self.dispatch(wid, UiEvent::AdoptSession(local_id), event_loop);
         } else {
-            self.remote_index.remove(&local_id);
             // `attach_ssh_into` already reported why; this only says which host.
             eprintln!("ghost: opened a session on {target} but could not attach to it");
         }
@@ -6914,7 +6876,7 @@ impl App {
         }
         let had_client = self.sessions.remove(id).is_some();
         if had_client || !self.observers.contains_key(id) {
-            let sub = if let Some((target, real)) = self.remote_index.get(id).cloned() {
+            let sub = if let Some((target, real)) = remote_id_owned(id) {
                 self.observe_remote(&target, &real)
             } else if !is_remote_id(id) {
                 Subscriber::observe(id).ok()
@@ -7104,7 +7066,6 @@ impl App {
         self.remote_envs.retain(|t, _| in_use.contains(t));
         // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
         self.remote_watchers.retain(|t, _| in_use.contains(t));
-        self.rebuild_remote_index();
     }
 
     /// The single quit path: record the open windows, then leave the event loop.
@@ -7502,7 +7463,6 @@ impl App {
             }
             UserEvent::RemoteSessions { target, infos } => {
                 self.remote_infos.insert(target, infos);
-                self.rebuild_remote_index();
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -7534,7 +7494,6 @@ impl App {
             UserEvent::RemoteUnreachable { target } => {
                 self.remote_infos.remove(&target);
                 self.remote_remembered.remove(&target);
-                self.rebuild_remote_index();
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -9524,12 +9483,6 @@ mod tests {
             app.remote_infos.contains_key("kov@box"),
             "the host's listing is stashed"
         );
-        let composite = format!("kov@box{REMOTE_ID_SEP}work");
-        assert_eq!(
-            app.remote_index.get(&composite),
-            Some(&("kov@box".to_string(), "work".to_string())),
-            "the namespaced fleet id resolves back to (target, real id)"
-        );
         assert!(
             app.sessions_changed
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -9979,11 +9932,6 @@ mod tests {
             assert!(
                 held,
                 "the window drives the new remote session over the transport"
-            );
-            assert_eq!(
-                app.remote_index.get(&composite),
-                Some(&("kov@box".to_string(), name.to_string())),
-                "the driven session is indexed back to its host"
             );
         });
     }
@@ -11070,84 +11018,6 @@ mod tests {
     }
 
     #[test]
-    fn a_driven_remote_session_stays_indexed_across_another_hosts_rebuild() {
-        // `rebuild_remote_index` rebuilds from the watcher's listings. A freshly
-        // spawned/connected remote session is driven (in `window.sessions`) and
-        // indexed before its OWN host has listed it — so a push from another host
-        // (or an empty listing) that triggers a rebuild must not drop it, or its
-        // rename/kill/observe would misroute to the local path and fail.
-        let Some(ghost_bin) = ghost_binary() else {
-            eprintln!("skipping: no `ghost` binary next to the test binary");
-            return;
-        };
-        with_isolated_xdg(|| {
-            let shim = write_ssh_shim();
-            let orig_path = std::env::var_os("PATH");
-            let mut dirs = vec![shim.path().to_path_buf()];
-            if let Some(p) = &orig_path {
-                dirs.extend(std::env::split_paths(p));
-            }
-            let joined = std::env::join_paths(dirs).unwrap();
-            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
-            unsafe { std::env::set_var("PATH", &joined) };
-
-            let mut app = App::headless();
-            let fe = HeadlessFrontend::new();
-            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
-            app.register_remote(&spec, ghost_bin.to_str().unwrap());
-            let group = app.mint_group();
-            let wid = app.open_fleet_window(&fe, group, None);
-            app.windows
-                .get_mut(&wid)
-                .unwrap()
-                .root
-                .set_group_connection(Some(spec.clone()));
-
-            let name = "hr-route-1";
-            // Stand in for the off-loop spawn worker (as above), then run the
-            // main-loop continuation that indexes and attaches the new session.
-            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
-            remote
-                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
-                .unwrap();
-            app.finish_remote_session_spawn(
-                wid,
-                "kov@box".to_string(),
-                name.to_string(),
-                Ok(()),
-                &fe,
-            );
-            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
-
-            // Another host pushes a listing before kov@box has listed our session,
-            // triggering a rebuild of the index.
-            app.on_user_event(
-                &fe,
-                UserEvent::RemoteSessions {
-                    target: "kov@other".to_string(),
-                    infos: Vec::new(),
-                },
-            );
-            let indexed = app.remote_index.get(&composite).cloned();
-
-            let _ = ghost_vt::session::kill_session(name);
-            // SAFETY: still within the lock; restore PATH for later tests.
-            unsafe {
-                match orig_path {
-                    Some(p) => std::env::set_var("PATH", p),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-
-            assert_eq!(
-                indexed,
-                Some(("kov@box".to_string(), name.to_string())),
-                "a driven remote session must stay indexed across another host's rebuild"
-            );
-        });
-    }
-
-    #[test]
     fn a_remote_id_always_routes_control_actions_over_the_transport() {
         // A plain id renames/kills over its local control socket.
         assert!(
@@ -11828,10 +11698,6 @@ mod tests {
                 app.sessions.is_empty(),
                 "its remote members are observed, not driven: {:?}",
                 app.sessions.keys().collect::<Vec<_>>()
-            );
-            assert!(
-                app.remote_index.contains_key(&one) && app.remote_index.contains_key(&two),
-                "both members are indexed so their tiles can route over the transport"
             );
             assert!(
                 app.remotes.lock().unwrap().contains_key("kov@box"),
