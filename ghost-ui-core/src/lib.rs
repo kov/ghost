@@ -28,7 +28,8 @@ pub mod workspace;
 
 pub use cmd::{Cmd, PointerIcon};
 pub use event::{
-    DeadSession, DeadState, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent, WheelDelta,
+    DeadSession, DeadState, Listed, PointPx, PointerButton, PointerPhase, SessionPush, UiEvent,
+    WheelDelta,
 };
 pub use fleet::{FleetModel, Locality};
 pub use frame::{FrameGrab, ResizeEdge, resize_edge_at};

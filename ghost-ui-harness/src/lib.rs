@@ -141,7 +141,7 @@ impl Harness {
     /// in now, as a reconcile would). Use [`SessionInfo`]s the model will bucket.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.sessions = sessions.clone();
-        self.inject(UiEvent::SessionList(sessions));
+        self.inject(UiEvent::SessionList(local_listing(&sessions)));
     }
 
     /// Feed one event to the model and execute the effects it returns.
@@ -161,7 +161,7 @@ impl Harness {
                 Cmd::ListSessions => {
                     let more = self.root.update(
                         &mut self.states,
-                        UiEvent::SessionList(self.sessions.clone()),
+                        UiEvent::SessionList(local_listing(&self.sessions)),
                     );
                     self.exec(more);
                 }
@@ -260,4 +260,13 @@ impl Harness {
     pub fn surface_renders(&self) -> u32 {
         self.renderer.as_ref().map_or(0, Renderer::surface_renders)
     }
+}
+
+/// A listing of this machine's sessions.
+fn local_listing(sessions: &[SessionInfo]) -> Vec<ghost_ui_core::Listed> {
+    sessions
+        .iter()
+        .cloned()
+        .map(ghost_ui_core::Listed::local)
+        .collect()
 }

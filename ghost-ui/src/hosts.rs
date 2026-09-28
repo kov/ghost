@@ -24,7 +24,7 @@ pub(crate) struct RemoteHost {
 pub(crate) struct HostLink {
     /// The open transport, while connected.
     pub(crate) conn: Option<RemoteHost>,
-    /// The host's latest listing (fleet-namespaced ids), from its watcher.
+    /// The host's latest listing, as the host reported it, from its watcher.
     /// `None` means unknown — never listed yet, or unreachable — never "empty".
     pub(crate) listing: Option<Vec<ghost_vt::session::SessionInfo>>,
     /// The session names the host still holds a descriptor for (bare,
@@ -110,27 +110,27 @@ const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
 /// doesn't flicker its members.
 const REMOTE_WATCH_MAX_FAILURES: u32 = 3;
 
-/// Rewrite a remote host's listing for the local fleet: give each session a
-/// fleet-unique id (`<target>␟<real id>`) so it never collides, keep its real id
-/// (or display name) visible as the display name, and tag it with the host's
-/// connection so it renders as a remote tile badged with the host.
-pub(crate) fn namespace_remote_infos(
+/// A remote host's listing as the local fleet knows it: each session under its
+/// fleet id, its host's name for it (or its display name) shown as its display
+/// name, and tagged with the host's connection so it renders as a remote tile
+/// badged with the host.
+pub(crate) fn remote_listing(
     target: &str,
-    infos: Vec<ghost_vt::session::SessionInfo>,
-) -> Vec<ghost_vt::session::SessionInfo> {
+    infos: &[ghost_vt::session::SessionInfo],
+) -> Vec<ghost_ui_core::Listed> {
     let spec = ConnectionSpec::parse_target(target);
     infos
-        .into_iter()
-        .map(|mut i| {
-            let display = if i.display_name.is_empty() {
-                i.name.clone()
-            } else {
-                i.display_name.clone()
-            };
-            i.name = remote_fleet_id(target, &i.name);
-            i.display_name = display;
-            i.connection = spec.clone();
-            i
+        .iter()
+        .map(|i| {
+            let mut info = i.clone();
+            if info.display_name.is_empty() {
+                info.display_name = info.name.clone();
+            }
+            info.connection = spec.clone();
+            ghost_ui_core::Listed {
+                id: remote_fleet_id(target, &i.name),
+                info,
+            }
         })
         .collect()
 }
@@ -270,7 +270,6 @@ fn watch_stream_once(
         // A failed fetch posts `None`: unknown, never stale.
         let changed = last_line.as_deref() != Some(line.as_str());
         last_line = Some(line);
-        let infos = namespace_remote_infos(target, infos);
         if !sink.post(UserEvent::RemoteSessions {
             target: target.to_string(),
             infos,

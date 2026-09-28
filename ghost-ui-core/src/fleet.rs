@@ -19,12 +19,12 @@ use std::collections::HashSet;
 
 use std::rc::Rc;
 
+use crate::event::Listed;
 use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId,
     SceneItem, Style, Transform, layout_frame,
 };
 use ghost_vt::protocol::{SessionEvent, SessionState};
-use ghost_vt::session::SessionInfo;
 
 use crate::event::SessionPush;
 use crate::group::{Group, GroupId};
@@ -1360,11 +1360,11 @@ impl FleetModel {
         &mut self,
         sessions: &mut Sessions,
         mine: &HashSet<SessionId>,
-        infos: Vec<SessionInfo>,
+        infos: Vec<Listed>,
     ) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         let mut dirty = false;
-        let new_ids: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        let new_ids: HashSet<&str> = infos.iter().map(|l| l.id.as_str()).collect();
         // A listing that still names a session killed here is a race with its
         // dying host: keep suppressing it. One that no longer names it
         // confirms the death and frees the name.
@@ -1411,12 +1411,12 @@ impl FleetModel {
         // already drives (fed by the shell) get a live preview; the rest stay
         // placeholders until the snapshot follow-up.
         let now_ms = self.now_ms;
-        for info in &infos {
-            if self.killed.contains(&info.name) {
+        for Listed { id, info } in &infos {
+            if self.killed.contains(id) {
                 continue;
             }
-            let locality = locality_for(mine, &info.name, info.attached);
-            if let Some(tile) = self.tiles.iter_mut().find(|t| t.id == info.name) {
+            let locality = locality_for(mine, id, info.attached);
+            if let Some(tile) = self.tiles.iter_mut().find(|t| &t.id == id) {
                 // A just-committed rename defends its optimistic label: don't let a
                 // listing that hasn't caught up (a remote rename still in flight)
                 // revert it. Confirm-and-clear when the listing shows the new name;
@@ -1488,10 +1488,10 @@ impl FleetModel {
                 // prior state ended. A vanished session's stale state can't linger to be
                 // resurrected under a reused name: the shell's per-wake prune drops it
                 // (names are process-unique anyway).
-                let state = sessions.get_or_mint(&info.name, cols, rows);
+                let state = sessions.get_or_mint(id, cols, rows);
                 state.set_display_name(info.display_name.clone());
                 self.push_tile(
-                    info.name.clone(),
+                    id.clone(),
                     TerminalView::new(self.metrics, cols, rows),
                     (cols, rows),
                     info.display_name.clone(),
@@ -4374,6 +4374,12 @@ fn badge_kind(tile: &Tile, focused: bool) -> Option<BadgeKind> {
 
 #[cfg(test)]
 mod tests {
+    use ghost_vt::session::SessionInfo;
+
+    /// A listing of this machine's sessions.
+    fn listed(infos: Vec<SessionInfo>) -> Vec<crate::Listed> {
+        infos.into_iter().map(crate::Listed::local).collect()
+    }
     use super::*;
     use crate::TerminalModel;
     use crate::input::KeyEventKind;
@@ -4567,9 +4573,9 @@ mod tests {
     }
 
     fn list(m: &mut Fleet, names: &[&str]) -> Vec<Cmd> {
-        m.update(UiEvent::SessionList(
+        m.update(UiEvent::SessionList(listed(
             names.iter().map(|n| info(n)).collect(),
-        ))
+        )))
     }
 
     fn data(m: &mut Fleet, name: &str, bytes: &[u8]) -> Vec<Cmd> {
@@ -4615,7 +4621,7 @@ mod tests {
     /// List `n` detached sessions named `s0..sn`.
     fn list_many(m: &mut Fleet, n: usize) {
         let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
-        m.update(UiEvent::SessionList(infos));
+        m.update(UiEvent::SessionList(listed(infos)));
     }
 
     fn sinfo(name: &str, attached: bool) -> SessionInfo {
@@ -4788,11 +4794,11 @@ mod tests {
     fn this_windows_sessions_render_as_its_emphasized_group_block() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        let cmds = m.update(UiEvent::SessionList(vec![
+        let cmds = m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true), // driven by this window
             info("b"),        // detached
             sinfo("c", true), // held elsewhere
-        ]));
+        ])));
         // The driven session renders in this window's block — named after
         // its color — the pool below it, and the elsewhere content folded
         // into its toggle band.
@@ -4904,12 +4910,12 @@ mod tests {
         // than being adopted (that path has its own test).
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("m0", true),
             info("a"),
             info("b"),
             info("c"),
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
@@ -4949,11 +4955,11 @@ mod tests {
         // elsewhere" tile instead of inside this window's block.
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("m0", true),
             info("a"),
             info("c"),
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
         focus(&mut m, "c");
         let cmds = ctrl_enter(&mut m);
@@ -4996,11 +5002,11 @@ mod tests {
     fn opening_a_group_held_elsewhere_confirms_once_then_opens_all() {
         let mut m = fleet();
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true), // held by another window
             info("b"),
             info("c"),
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["a", "c"]);
         reveal(&mut m);
         focus(&mut m, "c");
@@ -5031,11 +5037,11 @@ mod tests {
     fn my_blocks_kill_button_confirms_then_kills_every_member() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         let r = group_button_rect(&m, "w1", GroupButton::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(m.modal_open(), "killing a group is confirmed first");
@@ -5057,7 +5063,7 @@ mod tests {
         let mut m = fleet();
         let remote = format!("h{}work", crate::group::REMOTE_ID_SEP);
         // A live remote tile (a listed session is live), focused by the listing.
-        m.update(UiEvent::SessionList(vec![info(&remote)]));
+        m.update(UiEvent::SessionList(listed(vec![info(&remote)])));
         // `r` reuses the relaunch verb: on a LIVE remote tile it offers a restart
         // under the current ghost — destructive (the running program is lost), so
         // it is confirmed first rather than acting immediately.
@@ -5074,7 +5080,7 @@ mod tests {
     #[test]
     fn r_on_a_live_local_tile_does_nothing() {
         let mut m = fleet();
-        m.update(UiEvent::SessionList(vec![info("local")]));
+        m.update(UiEvent::SessionList(listed(vec![info("local")])));
         // A live LOCAL tile has nothing dead to relaunch and isn't remote, so `r`
         // is inert — restart-under-the-new-ghost is a remote-only action.
         assert!(key(&mut m, Key::Char("r".into())).is_empty());
@@ -5085,11 +5091,11 @@ mod tests {
     fn my_blocks_detach_button_releases_the_hold_but_keeps_the_group() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         let r = group_button_rect(&m, "w1", GroupButton::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert_eq!(
@@ -5145,13 +5151,13 @@ mod tests {
         // behind a toggle band that names how much it hides.
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("m0", true),
             sinfo("a", true), // held by another window, web's member
             info("b"),        // detached, but web's member: hides with web
             sinfo("x", true), // held elsewhere, identity-less (generic)
             info("d"),        // ungrouped detached: always visible
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["a", "b"]);
         snap_attached(&mut m, "a", Some(&crate::group::window_identity("g-web")));
         let labels: Vec<String> = headers(&m).iter().map(|(l, _)| l.clone()).collect();
@@ -5213,11 +5219,11 @@ mod tests {
         // tiles within one.
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("d"),
             sinfo("x", true), // held elsewhere (generic)
-        ]));
+        ])));
         reveal(&mut m);
         let ra = tile_rect(&m, "a");
         let rd = tile_rect(&m, "d");
@@ -5251,7 +5257,10 @@ mod tests {
         // the right-aligned chips run the name over.
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("batch")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("batch"),
+        ])));
         seed_group(&mut m, "g-p", "purple", &["batch"]); // closed: [attach all, dissolve, kill]
         // A portrait mirror makes the card — and so the block — narrow.
         m.update(UiEvent::SessionPush {
@@ -5283,7 +5292,10 @@ mod tests {
     fn nothing_elsewhere_means_no_toggle() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("d"),
+        ])));
         assert!(
             toggle_rect(&m).is_none(),
             "no hidden content, no toggle band"
@@ -5297,12 +5309,12 @@ mod tests {
         // partially attached group — not in the detached pool.
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("m0", true),
             sinfo("a", true), // held by the other window
             info("b"),        // detached, but still web's member
             info("c"),        // detached and ungrouped: the pool
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["a", "b"]);
         snap_attached(&mut m, "a", Some(&crate::group::window_identity("g-web")));
         m.show_elsewhere = true; // the block hides by default; look at it
@@ -5332,10 +5344,10 @@ mod tests {
         // attach-all has nothing to add and relaunch is per-card.
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         assert_eq!(
             m.group_chipset("w1"),
             vec![GroupButton::Detach, GroupButton::Rename, GroupButton::Kill]
@@ -5470,11 +5482,11 @@ mod tests {
     fn a_dead_member_stays_as_a_dead_tile_in_my_block_a_stray_one_vanishes() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         data(&mut m, "c", b"LAST-WORDS");
         // b (nobody's member) and c (driven here) both die.
         let cmds = list(&mut m, &["a"]);
@@ -5515,11 +5527,11 @@ mod tests {
     fn an_all_dead_block_keeps_no_chips() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         list(&mut m, &["b"]); // everything driven here dies
         assert_eq!(
             m.group_chipset("w1"),
@@ -5536,7 +5548,10 @@ mod tests {
     fn the_detach_button_releases_the_session_and_keeps_a_live_preview() {
         let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("b"),
+        ])));
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
         let r = button_rect(&m, "a", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -5554,7 +5569,7 @@ mod tests {
             "the tile moves out of This window immediately"
         );
         // The next listing (host confirms the client is gone) keeps it there.
-        m.update(UiEvent::SessionList(vec![info("a"), info("b")]));
+        m.update(UiEvent::SessionList(listed(vec![info("a"), info("b")])));
         assert_eq!(m.locality_of("a"), Some(Locality::Detached));
     }
 
@@ -5587,11 +5602,11 @@ mod tests {
     fn a_dead_tile_relaunches_on_activation() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         list(&mut m, &["a", "b"]); // c dies
         let cmds = press(&mut m, "c");
         assert_eq!(
@@ -5648,10 +5663,10 @@ mod tests {
     fn a_dead_tile_offers_a_discard_chip_beside_relaunch() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // c dies -> a dead tile in my block
         let scene = m.view();
         let labels: Vec<&str> = scene.layers[0]
@@ -5673,10 +5688,10 @@ mod tests {
     fn the_discard_chip_confirms_then_forgets_the_corpse() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // c dies
         let (x, y) = chip_centre(&m, "discard");
         let cmds = press_at(&mut m, x, y);
@@ -5717,7 +5732,7 @@ mod tests {
             "its membership is persisted away: {cmds:?}"
         );
         // The other half of the footer still relaunches.
-        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        m.update(UiEvent::SessionList(listed(vec![sinfo("a", true)])));
         list(&mut m, &[]); // a dies too
         let (x, y) = chip_centre(&m, "relaunch");
         let cmds = press_at(&mut m, x, y);
@@ -5739,7 +5754,7 @@ mod tests {
             members: vec!["a".into(), "x".into()],
             connection: None,
         }]);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        m.update(UiEvent::SessionList(listed(vec![sinfo("a", true)])));
         m.update(UiEvent::DeadSessions(vec![dead_info(
             "x",
             "worker",
@@ -5789,11 +5804,11 @@ mod tests {
     fn open_all_skips_dead_members_but_kill_throws_them_away() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         list(&mut m, &["a", "b"]); // c dies
         focus(&mut m, "a");
         assert_eq!(
@@ -5865,7 +5880,10 @@ mod tests {
     fn dropping_a_detached_tile_into_my_block_attaches_it_here() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("d"),
+        ])));
         let from = centre(&tile_rect(&m, "d"));
         let to = centre(&my_block_rect(&m));
         let cmds = drag(&mut m, from, to);
@@ -5889,10 +5907,10 @@ mod tests {
     fn dropping_an_elsewhere_tile_into_my_block_confirms_the_steal() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("x", true),
-        ]));
+        ])));
         reveal(&mut m);
         let from = centre(&tile_rect(&m, "x"));
         let to = centre(&my_block_rect(&m));
@@ -5911,11 +5929,11 @@ mod tests {
     fn dragging_a_member_out_of_my_block_detaches_it() {
         let mut m = my_fleet(&["a", "b"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("b", true),
             info("d"),
-        ]));
+        ])));
         let from = centre(&tile_rect(&m, "a"));
         // Drop well below everything — outside my block.
         let cmds = drag(&mut m, from, (WIDE.0 as f32 - 20.0, WIDE.1 as f32 - 10.0));
@@ -5932,10 +5950,10 @@ mod tests {
     fn dragging_a_dead_member_out_of_my_block_forgets_it() {
         let mut m = my_fleet(&["a", "b"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("b", true),
-        ]));
+        ])));
         list(&mut m, &["b"]); // a dies, remembered in my block
         assert!(m.tiles.iter().any(|t| t.id == "a" && t.dead));
         let from = centre(&tile_rect(&m, "a"));
@@ -5952,11 +5970,11 @@ mod tests {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x"]);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("x", true),
             info("d"),
-        ]));
+        ])));
         let before = m.groups().to_vec();
         reveal(&mut m);
         // Drop the detached tile onto the foreign block: nothing happens.
@@ -5982,11 +6000,11 @@ mod tests {
     fn dragging_a_marked_tile_drags_the_whole_marked_set() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("d1"),
             info("d2"),
-        ]));
+        ])));
         for id in ["d1", "d2"] {
             let pos = centre_of(&m, id);
             press_ctrl(&mut m, pos); // mark both
@@ -6005,11 +6023,11 @@ mod tests {
     fn a_attaches_the_marked_here_confirming_steals() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("d"),
             sinfo("x", true),
-        ]));
+        ])));
         reveal(&mut m);
         for id in ["d", "x"] {
             let pos = centre_of(&m, id);
@@ -6030,7 +6048,10 @@ mod tests {
         // Without any steal it runs immediately.
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("d"),
+        ])));
         let pos = centre_of(&m, "d");
         press_ctrl(&mut m, pos);
         let cmds = key(&mut m, Key::Char("a".into()));
@@ -6042,11 +6063,11 @@ mod tests {
     fn d_detaches_the_marked_sessions_this_window_drives() {
         let mut m = my_fleet(&["a", "b"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("b", true),
             info("d"),
-        ]));
+        ])));
         for id in ["a", "d"] {
             let pos = centre_of(&m, id);
             press_ctrl(&mut m, pos);
@@ -6083,7 +6104,10 @@ mod tests {
         // target, marks just widen it.
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("m0", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("m0", true),
+            info("d"),
+        ])));
         focus(&mut m, "d");
         let cmds = key(&mut m, Key::Char("a".to_string()));
         assert!(
@@ -6113,10 +6137,10 @@ mod tests {
         // remembered member away.
         let mut m = my_fleet(&["a", "z"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("z", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // z dies, remembered by my group
         assert!(m.tiles.iter().any(|t| t.id == "z" && t.dead));
         focus(&mut m, "z");
@@ -6138,11 +6162,11 @@ mod tests {
         // no foreground switch (Ctrl-Enter is the opening chord).
         let mut m = my_fleet(&["m0"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("m0", true),
             info("x"),
             info("y"),
-        ]));
+        ])));
         seed_group(&mut m, "g-web", "web", &["x", "y"]); // closed: both detached
         focus(&mut m, "x");
         let cmds = key_ctrl(&mut m, Key::Char("a".to_string()));
@@ -6160,11 +6184,11 @@ mod tests {
     fn ctrl_d_detaches_the_focused_tiles_group() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("b"),
             sinfo("c", true),
-        ]));
+        ])));
         focus(&mut m, "a");
         let cmds = key_ctrl(&mut m, Key::Char("d".to_string()));
         assert!(
@@ -6184,10 +6208,10 @@ mod tests {
     fn ctrl_delete_confirms_killing_the_focused_tiles_group() {
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         focus(&mut m, "a");
         let cmds = key_ctrl(&mut m, Key::Named(NamedKey::Delete));
         assert!(m.modal_open(), "a group kill is confirmed: {cmds:?}");
@@ -6206,10 +6230,10 @@ mod tests {
         // and groupless). It lands in the pool.
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         focus(&mut m, "a");
         let cmds = key(&mut m, Key::Char("u".to_string()));
         assert!(
@@ -6234,10 +6258,10 @@ mod tests {
     fn u_forgets_a_focused_dead_member() {
         let mut m = my_fleet(&["a", "z"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("z", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // z dies, remembered
         focus(&mut m, "z");
         let cmds = key(&mut m, Key::Char("u".to_string()));
@@ -6255,11 +6279,11 @@ mod tests {
         // sessions themselves keep running; nothing needs a confirm.
         let mut m = my_fleet(&["a", "c", "z"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
             sinfo("z", true),
-        ]));
+        ])));
         list(&mut m, &["a", "c"]); // z dies, remembered by my group
         focus(&mut m, "a");
         let cmds = key_ctrl(&mut m, Key::Char("u".to_string()));
@@ -6288,10 +6312,10 @@ mod tests {
         // relaunch — the verb is inert on them.
         let mut m = my_fleet(&["a", "z"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("z", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // z dies, remembered by my group
         focus(&mut m, "z");
         let cmds = key(&mut m, Key::Char("r".to_string()));
@@ -6319,11 +6343,11 @@ mod tests {
         // comes back — focused on a LIVE member, like the header chip.
         let mut m = my_fleet(&["a", "z", "w"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("z", true),
             sinfo("w", true),
-        ]));
+        ])));
         list(&mut m, &["a"]); // z and w die, remembered
         focus(&mut m, "a");
         let cmds = key_ctrl(&mut m, Key::Char("r".to_string()));
@@ -6344,11 +6368,11 @@ mod tests {
     fn delete_kills_the_marked_after_one_confirm() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("d1"),
             info("d2"),
-        ]));
+        ])));
         for id in ["d1", "d2"] {
             let pos = centre_of(&m, id);
             press_ctrl(&mut m, pos);
@@ -6371,10 +6395,10 @@ mod tests {
         // tile, nothing to resurrect.
         let mut m = my_fleet(&["a", "c"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         let r = button_rect(&m, "a", Button::Kill);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(m.modal_open(), "killing is confirmed first");
@@ -6391,10 +6415,10 @@ mod tests {
         );
         // The host takes a moment to die: a racing listing still naming the
         // session must not resurrect its tile or its membership.
-        let cmds = m.update(UiEvent::SessionList(vec![
+        let cmds = m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             sinfo("c", true),
-        ]));
+        ])));
         assert!(
             !m.tiles.iter().any(|t| t.id == "a"),
             "a dying session is not re-seeded"
@@ -6547,7 +6571,10 @@ mod tests {
     fn a_dead_member_keeps_my_block_on_screen() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("b"),
+        ])));
         // "a" dies: the block stays, showing the dead-but-remembered tile.
         list(&mut m, &["b"]);
         assert_eq!(order(&m), ["a", "b"]);
@@ -6620,10 +6647,10 @@ mod tests {
         // the frozen dive world (the end-of-dive layout jump).
         let mut m = fleet();
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![SessionInfo {
+        m.update(UiEvent::SessionList(listed(vec![SessionInfo {
             size: Some((120, 60)),
             ..info("a")
-        }]));
+        }])));
         assert_eq!(
             tile(&m, "a").grid,
             (120, 60),
@@ -6651,7 +6678,10 @@ mod tests {
     #[test]
     fn the_fleet_observes_sessions_it_does_not_drive() {
         let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
-        let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        let cmds = m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("b"),
+        ])));
         assert!(
             cmds.contains(&Cmd::Observe("b".to_string())),
             "the foreign tile gets a live mirror; got {cmds:?}"
@@ -6661,7 +6691,10 @@ mod tests {
             "a driven session is already live — observing it would double-feed"
         );
         // A second reconcile doesn't re-observe.
-        let cmds = m.update(UiEvent::SessionList(vec![sinfo("a", true), info("b")]));
+        let cmds = m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("b"),
+        ])));
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::Observe(_))));
     }
 
@@ -6766,7 +6799,7 @@ mod tests {
         // Marker parity: a bell someone was attached to see is not an unseen
         // notification. The live *reaction* for the focused window is separate.
         let mut m = fleet();
-        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        m.update(UiEvent::SessionList(listed(vec![sinfo("a", true)])));
         let cmds = push(&mut m, "a", SessionPush::Event(SessionEvent::Bell));
         assert!(!tile(&m, "a").bell);
         assert!(cmds.is_empty());
@@ -6862,7 +6895,11 @@ mod tests {
         seed_group(&mut m, "g2", "green", &["x", "y"]);
         // Nobody holds x or y: their group is closed. It renders last,
         // keeping its members out of the detached pool.
-        m.update(UiEvent::SessionList(vec![info("x"), info("y"), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            info("x"),
+            info("y"),
+            info("d"),
+        ])));
         assert_eq!(header_labels(&m), vec!["Detached", "green"]);
         assert_eq!(tile_y(&m, "x"), tile_y(&m, "y"));
         assert!(tile_y(&m, "d") < tile_y(&m, "x"));
@@ -6887,7 +6924,7 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x", "z"]);
-        m.update(UiEvent::SessionList(vec![info("x")]));
+        m.update(UiEvent::SessionList(listed(vec![info("x")])));
         // "z" died before this fleet ever saw it: the sweep seeds its tile,
         // and it renders inside its (closed) group's block.
         m.update(UiEvent::DeadSessions(vec![dead_info("z", "worker", &[])]));
@@ -6913,7 +6950,7 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x", "y"]);
-        m.update(UiEvent::SessionList(vec![info("x"), info("y")]));
+        m.update(UiEvent::SessionList(listed(vec![info("x"), info("y")])));
         focus(&mut m, "x");
         let cmds = ctrl_enter(&mut m);
         // The empty window BECOMES the group: same id, color, name.
@@ -6939,11 +6976,11 @@ mod tests {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x", "y"]);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", true),
             info("x"),
             info("y"),
-        ]));
+        ])));
         focus(&mut m, "x");
         let cmds = ctrl_enter(&mut m);
         assert_eq!(m.my_group.id, "w1", "a window with sessions keeps itself");
@@ -6972,7 +7009,7 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x", "z"]);
-        m.update(UiEvent::SessionList(vec![info("x")]));
+        m.update(UiEvent::SessionList(listed(vec![info("x")])));
         m.update(UiEvent::DeadSessions(vec![dead_info("z", "", &[])]));
         let r = group_button_rect(&m, "g2", GroupButton::Dissolve);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -7001,11 +7038,11 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x", "y"]);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("x", true),
             sinfo("y", true),
             info("d"),
-        ]));
+        ])));
         reveal(&mut m);
         // Registry membership alone buckets the foreign pair under their
         // window's block — after the detached pool (and the reveal toggle),
@@ -7032,10 +7069,10 @@ mod tests {
         let mut m = my_fleet(&[]);
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x"]);
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("x", true),
             sinfo("z", true),
-        ]));
+        ])));
         reveal(&mut m);
         // No identity, no membership: "z" sits in the generic section.
         assert_eq!(
@@ -7062,7 +7099,10 @@ mod tests {
         widen(&mut m);
         seed_group(&mut m, "g2", "green", &["x"]);
         seed_group(&mut m, "g3", "orange", &[]);
-        m.update(UiEvent::SessionList(vec![sinfo("x", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("x", true),
+            info("d"),
+        ])));
         reveal(&mut m);
         assert_eq!(
             header_labels(&m),
@@ -7091,7 +7131,10 @@ mod tests {
     fn the_rename_chip_edits_my_groups_name() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true), info("d")]));
+        m.update(UiEvent::SessionList(listed(vec![
+            sinfo("a", true),
+            info("d"),
+        ])));
         assert_eq!(
             m.group_chipset("w1"),
             vec![GroupButton::Detach, GroupButton::Rename, GroupButton::Kill]
@@ -7125,7 +7168,7 @@ mod tests {
     fn escape_cancels_the_group_rename() {
         let mut m = my_fleet(&["a"]);
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![sinfo("a", true)]));
+        m.update(UiEvent::SessionList(listed(vec![sinfo("a", true)])));
         let r = group_button_rect(&m, "w1", GroupButton::Rename);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         for c in "junk".chars() {
@@ -7158,34 +7201,34 @@ mod tests {
         let mut m = fleet();
         // Enumerated in a scrambled order; creation time is the intended spatial
         // order, so the grid must not follow how the host happened to list them.
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             info_at("c", 30),
             info_at("a", 10),
             info_at("b", 20),
-        ]));
+        ])));
         assert_eq!(
             order(&m),
             vec!["a", "b", "c"],
             "oldest session first, regardless of enumeration order"
         );
         // A later reconcile in yet another order must not reshuffle the grid.
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             info_at("b", 20),
             info_at("c", 30),
             info_at("a", 10),
-        ]));
+        ])));
         assert_eq!(
             order(&m),
             vec!["a", "b", "c"],
             "ordering is stable across reconciles"
         );
         // A brand-new (newest) session lands at the end; existing tiles keep slots.
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             info_at("d", 40),
             info_at("b", 20),
             info_at("a", 10),
             info_at("c", 30),
-        ]));
+        ])));
         assert_eq!(order(&m), vec!["a", "b", "c", "d"]);
     }
 
@@ -7203,9 +7246,9 @@ mod tests {
         // pair must not swap.
         let build = |enumerated: &[(&str, i64)]| {
             let mut m = fleet();
-            m.update(UiEvent::SessionList(
+            m.update(UiEvent::SessionList(listed(
                 enumerated.iter().map(|(n, t)| info_at(n, *t)).collect(),
-            ));
+            )));
             order(&m)
         };
         let want = vec!["s1", "s2", "s3", "s4"];
@@ -7226,11 +7269,11 @@ mod tests {
     #[test]
     fn tiles_are_split_into_attach_state_sections() {
         let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["a".to_string()]));
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a", false), // ours -> Attached
             sinfo("b", true),  // attached elsewhere
             sinfo("c", false), // detached
-        ]));
+        ])));
         assert_eq!(m.locality_of("a"), Some(Locality::ThisWindow));
         assert_eq!(m.locality_of("b"), Some(Locality::Elsewhere));
         assert_eq!(m.locality_of("c"), Some(Locality::Detached));
@@ -7293,12 +7336,12 @@ mod tests {
             SIZE,
             HashSet::from(["a1".to_string(), "a2".to_string()]),
         );
-        m.update(UiEvent::SessionList(vec![
+        m.update(UiEvent::SessionList(listed(vec![
             sinfo("a1", false),
             sinfo("a2", false),
             sinfo("d1", false),
             sinfo("d2", false),
-        ]));
+        ])));
         widen(&mut m);
         assert_eq!(m.focused(), Some("a1"));
         assert_eq!(m.locality_of("a1"), Some(Locality::ThisWindow));
@@ -7782,7 +7825,10 @@ mod tests {
     #[test]
     fn clicking_the_detach_button_detaches_instead_of_opening() {
         let mut m = Fleet::new(METRICS, SIZE, HashSet::from(["b".to_string()]));
-        m.update(UiEvent::SessionList(vec![info("a"), sinfo("b", true)]));
+        m.update(UiEvent::SessionList(listed(vec![
+            info("a"),
+            sinfo("b", true),
+        ])));
         let r = button_rect(&m, "b", Button::Detach);
         let cmds = press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         assert!(
@@ -7947,10 +7993,10 @@ mod tests {
 
         // Once the listing confirms the new label, it sticks (and the pending mark
         // is cleared, so a subsequent revert-to-old would take effect).
-        m.update(UiEvent::SessionList(vec![SessionInfo {
+        m.update(UiEvent::SessionList(listed(vec![SessionInfo {
             display_name: "newname".into(),
             ..info("a")
-        }]));
+        }])));
         assert_eq!(tile_display(&m, "a"), "newname");
     }
 
@@ -8022,7 +8068,7 @@ mod tests {
         let mut m = fleet();
         let mut i = info("sess-1");
         i.display_name = "build box".into();
-        m.update(UiEvent::SessionList(vec![i]));
+        m.update(UiEvent::SessionList(listed(vec![i])));
         let r = button_rect(&m, "sess-1", Button::Rename);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         // Alt-Backspace deletes the trailing word: "build box" -> "build ".
@@ -8069,7 +8115,7 @@ mod tests {
         let mut m = fleet();
         let mut i = info("sess-1");
         i.display_name = "build box".into();
-        m.update(UiEvent::SessionList(vec![i]));
+        m.update(UiEvent::SessionList(listed(vec![i])));
         let texts = view_texts(&m);
         assert!(
             texts.iter().any(|t| t.contains("build box")),
@@ -8086,7 +8132,7 @@ mod tests {
         let mut m = fleet();
         let mut i = info("sess-1");
         i.display_name = "old label".into();
-        m.update(UiEvent::SessionList(vec![i]));
+        m.update(UiEvent::SessionList(listed(vec![i])));
         let r = button_rect(&m, "sess-1", Button::Rename);
         press_at(&mut m, r.x + r.w / 2.0, r.y + r.h / 2.0);
         // The edit starts from the current display name, not the internal id.
@@ -8155,7 +8201,7 @@ mod tests {
         let mut m = fleet();
         let mut a = info("a");
         a.attached = true; // attached by another window
-        m.update(UiEvent::SessionList(vec![a]));
+        m.update(UiEvent::SessionList(listed(vec![a])));
         reveal(&mut m);
         assert_eq!(m.locality_of("a"), Some(Locality::Elsewhere));
         let cmds = press(&mut m, "a");
@@ -8250,7 +8296,7 @@ mod tests {
         let mut m = fleet();
         let mut a = info("a");
         a.attached = true; // held by another window -> take-over confirm
-        m.update(UiEvent::SessionList(vec![a]));
+        m.update(UiEvent::SessionList(listed(vec![a])));
         reveal(&mut m);
         press(&mut m, "a");
         // A take-over is a simple confirmation, not destruction: green, with
@@ -8375,7 +8421,7 @@ mod tests {
         widen(&mut m); // keep both tiles on one visible row
         let mut infos = vec![info("a"), info("b")];
         infos[1].bell = true; // "b" rang the bell
-        m.update(UiEvent::SessionList(infos));
+        m.update(UiEvent::SessionList(listed(infos)));
         let badges = |m: &Fleet| {
             m.view().layers[0]
                 .items
@@ -8468,10 +8514,10 @@ mod tests {
     fn card_metadata_shows_the_working_directory() {
         let mut m = fleet();
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![SessionInfo {
+        m.update(UiEvent::SessionList(listed(vec![SessionInfo {
             cwd: Some("~/Projects/ghost".into()),
             ..info("a")
-        }]));
+        }])));
         let scene = m.view();
         assert!(
             scene.layers[0].items.iter().any(|it| matches!(it,
@@ -8497,10 +8543,10 @@ mod tests {
     fn an_ssh_sessions_tile_meta_shows_its_host() {
         let mut m = fleet();
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![SessionInfo {
+        m.update(UiEvent::SessionList(listed(vec![SessionInfo {
             connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
             ..info("remote")
-        }]));
+        }])));
         let scene = m.view();
         assert!(
             scene.layers[0].items.iter().any(|it| matches!(it,
@@ -8521,7 +8567,7 @@ mod tests {
             members: vec!["x".into(), "y".into()],
             connection: ghost_vt::connection::ConnectionSpec::parse_target("kov@box"),
         }]));
-        m.update(UiEvent::SessionList(vec![info("x"), info("y")]));
+        m.update(UiEvent::SessionList(listed(vec![info("x"), info("y")])));
         assert!(
             header_labels(&m)
                 .iter()
@@ -8535,7 +8581,7 @@ mod tests {
     fn card_metadata_is_clipped_to_its_card() {
         let mut m = fleet();
         widen(&mut m);
-        m.update(UiEvent::SessionList(vec![SessionInfo {
+        m.update(UiEvent::SessionList(listed(vec![SessionInfo {
             command: vec![
                 "journalctl".into(),
                 "-f".into(),
@@ -8544,7 +8590,7 @@ mod tests {
             ],
             pid: 123456,
             ..info("skinny")
-        }]));
+        }])));
         // A tall observed grid narrows the card (aspect-locked), so the long
         // command cannot possibly fit its meta line.
         m.update(UiEvent::SessionPush {
@@ -8667,7 +8713,7 @@ mod tests {
         for n in 1..=12usize {
             let mut m = fleet();
             let infos: Vec<SessionInfo> = (0..n).map(|i| info(&format!("s{i}"))).collect();
-            m.update(UiEvent::SessionList(infos));
+            m.update(UiEvent::SessionList(listed(infos)));
             let (_, placements, _, content_h) = m.sections_layout();
             assert_eq!(placements.len(), n);
             let w = SIZE.0 as f32;
@@ -8969,7 +9015,10 @@ mod tests {
         let mut m = fleet(); // mine is empty
         let mut elsewhere = info("foreign");
         elsewhere.attached = true; // attached by some other window
-        let cmds = m.update(UiEvent::SessionList(vec![info("mine-detached"), elsewhere]));
+        let cmds = m.update(UiEvent::SessionList(listed(vec![
+            info("mine-detached"),
+            elsewhere,
+        ])));
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Attach(_))),
             "the fleet must not attach any session: {cmds:?}"
@@ -8986,7 +9035,7 @@ mod tests {
         // another window. Extracting it as the foreground would double-attach it
         // (in two groups); the guard crashes rather than silently corrupt state.
         let mut f = fleet();
-        f.update(UiEvent::SessionList(vec![sinfo("ghost-mac", true)]));
+        f.update(UiEvent::SessionList(listed(vec![sinfo("ghost-mac", true)])));
         let _ = f.into_single_adopting("ghost-mac".to_string(), SIZE, 1.0);
     }
 
@@ -8999,7 +9048,7 @@ mod tests {
         // single-session take-over used to skip the claim and dive on an Elsewhere tile).
         let mut f = fleet(); // owns nothing
         widen(&mut f);
-        f.update(UiEvent::SessionList(vec![sinfo("ghost-mac", true)]));
+        f.update(UiEvent::SessionList(listed(vec![sinfo("ghost-mac", true)])));
         assert_eq!(f.locality_of("ghost-mac"), Some(Locality::Elsewhere));
         reveal(&mut f); // the "attached elsewhere" pool is folded by default
         focus(&mut f, "ghost-mac");
@@ -9031,10 +9080,10 @@ mod tests {
         let mine = HashSet::from(["alpha".to_string()]);
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
         let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
-        f.update(UiEvent::SessionList(vec![
+        f.update(UiEvent::SessionList(listed(vec![
             info("alpha"),
             sinfo("beta", true),
-        ]));
+        ])));
         assert_eq!(
             f.locality_of("beta"),
             Some(Locality::Elsewhere),
@@ -9064,7 +9113,10 @@ mod tests {
         let mine = HashSet::from(["alpha".to_string()]);
         let primary = TerminalModel::new("alpha".to_string(), 80, 24, METRICS);
         let (mut f, _) = Fleet::adopting(primary, Vec::new(), METRICS, SIZE, 1.0, mine);
-        f.update(UiEvent::SessionList(vec![info("alpha"), info("beta")]));
+        f.update(UiEvent::SessionList(listed(vec![
+            info("alpha"),
+            info("beta"),
+        ])));
         // Move focus onto the foreign tile (it's in the section below ours).
         f.update(UiEvent::Key {
             key: Key::Named(NamedKey::ArrowDown),

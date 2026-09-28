@@ -802,7 +802,7 @@ fn calib_scene(size: (u32, u32), count: usize) -> ghost_render::Scene {
         .enumerate()
         .map(|(i, n)| info(n, true, &[], i as i32 + 1))
         .collect();
-    fleet.update(&mut sessions, &mine, UiEvent::SessionList(infos));
+    fleet.update(&mut sessions, &mine, UiEvent::SessionList(local(infos)));
     let cal = calibration_screen(80, 24);
     for n in &names {
         feed(&mut fleet, &mut sessions, &mine, n, &cal);
@@ -857,13 +857,13 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
     fleet.update(
         &mut sessions,
         &mine,
-        UiEvent::SessionList(vec![
+        UiEvent::SessionList(local(vec![
             info("edit", true, &["nvim", "src/fleet.rs"], 4011),
             info("build", true, &[], 4012),
             info("logs", true, &["journalctl", "-f"], 4099), // attached elsewhere
             info("prod", false, &["ssh", "prod-web-1"], 3777), // detached
             info("batch", false, &["make", "-j8"], 3120),    // a closed group's member
-        ]),
+        ])),
     );
 
     // Live previews for the sessions this window drives.
@@ -990,7 +990,7 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
     // window has already seen by the time it dives. RootModel caches these across the
     // toggle, so the fleet it rebuilds on F9 is in its final order from the start.
     let reconcile = || {
-        UiEvent::SessionList(
+        UiEvent::SessionList(local(
             names
                 .iter()
                 .enumerate()
@@ -1000,7 +1000,7 @@ fn kicked_dive(dir: &str, count: usize) -> (RootModel, Sessions, u64) {
                     si
                 })
                 .collect(),
-        )
+        ))
     };
     root.update(&mut states, reconcile());
     // Each session gets a distinct solid fill so it's obvious *which* session a dive
@@ -1200,6 +1200,14 @@ fn feed(
     );
 }
 
+/// A listing of this machine's sessions.
+fn local(infos: Vec<SessionInfo>) -> Vec<ghost_ui_core::Listed> {
+    infos
+        .into_iter()
+        .map(ghost_ui_core::Listed::local)
+        .collect()
+}
+
 fn info(name: &str, attached: bool, command: &[&str], pid: i32) -> SessionInfo {
     SessionInfo {
         name: name.to_string(),
@@ -1365,7 +1373,7 @@ mod tests {
         root.update(&mut states, key);
         root.update(
             &mut states,
-            UiEvent::SessionList(vec![info("m", true, &[], 1)]),
+            UiEvent::SessionList(local(vec![info("m", true, &[], 1)])),
         );
         root.update(&mut states, UiEvent::Tick { now_ms: 10_000 }); // stamp t0 → progress 0 = full zoom
         let dive = renderer.render_offscreen_scene(&root.view(&states), font, SIZE_PX);

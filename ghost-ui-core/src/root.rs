@@ -1849,16 +1849,16 @@ impl RootModel {
             // fleet handles its own tiles below; the foreground drives the window
             // title, so a label change there retitles.
             let mut cmds = Vec::new();
-            for info in infos {
-                if self.warm.contains_key(&info.name)
-                    && let Some(state) = sessions.get_mut(&info.name)
+            for listed in infos {
+                if self.warm.contains_key(&listed.id)
+                    && let Some(state) = sessions.get_mut(&listed.id)
                 {
-                    state.set_display_name(info.display_name.clone());
+                    state.set_display_name(listed.info.display_name.clone());
                 }
             }
             if let Mode::Single { id, .. } = &self.mode {
                 let id = id.clone();
-                if let Some(info) = infos.iter().find(|i| i.name == id)
+                if let Some(info) = infos.iter().find(|l| l.id == id).map(|l| &l.info)
                     && let Some(state) = sessions.get_mut(&id)
                 {
                     let before = state.title();
@@ -3208,6 +3208,10 @@ impl RootModel {
 
 #[cfg(test)]
 mod tests {
+    /// A listing of this machine's sessions.
+    fn listed(infos: Vec<SessionInfo>) -> Vec<crate::Listed> {
+        infos.into_iter().map(crate::Listed::local).collect()
+    }
     use super::*;
     use crate::input::{KeyEventKind, Mods};
 
@@ -3683,7 +3687,7 @@ mod tests {
             let (mut w, _, _) = RootModel::fleet(METRICS, SIZE, 1.0);
             w.update(
                 &mut sessions,
-                UiEvent::SessionList(vec![sess("x", false, 1)]),
+                UiEvent::SessionList(listed(vec![sess("x", false, 1)])),
             );
             // The previewed program subscribes to focus events: a rising edge, so the
             // ingest produces a report — which this feed has no write path for.
@@ -3729,7 +3733,7 @@ mod tests {
         let (mut w, _, _) = RootModel::fleet(METRICS, SIZE, 1.0);
         w.update(
             &mut sessions,
-            UiEvent::SessionList(vec![sess("x", false, 1)]),
+            UiEvent::SessionList(listed(vec![sess("x", false, 1)])),
         );
         assert!(sessions.get("x").is_some(), "the observed state is minted");
 
@@ -3877,7 +3881,7 @@ mod tests {
     /// is animating.
     fn dive_out(r: &mut Win, sessions: &[ghost_vt::session::SessionInfo]) {
         key(r, Key::Named(NamedKey::F9), Mods::NONE);
-        r.update(UiEvent::SessionList(sessions.to_vec()));
+        r.update(UiEvent::SessionList(listed(sessions.to_vec())));
     }
 
     #[test]
@@ -3968,7 +3972,11 @@ mod tests {
         // A freshly-opened overview window owns no session; the fleet lists one
         // that is attached in another window ("ghost-mac", attached elsewhere).
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
-        r.update(UiEvent::SessionList(vec![sess("ghost-mac", true, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess(
+            "ghost-mac",
+            true,
+            1,
+        )])));
         // F9 must not dive into — and thereby adopt — that foreign session. With
         // nothing of its own to return to, the window stays in the overview
         // rather than attaching a session that's already attached (in two groups).
@@ -4088,10 +4096,10 @@ mod tests {
             members: vec!["x".into(), "y".into()],
             connection: None,
         }]));
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             sess("x", false, 1),
             sess("y", false, 2),
-        ]));
+        ])));
         // Ctrl-Enter on the focused member (the empty window drives
         // nothing): the window BECOMES the group, and the identity the
         // shell reads for the very next attach already says so.
@@ -4169,7 +4177,7 @@ mod tests {
         // The driven, grouped member dies: the fleet keeps a dead tile and
         // emits a Detach for the window's client — which must also release
         // the root's ownership, or the next fleet would claim the corpse.
-        r.update(UiEvent::SessionList(vec![sess("beta", false, 2)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("beta", false, 2)])));
         assert!(
             !r.mine.contains("alpha"),
             "a session this window no longer drives is not ours"
@@ -4235,7 +4243,7 @@ mod tests {
     #[test]
     fn a_parked_take_over_survives_a_listing_that_shows_our_own_attach() {
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
-        r.update(UiEvent::SessionList(vec![sess("beta", false, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("beta", false, 1)])));
         // The shell attached beta into this window (a restore reconnect), says so,
         // and asks for it in the foreground.
         r.update(UiEvent::DriverGained {
@@ -4247,7 +4255,7 @@ mod tests {
             "a tile with no output yet holds in the fleet until its first frame"
         );
         // The host's listing catches up mid-wait: beta is attached — to us.
-        r.update(UiEvent::SessionList(vec![sess("beta", true, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("beta", true, 1)])));
         // Its first frame releases the parked dive.
         r.update(UiEvent::SessionData {
             name: "beta".into(),
@@ -4272,7 +4280,7 @@ mod tests {
     #[should_panic(expected = "attached in another window")]
     fn adopting_a_session_attached_elsewhere_is_still_refused() {
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
-        r.update(UiEvent::SessionList(vec![sess("beta", true, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("beta", true, 1)])));
         // Fed by an observer's mirror: the tile is live, so nothing parks and the
         // adopt goes straight to the extract.
         r.update(UiEvent::SessionData {
@@ -4348,7 +4356,7 @@ mod tests {
     fn escape_cancels_a_fleet_modal_instead_of_leaving() {
         let mut r = root(); // owns "alpha"
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE);
-        r.update(UiEvent::SessionList(vec![sess("alpha", true, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("alpha", true, 1)])));
         // F2 opens a rename on the focused tile; Esc must close the modal and
         // stay in the fleet, only leaving on a second, unclaimed press.
         key(&mut r, Key::Named(NamedKey::F2), Mods::NONE);
@@ -4385,10 +4393,10 @@ mod tests {
         let mut r = root(); // owns "alpha"
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         // The shell's ListSessions reply: our alpha plus a foreign detached beta.
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             info("alpha", true),
             info("beta", false),
-        ]));
+        ])));
         // Move focus onto the foreign tile (in the section below), then toggle back.
         r.update(UiEvent::Key {
             key: Key::Named(NamedKey::ArrowDown),
@@ -4667,7 +4675,7 @@ mod tests {
             "F9 fetches the complete grid first: {cmds:?}"
         );
         // The session list arrives: now the pull-back animation launches.
-        let launched = r.update(UiEvent::SessionList(vec![sess("alpha", true, 1)]));
+        let launched = r.update(UiEvent::SessionList(listed(vec![sess("alpha", true, 1)])));
         assert!(r.is_animating(), "the session list launches the zoom");
         assert!(
             launched
@@ -4772,10 +4780,10 @@ mod tests {
         // A later reply that REVERSES the order would reshuffle the live fleet. The
         // dive renders a frozen snapshot, so each tile must stay put — otherwise a
         // different session slides under the camera mid-dive.
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             sess("alpha", true, 9), // now newer
             sess("beta", true, 1),  // now older
-        ]));
+        ])));
         assert_eq!(
             before,
             tiles(&r),
@@ -4817,10 +4825,10 @@ mod tests {
         dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", true, 2)]);
         let during = order(&r); // the order the dive animates
         // A further reply lands mid-dive, as the host's poll does.
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             sess("alpha", true, 1),
             sess("beta", true, 2),
-        ]));
+        ])));
         let mut t = 1_000_000;
         while r.is_animating() {
             r.update(UiEvent::Tick { now_ms: t });
@@ -4866,12 +4874,12 @@ mod tests {
 
         // The reply: this window's attached alpha plus three detached foreign sessions
         // (the user's "1 attached + 3 detached" case).
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             sess("alpha", true, 1),
             sess("x", false, 2),
             sess("y", false, 3),
             sess("z", false, 4),
-        ]));
+        ])));
         assert!(r.is_animating(), "the dive launches once the grid is whole");
         assert_eq!(
             tile_count(&r),
@@ -5030,10 +5038,10 @@ mod tests {
         let mut r = root(); // owns alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
         settle(&mut r);
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             info("alpha", true),
             info("beta", false),
-        ]));
+        ])));
         // The shell attaches a clicked tile, then replies AdoptSession. beta is a
         // cold detached tile, so the open waits for its preview to load; its first
         // output lands the dive into the single view.
@@ -5945,7 +5953,7 @@ mod tests {
         // A fleet-started window (owns nothing); the user attaches a detached
         // session, the shell feeds it, then the user reopens the fleet.
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);
-        r.update(UiEvent::SessionList(vec![info("d", false)])); // detached
+        r.update(UiEvent::SessionList(listed(vec![info("d", false)]))); // detached
         r.update(UiEvent::AdoptSession("d".into())); // attach + show single
         r.update(UiEvent::SessionData {
             name: "d".into(),
@@ -5969,7 +5977,7 @@ mod tests {
         // tile is a cold placeholder with no live preview yet. The window is larger
         // than a preview, so taking the session over genuinely resizes it.
         let (mut r, _) = fleet(METRICS, (1400, 900), 1.0);
-        r.update(UiEvent::SessionList(vec![sess("d", false, 1)]));
+        r.update(UiEvent::SessionList(listed(vec![sess("d", false, 1)])));
         // Open it. The shell has begun attaching; this is its AdoptSession reply.
         let cmds = r.update(UiEvent::AdoptSession("d".into()));
         assert!(r.is_fleet(), "stays in the fleet while the preview loads");
@@ -6026,10 +6034,10 @@ mod tests {
     fn adopt_from_fleet_drops_into_that_sessions_single_view() {
         let mut r = root(); // owns alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             info("alpha", true),
             info("beta", false),
-        ]));
+        ])));
         // What the shell sends after attaching a double-clicked / spawned session.
         // beta is a cold detached tile, so the open waits for its preview to load
         // (see opening_a_detached_session_…); feeding it lands the dive into single.
@@ -6058,10 +6066,10 @@ mod tests {
     fn adopt_of_a_freshly_spawned_session_makes_a_new_terminal_and_keeps_previews() {
         let mut r = root(); // owns alpha
         key(&mut r, Key::Named(NamedKey::F9), Mods::NONE); // -> fleet
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             info("alpha", true),
             info("beta", false),
-        ]));
+        ])));
         // Adopt a session that is NOT a tile yet (just spawned by the shell).
         let cmds = r.update(UiEvent::AdoptSession("gamma".into()));
         assert!(!r.is_fleet());
@@ -6246,10 +6254,10 @@ mod tests {
         });
         // A foreign session appears *after* the theme was set: reconcile mints its
         // tile now, so it never saw the theme applied to an existing model.
-        r.update(UiEvent::SessionList(vec![
+        r.update(UiEvent::SessionList(listed(vec![
             sess("alpha", true, 1),
             sess("gamma", true, 2), // attached elsewhere → observed, not `mine`
-        ]));
+        ])));
         // The freshly-minted observed preview carries the window's theme...
         assert_eq!(
             r.sessions
@@ -6352,7 +6360,7 @@ mod tests {
         // window) gave the session; the foreground's window title follows it.
         let mut s = sess("alpha", true, 1);
         s.display_name = "build box".into();
-        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        let cmds = r.update(UiEvent::SessionList(listed(vec![s])));
         assert!(
             cmds.contains(&Cmd::SetTitle("build box".into())),
             "learning a display name retitles the window: {cmds:?}"
@@ -6360,7 +6368,7 @@ mod tests {
         // An unchanged list does not re-emit.
         let mut s = sess("alpha", true, 1);
         s.display_name = "build box".into();
-        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        let cmds = r.update(UiEvent::SessionList(listed(vec![s])));
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
             "an unchanged display name must not retitle: {cmds:?}"
@@ -6375,7 +6383,7 @@ mod tests {
         // the window title gains the label as a prefix, keeping the app title.
         let mut s = sess("alpha", true, 1);
         s.display_name = "build box".into();
-        let cmds = r.update(UiEvent::SessionList(vec![s]));
+        let cmds = r.update(UiEvent::SessionList(listed(vec![s])));
         assert!(
             cmds.contains(&Cmd::SetTitle("build box — vim".into())),
             "a custom label prefixes the foreground's app title: {cmds:?}"

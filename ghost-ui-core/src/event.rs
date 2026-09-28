@@ -9,6 +9,25 @@ use crate::input::{Key, KeyAlternates, KeyEventKind, Mods};
 use ghost_vt::protocol::{SessionEvent, SessionState};
 use ghost_vt::session::SessionInfo;
 
+/// One session in a listing: the id the fleet knows it by, and what its host
+/// reported about it. `info.name` is the host's own name for the session — for
+/// a remote one, not the id it has here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub id: SessionId,
+    pub info: SessionInfo,
+}
+
+impl Listed {
+    /// A session of this machine: its id is its name.
+    pub fn local(info: SessionInfo) -> Self {
+        Self {
+            id: info.name.clone(),
+            info,
+        }
+    }
+}
+
 /// A dead-but-remembered session, read back from its durable descriptor (see
 /// the host's `ghost_vt::descriptor`): the identity and metadata a dead tile
 /// shows, and the key a recreate is issued under.
@@ -210,7 +229,7 @@ pub enum UiEvent {
         name: SessionId,
     },
     /// Reply to `Cmd::ListSessions`.
-    SessionList(Vec<SessionInfo>),
+    SessionList(Vec<Listed>),
     /// A state push from `name`'s subscription. State reaches the fleet the
     /// moment it changes; the periodic `SessionList` remains only as set
     /// discovery and a slow backstop.

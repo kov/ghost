@@ -181,6 +181,14 @@ impl Harness {
         })
     }
 
+    /// [`session_list`](Self::session_list) as the fleet's listing.
+    fn listing(&self) -> Vec<ghost_ui_core::Listed> {
+        self.session_list()
+            .into_iter()
+            .map(ghost_ui_core::Listed::local)
+            .collect()
+    }
+
     /// The synthetic session list answering `Cmd::ListSessions`, so a reconcile
     /// keeps the fleet populated instead of clobbering it with the (empty) host.
     pub fn session_list(&self) -> Vec<SessionInfo> {
@@ -211,7 +219,7 @@ impl Harness {
     /// view (first toggle goes OUT); the slide starts with every session adopted, so
     /// Ctrl-Tab can cycle among them.
     pub fn setup_events(&self) -> Vec<UiEvent> {
-        let mut evs = vec![UiEvent::SessionList(self.session_list())];
+        let mut evs = vec![UiEvent::SessionList(self.listing())];
         for n in &self.names {
             evs.push(UiEvent::AdoptSession(n.clone()));
             evs.push(UiEvent::SessionData {
@@ -220,7 +228,7 @@ impl Harness {
                 ended: false,
             });
         }
-        evs.push(UiEvent::SessionList(self.session_list()));
+        evs.push(UiEvent::SessionList(self.listing()));
         evs.push(UiEvent::AdoptSession(self.target.clone()));
         evs
     }
@@ -324,7 +332,7 @@ impl Harness {
                 // and the dive-out launches (as the shell does after F9).
                 vec![
                     Action::Dispatch(f9()),
-                    Action::Dispatch(UiEvent::SessionList(self.session_list())),
+                    Action::Dispatch(UiEvent::SessionList(self.listing())),
                 ]
             }
             Phase::Fleet => {

@@ -48,7 +48,7 @@ mod windows;
 
 use hosts::{
     HostLink, LocalFeed, RemoteHost, remote_fleet_id, remote_id_owned, remote_id_parts,
-    start_remote_watcher,
+    remote_listing, start_remote_watcher,
 };
 use instance::LastExit;
 use std::collections::{HashMap, HashSet};
@@ -61,8 +61,9 @@ use ghost_renderer::{
     FrameOutcome, Gpu, Rendered, Renderer, SceneCache, SurfaceTarget, Target, WindowEdge,
 };
 use ghost_ui_core::{
-    CellMetrics, Cmd, Key, KeyEventKind, Mods, NamedKey, PointPx, PointerButton, PointerPhase,
-    RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WheelDelta, WindowRecord,
+    CellMetrics, Cmd, Key, KeyEventKind, Listed, Mods, NamedKey, PointPx, PointerButton,
+    PointerPhase, RootModel, Scene, SessionPush, Sessions, TerminalModel, UiEvent, WheelDelta,
+    WindowRecord,
 };
 use ghost_ui_harness::framestats;
 use ghost_vt::client::{Session, Subscriber};
@@ -1273,7 +1274,7 @@ enum StartupChoice {
 /// reachable from a session view with F9 whenever the user actually wants them.
 fn startup_choice(
     requested: Option<String>,
-    sessions: &[session::SessionInfo],
+    sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
 ) -> StartupChoice {
     // A remote member nothing lists right now: its host is away, and the tile holds
@@ -1281,7 +1282,7 @@ fn startup_choice(
     let awaiting = !awaiting_remote(sessions, groups).is_empty();
     match requested {
         Some(name) => StartupChoice::Attach(name),
-        None if sessions.iter().any(|s| !s.attached) || awaiting => StartupChoice::Fleet,
+        None if sessions.iter().any(|s| !s.info.attached) || awaiting => StartupChoice::Fleet,
         None => StartupChoice::Spawn,
     }
 }
@@ -1306,13 +1307,13 @@ enum ChoiceReason {
 /// plain three-way value at every call site.
 fn choice_reason(
     requested: Option<&str>,
-    sessions: &[session::SessionInfo],
+    sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
 ) -> ChoiceReason {
     if requested.is_some() {
         return ChoiceReason::Requested;
     }
-    if sessions.iter().any(|s| !s.attached) {
+    if sessions.iter().any(|s| !s.info.attached) {
         return ChoiceReason::DetachedSession;
     }
     if awaiting_remote(sessions, groups).is_empty() {
@@ -1326,14 +1327,11 @@ fn choice_reason(
 /// (and every Alt-N) into the fleet to wait for their hosts. Named because it is
 /// the one input a user cannot see: `groups.toml` grows a member per window that
 /// ever ran, and one whose host is merely unreachable keeps voting forever.
-fn awaiting_remote(
-    sessions: &[session::SessionInfo],
-    groups: &[ghost_ui_core::Group],
-) -> Vec<String> {
+fn awaiting_remote(sessions: &[Listed], groups: &[ghost_ui_core::Group]) -> Vec<String> {
     let mut out: Vec<String> = groups
         .iter()
         .flat_map(|g| &g.members)
-        .filter(|m| is_remote_id(m) && !sessions.iter().any(|s| &&s.name == m))
+        .filter(|m| is_remote_id(m) && !sessions.iter().any(|s| &&s.id == m))
         .cloned()
         .collect();
     out.sort();
@@ -1353,7 +1351,7 @@ fn awaiting_remote(
 fn choice_summary(
     trigger: &str,
     requested: Option<&str>,
-    sessions: &[session::SessionInfo],
+    sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
     choice: &StartupChoice,
 ) -> String {
@@ -1372,8 +1370,12 @@ fn choice_summary(
             .map(|s| {
                 format!(
                     "{}({})",
-                    show(&s.name),
-                    if s.attached { "attached" } else { "detached" }
+                    show(&s.id),
+                    if s.info.attached {
+                        "attached"
+                    } else {
+                        "detached"
+                    }
                 )
             })
             .collect(),
@@ -1414,7 +1416,7 @@ fn choice_summary(
 fn log_choice(
     trigger: &str,
     requested: Option<&str>,
-    sessions: &[session::SessionInfo],
+    sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
 ) -> StartupChoice {
     let choice = startup_choice(requested.map(str::to_owned), sessions, groups);
@@ -1497,10 +1499,10 @@ enum Startup {
 /// flagged dead when no live session by that name exists.
 fn restore_plan(
     records: &[ghost_ui_core::WindowRecord],
-    sessions: &[session::SessionInfo],
+    sessions: &[Listed],
     groups: &[ghost_ui_core::Group],
 ) -> Vec<WindowPlan> {
-    let alive = |id: &str| sessions.iter().any(|s| s.name == id);
+    let alive = |id: &str| sessions.iter().any(|s| s.id == id);
     records
         .iter()
         .filter_map(|rec| {
@@ -1657,7 +1659,11 @@ fn interactive(fresh: bool, ssh_window: bool) {
         Startup::Connect
     } else {
         let requested = std::env::var("GHOST_SESSION").ok();
-        let sessions = session::list().unwrap_or_default();
+        let sessions: Vec<Listed> = session::list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Listed::local)
+            .collect();
         // A bare launch with saved windows recreates them, taking precedence over
         // the reconnect-through-the-fleet default below; `--fresh` or an explicit
         // `$GHOST_SESSION` skip that and open just what was asked for.
@@ -3704,7 +3710,7 @@ impl App {
             match self.hosts.get(target).and_then(|h| h.listing.as_ref()) {
                 // Connected and serving it: it is live, not remembered — the
                 // listing carries it and the fleet has a real tile.
-                Some(infos) if infos.iter().any(|i| &i.name == member) => continue,
+                Some(infos) if infos.iter().any(|i| i.name == real) => continue,
                 // Connected and NOT serving it. The host's remembered-set (its
                 // descriptor names) tells the two dead cases apart: still
                 // remembered means an unclean death (a reboot) — relaunchable;
@@ -5799,16 +5805,14 @@ impl App {
                 cwd.is_dir().then(|| cwd.to_string_lossy().into_owned())
             }
             CwdSource::Remote { target, session } => {
-                // A host's stashed listing is namespaced (`<target>␟<real>`), so it
-                // is looked up by the composite id, not the name the host uses.
-                let composite = remote_fleet_id(target, session);
+                // A host's listing carries its own names for its sessions.
                 let reported = self
                     .hosts
                     .get(target)?
                     .listing
                     .as_ref()?
                     .iter()
-                    .find(|i| i.name == composite)?
+                    .find(|i| i.name == session)?
                     .cwd
                     .as_deref()?;
                 spawnable_cwd(reported).map(str::to_owned)
@@ -5913,21 +5917,18 @@ impl App {
     /// each session's cwd belongs to — ours for `local`, the host's own for a
     /// remote one when it told us one. Without it the whole path is shown: long,
     /// but true.
-    fn merged_listing(
-        &self,
-        local: Vec<ghost_vt::session::SessionInfo>,
-    ) -> Vec<ghost_vt::session::SessionInfo> {
-        let mut merged: Vec<_> = local
+    fn merged_listing(&self, local: Vec<ghost_vt::session::SessionInfo>) -> Vec<Listed> {
+        let mut merged: Vec<Listed> = local
             .into_iter()
             .map(|mut i| {
                 i.cwd = i
                     .cwd
                     .as_deref()
                     .map(|c| session::display_path(Path::new(c)));
-                i
+                Listed::local(i)
             })
             .collect();
-        for host in self.hosts.values() {
+        for (target, host) in &self.hosts {
             let Some(r) = &host.listing else {
                 continue;
             };
@@ -5936,11 +5937,11 @@ impl App {
                 .as_ref()
                 .and_then(|e| e.home.as_deref())
                 .map(PathBuf::from);
-            merged.extend(r.iter().cloned().map(|mut i| {
-                if let (Some(home), Some(cwd)) = (&home, &i.cwd) {
-                    i.cwd = Some(session::shorten_under(Path::new(cwd), home));
+            merged.extend(remote_listing(target, r).into_iter().map(|mut l| {
+                if let (Some(home), Some(cwd)) = (&home, &l.info.cwd) {
+                    l.info.cwd = Some(session::shorten_under(Path::new(cwd), home));
                 }
-                i
+                l
             }));
         }
         merged
@@ -6975,6 +6976,7 @@ impl App {
         records: Vec<ghost_ui_core::WindowRecord>,
     ) {
         let sessions = self.refresh_local_now();
+        let sessions: Vec<Listed> = sessions.into_iter().map(Listed::local).collect();
         let plans = restore_plan(&records, &sessions, &self.groups);
         // A record the plan dropped names a window that will never open again, and
         // the compositor holds geometry under that name until someone releases it.
@@ -7926,7 +7928,7 @@ impl App {
         // something to return to.
         let local = self.refresh_local_now();
         let mut sessions = self.merged_listing(local);
-        sessions.retain(|s| s.name != ended);
+        sessions.retain(|s| s.id != ended);
         // ...and out of the group memberships the choice weighs too, or a REMOTE
         // session that just exited reads as "a member no listing names" — the shape of
         // a host that is away — and the window would sit waiting for a session the user
@@ -8291,7 +8293,8 @@ mod tests {
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::{EdgeState, window_edge_for};
-    use crate::hosts::namespace_remote_infos;
+    use crate::hosts::{remote_id_parts, remote_listing};
+    use ghost_ui_core::Listed;
     use ghost_ui_core::WindowRecord;
     use ghost_vt::connection::ConnectionSpec;
     use ghost_vt::session::SessionInfo;
@@ -9102,8 +9105,8 @@ mod tests {
         // one). No window, disk, or network needed.
         let mut app = App::headless();
         let fe = HeadlessFrontend::new();
-        // The watcher posts already-namespaced infos (see `watch_stream_once`).
-        let infos = namespace_remote_infos("kov@box", vec![info("work", false)]);
+        // The watcher posts the host's listing as the host reported it.
+        let infos = vec![info("work", false)];
         app.on_user_event(
             &fe,
             UserEvent::RemoteSessions {
@@ -9199,7 +9202,7 @@ mod tests {
                 &fe,
                 UserEvent::RemoteSessions {
                     target: "kov@box".to_string(),
-                    infos: namespace_remote_infos("kov@box", vec![info("work", false)]),
+                    infos: vec![info("work", false)],
                 },
             );
             app.on_user_event(
@@ -9637,8 +9640,12 @@ mod tests {
             let group_b = app.mint_group();
             let b = app.open_fleet_window(&fe, group_b, None);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(
+                a,
+                ghost_ui_core::UiEvent::SessionList(local(list.clone())),
+                &fe,
+            );
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
 
             // Pump the real per-wake pass until the shared state holds the marker (A's
             // attach resync + the feed have to travel the sockets). Post-collapse the one
@@ -9723,8 +9730,12 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(
+                a,
+                ghost_ui_core::UiEvent::SessionList(local(list.clone())),
+                &fe,
+            );
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
                     .text_of(name)
@@ -9822,8 +9833,12 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(list.clone()), &fe);
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(
+                a,
+                ghost_ui_core::UiEvent::SessionList(local(list.clone())),
+                &fe,
+            );
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
                     .text_of(name)
@@ -9969,7 +9984,7 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let observed_first = app.observers.contains_key(name);
             let undriven_first = !app.sessions.contains_key(name);
 
@@ -10055,7 +10070,7 @@ mod tests {
             // pushes it) mints a foreign tile and rides A's one client — deduped, no mirror.
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
-            let listed = namespace_remote_infos("kov@box", vec![info(name, true)]);
+            let listed = remote_listing("kov@box", &[info(name, true)]);
             app.dispatch(b, ghost_ui_core::UiEvent::SessionList(listed), &fe);
             assert!(
                 app.windows[&b].root.views(&composite),
@@ -10282,7 +10297,7 @@ mod tests {
                 &fe,
                 UserEvent::RemoteSessions {
                     target: "kov@box".to_string(),
-                    infos: namespace_remote_infos("kov@box", listing()),
+                    infos: listing(),
                 },
             );
             let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
@@ -10379,7 +10394,7 @@ mod tests {
                 &fe,
                 UserEvent::RemoteSessions {
                     target: "kov@box".to_string(),
-                    infos: namespace_remote_infos("kov@box", listing()),
+                    infos: listing(),
                 },
             );
             let [first, second] = names.map(|n| format!("kov@box{REMOTE_ID_SEP}{n}"));
@@ -10583,7 +10598,7 @@ mod tests {
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let sees = |app: &App| {
                 app.states
                     .text_of(name)
@@ -10621,7 +10636,7 @@ mod tests {
                 .root
                 .set_show_elsewhere(true);
             let list = ghost_vt::session::list().unwrap_or_default();
-            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(list), &fe);
+            app.dispatch(b, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
             let key = |k| ghost_ui_core::UiEvent::Key {
                 key: k,
                 mods: Mods::NONE,
@@ -10765,6 +10780,19 @@ mod tests {
         assert_eq!(spawnable_cwd("../proj"), None);
     }
 
+    /// A listing of this machine's sessions.
+    fn local(infos: Vec<SessionInfo>) -> Vec<Listed> {
+        infos.into_iter().map(Listed::local).collect()
+    }
+
+    /// One listed session under `id`, a local name or a remote composite.
+    fn listed(id: &str, attached: bool) -> Listed {
+        match remote_id_parts(id) {
+            Some((target, real)) => remote_listing(target, &[info(real, attached)]).remove(0),
+            None => Listed::local(info(id, attached)),
+        }
+    }
+
     fn info(name: &str, attached: bool) -> SessionInfo {
         SessionInfo {
             name: name.to_string(),
@@ -10837,17 +10865,19 @@ mod tests {
             display_name: "editor".into(),
             ..base.clone()
         };
-        let out = namespace_remote_infos("kov@box", vec![base, renamed]);
+        let out = remote_listing("kov@box", &[base, renamed]);
 
         // The id is prefixed with the target (so it can't collide with a local
-        // session or another host), and the connection is set to this host.
-        assert_eq!(out[0].name, format!("kov@box{REMOTE_ID_SEP}work"));
-        assert_eq!(out[0].connection.as_ref().unwrap().target(), "kov@box");
+        // session or another host), the host's own name is kept, and the
+        // connection is set to this host.
+        assert_eq!(out[0].id, format!("kov@box{REMOTE_ID_SEP}work"));
+        assert_eq!(out[0].info.name, "work");
+        assert_eq!(out[0].info.connection.as_ref().unwrap().target(), "kov@box");
         // A session with no display name shows its real id; a renamed one keeps
         // its label — never the namespaced id.
-        assert_eq!(out[0].display_name, "work");
-        assert_eq!(out[1].name, format!("kov@box{REMOTE_ID_SEP}raw-id"));
-        assert_eq!(out[1].display_name, "editor");
+        assert_eq!(out[0].info.display_name, "work");
+        assert_eq!(out[1].id, format!("kov@box{REMOTE_ID_SEP}raw-id"));
+        assert_eq!(out[1].info.display_name, "editor");
     }
 
     fn group(id: &str, members: &[&str]) -> ghost_ui_core::Group {
@@ -10886,7 +10916,7 @@ mod tests {
             record("win-9", 80, 24, false, Some("ghost"), &["ghost"]),
             record("win-2", 90, 30, true, Some("gamma"), &["gamma"]),
         ];
-        let sessions = [info("alpha", false), info("beta", false)]; // gamma is dead
+        let sessions = [listed("alpha", false), listed("beta", false)]; // gamma is dead
         let groups = [
             group("win-1", &["alpha", "beta"]),
             group("win-2", &["gamma"]),
@@ -10920,7 +10950,7 @@ mod tests {
             record("win-1", 125, 0, false, Some("alpha"), &["alpha"]),
             record("win-2", 60000, 40, false, Some("beta"), &["beta"]),
         ];
-        let sessions = [info("alpha", false), info("beta", false)];
+        let sessions = [listed("alpha", false), listed("beta", false)];
         let groups = [group("win-1", &["alpha"]), group("win-2", &["beta"])];
 
         let plans = restore_plan(&records, &sessions, &groups);
@@ -10949,7 +10979,7 @@ mod tests {
             record("win-1", 80, 24, false, Some(&rem), &["alpha", &rem]),
             record("win-2", 80, 24, true, None, &[&rem2]),
         ];
-        let sessions = [info("alpha", false)];
+        let sessions = [listed("alpha", false)];
         let groups = [group("win-1", &["alpha", &rem]), group("win-2", &[&rem2])];
 
         let plans = restore_plan(&records, &sessions, &groups);
@@ -11016,7 +11046,7 @@ mod tests {
                 cwd: Some("/Users/kov/proj".into()),
                 ..info("work", false)
             };
-            app.host_mut("kov@mac").listing = Some(namespace_remote_infos("kov@mac", vec![listed]));
+            app.host_mut("kov@mac").listing = Some(vec![listed]);
 
             // Before the handshake lands there is no home to shorten against, so
             // the path is shown whole rather than guessed at.
@@ -11464,9 +11494,9 @@ mod tests {
             // diving straight through.
             app.dispatch(
                 wid,
-                ghost_ui_core::UiEvent::SessionList(namespace_remote_infos(
+                ghost_ui_core::UiEvent::SessionList(remote_listing(
                     "kov@box",
-                    vec![info(real, false)],
+                    &[info(real, false)],
                 )),
                 &fe,
             );
@@ -11481,10 +11511,7 @@ mod tests {
             // The listing catches up with the attach this restore just made.
             app.dispatch(
                 wid,
-                ghost_ui_core::UiEvent::SessionList(namespace_remote_infos(
-                    "kov@box",
-                    vec![info(real, true)],
-                )),
+                ghost_ui_core::UiEvent::SessionList(remote_listing("kov@box", &[info(real, true)])),
                 &fe,
             );
             // The session's first frame releases the parked dive.
@@ -11780,7 +11807,7 @@ mod tests {
     #[test]
     fn startup_attaches_to_an_explicitly_requested_session() {
         // `$GHOST_SESSION` wins regardless of what else is around.
-        let sessions = [info("a", false)];
+        let sessions = [listed("a", false)];
         assert!(matches!(
             startup_choice(Some("x".into()), &sessions, &[]),
             StartupChoice::Attach(n) if n == "x"
@@ -11789,7 +11816,7 @@ mod tests {
 
     #[test]
     fn startup_opens_the_fleet_when_any_session_is_detached() {
-        let sessions = [info("a", true), info("b", false)];
+        let sessions = [listed("a", true), listed("b", false)];
         assert!(matches!(
             startup_choice(None, &sessions, &[]),
             StartupChoice::Fleet
@@ -11810,7 +11837,7 @@ mod tests {
         ));
         // A group whose members are all live and attached remembers nothing
         // reconnectable — a plain launch still spawns.
-        let sessions = [info("a", true)];
+        let sessions = [listed("a", true)];
         let live = [group("g1", &["a"])];
         assert!(matches!(
             startup_choice(None, &sessions, &live),
@@ -11830,7 +11857,7 @@ mod tests {
         ));
         // ...but not once that host is connected and the session is listed and held:
         // then it is an ordinary attached-elsewhere session.
-        let listed = [info(&format!("kov@box{REMOTE_ID_SEP}work"), true)];
+        let listed = [listed(&format!("kov@box{REMOTE_ID_SEP}work"), true)];
         assert!(matches!(
             startup_choice(None, &listed, &away),
             StartupChoice::Spawn
@@ -11844,7 +11871,7 @@ mod tests {
             startup_choice(None, &[], &[]),
             StartupChoice::Spawn
         ));
-        let attached_elsewhere = [info("a", true)];
+        let attached_elsewhere = [listed("a", true)];
         assert!(matches!(
             startup_choice(None, &attached_elsewhere, &[]),
             StartupChoice::Spawn
@@ -11858,7 +11885,7 @@ mod tests {
         // decision — the fleet when there is a session to return to, a fresh session
         // otherwise — and never attaches to one specific session.
         assert!(matches!(
-            log_choice("new window", None, &[info("a", false)], &[]),
+            log_choice("new window", None, &[listed("a", false)], &[]),
             StartupChoice::Fleet
         ));
         assert!(matches!(
@@ -11866,7 +11893,7 @@ mod tests {
             StartupChoice::Spawn
         ));
         assert!(matches!(
-            log_choice("new window", None, &[info("a", true)], &[]),
+            log_choice("new window", None, &[listed("a", true)], &[]),
             StartupChoice::Spawn
         ));
         // An old window's remembered dead member must not turn every Alt-N into a
@@ -11884,7 +11911,7 @@ mod tests {
         // outcome (a window on a fleet with nothing to attach to) is intermittent:
         // whoever reads the log afterwards cannot re-observe the state.
         let away = format!("kov@box{REMOTE_ID_SEP}work");
-        let sessions = [info("a", true)];
+        let sessions = [listed("a", true)];
         let groups = [group("g1", &[&away])];
         let line = choice_summary(
             "new window",
@@ -11909,7 +11936,7 @@ mod tests {
     fn a_window_decision_names_whichever_input_forced_it() {
         use super::choice_summary;
         // A detached session outranks everything but an explicit request...
-        let detached = [info("a", false)];
+        let detached = [listed("a", false)];
         let line = choice_summary("launch", None, &detached, &[], &StartupChoice::Fleet);
         assert!(line.contains("listed=[a(detached)]"), "{line}");
         assert!(line.contains("a detached session to return to"), "{line}");
@@ -11939,7 +11966,7 @@ mod tests {
         let groups = [group("g1", &[&away, &here, "dead-local"])];
         // A listed remote is reachable; a dead LOCAL member never counts (that is
         // the regression `new_window_mirrors_a_plain_launch` guards).
-        let sessions = [info(&here, true)];
+        let sessions = [listed(&here, true)];
         assert_eq!(awaiting_remote(&sessions, &groups), vec![away.clone()]);
         // The same member remembered by two groups is one thing to wait for.
         let twice = [group("g1", &[&away]), group("g2", &[&away])];
