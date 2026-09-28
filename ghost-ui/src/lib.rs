@@ -4531,46 +4531,17 @@ impl App {
                 Cmd::ListSessions => {
                     // In bench mode the host isn't running; answer from the harness so
                     // a reconcile keeps the synthetic fleet populated.
-                    let mut infos = match &self.bench {
+                    let infos = match &self.bench {
                         Some(h) => h.session_list(),
                         None => session::list().unwrap_or_default(),
                     };
-                    // A listing carries whole paths so it can cross machines; the
-                    // `~` is put back here, at the last moment before they are
-                    // shown, and only for the sessions that are *ours* — this is
-                    // the one place we know the home they'd be shortened against
-                    // is the right one. The hosts' listings merged in below keep
-                    // their absolute paths: that `~` would be someone else's.
-                    for i in &mut infos {
-                        i.cwd = i
-                            .cwd
-                            .as_deref()
-                            .map(|c| session::display_path(Path::new(c)));
-                    }
                     let live = self.bench.is_none();
                     if live {
                         // Subscriptions and the dead-session sweep are local-only:
                         // remote sessions have no local socket/descriptor/recording.
                         self.sync_subscriptions(&infos);
                     }
-                    // Merge the connected hosts' latest listings (watcher-fed) so
-                    // the fleet shows local and remote sessions together.
-                    let mut combined = infos.clone();
-                    for (target, r) in &self.remote_infos {
-                        // The host's own home, if it told us one — never ours.
-                        // Without it the whole path is shown: long, but true.
-                        let home = self
-                            .remote_envs
-                            .get(target)
-                            .and_then(|e| e.home.as_deref())
-                            .map(PathBuf::from);
-                        combined.extend(r.iter().cloned().map(|mut i| {
-                            if let (Some(home), Some(cwd)) = (&home, &i.cwd) {
-                                i.cwd = Some(session::shorten_under(Path::new(cwd), home));
-                            }
-                            i
-                        }));
-                    }
+                    let combined = self.merged_listing(infos.clone());
                     self.dispatch(wid, UiEvent::SessionList(combined), event_loop);
                     if live {
                         self.sync_dead_sessions(wid, &infos, event_loop);
@@ -6229,6 +6200,44 @@ impl App {
         self.remote_watchers.insert(target.to_string(), watcher);
     }
 
+    /// Every session this process knows of, shaped for display: `local` (this
+    /// machine's listing) followed by each connected host's latest listing.
+    ///
+    /// A listing carries whole paths so it can cross machines; the `~` is put
+    /// back here, at the last moment before they are shown, against the home
+    /// each session's cwd belongs to — ours for `local`, the host's own for a
+    /// remote one when it told us one. Without it the whole path is shown: long,
+    /// but true.
+    fn merged_listing(
+        &self,
+        local: Vec<ghost_vt::session::SessionInfo>,
+    ) -> Vec<ghost_vt::session::SessionInfo> {
+        let mut merged: Vec<_> = local
+            .into_iter()
+            .map(|mut i| {
+                i.cwd = i
+                    .cwd
+                    .as_deref()
+                    .map(|c| session::display_path(Path::new(c)));
+                i
+            })
+            .collect();
+        for (target, r) in &self.remote_infos {
+            let home = self
+                .remote_envs
+                .get(target)
+                .and_then(|e| e.home.as_deref())
+                .map(PathBuf::from);
+            merged.extend(r.iter().cloned().map(|mut i| {
+                if let (Some(home), Some(cwd)) = (&home, &i.cwd) {
+                    i.cwd = Some(session::shorten_under(Path::new(cwd), home));
+                }
+                i
+            }));
+        }
+        merged
+    }
+
     /// Rebuild the namespaced-id → `(target, real id)` index from the current
     /// remote listings, so a take-over of a remote tile reaches the right session.
     fn rebuild_remote_index(&mut self) {
@@ -6782,10 +6791,7 @@ impl App {
         // every connected host's — so a detached session on a remote host counts as
         // something to return to, and a remote member of a host we ARE connected to
         // isn't mistaken for one that is away.
-        let mut sessions = session::list().unwrap_or_default();
-        for r in self.remote_infos.values() {
-            sessions.extend(r.iter().cloned());
-        }
+        let sessions = self.merged_listing(session::list().unwrap_or_default());
         match log_choice("new window", None, &sessions, &self.groups) {
             StartupChoice::Fleet => {
                 let group = self.mint_group();
@@ -8263,10 +8269,7 @@ impl App {
         // The same listing a launch weighs, minus the session that just ended: its host
         // may still be tearing down, and a corpse listed as detached would read as
         // something to return to.
-        let mut sessions = session::list().unwrap_or_default();
-        for r in self.remote_infos.values() {
-            sessions.extend(r.iter().cloned());
-        }
+        let mut sessions = self.merged_listing(session::list().unwrap_or_default());
         sessions.retain(|s| s.name != ended);
         // ...and out of the group memberships the choice weighs too, or a REMOTE
         // session that just exited reads as "a member no listing names" — the shape of
