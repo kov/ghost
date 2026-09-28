@@ -5696,7 +5696,7 @@ impl App {
             if !self.windows.contains_key(&wid) {
                 continue;
             }
-            let Some((_, real)) = composite.split_once(REMOTE_ID_SEP) else {
+            let Some((_, real)) = remote_id_parts(&composite) else {
                 continue;
             };
             let real = real.to_string();
@@ -5822,7 +5822,7 @@ impl App {
     /// from the live remote host; a local session (including an `ssh` child) reads
     /// its stored descriptor.
     fn foreground_connection(&self, id: &str) -> Option<ConnectionSpec> {
-        if let Some((target, _)) = id.split_once(REMOTE_ID_SEP) {
+        if let Some((target, _)) = remote_id_parts(id) {
             return self.connection(target).map(|h| h.remote.spec().clone());
         }
         ghost_vt::descriptor::read(id).and_then(|d| d.connection)
@@ -7044,7 +7044,7 @@ impl App {
         // Queue remote members to attach once their host reconnects (kicked by
         // `reconnect_restored_remotes`, drained by `finish_remote_reconnect`).
         for id in remotes {
-            let Some((target, _)) = id.split_once(REMOTE_ID_SEP) else {
+            let Some((target, _)) = remote_id_parts(&id) else {
                 continue;
             };
             let is_foreground = foreground.as_deref() == Some(id.as_str());
