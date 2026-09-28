@@ -4341,9 +4341,10 @@ mod tests {
     /// this window never attached and so was never told it drives — is not
     /// quietly taken. Taking one is a user decision (the confirm modal in
     /// `Fleet::activate` claims it first); an adopt that reaches the extract without
-    /// that claim is a bug in the caller, and the guard says so rather than leaving
-    /// the session attached twice, in two groups.
+    /// that claim is a bug in the caller, and a debug build's guard says so rather
+    /// than leaving the session attached twice, in two groups.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "attached in another window")]
     fn adopting_a_session_attached_elsewhere_is_still_refused() {
         let (mut r, _) = fleet(METRICS, SIZE, 1.0);

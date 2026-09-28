@@ -1193,11 +1193,14 @@ impl FleetModel {
             if Some(&tile.id) == keep.as_ref() {
                 // Adopting a session as the foreground claims it into this
                 // window's group. Doing that to a session attached in another
-                // window would leave it attached twice, in two groups — the
-                // "should not happen" corruption this guards against. Multi-client
-                // attach is a future feature that needs designing; until then,
-                // crash loudly rather than silently double-attach.
-                assert_ne!(
+                // window would leave it attached twice, in two groups. It cannot
+                // happen by construction: the shell grants a window the session
+                // (`UiEvent::Driving`) before it adopts, and a confirmed take-over
+                // claims the tile first. Should a caller break that, the shell's
+                // driver reconcile hands the session back to its recorded driver,
+                // so only a debug build stops here — a release abort would take
+                // every window down.
+                debug_assert_ne!(
                     tile.locality,
                     Locality::Elsewhere,
                     "refusing to adopt session '{}': it is attached in another window",
