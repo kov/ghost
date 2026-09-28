@@ -3905,10 +3905,18 @@ impl App {
     /// shared child.
     ///
     /// A fresh attach (no prior driver) finds no losers; only a real cross-window
-    /// take-over does. Both take-over routes must call this: `Cmd::Attach`, and the
-    /// adopt-in-place branch of `Cmd::TakeOver` that skips attaching because this
-    /// process already holds the client.
+    /// take-over does. Every take-over route must call this: `Cmd::Attach`, and
+    /// `Cmd::TakeOver` of a local or remote session, including the adopt-in-place
+    /// branches that skip attaching because this process already holds the client.
+    ///
+    /// The host is told too: the one client now speaks for `wid`, so it names
+    /// that window as the holder.
     fn hand_over(&mut self, wid: WindowId, id: &str, event_loop: &dyn Frontend) {
+        if let Some(identity) = self.windows.get(&wid).map(|w| w.root.client_identity())
+            && let Some(client) = self.sessions.get_mut(id)
+        {
+            let _ = client.hello(&identity);
+        }
         let losers: Vec<WindowId> = self
             .windows
             .iter()
@@ -6321,6 +6329,7 @@ impl App {
         let held = self.sessions.contains_key(id);
         if held || self.attach_remote_into(wid, id, target, real, event_loop) {
             self.dispatch(wid, UiEvent::AdoptSession(id.to_string()), event_loop);
+            self.hand_over(wid, id, event_loop);
         }
     }
 
@@ -10591,6 +10600,157 @@ mod tests {
             assert!(
                 still_held,
                 "a failed attach must not hand the session away from the window holding it"
+            );
+        });
+    }
+
+    /// Taking over a session another window of this process drives keeps the one
+    /// client, but the host must learn the driver moved: its listing names the
+    /// window now holding it, not the one that let it go.
+    #[test]
+    fn a_take_over_within_the_process_names_the_new_window_as_holder() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "moved-holder";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let holder = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.holder)
+            };
+            let mut spun = 0;
+            while holder().is_none() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let ga = app.mint_group();
+            let a = app.open_single_window(&fe, name, ga, None);
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let want = app.windows[&b].root.client_identity();
+            app.exec(b, vec![ghost_ui_core::Cmd::TakeOver(name.to_string())], &fe);
+            let mut named = None;
+            for _ in 0..100 {
+                named = holder().flatten();
+                if named.as_ref() == Some(&want) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            let _ = ghost_vt::session::kill_session(name);
+            assert!(a.is_some(), "window A attaches the session");
+            assert_eq!(
+                named,
+                Some(want),
+                "the listing names the window that took it over"
+            );
+        });
+    }
+
+    /// The same for a remote session: a take-over of a session another window
+    /// of this process drives over the transport moves it — the other window lets
+    /// it go, and the host names the new holder.
+    #[test]
+    fn a_remote_take_over_within_the_process_moves_the_session() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+            let name = "moved-remote";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            let listing = || ghost_vt::session::list().unwrap_or_default();
+            let mut spun = 0;
+            while listing().is_empty() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteSessions {
+                    target: "kov@box".to_string(),
+                    infos: namespace_remote_infos("kov@box", listing()),
+                },
+            );
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+
+            let ga = app.mint_group();
+            let a = app.open_fleet_window(&fe, ga, None);
+            app.exec(
+                a,
+                vec![ghost_ui_core::Cmd::TakeOver(composite.clone())],
+                &fe,
+            );
+            let a_drove = app.windows[&a].root.drives(&composite);
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            let want = app.windows[&b].root.client_identity();
+            app.exec(
+                b,
+                vec![ghost_ui_core::Cmd::TakeOver(composite.clone())],
+                &fe,
+            );
+            let a_still = app.windows[&a].root.drives(&composite);
+            let holder = || {
+                listing()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.holder)
+            };
+            let mut named = None;
+            for _ in 0..100 {
+                named = holder();
+                if named.as_ref() == Some(&want) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+            assert!(a_drove, "precondition: window A drives the session");
+            assert!(!a_still, "window A lets the session go");
+            assert_eq!(
+                named,
+                Some(want),
+                "the host names the window that took it over"
             );
         });
     }
