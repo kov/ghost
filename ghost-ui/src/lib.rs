@@ -401,6 +401,70 @@ struct RemoteHost {
     remote_ghost: String,
 }
 
+/// Everything the App knows about one remote host, keyed by target in
+/// [`App::hosts`]. Each part has its own lifetime: the connection, listing,
+/// remembered-set, environment and watcher last while a window references the
+/// host ([`App::prune_remotes`]); a retry lasts while a group remembers a member
+/// on it and we are not connected; queued restores until the host reconnects or
+/// their window closes. An entry holding none of them is dropped.
+#[derive(Default)]
+struct HostLink {
+    /// The open transport, while connected.
+    conn: Option<RemoteHost>,
+    /// The host's latest listing (fleet-namespaced ids), from its watcher.
+    /// `None` means unknown — never listed yet, or unreachable — never "empty".
+    listing: Option<Vec<ghost_vt::session::SessionInfo>>,
+    /// The session names the host still holds a descriptor for (bare,
+    /// un-namespaced) — its resurrection tickets, fetched by the watcher alongside
+    /// each listing. `remembered_remotes` consults it to tell a member that exited
+    /// cleanly on its host from one a reboot took down. `None` means unknown (an
+    /// older remote ghost, or the fetch hasn't landed), and the sweep stays
+    /// conservative: not-listed members remain relaunchable.
+    remembered: Option<HashSet<String>>,
+    /// What the host said about its machine in the `__probe` handshake. Only
+    /// `home` is read today — to shorten a remote session's directory for display
+    /// against the home it actually belongs to.
+    env: Option<ghost_vt::remote::HostEnv>,
+    /// The live `ghost __watch` stream that keeps `listing` fresh. Dropping it
+    /// stops its thread and kills its ssh.
+    watcher: Option<RemoteWatcher>,
+    /// The stop flag of the background worker retrying the host forever while a
+    /// group remembers a member on it and we are not connected (see
+    /// [`App::retry_remembered_hosts`]). Presence dedupes.
+    ///
+    /// This is what makes waiting durable: the hold outlives the drop that
+    /// started it, and — because the members are remembered in `groups.toml` — a
+    /// ghost that is quit and relaunched while the host is still down picks the
+    /// wait back up instead of forgetting the sessions.
+    retry: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Remote members a startup restore is waiting to re-adopt on this host (see
+    /// [`PendingRemote`], [`App::reconnect_restored_remotes`] /
+    /// [`App::finish_remote_reconnect`]). Each carries the window's SAVED view
+    /// mode and foreground flag, which can't be read back from the live window: a
+    /// restored remote-only window always opens as a fleet (no local tile to dive
+    /// into, so F9 can't force it single), so the saved intent must ride along
+    /// here. Queued restores for a host that never reconnects just linger, drained
+    /// on a successful reconnect or when their window closes.
+    pending_restores: Vec<PendingRemote>,
+    /// Set while a transport health probe runs for the host
+    /// ([`App::probe_remote_transports`]); the prober clears it when done, so one
+    /// runs at a time no matter how many wake suspicions fire.
+    probing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HostLink {
+    /// Whether the entry holds nothing worth keeping.
+    fn is_idle(&self) -> bool {
+        self.conn.is_none()
+            && self.listing.is_none()
+            && self.remembered.is_none()
+            && self.env.is_none()
+            && self.watcher.is_none()
+            && self.retry.is_none()
+            && self.pending_restores.is_empty()
+    }
+}
+
 /// The unit separator (and the `is_remote_id` predicate) are canonical in
 /// `ghost_ui_core` now — the fleet reasons about remote membership too — and
 /// re-exported here so this module's id helpers read unchanged.
@@ -434,8 +498,8 @@ fn remote_id_owned(id: &str) -> Option<(String, String)> {
 const REMOTE_WATCH_RETRY: Duration = Duration::from_millis(1500);
 
 /// Consecutive dropped watch streams (no listing pushed in between) before a
-/// remote host's tiles are cleared — a grace period so a momentary blip doesn't
-/// flicker the fleet.
+/// remote host is reported unreachable — a grace period so a momentary blip
+/// doesn't flicker its members.
 const REMOTE_WATCH_MAX_FAILURES: u32 = 3;
 
 /// Rewrite a remote host's listing for the local fleet: give each session a
@@ -516,8 +580,9 @@ impl EventSink for QueuedEvents {
 /// each listing back as a [`UserEvent::RemoteSessions`], so the fleet updates the
 /// instant a remote session changes rather than on a timer. Dropping the handle
 /// stops it — the flag ends the loop and killing the in-flight ssh unwinds a read
-/// blocked between listings — so a watcher lives exactly as long as its host is in
-/// [`App::remotes`] (until the last window referencing it closes, or the app exits).
+/// blocked between listings — so a watcher lives exactly as long as its host's
+/// connection in [`App::hosts`] (until the last window referencing it closes, or
+/// the app exits).
 struct RemoteWatcher {
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The currently-running `ghost __watch` child, shared so a stop can kill it
@@ -1724,7 +1789,7 @@ struct WindowPlan {
 }
 
 /// A remote member a startup restore is waiting to re-adopt into a window once
-/// its host reconnects (queued in [`App::pending_remote_restores`], drained by
+/// its host reconnects (queued in its [`HostLink::pending_restores`], drained by
 /// [`App::finish_remote_reconnect`]).
 struct PendingRemote {
     wid: WindowId,
@@ -1972,7 +2037,6 @@ fn interactive(fresh: bool, ssh_window: bool) {
     // Arm the wire trace if the config asks for it, before any window exists — the
     // interesting bytes start flowing with the first attach.
     ghost_ui_core::trace::set_enabled(config::UiConfig::load().wire_trace());
-    let remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>> = Arc::default();
     let sessions_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let config_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
@@ -1992,16 +2056,9 @@ fn interactive(fresh: bool, ssh_window: bool) {
         focused: None,
         sink: Some(sink.clone()),
         proxy: Some(proxy),
-        remotes,
-        remote_infos: HashMap::new(),
-        remote_envs: HashMap::new(),
-        remote_remembered: HashMap::new(),
-        remote_watchers: HashMap::new(),
-        pending_remote_restores: HashMap::new(),
+        hosts: HashMap::new(),
         reconnecting: HashMap::new(),
         input_stalls: HashMap::new(),
-        remote_retries: HashMap::new(),
-        probing_remotes: Arc::default(),
         last_wake_at: Instant::now(),
         subs: HashMap::new(),
         groups,
@@ -3396,16 +3453,9 @@ impl App {
             focused: None,
             sink: None,
             proxy: None,
-            remotes: Arc::default(),
-            remote_infos: HashMap::new(),
-            remote_envs: HashMap::new(),
-            remote_remembered: HashMap::new(),
-            remote_watchers: HashMap::new(),
-            pending_remote_restores: HashMap::new(),
+            hosts: HashMap::new(),
             reconnecting: HashMap::new(),
             input_stalls: HashMap::new(),
-            remote_retries: HashMap::new(),
-            probing_remotes: Arc::default(),
             last_wake_at: Instant::now(),
             subs: HashMap::new(),
             // From the (test-isolated) data dir, as `interactive` does — a shell test
@@ -3741,40 +3791,8 @@ pub struct App {
     /// own thread and wants winit's own handle). `None` under a headless frontend.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
-    /// Remote hosts reached over the ssh transport, keyed by target — retained
-    /// after a successful connect and shared with the watcher thread that lists
-    /// their sessions. A host stays until its last window/session is gone.
-    remotes: Arc<std::sync::Mutex<HashMap<String, RemoteHost>>>,
-    /// The latest remote listing per host (fleet-namespaced ids), delivered by the
-    /// watcher and merged into every `Cmd::ListSessions` reply.
-    remote_infos: HashMap<String, Vec<ghost_vt::session::SessionInfo>>,
-    /// The session names each connected host still holds a descriptor for (bare,
-    /// un-namespaced) — its resurrection tickets, fetched by the watcher thread
-    /// alongside each listing. `remembered_remotes` consults it to tell a member
-    /// that exited cleanly on its host from one a reboot took down. No entry
-    /// means "unknown" (an older remote ghost, or the fetch hasn't landed), and
-    /// the sweep stays conservative: not-listed members remain relaunchable.
-    remote_remembered: HashMap<String, HashSet<String>>,
-    /// What each connected host said about its machine in the `__probe`
-    /// handshake, keyed by target. Only `home` is read today — to shorten a
-    /// remote session's directory for display against the home it actually
-    /// belongs to — but the rest is what the far side is, answered in the one
-    /// exchange where it speaks for itself.
-    remote_envs: HashMap<String, ghost_vt::remote::HostEnv>,
-    /// One live `ghost __watch` stream per connected host, keyed by target: the
-    /// push that keeps `remote_infos` fresh. Dropping an entry stops its thread,
-    /// so a watcher ends exactly when its host leaves `remotes` (window close /
-    /// app exit).
-    remote_watchers: HashMap<String, RemoteWatcher>,
-    /// Remote members a startup restore is waiting to re-adopt, keyed by target
-    /// (see [`PendingRemote`], [`App::reconnect_restored_remotes`] /
-    /// [`App::finish_remote_reconnect`]). Each carries the window's SAVED view mode
-    /// and foreground flag, which can't be read back from the live window: a
-    /// restored remote-only window always opens as a fleet (no local tile to dive
-    /// into, so F9 can't force it single), so the saved intent must ride along here.
-    /// An entry for a host that never reconnects (password/unreachable) just lingers,
-    /// drained on a successful reconnect or when its window closes.
-    pending_remote_restores: HashMap<String, Vec<PendingRemote>>,
+    /// Every remote host the App knows about, keyed by target.
+    hosts: HashMap<String, HostLink>,
     /// Remote sessions whose transport dropped and are holding in the reconnecting
     /// state, keyed by `(window, composite id)`. Each value is the stop flag for its
     /// background probe thread (`spawn_reconnect_probe`): set it and drop the entry
@@ -3787,21 +3805,6 @@ pub struct App {
     /// the shell's — it is the shell that can name it and probe the transport.
     /// Pruned with the sessions themselves each wake.
     input_stalls: HashMap<String, InputStall>,
-    /// Remote **hosts** a group still remembers a session on but which we are not
-    /// connected to, each with the stop flag of the background worker retrying it
-    /// forever (see [`App::retry_remembered_hosts`]). Presence dedupes, so one
-    /// worker per host no matter how many members or windows want it.
-    ///
-    /// This is what makes waiting durable: the hold outlives the drop that started
-    /// it, and — because the members are remembered in `groups.toml` — a ghost that
-    /// is quit and relaunched while the host is still down picks the wait back up
-    /// instead of forgetting the sessions.
-    remote_retries: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Remote targets with a transport health probe in flight
-    /// ([`App::probe_remote_transports`]). Presence dedupes — one prober per host
-    /// no matter how many wake suspicions fire — and the prober thread clears its
-    /// own entry when done.
-    probing_remotes: Arc<std::sync::Mutex<HashSet<String>>>,
     /// When the event loop last ran, to spot a suspend: a wake-to-wake gap over
     /// [`SUSPEND_PROBE_GAP`] triggers a probe of the remote transports.
     last_wake_at: Instant,
@@ -3949,16 +3952,12 @@ impl App {
         let Some(sink) = self.sink.clone() else {
             return; // nowhere to post the result (an App with no sink at all)
         };
-        let connected: HashSet<String> = self
-            .remotes
-            .lock()
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let connected: HashSet<String> = self.connected_targets();
         let mut wanted: HashSet<String> = HashSet::new();
         let remembered = self.groups.iter().flat_map(|g| &g.members).chain(
-            self.pending_remote_restores
+            self.hosts
                 .values()
-                .flatten()
+                .flat_map(|h| &h.pending_restores)
                 .map(|p| &p.composite),
         );
         for member in remembered {
@@ -3970,15 +3969,16 @@ impl App {
         }
         // Stop retrying a host nothing remembers any more (its group was dissolved,
         // or it answered and is now connected).
-        self.remote_retries.retain(|target, stop| {
-            let keep = wanted.contains(target);
-            if !keep {
+        for (target, host) in &mut self.hosts {
+            if !wanted.contains(target)
+                && let Some(stop) = host.retry.take()
+            {
                 stop.store(true, Ordering::Relaxed);
             }
-            keep
-        });
+        }
+        self.forget_idle_hosts();
         for target in wanted {
-            if self.remote_retries.contains_key(&target) {
+            if self.hosts.get(&target).is_some_and(|h| h.retry.is_some()) {
                 continue;
             }
             let spec = self
@@ -3989,7 +3989,7 @@ impl App {
                 .or_else(|| ConnectionSpec::parse_target(&target));
             let Some(spec) = spec else { continue };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.remote_retries.insert(target, stop.clone());
+            self.host_mut(&target).retry = Some(stop.clone());
             spawn_remote_reconnect(sink.clone(), spec, stop);
         }
     }
@@ -4016,9 +4016,9 @@ impl App {
         // registry only once something saves it, so a bare launch whose hosts are
         // all away would otherwise open with nothing on screen.
         let remembered = self.groups.iter().flat_map(|g| &g.members).chain(
-            self.pending_remote_restores
+            self.hosts
                 .values()
-                .flatten()
+                .flat_map(|h| &h.pending_restores)
                 .map(|p| &p.composite),
         );
         for member in remembered {
@@ -4028,7 +4028,7 @@ impl App {
             if out.iter().any(|d| &d.name == member) {
                 continue;
             }
-            match self.remote_infos.get(target) {
+            match self.hosts.get(target).and_then(|h| h.listing.as_ref()) {
                 // Connected and serving it: it is live, not remembered — the
                 // listing carries it and the fleet has a real tile.
                 Some(infos) if infos.iter().any(|i| &i.name == member) => continue,
@@ -4042,8 +4042,9 @@ impl App {
                 // landed) stay conservative: relaunchable, as before.
                 Some(_) => {
                     if self
-                        .remote_remembered
+                        .hosts
                         .get(target)
+                        .and_then(|h| h.remembered.as_ref())
                         .is_some_and(|names| !names.contains(real))
                     {
                         continue;
@@ -4861,11 +4862,7 @@ impl App {
                     // hold a live transport to, create the session ON it (a real
                     // remote ghost session), matching the group's other sessions —
                     // not a local `ssh` child.
-                    let connected: HashSet<String> = self
-                        .remotes
-                        .lock()
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default();
+                    let connected: HashSet<String> = self.connected_targets();
                     let target = remote_spawn_target(connection.as_ref(), &connected);
                     // …and, on the same footing, where that session is working: a
                     // new terminal opens beside the one it came from, not back at
@@ -5358,11 +5355,7 @@ impl App {
     /// (the background half of a group relaunch); the interactive Recreate uses
     /// [`spawn_remote_session`](Self::spawn_remote_session), which also steps in.
     fn respawn_remote_dead(&self, target: &str, real: &str) {
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned());
+        let host = self.connection(target);
         let Some(host) = host else {
             eprintln!("ghost: no live connection to {target} to relaunch '{real}'");
             return;
@@ -5475,27 +5468,20 @@ impl App {
     /// drop→hold→reconnect path (and the watcher's own retry) takes over; no
     /// session state is touched here. A healthy master answers the bounded probe
     /// in milliseconds, so a false suspicion costs a couple of ssh control
-    /// commands. One prober per host at a time (`probing_remotes` dedupes).
+    /// commands. One prober per host at a time (its `probing` flag dedupes).
     pub fn probe_remote_transports(&mut self) {
-        let hosts: Vec<(String, RemoteHost)> = match self.remotes.lock() {
-            Ok(m) => m.iter().map(|(t, h)| (t.clone(), h.clone())).collect(),
-            Err(_) => return,
-        };
-        for (target, host) in hosts {
-            {
-                let Ok(mut probing) = self.probing_remotes.lock() else {
-                    return;
-                };
-                if !probing.insert(target.clone()) {
-                    continue;
-                }
+        use std::sync::atomic::Ordering;
+        for host in self.hosts.values() {
+            let Some(conn) = host.conn.clone() else {
+                continue;
+            };
+            if host.probing.swap(true, Ordering::Relaxed) {
+                continue;
             }
-            let probing = Arc::clone(&self.probing_remotes);
+            let probing = Arc::clone(&host.probing);
             std::thread::spawn(move || {
-                host.remote.reap_wedged_master();
-                if let Ok(mut probing) = probing.lock() {
-                    probing.remove(&target);
-                }
+                conn.remote.reap_wedged_master();
+                probing.store(false, Ordering::Relaxed);
             });
         }
     }
@@ -5515,11 +5501,7 @@ impl App {
         else {
             return;
         };
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&target).cloned());
+        let host = self.connection(&target);
         let (Some(host), Some(sink)) = (host, self.sink.clone()) else {
             return;
         };
@@ -5547,11 +5529,7 @@ impl App {
             dead_end(self);
             return;
         };
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&target).cloned());
+        let host = self.connection(&target);
         let Some(host) = host else {
             dead_end(self);
             return;
@@ -6012,7 +5990,7 @@ impl App {
 
     /// A background restore reconnect reached `spec`'s host: register it (starting
     /// its watcher) and attach every remembered session queued for it in
-    /// `pending_remote_restores` into its restored window, adopting so the window
+    /// its `pending_restores` into its restored window, adopting so the window
     /// shows it. A session gone from the remote just fails to attach (its tile
     /// stays cold); the drain clears the target either way.
     fn finish_remote_reconnect(
@@ -6023,14 +6001,15 @@ impl App {
     ) {
         self.register_remote(&spec, &remote_ghost);
         let target = spec.target();
-        let Some(pending) = self.pending_remote_restores.remove(&target) else {
+        let pending = self
+            .hosts
+            .get_mut(&target)
+            .map(|h| std::mem::take(&mut h.pending_restores))
+            .unwrap_or_default();
+        if pending.is_empty() {
             return;
-        };
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&target).cloned());
+        }
+        let host = self.connection(&target);
         let Some(host) = host else {
             return;
         };
@@ -6057,7 +6036,7 @@ impl App {
             // session) drives+foregrounds it. We key on the SAVED mode, not the
             // live one: a remote-only window is always restored into a fleet (it
             // owns no tile to dive into, so F9 can't force it single), so the
-            // single-view intent rides in from `pending_remote_restores`; the adopt
+            // single-view intent rides in from `pending_restores`; the adopt
             // then dives it out.
             if saved_fleet {
                 continue;
@@ -6151,8 +6130,10 @@ impl App {
                 // is looked up by the composite id, not the name the host uses.
                 let composite = remote_fleet_id(target, session);
                 let reported = self
-                    .remote_infos
+                    .hosts
                     .get(target)?
+                    .listing
+                    .as_ref()?
                     .iter()
                     .find(|i| i.name == composite)?
                     .cwd
@@ -6169,12 +6150,7 @@ impl App {
     /// its stored descriptor.
     fn foreground_connection(&self, id: &str) -> Option<ConnectionSpec> {
         if let Some((target, _)) = id.split_once(REMOTE_ID_SEP) {
-            return self
-                .remotes
-                .lock()
-                .ok()?
-                .get(target)
-                .map(|h| h.remote.spec().clone());
+            return self.connection(target).map(|h| h.remote.spec().clone());
         }
         ghost_vt::descriptor::read(id).and_then(|d| d.connection)
     }
@@ -6187,15 +6163,10 @@ impl App {
         let Ok(remote) = ghost_vt::remote::RemoteSsh::new(spec.clone()) else {
             return;
         };
-        if let Ok(mut m) = self.remotes.lock() {
-            m.insert(
-                spec.target(),
-                RemoteHost {
-                    remote: Arc::new(remote),
-                    remote_ghost: remote_ghost.to_string(),
-                },
-            );
-        }
+        self.host_mut(&spec.target()).conn = Some(RemoteHost {
+            remote: Arc::new(remote),
+            remote_ghost: remote_ghost.to_string(),
+        });
         self.ensure_remote_watcher(&spec.target());
     }
 
@@ -6206,19 +6177,39 @@ impl App {
         let Some(sink) = self.sink.clone() else {
             return;
         };
-        if self.remote_watchers.contains_key(target) {
+        if self.hosts.get(target).is_some_and(|h| h.watcher.is_some()) {
             return;
         }
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned());
+        let host = self.connection(target);
         let Some(host) = host else {
             return;
         };
         let watcher = start_remote_watcher(target.to_string(), host, sink);
-        self.remote_watchers.insert(target.to_string(), watcher);
+        self.host_mut(target).watcher = Some(watcher);
+    }
+
+    /// The open transport to `target`, if connected.
+    fn connection(&self, target: &str) -> Option<RemoteHost> {
+        self.hosts.get(target)?.conn.clone()
+    }
+
+    /// The targets with an open transport.
+    fn connected_targets(&self) -> HashSet<String> {
+        self.hosts
+            .iter()
+            .filter(|(_, h)| h.conn.is_some())
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// `target`'s entry, made on first use.
+    fn host_mut(&mut self, target: &str) -> &mut HostLink {
+        self.hosts.entry(target.to_string()).or_default()
+    }
+
+    /// Drop the hosts whose entries hold nothing any more.
+    fn forget_idle_hosts(&mut self) {
+        self.hosts.retain(|_, h| !h.is_idle());
     }
 
     /// This machine's sessions: the local feed's latest listing when it runs,
@@ -6263,10 +6254,13 @@ impl App {
                 i
             })
             .collect();
-        for (target, r) in &self.remote_infos {
-            let home = self
-                .remote_envs
-                .get(target)
+        for host in self.hosts.values() {
+            let Some(r) = &host.listing else {
+                continue;
+            };
+            let home = host
+                .env
+                .as_ref()
                 .and_then(|e| e.home.as_deref())
                 .map(PathBuf::from);
             merged.extend(r.iter().cloned().map(|mut i| {
@@ -6308,11 +6302,7 @@ impl App {
         real: &str,
         event_loop: &dyn Frontend,
     ) -> bool {
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned());
+        let host = self.connection(target);
         let Some(host) = host else {
             eprintln!("ghost: no live connection to {target} to open its session");
             return false;
@@ -6342,11 +6332,7 @@ impl App {
         name: &str,
         cwd: Option<String>,
     ) {
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned());
+        let host = self.connection(target);
         let Some(host) = host else {
             eprintln!("ghost: no live connection to {target} to open a session on");
             return;
@@ -6394,11 +6380,7 @@ impl App {
             self.report_failure(wid, "Could not open a session", format!("{target}: {e}"));
             return;
         }
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&target).cloned());
+        let host = self.connection(&target);
         let Some(host) = host else {
             self.report_failure(
                 wid,
@@ -6432,11 +6414,7 @@ impl App {
     /// host's transport (a live fleet preview). `None` if the host isn't connected
     /// or the observe channel couldn't open.
     fn observe_remote(&self, target: &str, real: &str) -> Option<Subscriber> {
-        let host = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned())?;
+        let host = self.connection(target)?;
         let cmd = host.remote.pipe_command(&host.remote_ghost, real);
         // Unlike an attach (which sends `Policy` and would be DROPPED by an older
         // host), an observe gains nothing from reading the host's real level: a host
@@ -6452,12 +6430,7 @@ impl App {
     /// event loop (one ssh command over the open master). The watcher reflects the
     /// removal within a poll.
     fn spawn_remote_kill(&self, target: &str, real: &str) {
-        let Some(host) = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned())
-        else {
+        let Some(host) = self.connection(target) else {
             // No live transport to the host — the kill can't be delivered. Say so
             // (like the rename twin below) rather than dropping it silently; the
             // fleet has already forgotten the tile either way.
@@ -6478,12 +6451,7 @@ impl App {
     /// speaking the current protocol level; a client driving it sees the transport
     /// drop (the old host died) and the reconnect path re-attaches to the new host.
     fn spawn_remote_restart(&self, target: &str, real: &str) {
-        let Some(host) = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned())
-        else {
+        let Some(host) = self.connection(target) else {
             eprintln!("ghost: no live connection to {target} to restart its session");
             return;
         };
@@ -6516,12 +6484,7 @@ impl App {
     /// Rename remote session `real` on `target` to `new` over its host's transport,
     /// off the event loop. The watcher reflects the new label on the next push.
     fn spawn_remote_rename(&self, target: &str, real: &str, new: &str) {
-        let Some(host) = self
-            .remotes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(target).cloned())
-        else {
+        let Some(host) = self.connection(target) else {
             // No live transport to the host — the rename can't be delivered. Say so
             // (the fleet's optimistic label will revert once the timeout lapses)
             // rather than dropping it silently.
@@ -6990,10 +6953,10 @@ impl App {
         // Drop any remote reconnects still queued for this window: it is gone, so a
         // late host reconnect has nowhere to land (`finish_remote_reconnect` would
         // skip it), and a host that never returns would leak the entry forever.
-        for queued in self.pending_remote_restores.values_mut() {
-            queued.retain(|p| p.wid != wid);
+        for host in self.hosts.values_mut() {
+            host.pending_restores.retain(|p| p.wid != wid);
         }
-        self.pending_remote_restores.retain(|_, q| !q.is_empty());
+        self.forget_idle_hosts();
         // Cancel any reconnect probes for this window (stop their threads) — the tile
         // they'd reattach into is gone.
         self.reconnecting.retain(|(w, _), stop| {
@@ -7056,16 +7019,20 @@ impl App {
     /// disappear.
     fn prune_remotes(&mut self) {
         let in_use = self.in_use_targets();
-        if let Ok(mut m) = self.remotes.lock() {
-            m.retain(|t, _| in_use.contains(t));
+        for (target, host) in &mut self.hosts {
+            if in_use.contains(target) {
+                continue;
+            }
+            host.conn = None;
+            host.listing = None;
+            host.remembered = None;
+            // Goes with the host that answered it: the next connect gets its own
+            // handshake, and a machine's home is not ours to remember for it.
+            host.env = None;
+            // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
+            host.watcher = None;
         }
-        self.remote_infos.retain(|t, _| in_use.contains(t));
-        self.remote_remembered.retain(|t, _| in_use.contains(t));
-        // Goes with the host that answered it: the next connect gets its own
-        // handshake, and a machine's home is not ours to remember for it.
-        self.remote_envs.retain(|t, _| in_use.contains(t));
-        // Dropping a watcher stops its thread and kills its `ghost __watch` ssh.
-        self.remote_watchers.retain(|t, _| in_use.contains(t));
+        self.forget_idle_hosts();
     }
 
     /// The single quit path: record the open windows, then leave the event loop.
@@ -7408,15 +7375,12 @@ impl App {
                 continue;
             };
             let is_foreground = foreground.as_deref() == Some(id.as_str());
-            self.pending_remote_restores
-                .entry(target.to_string())
-                .or_default()
-                .push(PendingRemote {
-                    wid,
-                    composite: id,
-                    fleet,
-                    foreground: is_foreground,
-                });
+            self.host_mut(target).pending_restores.push(PendingRemote {
+                wid,
+                composite: id,
+                fleet,
+                foreground: is_foreground,
+            });
         }
         // End in the overview iff the window was left in it — but only for a window
         // that opened on a LOCAL member. That branch opens a single view, so F9
@@ -7462,7 +7426,7 @@ impl App {
                 return;
             }
             UserEvent::RemoteSessions { target, infos } => {
-                self.remote_infos.insert(target, infos);
+                self.host_mut(&target).listing = Some(infos);
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -7473,13 +7437,18 @@ impl App {
             // fetch (`None`) clears the cache — unknown, not stale — and the
             // sweep stays conservative.
             UserEvent::RemoteRemembered { target, names } => {
-                match names {
-                    Some(names) => {
-                        self.remote_remembered.insert(target, names);
-                    }
-                    None => {
-                        self.remote_remembered.remove(&target);
-                    }
+                self.host_mut(&target).remembered = names;
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            // Nothing is known about the host's sessions now: drop its listing
+            // and its remembered-set (a stale set could forget a member whose
+            // descriptor outlived the fetch), so its members wait for it.
+            UserEvent::RemoteUnreachable { target } => {
+                if let Some(host) = self.hosts.get_mut(&target) {
+                    host.listing = None;
+                    host.remembered = None;
                 }
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7488,18 +7457,8 @@ impl App {
             // The host described its machine in the handshake. Keep it and
             // re-list: tiles already drawn with a whole remote path can now
             // shorten it against that host's own home.
-            // Nothing is known about the host's sessions now: drop its listing
-            // and its remembered-set (a stale set could forget a member whose
-            // descriptor outlived the fetch), so its members wait for it.
-            UserEvent::RemoteUnreachable { target } => {
-                self.remote_infos.remove(&target);
-                self.remote_remembered.remove(&target);
-                self.sessions_changed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
             UserEvent::RemoteEnv { target, env } => {
-                self.remote_envs.insert(target, env);
+                self.host_mut(&target).env = Some(env);
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -9480,7 +9439,9 @@ mod tests {
         );
 
         assert!(
-            app.remote_infos.contains_key("kov@box"),
+            app.hosts
+                .get("kov@box")
+                .is_some_and(|h| h.listing.is_some()),
             "the host's listing is stashed"
         );
         assert!(
@@ -9508,7 +9469,7 @@ mod tests {
                 connection: None,
             }];
             // The host is connected and its listing does not name the member.
-            app.remote_infos.insert("kov@box".to_string(), Vec::new());
+            app.host_mut("kov@box").listing = Some(Vec::new());
 
             // Until the host's remembered-set is known (an older remote ghost, or
             // the fetch hasn't landed), stay conservative: relaunchable, as before.
@@ -9523,8 +9484,7 @@ mod tests {
             // The host reports it remembers nothing: the session exited cleanly
             // there (or was killed) — there is nothing to resurrect, so the
             // sweep must not name it and its membership goes.
-            app.remote_remembered
-                .insert("kov@box".to_string(), std::collections::HashSet::new());
+            app.host_mut("kov@box").remembered = Some(std::collections::HashSet::new());
             assert!(
                 app.remembered_remotes().is_empty(),
                 "a member its connected host no longer remembers must be forgotten"
@@ -9532,10 +9492,8 @@ mod tests {
 
             // A host that still holds the descriptor (a reboot killed the host
             // uncleanly) is the case that stays relaunchable.
-            app.remote_remembered.insert(
-                "kov@box".to_string(),
-                std::iter::once("work".to_string()).collect(),
-            );
+            app.host_mut("kov@box").remembered =
+                Some(std::iter::once("work".to_string()).collect());
             let dead = app.remembered_remotes();
             assert_eq!(
                 dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
@@ -9617,7 +9575,7 @@ mod tests {
             },
         );
         assert_eq!(
-            app.remote_remembered.get("kov@box"),
+            app.hosts.get("kov@box").and_then(|h| h.remembered.as_ref()),
             Some(&std::iter::once("work".to_string()).collect()),
             "the host's remembered-set is stashed"
         );
@@ -9637,7 +9595,9 @@ mod tests {
             },
         );
         assert!(
-            !app.remote_remembered.contains_key("kov@box"),
+            !app.hosts
+                .get("kov@box")
+                .is_some_and(|h| h.remembered.is_some()),
             "an unknown remembered-set clears the cached one"
         );
     }
@@ -9655,12 +9615,10 @@ mod tests {
             let b = ConnectionSpec::parse_target("kov@b").unwrap();
             app.register_remote(&a, "ghost");
             app.register_remote(&b, "ghost");
-            app.remote_infos.insert("kov@a".to_string(), Vec::new());
-            app.remote_infos.insert("kov@b".to_string(), Vec::new());
-            app.remote_remembered
-                .insert("kov@a".to_string(), std::collections::HashSet::new());
-            app.remote_remembered
-                .insert("kov@b".to_string(), std::collections::HashSet::new());
+            app.host_mut("kov@a").listing = Some(Vec::new());
+            app.host_mut("kov@b").listing = Some(Vec::new());
+            app.host_mut("kov@a").remembered = Some(std::collections::HashSet::new());
+            app.host_mut("kov@b").remembered = Some(std::collections::HashSet::new());
 
             // A window that is an ssh group for host A references it; B is orphaned.
             let group = app.mint_group();
@@ -9673,20 +9631,26 @@ mod tests {
 
             app.prune_remotes();
 
-            let remotes = app.remotes.lock().unwrap();
-            assert!(remotes.contains_key("kov@a"), "the referenced host stays");
+            let connected = app.connected_targets();
+            assert!(connected.contains("kov@a"), "the referenced host stays");
             assert!(
-                !remotes.contains_key("kov@b"),
+                !connected.contains("kov@b"),
                 "the unreferenced host is dropped"
             );
-            assert!(app.remote_infos.contains_key("kov@a"));
+            assert!(app.hosts.get("kov@a").is_some_and(|h| h.listing.is_some()));
             assert!(
-                !app.remote_infos.contains_key("kov@b"),
+                !app.hosts.get("kov@b").is_some_and(|h| h.listing.is_some()),
                 "its cached listing is dropped too"
             );
-            assert!(app.remote_remembered.contains_key("kov@a"));
             assert!(
-                !app.remote_remembered.contains_key("kov@b"),
+                app.hosts
+                    .get("kov@a")
+                    .is_some_and(|h| h.remembered.is_some())
+            );
+            assert!(
+                !app.hosts
+                    .get("kov@b")
+                    .is_some_and(|h| h.remembered.is_some()),
                 "its cached remembered-set is dropped too"
             );
         });
@@ -10433,11 +10397,7 @@ mod tests {
             app.close_window(a, &fe);
 
             let downgraded = app.observers.contains_key(&composite);
-            let host_kept = app
-                .remotes
-                .lock()
-                .map(|m| m.contains_key("kov@box"))
-                .unwrap_or(false);
+            let host_kept = app.connected_targets().contains("kov@box");
             let state_alive = app.states.text_of(&composite).is_some();
 
             // Tear the real (shimmed-local) session down and restore PATH before asserting.
@@ -10527,7 +10487,7 @@ mod tests {
 
             // The connection to the host is gone with it, so window B's attach can
             // open no client.
-            app.remotes.lock().unwrap().remove("kov@box");
+            app.host_mut("kov@box").conn = None;
             let gb = app.mint_group();
             let b = app.open_fleet_window(&fe, gb, None);
             app.exec(b, vec![ghost_ui_core::Cmd::Attach(composite.clone())], &fe);
@@ -11382,10 +11342,7 @@ mod tests {
                 cwd: Some("/Users/kov/proj".into()),
                 ..info("work", false)
             };
-            app.remote_infos.insert(
-                "kov@mac".to_string(),
-                namespace_remote_infos("kov@mac", vec![listed]),
-            );
+            app.host_mut("kov@mac").listing = Some(namespace_remote_infos("kov@mac", vec![listed]));
 
             // Before the handshake lands there is no home to shorten against, so
             // the path is shown whole rather than guessed at.
@@ -11616,10 +11573,11 @@ mod tests {
                 app.windows.values().next().unwrap().root.is_fleet(),
                 "a remote-only window left in the fleet overview stays in it"
             );
-            let pending = app
-                .pending_remote_restores
+            let pending = &app
+                .hosts
                 .get("kov@box")
-                .expect("its host is queued for reconnect");
+                .expect("its host is queued for reconnect")
+                .pending_restores;
             assert!(
                 pending.iter().any(|p| p.composite == rem),
                 "the remote member is queued, not spawned locally"
@@ -11642,12 +11600,16 @@ mod tests {
 
             let wid = *app.windows.keys().next().unwrap();
             assert!(
-                app.pending_remote_restores.contains_key("kov@box"),
+                app.hosts
+                    .get("kov@box")
+                    .is_some_and(|h| !h.pending_restores.is_empty()),
                 "the remote reconnect is queued while the window is open"
             );
             app.close_window(wid, &fe);
             assert!(
-                !app.pending_remote_restores.contains_key("kov@box"),
+                !app.hosts
+                    .get("kov@box")
+                    .is_some_and(|h| !h.pending_restores.is_empty()),
                 "closing the window drops its queued remote reconnect"
             );
         });
@@ -11670,23 +11632,20 @@ mod tests {
             let one = remote("one");
             let two = remote("two");
             // Saved in the fleet overview (fleet: true) → observed in place, not driven.
-            app.pending_remote_restores.insert(
-                "kov@box".to_string(),
-                vec![
-                    PendingRemote {
-                        wid,
-                        composite: one.clone(),
-                        fleet: true,
-                        foreground: false,
-                    },
-                    PendingRemote {
-                        wid,
-                        composite: two.clone(),
-                        fleet: true,
-                        foreground: false,
-                    },
-                ],
-            );
+            app.host_mut("kov@box").pending_restores = vec![
+                PendingRemote {
+                    wid,
+                    composite: one.clone(),
+                    fleet: true,
+                    foreground: false,
+                },
+                PendingRemote {
+                    wid,
+                    composite: two.clone(),
+                    fleet: true,
+                    foreground: false,
+                },
+            ];
 
             app.finish_remote_reconnect(spec, "ghost".to_string(), &fe);
 
@@ -11700,11 +11659,13 @@ mod tests {
                 app.sessions.keys().collect::<Vec<_>>()
             );
             assert!(
-                app.remotes.lock().unwrap().contains_key("kov@box"),
+                app.connected_targets().contains("kov@box"),
                 "the host is registered (its watcher/observe path is live)"
             );
             assert!(
-                !app.pending_remote_restores.contains_key("kov@box"),
+                !app.hosts
+                    .get("kov@box")
+                    .is_some_and(|h| !h.pending_restores.is_empty()),
                 "the target is drained from the pending set"
             );
         });
@@ -11750,20 +11711,20 @@ mod tests {
             let group = app.mint_group();
             let wid = app.open_fleet_window(&fe, group, None);
             let composite = format!("kov@box{REMOTE_ID_SEP}{real}");
-            app.pending_remote_restores.insert(
-                "kov@box".to_string(),
-                vec![PendingRemote {
-                    wid,
-                    composite: composite.clone(),
-                    fleet: false,
-                    foreground: true,
-                }],
-            );
+            app.host_mut("kov@box").pending_restores = vec![PendingRemote {
+                wid,
+                composite: composite.clone(),
+                fleet: false,
+                foreground: true,
+            }];
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
             let held = app.sessions.contains_key(&composite);
             let single = !app.windows[&wid].root.is_fleet();
-            let drained = !app.pending_remote_restores.contains_key("kov@box");
+            let drained = !app
+                .hosts
+                .get("kov@box")
+                .is_some_and(|h| !h.pending_restores.is_empty());
 
             let _ = ghost_vt::session::kill_session(real);
             // SAFETY: still within the lock; restore PATH for later tests.
@@ -11835,15 +11796,12 @@ mod tests {
                 )),
                 &fe,
             );
-            app.pending_remote_restores.insert(
-                "kov@box".to_string(),
-                vec![PendingRemote {
-                    wid,
-                    composite: composite.clone(),
-                    fleet: false,
-                    foreground: true,
-                }],
-            );
+            app.host_mut("kov@box").pending_restores = vec![PendingRemote {
+                wid,
+                composite: composite.clone(),
+                fleet: false,
+                foreground: true,
+            }];
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
             // The listing catches up with the attach this restore just made.
@@ -11924,23 +11882,20 @@ mod tests {
             let fg = format!("kov@box{REMOTE_ID_SEP}fg-1");
             let bg = format!("kov@box{REMOTE_ID_SEP}bg-1");
             // Saved single (drive): fg is the foreground, bg a background member.
-            app.pending_remote_restores.insert(
-                "kov@box".to_string(),
-                vec![
-                    PendingRemote {
-                        wid,
-                        composite: fg.clone(),
-                        fleet: false,
-                        foreground: true,
-                    },
-                    PendingRemote {
-                        wid,
-                        composite: bg.clone(),
-                        fleet: false,
-                        foreground: false,
-                    },
-                ],
-            );
+            app.host_mut("kov@box").pending_restores = vec![
+                PendingRemote {
+                    wid,
+                    composite: fg.clone(),
+                    fleet: false,
+                    foreground: true,
+                },
+                PendingRemote {
+                    wid,
+                    composite: bg.clone(),
+                    fleet: false,
+                    foreground: false,
+                },
+            ];
 
             app.finish_remote_reconnect(spec, ghost_bin.to_str().unwrap().to_string(), &fe);
             let held_fg = app.sessions.contains_key(&fg);
