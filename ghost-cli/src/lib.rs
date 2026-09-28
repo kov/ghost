@@ -134,6 +134,14 @@ enum Command {
         /// New session name.
         new: String,
     },
+    /// Put a session in a window group, or take it out of any (no group given).
+    /// The group is kept by the session's host, so every listing names it.
+    SetGroup {
+        /// Session name.
+        name: String,
+        /// Group id; omit to take the session out of its group.
+        group: Option<String>,
+    },
     /// Search recorded session output for text — a grep over what your sessions
     /// rendered (recordings are compressed, so a plain `grep` can't). Prints one
     /// `session:line: text` per matching line, in `session` order.
@@ -464,6 +472,11 @@ fn dispatch(command: Command) {
             Ok(()) => println!("renamed '{old}' to '{new}'"),
             Err(e) => fail(&e.to_string()),
         },
+        Command::SetGroup { name, group } => {
+            if let Err(e) = client::set_group(&resolve(&name), group.as_deref()) {
+                fail(&e.to_string());
+            }
+        }
         Command::Search {
             pattern,
             session,

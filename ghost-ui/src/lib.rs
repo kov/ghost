@@ -3625,6 +3625,52 @@ impl App {
         }
     }
 
+    /// Tell each session's host the group it moved to between the registry this App
+    /// holds and `new`: the host keeps a session's group, so every listing names it
+    /// — the CLI, another ghost process, this one after a crash. A session taken
+    /// out of every group is told `None`. A remote host is told over its transport,
+    /// off the event loop. Best-effort: a host predating groups refuses, a dead
+    /// session has no host to tell, and an unreachable one is not told.
+    fn tell_hosts_their_groups(&self, new: &[ghost_ui_core::Group]) {
+        let group_of = |groups: &[ghost_ui_core::Group], id: &SessionId| {
+            groups
+                .iter()
+                .find(|g| g.members.contains(id))
+                .map(|g| g.id.clone())
+        };
+        let ids: HashSet<&SessionId> = self
+            .groups
+            .iter()
+            .chain(new)
+            .flat_map(|g| &g.members)
+            .collect();
+        for id in ids {
+            let now = group_of(new, id);
+            if now == group_of(&self.groups, id) {
+                continue;
+            }
+            match id.as_remote() {
+                None => {
+                    let _ = ghost_vt::client::set_group(id.name(), now.as_deref());
+                }
+                Some((target, real)) => {
+                    let Some(host) = self.connection(target) else {
+                        continue;
+                    };
+                    let real = real.to_string();
+                    std::thread::spawn(move || {
+                        if let Err(e) =
+                            host.remote
+                                .set_group(&host.remote_ghost, &real, now.as_deref())
+                        {
+                            eprintln!("ghost: {e}");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     /// Keep each session's one driver: a session nobody drives has none; a driver
     /// that let go (or closed) is replaced by [`Self::pick_driver`]'s choice among
     /// the windows still driving it; every other window driving it is told it no
@@ -4380,6 +4426,7 @@ impl App {
                         // group is remembered across a restart and its remote members
                         // rejoin it on reconnect (see restore).
                         groups::save(&new_groups);
+                        self.tell_hosts_their_groups(&new_groups);
                         self.groups = new_groups.clone();
                         let others: Vec<WindowId> = self
                             .windows
@@ -10307,6 +10354,133 @@ mod tests {
     /// the host reconnects, B's restore finds the client already held in this
     /// process and takes the session over — so A must let it go, not keep driving
     /// it beside B.
+    /// A session's group lives on its host: a window that takes a session into
+    /// its group tells the host, so every listing — `ghost ls`, another ghost
+    /// process, this one after a crash — names the group, not just this UI's
+    /// registry.
+    #[test]
+    fn a_session_a_window_claims_is_listed_in_that_windows_group() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "grp-claim";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let group_of = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.group)
+            };
+            let mut spun = 0;
+            while group_of().is_none() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let before = group_of();
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let gid = group.id.clone();
+            app.open_single_window(&fe, name, group, None)
+                .expect("the window attaches");
+            let mut spun = 0;
+            while group_of() != Some(Some(gid.clone())) && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let after = group_of();
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert_eq!(before, Some(None), "precondition: listed, in no group");
+            assert_eq!(
+                after,
+                Some(Some(gid)),
+                "the host lists the session in the window's group"
+            );
+        });
+    }
+
+    /// The same for a remote session: its host, reached over the transport, keeps
+    /// the group of the window that took it.
+    #[test]
+    fn a_remote_session_a_window_claims_is_listed_in_that_windows_group() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+
+            let group = app.mint_group();
+            let gid = group.id.clone();
+            let a = app.open_fleet_window(&fe, group, None);
+            let name = "rg-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                a,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
+            // The shim's "remote" host is this machine, under the same XDG dirs.
+            let group_of = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.group)
+            };
+            let mut spun = 0;
+            while group_of().as_ref() != Some(&gid) && spun < 250 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let listed = group_of();
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert_eq!(
+                listed,
+                Some(gid),
+                "the remote host lists the session in the window's group"
+            );
+        });
+    }
+
     #[test]
     fn a_restore_that_finds_its_session_held_takes_it_from_the_other_window() {
         let Some(ghost_bin) = ghost_binary() else {

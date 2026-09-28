@@ -994,6 +994,21 @@ impl RemoteSsh {
         Ok(())
     }
 
+    /// Put the remote session `name` in `group`, or take it out of any (`None`), with
+    /// the remote `ghost set-group`. Its host keeps the group, so its listings name it.
+    pub fn set_group(&self, remote_ghost: &str, name: &str, group: Option<&str>) -> io::Result<()> {
+        let mut argv = vec![remote_ghost, "set-group", name];
+        argv.extend(group);
+        let out = self.command(&argv).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost set-group` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Ensure a detached remote host named `name` exists. A fresh session is
     /// created; a failure here (the name already hosts a live session) is
     /// tolerated — the caller then attaches to whatever is there.

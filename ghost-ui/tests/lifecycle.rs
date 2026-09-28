@@ -387,6 +387,62 @@ fn rename_allows_spaces_in_the_display_name() {
 }
 
 #[test]
+fn set_group_puts_a_session_in_a_group_and_takes_it_out() {
+    // A remote UI keeps its sessions' groups on their host through this command,
+    // and reads them back from `ghost ls --json`.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "group-test";
+    let _guard = Cleanup { xdg, name };
+
+    ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session `{name}` was not listed"
+    );
+    let group_of = || {
+        let out = ghost(xdg).args(["ls", "--json"]).output().unwrap();
+        let infos: Vec<ghost_vt::session::SessionInfo> =
+            serde_json::from_slice(&out.stdout).unwrap_or_default();
+        infos
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.group)
+    };
+
+    let out = ghost(xdg)
+        .args(["set-group", name, "win-1-0"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost set-group` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || group_of().as_deref()
+            == Some("win-1-0")),
+        "the listing names the group: {:?}",
+        group_of()
+    );
+
+    let out = ghost(xdg).args(["set-group", name]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost set-group` without a group failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || group_of().is_none()),
+        "the session is in no group again: {:?}",
+        group_of()
+    );
+}
+
+#[test]
 fn ls_json_emits_a_parseable_listing() {
     // `ghost ls --json` feeds the remote-fleet initiator, so its output must
     // parse straight back into the SessionInfo the local lister produces.
