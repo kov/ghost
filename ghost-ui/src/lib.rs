@@ -1479,6 +1479,17 @@ enum Startup {
     Connect,
 }
 
+/// The group `id` is a member of in `groups`, if any.
+fn group_of(
+    groups: &[ghost_ui_core::Group],
+    id: &SessionId,
+) -> Option<ghost_ui_core::group::GroupId> {
+    groups
+        .iter()
+        .find(|g| g.members.contains(id))
+        .map(|g| g.id.clone())
+}
+
 /// Turn the saved workspace into a per-window restore plan. A record whose group
 /// is gone from the registry (all its members were killed/forgotten) can't be
 /// restored, so it is dropped. Members are the window's attached set with the
@@ -1714,6 +1725,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         observe_failed: HashSet::new(),
         unsourced: Vec::new(),
         drivers: HashMap::new(),
+        told_groups: HashMap::new(),
         exec_depth: 0,
         reconciling: false,
         dead_fed: HashSet::new(),
@@ -3116,6 +3128,7 @@ impl App {
             observe_failed: HashSet::new(),
             unsourced: Vec::new(),
             drivers: HashMap::new(),
+            told_groups: HashMap::new(),
             exec_depth: 0,
             reconciling: false,
             dead_fed: HashSet::new(),
@@ -3442,6 +3455,10 @@ pub struct App {
     /// ([`Self::set_driver`]); [`Self::reconcile_sources`] then makes any other
     /// window still driving the session let go, and re-picks when the driver stops.
     drivers: HashMap<SessionId, WindowId>,
+    /// The group this App last told each session's host, until a listing reports it
+    /// back; meanwhile the host's word on that session is not taken (see
+    /// [`Self::learn_host_groups`]).
+    told_groups: HashMap<SessionId, Option<ghost_ui_core::group::GroupId>>,
     /// How deep [`Self::exec`] is nested: the outermost call reconciles sources once
     /// its commands (and everything they dispatched) have run.
     exec_depth: u32,
@@ -3628,45 +3645,103 @@ impl App {
     /// Tell each session's host the group it moved to between the registry this App
     /// holds and `new`: the host keeps a session's group, so every listing names it
     /// — the CLI, another ghost process, this one after a crash. A session taken
-    /// out of every group is told `None`. A remote host is told over its transport,
-    /// off the event loop. Best-effort: a host predating groups refuses, a dead
-    /// session has no host to tell, and an unreachable one is not told.
-    fn tell_hosts_their_groups(&self, new: &[ghost_ui_core::Group]) {
-        let group_of = |groups: &[ghost_ui_core::Group], id: &SessionId| {
-            groups
-                .iter()
-                .find(|g| g.members.contains(id))
-                .map(|g| g.id.clone())
-        };
-        let ids: HashSet<&SessionId> = self
+    /// out of every group is told `None`.
+    fn tell_hosts_their_groups(&mut self, new: &[ghost_ui_core::Group]) {
+        let ids: HashSet<SessionId> = self
             .groups
             .iter()
             .chain(new)
-            .flat_map(|g| &g.members)
+            .flat_map(|g| g.members.iter().cloned())
             .collect();
         for id in ids {
-            let now = group_of(new, id);
-            if now == group_of(&self.groups, id) {
+            let now = group_of(new, &id);
+            if now != group_of(&self.groups, &id) {
+                self.tell_host_group(&id, now);
+            }
+        }
+    }
+
+    /// Tell `id`'s host its group, and remember what it was told until a listing
+    /// reports it back (see [`Self::learn_host_groups`]). A remote host is told over
+    /// its transport, off the event loop. Best-effort: a host predating groups
+    /// refuses (and never reports it back, so this registry keeps the say), a dead
+    /// session has no host to tell, and an unreachable one is not told.
+    fn tell_host_group(&mut self, id: &SessionId, group: Option<ghost_ui_core::group::GroupId>) {
+        match id.as_remote() {
+            None => {
+                let _ = ghost_vt::client::set_group(id.name(), group.as_deref());
+            }
+            Some((target, real)) => {
+                let Some(host) = self.connection(target) else {
+                    return;
+                };
+                let (real, group) = (real.to_string(), group.clone());
+                std::thread::spawn(move || {
+                    if let Err(e) =
+                        host.remote
+                            .set_group(&host.remote_ghost, &real, group.as_deref())
+                    {
+                        eprintln!("ghost: {e}");
+                    }
+                });
+            }
+        }
+        self.told_groups.insert(id.clone(), group);
+    }
+
+    /// Fold the groups a listing's hosts report into the registry. The host is the
+    /// authority on a session's group, except while it has not yet reported back
+    /// what this App told it: a listing can land before the host applied the
+    /// change, and must not revert the user's claim. A session whose host names a
+    /// group this registry does not know (another ghost made it) gets a group of
+    /// that id. A host that names none is either in no group or predates groups;
+    /// neither takes a session out of the registry's group. The host is told the
+    /// registry's group instead, once, which also migrates a membership only the
+    /// registry knew.
+    fn learn_host_groups(&mut self, listing: &[Listed], fe: &dyn Frontend) {
+        let mut groups = self.groups.clone();
+        let mut untold: Vec<(SessionId, ghost_ui_core::group::GroupId)> = Vec::new();
+        for l in listing {
+            if let Some(told) = self.told_groups.get(&l.id) {
+                if *told == l.info.group {
+                    self.told_groups.remove(&l.id);
+                }
                 continue;
             }
-            match id.as_remote() {
-                None => {
-                    let _ = ghost_vt::client::set_group(id.name(), now.as_deref());
-                }
-                Some((target, real)) => {
-                    let Some(host) = self.connection(target) else {
-                        continue;
-                    };
-                    let real = real.to_string();
-                    std::thread::spawn(move || {
-                        if let Err(e) =
-                            host.remote
-                                .set_group(&host.remote_ghost, &real, now.as_deref())
-                        {
-                            eprintln!("ghost: {e}");
+            let ours = group_of(&groups, &l.id);
+            match &l.info.group {
+                Some(hosted) if ours.as_ref() != Some(hosted) => {
+                    for g in &mut groups {
+                        g.members.retain(|m| *m != l.id);
+                    }
+                    let at = match groups.iter().position(|g| g.id == *hosted) {
+                        Some(at) => at,
+                        None => {
+                            let palette = ghost_ui_core::group::GROUP_PALETTE.len();
+                            let color = hosted.bytes().map(usize::from).sum::<usize>() % palette;
+                            groups.push(ghost_ui_core::Group::auto(hosted.clone(), color as u8));
+                            groups.len() - 1
                         }
-                    });
+                    };
+                    groups[at].members.push(l.id.clone());
                 }
+                None => {
+                    if let Some(ours) = ours {
+                        untold.push((l.id.clone(), ours));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        for (id, group) in untold {
+            self.tell_host_group(&id, Some(group));
+        }
+        if groups != self.groups {
+            groups::save(&groups);
+            self.groups = groups.clone();
+            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+            for wid in wids {
+                self.dispatch(wid, UiEvent::GroupsLoaded(groups.clone()), fe);
             }
         }
     }
@@ -4190,8 +4265,9 @@ impl App {
         }
         // A listing is the retry point for a preview whose mirror failed: the session
         // it names may be observable again.
-        if matches!(ev, UiEvent::SessionList(_)) {
+        if let UiEvent::SessionList(listing) = &ev {
             self.observe_failed.clear();
+            self.learn_host_groups(listing, event_loop);
         }
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
@@ -10406,6 +10482,68 @@ mod tests {
                 after,
                 Some(Some(gid)),
                 "the host lists the session in the window's group"
+            );
+        });
+    }
+
+    /// A ghost that never saw the claim — another process, or this one relaunched
+    /// with its registry lost — learns a session's group from the host's listing.
+    #[test]
+    fn a_fresh_registry_learns_a_sessions_group_from_its_host() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "grp-learn";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let mut spun = 0;
+            while ghost_vt::client::set_group(name, Some("win-elsewhere-7")).is_err() && spun < 100
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let hosted = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.group)
+            };
+            let mut spun = 0;
+            while hosted().is_none() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let precondition = hosted();
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(w, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
+            let learned = app
+                .groups()
+                .iter()
+                .any(|g| g.id == "win-elsewhere-7" && g.members.contains(&SessionId::local(name)));
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert_eq!(
+                precondition.as_deref(),
+                Some("win-elsewhere-7"),
+                "precondition: the host keeps the group"
+            );
+            assert!(
+                learned,
+                "the registry places the session in its host's group: {:?}",
+                app.groups()
             );
         });
     }
