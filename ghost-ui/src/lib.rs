@@ -4602,7 +4602,13 @@ impl App {
                             self.drive_with_client(&id, s);
                         }
                     }
-                    self.hand_over(wid, &id, event_loop);
+                    // Hand over only when this process now holds a client for it: an
+                    // attach that opened nothing (a remote id here, a dead host) took
+                    // nothing, and must not end the session in a window still holding
+                    // it (for instance through a remote reconnect hold).
+                    if self.sessions.contains_key(&id) {
+                        self.hand_over(wid, &id, event_loop);
+                    }
                 }
                 Cmd::Observe(id) if self.remote_index.contains_key(&id) => {
                     // Live remote preview: observe the session over its host's
@@ -10289,6 +10295,91 @@ mod tests {
             assert!(
                 state_alive,
                 "the shared state survives the remote driver leaving"
+            );
+        });
+    }
+
+    /// An attach that opens no client takes nothing from anyone. Window A drives a
+    /// remote session whose transport dropped: the pump removed its client and holds
+    /// the session for reconnect, so A still drives it with no client in the map.
+    /// Window B then asks to attach it and the attach fails. The hand-over must not
+    /// fire: telling A it lost the session would end A's foreground for a take-over
+    /// that never happened.
+    #[test]
+    fn a_failed_attach_does_not_take_a_session_from_the_window_holding_it() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+
+            let ga = app.mint_group();
+            let a = app.open_fleet_window(&fe, ga, None);
+            app.windows
+                .get_mut(&a)
+                .unwrap()
+                .root
+                .set_group_connection(Some(spec.clone()));
+            let name = "fa-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            app.finish_remote_session_spawn(
+                a,
+                "kov@box".to_string(),
+                name.to_string(),
+                Ok(()),
+                &fe,
+            );
+            let composite = format!("kov@box{REMOTE_ID_SEP}{name}");
+            let drove_first = app.windows[&a].root.drives(&composite);
+
+            // The transport drops: the pump removes the client and holds the session.
+            app.sessions.remove(&composite);
+            app.dispatch(
+                a,
+                ghost_ui_core::UiEvent::SessionDisconnected {
+                    name: composite.clone(),
+                },
+                &fe,
+            );
+
+            // Window B asks to attach it; no client can be opened for it here.
+            let gb = app.mint_group();
+            let b = app.open_fleet_window(&fe, gb, None);
+            app.exec(b, vec![ghost_ui_core::Cmd::Attach(composite.clone())], &fe);
+            let opened = app.sessions.contains_key(&composite);
+            let still_held = app.windows[&a].root.drives(&composite);
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(drove_first, "precondition: A drives the remote session");
+            assert!(!opened, "precondition: B's attach opened no client");
+            assert!(
+                still_held,
+                "a failed attach must not hand the session away from the window holding it"
             );
         });
     }
