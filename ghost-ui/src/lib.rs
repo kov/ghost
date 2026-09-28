@@ -1479,6 +1479,29 @@ enum Startup {
     Connect,
 }
 
+/// The ghost binary this process upgrades older hosts to, if it does: its own
+/// executable, unless `ui.toml` switches upgrades off or this is a development
+/// build — one run from a cargo build directory, whose binary the next build
+/// replaces. Every host would otherwise follow each rebuild.
+fn upgrade_target(cfg: &config::UiConfig) -> Option<PathBuf> {
+    if !cfg.auto_upgrade_hosts() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    (!is_cargo_build(&exe)).then_some(exe)
+}
+
+/// Whether `exe` lives in a cargo build directory: `…/target/<profile>/…`, or
+/// `…/target/<triple>/<profile>/…` for a cross build.
+fn is_cargo_build(exe: &Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    let profile = |p: &std::ffi::OsStr| matches!(p.to_str(), Some("debug" | "release"));
+    parts
+        .iter()
+        .enumerate()
+        .any(|(i, p)| *p == "target" && parts[i + 1..].iter().take(2).any(|q| profile(q)))
+}
+
 /// `groups` without their members: what `groups.toml` keeps.
 fn attributes_of(groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Group> {
     groups
@@ -1734,6 +1757,8 @@ fn interactive(fresh: bool, ssh_window: bool) {
         sessions: HashMap::new(),
         observers: HashMap::new(),
         observe_failed: HashSet::new(),
+        upgrade_hosts_to: upgrade_target(&config::UiConfig::load()),
+        upgrade_tried: HashSet::new(),
         unsourced: Vec::new(),
         drivers: HashMap::new(),
         told_groups: HashMap::new(),
@@ -3137,6 +3162,8 @@ impl App {
             sessions: HashMap::new(),
             observers: HashMap::new(),
             observe_failed: HashSet::new(),
+            upgrade_hosts_to: None,
+            upgrade_tried: HashSet::new(),
             unsourced: Vec::new(),
             drivers: HashMap::new(),
             told_groups: HashMap::new(),
@@ -3457,6 +3484,13 @@ pub struct App {
     /// attempt per listing rather than one per dispatch (a remote one opens an ssh
     /// channel each time).
     observe_failed: HashSet<SessionId>,
+    /// The ghost binary a host running an older ghost is upgraded to in place when
+    /// a listing shows it (see [`Self::upgrade_older_hosts`]); `None` when this
+    /// ghost does not upgrade hosts (switched off, or a development build).
+    upgrade_hosts_to: Option<PathBuf>,
+    /// Sessions whose host this run already asked to upgrade (or found current),
+    /// so a listing asks each at most once.
+    upgrade_tried: HashSet<SessionId>,
     /// Previews a reconcile left with no source, to be told to their viewers as an
     /// ended mirror (the tile reverts to a placeholder) by the next
     /// [`Self::reconcile_sources`].
@@ -3822,6 +3856,63 @@ impl App {
         self.states.resize_observed(id, cols, rows);
         self.drive_with_client(id, s);
         true
+    }
+
+    /// Ask each listed session's host that runs an older ghost to upgrade itself in
+    /// place to this one: it re-execs under the new binary keeping its program, PTY
+    /// and screen, and every window viewing it reattaches. Once per session per run,
+    /// off the event loop; a refusal (a program that never pauses its output, say)
+    /// is logged. A host predating in-place upgrades is left as it is — it can only
+    /// be restarted, which ends its program. A remote host is upgraded to the ghost
+    /// this UI provisioned there.
+    fn upgrade_older_hosts(&mut self, listing: &[Listed]) {
+        let Some(to) = self.upgrade_hosts_to.clone() else {
+            return;
+        };
+        use ghost_vt::protocol::{PROTO_LEVEL, PROTO_UPGRADE};
+        let mut remote: HashMap<String, Vec<String>> = HashMap::new();
+        for l in listing {
+            if !self.upgrade_tried.insert(l.id.clone()) {
+                continue;
+            }
+            match l.id.as_remote() {
+                None => {
+                    let name = l.id.name().to_string();
+                    let proto = ghost_vt::client::session_proto(&name);
+                    if !(PROTO_UPGRADE..PROTO_LEVEL).contains(&proto) {
+                        continue;
+                    }
+                    let to = to.display().to_string();
+                    std::thread::spawn(move || {
+                        if let Err(e) = ghost_vt::client::upgrade_session(&name, Some(to)) {
+                            eprintln!("ghost: upgrading the host of '{name}': {e}");
+                        }
+                    });
+                }
+                Some((target, real)) => {
+                    remote
+                        .entry(target.to_string())
+                        .or_default()
+                        .push(real.to_string());
+                }
+            }
+        }
+        for (target, names) in remote {
+            let Some(host) = self.connection(&target) else {
+                continue;
+            };
+            std::thread::spawn(move || {
+                for name in names {
+                    let proto = host.remote.session_proto(&host.remote_ghost, &name);
+                    if !(PROTO_UPGRADE..PROTO_LEVEL).contains(&proto) {
+                        continue;
+                    }
+                    if let Err(e) = host.remote.upgrade_session(&host.remote_ghost, &name) {
+                        eprintln!("ghost: upgrading the host of '{name}' on {target}: {e}");
+                    }
+                }
+            });
+        }
     }
 
     /// Keep each session's one driver: a session nobody drives has none; a driver
@@ -4347,6 +4438,7 @@ impl App {
         if let UiEvent::SessionList(listing) = &ev {
             self.observe_failed.clear();
             self.learn_host_groups(listing, event_loop);
+            self.upgrade_older_hosts(listing);
         }
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
@@ -10621,6 +10713,168 @@ mod tests {
                 fed,
                 "and drives it: input reaches the successor, output comes back"
             );
+        });
+    }
+
+    #[test]
+    fn a_ghost_run_from_a_cargo_build_directory_is_a_development_build() {
+        for dev in [
+            "/home/u/src/ghost/target/debug/ghost",
+            "/home/u/src/ghost/target/release/ghost",
+            "/home/u/src/ghost/target/aarch64-apple-darwin/release/ghost",
+        ] {
+            assert!(super::is_cargo_build(std::path::Path::new(dev)), "{dev}");
+        }
+        for installed in [
+            "/home/u/.cargo/bin/ghost",
+            "/usr/local/bin/ghost",
+            "/Applications/Ghost.app/Contents/MacOS/ghost",
+        ] {
+            assert!(
+                !super::is_cargo_build(std::path::Path::new(installed)),
+                "{installed}"
+            );
+        }
+    }
+
+    /// A host older than this ghost is brought up to it without a restart: the UI
+    /// asks it to upgrade itself in place when a listing shows it, and the window
+    /// driving its session keeps it throughout.
+    #[test]
+    fn an_older_host_is_upgraded_in_place_when_listed() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "upg-auto";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            let listed = || {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let mut spun = 0;
+            while !listed() && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, group, None)
+                .expect("the window attaches");
+            let id = SessionId::local(name);
+            // The host reads as one level behind this ghost.
+            std::fs::write(ghost_vt::paths::proto_path(name), "7").unwrap();
+
+            let list = ghost_vt::session::list().unwrap_or_default();
+            app.dispatch(a, ghost_ui_core::UiEvent::SessionList(local(list)), &fe);
+            let generation = || {
+                std::fs::read_to_string(ghost_vt::paths::gen_path(name))
+                    .ok()
+                    .and_then(|g| g.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            let current = || {
+                ghost_vt::client::session_proto(name) == ghost_vt::protocol::PROTO_LEVEL
+                    && generation() > 0
+            };
+            let mut spun = 0;
+            while !current() && spun < 250 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            for _ in 0..10 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let upgraded = current();
+            let kept = app
+                .windows
+                .get(&a)
+                .is_some_and(|w| w.root.foreground() == Some(&id) && w.root.drives(&id));
+
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(upgraded, "the host runs this ghost's level now");
+            assert!(kept, "and the window still shows and drives its session");
+        });
+    }
+
+    /// A remote host running an older ghost is upgraded the same way, over its
+    /// transport, to the ghost this UI uses on that host.
+    #[test]
+    fn an_older_remote_host_is_upgraded_in_place_when_listed() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, ghost_bin.to_str().unwrap());
+            let name = "rupg-1";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            // The shim's "remote" host is this machine: its marker is local.
+            std::fs::write(ghost_vt::paths::proto_path(name), "7").unwrap();
+
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            let listed = remote_listing("kov@box", &[info(name, false)]);
+            app.dispatch(w, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+            let generation = || {
+                std::fs::read_to_string(ghost_vt::paths::gen_path(name))
+                    .ok()
+                    .and_then(|g| g.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            let current = || {
+                ghost_vt::client::session_proto(name) == ghost_vt::protocol::PROTO_LEVEL
+                    && generation() > 0
+            };
+            let mut spun = 0;
+            while !current() && spun < 300 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let upgraded = current();
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(upgraded, "the remote host runs this ghost's level now");
         });
     }
 

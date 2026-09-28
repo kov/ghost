@@ -142,6 +142,7 @@ pub struct UiConfig {
     font: Font,
     input: Input,
     diagnostics: Diagnostics,
+    hosts: Hosts,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -251,6 +252,22 @@ impl Default for Input {
             selection_rules: None,
             option_as_meta: true,
         }
+    }
+}
+
+/// How this ghost treats the session hosts it finds.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Hosts {
+    /// Bring a host running an older ghost up to this one when it is listed: it
+    /// upgrades itself in place, keeping its running program and screen. On by
+    /// default. A ghost run from a cargo build directory never does this.
+    auto_upgrade: bool,
+}
+
+impl Default for Hosts {
+    fn default() -> Self {
+        Hosts { auto_upgrade: true }
     }
 }
 
@@ -427,6 +444,11 @@ impl UiConfig {
     /// (0 opts out). The shell scales this by the device factor and hands it to the
     /// model, which insets the grid and lets the terminal background fill the border.
     /// Whether to log everything ghost sends a child — see [`Diagnostics::wire_trace`].
+    /// Whether hosts running an older ghost are upgraded in place (see [`Hosts`]).
+    pub fn auto_upgrade_hosts(&self) -> bool {
+        self.hosts.auto_upgrade
+    }
+
     pub fn wire_trace(&self) -> bool {
         self.diagnostics.wire_trace
     }
@@ -477,6 +499,13 @@ mod tests {
         assert_eq!(t.bg, [0x00, 0x2b, 0x36]);
         assert_eq!(t.fg, [0x83, 0x94, 0x96]);
         assert_eq!(t.palette[1], [0xdc, 0x32, 0x2f]); // solarized red
+    }
+
+    #[test]
+    fn hosts_upgrade_automatically_unless_switched_off() {
+        assert!(UiConfig::parse("").unwrap().auto_upgrade_hosts());
+        let off = UiConfig::parse("[hosts]\nauto_upgrade = false\n").unwrap();
+        assert!(!off.auto_upgrade_hosts());
     }
 
     #[test]

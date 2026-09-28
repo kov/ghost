@@ -154,9 +154,21 @@ group = 1
 [zoom]
 factor = 1.0            # persisted across the Cmd/Ctrl +/-/0 shortcuts
 
+[hosts]
+auto_upgrade = true     # bring hosts running an older ghost up to this one; see below
+
 [diagnostics]
 wire_trace = false      # log everything ghost sends a program; see below
 ```
+
+A session host is its own process and keeps running whatever ghost started it,
+so updating ghost leaves older hosts behind. With `auto_upgrade` on (the
+default), a window that lists such a host asks it to upgrade itself in place:
+it re-execs under the new binary and keeps its running program, its screen and
+its attached windows. Remote hosts are upgraded to the ghost this UI uses on
+that host. A host too old to upgrade in place is left as it is (restarting it
+ends its program), and a ghost run from a cargo build directory never upgrades
+hosts, so they don't follow every rebuild.
 
 A translucent window is glass, and ghost picks how to render it rather than
 asking you to. It first asks the compositor for a real backdrop blur — the

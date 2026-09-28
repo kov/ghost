@@ -994,6 +994,35 @@ impl RemoteSsh {
         Ok(())
     }
 
+    /// Ask the remote session `name`'s host to upgrade itself in place to the ghost
+    /// at `remote_ghost` (`<remote_ghost> __upgrade <name> <path>`), keeping its
+    /// program and screen. A ghost found on the remote `PATH` is resolved to its
+    /// absolute path first: the host only execs a regular file it can vet.
+    pub fn upgrade_session(&self, remote_ghost: &str, name: &str) -> io::Result<()> {
+        let path = if remote_ghost.starts_with('/') {
+            remote_ghost.to_string()
+        } else {
+            let out = self.command(&["command", "-v", remote_ghost]).output()?;
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() || !path.starts_with('/') {
+                return Err(io::Error::other(format!(
+                    "cannot find `{remote_ghost}` on the remote to upgrade to"
+                )));
+            }
+            path
+        };
+        let out = self
+            .command(&[remote_ghost, "__upgrade", name, &path])
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "remote `ghost __upgrade` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Put the remote session `name` in `group`, or take it out of any (`None`), with
     /// the remote `ghost set-group`. Its host keeps the group, so its listings name it.
     pub fn set_group(&self, remote_ghost: &str, name: &str, group: Option<&str>) -> io::Result<()> {
