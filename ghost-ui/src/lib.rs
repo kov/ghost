@@ -566,17 +566,13 @@ fn start_remote_watcher(
                 failures = 0;
             } else {
                 failures = failures.saturating_add(1);
-                // Unreachable for a grace period: clear the host's stale tiles,
-                // and its remembered-set with them — judging members by a stale
-                // set could forget one whose descriptor outlived the fetch.
+                // Unreachable for a grace period: say so. An empty listing
+                // would claim the host answered and holds nothing, turning
+                // members that are likely still running into exited ones.
                 if failures >= REMOTE_WATCH_MAX_FAILURES
-                    && (!sink.post(UserEvent::RemoteSessions {
+                    && !sink.post(UserEvent::RemoteUnreachable {
                         target: target.clone(),
-                        infos: Vec::new(),
-                    }) || !sink.post(UserEvent::RemoteRemembered {
-                        target: target.clone(),
-                        names: None,
-                    }))
+                    })
                 {
                     break; // the event loop closed
                 }
@@ -7462,6 +7458,17 @@ impl App {
             // The host described its machine in the handshake. Keep it and
             // re-list: tiles already drawn with a whole remote path can now
             // shorten it against that host's own home.
+            // Nothing is known about the host's sessions now: drop its listing
+            // and its remembered-set (a stale set could forget a member whose
+            // descriptor outlived the fetch), so its members wait for it.
+            UserEvent::RemoteUnreachable { target } => {
+                self.remote_infos.remove(&target);
+                self.remote_remembered.remove(&target);
+                self.rebuild_remote_index();
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             UserEvent::RemoteEnv { target, env } => {
                 self.remote_envs.insert(target, env);
                 self.sessions_changed
@@ -9484,6 +9491,62 @@ mod tests {
                 "a member the host still remembers is relaunchable"
             );
             assert_eq!(dead[0].state, ghost_ui_core::DeadState::Exited);
+        });
+    }
+
+    #[test]
+    fn a_host_that_stops_answering_leaves_its_members_awaiting_it() {
+        // A laptop sleeps or the network drops: the watcher stops hearing from the
+        // host. Its sessions are very likely still running there, so a remembered
+        // member must wait for the host ("waiting for kov@box"), never be offered
+        // a relaunch as if it had died.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let composite = format!("kov@box{REMOTE_ID_SEP}work");
+            app.groups = vec![ghost_ui_core::Group {
+                id: "w1".into(),
+                name: "blue".into(),
+                color: 0,
+                members: vec![composite.clone()],
+                connection: None,
+            }];
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteSessions {
+                    target: "kov@box".to_string(),
+                    infos: namespace_remote_infos("kov@box", vec![info("work", false)]),
+                },
+            );
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteRemembered {
+                    target: "kov@box".to_string(),
+                    names: Some(std::iter::once("work".to_string()).collect()),
+                },
+            );
+            assert!(
+                app.remembered_remotes().is_empty(),
+                "precondition: a listed member is live, not remembered"
+            );
+
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteUnreachable {
+                    target: "kov@box".to_string(),
+                },
+            );
+            let dead = app.remembered_remotes();
+            assert_eq!(
+                dead.iter()
+                    .map(|d| (d.name.as_str(), &d.state))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    composite.as_str(),
+                    &ghost_ui_core::DeadState::AwaitingHost("kov@box".to_string())
+                )],
+                "a member of an unreachable host waits for it"
+            );
         });
     }
 

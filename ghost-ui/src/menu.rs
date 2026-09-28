@@ -40,6 +40,10 @@ pub enum UserEvent {
         target: String,
         infos: Vec<ghost_vt::session::SessionInfo>,
     },
+    /// The watcher lost the remote host: it has not answered for a grace period.
+    /// Nothing is known about its sessions now — they may well still be running
+    /// there — which is different from a host that answers and lists none.
+    RemoteUnreachable { target: String },
     /// The session names a remote host still holds a descriptor for (bare,
     /// un-namespaced) — its resurrection tickets, fetched by the watcher thread
     /// alongside each listing. The dead-member sweep uses it to tell a session
