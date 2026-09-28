@@ -668,13 +668,27 @@ fn vs(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
     );
     let c = corner[vi];
-    let px = inst.rect.xy + c * inst.rect.zw;
+    // A textured quad — a glyph bitmap, rasterized for whole pixels and sampled
+    // Nearest — lands on the pixel grid. Off it, on a half-pixel edge (every other
+    // row at a fractional scale, whose cell pitch is fractional, or a terminal
+    // inset by a scaled padding or titlebar), texel boundaries fall on pixel
+    // centres and each glyph rounds its own way: one drops a pixel, the next loses
+    // its top row of ink. Snapped here, after every offset and camera, because this
+    // is the first place the final position is known. A solid rect (all four uv
+    // equal: the opaque texel) keeps its exact geometry. Not `round`: WGSL rounds
+    // a tie to even, so on a half-pixel row a glyph's own whole-pixel bitmap top
+    // would decide which way it goes — the jitter again, by parity.
+    var origin = inst.rect.xy;
+    if (any(inst.uv.xy != inst.uv.zw)) {
+        origin = floor(origin + 0.5);
+    }
+    let px = origin + c * inst.rect.zw;
     let clip = vec2<f32>(px.x / u.viewport.x * 2.0 - 1.0, 1.0 - px.y / u.viewport.y * 2.0);
     var out: VsOut;
     out.pos = vec4<f32>(clip, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, c);
     out.color = inst.color;
-    out.box = vec4<f32>(inst.rect.xy + inst.rect.zw * 0.5, inst.rect.zw * 0.5);
+    out.box = vec4<f32>(origin + inst.rect.zw * 0.5, inst.rect.zw * 0.5);
     out.radius = inst.radius;
     return out;
 }
@@ -6432,6 +6446,131 @@ mod tests {
             lower_red(&under),
             "SGR 4 paints a red underline below the glyph"
         );
+    }
+
+    /// At a fractional scale the cell pitch is fractional (18px lines at 1.25 are
+    /// 22.5px), so every other row starts on a half pixel, and a real window
+    /// insets its terminal by a scaled titlebar and padding that need not be whole
+    /// either. A glyph quad placed off the grid puts texel boundaries on pixel
+    /// centres, and the Nearest atlas sample then rounds each glyph its own way:
+    /// some drop a pixel, others lose their top row. The same text must look the
+    /// same on every row — each glyph's ink, cut out of its cell, identical to the
+    /// row above's, and a row's glyphs all moved by the same amount.
+    #[test]
+    fn glyphs_off_the_pixel_grid_keep_their_shape_and_baseline() {
+        const SCALE: f32 = 1.25;
+        let m = CellMetrics {
+            advance: TM.advance * SCALE,
+            line_height: TM.line_height * SCALE,
+        };
+        let text = "go ahead with the depth attach first, suite performance";
+        let cols = text.chars().count();
+        let mut v = Vt::new(cols + 1, 3);
+        v.feed_str(&format!("{text}\r\n{text}\r\n"));
+        let f = layout_frame(&v, m);
+        let font = ghost_shaper::font_from_bytes(FIRA).expect("font");
+
+        // The bare frame (rows at 0 and 22.5), and the frame as a windowed scene
+        // draws it: inline under a titlebar layer, inset to a fractional origin.
+        let bare = Renderer::headless(Theme::default()).render_offscreen(&f, font, SIZE_PX * SCALE);
+        let (ox, oy) = (12.5, 46.25);
+        let (w, h) = (
+            (ox + (cols + 1) as f32 * m.advance).ceil() as u32,
+            (oy + 3.0 * m.line_height).ceil() as u32,
+        );
+        let scene = Scene {
+            size_px: (w, h),
+            layers: vec![
+                Layer::new(
+                    0,
+                    vec![SceneItem::Terminal {
+                        id: SceneId::Root,
+                        session: SESSION_A,
+                        rect: RectPx {
+                            x: ox,
+                            y: oy,
+                            w: w as f32 - ox,
+                            h: h as f32 - oy,
+                        },
+                        frame: Rc::new(f),
+                        selection: None,
+                        dim: false,
+                        damage: TermDamage::All,
+                    }],
+                ),
+                Layer::new(
+                    1,
+                    vec![SceneItem::Rect {
+                        id: SceneId::Tile(1),
+                        rect: RectPx {
+                            x: 0.0,
+                            y: 0.0,
+                            w: w as f32,
+                            h: 20.0,
+                        },
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        radius: 0.0,
+                    }],
+                ),
+            ],
+        };
+        let windowed = Renderer::headless(Theme::default()).render_offscreen_scene(
+            &scene,
+            font,
+            SIZE_PX * SCALE,
+        );
+
+        for (name, img, (ox, oy)) in [
+            ("bare", &bare, (0.0, 0.0)),
+            ("windowed", &windowed, (ox, oy)),
+        ] {
+            let bg = px(img, img.width - 1, img.height - 1);
+            let inked = |x: u32, y: u32| {
+                let p = px(img, x, y);
+                (0..3)
+                    .map(|i| (p[i] as i32 - bg[i] as i32).abs())
+                    .sum::<i32>()
+                    > 90
+            };
+            // The ink of cell `col` on text row `row`: rows of booleans from the
+            // cell's first whole pixel, trimmed to the rows that carry any, each
+            // tagged with its offset so a moved glyph shows as a different top.
+            let ink = |row: usize, col: usize| {
+                let x0 = (ox + col as f32 * m.advance).round() as u32;
+                let x1 = (ox + (col + 1) as f32 * m.advance).round() as u32;
+                let y0 = (oy + row as f32 * m.line_height).ceil() as u32;
+                (y0..y0 + m.line_height as u32)
+                    .map(|y| (y - y0, (x0..x1).map(|x| inked(x, y)).collect::<Vec<_>>()))
+                    .filter(|(_, l)| l.iter().any(|b| *b))
+                    .collect::<Vec<_>>()
+            };
+            let shape =
+                |l: &[(u32, Vec<bool>)]| l.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+            let top = |l: &[(u32, Vec<bool>)]| l.first().map_or(0, |(y, _)| *y as i32);
+            let mut misshapen = Vec::new();
+            let mut shifts = std::collections::BTreeMap::<i32, String>::new();
+            for (col, ch) in text.chars().enumerate().filter(|(_, c)| *c != ' ') {
+                let (above, below) = (ink(0, col), ink(1, col));
+                if shape(&above) != shape(&below) {
+                    misshapen.push(ch);
+                }
+                // A row as a whole may land a pixel off the one above (it starts
+                // part-way into one); what may not happen is glyphs disagreeing.
+                shifts
+                    .entry(top(&below) - top(&above))
+                    .or_default()
+                    .push(ch);
+            }
+            assert!(
+                misshapen.is_empty(),
+                "{name}: glyphs that lost or gained ink between rows: {misshapen:?}"
+            );
+            assert_eq!(
+                shifts.len(),
+                1,
+                "{name}: glyphs on one row sit at different heights (shift -> glyphs): {shifts:?}"
+            );
+        }
     }
 
     #[test]
