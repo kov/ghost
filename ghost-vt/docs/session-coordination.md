@@ -1,167 +1,86 @@
-# Session coordination: replacing the 500 ms poll with per-session push
+# Session coordination: per-session push
 
-**Status:** Decided (design) · **Date:** 2026-06-23, updated 2026-07-02 ·
-**Scope:** how the frontend/CLI learn about session existence and state, plus
-the live-bell and observer-attach features that ride the same seam ·
-**Work status:** NOT STARTED — research/design only. This is the first phase of
-the fleet-redesign completion plan; observer-attach (below) is the second, and
-is what makes every fleet tile a live preview.
+How the frontend and CLI learn which sessions exist and what state they are in,
+and how the fleet gets live previews of sessions it does not drive.
 
-## Problem
+## Design choice
 
-The fleet overview (and anything that lists sessions) learns about sessions by
-**polling the filesystem**:
+Each session is its own `ghost __host` process with its own control socket, and
+there is no central daemon. State is **pushed per session** over that socket.
+Two alternatives were rejected:
 
-- `Cmd::ListSessions` → `ghost_vt::session::list()` → `list_in()` reads
-  `paths::runtime_dir()` and, per entry, stats marker files
-  (`attached: path.join("attached").exists()`, `bell: …` in `session.rs`).
-- The fleet drives this on a timer (`ghost-ui-core/src/fleet.rs`,
-  `REFRESH_MS = 500`).
+- **Filesystem watching alone** (inotify/fsevents on the runtime dir) only works
+  locally, behaves differently on macOS, and still signals state through marker
+  files — a bool with no owner and no ordering. It survives only as the
+  *set-change trigger* (below).
+- **A central coordination daemon** would decouple discovery from the filesystem,
+  but reintroduces a single point of failure, version skew and liveness traps
+  that process-per-session avoids. If one is ever built, it should relay the
+  same per-session events rather than invent new ones.
 
-Two problems:
+What push does *not* decouple is discovery of the session **set**: knowing which
+sessions exist still starts from the runtime-dir layout (locally) or from
+`ghost __watch` (remotely, and it reads the same layout on the far side).
 
-1. **Latency and waste.** Up to 500 ms to notice a new session, a title change,
-   an attach/detach, or a bell — and a full directory re-stat every tick even
-   when nothing changed.
-2. **Layout coupling.** Hosts, clients, and the CLI all hard-code the on-disk
-   layout `runtime_dir()/<name>/{sock,pid,lock,meta,attached,bell}`
-   (`ghost-vt/src/paths.rs`). State is signalled by the *presence of marker
-   files*, which is lossy (a bool — no count, no ordering, no identity) and
-   **cannot cross the deferred remote transport**: a remote host shares no
-   filesystem with the client.
+## Protocol surface
 
-## Options considered
+All in `ghost-vt/src/protocol.rs`; variants are appended only (frozen-discriminant
+tests pin the ordinals).
 
-A research workflow (2026-06-23) scored three approaches (judge panel:
-C = 22, D = 22, B = 18, A = 16).
+- `ClientMsg::Subscribe` — push me state for this session; I am not a display
+  client. The host replies with `ServerMsg::Snapshot(SessionState)` and then
+  `ServerMsg::Event(SessionEvent)` as state changes.
+- `ClientMsg::Observe` — a subscription that also receives output: `Snapshot`,
+  `Event(Resized)` with the real grid, a full resync, then live `Output`.
+- `ClientMsg::Hello { client }` — an opaque identity the host echoes back in
+  `AttachInfo.client` while that connection holds the display. The GUI sends
+  `ghost-ui:<group-id>`.
+- `SessionEvent`: `Bell`, `TitleChanged`, `Attached(AttachInfo)`, `Detached`,
+  `Activity`, `Renamed`, `Resized { cols, rows }`.
 
-### A — inotify / fsevents on the runtime dir
-Watch `runtime_dir()` and reconcile on notify instead of on a timer.
-- **Pro:** small; removes the steady-state poll.
-- **Con:** still layout-coupled (it watches files), **local-only**, and
-  macOS-divergent (fsevents semantics differ). It's a *trigger* optimization,
-  not a decoupling.
-- **Verdict:** demoted to *just* the set-change trigger — one `ListSessions`
-  fired from a `notify` watch, with a slow reconcile floor as a backstop.
+A client gates each verb on the host's feature level from the session's `proto`
+marker (`PROTO_SUBSCRIBE = 3`, `PROTO_OBSERVE = 4`); a host below it is polled
+through the marker files instead.
 
-### B — central coordination daemon
-A single long-lived process that owns the registry and relays events.
-- **Pro:** fully decouples discovery from the filesystem; natural home for
-  remote-fleet relaying.
-- **Con:** reintroduces a single point of failure, version skew, and liveness
-  traps that the process-per-session design deliberately avoids.
-- **Verdict:** deferred to the remote-fleet end-state. When built, it relays the
-  *same* per-session events option C defines.
+A subscriber or observer never sends `Resize`, so it never becomes the display
+client and never resizes the PTY. This is a client convention: the host does not
+reject a `Resize` from a subscriber.
 
-### C — daemonless per-session push  ← chosen
-Each host serves a new **`Subscribe`** verb on its **existing per-session
-control socket**; subscribers are pushed typed `ServerMsg` events, and host
-death is observed as socket EOF.
-- **Pro:** no new process, no new codec — pure new `ClientMsg`/`ServerMsg`
-  variants over the existing `Conn`/`Transport` framing. The frontend already
-  opens that socket for a live tile, so the seam exists. The same mechanism
-  serves live bell and observer-attach (below).
-- **Con (honest residual):** it decouples session **state**, not session-**set**
-  discovery — knowing *which* sessions exist still begins with the directory
-  listing. Full discovery decoupling is B's job, later.
+## Host behaviour
 
-## Chosen design (C)
+- **Snapshot/diff.** The host keeps `last_state` even with no subscribers, and at
+  the end of each loop turn diffs it against the current state and pushes the
+  difference, so a late subscriber never replays history.
+- **Bell.** `SessionEvent::Bell` fires even while a client is attached (the live
+  bell). The `bell` marker file keeps its old meaning: set only while nobody is
+  attached, cleared on attach.
+- **Markers.** `attached` and `bell` are still written for listing and for
+  clients below `PROTO_SUBSCRIBE`. `SessionInfo.attached` in a listing is a bool;
+  *who* holds the display is only available through a subscription.
+- **Flow control.** `Activity` is sent only to a subscriber with nothing queued.
+  An observer's output stops being queued past `OBSERVER_MAX_PENDING` (256 KiB);
+  the observer is marked lagged, and once its queue drains it is re-seeded with
+  `Resized` plus a resync in the same flush turn.
+- **Liveness.** Host death is EOF on the subscription.
 
-### Protocol surface
-Today (`ghost-vt/src/protocol.rs`): postcard-serialized, length-prefixed frames
-(`FrameReader`).
-- `ClientMsg`: `Input`, `Resize`, `Detach`, `Kill`, `Rename(String)`, `Repaint`,
-  `Theme(ThemeColors)`.
-- `ServerMsg`: `Output(Vec<u8>)`, `Exited(i32)`, `RenameResult { ok, message }`.
+## Frontend behaviour
 
-Old-host compatibility already has a mechanism: the host writes its
-`PROTO_LEVEL` to the session's `proto` marker at startup, and clients gate
-newer verbs on it (see `PROTO_RENAME_LABEL`). `Subscribe` gets its own
-`PROTO_SUBSCRIBE` level the same way — a client simply keeps polling a session
-whose host predates it.
+- The App keeps one `Subscriber` per local session in `subs` for state pushes and
+  fans each push to every window as `UiEvent::SessionPush`.
+- Fleet previews of sessions this process does not drive use `Observe`; the
+  observer's output feeds the one shared emulator for that session.
+- **Set changes locally:** a `notify` watch on the runtime dir (ignoring `Access`
+  events, which would otherwise re-trigger themselves) sets a flag. The next wake
+  sends `UiEvent::SessionsChanged`, and the window answers with
+  `Cmd::ListSessions`. A subscription ending also triggers a re-list. A slow
+  reconcile floor (`REFRESH_MS`, at least 5 s) is the backstop.
+- **Set changes remotely:** one `ghost __watch` stream per host, which registers
+  its watch before taking the first listing and emits JSON lines only on change.
 
-Add:
-- `ClientMsg::Subscribe` — "push me state events for this session; I am **not** a
-  display client." A subscriber never sends `Resize`, so it never steals the
-  display or resizes the PTY (see observer-attach).
-- `ServerMsg::Snapshot(SessionState)` — sent once on subscribe so the client
-  starts consistent before any delta.
-- `ServerMsg::Event(SessionEvent)` — pushed thereafter:
+## Open
 
-```rust
-enum SessionEvent {
-    Bell,
-    TitleChanged(String),
-    Attached(AttachInfo),   // richer than today's bare `attached` bool
-    Detached,
-    Activity,               // output produced — drives the fleet activity badge
-    Renamed(String),
-}
-```
-
-`AttachInfo` carries **window identity**, so the fleet can distinguish
-*ThisWindow* from *Elsewhere* with fidelity (exactly what multi-window needs),
-replacing the lossy `attached` marker.
-
-### Liveness
-Host death = socket EOF on the subscription — no heartbeat, no marker staleness.
-This is how a display client already learns the host is gone.
-
-### Markers stay during migration
-The `attached`/`bell` marker files are **dual-written** so the polling path keeps
-working until every consumer is switched over. The `notify` watch on
-`runtime_dir()` becomes the set-change trigger (replacing the steady 500 ms
-timer), with a slow reconcile floor as a backstop.
-
-## What rides this seam
-
-- **Live bell** *(folded into this scope, 2026-06-23)*. The fleet badge for a
-  *detached* session that rang **already works**: `ghost-term` counts BEL → the
-  host writes the `bell` marker while no client is attached → `SessionInfo.bell`
-  → `BadgeKind::Bell`. What's missing is the **focused/attached** real-time
-  reaction (flash / OS urgency), and that is precisely `SessionEvent::Bell`. So
-  live bell is not a standalone feature — it's the first consumer of this
-  redesign.
-- **Observer-attach (live foreign previews).** The fleet wants live previews of
-  sessions owned by another window without stealing them. A subscriber that also
-  receives output but never sends `Resize` is a read-only OUTPUT observer — a
-  small extension on the same seam (the host already treats "sends `Resize`" as
-  the thing that makes a client the display client). On the frontend, observed
-  output feeds a fleet-owned `TerminalModel` that flows into the existing
-  per-session `Surface` compositor unchanged — this is the surface plan's
-  "Brick 4" (eager background liveness), and it is why migration step 7
-  (coalescing/flow control) is load-bearing: bulk output in an observed session
-  must not flood every subscribed window; the fleet's lazy update-on-composite
-  policy is the consumer-side half of that answer.
-- **Multi-window fidelity.** `AttachInfo` with window identity gives the fleet
-  accurate ThisWindow / Elsewhere / Detached grouping across windows.
-
-## Migration (7 test-first steps)
-
-1. **Protocol surface** — add `Subscribe`, `Snapshot`, `Event`, `SessionEvent`,
-   `AttachInfo` (+ frame round-trip tests).
-2. **Host: subscribe** — handle `Subscribe` → reply `Snapshot`, register the
-   subscriber.
-3. **Host: deltas** — emit `Event`s, **dual-written** with the existing marker
-   files.
-4. **Frontend: consume** — the fleet reacts to `Event`s instead of polling for
-   state.
-5. **Trigger** — replace the 500 ms timer with a `notify` set-change watch + slow
-   reconcile floor.
-6. **Death = EOF** — subscriptions clean up on host exit.
-7. **Coalescing + flow control** — don't flood a slow subscriber with
-   `Activity`/`Output`.
-
-## Open / deferred
-
-- Session-**set** discovery stays layout-coupled (C decouples state only); full
-  decoupling is the central daemon's job (B), later, for the remote fleet.
-- Audio bell, bell count/coalescing semantics, and per-client bell preferences
-  are frontend concerns layered on top of `SessionEvent::Bell`.
-
----
-
-*Provenance: this consolidates the 2026-06-23 research-workflow verdict (formerly
-only in agent memory / the workflow transcript). The companion frontend backlog
-lives in the foundation-parity notes; window chrome is in
-`ghost-ui/docs/window-decorations.md`.*
+- Remote sessions get no state subscription, and the observer pump forwards only
+  `Resized`, so a remote session's holder identity and live bell never reach the
+  fleet; it sees only the listing's `attached` bool.
+- Bell count and per-client bell preferences are frontend concerns layered on
+  `SessionEvent::Bell`.

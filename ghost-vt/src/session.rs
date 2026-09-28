@@ -20,7 +20,7 @@ use std::path::Path;
 pub struct SessionInfo {
     pub name: String,
     pub pid: i32,
-    /// Unix seconds at which the session was created, or `None` if unrecorded.
+    /// Unix milliseconds at which the session was created, or `None` if unrecorded.
     pub created_at: Option<i64>,
     /// The current terminal title (OSC 0/2), empty if none has been set.
     pub title: String,

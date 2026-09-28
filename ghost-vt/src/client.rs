@@ -37,8 +37,9 @@ pub struct Client {
     conn: Conn,
     /// The host's declared protocol feature level, read from the session dir's
     /// `proto` marker at connect time (0 when absent — a host built before the
-    /// marker existed). Optional messages are gated on it: an old host treats
-    /// a message it cannot decode as a connection error and drops us.
+    /// marker existed). Optional messages are gated on it: a level-0 host
+    /// treats a message it cannot decode as a connection error and drops us,
+    /// and any later host skips it, so an ungated send is lost either way.
     proto: u32,
     /// The host's exec generation at connect time, read from the session dir's
     /// `gen` marker (0 when absent). A local attach uses it to tell a re-exec
@@ -483,8 +484,8 @@ impl Session {
     ///
     /// Sent right after attaching, like [`report_theme`](Session::report_theme), and
     /// silently skipped when the host predates [`ClientMsg::Policy`] (it never
-    /// declared [`PROTO_POLICY`](crate::protocol::PROTO_POLICY)) — an old host would
-    /// treat the unknown message as a connection error and drop us. Such a session
+    /// declared [`PROTO_POLICY`](crate::protocol::PROTO_POLICY)) — such a host
+    /// could not act on it, and a level-0 host would drop us over it. Such a session
     /// keeps running under the policy its host was spawned with; there is nothing
     /// this client can do about that from out here.
     pub fn report_policy(&mut self, policy: ghost_term::TerminalPolicy) -> io::Result<()> {
@@ -502,9 +503,8 @@ impl Session {
     /// not where the GUI writes.
     ///
     /// Silently skipped on a host predating [`PROTO_TRACE`]
-    /// (crate::protocol::PROTO_TRACE): the unknown message would be a decode
-    /// error it treats as a broken connection, so an ungated send would end the
-    /// session instead of quietly tracing nothing.
+    /// (crate::protocol::PROTO_TRACE): such a host could not act on it (it would
+    /// skip the frame), and a level-0 host would drop us over it.
     pub fn report_trace(&mut self, on: bool) -> io::Result<()> {
         if self.client.proto < crate::protocol::PROTO_TRACE {
             return Ok(());
@@ -826,16 +826,6 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-/// Rename a session non-interactively (the `ghost rename` command). Connects to
-/// the session by its immutable id and asks the host to set its display name,
-/// returning the host's verdict. A label change only — the session's files and
-/// attach state are untouched — and sent over a control connection (no resize),
-/// so any attached client is left undisturbed.
-///
-/// Refused for a host predating label renames (see
-/// [`PROTO_RENAME_LABEL`](crate::protocol::PROTO_RENAME_LABEL)): such a host
-/// would move the session's files, detaching clients — the very churn the
-/// label design removed.
 /// Ask a session's host to upgrade itself in place onto a (possibly newer)
 /// binary, keeping its running child, PTY, socket, and liveness lock — only the
 /// host's code image is replaced (see `docs/host-self-upgrade.md`). `path` names
@@ -901,6 +891,16 @@ pub fn upgrade_session(name: &str, path: Option<String>) -> io::Result<()> {
     }
 }
 
+/// Rename a session non-interactively (the `ghost rename` command). Connects to
+/// the session by its immutable id and asks the host to set its display name,
+/// returning the host's verdict. A label change only — the session's files and
+/// attach state are untouched — and sent over a control connection (no resize),
+/// so any attached client is left undisturbed.
+///
+/// Refused for a host predating label renames (see
+/// [`PROTO_RENAME_LABEL`](crate::protocol::PROTO_RENAME_LABEL)): such a host
+/// would move the session's files, detaching clients — the very churn the
+/// label design removed.
 pub fn rename(old: &str, new: &str) -> io::Result<()> {
     if session_proto(old) < crate::protocol::PROTO_RENAME_LABEL {
         return Err(io::Error::other(format!(

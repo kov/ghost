@@ -235,8 +235,8 @@ const _: () = assert!(PROTO_LEVEL >= PROTO_OBSERVE);
 
 /// Feature level at which the host understands [`ClientMsg::Policy`]. A host below
 /// it enforces the policy it was spawned with (today: everything), and a client
-/// must not send one — an unknown message is a decode error the host treats as a
-/// broken connection, and it would drop the client rather than ignore the message.
+/// doesn't send one: the host would skip the frame it cannot decode (every host
+/// since [`PROTO_THEME`] does), so the report would be silently lost.
 pub const PROTO_POLICY: u32 = 5;
 
 const _: () = assert!(PROTO_POLICY > PROTO_OBSERVE);
@@ -244,19 +244,18 @@ const _: () = assert!(PROTO_LEVEL >= PROTO_POLICY);
 
 /// Feature level at which the host understands [`ClientMsg::Upgrade`] — an
 /// in-place self-upgrade to a newer binary keeping the running child. A host
-/// below it cannot self-upgrade (it predates the mechanism), and a client must
-/// not send it one: the unknown message would be a decode error the host treats
-/// as a broken connection. This is the "going-forward only" gate — only a host
-/// already speaking level 6 can be upgraded live.
+/// below it cannot self-upgrade (it predates the mechanism): it would skip the
+/// frame it cannot decode and never answer, so the client refuses up front. This
+/// is the "going-forward only" gate — only a host already speaking level 6 can be
+/// upgraded live.
 pub const PROTO_UPGRADE: u32 = 6;
 
 const _: () = assert!(PROTO_UPGRADE > PROTO_POLICY);
 const _: () = assert!(PROTO_LEVEL >= PROTO_UPGRADE);
 
 /// Feature level at which the host understands [`ClientMsg::Trace`]. A host
-/// below it cannot trace, and a client must not send it one: the unknown
-/// message is a decode error the host treats as a broken connection, so an
-/// ungated send would drop the session rather than quietly do nothing.
+/// below it cannot trace; it would skip the frame it cannot decode, so the
+/// client doesn't send one.
 pub const PROTO_TRACE: u32 = 7;
 
 const _: () = assert!(PROTO_TRACE > PROTO_UPGRADE);
