@@ -40,6 +40,9 @@ pub enum UserEvent {
         target: String,
         infos: Vec<ghost_vt::session::SessionInfo>,
     },
+    /// This machine's session listing, pushed by the local feed whenever the set
+    /// or a listed field changes (and on a slow heartbeat).
+    LocalSessions(Vec<ghost_vt::session::SessionInfo>),
     /// The watcher lost the remote host: it has not answered for a grace period.
     /// Nothing is known about its sessions now — they may well still be running
     /// there — which is different from a host that answers and lists none.

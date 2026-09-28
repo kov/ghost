@@ -81,13 +81,22 @@ into the child or end the session.
   fans each push to every window as `UiEvent::SessionPush`.
 - Fleet previews of sessions this process does not drive use `Observe`; the
   observer's output feeds the one shared emulator for that session.
-- **Set changes locally:** a `notify` watch on the runtime dir (ignoring `Access`
-  events, which would otherwise re-trigger themselves) sets a flag. The next wake
-  sends `UiEvent::SessionsChanged`, and the window answers with
-  `Cmd::ListSessions`. A subscription ending also triggers a re-list. A slow
-  reconcile floor (`REFRESH_MS`, at least 5 s) is the backstop.
-- **Set changes remotely:** one `ghost __watch` stream per host, which registers
-  its watch before taking the first listing and emits JSON lines only on change.
+- **Set changes, local and remote alike,** come from one watch
+  (`watch::watch_set` + `SetChanges::stream`): the runtime tree recursively plus
+  the descriptors dir, `Access` events ignored (a listing's own reads would
+  otherwise re-trigger it), registered before the first listing is taken, and
+  emitting only on change plus a 30 s heartbeat. Locally the App runs it on a
+  thread (`LocalFeed`) posting `UserEvent::LocalSessions`; for each connected
+  host it reads the same stream as JSON lines from `ghost __watch` over ssh. A
+  host that stops answering is reported as unreachable, never as an empty
+  listing, so its members wait for it instead of reading as exited.
+- Each listing arriving sends `UiEvent::SessionsChanged`, and the window answers
+  with `Cmd::ListSessions`, served from the latest listings. A subscription
+  ending also triggers a re-list. A slow reconcile floor (`REFRESH_MS`, at least
+  5 s) is the backstop.
+- **Claiming and pruning names** are serialized by `<runtime>/.lock`: a spawn
+  makes the session directory and takes its lock under it, and a prune re-judges
+  a directory under it before removing it.
 
 ## Open
 

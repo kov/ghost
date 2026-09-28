@@ -998,36 +998,28 @@ fn client_identity() -> String {
     )
 }
 
-/// Watch the session runtime dir and raise `flag` on any change — the
-/// set-change trigger that lets the fleet re-enumerate the moment a session
-/// appears or vanishes instead of waiting for its slow floor tick. `None`
-/// (nothing to watch, or no watch backend) degrades to floor-tick-only.
-fn session_set_watcher(
-    flag: Arc<std::sync::atomic::AtomicBool>,
-) -> Option<notify::RecommendedWatcher> {
-    session_set_watcher_in(&ghost_vt::paths::runtime_dir(), flag)
+/// This machine's session set, pushed: a thread streams the listing as a
+/// [`UserEvent::LocalSessions`] now and on every change — the same watch
+/// `ghost __watch` streams to a remote initiator, so local and remote sessions
+/// are discovered one way. Dropping the handle drops the watch, which ends the
+/// thread.
+struct LocalFeed {
+    _watcher: notify::RecommendedWatcher,
 }
 
-/// [`session_set_watcher`] over an explicit `dir`, so tests can drive it against
-/// a tempdir without touching the real XDG location.
-fn session_set_watcher_in(
-    dir: &std::path::Path,
-    flag: Arc<std::sync::atomic::AtomicBool>,
-) -> Option<notify::RecommendedWatcher> {
-    use notify::Watcher;
-    // The dir may not exist before the first session; create it so the watch
-    // can bind now (hosts create it on demand anyway).
-    std::fs::create_dir_all(dir).ok()?;
-    let mut w = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(ev) = res
-            && fs_event_is_a_change(&ev)
-        {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    })
-    .ok()?;
-    w.watch(dir, notify::RecursiveMode::NonRecursive).ok()?;
-    Some(w)
+impl LocalFeed {
+    /// Start the feed, posting to `sink`. `None` (no watch backend, or no thread)
+    /// leaves listings to a synchronous read each time one is wanted.
+    fn start(sink: Arc<dyn EventSink>) -> Option<Self> {
+        let (watcher, changes) = ghost_vt::watch::watch_set().ok()?;
+        std::thread::Builder::new()
+            .name("ghost-local-feed".into())
+            .spawn(move || {
+                changes.stream(|sessions| sink.post(UserEvent::LocalSessions(sessions.to_vec())))
+            })
+            .ok()?;
+        Some(Self { _watcher: watcher })
+    }
 }
 
 /// Whether a filesystem notification reports the watched content actually
@@ -1995,7 +1987,8 @@ fn interactive(fresh: bool, ssh_window: bool) {
         last_wake_at: Instant::now(),
         subs: HashMap::new(),
         groups,
-        _watcher: session_set_watcher(sessions_changed.clone()),
+        local_feed: LocalFeed::start(sink.clone()),
+        local_infos: None,
         sessions_changed,
         _config_watcher: config_watcher(config_changed.clone()),
         config_changed,
@@ -3401,7 +3394,8 @@ impl App {
             // From the (test-isolated) data dir, as `interactive` does — a shell test
             // that seeds `groups.toml` gets the registry the real launch would read.
             groups: groups::load(),
-            _watcher: None,
+            local_feed: None,
+            local_infos: None,
             sessions_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _config_watcher: None,
             config_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3807,12 +3801,18 @@ pub struct App {
     /// at startup, updated (and persisted) on every `Cmd::SaveGroups`, and
     /// broadcast to windows as `UiEvent::GroupsLoaded` so they stay in step.
     groups: Vec<ghost_ui_core::Group>,
-    /// Set by the runtime-dir watcher thread when the session *set* may have
-    /// changed; drained on the loop to hint an immediate re-enumeration.
+    /// Set when a listing arrives (the local feed, a host's watcher) or anything
+    /// else changes what one would say; drained on the loop to hint an immediate
+    /// re-enumeration.
     sessions_changed: Arc<std::sync::atomic::AtomicBool>,
-    /// The watch itself; dropping it stops event delivery. `None` when the
-    /// runtime dir cannot be watched — the floor tick still reconciles.
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// The local session-set feed; dropping it stops it. `None` when the runtime
+    /// dir cannot be watched, and in headless Apps — listings are then read
+    /// synchronously, and the floor tick still reconciles.
+    local_feed: Option<LocalFeed>,
+    /// This machine's latest listing from [`local_feed`](Self::local_feed).
+    /// `None` until the feed's first post; read through
+    /// [`local_listing`](Self::local_listing).
+    local_infos: Option<Vec<ghost_vt::session::SessionInfo>>,
     /// Set by the config-dir watcher when `ui.toml` may have changed; drained on
     /// the loop to hot-reload the live-reloadable settings (see [`reload_config`]).
     config_changed: Arc<std::sync::atomic::AtomicBool>,
@@ -4533,7 +4533,7 @@ impl App {
                     // a reconcile keeps the synthetic fleet populated.
                     let infos = match &self.bench {
                         Some(h) => h.session_list(),
-                        None => session::list().unwrap_or_default(),
+                        None => self.local_listing(),
                     };
                     let live = self.bench.is_none();
                     if live {
@@ -6200,6 +6200,26 @@ impl App {
         self.remote_watchers.insert(target.to_string(), watcher);
     }
 
+    /// This machine's sessions: the local feed's latest listing when it runs,
+    /// otherwise a fresh read.
+    fn local_listing(&self) -> Vec<ghost_vt::session::SessionInfo> {
+        match (&self.local_feed, &self.local_infos) {
+            (Some(_), Some(infos)) => infos.clone(),
+            _ => session::list().unwrap_or_default(),
+        }
+    }
+
+    /// This machine's sessions read now, for a one-shot decision that must not
+    /// weigh a listing the feed has not yet caught up with. Refreshes the feed's
+    /// copy too, so the fleet's next reconcile agrees with the decision.
+    fn refresh_local_now(&mut self) -> Vec<ghost_vt::session::SessionInfo> {
+        let infos = session::list().unwrap_or_default();
+        if self.local_feed.is_some() {
+            self.local_infos = Some(infos.clone());
+        }
+        infos
+    }
+
     /// Every session this process knows of, shaped for display: `local` (this
     /// machine's listing) followed by each connected host's latest listing.
     ///
@@ -6791,7 +6811,8 @@ impl App {
         // every connected host's — so a detached session on a remote host counts as
         // something to return to, and a remote member of a host we ARE connected to
         // isn't mistaken for one that is away.
-        let sessions = self.merged_listing(session::list().unwrap_or_default());
+        let local = self.refresh_local_now();
+        let sessions = self.merged_listing(local);
         match log_choice("new window", None, &sessions, &self.groups) {
             StartupChoice::Fleet => {
                 let group = self.mint_group();
@@ -7214,9 +7235,7 @@ impl App {
         let mut model = TerminalModel::new(name.to_string(), cols, rows, metrics());
         // Seed the display name so a labeled session titles the window with its
         // label from the first frame (best-effort; a reconcile would fix it too).
-        if let Ok(sessions) = session::list()
-            && let Some(info) = sessions.iter().find(|s| s.name == name)
-        {
+        if let Some(info) = self.local_listing().into_iter().find(|s| s.name == name) {
             model.set_display_name(info.display_name.clone());
         }
         // Title the window with the session up front (its label or name until the
@@ -7315,7 +7334,7 @@ impl App {
         event_loop: &dyn Frontend,
         records: Vec<ghost_ui_core::WindowRecord>,
     ) {
-        let sessions = session::list().unwrap_or_default();
+        let sessions = self.refresh_local_now();
         let plans = restore_plan(&records, &sessions, &self.groups);
         // A record the plan dropped names a window that will never open again, and
         // the compositor holds geometry under that name until someone releases it.
@@ -7436,6 +7455,12 @@ impl App {
             UserEvent::Menu(action) => action,
             // The watcher thread delivered a remote host's latest listing: stash it
             // and hint a re-enumeration so the fleet merges it in.
+            UserEvent::LocalSessions(infos) => {
+                self.local_infos = Some(infos);
+                self.sessions_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             UserEvent::RemoteSessions { target, infos } => {
                 self.remote_infos.insert(target, infos);
                 self.rebuild_remote_index();
@@ -8269,7 +8294,8 @@ impl App {
         // The same listing a launch weighs, minus the session that just ended: its host
         // may still be tearing down, and a corpse listed as detached would read as
         // something to return to.
-        let mut sessions = self.merged_listing(session::list().unwrap_or_default());
+        let local = self.refresh_local_now();
+        let mut sessions = self.merged_listing(local);
         sessions.retain(|s| s.name != ended);
         // ...and out of the group memberships the choice weighs too, or a REMOTE
         // session that just exited reads as "a member no listing names" — the shape of
@@ -8913,34 +8939,65 @@ mod tests {
         );
     }
 
+    /// The local feed reports a change a host makes to its own session without
+    /// waiting for a re-list tick — here its group, a `meta` write one level below
+    /// the runtime dir.
     #[test]
-    fn reading_the_session_dir_does_not_trigger_reenumeration() {
-        // Session re-enumeration READS the runtime dir (opendir/readdir raises
-        // Access on inotify) and each session's meta files. Counting those reads
-        // as set-changes turns one reconcile into a permanent self-sustaining
-        // churn loop, re-listing sessions at event-loop frequency.
-        let tmp = tempfile::tempdir().unwrap();
-        let entry = tmp.path().join("some-session");
-        std::fs::write(&entry, "x").unwrap();
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watcher = super::session_set_watcher_in(tmp.path(), flag.clone());
-        if watcher.is_none() {
+    fn a_local_sessions_group_change_reaches_the_local_feed() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
             return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        // What an enumeration does: list the dir, read an entry.
-        let _ = std::fs::read_dir(tmp.path()).unwrap().count();
-        let _ = std::fs::read(&entry).unwrap();
-        assert!(
-            !flag_within(&flag, 400),
-            "reading the session dir must not count as a set change"
-        );
-        // A session appearing still triggers.
-        std::fs::write(tmp.path().join("new-session"), "x").unwrap();
-        assert!(
-            flag_within(&flag, 2000),
-            "a new entry in the session dir must trigger the flag"
-        );
+        };
+        with_isolated_xdg(|| {
+            let name = "grouped";
+            let ok = std::process::Command::new(&ghost_bin)
+                .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "`ghost new -d` succeeded");
+            // Listable (its pid written) before the feed starts, so the change
+            // under test is the group alone.
+            let mut spun = 0;
+            while !ghost_vt::session::list()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name)
+                && spun < 100
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+
+            let queued = std::sync::Arc::new(super::QueuedEvents::default());
+            let feed =
+                super::LocalFeed::start(queued.clone()).expect("watch the local session set");
+            // What the feed has reported for the session so far, polled until
+            // `want` holds or ~2s pass.
+            let reported = |want: &dyn Fn(&ghost_vt::session::SessionInfo) -> bool| {
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    let seen = queued.take().into_iter().any(|e| {
+                        matches!(e, UserEvent::LocalSessions(infos)
+                            if infos.iter().any(|i| i.name == name && want(i)))
+                    });
+                    if seen {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                false
+            };
+            let listed = reported(&|_| true);
+            let grouped = listed
+                && ghost_vt::client::set_group(name, Some("g")).is_ok()
+                && reported(&|i| i.group.as_deref() == Some("g"));
+
+            drop(feed);
+            let _ = ghost_vt::session::kill_session(name);
+            assert!(listed, "the feed lists the session");
+            assert!(grouped, "the feed reports the session's new group");
+        });
     }
 
     // --- compositor session restore (`xdg_session_management_v1`) ----------

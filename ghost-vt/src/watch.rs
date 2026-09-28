@@ -37,7 +37,29 @@ fn wakes(kind: &notify::EventKind) -> bool {
 pub fn run() -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let (_watcher, changes) = watch_set()?;
+    let mut failed = None;
+    changes.stream(|sessions| {
+        let line = serde_json::to_string(sessions).map_err(io::Error::other);
+        match line.and_then(|l| write_line(&mut out, &l)) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            }
+        }
+    });
+    failed.map_or(Ok(()), Err)
+}
 
+/// Mutations of this machine's session set, from a watch taken by [`watch_set`].
+/// The stream ends when the watcher returned alongside it is dropped.
+pub struct SetChanges(mpsc::Receiver<()>);
+
+/// Watch this machine's session set: the runtime tree (recursively) and the
+/// session descriptors. Keep the returned watcher alive for as long as the
+/// [`SetChanges`] should flow; dropping it ends [`SetChanges::stream`].
+pub fn watch_set() -> io::Result<(notify::RecommendedWatcher, SetChanges)> {
     let dir = paths::runtime_dir();
     // The dir may not exist before the first session; create it so the watch binds.
     std::fs::create_dir_all(&dir).ok();
@@ -71,43 +93,58 @@ pub fn run() -> io::Result<()> {
     if std::fs::create_dir_all(&descriptors).is_ok() {
         let _ = watcher.watch(&descriptors, notify::RecursiveMode::NonRecursive);
     }
+    Ok((watcher, SetChanges(rx)))
+}
 
-    // The first listing is taken *after* the watch is registered, never before.
-    // A session is only listable once its host has written its pid, which lands
-    // some milliseconds after the spawn command that forked it returned — so a
-    // session coming up right now becomes visible at an instant we do not
-    // control. Snapshot first and that instant can fall between the snapshot and
-    // the registration: the listing misses it and no event is pending, so it
-    // stays unreported until the heartbeat, half a minute later. This way round
-    // the change is either already in the snapshot or waiting in `rx`; the worst
-    // case is a redundant wake, which the `line != last` check below absorbs.
-    let mut last = listing_line()?;
-    write_line(&mut out, &last)?;
-
-    loop {
-        match rx.recv_timeout(HEARTBEAT) {
-            // A mutation: coalesce the burst, then emit the fresh listing — but
-            // only if it actually changed, so a write that doesn't alter the
-            // listing (or an already-coalesced burst) costs no push over the pipe.
-            Ok(_) => {
-                while rx.recv_timeout(COALESCE).is_ok() {}
-                let line = listing_line()?;
-                if line != last {
-                    write_line(&mut out, &line)?;
-                    last = line;
+impl SetChanges {
+    /// Hand `emit` the current listing now, then again on every mutation
+    /// (coalesced, and only when the listing actually changed) and on every
+    /// [`HEARTBEAT`] tick. Returns once `emit` answers `false` or the watcher is
+    /// dropped.
+    pub fn stream(self, mut emit: impl FnMut(&[session::SessionInfo]) -> bool) {
+        let rx = self.0;
+        // The first listing is taken *after* the watch is registered, never
+        // before. A session is only listable once its host has written its pid,
+        // which lands some milliseconds after the spawn command that forked it
+        // returned — so a session coming up right now becomes visible at an
+        // instant we do not control. Snapshot first and that instant can fall
+        // between the snapshot and the registration: the listing misses it and
+        // no event is pending, so it stays unreported until the heartbeat, half a
+        // minute later. This way round the change is either already in the
+        // snapshot or waiting in `rx`; the worst case is a redundant wake, which
+        // the `sessions != last` check below absorbs.
+        let mut last = listing();
+        if !emit(&last) {
+            return;
+        }
+        loop {
+            match rx.recv_timeout(HEARTBEAT) {
+                // A mutation: coalesce the burst, then emit the fresh listing —
+                // but only if it actually changed, so a write that doesn't alter
+                // the listing (or an already-coalesced burst) costs no push.
+                Ok(()) => {
+                    while rx.recv_timeout(COALESCE).is_ok() {}
+                    let sessions = listing();
+                    if sessions != last {
+                        last = sessions;
+                        if !emit(&last) {
+                            return;
+                        }
+                    }
                 }
+                // Keepalive: always re-emit, even unchanged — it refreshes the
+                // listing and lets a pipe-backed `emit` notice a gone reader.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    last = listing();
+                    if !emit(&last) {
+                        return;
+                    }
+                }
+                // The watcher was dropped.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            // Keepalive: always re-emit, even unchanged — it refreshes the listing
-            // and detects a closed pipe via the failing write.
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                last = listing_line()?;
-                write_line(&mut out, &last)?;
-            }
-            // The watcher was dropped — cannot happen while `watcher` is held.
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
 }
 
 /// Parse one line of [`run`]'s output back into a session listing — the reader's
@@ -116,11 +153,15 @@ pub fn parse_listing(line: &str) -> serde_json::Result<Vec<session::SessionInfo>
     serde_json::from_str(line)
 }
 
+/// The current session listing.
+fn listing() -> Vec<session::SessionInfo> {
+    session::list().unwrap_or_default()
+}
+
 /// The current session listing as one line of JSON (the same shape as
 /// `ghost ls --json`), without the trailing newline.
 fn listing_line() -> io::Result<String> {
-    let sessions = session::list().unwrap_or_default();
-    serde_json::to_string(&sessions).map_err(io::Error::other)
+    serde_json::to_string(&listing()).map_err(io::Error::other)
 }
 
 /// Write one listing line, newline-terminated and flushed.
@@ -139,6 +180,20 @@ pub fn emit(out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Building a listing READS the runtime tree (opendir/readdir, every `meta`),
+    /// which raises Access events under inotify. Counting those as changes would
+    /// turn one listing into a self-sustaining loop of re-listing.
+    #[test]
+    fn a_read_never_wakes_the_stream_but_a_mutation_does() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
+        assert!(!wakes(&EventKind::Access(AccessKind::Read)));
+        assert!(!wakes(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(wakes(&EventKind::Create(CreateKind::Folder)));
+        assert!(wakes(&EventKind::Modify(ModifyKind::Any)));
+    }
 
     #[test]
     fn emit_writes_one_newline_terminated_json_listing() {
