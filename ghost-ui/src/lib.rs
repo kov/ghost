@@ -6689,6 +6689,23 @@ impl App {
         }
     }
 
+    /// `groups` with every remote member dropped whose host has answered with a
+    /// listing: the window decisions read a remote member no listing carries as one
+    /// whose host is away, and that only holds while its host's listing is unknown.
+    /// A member a connected host does not list is gone there, or dead and
+    /// relaunchable from the fleet — nothing to wait for, so it must not send every
+    /// new window into the fleet.
+    fn waitable_members(&self, groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Group> {
+        let mut groups = groups.to_vec();
+        for g in &mut groups {
+            g.members.retain(|m| {
+                m.target()
+                    .is_none_or(|t| self.hosts.get(t).is_none_or(|h| h.listing.is_none()))
+            });
+        }
+        groups
+    }
+
     /// Open a new window that behaves exactly like a fresh launch (File > New Window
     /// / Cmd-N): reconnect through the fleet when it has a session to return to,
     /// otherwise spawn a fresh session and show it as a single view (see
@@ -6701,7 +6718,8 @@ impl App {
         // isn't mistaken for one that is away.
         let local = self.refresh_local_now();
         let sessions = self.merged_listing(local);
-        match log_choice("new window", None, &sessions, &self.groups) {
+        let groups = self.waitable_members(&self.groups);
+        match log_choice("new window", None, &sessions, &groups) {
             StartupChoice::Fleet => {
                 let group = self.mint_group();
                 self.open_fleet_window(event_loop, group, None);
@@ -8244,7 +8262,7 @@ impl App {
         // a host that is away — and the window would sit waiting for a session the user
         // themselves ended. A remote transport merely dropping never gets here (it is
         // held for reconnect, not ended), so an ended remote id is genuinely gone.
-        let mut groups = self.groups.clone();
+        let mut groups = self.waitable_members(&self.groups);
         for g in &mut groups {
             g.members.retain(|m| m != ended);
         }
@@ -10712,6 +10730,51 @@ mod tests {
             assert!(
                 fed,
                 "and drives it: input reaches the successor, output comes back"
+            );
+        });
+    }
+
+    /// A remembered remote member is something to wait for only while its host is
+    /// away. Once the host is connected and lists its sessions, a member it does not
+    /// list is gone there (or dead and relaunchable from the fleet), not waiting —
+    /// and must not send every new window into the fleet.
+    #[test]
+    fn a_member_its_connected_host_no_longer_lists_is_not_waited_for() {
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            app.groups = vec![ghost_ui_core::Group {
+                id: "win-old-2".into(),
+                name: "blue".into(),
+                color: 0,
+                members: vec![SessionId::remote("kov@box", "gone")],
+                connection: None,
+            }];
+            app.host_mut("kov@box").listing = Some(vec![info("held", true)]);
+
+            app.open_launch_window(&fe);
+            let fleet = app.windows.values().next().map(|w| w.root.is_fleet());
+
+            // The host drops: now the member is waiting for it, and the fleet is
+            // where that wait shows.
+            let before: HashSet<_> = app.windows.keys().copied().collect();
+            app.host_mut("kov@box").listing = None;
+            app.open_launch_window(&fe);
+            let waiting = app
+                .windows
+                .iter()
+                .find(|(wid, _)| !before.contains(wid))
+                .map(|(_, w)| w.root.is_fleet());
+
+            assert_eq!(
+                fleet,
+                Some(false),
+                "nothing to return to: the new window opens a session"
+            );
+            assert_eq!(
+                waiting,
+                Some(true),
+                "a member whose host is away is waited for in the fleet"
             );
         });
     }
