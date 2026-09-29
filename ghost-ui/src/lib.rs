@@ -6698,10 +6698,8 @@ impl App {
     fn waitable_members(&self, groups: &[ghost_ui_core::Group]) -> Vec<ghost_ui_core::Group> {
         let mut groups = groups.to_vec();
         for g in &mut groups {
-            g.members.retain(|m| {
-                m.target()
-                    .is_none_or(|t| self.hosts.get(t).is_none_or(|h| h.listing.is_none()))
-            });
+            g.members
+                .retain(|m| m.target().is_none_or(|t| !self.host_answered(t)));
         }
         groups
     }
@@ -7037,8 +7035,8 @@ impl App {
         }
         let mut records: Vec<ghost_ui_core::WindowRecord> = self
             .windows
-            .values()
-            .map(|w| w.root.window_record())
+            .iter()
+            .map(|(&wid, w)| self.with_awaited(wid, w.root.window_record()))
             .collect();
         // Stable order so an unchanged workspace serialises identically and the
         // write-on-change guard holds.
@@ -7065,6 +7063,54 @@ impl App {
             windows::save(&workspace);
             self.last_workspace = workspace;
         }
+    }
+
+    /// `record` with the remote sessions its window is waiting on folded back in.
+    /// A window records what it drives, and while a member's host is away it
+    /// drives nothing: a restore still queued for the host, a dropped transport
+    /// reconnecting, or a group member whose host has not answered. The record is
+    /// the only memory of those sessions (a host too old to keep a group never
+    /// names it), so the save must not forget them. A window still waiting on its
+    /// restore keeps the mode and foreground it was saved with.
+    fn with_awaited(
+        &self,
+        wid: WindowId,
+        mut record: ghost_ui_core::WindowRecord,
+    ) -> ghost_ui_core::WindowRecord {
+        let pending = self
+            .hosts
+            .values()
+            .flat_map(|h| &h.pending_restores)
+            .filter(|p| p.wid == wid);
+        for p in pending {
+            record.attached.push(p.id.clone());
+            record.fleet = p.fleet;
+            if p.foreground {
+                record.foreground = Some(p.id.clone());
+            }
+        }
+        let reconnecting = self
+            .reconnecting
+            .keys()
+            .filter(|(w, _)| *w == wid)
+            .map(|(_, id)| id.clone());
+        record.attached.extend(reconnecting);
+        let unanswered = self
+            .groups
+            .iter()
+            .filter(|g| g.id == record.group_id)
+            .flat_map(|g| &g.members)
+            .filter(|m| m.target().is_some_and(|t| !self.host_answered(t)));
+        record.attached.extend(unanswered.cloned());
+        record.attached.sort();
+        record.attached.dedup();
+        record
+    }
+
+    /// Whether `target`'s host has answered with a listing — the one test for a
+    /// remote member being away (its listing unknown) rather than gone there.
+    fn host_answered(&self, target: &str) -> bool {
+        self.hosts.get(target).is_some_and(|h| h.listing.is_some())
     }
 
     /// The window a "current window" menu action should target: the last-focused
@@ -12470,6 +12516,30 @@ mod tests {
                 pending.iter().any(|p| p.id == rem),
                 "the remote member is queued, not spawned locally"
             );
+        });
+    }
+
+    #[test]
+    fn a_restored_remote_window_keeps_its_sessions_until_its_host_answers() {
+        // The hosts keep a session's group now, so `groups.toml` loads memberless
+        // and a remote window's saved record is all that remembers its sessions
+        // (a host too old to keep a group never says). Saving before the host
+        // reconnects must not forget them, or the next launch drops the window.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let work = remote("work");
+            let build = SessionId::remote("kov@other", "build");
+            let none: [SessionId; 0] = [];
+            app.groups = vec![group("g1", &none), group("g2", &none)];
+            let records = vec![
+                record("g1", 80, 24, true, None, &[&work]),
+                record("g2", 100, 30, false, Some(build.clone()), &[&build]),
+            ];
+            app.restore_workspace(&fe, records.clone());
+            app.save_workspace();
+
+            assert_eq!(super::windows::load().windows, records);
         });
     }
 

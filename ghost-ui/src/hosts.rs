@@ -46,9 +46,9 @@ pub(crate) struct HostLink {
     /// [`App::retry_remembered_hosts`]). Presence dedupes.
     ///
     /// This is what makes waiting durable: the hold outlives the drop that
-    /// started it, and — because the members are remembered in `groups.toml` — a
-    /// ghost that is quit and relaunched while the host is still down picks the
-    /// wait back up instead of forgetting the sessions.
+    /// started it, and — because a window's record in `windows.toml` keeps the
+    /// sessions it is waiting on — a ghost that is quit and relaunched while the
+    /// host is still down picks the wait back up instead of forgetting them.
     pub(crate) retry: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Remote members a startup restore is waiting to re-adopt on this host (see
     /// [`PendingRemote`], [`App::reconnect_restored_remotes`] /
