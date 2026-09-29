@@ -397,11 +397,15 @@ fn the_transport_reports_a_remote_sessions_own_protocol_level() {
 
     // The host writes its own `proto` marker at spawn; wait for it, then rewrite it
     // to a level below ours to stand in for an older running host (a real old host
-    // would have written this value itself).
+    // would have written this value itself). Wait for the pidfile too: the marker
+    // comes first, and a host still coming up is one no kill can find, so the
+    // guard would leave it running past the test.
     let marker = root.join("dev_example/run/ghost/oldhost/proto");
+    let pidfile = root.join("dev_example/run/ghost/oldhost/pid");
     assert!(
-        wait_until(Duration::from_secs(5), || marker.exists()),
-        "the remote host never wrote its proto marker"
+        wait_until(Duration::from_secs(5), || marker.exists()
+            && pidfile.exists()),
+        "the remote host never came up"
     );
     std::fs::write(&marker, "4\n").unwrap();
 
