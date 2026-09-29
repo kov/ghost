@@ -148,3 +148,64 @@ fn session_host_lives_outside_the_graphical_session() {
         "host's scope {unit} is not in background.slice: {props}"
     );
 }
+
+/// The session's program must leave the graphical session with its host. The
+/// host's move is a job the user manager runs asynchronously, and a child forked
+/// before it lands is born in the launcher's app scope — where a logout SIGTERMs
+/// it, and the session ends with it even though its host escaped.
+#[test]
+fn session_child_lives_in_its_hosts_scope() {
+    if !have_user_manager() {
+        eprintln!("skipping: no systemd user manager on this machine");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "child-scope";
+    let _guard = KillOnDrop { xdg, name };
+
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "sleep", "600"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid_path = xdg.join("run").join("ghost").join(name).join("pid");
+    assert!(
+        wait_until(Duration::from_secs(5), || pid_path.exists()),
+        "host never wrote a pidfile"
+    );
+    let host: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pidfile holds a pid");
+    let children = format!("/proc/{host}/task/{host}/children");
+    let mut child = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            child = std::fs::read_to_string(&children)
+                .ok()
+                .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok());
+            child.is_some()
+        }),
+        "host never started its child"
+    );
+    let child = child.unwrap();
+
+    let ours = leaf_cgroup(std::process::id() as i32);
+    assert!(
+        wait_until(Duration::from_secs(5), || leaf_cgroup(host) != ours),
+        "host stayed in the launching process's cgroup ({ours})"
+    );
+    assert_eq!(
+        leaf_cgroup(child),
+        leaf_cgroup(host),
+        "the session's child was left in {} — a logout would kill it",
+        leaf_cgroup(child)
+    );
+}

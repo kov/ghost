@@ -72,7 +72,26 @@ pub fn escape_graphical_session(session_name: &str) {
         "inactive-or-failed",
         // No auxiliary units.
         "0",
-    ]));
+    ]))
+    .map(|_| {
+        // The call only queues the move; the user manager runs it as a job. The
+        // host forks the session's program next, and a child forked before the
+        // move lands is born in the launcher's scope, where a logout kills it
+        // (and the session with it). So wait for the move, bounded: a manager
+        // that never gets to it leaves the host where it was, as a failed call does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !in_unit(&unit) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Whether this process's cgroup is `unit`'s: the last segment of its cgroup v2
+/// path is the unit a systemd-managed process lives in.
+#[cfg(target_os = "linux")]
+fn in_unit(unit: &str) -> bool {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .is_ok_and(|c| c.lines().any(|l| l.rsplit('/').next() == Some(unit)))
 }
 
 /// Enable systemd lingering for this user, so `user@N.service` — and with it the
