@@ -59,6 +59,11 @@ pub(crate) struct HostLink {
     /// here. Queued restores for a host that never reconnects just linger, drained
     /// on a successful reconnect or when their window closes.
     pub(crate) pending_restores: Vec<PendingRemote>,
+    /// Restored windows whose record named this host, waiting for its first
+    /// listing to bring their group's members back. Until then the host is
+    /// reconnected and stays in their records; the listing hands the job to the
+    /// members it names.
+    pub(crate) restoring: HashSet<WindowId>,
     /// Set while a transport health probe runs for the host
     /// ([`App::probe_remote_transports`]); the prober clears it when done, so one
     /// runs at a time no matter how many wake suspicions fire.
@@ -75,6 +80,7 @@ impl HostLink {
             && self.watcher.is_none()
             && self.retry.is_none()
             && self.pending_restores.is_empty()
+            && self.restoring.is_empty()
     }
 }
 

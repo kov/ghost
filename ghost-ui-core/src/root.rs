@@ -1429,6 +1429,8 @@ impl RootModel {
             // foreground is outside its attached set would restore inconsistently.
             foreground: self.primary.clone().filter(|p| self.mine.contains(p)),
             attached,
+            // Which hosts hold the group is the shell's to know.
+            hosts: Vec::new(),
         }
     }
 

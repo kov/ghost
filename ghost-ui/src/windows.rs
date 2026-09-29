@@ -71,6 +71,7 @@ mod tests {
 
     fn rec(group_id: &str, cols: u16, rows: u16, fleet: bool) -> WindowRecord {
         WindowRecord {
+            hosts: Vec::new(),
             group_id: group_id.into(),
             cols,
             rows,

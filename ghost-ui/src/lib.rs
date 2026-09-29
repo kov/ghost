@@ -1448,6 +1448,9 @@ struct WindowPlan {
     locals: Vec<PlanMember>,
     /// Remote member ids to reconnect + re-adopt.
     remotes: Vec<SessionId>,
+    /// The remote hosts the window's group has sessions on, reconnected so their
+    /// listings bring the group's members back.
+    hosts: Vec<String>,
 }
 
 /// A remote member a startup restore is waiting to re-adopt into a window once
@@ -1560,9 +1563,10 @@ fn restore_plan(
                     id,
                 })
                 .collect();
-            // Nothing to restore at all → drop the window; a remote-only window is
-            // kept so its host is reconnected and its sessions re-adopted.
-            if locals.is_empty() && remotes.is_empty() {
+            // Nothing to restore at all → drop the window; a window with remote
+            // sessions, or whose group lives on remote hosts, is kept so its hosts
+            // are reconnected and its sessions come back.
+            if locals.is_empty() && remotes.is_empty() && rec.hosts.is_empty() {
                 return None;
             }
             Some(WindowPlan {
@@ -1576,6 +1580,7 @@ fn restore_plan(
                 foreground: rec.foreground.clone(),
                 locals,
                 remotes,
+                hosts: rec.hosts.clone(),
             })
         })
         .collect()
@@ -3956,6 +3961,29 @@ impl App {
         }
     }
 
+    /// The remote hosts something here still remembers sessions on: a group's
+    /// member, a restore queued for the host, or a restored window waiting for the
+    /// host's listing to bring its group back.
+    fn remembered_hosts(&self) -> HashSet<String> {
+        let members = self.groups.iter().flat_map(|g| &g.members).chain(
+            self.hosts
+                .values()
+                .flat_map(|h| &h.pending_restores)
+                .map(|p| &p.id),
+        );
+        let mut hosts: HashSet<String> = members
+            .filter_map(|m| m.target())
+            .map(str::to_string)
+            .collect();
+        hosts.extend(
+            self.hosts
+                .iter()
+                .filter(|(_, h)| !h.restoring.is_empty())
+                .map(|(t, _)| t.clone()),
+        );
+        hosts
+    }
+
     /// Keep one background reconnect running for every remote host a group still
     /// remembers a session on and that we are not connected to, and stop the ones
     /// nothing wants any more. Idempotent and cheap — called from the loop's
@@ -3974,20 +4002,11 @@ impl App {
             return; // nowhere to post the result (an App with no sink at all)
         };
         let connected: HashSet<String> = self.connected_targets();
-        let mut wanted: HashSet<String> = HashSet::new();
-        let remembered = self.groups.iter().flat_map(|g| &g.members).chain(
-            self.hosts
-                .values()
-                .flat_map(|h| &h.pending_restores)
-                .map(|p| &p.id),
-        );
-        for member in remembered {
-            if let Some((target, _)) = member.as_remote()
-                && !connected.contains(target)
-            {
-                wanted.insert(target.to_string());
-            }
-        }
+        let wanted: HashSet<String> = self
+            .remembered_hosts()
+            .into_iter()
+            .filter(|t| !connected.contains(t))
+            .collect();
         // Stop retrying a host nothing remembers any more (its group was dissolved,
         // or it answered and is now connected).
         for (target, host) in &mut self.hosts {
@@ -4438,6 +4457,13 @@ impl App {
         if let UiEvent::SessionList(listing) = &ev {
             self.observe_failed.clear();
             self.learn_host_groups(listing, event_loop);
+            // A host that listed has named its members of every group; a restored
+            // window waiting on it is remembered through them from now on.
+            for host in self.hosts.values_mut() {
+                if host.listing.is_some() {
+                    host.restoring.clear();
+                }
+            }
             self.upgrade_older_hosts(listing);
         }
         let cmds = match self.windows.get_mut(&wid) {
@@ -6936,6 +6962,7 @@ impl App {
         // skip it), and a host that never returns would leak the entry forever.
         for host in self.hosts.values_mut() {
             host.pending_restores.retain(|p| p.wid != wid);
+            host.restoring.remove(&wid);
         }
         self.forget_idle_hosts();
         // Cancel any reconnect probes for this window (stop their threads) — the tile
@@ -6982,6 +7009,12 @@ impl App {
                 if let Some((target, _)) = m.as_remote() {
                     targets.insert(target.to_string());
                 }
+            }
+        }
+        // A restored window waiting for a host's listing needs its host connected.
+        for (target, host) in &self.hosts {
+            if !host.restoring.is_empty() {
+                targets.insert(target.clone());
             }
         }
         // A reconnecting session's client is dropped while it holds, so it no longer
@@ -7071,7 +7104,9 @@ impl App {
     /// reconnecting, or a group member whose host has not answered. The record is
     /// the only memory of those sessions (a host too old to keep a group never
     /// names it), so the save must not forget them. A window still waiting on its
-    /// restore keeps the mode and foreground it was saved with.
+    /// restore keeps the mode and foreground it was saved with. The record also
+    /// names the hosts its group lives on, whose listings bring the group's
+    /// members back on restore.
     fn with_awaited(
         &self,
         wid: WindowId,
@@ -7095,6 +7130,26 @@ impl App {
             .filter(|(w, _)| *w == wid)
             .map(|(_, id)| id.clone());
         record.attached.extend(reconnecting);
+        record.hosts = record
+            .attached
+            .iter()
+            .chain(
+                self.groups
+                    .iter()
+                    .filter(|g| g.id == record.group_id)
+                    .flat_map(|g| &g.members),
+            )
+            .filter_map(|m| m.target())
+            .map(str::to_string)
+            .chain(
+                self.hosts
+                    .iter()
+                    .filter(|(_, h)| h.restoring.contains(&wid))
+                    .map(|(t, _)| t.clone()),
+            )
+            .collect();
+        record.hosts.sort();
+        record.hosts.dedup();
         let unanswered = self
             .groups
             .iter()
@@ -7371,6 +7426,7 @@ impl App {
             foreground,
             locals,
             remotes,
+            hosts,
         } = plan;
         let size = Some((cols, rows));
         let had_locals = !locals.is_empty();
@@ -7403,6 +7459,9 @@ impl App {
             }
             None => self.open_fleet_window(event_loop, group, size),
         };
+        for target in hosts {
+            self.host_mut(&target).restoring.insert(wid);
+        }
         // Queue remote members to attach once their host reconnects (kicked by
         // `reconnect_restored_remotes`, drained by `finish_remote_reconnect`).
         for id in remotes {
@@ -12112,6 +12171,7 @@ mod tests {
         att: &[A],
     ) -> WindowRecord {
         WindowRecord {
+            hosts: Vec::new(),
             group_id: group_id.into(),
             cols,
             rows,
@@ -12532,14 +12592,69 @@ mod tests {
             let build = SessionId::remote("kov@other", "build");
             let none: [SessionId; 0] = [];
             app.groups = vec![group("g1", &none), group("g2", &none)];
-            let records = vec![
+            let mut records = vec![
                 record("g1", 80, 24, true, None, &[&work]),
                 record("g2", 100, 30, false, Some(build.clone()), &[&build]),
             ];
+            records[0].hosts = vec!["kov@box".to_string()];
+            records[1].hosts = vec!["kov@other".to_string()];
             app.restore_workspace(&fe, records.clone());
             app.save_workspace();
 
             assert_eq!(super::windows::load().windows, records);
+        });
+    }
+
+    #[test]
+    fn a_restored_window_learns_its_remote_sessions_from_the_hosts_it_remembers() {
+        // A window left in the fleet over a remote group drives nothing, so its
+        // record names no session: its hosts keep the membership. The record
+        // remembers which hosts to ask; a restore reconnects them, and each one's
+        // listing brings its members of the group back into the window.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            let none: [SessionId; 0] = [];
+            app.groups = vec![group("g1", &none)];
+            let mut saved = record("g1", 80, 24, true, None, &none);
+            saved.hosts = vec!["kov@box".to_string()];
+            app.restore_workspace(&fe, vec![saved.clone()]);
+
+            assert_eq!(
+                app.windows.len(),
+                1,
+                "the window its hosts remember is restored"
+            );
+            assert!(
+                app.remembered_hosts().contains("kov@box"),
+                "its host is reconnected"
+            );
+            app.save_workspace();
+            assert_eq!(
+                super::windows::load().windows,
+                vec![saved.clone()],
+                "the host is remembered while it is away"
+            );
+
+            let mut work = info("work", false);
+            work.group = Some("g1".to_string());
+            app.host_mut("kov@box").listing = Some(vec![work]);
+            let wid = *app.windows.keys().next().unwrap();
+            let listing = app.merged_listing(Vec::new());
+            app.dispatch(wid, ghost_ui_core::UiEvent::SessionList(listing), &fe);
+
+            let members = &app.groups().iter().find(|g| g.id == "g1").unwrap().members;
+            assert_eq!(
+                members,
+                &vec![remote("work")],
+                "the host's listing fills the group"
+            );
+            app.save_workspace();
+            assert_eq!(
+                super::windows::load().windows,
+                vec![saved],
+                "the host stays remembered once it answered, through its member"
+            );
         });
     }
 

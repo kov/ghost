@@ -30,6 +30,11 @@ pub struct WindowRecord {
     /// group stay cold in its block.
     #[serde(default)]
     pub attached: Vec<SessionId>,
+    /// The remote hosts the window's group has sessions on. A host keeps its
+    /// sessions' group, so on restore each is reconnected and its listing brings
+    /// the group's members back — including the ones the window only showed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
 }
 
 /// The windows open at the last quit, in a stable order. (Round-trips through
