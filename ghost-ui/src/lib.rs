@@ -71,7 +71,7 @@ use ghost_vt::session;
 use menu::{ConnectOutcome, MenuIntent, UserEvent};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{Fullscreen, Window, WindowId};
@@ -3315,6 +3315,8 @@ struct WindowState {
     pointer_pos: PointPx,
     /// When this window's next scheduled `Tick` is due, if any.
     next_tick: Option<Instant>,
+    /// The trackpad gesture in progress, measured for the fling at its lift.
+    scroll_velocity: ghost_ui_core::kinetic::VelocityTracker,
     /// Most recent left/middle/right press (time, button, pos) for detecting
     /// double/triple clicks, and the running click count.
     last_click: Option<(Instant, PointerButton, PointPx)>,
@@ -6616,6 +6618,7 @@ impl App {
                 frame_edge: None,
                 pointer_down: false,
                 next_tick: None,
+                scroll_velocity: Default::default(),
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
@@ -7337,6 +7340,7 @@ impl App {
                 frame_edge: None,
                 pointer_down: false,
                 next_tick: None,
+                scroll_velocity: Default::default(),
                 last_click: None,
                 click_count: 0,
                 pacer: pacer::FramePacer::new(pacer::FRAME_BUDGET_MS),
@@ -8118,40 +8122,48 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel {
-                delta, momentum, ..
+                delta,
+                phase,
+                momentum,
+                ..
             } => {
                 self.note_input(id);
-                // Keep the device's unit: a wheel click is a discrete notch, a
-                // trackpad reports smooth pixel travel — the core paces each.
-                // The OS's post-flick coasting is marked so the core can damp
-                // it (our vendored-winit `momentum` patch).
-                let wheel = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => WheelDelta::Notches(y as f64),
-                    MouseScrollDelta::PixelDelta(p) if momentum => WheelDelta::Momentum(p.y),
-                    MouseScrollDelta::PixelDelta(p) => WheelDelta::Pixels(p.y),
-                };
-                let Some((pos, mods)) = self
-                    .windows
-                    .get(&id)
-                    .map(|w| (w.pointer_pos, from_winit::mods(w.mods)))
-                else {
+                let t_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+                let now_ms = self.now_ms();
+                let Some(w) = self.windows.get_mut(&id) else {
                     return;
                 };
+                let (pos, mods) = (w.pointer_pos, from_winit::mods(w.mods));
+                // macOS coasts after a flick on its own; elsewhere the lift is
+                // where the core's glide takes over.
+                let own_momentum = !cfg!(target_os = "macos");
+                let wheels = from_winit::wheel(
+                    &mut w.scroll_velocity,
+                    delta,
+                    phase,
+                    momentum,
+                    t_ms,
+                    own_momentum,
+                );
                 let Some(pos) = self.in_content(id, pos) else {
                     return;
                 };
-                self.dispatch(
-                    id,
-                    UiEvent::Pointer {
-                        phase: PointerPhase::Wheel,
-                        button: None,
-                        pos,
-                        mods,
-                        wheel,
-                        clicks: 1,
-                    },
-                    &fe,
-                );
+                for wheel in wheels {
+                    let ev = match wheel {
+                        from_winit::Wheel::Scroll(wheel) => UiEvent::Pointer {
+                            phase: PointerPhase::Wheel,
+                            button: None,
+                            pos,
+                            mods,
+                            wheel,
+                            clicks: 1,
+                        },
+                        from_winit::Wheel::Fling { px_per_s } => {
+                            UiEvent::Fling { px_per_s, now_ms }
+                        }
+                    };
+                    self.dispatch(id, ev, &fe);
+                }
             }
             _ => {}
         }

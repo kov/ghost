@@ -1804,8 +1804,10 @@ impl TerminalView {
             // A lone terminal ignores enumeration, subscription, and group
             // state, and never sees `AdoptSession`, the fanned `SessionEnded`
             // lifecycle, or `Driving` (drivership lives on `RootModel`, which
-            // handles all of those).
+            // handles all of those). A `Fling` is `RootModel`'s too: it coasts
+            // on as ordinary `Momentum` wheels, whichever view is showing.
             UiEvent::SessionList(_)
+            | UiEvent::Fling { .. }
             | UiEvent::AdoptSession(_)
             | UiEvent::SessionPush { .. }
             | UiEvent::SessionsChanged

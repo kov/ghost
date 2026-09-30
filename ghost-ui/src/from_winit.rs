@@ -2,8 +2,10 @@
 //! input here; everything downstream speaks only core types. Keeping all winit
 //! type knowledge in one module is what lets the core stay pure and testable.
 
+use ghost_ui_core::WheelDelta;
 use ghost_ui_core::input::{Key, KeyAlternates, Mods, NamedKey};
-use winit::event::KeyEvent;
+use ghost_ui_core::kinetic::VelocityTracker;
+use winit::event::{KeyEvent, MouseScrollDelta, TouchPhase};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey as WNamed, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
@@ -185,6 +187,59 @@ fn named(n: WNamed) -> NamedKey {
         WNamed::F12 => NamedKey::F12,
         _ => NamedKey::Other,
     }
+}
+
+/// What one winit wheel event says to the core.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Wheel {
+    Scroll(WheelDelta),
+    /// The fingers lifted mid-flick (see [`ghost_ui_core::UiEvent::Fling`]).
+    Fling {
+        px_per_s: f64,
+    },
+}
+
+/// Translate a winit wheel event, arrived at `t_ms`. Wheel clicks stay
+/// discrete notches and trackpad travel stays pixels, so the core can pace
+/// each; the OS's own post-flick coasting (macOS) is marked `Momentum`.
+///
+/// `own_momentum` is for an OS that stops dead at the lift (libinput sends
+/// an axis stop — winit's `TouchPhase::Ended` — and nothing after): the finger
+/// travel feeds `tracker`, and the lift becomes a [`Wheel::Fling`] at the
+/// fingers' speed for the core to coast on from. The lift's own zero delta is
+/// not passed on.
+pub fn wheel(
+    tracker: &mut VelocityTracker,
+    delta: MouseScrollDelta,
+    phase: TouchPhase,
+    momentum: bool,
+    t_ms: f64,
+    own_momentum: bool,
+) -> Vec<Wheel> {
+    let dy = match delta {
+        MouseScrollDelta::LineDelta(_, y) => {
+            tracker.reset();
+            return vec![Wheel::Scroll(WheelDelta::Notches(y as f64))];
+        }
+        MouseScrollDelta::PixelDelta(p) if momentum => {
+            return vec![Wheel::Scroll(WheelDelta::Momentum(p.y))];
+        }
+        MouseScrollDelta::PixelDelta(p) => p.y,
+    };
+    if !own_momentum {
+        return vec![Wheel::Scroll(WheelDelta::Pixels(dy))];
+    }
+    let mut out = Vec::new();
+    if dy != 0.0 {
+        tracker.push(t_ms, dy);
+        out.push(Wheel::Scroll(WheelDelta::Pixels(dy)));
+    }
+    if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+        out.push(Wheel::Fling {
+            px_per_s: tracker.lift(t_ms),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -385,5 +440,74 @@ mod tests {
             us_layout_char(PhysicalKey::Unidentified(NativeKeyCode::Unidentified)),
             None
         );
+    }
+
+    mod wheel {
+        use super::super::{Wheel, wheel};
+        use ghost_ui_core::WheelDelta;
+        use ghost_ui_core::kinetic::VelocityTracker;
+        use winit::dpi::PhysicalPosition;
+        use winit::event::{MouseScrollDelta, TouchPhase};
+
+        fn px(y: f64) -> MouseScrollDelta {
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y))
+        }
+
+        /// A two-finger flick the way libinput delivers it: 20px every 8ms,
+        /// then the axis stop at the lift.
+        fn flick(t: &mut VelocityTracker, own: bool) -> Vec<Wheel> {
+            let mut out = Vec::new();
+            for i in 0..8 {
+                let phase = if i == 0 {
+                    TouchPhase::Started
+                } else {
+                    TouchPhase::Moved
+                };
+                out.extend(wheel(t, px(20.0), phase, false, 8.0 * i as f64, own));
+            }
+            out.extend(wheel(t, px(0.0), TouchPhase::Ended, false, 60.0, own));
+            out
+        }
+
+        #[test]
+        fn a_lift_becomes_a_fling_at_the_fingers_speed() {
+            let out = flick(&mut VelocityTracker::default(), true);
+            assert_eq!(out[..8], [Wheel::Scroll(WheelDelta::Pixels(20.0)); 8]);
+            let [Wheel::Fling { px_per_s }] = out[8..] else {
+                panic!("the lift is a fling, and its zero delta is not scrolled: {out:?}");
+            };
+            assert!((px_per_s - 2500.0).abs() < 1.0, "{px_per_s}");
+        }
+
+        #[test]
+        fn an_os_that_coasts_itself_gets_no_second_glide() {
+            // macOS: the lift is followed by the OS's own momentum events.
+            let mut t = VelocityTracker::default();
+            let out = flick(&mut t, false);
+            assert!(
+                !out.iter().any(|w| matches!(w, Wheel::Fling { .. })),
+                "{out:?}"
+            );
+            assert_eq!(
+                wheel(&mut t, px(12.0), TouchPhase::Moved, true, 70.0, false),
+                [Wheel::Scroll(WheelDelta::Momentum(12.0))]
+            );
+        }
+
+        #[test]
+        fn a_wheel_click_is_a_notch_and_ends_any_finger_gesture() {
+            let mut t = VelocityTracker::default();
+            wheel(&mut t, px(20.0), TouchPhase::Moved, false, 0.0, true);
+            wheel(&mut t, px(20.0), TouchPhase::Moved, false, 8.0, true);
+            let click = MouseScrollDelta::LineDelta(0.0, 1.0);
+            assert_eq!(
+                wheel(&mut t, click, TouchPhase::Moved, false, 10.0, true),
+                [Wheel::Scroll(WheelDelta::Notches(1.0))]
+            );
+            assert_eq!(
+                wheel(&mut t, px(0.0), TouchPhase::Ended, false, 12.0, true),
+                [Wheel::Fling { px_per_s: 0.0 }]
+            );
+        }
     }
 }

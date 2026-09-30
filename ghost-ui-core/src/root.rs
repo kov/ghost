@@ -459,6 +459,14 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
+    /// The coast after a trackpad flick, where the OS sends none of its own
+    /// (see [`crate::kinetic`]), and the pointer spot and modifiers it scrolls
+    /// with. Not an [`Anim`]: it is input, not a transition, so it neither owns
+    /// the tick stream nor defers rasters, and a dive or slide cancels it.
+    glide: Option<(crate::kinetic::Glide, crate::PointPx, Mods)>,
+    /// Where the last wheel event pointed, so a glide scrolls what the fingers
+    /// were scrolling.
+    wheel_at: Option<(crate::PointPx, Mods)>,
     /// Whether this window currently has OS focus (from `UiEvent::Focus`).
     /// Drives the live-bell reaction: a bell in an owned session while the
     /// window is unfocused asks the OS for attention.
@@ -867,6 +875,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            glide: None,
+            wheel_at: None,
             focused_win: true,
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
@@ -913,6 +923,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            glide: None,
+            wheel_at: None,
             focused_win: true,
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
@@ -944,6 +956,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            glide: None,
+            wheel_at: None,
             focused_win: true,
             groups: Vec::new(),
             my_group: crate::Group::auto(String::new(), 0),
@@ -1569,6 +1583,14 @@ impl RootModel {
     }
 
     fn update_dispatch(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
+        if let UiEvent::Fling { px_per_s, now_ms } = ev {
+            return self.fling(px_per_s, now_ms);
+        }
+        self.note_glide_input(&ev);
+        let glide_cmds = match &ev {
+            UiEvent::Tick { now_ms } => self.tick_glide(sessions, *now_ms),
+            _ => Vec::new(),
+        };
         // While an animation plays it owns the tick stream (driving the timeline at
         // ~60fps); the model swap already happened, so this is purely the visual
         // hand-off. On completion it hands one tick back so the periodic session
@@ -1902,6 +1924,79 @@ impl RootModel {
             cmds.push(Cmd::RequestAttention);
         }
         cmds.extend(flash_cmds);
+        cmds.extend(glide_cmds);
+        cmds
+    }
+
+    /// The fingers lifted off a flick: coast on from there, scrolling where
+    /// the last wheel pointed.
+    fn fling(&mut self, px_per_s: f64, now_ms: u64) -> Vec<Cmd> {
+        self.glide = self.wheel_at.and_then(|(pos, mods)| {
+            crate::kinetic::Glide::new(px_per_s, now_ms).map(|g| (g, pos, mods))
+        });
+        match self.glide {
+            Some(_) => vec![Cmd::ScheduleTick {
+                after_ms: ANIM_TICK_MS,
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Input that takes over from a glide stops it: the fingers back on the
+    /// pad (any finger or wheel scroll), a click, typing. The glide's own
+    /// `Momentum` wheels, and the zero-travel stop of a lift, don't count.
+    fn note_glide_input(&mut self, ev: &UiEvent) {
+        match ev {
+            UiEvent::Pointer {
+                phase: PointerPhase::Wheel,
+                pos,
+                mods,
+                wheel,
+                ..
+            } => {
+                self.wheel_at = Some((*pos, *mods));
+                if !matches!(wheel, crate::WheelDelta::Momentum(_)) && wheel.raw() != 0.0 {
+                    self.glide = None;
+                }
+            }
+            UiEvent::Pointer {
+                phase: PointerPhase::Press,
+                ..
+            }
+            | UiEvent::Text(_) => self.glide = None,
+            UiEvent::Key { kind, .. } if kind.is_down() => self.glide = None,
+            _ => {}
+        }
+    }
+
+    /// Advance the glide to `now_ms`, handing its travel to the showing view as
+    /// a `Momentum` wheel. A dive or slide in flight ends it.
+    fn tick_glide(&mut self, sessions: &mut Sessions, now_ms: u64) -> Vec<Cmd> {
+        if self.anim.is_some() {
+            self.glide = None;
+        }
+        let Some((glide, pos, mods)) = &mut self.glide else {
+            return Vec::new();
+        };
+        let (pos, mods) = (*pos, *mods);
+        let Some(travel) = glide.step(now_ms) else {
+            self.glide = None;
+            return Vec::new();
+        };
+        let mut cmds = self.update_dispatch(
+            sessions,
+            UiEvent::Pointer {
+                phase: PointerPhase::Wheel,
+                button: None,
+                pos,
+                mods,
+                wheel: crate::WheelDelta::Momentum(travel),
+                clicks: 1,
+            },
+        );
+        cmds.push(Cmd::ScheduleTick {
+            after_ms: ANIM_TICK_MS,
+        });
         cmds
     }
 
@@ -7015,5 +7110,157 @@ mod tests {
             !r.foreground_trace().expect("single view").sync_held,
             "the slide's completion tick released the hold latched while warm"
         );
+    }
+
+    // ---- Kinetic scrolling: the glide after a trackpad flick (Linux) ----
+
+    /// A single view of `alpha` holding `L0`..`L99`, resting at the live bottom.
+    fn hundred_lines() -> Win {
+        let mut r = root();
+        let s: Vec<String> = (0..100).map(|i| format!("L{i}")).collect();
+        feed(&mut r, "alpha", s.join("\r\n").as_bytes());
+        r
+    }
+
+    /// How far the view sits up in history, in px (0 = live bottom, where the top
+    /// row shows `L76`): the drawn frame's first — possibly partial — row, and the
+    /// sub-row slide that shows it.
+    fn scrolled_px(r: &Win) -> f32 {
+        use crate::SceneItem;
+        let scene = r.view();
+        let SceneItem::Terminal { frame, .. } = scene.terminals().next().unwrap() else {
+            unreachable!()
+        };
+        let top: i32 = frame.rows_layout[0].runs[0].text[1..].parse().unwrap();
+        let whole = (76 - top) as f32 * METRICS.line_height;
+        if frame.scroll_frac_px > 0.0 {
+            whole - METRICS.line_height + frame.scroll_frac_px
+        } else {
+            whole
+        }
+    }
+
+    fn trackpad(r: &mut Win, wheel: crate::WheelDelta) -> Vec<Cmd> {
+        r.update(UiEvent::Pointer {
+            phase: PointerPhase::Wheel,
+            button: None,
+            pos: crate::PointPx { x: 100.0, y: 100.0 },
+            mods: Mods::NONE,
+            wheel,
+            clicks: 1,
+        })
+    }
+
+    fn schedules_tick(cmds: &[Cmd]) -> bool {
+        cmds.iter().any(|c| matches!(c, Cmd::ScheduleTick { .. }))
+    }
+
+    /// Tick the clock every frame from `from` to `to` (ms), as the shell does
+    /// while ticks are asked for.
+    fn run_clock(r: &mut Win, from: u64, to: u64) {
+        let mut t = from;
+        while t <= to {
+            r.update(UiEvent::Tick { now_ms: t });
+            t += 16;
+        }
+    }
+
+    #[test]
+    fn a_flick_coasts_on_after_the_fingers_lift_and_settles() {
+        // libinput stops dead at the lift; without a glide of our own a flick
+        // stops the instant the fingers leave the pad.
+        let mut r = hundred_lines();
+        trackpad(&mut r, crate::WheelDelta::Pixels(36.0));
+        let lifted_at = scrolled_px(&r);
+        assert_eq!(lifted_at, 36.0, "the finger itself tracks 1:1");
+        let cmds = r.update(UiEvent::Fling {
+            px_per_s: 2000.0,
+            now_ms: 1_000,
+        });
+        assert!(schedules_tick(&cmds), "the glide asks for frames");
+        run_clock(&mut r, 1_016, 1_100);
+        let mid = scrolled_px(&r);
+        assert!(mid > lifted_at, "coasting on, up into history: {mid}");
+        run_clock(&mut r, 1_116, 5_000);
+        let settled = scrolled_px(&r);
+        let coasted = settled - lifted_at;
+        assert!(
+            (3.0 * 18.0..=20.0 * 18.0).contains(&coasted),
+            "a brisk flick glides a settling distance on, not a screenful: {coasted}px"
+        );
+        assert!(
+            !schedules_tick(&r.update(UiEvent::Tick { now_ms: 5_016 })),
+            "a settled glide stops asking for frames"
+        );
+        run_clock(&mut r, 5_032, 6_000);
+        assert_eq!(scrolled_px(&r), settled, "and stays put");
+    }
+
+    #[test]
+    fn a_flick_down_glides_back_toward_the_live_bottom() {
+        let mut r = hundred_lines();
+        trackpad(&mut r, crate::WheelDelta::Pixels(900.0));
+        trackpad(&mut r, crate::WheelDelta::Pixels(-36.0));
+        let lifted_at = scrolled_px(&r);
+        r.update(UiEvent::Fling {
+            px_per_s: -2000.0,
+            now_ms: 0,
+        });
+        run_clock(&mut r, 16, 4_000);
+        assert!(
+            scrolled_px(&r) < lifted_at,
+            "the glide follows the flick's direction"
+        );
+    }
+
+    #[test]
+    fn a_new_touch_catches_the_glide() {
+        // Scrolling again, clicking, or typing mid-glide takes over: the view
+        // must not keep drifting under the user's hand.
+        for interrupt in ["scroll", "click", "key"] {
+            let mut r = hundred_lines();
+            trackpad(&mut r, crate::WheelDelta::Pixels(36.0));
+            r.update(UiEvent::Fling {
+                px_per_s: 3000.0,
+                now_ms: 0,
+            });
+            run_clock(&mut r, 16, 48);
+            match interrupt {
+                "scroll" => {
+                    trackpad(&mut r, crate::WheelDelta::Pixels(1.0));
+                }
+                "click" => {
+                    r.update(UiEvent::Pointer {
+                        phase: PointerPhase::Press,
+                        button: Some(PointerButton::Left),
+                        pos: crate::PointPx { x: 100.0, y: 100.0 },
+                        mods: Mods::NONE,
+                        wheel: crate::WheelDelta::NONE,
+                        clicks: 1,
+                    });
+                }
+                _ => {
+                    key(&mut r, Key::Named(NamedKey::Enter), Mods::NONE);
+                }
+            }
+            let caught = scrolled_px(&r);
+            run_clock(&mut r, 64, 3_000);
+            assert_eq!(scrolled_px(&r), caught, "a {interrupt} stops the glide");
+        }
+    }
+
+    #[test]
+    fn a_lift_after_the_fingers_stopped_does_not_glide() {
+        // Scroll, hold still, lift: the shell measures ~0 px/s, and the view
+        // must stay exactly where the finger left it.
+        let mut r = hundred_lines();
+        trackpad(&mut r, crate::WheelDelta::Pixels(40.0));
+        let cmds = r.update(UiEvent::Fling {
+            px_per_s: 0.0,
+            now_ms: 0,
+        });
+        assert!(!schedules_tick(&cmds));
+        run_clock(&mut r, 16, 2_000);
+        assert_eq!(scrolled_px(&r), 40.0);
     }
 }

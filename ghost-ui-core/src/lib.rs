@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod frame;
 pub mod group;
 pub mod input;
+pub mod kinetic;
 pub mod mouse;
 pub mod root;
 pub mod session_id;

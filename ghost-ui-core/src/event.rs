@@ -247,6 +247,15 @@ pub enum UiEvent {
     /// `Cmd::SpawnSession` / `Cmd::TakeOver`): switch to its single view and
     /// take ownership. The window adopts the fleet tile's screen if it has one.
     AdoptSession(SessionId),
+    /// The fingers lifted off a trackpad scroll moving at `px_per_s` (physical
+    /// px/s, positive = up into history, like [`WheelDelta`]) — the shell's
+    /// measurement of the flick on platforms whose OS sends no momentum of its
+    /// own (Linux: libinput stops at the lift). The window coasts on from there
+    /// (see [`crate::kinetic::Glide`]); `now_ms` is the lift on the tick clock.
+    Fling {
+        px_per_s: f64,
+        now_ms: u64,
+    },
     /// Injected monotonic clock pulse, milliseconds since the shell started.
     /// The sole time source — the core never reads a wall-clock.
     Tick {
