@@ -35,14 +35,6 @@ use crate::{
 /// Lines moved per mouse-wheel notch when scrolling local scrollback.
 const SCROLL_LINES: i64 = 3;
 
-/// Fraction of the OS's post-flick momentum travel that is applied. The finger
-/// tracks 1:1, but the coasting macOS generates after a flick is sized for
-/// pixel-smooth views (Safari, Terminal.app); stepping whole lines through the
-/// full glide reads as leaping far past the target. A quarter keeps the OS's
-/// decay shape — ease a little further, slow, stop — over a settling distance
-/// (pinned by `a_flicks_momentum_glide_is_damped_so_it_settles_nearby`).
-const MOMENTUM_DAMPING: f64 = 0.25;
-
 /// Cadence of selection-autoscroll steps while a drag hovers past a grid edge.
 const AUTOSCROLL_MS: u64 = 30;
 /// Fastest selection autoscroll, in lines per step (reached a few line-heights
@@ -3156,13 +3148,11 @@ impl TerminalView {
     /// The remainder keeps its native unit; switching devices drops it (it is
     /// less than one step, invisible).
     fn wheel_steps(&mut self, wheel: WheelDelta, line_height: f64) -> i64 {
-        // Momentum is finger-unit pixels too (damped — see MOMENTUM_DAMPING),
-        // so it shares the Pixels remainder: the flick→glide boundary must
-        // not drop the fraction.
+        // Momentum is finger-unit pixels too, so it shares the Pixels
+        // remainder: the flick→glide boundary must not drop the fraction.
         let delta = match wheel {
             WheelDelta::Notches(n) => n,
-            WheelDelta::Pixels(p) => p,
-            WheelDelta::Momentum(p) => p * MOMENTUM_DAMPING,
+            WheelDelta::Pixels(p) | WheelDelta::Momentum(p) => p,
         };
         let (rem, step) = match (wheel, self.wheel_pending) {
             (WheelDelta::Notches(_), WheelDelta::Notches(rem)) => (rem, 1.0),
@@ -3369,8 +3359,8 @@ impl TerminalView {
                     // Scroll local scrollback (up = into history): a wheel
                     // click jumps SCROLL_LINES whole rows, trackpad travel is
                     // pixel-exact — the content tracks the finger, resting
-                    // between rows, and the OS's post-flick glide follows
-                    // damped. Mid-drag this is fine — the selection lives in
+                    // between rows, and the post-flick glide follows the
+                    // same way. Mid-drag this is fine — the selection lives in
                     // absolute line space — it just re-extends to the content
                     // now under the pointer.
                     let cmds = match wheel {
@@ -3381,8 +3371,9 @@ impl TerminalView {
                             }
                             self.scroll_by(state, steps * SCROLL_LINES)
                         }
-                        WheelDelta::Pixels(p) => self.scroll_by_px(state, p),
-                        WheelDelta::Momentum(p) => self.scroll_by_px(state, p * MOMENTUM_DAMPING),
+                        WheelDelta::Pixels(p) | WheelDelta::Momentum(p) => {
+                            self.scroll_by_px(state, p)
+                        }
                     };
                     self.re_extend(state);
                     cmds
@@ -6956,10 +6947,10 @@ mod tests {
     }
 
     #[test]
-    fn a_flicks_momentum_glide_is_damped_so_it_settles_nearby() {
+    fn a_flicks_momentum_glide_scrolls_one_to_one() {
         // After the fingers lift, the OS keeps coasting (momentum events).
-        // Applied 1:1 to a whole-line viewport that glide leaps far past the
-        // target; damped to a quarter it eases a little further and stops.
+        // The scrollback is pixel-smooth, so the glide lands exactly as far
+        // as the OS says — the distance macOS itself would scroll.
         let mut m = model();
         feed_lines(&mut m, 100);
         m.update(wheel_px(18.0)); // the finger itself scrolled one line
@@ -6967,22 +6958,18 @@ mod tests {
         for _ in 0..8 {
             m.update(wheel_momentum(18.0)); // 144px of coasting…
         }
-        assert_eq!(
-            top_row_text(&m),
-            "L73",
-            "…lands 2 lines on (144px/4 = 36px), not 8 more lines"
-        );
+        assert_eq!(top_row_text(&m), "L67", "…lands 8 lines on");
     }
 
     #[test]
     fn the_glide_keeps_the_fingers_leftover_fraction() {
-        // The finger parks the view half a row up; the damped glide continues
-        // from that exact position instead of restarting on the row grid.
+        // The finger parks the view half a row up; the glide continues from
+        // that exact position instead of restarting on the row grid.
         let mut m = model();
         feed_lines(&mut m, 100);
         m.update(wheel_px(9.0)); // half a row, pixel-exact
         assert_eq!(frame_shape(&m), (9.0, 25, "L75".into()));
-        m.update(wheel_momentum(36.0)); // damped to 9px -> exactly one row
+        m.update(wheel_momentum(9.0)); // the other half -> exactly one row
         assert_eq!(frame_shape(&m), (0.0, 24, "L75".into()));
     }
 
@@ -7079,7 +7066,7 @@ mod tests {
     }
 
     #[test]
-    fn momentum_reports_to_the_app_are_damped_like_the_scrollback() {
+    fn momentum_reports_to_the_app_pace_like_the_scrollback() {
         let mut m = model();
         feed(&mut m, b"\x1b[?1000h\x1b[?1006h");
         m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0)); // cell (1,1)
@@ -7091,7 +7078,10 @@ mod tests {
                 .filter(|c| matches!(c, Cmd::SendInput { .. }))
                 .count();
         }
-        assert_eq!(reports, 2, "the damped glide is 2 notches, not 8");
+        assert_eq!(
+            reports, 8,
+            "a line-height of glide per notch, like the finger"
+        );
     }
 
     #[test]

@@ -75,9 +75,6 @@ const MAX_CARD_VIEWPORT_FRAC: f32 = 0.45;
 /// Lines of vertical scroll per mouse-wheel notch (trackpads scroll by pixel
 /// travel instead — see [`FleetModel::wheel`]).
 const SCROLL_LINES: f32 = 3.0;
-/// Fraction of the OS's post-flick momentum travel that is applied, matching
-/// the terminal scrollback's damping so a flick settles near the target.
-const MOMENTUM_DAMPING: f32 = 0.25;
 /// Card chrome colours (metadata header, button footer).
 const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
 const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
@@ -2070,16 +2067,15 @@ impl FleetModel {
 
     /// Scroll the grid: a wheel click moves a [`SCROLL_LINES`] step, trackpad
     /// pixels track the finger 1:1 (`scroll_y` is already in pixels, so no
-    /// sub-step remainder to carry), and post-flick coasting is damped by
-    /// [`MOMENTUM_DAMPING`]. Wheel up reveals tiles above. Returns a redraw
+    /// sub-step remainder to carry), and so does post-flick coasting. Wheel
+    /// up reveals tiles above. Returns a redraw
     /// iff the offset actually moved.
     fn wheel(&mut self, wheel: WheelDelta) -> Vec<Cmd> {
         let travel = match wheel {
             WheelDelta::Notches(n) => {
                 n as f32 * SCROLL_LINES * self.effective_metrics().line_height
             }
-            WheelDelta::Pixels(p) => p as f32,
-            WheelDelta::Momentum(p) => p as f32 * MOMENTUM_DAMPING,
+            WheelDelta::Pixels(p) | WheelDelta::Momentum(p) => p as f32,
         };
         if travel == 0.0 {
             return Vec::new();
@@ -8831,9 +8827,9 @@ mod tests {
     }
 
     #[test]
-    fn a_flicks_glide_is_damped_in_the_grid_too() {
-        // Post-flick OS coasting lands at a quarter of its raw travel, like
-        // the terminal's scrollback, so a flick settles near the target.
+    fn a_flicks_glide_scrolls_the_grid_one_to_one() {
+        // Post-flick coasting is travel the OS measured for this flick: the
+        // grid follows it exactly, like the finger.
         let mut m = fleet();
         list_many(&mut m, 6); // overflows the 400x200 viewport
         m.update(UiEvent::Pointer {
@@ -8844,7 +8840,7 @@ mod tests {
             wheel: WheelDelta::Momentum(-80.0),
             clicks: 1,
         });
-        assert_eq!(m.scroll_y, 20.0, "80px of coasting lands 20px");
+        assert_eq!(m.scroll_y, 80.0, "80px of coasting scrolls 80px");
     }
 
     #[test]

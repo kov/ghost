@@ -9,9 +9,8 @@
 //! then plays a [`Glide`] on its tick clock, feeding the travel to whichever
 //! view is showing as ordinary `Momentum` wheels.
 //!
-//! The glide emits what macOS would have sent — its deceleration curve, before
-//! the views' own damping of momentum travel — so one knob (the views'
-//! `MOMENTUM_DAMPING`) sets the feel on both platforms.
+//! The glide emits what macOS would have sent — its deceleration curve — so
+//! a flick coasts the same on both platforms.
 //!
 //! [`WheelDelta::Momentum`]: crate::WheelDelta::Momentum
 

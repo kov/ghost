@@ -107,11 +107,10 @@ pub enum WheelDelta {
     Notches(f64),
     /// Smooth per-pixel travel (winit `PixelDelta`, trackpads).
     Pixels(f64),
-    /// The OS coasting after a flick (macOS momentum phase): pixels like
-    /// [`Pixels`](WheelDelta::Pixels), but the fingers have already lifted.
-    /// Kept apart so views can damp the glide — applied 1:1 to a viewport that
-    /// steps in whole lines, the full OS glide reads as leaping far past
-    /// where you were looking.
+    /// Coasting after a flick — the macOS momentum phase, or ghost's own glide
+    /// where the OS has none ([`crate::kinetic`]): pixels, applied like
+    /// [`Pixels`](WheelDelta::Pixels), but the fingers have already lifted —
+    /// so it is not the user taking over from a glide in progress.
     Momentum(f64),
 }
 

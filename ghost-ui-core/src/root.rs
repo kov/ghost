@@ -7182,12 +7182,10 @@ mod tests {
         let mid = scrolled_px(&r);
         assert!(mid > lifted_at, "coasting on, up into history: {mid}");
         run_clock(&mut r, 1_116, 5_000);
+        // How far is the glide's to answer (`kinetic`, against macOS's own
+        // coasting); here it is that the window plays it out.
         let settled = scrolled_px(&r);
-        let coasted = settled - lifted_at;
-        assert!(
-            (3.0 * 18.0..=20.0 * 18.0).contains(&coasted),
-            "a brisk flick glides a settling distance on, not a screenful: {coasted}px"
-        );
+        assert!(settled > mid, "and further still: {settled}");
         assert!(
             !schedules_tick(&r.update(UiEvent::Tick { now_ms: 5_016 })),
             "a settled glide stops asking for frames"
