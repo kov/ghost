@@ -65,6 +65,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # bundled font.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.11"
+# The raw bindings under `fontconfig`, for the one query it doesn't wrap: whether a
+# candidate's charset has a character (font fallback walks the sorted list with it).
+yeslogic-fontconfig-sys = "6.0.1"
 # Emoji_Presentation property data: chars that default to emoji presentation
 # route font fallback through fontconfig's `emoji` generic family, so they get
 # the color emoji font instead of whatever monochrome face covers them.

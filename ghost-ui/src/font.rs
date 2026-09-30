@@ -379,7 +379,51 @@ impl SystemFallback {
             return Some(face);
         }
         let key = self.query_fontconfig(ch)?;
-        self.load_dedup(key)
+        if let Some(face) = self.load_dedup(key.clone())
+            && ghost_shaper::covers(face, ch)
+        {
+            return Some(face);
+        }
+        self.first_covering(ch, &key.0)
+    }
+
+    /// The first face in fontconfig's sorted list whose charset has `ch` and that
+    /// really covers it, for when the best match does not. That happens when nothing
+    /// covers `ch`, and also when the font cache is corrupt: an entry with no charset
+    /// is never penalised and wins every match, whatever is asked. Only candidates
+    /// whose cached charset claims `ch` are read, so a miss never loads every font on
+    /// the system. A hit here means fontconfig's ranking was wrong, which is worth a
+    /// warning: the rest of the desktop is getting that same wrong answer.
+    #[cfg(target_os = "linux")]
+    fn first_covering(&mut self, ch: char, best: &std::path::Path) -> Option<FontRef<'static>> {
+        let candidates: Vec<(PathBuf, usize)> = {
+            let fc = self.fc.as_ref()?;
+            let mut pat = fontconfig::Pattern::new(fc).ok()?;
+            let mut charset = fontconfig::CharSet::new(fc).ok()?;
+            charset.add_char(ch).ok()?;
+            pat.add_charset(charset).ok()?;
+            let sorted = pat.sort_fonts(fontconfig::UnicodeCoverage::Trim).ok()?;
+            sorted
+                .iter()
+                .filter(|p| charset_has(p, ch))
+                .filter_map(|p| {
+                    let path = PathBuf::from(p.filename().ok()?);
+                    Some((path, face_index(p.face_index().ok())))
+                })
+                .collect()
+        };
+        let face = candidates.into_iter().find_map(|key| {
+            self.load_dedup(key)
+                .filter(|face| ghost_shaper::covers(*face, ch))
+        })?;
+        eprintln!(
+            "ghost-ui: fontconfig's best match for U+{:04X} is {}, which lacks it; \
+             using a later candidate. If this repeats for many characters the font \
+             cache is likely corrupt (try `fc-cache -f`).",
+            ch as u32,
+            best.display(),
+        );
+        Some(face)
     }
 
     /// Load the face at `key`, deduplicating repeat loads of the same file.
@@ -394,9 +438,9 @@ impl SystemFallback {
     }
 
     /// The (file, face-index) fontconfig picks as the best match that covers `ch`.
-    /// fontconfig may still hand back a non-covering font when nothing covers it; the
-    /// renderer re-checks coverage before using the glyph, so a miss degrades to
-    /// `.notdef` rather than a wrong glyph.
+    /// fontconfig may still hand back a non-covering font — when nothing covers it,
+    /// or when its cache is corrupt — so [`resolve`](Self::resolve) checks coverage
+    /// and falls back to [`first_covering`](Self::first_covering).
     #[cfg(target_os = "linux")]
     fn query_fontconfig(&self, ch: char) -> Option<(PathBuf, usize)> {
         self.query(ch, false)
@@ -438,6 +482,26 @@ impl SystemFallback {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn resolve(&mut self, _ch: char) -> Option<FontRef<'static>> {
         None
+    }
+}
+
+/// Whether a fontconfig font pattern's charset has `ch`. `false` when the pattern
+/// carries no charset at all — the corrupt-cache entry that has to be skipped.
+#[cfg(target_os = "linux")]
+fn charset_has(pattern: &fontconfig::Pattern, ch: char) -> bool {
+    // fontconfig is linked (the `dlopen` feature is off), so these are plain externs.
+    use fontconfig_sys::{FcCharSet, FcCharSetHasChar, FcPatternGetCharSet, FcResultMatch};
+    let mut charset: *mut FcCharSet = std::ptr::null_mut();
+    // SAFETY: the pattern is live for the call; the charset it hands back is owned
+    // by the pattern and only read before this returns.
+    unsafe {
+        FcPatternGetCharSet(
+            pattern.as_ptr() as *mut _,
+            fontconfig::FC_CHARSET.as_ptr(),
+            0,
+            &mut charset,
+        ) == FcResultMatch
+            && FcCharSetHasChar(charset, ch as u32) != 0
     }
 }
 
