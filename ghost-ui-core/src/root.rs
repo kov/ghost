@@ -1932,7 +1932,7 @@ impl RootModel {
     /// the last wheel pointed.
     fn fling(&mut self, px_per_s: f64, now_ms: u64) -> Vec<Cmd> {
         self.glide = self.wheel_at.and_then(|(pos, mods)| {
-            crate::kinetic::Glide::new(px_per_s, now_ms).map(|g| (g, pos, mods))
+            crate::kinetic::Glide::new(px_per_s, self.scale as f64, now_ms).map(|g| (g, pos, mods))
         });
         match self.glide {
             Some(_) => vec![Cmd::ScheduleTick {
