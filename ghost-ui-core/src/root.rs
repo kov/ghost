@@ -1943,7 +1943,7 @@ impl RootModel {
     }
 
     /// Input that takes over from a glide stops it: the fingers back on the
-    /// pad (any finger or wheel scroll), a click, typing. The glide's own
+    /// pad (resting, or scrolling again), a wheel click, a click, typing. The glide's own
     /// `Momentum` wheels, and the zero-travel stop of a lift, don't count.
     fn note_glide_input(&mut self, ev: &UiEvent) {
         match ev {
@@ -1963,7 +1963,8 @@ impl RootModel {
                 phase: PointerPhase::Press,
                 ..
             }
-            | UiEvent::Text(_) => self.glide = None,
+            | UiEvent::Text(_)
+            | UiEvent::FingersRest => self.glide = None,
             UiEvent::Key { kind, .. } if kind.is_down() => self.glide = None,
             _ => {}
         }
@@ -7213,9 +7214,10 @@ mod tests {
 
     #[test]
     fn a_new_touch_catches_the_glide() {
-        // Scrolling again, clicking, or typing mid-glide takes over: the view
-        // must not keep drifting under the user's hand.
-        for interrupt in ["scroll", "click", "key"] {
+        // Resting fingers on the pad, scrolling again, clicking, or typing
+        // mid-glide takes over: the view must not keep drifting under the
+        // user's hand.
+        for interrupt in ["rest", "scroll", "click", "key"] {
             let mut r = hundred_lines();
             trackpad(&mut r, crate::WheelDelta::Pixels(36.0));
             r.update(UiEvent::Fling {
@@ -7224,6 +7226,9 @@ mod tests {
             });
             run_clock(&mut r, 16, 48);
             match interrupt {
+                "rest" => {
+                    r.update(UiEvent::FingersRest);
+                }
                 "scroll" => {
                     trackpad(&mut r, crate::WheelDelta::Pixels(1.0));
                 }

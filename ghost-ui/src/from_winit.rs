@@ -242,6 +242,19 @@ pub fn wheel(
     out
 }
 
+/// Fingers coming to rest on the touchpad (a hold gesture starting) are the
+/// touch that stops a glide, and the start of whatever gesture comes next:
+/// the previous one's motion no longer counts toward a fling. Their lifting
+/// or moving on says nothing new.
+pub fn hold(tracker: &mut VelocityTracker, phase: TouchPhase) -> bool {
+    if phase == TouchPhase::Started {
+        tracker.reset();
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Covers the pure winit → core mappings. `alternates` is the one function not
@@ -443,7 +456,7 @@ mod tests {
     }
 
     mod wheel {
-        use super::super::{Wheel, wheel};
+        use super::super::{Wheel, hold, wheel};
         use ghost_ui_core::WheelDelta;
         use ghost_ui_core::kinetic::VelocityTracker;
         use winit::dpi::PhysicalPosition;
@@ -508,6 +521,20 @@ mod tests {
                 wheel(&mut t, px(0.0), TouchPhase::Ended, false, 12.0, true),
                 [Wheel::Fling { px_per_s: 0.0 }]
             );
+        }
+
+        #[test]
+        fn fingers_coming_to_rest_stop_a_glide_and_start_afresh() {
+            let mut t = VelocityTracker::default();
+            wheel(&mut t, px(20.0), TouchPhase::Moved, false, 0.0, true);
+            assert!(hold(&mut t, TouchPhase::Started));
+            assert_eq!(
+                wheel(&mut t, px(0.0), TouchPhase::Ended, false, 10.0, true),
+                [Wheel::Fling { px_per_s: 0.0 }],
+                "motion from before the rest does not fling"
+            );
+            assert!(!hold(&mut t, TouchPhase::Cancelled));
+            assert!(!hold(&mut t, TouchPhase::Ended));
         }
     }
 }

@@ -281,6 +281,18 @@ pub enum WindowEvent {
     /// An mouse button press has been received.
     MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
 
+    /// Fingers resting on a touchpad without moving: `Started` when they come
+    /// to rest, `Ended` when they lift, `Cancelled` when they start moving
+    /// (the hold turning into a scroll or another gesture). What stops
+    /// kinetic scrolling.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - Only available on **Wayland**, with version 3 of
+    ///   `zwp_pointer_gestures_v1` (ghost patch). `fingers` is 0 on `Ended` and
+    ///   `Cancelled`.
+    HoldGesture { device_id: DeviceId, fingers: u32, phase: TouchPhase },
+
     /// Two-finger pinch gesture, often used for magnification.
     ///
     /// ## Platform-specific
@@ -1065,6 +1077,11 @@ mod tests {
                     device_id: did,
                     state: event::ElementState::Pressed,
                     button: event::MouseButton::Other(0),
+                });
+                with_window_event(HoldGesture {
+                    device_id: did,
+                    fingers: 2,
+                    phase: event::TouchPhase::Started,
                 });
                 with_window_event(PinchGesture {
                     device_id: did,

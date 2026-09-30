@@ -1800,6 +1800,7 @@ impl TerminalView {
             // on as ordinary `Momentum` wheels, whichever view is showing.
             UiEvent::SessionList(_)
             | UiEvent::Fling { .. }
+            | UiEvent::FingersRest
             | UiEvent::AdoptSession(_)
             | UiEvent::SessionPush { .. }
             | UiEvent::SessionsChanged

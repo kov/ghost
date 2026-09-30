@@ -8121,6 +8121,15 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
             }
+            WindowEvent::HoldGesture { phase, .. } => {
+                let Some(w) = self.windows.get_mut(&id) else {
+                    return;
+                };
+                if from_winit::hold(&mut w.scroll_velocity, phase) {
+                    self.note_input(id);
+                    self.dispatch(id, UiEvent::FingersRest, &fe);
+                }
+            }
             WindowEvent::MouseWheel {
                 delta,
                 phase,

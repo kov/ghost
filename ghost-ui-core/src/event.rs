@@ -255,6 +255,10 @@ pub enum UiEvent {
         px_per_s: f64,
         now_ms: u64,
     },
+    /// Fingers came to rest on the touchpad (a hold gesture: on Wayland,
+    /// `zwp_pointer_gesture_hold_v1`) — the touch that stops a glide, as it
+    /// stops macOS's own coasting.
+    FingersRest,
     /// Injected monotonic clock pulse, milliseconds since the shell started.
     /// The sole time source — the core never reads a wall-clock.
     Tick {
