@@ -123,8 +123,8 @@ maximized, 69/70 floating at 1.3333) with zero dropped frames. `msg -j windows`
 reports `surface_size` beside `window_size`, so the shadow ring can finally be
 checked from *outside* ghost — 780×527 against 728×475 logical is the same 65px
 ghost measured for itself. Maximize-at-fractional-scale, called untestable
-above, is now writable. Input injection, screenshot-to-file and
-`ext-background-effect-v1` are reported working but we have not exercised them.
+above, is now writable. Screenshot-to-file and `ext-background-effect-v1` are
+reported working but we have not exercised them.
 
 Two caveats gate a synoik rig: the headless dmabuf path is **LINEAR 8888 only**
 (a Venus constraint), and on a driver without `VK_EXT_physical_device_drm` —
@@ -169,8 +169,18 @@ Root-caused upstream: headless never sets a primary scanout output, so frame
 callbacks come only from synoik's 995ms overdue timer and Fifo waits it out on
 every present. Fixed in synoik `65c0cfaa`, which pins headless's scanout
 state to a real element pass: measured against that build the same dive takes
-0.34–0.45s, the weston number. The pin is now synoik's `6600b12e`, which
-carries that fix, and the dive takes 0.40s against a clean clone of it.
+0.34–0.45s, the weston number. The pin carries that fix, and the dive takes
+0.40s against a clean clone of it.
+
+**Input goes in through `synoik msg input`**, the real input pipeline:
+keys and text, clicks, wheel notches, and the touchpad — `finger-scroll DX DY`
+(finger-source axis, Wayland sign), `scroll-stop` (the lift: `axis_stop` on
+both axes), `hold-begin`/`hold-end` (`zwp_pointer_gesture_hold_v1`).
+`ghost-ui/tests/kinetic_scroll.rs` drives trackpad flicks with them. Two traps:
+place the pointer with the absolute `pointer-move-to X Y`, because a relative
+slam into a corner parks it on the **hot corner**, and the overview that opens
+swallows every scroll without an error; and events are stamped when synoik
+handles each `msg`, so pacing between calls is what the client sees.
 
 **Headless synoik is not a frame-rate reference**, and that fix is why. It
 moved a headless client from 1 fps to *unpaced*: callbacks go out once per

@@ -7807,6 +7807,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 win.pacer.painted(now_ms);
                                 win.presented_ok = true;
                                 tracing::trace!(target: "ghost::present", window = ?id, showing = ?win.root.showing(), t = now_ms, "presented");
+                                // What the window now shows at its top — the first,
+                                // possibly partial, row and how far it is slid in —
+                                // for tests that watch scrolling as the user would.
+                                if tracing::enabled!(target: "ghost::view", tracing::Level::DEBUG)
+                                    && let Some((top, frac)) = top_row(&scene)
+                                {
+                                    tracing::debug!(target: "ghost::view", window = ?id, top = %top, frac, t = now_ms, "view presented");
+                                }
                                 // The foreground was just composited: reset its per-session
                                 // damage baseline so the next `view` measures change from
                                 // here (a Lost frame leaves the pending damage to fold into
@@ -8750,6 +8758,20 @@ impl App {
         }
         self.assert_foreground_states_present("after wake");
         fe.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+    }
+}
+
+/// The text of the first terminal's top row as drawn — possibly a partial row
+/// slid in from history — and the sub-row slide showing it
+/// (`Frame::scroll_frac_px`).
+fn top_row(scene: &Scene) -> Option<(String, f32)> {
+    match scene.terminals().next()? {
+        ghost_render::SceneItem::Terminal { frame, .. } => {
+            let row = frame.rows_layout.first()?;
+            let text: String = row.runs.iter().map(|r| r.text.as_str()).collect();
+            Some((text.trim_end().to_string(), frame.scroll_frac_px))
+        }
+        _ => None,
     }
 }
 
