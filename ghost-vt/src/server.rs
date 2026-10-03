@@ -1460,7 +1460,7 @@ fn host_main(
             )? {
                 Disposition::Keep | Disposition::Drop => {}
                 Disposition::Kill => {
-                    kill_child(&mut child);
+                    kill_child(&mut child, &pty);
                     discard_traces(current_name, opts.record.as_deref());
                     return Ok(0);
                 }
@@ -1533,7 +1533,7 @@ fn host_main(
                             Disposition::Kill
                         )
                     {
-                        kill_child(&mut child);
+                        kill_child(&mut child, &pty);
                         discard_traces(current_name, opts.record.as_deref());
                         return Ok(0);
                     }
@@ -1784,7 +1784,7 @@ fn host_main(
                     // An explicit kill throws the session away whoever asks, the
                     // same as the display client's (see `discard_traces`).
                     Disposition::Kill => {
-                        kill_child(&mut child);
+                        kill_child(&mut child, &pty);
                         discard_traces(current_name, opts.record.as_deref());
                         return Ok(0);
                     }
@@ -1995,7 +1995,7 @@ fn host_main(
                 // A kill raced the prep and was pulled off the self-pipe — honor
                 // it now, exactly as the loop's tail signal handler would.
                 UpgradeOutcome::Terminated => {
-                    kill_child(&mut child);
+                    kill_child(&mut child, &pty);
                     notify_exit(&mut client, 0);
                     return Ok(0);
                 }
@@ -2186,7 +2186,7 @@ fn host_main(
                     // is reaped there via `child_exited`.
                     libc::SIGCHLD => {}
                     libc::SIGTERM | libc::SIGINT => {
-                        kill_child(&mut child);
+                        kill_child(&mut child, &pty);
                         notify_exit(&mut client, 0);
                         return Ok(0);
                     }
@@ -2746,12 +2746,31 @@ fn write_descriptor(name: &str, meta: &crate::meta::Meta, cwd: Option<std::path:
     );
 }
 
+/// How long a host tearing down waits to reap the child it killed. Well inside
+/// the two seconds `ghost kill` gives the host to be gone, so a child that will
+/// not die costs the host its reaping, never the kill its success.
+const REAP_LIMIT: Duration = Duration::from_secs(1);
+
 /// Kill and reap the child if one has been spawned; a no-op for a deferred
 /// session whose child never started.
-fn kill_child(child: &mut Option<crate::child::Child>) {
+///
+/// The PTY is drained (and its output discarded) while waiting: the host is
+/// the only reader of the master, and a child killed mid-flood cannot finish
+/// exiting until its tty's output queue empties — see
+/// [`Child::kill_draining`](crate::child::Child::kill_draining). Waiting
+/// without reading is how a `ghost kill` used to wedge a host for good.
+fn kill_child(child: &mut Option<crate::child::Child>, pty: &pty_process::blocking::Pty) {
     if let Some(c) = child {
-        c.kill();
+        c.kill_draining(|| discard_pty_output(pty), REAP_LIMIT);
     }
+}
+
+/// Read the non-blocking master dry, throwing the bytes away — output from a
+/// session being killed, which nothing will show.
+fn discard_pty_output(pty: &pty_process::blocking::Pty) {
+    use std::io::Read;
+    let mut buf = [0u8; 16 * 1024];
+    while matches!((&*pty).read(&mut buf), Ok(n) if n > 0) {}
 }
 
 /// Best-effort notification to the client that the session ended.
