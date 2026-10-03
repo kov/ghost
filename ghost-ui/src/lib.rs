@@ -36,6 +36,8 @@ mod from_winit;
 mod groups;
 mod hosts;
 mod instance;
+#[cfg(target_os = "macos")]
+mod macos_frame;
 pub mod menu;
 mod pacer;
 mod rendertrace;
@@ -220,30 +222,78 @@ pub fn run() {
 #[cfg(target_os = "macos")]
 fn window_dump() {
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSView, NSWindow};
+    use objc2_app_kit::{NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
     struct DumpApp;
     impl ApplicationHandler for DumpApp {
         fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
+            let bar_before = macos_frame::titlebar_height(mtm);
             // Created exactly as a translucent app window is — `with_transparent`
-            // is what pulls in the background colour we are asserting about.
+            // is what pulls in the background colour we are asserting about, and
+            // the frame attributes are the app's own.
             let window = event_loop
-                .create_window(Window::default_attributes().with_transparent(true))
+                .create_window(macos_frame::attributes(
+                    Window::default_attributes().with_transparent(true),
+                ))
                 .expect("create window");
-            let ns: Retained<NSWindow> = {
-                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                let handle = window.window_handle().expect("window handle");
-                let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-                    panic!("not an AppKit window");
-                };
-                // SAFETY: on macOS the AppKit handle's `ns_view` is a live NSView
-                // owned by the window we just created.
-                let view: &NSView = unsafe { &*h.ns_view.as_ptr().cast::<NSView>() };
-                view.window().expect("the view is in a window")
-            };
+            let ns: Retained<NSWindow> = macos_frame::ns_window(&window).expect("an AppKit window");
             let (opaque, bg_alpha) =
                 unsafe { (ns.isOpaque(), ns.backgroundColor().alphaComponent()) };
             println!("opaque={opaque}");
             println!("bg_alpha={bg_alpha}");
+
+            // The titlebar: what the app makes of it, and what AppKit says
+            // independently, for the test to hold one against the other.
+            let native = macos_frame::measure(&window).expect("a titlebar to measure");
+            println!("bar_pt={}", native.height);
+            println!("bar_pt_before_window={bar_before}");
+            println!("controls_pt={}", native.controls);
+            let frame = ns.frame();
+            let layout = unsafe { ns.contentLayoutRect() };
+            println!("titlebar_pt={}", frame.size.height - layout.size.height);
+            println!(
+                "fullsize_content={}",
+                ns.styleMask()
+                    .contains(NSWindowStyleMask::FullSizeContentView)
+            );
+            println!("titlebar_transparent={}", unsafe {
+                ns.titlebarAppearsTransparent()
+            });
+            println!(
+                "title_hidden={}",
+                unsafe { ns.titleVisibility() } == NSWindowTitleVisibility::NSWindowTitleHidden
+            );
+            for (name, which) in [
+                ("close", NSWindowButton::NSWindowCloseButton),
+                ("miniaturize", NSWindowButton::NSWindowMiniaturizeButton),
+                ("zoom", NSWindowButton::NSWindowZoomButton),
+            ] {
+                let hidden = ns
+                    .standardWindowButton(which)
+                    .is_none_or(|b| unsafe { b.isHiddenOrHasHiddenAncestor() });
+                println!("{name}_hidden={hidden}");
+            }
+            let zoom = macos_frame::button_frame(&ns, NSWindowButton::NSWindowZoomButton)
+                .expect("a zoom button");
+            println!("zoom_max_x={}", zoom.origin.x + zoom.size.width);
+            // Measured from the TOP, as the bar is laid out.
+            println!(
+                "zoom_mid_y={}",
+                frame.size.height - (zoom.origin.y + zoom.size.height / 2.0)
+            );
+            // Which view a click in the middle of the bar lands on — ours, or
+            // AppKit's titlebar.
+            if let Some(theme) = ns.contentView().and_then(|v| unsafe { v.superview() }) {
+                let at = objc2_foundation::NSPoint::new(
+                    frame.size.width / 2.0,
+                    frame.size.height - native.height / 2.0,
+                );
+                let hit = unsafe { theme.hitTest(at) };
+                println!(
+                    "bar_hit={}",
+                    hit.map_or("none".into(), |v| v.class().name().to_string())
+                );
+            }
             event_loop.exit();
         }
         fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
@@ -2157,6 +2207,11 @@ pub struct Graphics {
     /// time (a global atomic), re-parse the font header, and — before the shape cache
     /// was keyed on stable font data — silently defeat that cache. Reuse it everywhere.
     fonts: ghost_shaper::FontSet<'static>,
+    /// The titlebar AppKit lays the traffic lights out in, which our bar stands
+    /// in for — `None` if the window had none to measure, and then no bar is
+    /// drawn either.
+    #[cfg(target_os = "macos")]
+    native_bar: Option<macos_frame::NativeTitlebar>,
 }
 
 impl Graphics {
@@ -2173,9 +2228,10 @@ impl Graphics {
         // paints pixels we already own — Wayland, where the frame is a
         // client-side one anyway (mutter offers no server-side decorations). On
         // X11 the window manager's frame is real, and replacing it would mean
-        // reimplementing what it does for us; on macOS the native traffic lights
-        // stay. Decided once, here: it sets both how tall the window opens and
-        // whether we ask for the desktop's frame at all, and those two must agree.
+        // reimplementing what it does for us. On macOS the bar is ours but the
+        // frame stays AppKit's, traffic lights and all (`macos_frame`). Decided
+        // once, here: it sets both how tall the window opens and what we ask of
+        // the desktop's frame, and those two must agree.
         #[cfg(all(unix, not(target_os = "macos")))]
         let own_frame = {
             use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
@@ -2183,7 +2239,11 @@ impl Graphics {
                 .display_handle()
                 .is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_)))
         };
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        // On macOS the bar is ours too, under AppKit's own traffic lights — see
+        // `macos_frame`.
+        #[cfg(target_os = "macos")]
+        let own_frame = true;
+        #[cfg(not(unix))]
         let own_frame = false;
         // Open sized to `cols`x`rows` cells at the base font, plus the padding border on
         // each side, so the configured grid fits inside it (padding surrounds, not eats
@@ -2195,8 +2255,19 @@ impl Graphics {
         // Our own titlebar eats into the window rather than sitting above it (the
         // desktop's frame is drawn outside), so the window has to open that much
         // taller or the configured grid arrives one bar short.
+        #[cfg(not(target_os = "macos"))]
         let bar = if own_frame {
             f64::from(ghost_ui_core::frame::BAR_HEIGHT)
+        } else {
+            0.0
+        };
+        // The native titlebar's: the lights are centred in that band, so it is
+        // the one height our bar can be.
+        #[cfg(target_os = "macos")]
+        let bar = if own_frame {
+            macos_frame::titlebar_height(
+                objc2_foundation::MainThreadMarker::new().expect("windows open on the main thread"),
+            )
         } else {
             0.0
         };
@@ -2214,7 +2285,8 @@ impl Graphics {
         // nothing but alpha. Declaring such a surface opaque tells the compositor
         // not to blend it, and the premultiplied black shadow then composites as a
         // black border around the window.
-        let want_transparent = bg_translucent || own_frame;
+        // macOS casts the window's shadow itself, outside the surface.
+        let want_transparent = bg_translucent || (own_frame && !cfg!(target_os = "macos"));
         // Bench mode measures the render path at a realistic size, so open maximized
         // (the small default grid would understate per-frame raster cost).
         let maximized = std::env::var_os("GHOST_BENCH").is_some();
@@ -2233,6 +2305,12 @@ impl Graphics {
         #[cfg(all(unix, not(target_os = "macos")))]
         let attrs = if own_frame {
             attrs.with_decorations(false)
+        } else {
+            attrs
+        };
+        #[cfg(target_os = "macos")]
+        let attrs = if own_frame {
+            macos_frame::attributes(attrs)
         } else {
             attrs
         };
@@ -2359,10 +2437,24 @@ impl Graphics {
                 );
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(face) = font::resolve_title_face() {
+                let ui = desktop::desktop_font();
+                renderer.set_chrome_font(
+                    ghost_shaper::FontSet::single(face),
+                    font::style_weight(ui.style.as_deref()),
+                );
+            } else {
+                eprintln!("ghost-ui: no window-title font; window chrome will draw no text");
+            }
+        }
         // Keep the frost grain a fixed logical size on HiDPI.
         renderer.set_scale_factor(window.scale_factor() as f32);
         renderer.set_window_edge(edge);
 
+        #[cfg(target_os = "macos")]
+        let native_bar = own_frame.then(|| macos_frame::measure(&window)).flatten();
         let gfx = Graphics {
             window,
             target: Target::Surface(SurfaceTarget::new(
@@ -2374,6 +2466,8 @@ impl Graphics {
             renderer,
             scene_cache: SceneCache::default(),
             fonts: font_setup().fonts,
+            #[cfg(target_os = "macos")]
+            native_bar,
         };
         gfx.log_measurements("created");
         gfx
@@ -2446,11 +2540,35 @@ impl Graphics {
     /// Our titlebar's height in physical pixels, or 0 when the desktop draws the
     /// frame. Every place the bar shifts something — the model's size, the scene,
     /// the pointer, the IME box — takes it from here, so they cannot drift apart.
+    #[cfg(not(target_os = "macos"))]
     fn bar_px(&self) -> u32 {
         ghost_ui_core::frame::bar_height_px(
             !self.window.is_decorated(),
             self.window.scale_factor() as f32,
         )
+    }
+
+    /// On macOS the bar is the native titlebar's height — and none at all in
+    /// fullscreen, where AppKit takes the titlebar away and our content has the
+    /// whole screen.
+    #[cfg(target_os = "macos")]
+    fn bar_px(&self) -> u32 {
+        match self.native_bar {
+            Some(bar) if self.window.fullscreen().is_none() => {
+                (bar.height * self.window.scale_factor()).round() as u32
+            }
+            _ => 0,
+        }
+    }
+
+    /// What the bar keeps clear for controls the platform draws on it, in
+    /// physical px — macOS's traffic lights; nothing anywhere else.
+    fn controls_px(&self) -> f32 {
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = self.native_bar {
+            return (bar.controls * self.window.scale_factor()) as f32;
+        }
+        0.0
     }
 
     /// The room this window keeps around itself for its shadow, in physical
@@ -2517,7 +2635,6 @@ impl Graphics {
 
     /// The size of the window inside this surface: what the shell must lay the
     /// frame and the model out in.
-    #[cfg(target_os = "linux")]
     fn window_px(&self) -> (u32, u32) {
         self.margins_px().window(self.size())
     }
@@ -2541,18 +2658,19 @@ impl Graphics {
             pressed: w.pressed_button,
             maximized: self.window.is_maximized(),
             scale,
+            controls_px: self.controls_px(),
         }
     }
 
     /// The desktop theme's headerbar background and title colour, for a focused
     /// or backdropped window.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     fn titlebar_colors(focused: bool) -> (ghost_render::scene::Rgba, ghost_render::scene::Rgba) {
         let c = desktop::frame_colors(focused);
         (c.bg, c.fg)
     }
 
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(not(unix))]
     fn titlebar_colors(_focused: bool) -> (ghost_render::scene::Rgba, ghost_render::scene::Rgba) {
         ([0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0])
     }
@@ -5078,7 +5196,6 @@ impl App {
 
     /// The titlebar strip of a window whose frame is ours, in window space.
     /// `None` when the desktop draws the frame and there is no bar of ours.
-    #[cfg(target_os = "linux")]
     fn bar_rect(&self, id: WindowId) -> Option<ghost_render::scene::RectPx> {
         let gfx = self.windows.get(&id)?.gfx.as_ref()?;
         let h = gfx.bar_px();
@@ -5096,7 +5213,6 @@ impl App {
     /// changes — the hover circle is the only thing that says a button is there.
     /// `pos` is the pointer in window space while it is on the bar, and `None`
     /// once it is anywhere else, which un-hovers whatever it left.
-    #[cfg(target_os = "linux")]
     fn track_bar_hover(&mut self, id: WindowId, pos: Option<PointPx>) {
         let hovered = pos.zip(self.bar_rect(id)).and_then(|(pos, bar)| {
             let scale = self.windows.get(&id)?.gfx.as_ref()?.window.scale_factor() as f32;
@@ -5115,7 +5231,6 @@ impl App {
     /// action, or opens the window menu.
     ///
     /// Returns whether the press was the bar's — the model never sees those.
-    #[cfg(target_os = "linux")]
     fn press_on_bar(
         &mut self,
         id: WindowId,
@@ -5181,7 +5296,6 @@ impl App {
 
     /// Act on a titlebar release: a button fires only if the pointer is still on
     /// the one the press armed. Returns whether the release was the bar's.
-    #[cfg(target_os = "linux")]
     fn release_on_bar(&mut self, id: WindowId, pos: PointPx, event_loop: &dyn Frontend) -> bool {
         let Some(armed) = self.windows.get(&id).and_then(|w| w.pressed_button) else {
             return false;
@@ -5209,7 +5323,6 @@ impl App {
     }
 
     /// Perform a window-control button.
-    #[cfg(target_os = "linux")]
     fn press_window_button(
         &mut self,
         id: WindowId,
@@ -8046,7 +8159,6 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => None,
                     },
                 );
-                #[cfg(target_os = "linux")]
                 self.track_bar_hover(id, matches!(hit, FrameHit::Bar).then_some(pos));
                 let FrameHit::Content(pos) = hit else {
                     return;
@@ -8093,7 +8205,6 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     // The titlebar is chrome: its presses drive the window, not
                     // the model, and its buttons fire on release.
-                    #[cfg(target_os = "linux")]
                     if pressed {
                         if self.press_on_bar(id, pos, b, clicks) {
                             return;
@@ -12478,6 +12589,7 @@ mod tests {
             pressed: None,
             maximized: false,
             scale: 1.0,
+            controls_px: 0.0,
         };
         ghost_ui_core::frame::with_titlebar(w.root.view(&app.states), &bar)
             .layers

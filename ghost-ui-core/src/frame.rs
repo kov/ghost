@@ -178,6 +178,12 @@ pub struct Titlebar {
     pub maximized: bool,
     /// Scale, for sizing the buttons in physical px.
     pub scale: f32,
+    /// Physical px kept clear at the bar's leading end for window controls the
+    /// platform draws itself — macOS's traffic lights, which stay AppKit's and
+    /// sit on our bar. Nothing of ours is drawn there, and the title is kept as
+    /// far from the trailing end too, so it stays centred on the window as a
+    /// native title is rather than drifting off to one side.
+    pub controls_px: f32,
 }
 
 /// How loud a [`Notice`] is.
@@ -425,12 +431,12 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
             .iter()
             .filter(|(b, _)| bar.buttons.left.contains(b))
             .map(|(_, r)| r.x + r.w)
-            .fold(strip.x, f32::max);
+            .fold(strip.x + bar.controls_px, f32::max);
         let right = buttons
             .iter()
             .filter(|(b, _)| bar.buttons.right.contains(b))
             .map(|(_, r)| r.x)
-            .fold(strip.x + strip.w, f32::min);
+            .fold(strip.x + strip.w - bar.controls_px, f32::min);
         // The details button, when there is one, is part of what the heading has
         // to stay clear of.
         let right = details.map_or(right, |d| right.min(d.x - BUTTON_GAP * bar.scale));
@@ -702,6 +708,7 @@ mod tests {
             pressed: None,
             maximized: false,
             scale: 1.0,
+            controls_px: 0.0,
         }
     }
 
@@ -976,6 +983,38 @@ mod tests {
         assert!(
             button_at(mid, &bad.buttons, strip, bad.scale).is_none(),
             "and the pill never sits under a window control"
+        );
+    }
+
+    #[test]
+    fn the_title_keeps_clear_of_controls_the_platform_draws() {
+        // macOS's traffic lights are AppKit's, not ours, so there are no buttons
+        // of ours to stay clear of — only the room the bar keeps for them. The
+        // title stays centred on the window, as a native title is, by keeping
+        // the same distance from the other end.
+        let bar = Titlebar {
+            controls_px: 76.0,
+            ..titlebar(28)
+        };
+        let scene = with_titlebar(content(800, 572), &bar);
+        let items: Vec<_> = scene.layers.iter().flat_map(|l| &l.items).collect();
+        let title = items
+            .iter()
+            .find_map(|i| match i {
+                SceneItem::ChromeText { id, rect, .. } if *id == SceneId::Titlebar => Some(*rect),
+                _ => None,
+            })
+            .expect("the title is drawn");
+        assert_eq!(title.x, 76.0, "the title starts clear of the controls");
+        assert_eq!(
+            title.x + title.w,
+            800.0 - 76.0,
+            "and is centred on the window"
+        );
+        // And nothing of ours is drawn where the lights are but the bar itself.
+        assert!(
+            !items.iter().any(|i| matches!(i, SceneItem::ChromeText { id, .. } | SceneItem::Rect { id, .. } if *id == SceneId::WindowButton)),
+            "no window buttons of ours"
         );
     }
 
@@ -1350,6 +1389,7 @@ mod inset_tests {
             notice: None,
             font_px: 12.0,
             scale: 1.25,
+            controls_px: 0.0,
             buttons: ButtonLayout::default(),
             hovered: None,
             pressed: None,

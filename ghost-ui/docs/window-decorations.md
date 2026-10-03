@@ -233,7 +233,8 @@ Verified in the vendored winit (0.30.13):
   follows it) — and the flag was **removed**: a fallback nothing exercises only
   diverges, and the two frames had already stopped agreeing about what a window
   can say. Who draws the frame is now a platform fact, not a setting: ours on
-  Wayland, the desktop's on X11 and macOS. A leftover `decorations = …` key in
+  Wayland, the desktop's on X11, and on macOS our bar under AppKit's own frame
+  (see *macOS* below). A leftover `decorations = …` key in
   a config is ignored rather than an error.
 - **P1 — the edge, ours.** `WindowEdge` grows from bottom-only to all four
   corners, with our own values instead of alphas sampled off a frame crate.
@@ -324,13 +325,46 @@ Verified in the vendored winit (0.30.13):
   change; bolting them onto the parity work means neither can be judged on its
   own, and it keeps macOS out of scope for longer (the bar is the only reason
   macOS would re-enter, and its backing-scale issue is unresolved).
-- **Wayland only.** Mutter never offers server-side decorations, so there the
+- **Wayland only** (macOS followed later — see below). Mutter never offers server-side decorations, so there the
   frame is client-side either way and taking it over changes only who paints
   pixels we already own. On X11 the window manager's frame is real — and there
-  is no shadow without `_GTK_FRAME_EXTENTS` — so the desktop keeps it; macOS
-  keeps its native traffic lights until the mac CSD work lands. The consequence
-  to hold onto: anything the frame alone can say (the freeze notice) is unsaid
-  on those platforms.
+  is no shadow without `_GTK_FRAME_EXTENTS` — so the desktop keeps it. The
+  consequence to hold onto: anything the frame alone can say (the freeze
+  notice) is unsaid there.
+
+## macOS (2026-10-03)
+
+Option A as decided, built on the bar the Linux work produced: the window keeps
+its native frame (`decorations(true)`), opens with the transparent-titlebar
+recipe above (`ghost-ui/src/macos_frame.rs`), and our surface runs up under the
+titlebar, where we draw the same bar — title, notice, details button — that
+Wayland gets. AppKit keeps drawing and owning the traffic lights, and with them
+resize, zoom, the tiling popover, fullscreen, the shadow and the rounded corners.
+
+- **Height is measured, not chosen.** The bar is exactly the native titlebar's
+  height (`frame - contentLayoutRect`; 32pt on macOS 27), so the lights sit
+  centred on it — the "decision to make up front" above, settled by asking the
+  window rather than by a constant. The window opens taller by the same amount,
+  read before it exists from `frameRectForContentRect:styleMask:`. In
+  fullscreen the bar is 0: AppKit takes the titlebar away and the content has
+  the screen.
+- **No buttons of ours.** `button_layout()` is empty; the bar keeps
+  `Titlebar::controls_px` clear at its leading end (the zoom button's far edge
+  plus a gap, measured) and the same at the trailing end, so the title stays
+  centred on the window as a native one is.
+- **Clicks on the bar are ours.** A hit-test of the bar lands on winit's view,
+  not AppKit's titlebar, so the shared bar handlers run: a press drags the
+  window (`performWindowDragWithEvent:`), and a double-click does what System
+  Settings says (`AppleActionOnDoubleClick`; `Maximize`/`Fill` zoom).
+- **The desktop's look.** The title font is CoreText's window-title role
+  (`kCTFontUIFontWindowTitle` — the system family is dot-named, and CoreText
+  answers a dot name with Times), bold via the variable `wght` axis; the bar is
+  `windowBackgroundColor`, the title `labelColor`, dimmed to
+  `tertiaryLabelColor` in the background — resolved in the app's appearance and
+  read once, as the Linux colours are.
+- **Verified** by `tests/window_macos.rs` against the `GHOST_WINDOW_DUMP` probe
+  (the lights are visible and AppKit's, the bar is the native height, centred on
+  the lights, and clear of them) and `tests/chrome_font_macos.rs`.
 
 ## Open question (revisit only if pursuing Custom-on-mac)
 

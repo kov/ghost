@@ -237,6 +237,35 @@ pub fn style_weight(style: Option<&str>) -> Option<f32> {
     })
 }
 
+/// CoreText's UI-font role for a window's title (`kCTFontUIFontWindowTitle`),
+/// which `core-text` leaves unnamed.
+#[cfg(target_os = "macos")]
+const CT_WINDOW_TITLE_FONT: core_text::font::CTFontUIFontType = 15;
+
+/// The system's window-title font, as CoreText states it for the role — the font
+/// every native window's title is set in. Asked by role because it cannot be
+/// asked by name: the system UI family is dot-prefixed, and CoreText answers a
+/// dot name with Times.
+#[cfg(target_os = "macos")]
+pub fn window_title_font() -> core_text::font::CTFont {
+    // Size 0 is "the role's own size".
+    core_text::font::new_ui_font_for_language(CT_WINDOW_TITLE_FONT, 0.0, None)
+}
+
+/// The face of [`window_title_font`], read out of its file for the chrome text
+/// path. The weight is not in the face: the system font is one variable file
+/// whose PostScript names are named *instances*, which no face in the file is
+/// called — so an unmatched name means that file's (only) face, and the weight
+/// rides on the `wght` axis ([`style_weight`]) like any variable family's.
+#[cfg(target_os = "macos")]
+pub fn resolve_title_face() -> Option<FontRef<'static>> {
+    let font = window_title_font();
+    let path = font.copy_descriptor().font_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let idx = ghost_shaper::face_index_by_postscript(&bytes, &font.postscript_name()).unwrap_or(0);
+    load(&path, idx)
+}
+
 #[cfg(target_os = "macos")]
 fn resolve_faces(family: Option<&str>) -> FontSet<'static> {
     let Some(family) = family else {

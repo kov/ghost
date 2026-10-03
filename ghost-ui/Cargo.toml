@@ -84,15 +84,24 @@ unicode-properties = "0.1"
 core-foundation = "0.9"
 core-text = "20.1"
 objc2 = "0.5"
+# block2 too: AppKit's semantic colours only resolve inside an appearance's block.
+block2 = "0.5"
 objc2-app-kit = { version = "0.2", features = [
+    "block2",
+    "NSAppearance",
     "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSColorSpace",
+    "NSControl",
     "NSMenu",
     "NSMenuItem",
     "NSEvent",
     "NSWindow",
     "NSResponder",
+    "NSView",
 ] }
-objc2-foundation = { version = "0.2", features = ["NSString"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults"] }
 
 [dev-dependencies]
 # The CLI end-to-end suite (moved here with the `ghost` binary) drives it over a PTY.

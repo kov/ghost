@@ -34,6 +34,7 @@ fn the_hovered_window_button_wears_a_circle_not_a_square() {
         pressed: None,
         maximized: false,
         scale: 1.0,
+        controls_px: 0.0,
     };
     let mut content = Scene::new((W, H));
     content.layers.push(Layer::new(
