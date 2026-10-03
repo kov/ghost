@@ -645,10 +645,7 @@ fn a_new_session_starts_where_the_one_it_branched_off_is() {
             wid,
             UiEvent::Key {
                 key: ghost_ui_core::Key::Char("t".into()),
-                mods: ghost_ui_core::Mods {
-                    alt: true,
-                    ..Default::default()
-                },
+                mods: app_chord(),
                 kind: ghost_ui_core::KeyEventKind::Press,
                 alts: None,
             },
@@ -688,10 +685,7 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
             a,
             UiEvent::Key {
                 key: ghost_ui_core::Key::Char("n".into()),
-                mods: ghost_ui_core::Mods {
-                    alt: true,
-                    ..Default::default()
-                },
+                mods: app_chord(),
                 kind: ghost_ui_core::KeyEventKind::Press,
                 alts: None,
             },
@@ -711,6 +705,16 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
 }
 
 /// The rendered occurrences of `needle` on a session's screen.
+/// The modifier ghost's own window and session shortcuts ride on: Cmd on macOS,
+/// where Option stays Meta for the shell, and Alt everywhere else.
+fn app_chord() -> ghost_ui_core::Mods {
+    ghost_ui_core::Mods {
+        alt: !cfg!(target_os = "macos"),
+        sup: cfg!(target_os = "macos"),
+        ..Default::default()
+    }
+}
+
 fn rendered_count(app: &App, id: &str, needle: &str) -> usize {
     app.states()
         .text_of(&id.into())
@@ -806,16 +810,21 @@ fn switching_away_from_a_session_tells_its_program_it_is_no_longer_shown() {
         // is one report the program really received.
         app.dispatch(
             wid,
-            UiEvent::Text("stty -echo -icanon; printf '\\033[?1004h'; exec cat -v\r".into()),
+            UiEvent::Text(
+                "stty -echo -icanon; exec sh -c \"printf '\\033[?1004h'; exec cat -v\"\r".into(),
+            ),
             &fe,
         );
-        // The `?1004h` rising edge reports at once — into the shell, which is still
-        // between `printf` and `exec`. So the wire is proven with a marker instead:
-        // until this echoes back, a silent screen means "no child", not "no report".
+        // The `?1004h` rising edge reports at once, and `sh -c` never reads its
+        // stdin, so that report always waits in the pty for `cat` — it is part of
+        // the baseline, and has to have landed before the baseline is counted, or
+        // a late one reads as a spurious extra. The marker proves the wire: until
+        // it echoes back, a silent screen means "no child", not "no report".
         app.dispatch(wid, UiEvent::Text("PING".into()), &fe);
         let echoing = wait_until(Duration::from_secs(20), || {
             app.wake(&fe);
             rendered_count(&app, "watcher-a", "PING") >= 1
+                && rendered_count(&app, "watcher-a", "^[[I") >= 1
         });
         assert!(
             echoing,
