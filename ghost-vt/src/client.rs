@@ -1206,9 +1206,20 @@ mod tests {
         assert!(!p.disconnected, "a clean exit is not a dropped connection");
 
         // A lost connection: the peer closes with no `Exited` → disconnected.
+        // The EOF is waited for rather than expected on the first read: a test
+        // running alongside may fork, and until its child execs it holds a copy
+        // of every fd in this process — this socket's other end included — so
+        // the close can take a moment to land.
         let (host, mut session) = paired_session();
         drop(host);
-        let p = session.pump().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let p = loop {
+            let p = session.pump().unwrap();
+            if p.ended || std::time::Instant::now() >= deadline {
+                break p;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(p.ended, "a closed connection ends the session");
         assert!(
             p.disconnected,
