@@ -29,8 +29,7 @@
 
 mod bench;
 mod config;
-/// What the desktop says a window should look like (GNOME `gsettings`).
-#[cfg(target_os = "linux")]
+/// What the desktop says a window should look like.
 pub mod desktop;
 pub mod font;
 mod from_winit;
@@ -41,9 +40,6 @@ pub mod menu;
 mod pacer;
 mod rendertrace;
 mod resize;
-/// The CSD frame's titlebar text, drawn with ghost's own font stack. Linux
-/// only: every other platform draws its own titlebar.
-#[cfg(target_os = "linux")]
 mod windows;
 
 use hosts::{HostLink, LocalFeed, RemoteHost, remote_listing, start_remote_watcher};
@@ -2521,6 +2517,7 @@ impl Graphics {
 
     /// The size of the window inside this surface: what the shell must lay the
     /// frame and the model out in.
+    #[cfg(target_os = "linux")]
     fn window_px(&self) -> (u32, u32) {
         self.margins_px().window(self.size())
     }

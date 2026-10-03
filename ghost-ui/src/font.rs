@@ -220,7 +220,6 @@ pub fn resolve_face(family: &str, style: Option<&str>) -> Option<FontRef<'static
 /// Applied as a variation setting, which a variable font honours and a static
 /// face ignores — so it costs nothing to pass alongside a real bold face, and
 /// is the only way to get bold out of a family that ships one variable file.
-#[cfg(target_os = "linux")]
 pub fn style_weight(style: Option<&str>) -> Option<f32> {
     let style = style?.to_ascii_lowercase();
     let style = style.replace(['-', ' '], "");
