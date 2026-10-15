@@ -93,7 +93,7 @@ free for the shell); where a bare `Ctrl` chord would collide with terminal input
 
 | Action                          | macOS   | Linux                       |
 | ------------------------------- | ------- | --------------------------- |
-| New window                      | `Cmd-N` | `Ctrl-Shift-N` / `Alt-N`    |
+| New window (from this one)      | `Cmd-N` | `Ctrl-Shift-N` / `Alt-N`    |
 | New session (this window)       | `Cmd-T` | `Alt-T`                     |
 | New SSH window                  | `Cmd-S` | `Ctrl-Shift-S` / `Alt-S`    |
 | New SSH session (this window)   | `Cmd-G` | `Ctrl-Shift-G` / `Alt-G`    |
@@ -104,6 +104,11 @@ free for the shell); where a bare `Ctrl` chord would collide with terminal input
 | Zoom in / out / reset           | `Cmd` `+` / `-` / `0` | `Ctrl` `+` / `-` / `0` |
 | Toggle fleet view               | `F9`    | `F9`                        |
 | Cycle sessions in this window   | `Ctrl-Tab` / `Ctrl-Shift-Tab` | `Ctrl-Tab` / `Ctrl-Shift-Tab` |
+
+A new window or session branches off the one you are in: it opens on the same
+host (an ssh window gives an ssh window) and in the same directory. The app icon
+and a bare `ghost` open a window the plain way instead — the fleet when a session
+is detached, else a fresh local session.
 
 Inside the fleet: arrows / `Tab` move focus, `Enter` opens the focused tile,
 `Ctrl-Enter` opens its whole group, `Space` marks a tile, `u` ungroups, `Ctrl-U`

@@ -224,9 +224,9 @@ fn a_cleanly_exited_session_is_not_offered_for_relaunch() {
     });
 }
 
-/// Alt-N / File > New Window with nothing detached must open a **new session**, not
-/// a fleet whose only content is sessions attached in other windows (whose only
-/// action is stealing them). The trigger in the wild is an old auto-group: a window
+/// A plain-launch window (the app icon, a bare `ghost`) with nothing detached must
+/// open a **new session**, not a fleet whose only content is sessions attached in
+/// other windows (whose only action is stealing them). The trigger in the wild is an old auto-group: a window
 /// that ran days ago leaves its member in `groups.toml`, and once that session dies
 /// the shell counted it as "something to return to" forever.
 #[test]
@@ -701,6 +701,63 @@ fn opening_a_new_window_keeps_the_one_it_was_asked_from() {
             "the window Alt+N was pressed in stays, still on its session"
         );
         support::kill_session("first-a");
+    });
+}
+
+/// Alt+N branches off the window it was pressed in, exactly as Alt+T does: the new
+/// window gets a new session started in the directory its sibling is working in —
+/// and never the plain-launch fleet, even with a detached session lying around
+/// (that is what the app icon and a bare `ghost` are for).
+#[test]
+fn a_new_window_branches_off_the_window_it_was_asked_from() {
+    with_isolated_xdg(|tmp| {
+        let work = tmp.join("work");
+        std::fs::create_dir(&work).expect("a directory to work in");
+        let work = work.canonicalize().expect("canonical work dir");
+        support::spawn_session_running_in("branch-n", Some(&work), "echo branch-n ready; exec cat");
+        // Something a plain launch would return to.
+        spawn_session("idle-1");
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let a = app
+            .open_single_window(&fe, "branch-n", g, None)
+            .expect("window A");
+        app.wake(&fe);
+
+        app.dispatch(
+            a,
+            press(ghost_ui_core::Key::Char("n".into()), app_chord()),
+            &fe,
+        );
+        app.wake(&fe);
+
+        let asked = fe.spawn_requests();
+        let new = app.window_ids().into_iter().find(|&w| w != a);
+        let new_root = new.and_then(|w| app.root(w));
+        let shows_new_session = new_root.is_some_and(|r| {
+            !r.is_fleet() && asked.len() == 1 && r.foregrounds(&asked[0].0.as_str().into())
+        });
+        let cwd = asked
+            .first()
+            .and_then(|(_, c)| c.as_ref())
+            .and_then(|c| c.canonicalize().ok());
+        for (name, _) in &asked {
+            support::kill_session(name);
+        }
+        support::kill_session("branch-n");
+        support::kill_session("idle-1");
+
+        assert!(
+            shows_new_session,
+            "Alt+N must open a window on one new session, not the fleet: {asked:?}"
+        );
+        assert_eq!(
+            cwd.as_deref(),
+            Some(work.as_path()),
+            "the new window's session must start where its sibling is working"
+        );
     });
 }
 

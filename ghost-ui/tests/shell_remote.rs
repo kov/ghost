@@ -485,6 +485,120 @@ fn a_session_branched_off_a_remote_one_opens_in_the_same_directory_there() {
     });
 }
 
+/// Alt+N on a session living on a remote host branches off it exactly as Alt+T
+/// does — a new session **on that host, in the same directory** — only in a new
+/// window, which then drives it.
+#[test]
+fn a_window_branched_off_a_remote_session_opens_on_the_same_host_and_directory() {
+    let Some(remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    // SAFETY: process-global, held under SERIAL for the duration.
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|_tmp| {
+        let proj = remote.home().join("proj");
+        std::fs::create_dir_all(&proj).expect("a directory on the remote");
+        let proj_reported = proj.to_str().expect("a printable path");
+
+        let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+        let remote_ghost =
+            retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+        r.spawn_host(&remote_ghost, "work", proj.to_str())
+            .expect("spawn remote session");
+        assert!(
+            wait_until(Duration::from_secs(10), || r
+                .list_sessions(&remote_ghost)
+                .map(|s| s
+                    .iter()
+                    .any(|i| i.name == "work" && i.cwd.as_deref() == Some(proj_reported)))
+                .unwrap_or(false)),
+            "the session never came up on the remote in {proj_reported}: {:?}",
+            r.list_sessions(&remote_ghost)
+        );
+
+        let q: Arc<QueuedEvents> = Arc::default();
+        let sink: Arc<dyn EventSink> = q.clone();
+        let mut app = App::headless_with_sink(sink);
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+
+        let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            sees_tile(&app.root(wid).expect("window").view(app.states()), "work")
+        });
+        assert!(
+            discovered,
+            "the remote session never appeared in the fleet: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::tile_center(&scene, "work")
+            .unwrap_or_else(|| panic!("no card to click: {:?}", visible_text(&scene)));
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+            for ev in support::click_events(cx, cy) {
+                app.dispatch(wid, ev, &fe);
+            }
+        }
+        let attached = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            !app.root(wid).expect("window").is_fleet()
+        });
+        assert!(
+            attached,
+            "the window never opened the remote session: {:?}",
+            visible_text(&app.root(wid).expect("window").view(app.states()))
+        );
+
+        app.dispatch(
+            wid,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("n".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+
+        let target = remote.spec().target();
+        let mut sibling: Option<String> = None;
+        let landed = pump_until(&mut app, &fe, &q, Duration::from_secs(30), |app| {
+            sibling = r.list_sessions(&remote_ghost).ok().and_then(|s| {
+                s.into_iter()
+                    .find(|i| i.name != "work" && i.cwd.as_deref() == Some(proj_reported))
+                    .map(|i| i.name)
+            });
+            let Some(name) = &sibling else { return false };
+            let id = SessionId::remote(target.as_str(), name.as_str());
+            app.window_ids()
+                .into_iter()
+                .any(|w| w != wid && app.root(w).is_some_and(|r| r.foregrounds(&id)))
+        });
+        assert!(
+            landed,
+            "Alt+N must open a new window driving a new session on the host, in the \
+             same directory: sibling {sibling:?}, listing {:?}",
+            r.list_sessions(&remote_ghost)
+        );
+        assert!(
+            app.root(wid)
+                .is_some_and(|r| r.foregrounds(&SessionId::remote(target.as_str(), "work"))),
+            "the window Alt+N was pressed in stays on its own session"
+        );
+    });
+}
+
 /// How many times `needle` is rendered on session `id`'s screen.
 fn rendered_count(app: &App, id: &SessionId, needle: &str) -> usize {
     app.states()

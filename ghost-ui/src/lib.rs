@@ -1193,6 +1193,14 @@ fn spawn_session(
     })
 }
 
+/// What a new session branched off a window inherits (see [`App::branch_from`]).
+struct Branch {
+    connection: Option<ConnectionSpec>,
+    /// The live remote host to create the session on, if any.
+    target: Option<String>,
+    cwd: Option<String>,
+}
+
 /// The connection a new terminal in a window inherits: the session it was spawned
 /// from (the foreground) wins — a new terminal is a sibling of what you're looking
 /// at — else the window group's own connection (an explicit "ssh group"), else none
@@ -3107,12 +3115,15 @@ pub struct HeadlessFrontend {
     /// How many times the App removed a session outright.
     removed: std::cell::Cell<usize>,
     /// Every local session the App asked to start, in order, with the directory
-    /// it asked for it to start in.
-    spawned: std::cell::RefCell<Vec<(String, Option<PathBuf>)>>,
+    /// it asked for it to start in and the connection it was to run over.
+    spawned: std::cell::RefCell<Vec<SpawnRequest>>,
     /// Set to make every spawn fail, standing in for the binary having been
     /// replaced under a running GUI.
     spawns_fail: std::cell::Cell<bool>,
 }
+
+/// One start request a [`HeadlessFrontend`] saw: `(name, cwd, connection)`.
+type SpawnRequest = (String, Option<PathBuf>, Option<ConnectionSpec>);
 
 impl HeadlessFrontend {
     /// The id this frontend's compositor always settles on, standing in for the
@@ -3142,14 +3153,28 @@ impl HeadlessFrontend {
         self.spawned
             .borrow()
             .iter()
-            .map(|(n, _)| n.clone())
+            .map(|(n, _, _)| n.clone())
             .collect()
     }
 
     /// Those same requests with the directory each was to start in — what a new
     /// terminal inherits from the session it branched off.
     pub fn spawn_requests(&self) -> Vec<(String, Option<PathBuf>)> {
-        self.spawned.borrow().clone()
+        self.spawned
+            .borrow()
+            .iter()
+            .map(|(n, cwd, _)| (n.clone(), cwd.clone()))
+            .collect()
+    }
+
+    /// The connection each of those requests was to run over (`None` = a local
+    /// shell) — what a new terminal inherits from the window it branched off.
+    pub fn spawn_connections(&self) -> Vec<Option<ConnectionSpec>> {
+        self.spawned
+            .borrow()
+            .iter()
+            .map(|(_, _, c)| c.clone())
+            .collect()
     }
 
     /// The name each window opened so far was registered under.
@@ -3244,7 +3269,7 @@ impl Frontend for HeadlessFrontend {
     ) -> std::io::Result<()> {
         self.spawned
             .borrow_mut()
-            .push((name.to_string(), cwd.clone()));
+            .push((name.to_string(), cwd.clone(), connection.clone()));
         if self.spawns_fail.get() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -4913,7 +4938,7 @@ impl App {
                         eprintln!("ghost: rename failed: {e}");
                     }
                 }
-                Cmd::NewWindow => self.open_launch_window(event_loop),
+                Cmd::NewWindow => self.open_branched_window(wid, event_loop),
                 Cmd::NewSshWindow => self.open_connect_window(event_loop),
                 Cmd::NewSshSession => self.open_connect_session(wid),
                 Cmd::ConnectSshWindow { spec } => {
@@ -4948,20 +4973,11 @@ impl App {
                 }
                 Cmd::SpawnSession => {
                     let name = self.unique_session_name();
-                    // Inherit the window's ssh connection (group's own, else the
-                    // foreground session's) so a new terminal follows the one it
-                    // branches off onto the same host.
-                    let connection = self.inherited_spawn_connection(wid);
-                    // Inheritance-over-remote: if the inherited host is one we already
-                    // hold a live transport to, create the session ON it (a real
-                    // remote ghost session), matching the group's other sessions —
-                    // not a local `ssh` child.
-                    let connected: HashSet<String> = self.connected_targets();
-                    let target = remote_spawn_target(connection.as_ref(), &connected);
-                    // …and, on the same footing, where that session is working: a
-                    // new terminal opens beside the one it came from, not back at
-                    // whatever directory ghost itself was launched in.
-                    let cwd = self.inherited_spawn_cwd(wid, connection.as_ref(), target.as_deref());
+                    let Branch {
+                        connection,
+                        target,
+                        cwd,
+                    } = self.branch_from(wid);
                     match target {
                         Some(target) => self.spawn_remote_session(wid, &target, &name, cwd),
                         None => {
@@ -6145,6 +6161,63 @@ impl App {
             w.connect = None;
             w.root.connect_failed(msg);
             w.request_redraw();
+        }
+    }
+
+    /// Everything a new session branched off `wid` (Alt+T into it, Alt+N into a
+    /// new window) inherits from it: the window's ssh connection (the foreground
+    /// session's, else the group's own) so a new terminal follows the one it
+    /// branches off onto the same host; the live host to create it ON, when we
+    /// already hold a transport to that host (a real remote ghost session, matching
+    /// the group's other sessions — not a local `ssh` child); and, on the same
+    /// footing, where that session is working, so a new terminal opens beside the
+    /// one it came from, not back at whatever directory ghost was launched in.
+    fn branch_from(&self, wid: WindowId) -> Branch {
+        let connection = self.inherited_spawn_connection(wid);
+        let connected: HashSet<String> = self.connected_targets();
+        let target = remote_spawn_target(connection.as_ref(), &connected);
+        let cwd = self.inherited_spawn_cwd(wid, connection.as_ref(), target.as_deref());
+        Branch {
+            connection,
+            target,
+            cwd,
+        }
+    }
+
+    /// Open a new window branched off `wid` (Alt+N): a new session exactly as
+    /// Alt+T would start it in `wid` (see [`branch_from`](Self::branch_from)),
+    /// shown in a window of its own. An inherited connection makes the new window
+    /// an ssh group for that host, so its own new sessions follow it there too.
+    /// The plain-launch choice (the fleet when something is detached) belongs to
+    /// a bare `ghost` and the app icon, which have no window to branch off.
+    fn open_branched_window(&mut self, wid: WindowId, event_loop: &dyn Frontend) {
+        let Branch {
+            connection,
+            target,
+            cwd,
+        } = self.branch_from(wid);
+        let name = self.unique_session_name();
+        let mut group = self.mint_group();
+        group.connection = connection.clone();
+        match target {
+            // The session is created off-loop and attached into the window when it
+            // lands, so the window opens on the (empty) fleet and waits for it.
+            Some(target) => {
+                let new = self.open_fleet_window(event_loop, group, None);
+                self.spawn_remote_session(new, &target, &name, cwd);
+            }
+            None => {
+                match event_loop.spawn_session(&name, vec![], connection, cwd.map(PathBuf::from)) {
+                    Ok(()) => {
+                        self.open_single_window(event_loop, &name, group, None);
+                    }
+                    // The window was asked for and still opens, saying why it is empty.
+                    Err(e) => {
+                        let new = self.open_fleet_window(event_loop, group, None);
+                        self.report_failure(new, "Could not start a session", e);
+                    }
+                }
+            }
         }
     }
 
@@ -7736,8 +7809,13 @@ impl App {
             }
         };
         match menu::menu_intent(action) {
-            // Opening a window needs no focused target — it always works.
-            MenuIntent::NewWindow => self.open_launch_window(fe),
+            // Opening a window needs no focused target — it always works; with
+            // one, File > New Window branches off it like Cmd-N does.
+            MenuIntent::NewWindow => match self.focused_window() {
+                Some(wid) => self.exec(wid, vec![Cmd::NewWindow], fe),
+                None => self.open_launch_window(fe),
+            },
+            MenuIntent::LaunchWindow => self.open_launch_window(fe),
             MenuIntent::FocusedCmd(cmd) => {
                 if let Some(wid) = self.focused_window() {
                     self.exec(wid, vec![cmd], fe);
@@ -13231,6 +13309,46 @@ mod tests {
     }
 
     #[test]
+    fn a_new_window_from_an_ssh_window_is_an_ssh_window_for_the_same_host() {
+        // Alt+N branches off the window it was pressed in, like Alt+T: from an ssh
+        // group whose host has no live transport, the new window's session is an
+        // `ssh` child to that host, and the new window is itself an ssh group for
+        // it, so its own Alt+T/Alt+N follow too. The spawn is made to fail so no
+        // real ssh runs; the request and the window's identity are the behaviour.
+        with_isolated_xdg(|| {
+            let mut app = App::headless();
+            let fe = HeadlessFrontend::new();
+            fe.fail_spawns();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            let group = app.mint_group();
+            let a = app.open_fleet_window(&fe, group, None);
+            app.windows
+                .get_mut(&a)
+                .unwrap()
+                .root
+                .set_group_connection(Some(spec.clone()));
+
+            app.exec(a, vec![ghost_ui_core::Cmd::NewWindow], &fe);
+
+            assert_eq!(
+                fe.spawn_connections(),
+                vec![Some(spec.clone())],
+                "the new window's session runs over the window's ssh connection"
+            );
+            let new = app
+                .window_ids()
+                .into_iter()
+                .find(|&w| w != a)
+                .expect("a second window opened");
+            assert_eq!(
+                app.root(new).unwrap().group_connection(),
+                Some(&spec),
+                "the new window is an ssh group for the same host"
+            );
+        });
+    }
+
+    #[test]
     fn inherited_connection_prefers_foreground_then_group_then_local() {
         use super::inherited_connection;
         use ghost_vt::connection::ConnectionSpec;
@@ -13408,7 +13526,7 @@ mod tests {
 
     #[test]
     fn new_window_mirrors_a_plain_launch() {
-        // File > New Window / Cmd-N opens a window that "acts like the first one":
+        // A window from the app icon (or a second `ghost`) "acts like the first one":
         // it carries no `$GHOST_SESSION` request, so it always takes the plain-launch
         // decision — the fleet when there is a session to return to, a fresh session
         // otherwise — and never attaches to one specific session.
@@ -13424,8 +13542,8 @@ mod tests {
             log_choice("new window", None, &[listed("a", true)], &[]),
             StartupChoice::Spawn
         ));
-        // An old window's remembered dead member must not turn every Alt-N into a
-        // fleet: this is the regression `tests/shell.rs` reproduces end-to-end.
+        // An old window's remembered dead member must not turn every new window
+        // into a fleet: this is the regression `tests/shell.rs` reproduces end-to-end.
         assert!(matches!(
             log_choice("new window", None, &[], &[group("g1", &["gone"])]),
             StartupChoice::Spawn

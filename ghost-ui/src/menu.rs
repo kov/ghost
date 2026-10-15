@@ -155,7 +155,10 @@ pub enum ConnectOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum MenuAction {
+    /// File > New Window (Cmd-N): branches off the focused window, like Cmd-T.
     NewWindow,
+    /// The Dock icon's New Window: the plain launch, as a bare `ghost` makes it.
+    LaunchWindow,
     NewSession,
     Copy,
     Paste,
@@ -180,6 +183,7 @@ impl MenuAction {
             MenuAction::ZoomOut => 6,
             MenuAction::ZoomReset => 7,
             MenuAction::ToggleFleet => 8,
+            MenuAction::LaunchWindow => 9,
         }
     }
 
@@ -195,6 +199,7 @@ impl MenuAction {
             6 => MenuAction::ZoomOut,
             7 => MenuAction::ZoomReset,
             8 => MenuAction::ToggleFleet,
+            9 => MenuAction::LaunchWindow,
             _ => return None,
         })
     }
@@ -205,8 +210,12 @@ impl MenuAction {
 /// `user_event`). Not `Eq` — [`Cmd`] carries non-`Eq` payloads.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuIntent {
-    /// Open a fresh fleet window — works even with no window focused.
+    /// Open a new window branched off the focused one (see `Cmd::NewWindow`), or
+    /// the plain launch when no window is focused — works either way.
     NewWindow,
+    /// Open a window exactly as a plain launch would (the fleet when something is
+    /// detached, else a fresh session) — needs no focused window.
+    LaunchWindow,
     /// Issue a command to the focused window.
     FocusedCmd(Cmd),
     /// Re-inject a key chord into the focused window, so it flows through the
@@ -221,6 +230,7 @@ pub enum MenuIntent {
 pub fn menu_intent(action: MenuAction) -> MenuIntent {
     match action {
         MenuAction::NewWindow => MenuIntent::NewWindow,
+        MenuAction::LaunchWindow => MenuIntent::LaunchWindow,
         MenuAction::NewSession => MenuIntent::FocusedCmd(Cmd::SpawnSession),
         MenuAction::Copy => MenuIntent::FocusedKey(Key::Char("c".into()), Mods::SUPER),
         MenuAction::Paste => MenuIntent::FocusedKey(Key::Char("v".into()), Mods::SUPER),
@@ -483,7 +493,7 @@ mod imp {
             mtm,
             target,
             ns_string!("New Window"),
-            MenuAction::NewWindow,
+            MenuAction::LaunchWindow,
             ns_string!(""),
         ));
         DOCK_MENU.with(|m| *m.borrow_mut() = Some(menu));
@@ -681,6 +691,7 @@ mod tests {
             MenuAction::ZoomOut,
             MenuAction::ZoomReset,
             MenuAction::ToggleFleet,
+            MenuAction::LaunchWindow,
         ] {
             assert_eq!(MenuAction::from_tag(action.tag()), Some(action));
             assert!(
@@ -698,6 +709,11 @@ mod tests {
     fn menu_intents_reinject_the_core_chords() {
         // The window-level actions bypass the terminal.
         assert_eq!(menu_intent(MenuAction::NewWindow), MenuIntent::NewWindow);
+        // The Dock's New Window is the plain launch: it has no window to branch off.
+        assert_eq!(
+            menu_intent(MenuAction::LaunchWindow),
+            MenuIntent::LaunchWindow
+        );
         assert_eq!(
             menu_intent(MenuAction::NewSession),
             MenuIntent::FocusedCmd(Cmd::SpawnSession)
