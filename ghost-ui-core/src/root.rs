@@ -4627,6 +4627,7 @@ mod tests {
         r.root.set_selection_config(&crate::SelectionConfig {
             word_chars: crate::DEFAULT_WORD_CHARS.to_string(),
             rules: vec![SmartRule::new(r"[a-z]+/(GH-\d+)", 1, 1).unwrap()].into(),
+            ..crate::SelectionConfig::default()
         });
         r.update(UiEvent::AdoptSession("beta".into()));
         feed(&mut r, "beta", b"on fix/GH-1234 today");

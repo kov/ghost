@@ -3299,9 +3299,9 @@ impl TerminalView {
                     }
                     pre.push(Cmd::Redraw);
                     pre
-                } else if b == mouse::Button::Middle {
-                    // Middle-click pastes the primary selection (the reply comes
-                    // back as `ClipboardText`, like a normal paste).
+                } else if b == mouse::Button::Middle && self.selection_cfg.middle_click_paste {
+                    // Middle-click pastes the primary selection when enabled (the
+                    // reply comes back as `ClipboardText`, like a normal paste).
                     pre.push(Cmd::ReadPrimary);
                     pre
                 } else {
@@ -3524,9 +3524,9 @@ pub fn default_smart_rules() -> Rc<[SmartRule]> {
     DEFAULT_RULES.with(Rc::clone)
 }
 
-/// Everything double-click selection is configured with. The two travel
-/// together — the shell reads both from `[input]`, and every view, warm mirror
-/// and resized model gets both stamped on it — so they plumb as one thing.
+/// Everything selection is configured with. These travel together — the shell
+/// reads them all from `[input]`, and every view, warm mirror and resized model
+/// gets them stamped on it — so they plumb as one thing.
 #[derive(Debug, Clone)]
 pub struct SelectionConfig {
     /// Extra word characters on top of the alphanumerics — see
@@ -3535,6 +3535,9 @@ pub struct SelectionConfig {
     /// The content-aware rules, in no particular order: they all get their say
     /// and the scoring decides.
     pub rules: Rc<[SmartRule]>,
+    /// Whether a middle-click pastes the primary selection. Off by default:
+    /// a stray wheel press shouldn't dump text into the shell.
+    pub middle_click_paste: bool,
 }
 
 impl Default for SelectionConfig {
@@ -3542,6 +3545,7 @@ impl Default for SelectionConfig {
         SelectionConfig {
             word_chars: DEFAULT_WORD_CHARS.to_string(),
             rules: default_smart_rules(),
+            middle_click_paste: false,
         }
     }
 }
@@ -4254,8 +4258,29 @@ mod tests {
     }
 
     #[test]
-    fn middle_click_pastes_the_primary_selection() {
+    fn middle_click_does_not_paste_by_default() {
         let mut m = model();
+        feed(&mut m, b"text");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        let cmds = m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Middle),
+            1.0,
+            1.0,
+        ));
+        assert!(
+            !cmds.contains(&Cmd::ReadPrimary),
+            "middle-click paste is opt-in: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn middle_click_pastes_the_primary_selection_when_enabled() {
+        let mut m = model();
+        m.set_selection_config(&SelectionConfig {
+            middle_click_paste: true,
+            ..SelectionConfig::default()
+        });
         feed(&mut m, b"text");
         m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
         assert_eq!(
@@ -4517,6 +4542,7 @@ mod tests {
         m.set_selection_config(&SelectionConfig {
             word_chars: DEFAULT_WORD_CHARS.to_string(),
             rules: vec![SmartRule::new(r"[a-z]+/(GH-\d+)", 1, 1).unwrap()].into(),
+            ..SelectionConfig::default()
         });
         feed(&mut m, b"on fix/GH-1234 and a/src/foo.rs");
         assert_eq!(double_click_text(&mut m, 0, 10), "GH-1234");

@@ -243,6 +243,10 @@ struct Input {
     /// usual behaviour; set to `false` to type é/ü/£/… via Option. No effect off
     /// macOS, where Alt is already Meta.
     option_as_meta: bool,
+    /// X11/Wayland: paste the primary selection on middle-click. Off by
+    /// default. Selecting text still publishes it to the primary selection
+    /// either way, so other apps can middle-click paste it.
+    middle_click_paste: bool,
 }
 
 impl Default for Input {
@@ -251,6 +255,7 @@ impl Default for Input {
             word_chars: DEFAULT_WORD_CHARS.to_string(),
             selection_rules: None,
             option_as_meta: true,
+            middle_click_paste: false,
         }
     }
 }
@@ -404,6 +409,7 @@ impl UiConfig {
         let Some(rules) = &self.input.selection_rules else {
             return SelectionConfig {
                 word_chars: self.input.word_chars.clone(),
+                middle_click_paste: self.input.middle_click_paste,
                 ..SelectionConfig::default()
             };
         };
@@ -420,6 +426,7 @@ impl UiConfig {
         SelectionConfig {
             word_chars: self.input.word_chars.clone(),
             rules: rules.into(),
+            middle_click_paste: self.input.middle_click_paste,
         }
     }
 
@@ -649,6 +656,32 @@ mod tests {
             UiConfig::parse("[input]\noption_as_meta = true\n")
                 .unwrap()
                 .option_as_meta()
+        );
+    }
+
+    #[test]
+    fn middle_click_paste_defaults_off_and_parses() {
+        assert!(!UiConfig::default().selection().middle_click_paste);
+        assert!(
+            !UiConfig::parse("[input]\n")
+                .unwrap()
+                .selection()
+                .middle_click_paste
+        );
+        assert!(
+            UiConfig::parse("[input]\nmiddle_click_paste = true\n")
+                .unwrap()
+                .selection()
+                .middle_click_paste
+        );
+        // Enabling it survives custom rules replacing the built-ins.
+        assert!(
+            UiConfig::parse(
+                "[input]\nmiddle_click_paste = true\n[[input.selection_rules]]\nregex = 'x'\n"
+            )
+            .unwrap()
+            .selection()
+            .middle_click_paste
         );
     }
 
