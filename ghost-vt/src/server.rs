@@ -642,6 +642,9 @@ struct PendingUpgrade {
 struct ProbedTarget {
     handoff: u32,
     proto: u32,
+    /// The target's build ([`crate::build`]); `None` for a target that
+    /// predates reporting it.
+    build: Option<u64>,
 }
 
 /// Ask the target binary what it speaks, by running its `ghost __handoff`
@@ -695,7 +698,12 @@ fn probe_target(exe: &std::path::Path) -> io::Result<ProbedTarget> {
         .next()
         .and_then(|t| t.parse().ok())
         .ok_or_else(|| io::Error::other("upgrade target did not report a protocol level"))?;
-    Ok(ProbedTarget { handoff, proto })
+    let build = toks.next().and_then(|t| t.parse().ok());
+    Ok(ProbedTarget {
+        handoff,
+        proto,
+        build,
+    })
 }
 
 /// Vet a target binary before we probe or exec it. The probe RUNS the target
@@ -964,6 +972,16 @@ fn prepare_upgrade(
         )));
     }
 
+    // Refuse to step back to an OLDER BUILD, even at our level: two ghosts of
+    // different builds asking (two UIs, one installed later) would otherwise
+    // bounce the host between them. The same build is fine — that is a plain
+    // re-exec. A target too old to report its build is judged on its level alone.
+    if probed.build.is_some_and(|b| b < crate::build::current()) {
+        return Err(io::Error::other(
+            "refusing to upgrade: the target is an older build than this host runs",
+        ));
+    }
+
     // Checkpoint the current screen onto an unlinked temp file to carry it across
     // the exec (reversible: a throwaway file dropped on any later failure). Built
     // before we touch fd flags so nothing is half-applied if it fails.
@@ -1094,6 +1112,16 @@ fn host_main(
             crate::protocol::PROTO_LEVEL.to_string(),
         );
     }
+    // Which build this host runs, for whoever decides it needs upgrading —
+    // republished by a self-upgrade, which runs this code again. Before the pid,
+    // which is what makes the session listable: nothing lists a host that has
+    // not said what it is. Not fatal, unlike the proto marker: this also runs
+    // after an upgrade's exec, past the point of refusing, and a missing marker
+    // costs only one more (same-build) upgrade on the next listing.
+    let _ = std::fs::write(
+        paths::build_path(current_name),
+        crate::build::current().to_string(),
+    );
     std::fs::write(
         paths::pid_path(current_name),
         std::process::id().to_string(),

@@ -132,6 +132,17 @@ pub fn session_proto(name: &str) -> u32 {
     proto_at(&paths::socket_path(name))
 }
 
+/// The build the named session's host runs (see [`crate::build`]), read from
+/// its `build` marker; `None` for a host built before the marker existed. The
+/// `ghost __build <name>` far end of the SSH transport prints it.
+pub fn session_build(name: &str) -> Option<u64> {
+    std::fs::read_to_string(paths::build_path(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 impl Client {
     /// Send a message to the host.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {

@@ -236,14 +236,25 @@ enum Command {
         /// To pick up a newer/staged binary, pass its path explicitly.
         path: Option<String>,
     },
-    /// Print this binary's exec-handoff format version and protocol level
-    /// (`<handoff> <proto>`) and exit. A host about to self-upgrade runs
+    /// Print this binary's exec-handoff format version, protocol level and build
+    /// (`<handoff> <proto> <build>`) and exit. A host about to self-upgrade runs
     /// `<target> __handoff` to check the target speaks its handoff format and
     /// won't downgrade its protocol before exec'ing onto it (a handoff mismatch,
     /// a lower proto level, or a target too old to answer is refused). An
     /// internal plumbing command; not for direct use.
     #[command(name = "__handoff", hide = true)]
     Handoff,
+    /// Print the build the named session's host runs (see `ghost_vt::build`),
+    /// read from its `build` marker; fails for a host too old to publish one,
+    /// and for one no longer running (its marker outlives it until pruned).
+    /// Run over ssh so an initiator can tell whether a remote host is older than
+    /// the ghost it would upgrade it to. An internal plumbing command; not for
+    /// direct use.
+    #[command(name = "__build", hide = true)]
+    Build {
+        /// Immutable id of the session whose host build to report.
+        name: String,
+    },
 }
 
 /// What a parsed command line asks the `ghost` binary to do.
@@ -554,10 +565,21 @@ fn dispatch(command: Command) {
             }
         }
         Command::Handoff => println!(
-            "{} {}",
+            "{} {} {}",
             ghost_vt::server::HANDOFF_VERSION,
-            ghost_vt::protocol::PROTO_LEVEL
+            ghost_vt::protocol::PROTO_LEVEL,
+            ghost_vt::build::current()
         ),
+        Command::Build { name } => {
+            let live = ghost_vt::session::list()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name);
+            match ghost_vt::client::session_build(&name).filter(|_| live) {
+                Some(build) => println!("{build}"),
+                None => fail(&format!("session '{name}' runs no build it has published")),
+            }
+        }
     }
 }
 

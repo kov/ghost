@@ -216,11 +216,26 @@ in the child. So **binary signature-checking is theater — skip it.** Instead:
   client** — mirror the `ClientMsg::Policy` guard (`!c.subscribed && !c.observing`,
   server.rs:1324). An observer/subscriber can't trigger an upgrade.
 - Validate the target: a **regular file, our UID, not group/world-writable**.
-- **Pre-exec `__probe`** the target requiring the marker AND `proto >= our
-  CURRENT level` — **no downgrades**. This doubles as "will it even run here",
-  turning an exec failure into a cleanly-refused command instead of a dead host.
+- **Pre-exec `__handoff` probe** of the target, requiring its handoff version,
+  `proto >= our CURRENT level`, and — when it reports one — a build no older
+  than ours (`ghost_vt::build`: the binary's mtime) — **no downgrades**, so two
+  ghosts of different builds can never bounce a host between them. This doubles
+  as "will it even run here", turning an exec failure into a cleanly-refused
+  command instead of a dead host.
 - Do **not** restrict the path to the staged dir — dev builds and
   `GHOST_REMOTE_GHOST` legitimately point elsewhere.
+
+## Who asks, and when
+
+The UI asks each listed host once per run, when its protocol level is older
+than the UI's, or its level matches and its published `build` marker is older
+(or absent). The rollout is staged: one host is upgraded and must come back
+listed as the new build, and stay so for a few seconds, before the rest follow
+one at a time; if it does not, the others are left as they are. The probe
+catches a target that will not start; only the staging limits one that starts
+and then fails. Each listing that brings sessions not yet tried starts a
+rollout of its own, which knows nothing of an earlier one's failure. Dev builds run from `target/` never upgrade hosts, and `[hosts]
+auto_upgrade = false` turns it off.
 
 ## Adopt-by-pid is a refactor, not a one-liner (P2 scope)
 

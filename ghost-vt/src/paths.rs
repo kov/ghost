@@ -101,6 +101,14 @@ pub fn proto_path(name: &str) -> PathBuf {
     session_dir(name).join("proto")
 }
 
+/// Path of the build marker for the named session: the host writes the build it
+/// runs here ([`crate::build::current`]) before it is listable, and again after
+/// an in-place upgrade. Absent for hosts built before the marker existed, which
+/// read as older than any build.
+pub fn build_path(name: &str) -> PathBuf {
+    session_dir(name).join("build")
+}
+
 /// Path of the exec-generation marker for the named session. A fresh spawn
 /// writes `0` here; each in-place self-upgrade bumps it by one just before the
 /// `execv`. A local attach records the value it connected at and, on a bare

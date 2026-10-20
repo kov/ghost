@@ -1578,6 +1578,84 @@ enum Startup {
     Connect,
 }
 
+/// How long an upgraded host is given to come back as the new build before the
+/// rest of a rollout follows it (see [`roll_out`]).
+const UPGRADE_SETTLE: Duration = Duration::from_secs(3);
+
+/// Whether a host at protocol level `proto`, running build `build`, should be
+/// upgraded to a ghost of build `target` (builds: see [`ghost_vt::build`]). Only
+/// a host that can upgrade itself in place, and never to a lower level; then
+/// when its level is older, or its build is — a host that has not published a
+/// build predates the marker, so it is older. A target whose build is unknown
+/// is judged on the level alone.
+fn wants_upgrade(proto: u32, build: Option<u64>, target: Option<u64>) -> bool {
+    use ghost_vt::protocol::{PROTO_LEVEL, PROTO_UPGRADE};
+    if !(PROTO_UPGRADE..=PROTO_LEVEL).contains(&proto) {
+        return false;
+    }
+    proto < PROTO_LEVEL
+        || match (build, target) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(build), Some(target)) => build < target,
+        }
+}
+
+/// Upgrade the hosts of `names`, in order, staged so a bad build cannot take
+/// them all: the first upgraded must have `came_back` (alive, running the new
+/// build) and stayed so for `settle`, within three times that, before the rest
+/// follow. A host that refused takes nothing down — it is logged and the next
+/// one goes first instead. `where_` names the machine in the log.
+fn roll_out(
+    names: &[String],
+    settle: Duration,
+    upgrade: impl Fn(&str) -> std::io::Result<()>,
+    came_back: impl Fn(&str) -> bool,
+    where_: &str,
+) {
+    let mut proven = false;
+    for name in names {
+        if let Err(e) = upgrade(name) {
+            eprintln!("ghost: upgrading the host of '{name}'{where_}: {e}");
+            continue;
+        }
+        if proven {
+            continue;
+        }
+        if !stays_back(settle, || came_back(name)) {
+            eprintln!(
+                "ghost: the host of '{name}'{where_} did not come back from its upgrade; \
+                 leaving the other sessions' hosts as they are"
+            );
+            return;
+        }
+        proven = true;
+    }
+}
+
+/// Whether `back` holds, unbroken, for `settle` — polled, within three times
+/// that: a host that came back slowly still counts, one that came back and
+/// died again does not.
+fn stays_back(settle: Duration, back: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    let mut since = None;
+    loop {
+        let now = Instant::now();
+        if back() {
+            let since = *since.get_or_insert(now);
+            if now - since >= settle {
+                return true;
+            }
+        } else {
+            since = None;
+        }
+        if now - start >= settle * 3 {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The ghost binary this process upgrades older hosts to, if it does: its own
 /// executable, unless `ui.toml` switches upgrades off or this is a development
 /// build — one run from a cargo build directory, whose binary the next build
@@ -4082,37 +4160,28 @@ impl App {
         true
     }
 
-    /// Ask each listed session's host that runs an older ghost to upgrade itself in
-    /// place to this one: it re-execs under the new binary keeping its program, PTY
-    /// and screen, and every window viewing it reattaches. Once per session per run,
-    /// off the event loop; a refusal (a program that never pauses its output, say)
-    /// is logged. A host predating in-place upgrades is left as it is — it can only
-    /// be restarted, which ends its program. A remote host is upgraded to the ghost
-    /// this UI provisioned there.
+    /// Ask each listed session's host that runs an older ghost — an older
+    /// protocol level, or an older build at this one (see [`wants_upgrade`]) — to
+    /// upgrade itself in place: it re-execs under the new binary keeping its
+    /// program, PTY and screen, and every window viewing it reattaches. Once per
+    /// session per run, off the event loop, and staged ([`roll_out`]): one host
+    /// first, checked on before the rest follow, so a bad build reaches one
+    /// session rather than all of them. A refusal (a program that never pauses
+    /// its output, say) is logged. A host predating in-place upgrades is left as
+    /// it is — it can only be restarted, which ends its program. A remote host is
+    /// upgraded to the ghost this UI provisioned there.
     fn upgrade_older_hosts(&mut self, listing: &[Listed]) {
         let Some(to) = self.upgrade_hosts_to.clone() else {
             return;
         };
-        use ghost_vt::protocol::{PROTO_LEVEL, PROTO_UPGRADE};
+        let mut local = Vec::new();
         let mut remote: HashMap<String, Vec<String>> = HashMap::new();
         for l in listing {
             if !self.upgrade_tried.insert(l.id.clone()) {
                 continue;
             }
             match l.id.as_remote() {
-                None => {
-                    let name = l.id.name().to_string();
-                    let proto = ghost_vt::client::session_proto(&name);
-                    if !(PROTO_UPGRADE..PROTO_LEVEL).contains(&proto) {
-                        continue;
-                    }
-                    let to = to.display().to_string();
-                    std::thread::spawn(move || {
-                        if let Err(e) = ghost_vt::client::upgrade_session(&name, Some(to)) {
-                            eprintln!("ghost: upgrading the host of '{name}': {e}");
-                        }
-                    });
-                }
+                None => local.push(l.id.name().to_string()),
                 Some((target, real)) => {
                     remote
                         .entry(target.to_string())
@@ -4121,20 +4190,65 @@ impl App {
                 }
             }
         }
+        if !local.is_empty() {
+            std::thread::spawn(move || {
+                let target = ghost_vt::build::of_file(&to);
+                let mut names: Vec<String> = local
+                    .into_iter()
+                    .filter(|name| {
+                        wants_upgrade(
+                            ghost_vt::client::session_proto(name),
+                            ghost_vt::client::session_build(name),
+                            target,
+                        )
+                    })
+                    .collect();
+                names.sort();
+                let to = to.display().to_string();
+                roll_out(
+                    &names,
+                    UPGRADE_SETTLE,
+                    |name| ghost_vt::client::upgrade_session(name, Some(to.clone())),
+                    // Listed, not `host_is_live`: that reads a pruned session
+                    // as one still starting.
+                    |name| {
+                        ghost_vt::session::list()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|s| s.name == name)
+                            && (target.is_none() || ghost_vt::client::session_build(name) == target)
+                    },
+                    "",
+                );
+            });
+        }
         for (target, names) in remote {
             let Some(host) = self.connection(&target) else {
                 continue;
             };
             std::thread::spawn(move || {
-                for name in names {
-                    let proto = host.remote.session_proto(&host.remote_ghost, &name);
-                    if !(PROTO_UPGRADE..PROTO_LEVEL).contains(&proto) {
-                        continue;
-                    }
-                    if let Err(e) = host.remote.upgrade_session(&host.remote_ghost, &name) {
-                        eprintln!("ghost: upgrading the host of '{name}' on {target}: {e}");
-                    }
-                }
+                let build = host.remote.ghost_build(&host.remote_ghost);
+                let mut names: Vec<String> = names
+                    .into_iter()
+                    .filter(|name| {
+                        wants_upgrade(
+                            host.remote.session_proto(&host.remote_ghost, name),
+                            host.remote.session_build(&host.remote_ghost, name),
+                            build,
+                        )
+                    })
+                    .collect();
+                names.sort();
+                roll_out(
+                    &names,
+                    UPGRADE_SETTLE,
+                    |name| host.remote.upgrade_session(&host.remote_ghost, name),
+                    |name| {
+                        build.is_none()
+                            || host.remote.session_build(&host.remote_ghost, name) == build
+                    },
+                    &format!(" on {target}"),
+                );
             });
         }
     }
@@ -11442,6 +11556,262 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_host_is_upgraded_when_its_level_or_its_build_is_older() {
+        use super::wants_upgrade;
+        use ghost_vt::protocol::{PROTO_LEVEL, PROTO_UPGRADE};
+        let now = Some(100);
+        assert!(wants_upgrade(PROTO_LEVEL, Some(99), now), "older build");
+        assert!(wants_upgrade(PROTO_LEVEL, None, now), "too old to say");
+        assert!(!wants_upgrade(PROTO_LEVEL, Some(100), now), "same build");
+        assert!(!wants_upgrade(PROTO_LEVEL, Some(101), now), "newer build");
+        assert!(
+            !wants_upgrade(PROTO_LEVEL, None, None),
+            "target unknown: level alone"
+        );
+        assert!(
+            wants_upgrade(PROTO_LEVEL - 1, Some(101), None),
+            "older level"
+        );
+        assert!(
+            !wants_upgrade(PROTO_UPGRADE - 1, None, now),
+            "cannot upgrade in place"
+        );
+        assert!(
+            !wants_upgrade(PROTO_LEVEL + 1, None, now),
+            "never to a lower level"
+        );
+    }
+
+    #[test]
+    fn a_rollout_goes_on_only_once_its_first_upgrade_came_back() {
+        use std::cell::RefCell;
+        let names: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let run = |refuses: &[&str], back: bool| {
+            let asked = RefCell::new(Vec::new());
+            let checked = RefCell::new(Vec::new());
+            super::roll_out(
+                &names,
+                Duration::ZERO,
+                |n| {
+                    asked.borrow_mut().push(n.to_string());
+                    if refuses.contains(&n) {
+                        Err(std::io::Error::other("busy"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |n| {
+                    checked.borrow_mut().push(n.to_string());
+                    back
+                },
+                "",
+            );
+            (asked.into_inner(), checked.into_inner())
+        };
+        assert_eq!(run(&[], true), (names.clone(), vec!["a".to_string()]));
+        assert_eq!(
+            run(&[], false),
+            (vec!["a".to_string()], vec!["a".to_string()]),
+            "a first host that did not come back stops the rest"
+        );
+        assert_eq!(
+            run(&["a"], false),
+            (
+                vec!["a".to_string(), "b".to_string()],
+                vec!["b".to_string()]
+            ),
+            "a refusal is not a bad build: the next goes first"
+        );
+    }
+
+    #[test]
+    fn a_host_that_comes_back_and_dies_again_has_not_come_back() {
+        use std::cell::Cell;
+        let settle = Duration::from_millis(300);
+        let start = Instant::now();
+        let slow = |after: u64| move || start.elapsed() >= Duration::from_millis(after);
+        assert!(super::stays_back(settle, slow(200)), "slow, then steady");
+        let start = Instant::now();
+        assert!(
+            !super::stays_back(settle, || start.elapsed() < Duration::from_millis(150)),
+            "back, then gone"
+        );
+        let polls = Cell::new(0);
+        assert!(!super::stays_back(settle, || {
+            polls.set(polls.get() + 1);
+            false
+        }));
+        assert!(polls.get() > 1, "polled until the deadline");
+    }
+
+    /// Start `name` detached under `ghost_bin` and wait for it to be listed.
+    fn start_listed(ghost_bin: &std::path::Path, name: &str) {
+        let ok = std::process::Command::new(ghost_bin)
+            .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "`ghost new -d {name}` succeeded");
+        let listed = || {
+            ghost_vt::session::list()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name)
+        };
+        let mut spun = 0;
+        while !listed() && spun < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            spun += 1;
+        }
+        assert!(listed(), "{name} listed");
+    }
+
+    /// How many times `name`'s host has re-exec'd itself.
+    fn generation_of(name: &str) -> u64 {
+        std::fs::read_to_string(ghost_vt::paths::gen_path(name))
+            .ok()
+            .and_then(|g| g.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Hand `app` the current listing, then pump it for `ms` milliseconds or
+    /// until `done`.
+    fn list_and_pump(
+        app: &mut App,
+        wid: crate::WindowId,
+        fe: &HeadlessFrontend,
+        ms: u64,
+        mut done: impl FnMut() -> bool,
+    ) {
+        let list = ghost_vt::session::list().unwrap_or_default();
+        app.dispatch(wid, ghost_ui_core::UiEvent::SessionList(local(list)), fe);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while !done() && std::time::Instant::now() < deadline {
+            app.wake(fe);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A host at this ghost's protocol level but running an older build — any
+    /// fix that did not touch the wire — is upgraded too, and then says it runs
+    /// the new build.
+    #[test]
+    fn an_older_build_at_the_same_protocol_level_is_upgraded_when_listed() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "upg-build";
+            start_listed(&ghost_bin, name);
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let a = app
+                .open_single_window(&fe, name, group, None)
+                .expect("the window attaches");
+            // Same level, a build from long ago.
+            std::fs::write(ghost_vt::paths::build_path(name), "1").unwrap();
+
+            list_and_pump(&mut app, a, &fe, 5_000, || generation_of(name) > 0);
+            let upgraded = generation_of(name) > 0;
+            let republished = ghost_vt::client::session_build(name);
+            let _ = ghost_vt::session::kill_session(name);
+
+            assert!(upgraded, "the host re-exec'd in place");
+            assert_eq!(
+                republished,
+                ghost_vt::build::of_file(&ghost_bin),
+                "the upgraded host names the build it runs now"
+            );
+        });
+    }
+
+    /// A host already running a newer build than this ghost is left alone:
+    /// stepping it back is never an upgrade.
+    #[test]
+    fn a_newer_build_is_not_asked_to_upgrade() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let name = "upg-newer";
+            start_listed(&ghost_bin, name);
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let a = app.open_fleet_window(&fe, group, None);
+            std::fs::write(ghost_vt::paths::build_path(name), u64::MAX.to_string()).unwrap();
+
+            list_and_pump(&mut app, a, &fe, 1_500, || generation_of(name) > 0);
+            let generation = generation_of(name);
+            let _ = ghost_vt::session::kill_session(name);
+            assert_eq!(generation, 0, "never re-exec'd");
+        });
+    }
+
+    /// A bad build reaches one session, not all of them: the first host is
+    /// upgraded alone and checked on, and when it does not come back as the new
+    /// build the rest are left as they are. The target here passes every check
+    /// before the exec, then dies as the host — what no check can catch.
+    #[test]
+    fn a_first_upgrade_that_kills_its_host_stops_the_rest() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            start_listed(&ghost_bin, "canary-a");
+            start_listed(&ghost_bin, "canary-b");
+            let dir = tempfile::tempdir().unwrap();
+            let bad = dir.path().join("ghost");
+            std::fs::write(
+                &bad,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in __handoff) echo {} {} {};; *) exit 1;; esac\n",
+                    ghost_vt::server::HANDOFF_VERSION,
+                    ghost_vt::protocol::PROTO_LEVEL,
+                    u64::MAX - 1
+                ),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(bad.clone());
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            let a = app.open_fleet_window(&fe, group, None);
+
+            let listed = |name: &str| {
+                ghost_vt::session::list()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s.name == name)
+            };
+            let a_gone = || !listed("canary-a");
+            list_and_pump(&mut app, a, &fe, 5_000, a_gone);
+            // Long enough for the check on the first to have run, and for a
+            // rollout that ignored it to have reached the second.
+            list_and_pump(&mut app, a, &fe, 6_000, || false);
+            let first_gone = a_gone();
+            let second = generation_of("canary-b");
+            let second_live = listed("canary-b");
+            let _ = ghost_vt::session::kill_session("canary-b");
+            let _ = ghost_vt::session::kill_session("canary-a");
+
+            assert!(first_gone, "the bad build took the first host down");
+            assert!(second_live, "the second host is still running");
+            assert_eq!(second, 0, "and was never asked to upgrade");
+        });
+    }
+
     /// A remote host running an older ghost is upgraded the same way, over its
     /// transport, to the ghost this UI uses on that host.
     #[test]
@@ -11505,6 +11875,89 @@ mod tests {
             }
 
             assert!(upgraded, "the remote host runs this ghost's level now");
+        });
+    }
+
+    /// A remote host at this ghost's level but an older build is upgraded too,
+    /// judged by the build the remote ghost reports over the transport. The
+    /// shim's "remote" is this machine, so the same host is also listed locally;
+    /// the remote ghost is a later copy so that only the remote path can bring
+    /// the host to it (the host refuses to step back from it to the original).
+    #[test]
+    fn an_older_remote_build_at_the_same_level_is_upgraded_when_listed() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            let later = tempfile::tempdir().unwrap();
+            let remote_ghost = later.path().join("ghost");
+            std::fs::copy(&ghost_bin, &remote_ghost).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&remote_ghost)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+            let remote_build = ghost_vt::build::of_file(&remote_ghost);
+
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, remote_ghost.to_str().unwrap());
+            let name = "rupg-build";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            // Listed only once it has published its own build, which would
+            // overwrite ours.
+            let mut spun = 0;
+            while !ghost_vt::session::list()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name)
+                && spun < 100
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            // The shim's "remote" host is this machine: its marker is local.
+            std::fs::write(ghost_vt::paths::build_path(name), "1").unwrap();
+
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            let listed = remote_listing("kov@box", &[info(name, false)]);
+            app.dispatch(w, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+            let on_remote_build = || ghost_vt::client::session_build(name) == remote_build;
+            let mut spun = 0;
+            while !on_remote_build() && spun < 500 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let upgraded = on_remote_build();
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(upgraded, "the host re-exec'd onto the remote ghost's build");
         });
     }
 

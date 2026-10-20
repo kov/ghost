@@ -1046,6 +1046,48 @@ impl RemoteSsh {
         Ok(())
     }
 
+    /// The first line `<remote_ghost> <args…>` prints, bounded like
+    /// [`session_proto`](Self::session_proto); `None` when it fails or says
+    /// nothing in time.
+    fn read_line(&self, remote_ghost: &str, args: &[&str]) -> Option<String> {
+        let mut words = vec![remote_ghost];
+        words.extend_from_slice(args);
+        let mut child = self
+            .command(&words)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        if !matches!(wait_bounded(&mut child, PROTO_READ_TIMEOUT), Some(s) if s.success()) {
+            return None;
+        }
+        use std::io::Read as _;
+        let mut buf = String::new();
+        child.stdout.take()?.read_to_string(&mut buf).ok()?;
+        Some(buf.lines().next()?.trim().to_string())
+    }
+
+    /// The build the remote session `name`'s host runs (see [`crate::build`]),
+    /// via `<remote_ghost> __build <name>`. `None` when it has not published
+    /// one, or the remote ghost is too old to say.
+    pub fn session_build(&self, remote_ghost: &str, name: &str) -> Option<u64> {
+        self.read_line(remote_ghost, &["__build", name])?
+            .parse()
+            .ok()
+    }
+
+    /// The build of the remote ghost itself — what a host there would be
+    /// upgraded to — from the third field of its `__handoff` report. `None`
+    /// for a ghost too old to report it.
+    pub fn ghost_build(&self, remote_ghost: &str) -> Option<u64> {
+        self.read_line(remote_ghost, &["__handoff"])?
+            .split_whitespace()
+            .nth(2)?
+            .parse()
+            .ok()
+    }
+
     /// Ask the remote session `name`'s host to upgrade itself in place to the ghost
     /// at `remote_ghost` (`<remote_ghost> __upgrade <name> <path>`), keeping its
     /// program and screen. A ghost found on the remote `PATH` is resolved to its

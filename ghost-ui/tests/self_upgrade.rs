@@ -259,6 +259,90 @@ fn a_self_upgrade_refuses_a_protocol_downgrade() {
     assert_target_refused("downup", &target, "downgrade");
 }
 
+/// A host never steps back to an older build, even at the same protocol
+/// level: two ghosts of different builds asking would otherwise bounce every
+/// host between them. A target that reports an older build than the host's
+/// own is refused.
+#[test]
+fn a_self_upgrade_refuses_an_older_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Valid handoff and level; built at the dawn of time.
+    let body = format!("#!/bin/sh\necho {} {} 1\n", HANDOFF_VERSION, PROTO_LEVEL);
+    let target = write_fake_ghost(tmp.path(), &body, 0o755);
+    assert_target_refused("olderup", &target, "older build");
+}
+
+/// Which build a host runs — the modification time of the binary it was
+/// started from, in nanoseconds — is on disk for anyone deciding whether it
+/// needs upgrading, and `ghost __build` reports it (the far end of the remote
+/// transport).
+#[test]
+fn a_host_publishes_the_build_it_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "buildmark";
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "sh", "-c", "exec cat"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _guard = KillOnDrop { xdg, name };
+    let built = std::fs::metadata(GHOST)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_string();
+    let marker = sock(xdg, name).with_file_name("build");
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some(built.as_str()),
+        "a listed host has published its build"
+    );
+    let out = ghost(xdg).args(["__build", name]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), built);
+    // A host that died leaves its marker behind until the session is pruned;
+    // it no longer runs any build, and a rollout checking on it must hear so.
+    signal(&host_pid(xdg, name).expect("host pid"), "KILL");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !ghost(xdg)
+                .args(["__build", name])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        }),
+        "a dead host reports no build"
+    );
+    // And the probe a host runs on its upgrade target reports it too.
+    let out = Command::new(GHOST).arg("__handoff").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .nth(2),
+        Some(built.as_str())
+    );
+}
+
 /// An upgrade must keep the session the SAME session: the child's terminal
 /// geometry (the old code reverted it to the stale spawn-time `opts.size`) and
 /// the durable identity — the rename label, the creation time — must survive.
