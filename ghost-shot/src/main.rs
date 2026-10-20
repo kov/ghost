@@ -179,9 +179,10 @@ fn main() {
         "fleet" => fleet_scene(false),
         "fleet-revealed" => fleet_scene(true),
         "single" => single_scene(),
+        "status" => status_scene(),
         other => {
             eprintln!(
-                "unknown scene '{other}' (expected: fleet | fleet-revealed | single | zoom | bench | calib | calib-tui)"
+                "unknown scene '{other}' (expected: fleet | fleet-revealed | single | status | zoom | bench | calib | calib-tui)"
             );
             std::process::exit(2);
         }
@@ -1184,6 +1185,78 @@ fn single_scene() -> (ghost_render::Scene, u32, u32) {
     });
     let (root, states) = RootModel::single(model, METRICS, size);
     (root.view(&states), size.0, size.1)
+}
+
+/// The program-status chrome (OSC 7501): a window whose foreground session is
+/// working (the progress line along the bar), with a background session
+/// blocked on a permission prompt — counted on the titlebar's button, and its
+/// list unfolded over the terminal.
+fn status_scene() -> (ghost_render::Scene, u32, u32) {
+    let bar_px = 35u32;
+    let size = (1100u32, 700u32);
+    let content = (size.0, size.1 - bar_px);
+    let report = |root: &mut RootModel, states: &mut Sessions, name: &str, bytes: String| {
+        root.update(
+            states,
+            UiEvent::SessionData {
+                name: name.into(),
+                bytes: bytes.into_bytes(),
+                ended: false,
+            },
+        );
+    };
+    let mut model = TerminalModel::new("build".into(), 80, 24, METRICS);
+    model.update(UiEvent::Resize {
+        w_px: content.0,
+        h_px: content.1,
+        scale: 1.0,
+    });
+    let (mut root, mut states) = RootModel::single(model, METRICS, content);
+    let mut other = TerminalModel::new("review".into(), 80, 24, METRICS);
+    other.update(UiEvent::Resize {
+        w_px: content.0,
+        h_px: content.1,
+        scale: 1.0,
+    });
+    let _ = states.adopt(other);
+    root.update(&mut states, UiEvent::AdoptSession("review".into()));
+    root.update(&mut states, UiEvent::AdoptSession("build".into()));
+    for now_ms in [0, 10_000] {
+        root.update(&mut states, UiEvent::Tick { now_ms });
+    }
+    report(&mut root, &mut states, "build", EDIT.to_string());
+    report(
+        &mut root,
+        &mut states,
+        "build",
+        "\x1b]7501;state=working:app=claude-code:progress=62\x1b\\".into(),
+    );
+    // "approve Bash: cargo publish --dry-run"
+    report(
+        &mut root,
+        &mut states,
+        "review",
+        "\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBjYXJnbyBwdWJsaXNoIC0tZHJ5LXJ1bg==\x1b\\".into(),
+    );
+    let _ = root.toggle_attention(&states);
+    let bar = ghost_ui_core::frame::Titlebar {
+        height_px: bar_px,
+        bg: [0.19, 0.19, 0.21, 1.0],
+        fg: [0.92, 0.92, 0.94, 1.0],
+        title: "~/P/ghost".into(),
+        notice: root.chrome_notice(),
+        status: root.bar_status(&states),
+        attention: root.attention_badge(&states),
+        font_px: 14.0,
+        buttons: ghost_ui_core::frame::ButtonLayout::parse(":minimize,maximize,close"),
+        hovered: None,
+        pressed: None,
+        maximized: false,
+        scale: 1.0,
+        controls_px: 0.0,
+    };
+    let scene = ghost_ui_core::frame::with_titlebar(root.view(&states), &bar);
+    (scene, size.0, size.1)
 }
 
 fn feed(
