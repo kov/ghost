@@ -109,6 +109,13 @@ pub enum Query {
     /// not set one reads back the theme foreground, which is what its text is
     /// painted with.
     SpecialColors(Vec<u16>),
+    /// `OSC 7501 ; ? ST` — the Program Status Protocol's capability query
+    /// (`docs/program-status-design.md`). Reply: `OSC 7501 ; ? : states=… :
+    /// kinds=… ST`, listing every state and blocked-kind ghost understands. A
+    /// program sends `CSI c` right behind the query and counts the protocol
+    /// unsupported if the DA reply comes first; answering both in stream order
+    /// here is what makes it come second.
+    ProgramStatus,
     /// `CSI ? 996 n` — one-shot color-scheme request (contour's dark/light
     /// extension, mode 2031's query form). Reply: `CSI ? 997 ; Ps n` with
     /// Ps 1 = dark, 2 = light.
@@ -489,6 +496,7 @@ impl Query {
                 let pm = decrpm_pm((ctx.ansi_mode_state)(*mode));
                 format!("\x1b[{mode};{pm}$y").into_bytes()
             }
+            Query::ProgramStatus => b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\".to_vec(),
             Query::ForegroundColor => {
                 format!("\x1b]10;{}\x1b\\", xterm_rgb(ctx.colors.fg)).into_bytes()
             }
@@ -715,6 +723,10 @@ impl QueryScanner {
                 asked if asked.is_empty() => Vec::new(),
                 asked => vec![Query::SpecialColors(asked)],
             },
+            // OSC 7501 ; ? — the capability query. Whitespace around a value is
+            // stripped by the spec; anything else after the `;` is a report,
+            // which the emulator applies and nobody answers.
+            "7501" if rest.trim() == "?" => vec![Query::ProgramStatus],
             _ => Vec::new(),
         }
     }
@@ -1009,6 +1021,30 @@ mod tests {
         );
         // A bare `CSI ... y` without the `*` intermediate is not DECRQCRA.
         assert!(scan_all(b"\x1b[1;1;1;1y").is_empty());
+    }
+
+    /// OSC 7501's capability query, and only the query: a report is the
+    /// emulator's to apply, never answered. The program sends `CSI c` right
+    /// behind it and reads support off which reply arrives first, so the
+    /// order the two are answered in is the protocol.
+    #[test]
+    fn recognizes_the_program_status_query_ahead_of_device_attributes() {
+        assert_eq!(scan_all(b"\x1b]7501;?\x1b\\"), [Query::ProgramStatus]);
+        assert_eq!(scan_all(b"\x1b]7501;?\x07"), [Query::ProgramStatus]);
+        assert_eq!(scan_all(b"\x1b]7501; ? \x07"), [Query::ProgramStatus]);
+        assert!(scan_all(b"\x1b]7501;state=working\x07").is_empty());
+        assert_eq!(
+            scan_all(b"\x1b]7501;?\x1b\\\x1b[c"),
+            [Query::ProgramStatus, Query::PrimaryDeviceAttributes]
+        );
+    }
+
+    #[test]
+    fn the_program_status_reply_lists_every_state_and_kind() {
+        assert_eq!(
+            Query::ProgramStatus.reply(&ctx()),
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+        );
     }
 
     #[test]

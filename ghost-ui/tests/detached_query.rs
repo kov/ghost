@@ -381,6 +381,43 @@ fn detached_session_answers_xtversion_query() {
     );
 }
 
+/// Claude Code reports its state over OSC 7501 only once the terminal answers
+/// the protocol's capability query, and it reads support off reply order: it
+/// sends `CSI c` right behind the query, and a DA reply that comes first means
+/// "unsupported". A detached session must answer both, the status one first.
+#[test]
+fn detached_session_answers_program_status_query_before_device_attributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "program-status-detached";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Read up to the first backslash: the status reply's ST. A DA reply has
+    // none, so had it come first it would lead the text read.
+    let sentinel = xdg.join("program-status-answered");
+    let script = format!(
+        "printf '\\033]7501;?\\033\\\\\\033[c'; \
+         if IFS= read -r -s -d '\\' -t 2 reply; then \
+           case \"$reply\" in $'\\e]7501;?:states='*) touch '{}';; esac; fi; \
+         exec sleep 60",
+        sentinel.display()
+    );
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--", "bash", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new -d` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.exists()),
+        "detached session did not answer the program status query ahead of DA"
+    );
+}
+
 #[test]
 fn detached_session_answers_kitty_graphics_query() {
     let tmp = tempfile::tempdir().unwrap();
