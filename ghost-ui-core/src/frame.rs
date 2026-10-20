@@ -607,11 +607,16 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
         // Centred between the button groups rather than on the window, so a
         // title long enough to reach them stays clear of them — and a window
         // with buttons on one side only still reads as centred in what is left.
+        // From a bare edge, as far in as the close button's ✕ ends from the
+        // other one, so a heading long enough to show from its start mirrors
+        // the buttons' end of the bar. The ✕ is centred in its button and about
+        // 0.6 em of ink.
+        let edge_inset = (BUTTON_GAP + BUTTON_SIZE * 0.5) * bar.scale - 0.3 * bar.font_px;
         let left = buttons
             .iter()
             .filter(|(b, _)| bar.buttons.left.contains(b))
             .map(|(_, r)| r.x + r.w)
-            .fold(strip.x + bar.controls_px, f32::max);
+            .fold(strip.x + bar.controls_px.max(edge_inset), f32::max);
         let right = buttons
             .iter()
             .filter(|(b, _)| bar.buttons.right.contains(b))
@@ -1490,6 +1495,42 @@ mod tests {
             r.x + r.w <= leftmost_button,
             "the title's box stops before the buttons ({} vs {leftmost_button})",
             r.x + r.w
+        );
+    }
+
+    /// With nothing on its left but the window's edge, the heading starts as
+    /// far in from it as the close button's ✕ ends from the right — so a long
+    /// heading, which shows from its start, mirrors the buttons' end of the bar
+    /// rather than touching the edge.
+    #[test]
+    fn the_heading_starts_as_far_in_as_the_close_glyph_ends() {
+        let bar = Titlebar {
+            buttons: ButtonLayout::parse(":minimize,maximize,close"),
+            ..titlebar(35)
+        };
+        let scene = with_titlebar(content(800, 565), &bar);
+        let heading = scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                SceneItem::ChromeText { id, rect, .. } if *id == SceneId::Titlebar => Some(*rect),
+                _ => None,
+            })
+            .expect("the title is drawn");
+        let close = button_rects(&bar.buttons, BAR, 1.0)
+            .into_iter()
+            .find(|(b, _)| *b == WindowButton::Close)
+            .unwrap()
+            .1;
+        // The ✕ is drawn centred in its button, about 0.6 em of ink.
+        let glyph_end = close.x + close.w * 0.5 + 0.3 * bar.font_px;
+        let margin = BAR.x + BAR.w - glyph_end;
+        assert!(margin > 6.0, "{margin}");
+        assert!(
+            (heading.x - (BAR.x + margin)).abs() < 0.01,
+            "{} vs {margin}",
+            heading.x
         );
     }
 
