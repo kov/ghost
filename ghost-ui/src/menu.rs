@@ -173,6 +173,8 @@ pub enum MenuAction {
     ZoomOut,
     ZoomReset,
     ToggleFleet,
+    /// File > Open Selection (Cmd-O): the selected file or URL.
+    OpenSelection,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -191,6 +193,7 @@ impl MenuAction {
             MenuAction::ZoomReset => 7,
             MenuAction::ToggleFleet => 8,
             MenuAction::LaunchWindow => 9,
+            MenuAction::OpenSelection => 10,
         }
     }
 
@@ -207,6 +210,7 @@ impl MenuAction {
             7 => MenuAction::ZoomReset,
             8 => MenuAction::ToggleFleet,
             9 => MenuAction::LaunchWindow,
+            10 => MenuAction::OpenSelection,
             _ => return None,
         })
     }
@@ -230,7 +234,7 @@ pub enum MenuIntent {
     FocusedKey(Key, Mods),
 }
 
-/// Map a menu action to its effect. Copy / Paste / Zoom re-use the Command chords
+/// Map a menu action to its effect. Copy / Paste / Open / Zoom re-use the Command chords
 /// the core already classifies (Cmd is `Mods::SUPER`), so the menu replays a
 /// keystroke rather than duplicating the shortcut logic. Toggle Fleet replays the
 /// bare F9 the core interprets directly.
@@ -245,6 +249,7 @@ pub fn menu_intent(action: MenuAction) -> MenuIntent {
         MenuAction::ZoomOut => MenuIntent::FocusedKey(Key::Char("-".into()), Mods::SUPER),
         MenuAction::ZoomReset => MenuIntent::FocusedKey(Key::Char("0".into()), Mods::SUPER),
         MenuAction::ToggleFleet => MenuIntent::FocusedKey(Key::Named(NamedKey::F9), Mods::NONE),
+        MenuAction::OpenSelection => MenuIntent::FocusedKey(Key::Char("o".into()), Mods::SUPER),
     }
 }
 
@@ -378,6 +383,13 @@ mod imp {
             ns_string!("New Session"),
             MenuAction::NewSession,
             ns_string!("t"),
+        ));
+        file.addItem(&action_item(
+            mtm,
+            &target,
+            ns_string!("Open Selection"),
+            MenuAction::OpenSelection,
+            ns_string!("o"),
         ));
         file.addItem(&NSMenuItem::separatorItem(mtm));
         // performClose: sends the key window a close, which winit surfaces as
@@ -699,6 +711,7 @@ mod tests {
             MenuAction::ZoomReset,
             MenuAction::ToggleFleet,
             MenuAction::LaunchWindow,
+            MenuAction::OpenSelection,
         ] {
             assert_eq!(MenuAction::from_tag(action.tag()), Some(action));
             assert!(
@@ -746,6 +759,10 @@ mod tests {
         assert_eq!(
             menu_intent(MenuAction::ZoomReset),
             MenuIntent::FocusedKey(Key::Char("0".into()), Mods::SUPER)
+        );
+        assert_eq!(
+            menu_intent(MenuAction::OpenSelection),
+            MenuIntent::FocusedKey(Key::Char("o".into()), Mods::SUPER)
         );
         // Toggle Fleet replays the bare F9 the core interprets directly.
         assert_eq!(
