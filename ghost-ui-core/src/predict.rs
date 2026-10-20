@@ -732,10 +732,17 @@ impl PredictionEngine {
                                 self.glitch_trigger -= 1;
                                 self.last_quick_confirmation = Some(now);
                             }
-                            // The rest of the row takes on the real renditions.
+                            // The rest of the row takes on the real renditions —
+                            // its characters, not its blanks (mosh styles those
+                            // too). A predicted blank is the screen's own blank
+                            // shifted along, already in the screen's style; given
+                            // an underline or a background it would draw that out
+                            // to the edge of the window.
                             let pen = *screen.cell(row, col).pen();
                             for k in &mut self.overlays[ri].cells[ci..] {
-                                k.replacement = with_pen(k.replacement, pen);
+                                if !is_blank(&k.replacement) {
+                                    k.replacement = with_pen(k.replacement, pen);
+                                }
                             }
                         }
                         self.overlays[ri].cells[ci].reset();
@@ -1154,5 +1161,33 @@ mod tests {
         type_bytes(&mut e, &mut seq, "w", &vt, t0 + ms(310));
         assert!(e.shown().is_empty());
         assert_eq!(e.wants_tick(), None);
+    }
+
+    /// A confirmed echo's style carries on to the typed characters after it, but
+    /// never to the blanks the typing shifted along: those are the screen's own
+    /// blanks, and an underline (fish's valid-path one, say) copied onto them
+    /// draws a rule out to the window's edge.
+    #[test]
+    fn an_underlined_echo_never_styles_the_blanks_after_it() {
+        let t0 = Instant::now();
+        let mut vt = prompt();
+        let mut seq = 0;
+        let mut e = confirmed(&mut vt, &mut seq, t0);
+        type_bytes(&mut e, &mut seq, "a", &vt, t0 + ms(400));
+        let a = seq;
+        type_bytes(&mut e, &mut seq, "b", &vt, t0 + ms(420));
+        vt.feed_str("\x1b[4ma\x1b[m");
+        e.echo_ack(a, &vt, t0 + ms(800));
+        let shown: Vec<_> = e
+            .shown()
+            .cells
+            .iter()
+            .map(|(r, c, cell)| (*r, *c, cell.char(), cell.pen().is_underline()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![(0, 4, 'b', true)],
+            "only the typed `b` is drawn, in the style it continues"
+        );
     }
 }

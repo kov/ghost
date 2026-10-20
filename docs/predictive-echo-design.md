@@ -140,7 +140,10 @@ each predicted cell whose `expiration_frame ≤ echo_ack`:
 
 - **Correct** (replica cell content matches, and it is not just the original
   content): confirm its epoch; copy the real renditions onto the rest of the
-  row's predictions; retire it.
+  row's predicted characters; retire it. Unlike mosh, predicted blanks keep
+  their own renditions: they are the screen's blanks shifted along, and an
+  inherited underline (fish's valid-path style) or background would draw a
+  rule out to the window's edge.
 - **Correct, no credit** (blank prediction, `unknown`, or it matches what was
   there before): retire it without confirming.
 - **Incorrect**: if it was tentative, kill that epoch; otherwise reset the whole
