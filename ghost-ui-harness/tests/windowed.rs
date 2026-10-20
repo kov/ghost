@@ -74,6 +74,7 @@ fn info(name: &str, attached: bool, created_at: i64) -> SessionInfo {
         connection: None,
         holder: None,
         group: None,
+        status: None,
     }
 }
 

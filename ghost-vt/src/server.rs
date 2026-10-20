@@ -1193,6 +1193,7 @@ fn host_main(
             connection: opts.connection.clone(),
             policy: inherited_policy,
             group: inherited_group,
+            status: None,
         },
     };
     let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
@@ -2109,6 +2110,19 @@ fn host_main(
                 title: meta.title.clone(),
                 display_name: meta.display_name.clone(),
             };
+            // The program's status: published when it changes, and seen the
+            // moment a display client is attached to see it.
+            let status = next_status(
+                meta.status.as_ref(),
+                screen.vt().program_status().headline(),
+                now_state.attached.is_some(),
+                unix_ms(),
+            );
+            let restatused = status != meta.status;
+            if restatused {
+                meta.status = status;
+                let _ = crate::meta::write(&paths::meta_path(current_name), &meta);
+            }
             let grid = screen.dimensions();
             let regridded = grid != last_grid;
             last_grid = grid;
@@ -2148,6 +2162,9 @@ fn host_main(
                 }
                 if regrouped {
                     events.push(SessionEvent::GroupChanged(meta.group.clone()));
+                }
+                if restatused {
+                    events.push(SessionEvent::StatusChanged(meta.status.clone()));
                 }
                 match (&last_state.attached, &now_state.attached) {
                     (before, Some(info)) if before.as_ref() != Some(info) => {
@@ -2227,6 +2244,49 @@ enum Disposition {
     Drop,
     /// Kill the whole session.
     Kill,
+}
+
+/// Unix milliseconds now (0 if the clock is before the epoch).
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The status to publish, given the one last published and the emulator's
+/// headline now. While the state (and its blocked kind) holds, the status
+/// keeps its age and whether it was seen — a new message under the same state
+/// is the same wait, not a new one. It is seen once a display client has been
+/// attached since it changed: switching to the session is looking at it.
+fn next_status(
+    previous: Option<&crate::protocol::StatusHeadline>,
+    headline: Option<ghost_term::status::StatusRecord>,
+    attached: bool,
+    now: i64,
+) -> Option<crate::protocol::StatusHeadline> {
+    let headline = headline?;
+    let held = previous.filter(|p| p.state == headline.state && p.kind == headline.kind);
+    Some(crate::protocol::StatusHeadline {
+        state: headline.state,
+        kind: headline.kind,
+        progress: headline.progress,
+        app: headline.app,
+        title: headline.title,
+        msg: headline.msg,
+        seen: attached || held.is_some_and(|p| p.seen),
+        since: held.map_or(now, |p| p.since),
+    })
+}
+
+/// Tell a new watcher the program's current status, straight after its
+/// snapshot — whose layout older subscribers decode, so it can't carry it.
+fn queue_current_status(c: &mut Client, meta: &crate::meta::Meta) {
+    if let Some(status) = &meta.status {
+        c.queue(&ServerMsg::Event(
+            crate::protocol::SessionEvent::StatusChanged(Some(status.clone())),
+        ));
+    }
 }
 
 /// Read the display client once and act on whatever it sent, dropping it (to
@@ -2456,6 +2516,7 @@ fn handle_client_messages(
                     title: meta.title.clone(),
                     display_name: meta.display_name.clone(),
                 }));
+                queue_current_status(c, meta);
                 c.subscribed = true;
             }
             ClientMsg::Observe => {
@@ -2470,6 +2531,7 @@ fn handle_client_messages(
                     title: meta.title.clone(),
                     display_name: meta.display_name.clone(),
                 }));
+                queue_current_status(c, meta);
                 let (cols, rows) = screen.dimensions();
                 c.queue(&ServerMsg::Event(crate::protocol::SessionEvent::Resized {
                     cols,

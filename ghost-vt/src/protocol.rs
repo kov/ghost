@@ -157,6 +157,33 @@ pub struct SessionState {
     pub display_name: String,
 }
 
+/// What a session's program last said it is doing over OSC 7501 — the
+/// emulator's headline record ([`ghost_term::status::ProgramStatus::headline`])
+/// plus what only the host can know about it. Carried in the session's `meta`
+/// (so listings, local and remote, report it) and pushed as
+/// [`SessionEvent::StatusChanged`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusHeadline {
+    pub state: ghost_term::status::StatusState,
+    /// Why it is blocked; only ever set when `state` is `Blocked`.
+    pub kind: Option<ghost_term::status::BlockedKind>,
+    /// 0–100 while working or blocked; `None` is indeterminate.
+    pub progress: Option<u8>,
+    /// The program's stable identifier (`claude-code`), inherited from an
+    /// ancestor record when the headline carries none.
+    pub app: Option<String>,
+    pub title: Option<String>,
+    /// One line of what it is doing, waiting for, or finished.
+    pub msg: Option<String>,
+    /// Whether a display client has been attached since the state last
+    /// changed — a `done` or `error` nobody was looking at is unseen until
+    /// someone switches to the session, exactly like the bell.
+    pub seen: bool,
+    /// Unix milliseconds at which the state (or its blocked kind) last changed.
+    /// A new message under the same state keeps it.
+    pub since: i64,
+}
+
 /// A state change pushed to subscribers as [`ServerMsg::Event`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEvent {
@@ -183,6 +210,11 @@ pub enum SessionEvent {
     /// The session joined a group, or left its group (`None`)
     /// ([`ClientMsg::SetGroup`]).
     GroupChanged(Option<String>),
+    /// The program's status headline changed, or — right after the
+    /// [`ServerMsg::Snapshot`] — what it currently is, when there is one.
+    /// `None`: no program has a status any more. Appended after
+    /// `GroupChanged`; older subscribers skip the unknown frame.
+    StatusChanged(Option<StatusHeadline>),
 }
 
 /// Messages sent from the session host to an attach client.

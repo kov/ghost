@@ -209,6 +209,7 @@ impl Harness {
                 connection: None,
                 holder: None,
                 group: None,
+                status: None,
             })
             .collect()
     }

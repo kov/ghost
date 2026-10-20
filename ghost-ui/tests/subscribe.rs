@@ -8,9 +8,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use ghost_term::status::{BlockedKind, StatusState};
 use ghost_vt::client::{Client, Subscriber};
 use ghost_vt::protocol::{
-    AttachInfo, ClientMsg, PROTO_SUBSCRIBE, ServerMsg, SessionEvent, SessionState,
+    AttachInfo, ClientMsg, PROTO_SUBSCRIBE, ServerMsg, SessionEvent, SessionState, StatusHeadline,
 };
 
 const GHOST: &str = env!("CARGO_BIN_EXE_ghost");
@@ -1041,4 +1042,190 @@ fn a_relaunched_session_comes_back_in_its_group() {
         Some("win-5-5"),
         "the relaunched session is back in its group"
     );
+}
+
+/// The session's listing entry, parsed as a front-end reads it.
+fn listed(xdg: &Path, name: &str) -> Option<ghost_vt::session::SessionInfo> {
+    let out = ghost(xdg).args(["ls", "--json"]).output().ok()?;
+    let sessions: Vec<ghost_vt::session::SessionInfo> = serde_json::from_slice(&out.stdout).ok()?;
+    sessions.into_iter().find(|s| s.name == name)
+}
+
+fn listed_status(xdg: &Path, name: &str) -> Option<StatusHeadline> {
+    listed(xdg, name)?.status
+}
+
+/// `OSC 7501` report as a `printf` format: the pairs, then ST.
+fn status_report(pairs: &str) -> String {
+    format!("printf '\\033]7501;{pairs}\\033\\\\'")
+}
+
+/// What Claude Code says at a permission prompt reaches every front-end — the
+/// listing (which the remote fleet reads too) and a subscriber's push — and
+/// ends there when the program clears it. Nobody was attached to see it.
+#[test]
+fn a_programs_status_is_listed_and_pushed_until_it_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "status-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    // The child moves on one step per line written to this FIFO, so the test
+    // decides when each report lands without anyone attaching.
+    let fifo = xdg.join("step");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // "approve Bash: rm x", base64.
+    let msg = "YXBwcm92ZSBCYXNoOiBybSB4";
+    let script = format!(
+        "exec 3<'{}'; read line <&3; {}; read line <&3; {}; sleep 60",
+        fifo.display(),
+        status_report(&format!(
+            "state=blocked:app=claude-code:kind=permission:msg={msg}"
+        )),
+        status_report("state=clear"),
+    );
+    let session_dir = spawn_session(xdg, name, &script);
+    let sock = session_dir.join("sock");
+    assert_eq!(
+        listed_status(xdg, name),
+        None,
+        "no status before any report"
+    );
+
+    let mut sub = Client::connect_path(&sock).expect("subscriber connect");
+    sub.send(&ClientMsg::Subscribe).unwrap();
+    recv_snapshot(&mut sub, Duration::from_secs(5)).expect("snapshot");
+    let mut seen = Vec::new();
+
+    let mut step = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    use std::io::Write;
+    step.write_all(b"\n").unwrap();
+
+    let is_blocked = |s: &StatusHeadline| {
+        s.state == StatusState::Blocked
+            && s.kind == Some(BlockedKind::Permission)
+            && s.app.as_deref() == Some("claude-code")
+            && s.msg.as_deref() == Some("approve Bash: rm x")
+            && !s.seen
+            && s.since > 0
+    };
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|e| matches!(e, SessionEvent::StatusChanged(Some(s)) if is_blocked(s)))
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_some_and(|s| is_blocked(&s))),
+        "listing never reported the blocked status: {:?}",
+        listed_status(xdg, name)
+    );
+
+    step.write_all(b"\n").unwrap();
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.last() == Some(&SessionEvent::StatusChanged(None))
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_none()),
+        "listing kept a cleared status"
+    );
+}
+
+/// A watcher that starts after the program reported still learns its status,
+/// straight after the snapshot — a window opened later sees the session asking.
+#[test]
+fn a_late_subscriber_learns_the_status_after_its_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "status-late-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    let script = format!("{}; sleep 60", status_report("state=blocked:kind=question"));
+    let session_dir = spawn_session(xdg, name, &script);
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_some()),
+        "status never listed"
+    );
+
+    let mut sub = Client::connect_path(&session_dir.join("sock")).expect("connect");
+    sub.send(&ClientMsg::Subscribe).unwrap();
+    // The status follows the snapshot at once, likely in the same read, so
+    // keep everything after the snapshot rather than `recv_snapshot`'s cut.
+    sub.set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    let mut msgs = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            if let Ok(Some(batch)) = sub.recv_ready() {
+                msgs.extend(batch);
+            }
+            msgs.iter().any(|m| matches!(m, ServerMsg::Snapshot(_)))
+        }),
+        "no snapshot"
+    );
+    let first = msgs
+        .iter()
+        .position(|m| matches!(m, ServerMsg::Snapshot(_)))
+        .unwrap();
+    let mut seen: Vec<SessionEvent> = msgs
+        .drain(first + 1..)
+        .filter_map(|m| match m {
+            ServerMsg::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    recv_events_until(&mut sub, &mut seen, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| {
+            matches!(e, SessionEvent::StatusChanged(Some(s))
+                if s.state == StatusState::Blocked && s.kind == Some(BlockedKind::Question))
+        })
+    });
+}
+
+/// A result nobody saw stays unseen until someone switches to the session,
+/// like the bell; a new message under the same state keeps its age.
+#[test]
+fn a_status_is_seen_once_a_display_client_attaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "status-seen-test";
+    let _guard = KillOnDrop { xdg, name };
+
+    let script = format!(
+        "{}; read line; {}; sleep 60",
+        status_report("state=working:msg=b25l"),
+        status_report("state=working:msg=dHdv"),
+    );
+    let session_dir = spawn_session(xdg, name, &script);
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_some_and(|s| s.msg.as_deref() == Some("one") && !s.seen)),
+        "unseen status never listed: {:?}",
+        listed_status(xdg, name)
+    );
+    let since = listed_status(xdg, name).unwrap().since;
+
+    let mut display = Client::connect_path(&session_dir.join("sock")).expect("connect");
+    display
+        .send(&ClientMsg::Resize { cols: 80, rows: 24 })
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_some_and(|s| s.seen)),
+        "attaching never marked the status seen"
+    );
+    display.send(&ClientMsg::Input(b"\n".to_vec())).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || listed_status(xdg, name)
+            .is_some_and(|s| s.msg.as_deref() == Some("two"))),
+        "the new message never listed"
+    );
+    assert_eq!(listed_status(xdg, name).unwrap().since, since);
 }

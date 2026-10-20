@@ -65,6 +65,10 @@ pub struct SessionInfo {
     /// [`ClientMsg::SetGroup`](crate::protocol::ClientMsg::SetGroup)), read from
     /// the host's `meta`. `None` when ungrouped.
     pub group: Option<String>,
+    /// What the session's program last said it is doing (OSC 7501), read
+    /// from the host's `meta`. `None` when nothing has a status — or the host
+    /// predates program status (a missing field reads as `None`).
+    pub status: Option<crate::protocol::StatusHeadline>,
 }
 
 impl SessionInfo {
@@ -188,6 +192,7 @@ fn list_in_with(
                     connection: meta.connection,
                     holder: holder.filter(|h| !h.is_empty()),
                     group: meta.group,
+                    status: meta.status,
                 });
             }
             HostState::Starting => {} // keep, but not yet listable
@@ -610,6 +615,7 @@ mod tests {
             connection: None,
             holder: None,
             group: None,
+            status: None,
         };
         assert_eq!(s.display(), "sess-1", "unset display falls back to the id");
         s.display_name = "build box".into();
@@ -634,6 +640,7 @@ mod tests {
             connection: crate::connection::ConnectionSpec::parse_target("kov@box"),
             holder: None,
             group: None,
+            status: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: SessionInfo = serde_json::from_str(&json).unwrap();
@@ -660,6 +667,7 @@ mod tests {
                 policy: ghost_term::TerminalPolicy::default(),
                 connection: None,
                 group: None,
+                status: None,
             },
         )
         .unwrap();

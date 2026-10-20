@@ -12522,6 +12522,7 @@ mod tests {
             connection: None,
             holder: None,
             group: None,
+            status: None,
         }
     }
 
@@ -12573,6 +12574,7 @@ mod tests {
             connection: None, // the remote host reports it as local-to-itself
             holder: None,
             group: None,
+            status: None,
         };
         let renamed = SessionInfo {
             name: "raw-id".into(),

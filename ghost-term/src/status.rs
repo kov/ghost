@@ -19,7 +19,9 @@ use base64::engine::DecodePaddingMode;
 use base64::Engine;
 
 /// What a program says it is doing.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum StatusState {
     /// At rest, waiting for the user's next instruction.
     Idle,
@@ -64,7 +66,7 @@ impl StatusState {
 }
 
 /// Why a `blocked` program is waiting.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlockedKind {
     /// Approval to act.
     Permission,

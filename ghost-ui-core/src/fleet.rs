@@ -1706,6 +1706,7 @@ impl FleetModel {
                 }
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
+            SessionPush::Event(SessionEvent::StatusChanged(_)) => {}
             // Group membership still lives in the UI's own registry; the host's
             // copy is not read yet.
             SessionPush::Event(SessionEvent::GroupChanged(_)) => {}
@@ -4521,6 +4522,7 @@ mod tests {
             connection: None,
             holder: None,
             group: None,
+            status: None,
         }
     }
 

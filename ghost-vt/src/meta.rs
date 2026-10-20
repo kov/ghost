@@ -55,6 +55,10 @@ pub struct Meta {
     /// the durable descriptor so the membership outlives the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// What the session's program last said it is doing (OSC 7501), `None`
+    /// when nothing has a status. Kept here so discovery reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<crate::protocol::StatusHeadline>,
 }
 
 /// Write `meta` to `path` atomically (write a sibling temp file, then rename),
@@ -88,6 +92,7 @@ mod tests {
             connection: None,
             policy: ghost_term::TerminalPolicy::default(),
             group: None,
+            status: None,
         };
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), Some(meta));

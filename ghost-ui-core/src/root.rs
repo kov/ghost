@@ -4055,6 +4055,7 @@ mod tests {
             connection: None,
             holder: None,
             group: None,
+            status: None,
         }
     }
 
@@ -4613,6 +4614,7 @@ mod tests {
                 connection: None,
                 holder: None,
                 group: None,
+                status: None,
             }
         }
         let mut r = root(); // owns "alpha"
@@ -5355,6 +5357,7 @@ mod tests {
             connection: None,
             holder: None,
             group: None,
+            status: None,
         }
     }
 
