@@ -193,39 +193,37 @@ Test-first, outer behaviour first:
 - **Remote (`shell_remote.rs`):** a remote background session's status reaches
   the affordance through the watch feed.
 
-## Before building: what Claude Code really sends
+## What Claude Code sends
 
-Claude Code's docs say only that terminals implementing the protocol "can show
-whether Claude Code is working, waiting on you, or done". They do not say which
-states it emits, when it emits them, or whether it clears its records when it
-exits.
+Measured 2026-10-20 against Claude Code 2.1.304, read back from a ghost
+recording.
 
-So the first step is the query reply alone. Then run Claude Code in a ghost
-session and read the recording back, which captures the output stream, to
-record what it actually sends:
+- It queries (`OSC 7501 ; ?`) at startup, and again when resumed.
+- **Root record only.** It never sends `id`, `title` or `progress`, and every
+  report carries `app=claude-code`.
 
-- per turn;
-- at a permission prompt;
-- at an AskUserQuestion;
-- on Ctrl-C;
-- on `/exit`.
+| Moment | Report |
+| --- | --- |
+| Started, waiting for a prompt | `state=idle` |
+| A turn starts | `state=working` |
+| Each tool call | `state=working` + `msg`, the call's description ("Exporting this session and listing OSC 7501 reports") |
+| An AskUserQuestion | `state=blocked:kind=question` + `msg`, e.g. "answer: <question> (<option> · <option>)" |
+| A permission prompt | `state=blocked:kind=permission` + `msg`, e.g. "approve Bash: rm …" |
+| Answered or approved | `state=working` |
+| The turn ends | `state=done`, held until the next turn starts |
+| Ctrl-C | `state=idle` |
+| `/exit` | `state=clear`, sent three times |
 
-That settles the open questions below, and the record's lifetime rules are
-adjusted only if reality forces it.
+So the root record alone carries everything the chrome shows. Claude Code
+cleans up after itself on exit, so no stale record is left behind.
 
 ## Decisions
 
 - **Scope of the affordance:** the window's own group. It lists the members of
   this window's group that are not its foreground session. Sessions elsewhere
   are their own windows' business, for now.
-- **Leftovers when a program exits without clearing its records:**
-  - The shell prompt clears `working` and `blocked`, but only with OSC 133
-    shell integration. Without it, a stale `working` record could outlive
-    Claude Code.
-  - If the capture shows Claude Code leaves records behind, records are also
-    dropped when the program leaves the alternate screen, which Claude Code's
-    fullscreen mode uses. This is a deliberate deviation from the spec, scoped
-    to that case.
+- **Leftovers when a program exits:** none from Claude Code, which clears its
+  record on `/exit`. ghost follows the spec's lifetime rules as written.
 - **Tints:** as in the table above, to be revisited after dogfooding.
 - **Desktop notifications** (the spec allows them, rate-limited) are left for
   later.
