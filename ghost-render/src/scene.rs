@@ -58,6 +58,8 @@ pub enum SceneId {
     WindowButton,
     /// The titlebar's "Details" button, offering the rest of a failure notice.
     NoticeDetails,
+    /// The line along the titlebar's foot showing a working program's progress.
+    StatusProgress,
 }
 
 /// Where a [`SceneItem::ChromeText`] sits in its box.

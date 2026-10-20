@@ -1134,3 +1134,68 @@ fn the_open_chord_opens_the_selected_file_or_url() {
         support::kill_session("opener");
     });
 }
+
+/// What a session's program says over OSC 7501 reaches the window's header
+/// bar: a permission prompt with its message while it waits, then — once the
+/// user answers — a finished turn, shown until the next key press.
+#[test]
+fn the_header_bar_shows_what_the_foreground_program_is_doing() {
+    use ghost_ui_core::frame::BarStatus;
+    with_isolated_xdg(|_| {
+        // "approve Bash: rm x", base64.
+        support::spawn_session_running(
+            "asker",
+            "printf '\\033]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSB4\\033\\\\'; \
+             read answer; \
+             printf '\\033]7501;state=done:app=claude-code\\033\\\\'; \
+             exec cat",
+        );
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "asker", g, None)
+            .expect("window");
+        let status = |app: &mut App| {
+            app.wake(&fe);
+            app.root(wid).expect("window").bar_status(app.states())
+        };
+
+        let asking = Some(BarStatus::Blocked {
+            urgent: true,
+            msg: Some("approve Bash: rm x".into()),
+        });
+        assert!(
+            wait_until(Duration::from_secs(10), || status(&mut app) == asking),
+            "the bar never showed the prompt: {:?}",
+            status(&mut app)
+        );
+
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Named(ghost_ui_core::NamedKey::Enter),
+                ghost_ui_core::Mods::default(),
+            ),
+            &fe,
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || status(&mut app)
+                == Some(BarStatus::Done)),
+            "the bar never showed the finished turn: {:?}",
+            status(&mut app)
+        );
+
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Char("x".into()),
+                ghost_ui_core::Mods::default(),
+            ),
+            &fe,
+        );
+        assert_eq!(status(&mut app), None, "a key press is the result seen");
+        support::kill_session("asker");
+    });
+}

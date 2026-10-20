@@ -518,6 +518,11 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
+    /// The foreground session's program status the user has seen, as its
+    /// session and [`ProgramStatus::generation`](ghost_term::status::ProgramStatus::generation):
+    /// a `done` the bar stops showing once a key is pressed in the session, until
+    /// the program reports again.
+    status_seen: Option<(SessionId, u64)>,
     /// The coast after a trackpad flick, where the OS sends none of its own
     /// (see [`crate::kinetic`]), and the pointer spot and modifiers it scrolls
     /// with. Not an [`Anim`]: it is input, not a transition, so it neither owns
@@ -934,6 +939,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            status_seen: None,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -982,6 +988,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            status_seen: None,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -1015,6 +1022,7 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
+            status_seen: None,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -1583,6 +1591,60 @@ impl RootModel {
         }
     }
 
+    /// What the foreground session's program says it is doing, as the frame
+    /// shows it (see [`crate::frame::Titlebar::status`]). Read straight from the
+    /// session's own emulator, so it follows the program without a round trip.
+    /// `None` in the fleet, for a program at rest, and for a `done` the user has
+    /// pressed a key on since.
+    pub fn bar_status(&self, sessions: &Sessions) -> Option<crate::frame::BarStatus> {
+        use crate::frame::BarStatus;
+        use ghost_term::status::{BlockedKind, StatusState};
+        let Mode::Single { id, .. } = &self.mode else {
+            return None;
+        };
+        let status = sessions.get(id)?.screen().vt().program_status();
+        let headline = status.headline()?;
+        Some(match headline.state {
+            StatusState::Idle => return None,
+            StatusState::Working => BarStatus::Working {
+                progress: headline.progress,
+            },
+            StatusState::Blocked => BarStatus::Blocked {
+                urgent: matches!(
+                    headline.kind,
+                    Some(BlockedKind::Permission | BlockedKind::Question)
+                ),
+                msg: headline.msg,
+            },
+            StatusState::Done
+                if self.status_seen.as_ref() == Some(&(id.clone(), status.generation())) =>
+            {
+                return None;
+            }
+            StatusState::Done => BarStatus::Done,
+            StatusState::Error => BarStatus::Error,
+        })
+    }
+
+    /// A key pressed in the single view is the user back at this session: a
+    /// finished program's result has been seen. Whether that took a result off
+    /// the bar — which then needs repainting, as the key itself may draw nothing.
+    fn see_status(&mut self, sessions: &Sessions, ev: &UiEvent) -> bool {
+        let (UiEvent::Key { kind, .. }, Mode::Single { id, .. }) = (ev, &self.mode) else {
+            return false;
+        };
+        if !kind.is_down() {
+            return false;
+        }
+        let Some(state) = sessions.get(id) else {
+            return false;
+        };
+        let before = self.bar_status(sessions);
+        let generation = state.screen().vt().program_status().generation();
+        self.status_seen = Some((id.clone(), generation));
+        before != self.bar_status(sessions)
+    }
+
     /// Report something this window could not do. `summary` is the line the frame
     /// carries; `details` is everything else, kept for the details button.
     pub fn report_error(&mut self, summary: impl Into<String>, details: impl Into<String>) {
@@ -1617,7 +1679,11 @@ impl RootModel {
     }
 
     pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
-        let cmds = self.update_dispatch(sessions, ev);
+        let saw_result = self.see_status(sessions, &ev);
+        let mut cmds = self.update_dispatch(sessions, ev);
+        if saw_result {
+            cmds.push(Cmd::Redraw);
+        }
         // A kill emits a Cmd::Kill — the session is gone, so this window no longer
         // drives it. This is the boundary every command crosses (finding #18), so a
         // fleet-side kill reaches the window's `mine` here. (A detach's release,
@@ -3434,6 +3500,141 @@ mod tests {
     fn fleet(metrics: CellMetrics, size_px: (u32, u32), scale: f32) -> (Win, Vec<Cmd>) {
         let (root, sessions, cmds) = RootModel::fleet(metrics, size_px, scale);
         (Win { root, sessions }, cmds)
+    }
+
+    /// A window showing session "a", and the shared state it reads.
+    fn status_window() -> (RootModel, Sessions) {
+        let mut sessions = Sessions::new();
+        sessions.get_or_mint(&"a".into(), 80, 24);
+        let mut root = RootModel::viewing(&"a".into(), 80, 24, METRICS, SIZE);
+        root.mine.insert("a".into());
+        (root, sessions)
+    }
+
+    fn report(root: &mut RootModel, sessions: &mut Sessions, name: &str, pairs: &str) {
+        let _ = root.update(
+            sessions,
+            UiEvent::SessionData {
+                name: name.into(),
+                bytes: format!("\x1b]7501;{pairs}\x1b\\").into_bytes(),
+                ended: false,
+            },
+        );
+    }
+
+    fn press(root: &mut RootModel, sessions: &mut Sessions, c: &str) {
+        let _ = root.update(
+            sessions,
+            UiEvent::Key {
+                key: Key::Char(c.into()),
+                mods: Mods::default(),
+                kind: KeyEventKind::Press,
+                alts: None,
+            },
+        );
+    }
+
+    /// Claude Code's turn, as it reports it, reaches the bar: working, asking
+    /// with its message, then done until the user is back at the keyboard —
+    /// and done again after the next turn, though it says the same thing.
+    #[test]
+    fn the_bar_follows_the_foreground_programs_status() {
+        use crate::frame::BarStatus;
+        let (mut root, mut sessions) = status_window();
+        assert_eq!(root.bar_status(&sessions), None);
+
+        report(&mut root, &mut sessions, "a", "state=idle:app=claude-code");
+        assert_eq!(root.bar_status(&sessions), None, "at rest, nothing to show");
+        report(
+            &mut root,
+            &mut sessions,
+            "a",
+            "state=working:app=claude-code:progress=40",
+        );
+        assert_eq!(
+            root.bar_status(&sessions),
+            Some(BarStatus::Working { progress: Some(40) })
+        );
+        // "approve Bash: rm x"
+        report(
+            &mut root,
+            &mut sessions,
+            "a",
+            "state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSB4",
+        );
+        assert_eq!(
+            root.bar_status(&sessions),
+            Some(BarStatus::Blocked {
+                urgent: true,
+                msg: Some("approve Bash: rm x".into())
+            })
+        );
+        report(&mut root, &mut sessions, "a", "state=blocked:kind=auth");
+        assert_eq!(
+            root.bar_status(&sessions),
+            Some(BarStatus::Blocked {
+                urgent: false,
+                msg: None
+            })
+        );
+
+        report(&mut root, &mut sessions, "a", "state=done:app=claude-code");
+        assert_eq!(root.bar_status(&sessions), Some(BarStatus::Done));
+        press(&mut root, &mut sessions, "x");
+        assert_eq!(
+            root.bar_status(&sessions),
+            None,
+            "seen once a key is pressed"
+        );
+
+        report(
+            &mut root,
+            &mut sessions,
+            "a",
+            "state=working:app=claude-code",
+        );
+        report(&mut root, &mut sessions, "a", "state=done:app=claude-code");
+        assert_eq!(
+            root.bar_status(&sessions),
+            Some(BarStatus::Done),
+            "the next turn's result is new"
+        );
+
+        report(&mut root, &mut sessions, "a", "state=error");
+        assert_eq!(root.bar_status(&sessions), Some(BarStatus::Error));
+        report(&mut root, &mut sessions, "a", "state=clear");
+        assert_eq!(root.bar_status(&sessions), None);
+    }
+
+    /// Seeing a result changes the bar, so the key press that sees it repaints
+    /// it — not left for the program's echo, which may never come.
+    #[test]
+    fn the_key_press_that_sees_a_result_repaints_the_bar() {
+        let (mut root, mut sessions) = status_window();
+        report(&mut root, &mut sessions, "a", "state=done");
+        let cmds = root.update(
+            &mut sessions,
+            UiEvent::Key {
+                key: Key::Char("x".into()),
+                mods: Mods::default(),
+                kind: KeyEventKind::Press,
+                alts: None,
+            },
+        );
+        assert!(cmds.contains(&Cmd::Redraw), "{cmds:?}");
+    }
+
+    /// The bar speaks for the session in front: a background session's
+    /// status is the header bar's list to show, not the title's.
+    #[test]
+    fn only_the_foreground_session_colours_the_bar() {
+        let (mut root, mut sessions) = status_window();
+        sessions.get_or_mint(&"b".into(), 80, 24);
+        root.mine.insert("b".into());
+        root.warm
+            .insert("b".into(), TerminalView::new(METRICS, 80, 24));
+        report(&mut root, &mut sessions, "b", "state=blocked:kind=question");
+        assert_eq!(root.bar_status(&sessions), None);
     }
 
     fn key(r: &mut Win, k: Key, mods: Mods) -> Vec<Cmd> {

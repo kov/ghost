@@ -166,6 +166,10 @@ pub struct Titlebar {
     /// ordinary window. The frame is where this belongs: it costs no content,
     /// reads at a glance, and leaves the edges of the terminal alone.
     pub notice: Option<Notice>,
+    /// What the foreground session's program says it is doing (OSC 7501), as
+    /// the bar shows it: a tint, a message in place of the title, or a progress
+    /// line. A [`Self::notice`] outranks it — the window's own word comes first.
+    pub status: Option<BarStatus>,
     /// Em size of the title, in physical px.
     pub font_px: f32,
     /// Which buttons, on which side — the desktop's choice.
@@ -184,6 +188,23 @@ pub struct Titlebar {
     /// far from the trailing end too, so it stays centred on the window as a
     /// native title is rather than drifting off to one side.
     pub controls_px: f32,
+}
+
+/// The foreground program's status, as the bar shows it (see
+/// `docs/program-status-design.md`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BarStatus {
+    /// Running: no tint, a line along the bar's foot — as long as `progress`
+    /// says (0–100), or faint across the whole bar when it says nothing.
+    Working { progress: Option<u8> },
+    /// Waiting on the user: amber, strongest when `urgent` (a permission or a
+    /// question the user has to answer), and the program's `msg` in place of
+    /// the title — while it waits, what it waits for is what to read.
+    Blocked { urgent: bool, msg: Option<String> },
+    /// Finished, with a result to look at: green.
+    Done,
+    /// Failed: a muted red — not ghost's own failure red, which is louder.
+    Error,
 }
 
 /// How loud a [`Notice`] is.
@@ -239,15 +260,50 @@ fn chilled(bg: Rgba) -> Rgba {
     tinted(bg, ICE, ICE_MIX)
 }
 
-/// The bar's colour under whatever notice it carries — its own, when there is
-/// none.
+/// The tints a program's status gives the bar. Gentler than a notice: they are
+/// the program's word, on show for as long as it lasts, where a notice is the
+/// window's own and passing.
+const AMBER: Rgba = [0.96, 0.66, 0.16, 1.0];
+const AMBER_MIX: f32 = 0.42;
+const AMBER_MIX_URGENT: f32 = 0.55;
+const MOSS: Rgba = [0.36, 0.74, 0.40, 1.0];
+const MOSS_MIX: f32 = 0.35;
+const ROSE: Rgba = [0.74, 0.38, 0.42, 1.0];
+const ROSE_MIX: f32 = 0.38;
+
+/// The bar's colour under whatever notice it carries — or, without one, under
+/// its program's status — its own, when there is neither.
 pub fn notice_bg(bar: &Titlebar) -> Rgba {
-    match bar.notice.as_ref().map(|n| n.tone) {
-        Some(NoticeTone::Mode) => chilled(bar.bg),
-        Some(NoticeTone::Error) => tinted(bar.bg, EMBER, EMBER_MIX),
-        None => bar.bg,
+    match (bar.notice.as_ref().map(|n| n.tone), &bar.status) {
+        (Some(NoticeTone::Mode), _) => chilled(bar.bg),
+        (Some(NoticeTone::Error), _) => tinted(bar.bg, EMBER, EMBER_MIX),
+        (None, Some(BarStatus::Blocked { urgent, .. })) => tinted(
+            bar.bg,
+            AMBER,
+            if *urgent { AMBER_MIX_URGENT } else { AMBER_MIX },
+        ),
+        (None, Some(BarStatus::Done)) => tinted(bar.bg, MOSS, MOSS_MIX),
+        (None, Some(BarStatus::Error)) => tinted(bar.bg, ROSE, ROSE_MIX),
+        (None, Some(BarStatus::Working { .. }) | None) => bar.bg,
     }
 }
+
+/// `text` with what could disguise it taken out: bidirectional overrides and
+/// isolates, and invisible formatting (zero-width characters, the word joiner,
+/// the BOM). A program's message is drawn in the window's own frame, so it must
+/// not be able to reorder or hide what it says.
+fn disarmed(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !matches!(c,
+                '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+        })
+        .collect()
+}
+
+/// How thick the progress line is, in logical pixels.
+const PROGRESS_LINE: f32 = 2.0;
 
 /// What the details button says.
 pub const DETAILS_LABEL: &str = "Details";
@@ -413,16 +469,38 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
         color: notice_bg(bar),
         radius: 0.0,
     }];
+    // A working program's progress: a line along the bar's foot, in the
+    // title's colour so it belongs to the theme.
+    if let (None, Some(BarStatus::Working { progress })) = (&bar.notice, &bar.status) {
+        let h = (PROGRESS_LINE * bar.scale).round().max(1.0);
+        let (w, alpha) = match progress {
+            Some(p) => (strip.w * f32::from((*p).min(100)) / 100.0, 0.55),
+            None => (strip.w, 0.22),
+        };
+        items.push(SceneItem::Rect {
+            id: SceneId::StatusProgress,
+            rect: RectPx {
+                x: strip.x,
+                y: strip.y + strip.h - h,
+                w,
+                h,
+            },
+            color: [bar.fg[0], bar.fg[1], bar.fg[2], alpha],
+            radius: 0.0,
+        });
+    }
     let buttons = button_rects(&bar.buttons, strip, bar.scale);
     let details = details_rect(bar, strip);
     // A notice stands in for the title: what the window is doing, or what went
     // wrong, matters more than its name for as long as it lasts, and the
     // compositor still knows the real title, so the task switcher goes on naming
     // the window properly.
-    let heading = match &bar.notice {
-        Some(n) => &n.text,
-        None => &bar.title,
+    let heading = match (&bar.notice, &bar.status) {
+        (Some(n), _) => n.text.clone(),
+        (None, Some(BarStatus::Blocked { msg: Some(msg), .. })) => disarmed(msg),
+        (None, _) => bar.title.clone(),
     };
+    let heading = &heading;
     if !heading.is_empty() {
         // Centred between the button groups rather than on the window, so a
         // title long enough to reach them stays clear of them — and a window
@@ -702,6 +780,7 @@ mod tests {
             fg: [1.0, 1.0, 1.0, 1.0],
             title: "ghost".into(),
             notice: None,
+            status: None,
             font_px: 15.0,
             buttons: ButtonLayout::default(),
             hovered: None,
@@ -851,6 +930,137 @@ mod tests {
                 |i| matches!(i, SceneItem::ChromeText { id, .. } if *id == SceneId::WindowButton),
             )
             .count()
+    }
+
+    fn with_status(status: BarStatus) -> Titlebar {
+        Titlebar {
+            status: Some(status),
+            ..titlebar(35)
+        }
+    }
+
+    fn progress_line(scene: &Scene) -> Option<RectPx> {
+        scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                SceneItem::Rect { id, rect, .. } if *id == SceneId::StatusProgress => Some(*rect),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn a_program_waiting_on_the_user_turns_the_bar_amber_and_says_why() {
+        let plain = bar_of(&with_titlebar(content(800, 565), &titlebar(35))).0;
+        let asking = with_status(BarStatus::Blocked {
+            urgent: true,
+            msg: Some("approve Bash: rm x".into()),
+        });
+        let (amber, said) = bar_of(&with_titlebar(content(800, 565), &asking));
+        assert_eq!(said, vec!["approve Bash: rm x".to_string()]);
+        assert!(
+            amber[0] > amber[2] && amber[1] > amber[2] && amber[0] > plain[0],
+            "amber: warm, red and green over blue, and warmer than it was: {amber:?}"
+        );
+        // Waiting without a message keeps the title; a less pressing wait is
+        // the same colour, not as strong.
+        let (soft, said) = bar_of(&with_titlebar(
+            content(800, 565),
+            &with_status(BarStatus::Blocked {
+                urgent: false,
+                msg: None,
+            }),
+        ));
+        assert_eq!(said, vec!["ghost".to_string()]);
+        assert!(
+            soft[0] > plain[0] && soft[0] < amber[0],
+            "{soft:?} vs {amber:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_program_greens_the_bar_and_a_failed_one_reddens_it() {
+        let plain = bar_of(&with_titlebar(content(800, 565), &titlebar(35))).0;
+        let (done, said) = bar_of(&with_titlebar(
+            content(800, 565),
+            &with_status(BarStatus::Done),
+        ));
+        assert_eq!(said, vec!["ghost".to_string()], "the title stays");
+        assert!(
+            done[1] > done[0] && done[1] > done[2] && done[1] > plain[1],
+            "{done:?}"
+        );
+        let (failed, _) = bar_of(&with_titlebar(
+            content(800, 565),
+            &with_status(BarStatus::Error),
+        ));
+        assert!(failed[0] > failed[1] && failed[0] > failed[2], "{failed:?}");
+        let (ours, _) = bar_of(&with_titlebar(
+            content(800, 565),
+            &Titlebar {
+                notice: Some(Notice::error("Could not start a session")),
+                ..titlebar(35)
+            },
+        ));
+        assert_ne!(failed, ours, "a program's failure is not ghost's");
+    }
+
+    #[test]
+    fn the_windows_own_notice_outranks_the_programs_status() {
+        let bar = Titlebar {
+            notice: Some(Notice::mode("paused")),
+            ..with_status(BarStatus::Blocked {
+                urgent: true,
+                msg: Some("approve".into()),
+            })
+        };
+        let noticed = Titlebar {
+            notice: Some(Notice::mode("paused")),
+            ..titlebar(35)
+        };
+        assert_eq!(
+            bar_of(&with_titlebar(content(800, 565), &bar)),
+            bar_of(&with_titlebar(content(800, 565), &noticed))
+        );
+    }
+
+    #[test]
+    fn a_working_program_draws_its_progress_along_the_bars_foot() {
+        let (bg, _) = bar_of(&with_titlebar(content(800, 565), &titlebar(35)));
+        let working = with_titlebar(
+            content(800, 565),
+            &with_status(BarStatus::Working { progress: Some(25) }),
+        );
+        assert_eq!(bar_of(&working).0, bg, "working is no reason to tint");
+        let line = progress_line(&working).expect("a progress line");
+        assert_eq!((line.x, line.w), (0.0, 200.0), "a quarter of the bar");
+        assert_eq!(line.y + line.h, 35.0, "along its foot");
+        let busy = with_titlebar(
+            content(800, 565),
+            &with_status(BarStatus::Working { progress: None }),
+        );
+        assert_eq!(
+            progress_line(&busy).unwrap().w,
+            800.0,
+            "busy: all the way across"
+        );
+        assert_eq!(
+            progress_line(&with_titlebar(content(800, 565), &titlebar(35))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_programs_message_cannot_reorder_or_hide_what_it_says() {
+        let bar = with_status(BarStatus::Blocked {
+            urgent: true,
+            msg: Some("approve \u{202E}xr mr\u{202C}\u{200B} now\u{2066}".into()),
+        });
+        assert_eq!(
+            bar_of(&with_titlebar(content(800, 565), &bar)).1,
+            vec!["approve xr mr now".to_string()]
+        );
     }
 
     #[test]
@@ -1394,6 +1604,7 @@ mod inset_tests {
             hovered: None,
             pressed: None,
             maximized: false,
+            status: None,
         };
         assert_eq!(with_frame(content, &bar, m).size_px, surface);
     }

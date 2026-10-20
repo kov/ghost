@@ -299,6 +299,11 @@ fn text(value: Option<&str>, max_encoded: usize, max: usize) -> Option<Option<St
 pub struct ProgramStatus {
     /// Least recently updated first: a report moves its record to the end.
     records: Vec<StatusRecord>,
+    /// Counts every change to the records. Not part of the state (a dump does
+    /// not carry it, and equality ignores it): it tells a reader that a report
+    /// came in even when it said the same thing as the last one — a program
+    /// done with a second turn reports exactly what it did after the first.
+    generation: u64,
 }
 
 impl PartialEq for ProgramStatus {
@@ -309,6 +314,7 @@ impl PartialEq for ProgramStatus {
 
 impl ProgramStatus {
     pub(crate) fn apply(&mut self, report: StatusReport) {
+        self.generation += 1;
         match report {
             StatusReport::Set(record) => {
                 self.records.retain(|r| r.id != record.id);
@@ -327,11 +333,21 @@ impl ProgramStatus {
     /// does `idle` — the spec lets a terminal drop it, but a program at rest
     /// says nothing untrue by staying so.
     pub(crate) fn end_live_work(&mut self) {
+        let before = self.records.len();
         self.records.retain(|r| !r.state.is_live());
+        if self.records.len() != before {
+            self.generation += 1;
+        }
     }
 
     pub(crate) fn reset(&mut self) {
+        self.generation += 1;
         self.records.clear();
+    }
+
+    /// Bumped by every report and every change to the records — see the field.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The records, least recently updated first.

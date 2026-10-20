@@ -2696,10 +2696,11 @@ impl Graphics {
     }
 
     /// The titlebar to draw over this window's content: its height, its colours
-    /// for the window's current focus, and the title.
+    /// for the window's current focus, the title, and what the foreground
+    /// session's program says it is doing (read from `sessions`).
     ///
     /// The colours are the desktop's — see [`desktop::frame_colors`].
-    fn titlebar(&self, w: &WindowState) -> ghost_ui_core::frame::Titlebar {
+    fn titlebar(&self, w: &WindowState, sessions: &Sessions) -> ghost_ui_core::frame::Titlebar {
         let (bg, fg) = Self::titlebar_colors(w.activated);
         let scale = self.window.scale_factor() as f32;
         ghost_ui_core::frame::Titlebar {
@@ -2708,6 +2709,7 @@ impl Graphics {
             fg,
             title: w.title.clone(),
             notice: w.root.chrome_notice(),
+            status: w.root.bar_status(sessions),
             font_px: desktop::desktop_font().px_size(scale),
             buttons: desktop::button_layout(),
             hovered: w.hovered_button,
@@ -5369,10 +5371,9 @@ impl App {
         let on_button = ghost_ui_core::frame::button_at(pos, &desktop::button_layout(), bar, scale);
         // The details button belongs to the notice, not to the window controls,
         // and it acts on press: there is nothing destructive behind it to arm.
-        let on_details = self
-            .windows
-            .get(&id)
-            .is_some_and(|w| ghost_ui_core::frame::details_at(pos, &gfx.titlebar(w), bar));
+        let on_details = self.windows.get(&id).is_some_and(|w| {
+            ghost_ui_core::frame::details_at(pos, &gfx.titlebar(w, &self.states), bar)
+        });
         if button == PointerButton::Left && on_details {
             if let Some(w) = self.windows.get_mut(&id) {
                 w.root.show_error_details();
@@ -6836,7 +6837,7 @@ impl App {
             let step = w.resize.note(now_ms, w_px, h_px, scale);
             // Described before `gfx` is borrowed mutably below: the bar is read
             // off both the window and the window's state.
-            let bar = w.gfx.as_ref().map(|g| g.titlebar(w));
+            let bar = w.gfx.as_ref().map(|g| g.titlebar(w, &self.states));
             let margins = w
                 .gfx
                 .as_ref()
@@ -8116,7 +8117,7 @@ impl ApplicationHandler<UserEvent> for App {
                         win.render_trace.saw_redraw_event(now_ms);
                     }
                     // A headless window has no surface; there is nothing to paint.
-                    let bar = win.gfx.as_ref().map(|g| g.titlebar(win));
+                    let bar = win.gfx.as_ref().map(|g| g.titlebar(win, &self.states));
                     let margins = win
                         .gfx
                         .as_ref()
@@ -12883,6 +12884,7 @@ mod tests {
             maximized: false,
             scale: 1.0,
             controls_px: 0.0,
+            status: w.root.bar_status(&app.states),
         };
         ghost_ui_core::frame::with_titlebar(w.root.view(&app.states), &bar)
             .layers
