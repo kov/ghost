@@ -1033,6 +1033,7 @@ dependencies = [
  "ghost-render",
  "ghost-renderer",
  "ghost-shaper",
+ "ghost-term",
  "ghost-ui-core",
  "ghost-ui-harness",
  "ghost-vt",

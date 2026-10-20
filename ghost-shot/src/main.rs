@@ -176,8 +176,9 @@ fn main() {
 
     let out = args.next().unwrap_or_else(|| "ghost-shot.png".to_string());
     let (scene, w, h) = match which.as_str() {
-        "fleet" => fleet_scene(false),
-        "fleet-revealed" => fleet_scene(true),
+        "fleet" => fleet_scene(false, false),
+        "fleet-revealed" => fleet_scene(true, false),
+        "fleet-status" => fleet_scene(false, true),
         "single" => single_scene(),
         "status" => status_scene(),
         other => {
@@ -836,7 +837,7 @@ fn calib_tui() {
 /// the window's emphasized group block), one held by another window, and one
 /// detached — covering the block, both sections, cards, buttons, the focus
 /// border, and scaled live previews.
-fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
+fn fleet_scene(revealed: bool, statuses: bool) -> (ghost_render::Scene, u32, u32) {
     let size = (1400u32, 1200u32);
     let mine: HashSet<SessionId> = ["edit", "build"]
         .into_iter()
@@ -944,6 +945,57 @@ fn fleet_scene(revealed: bool) -> (ghost_render::Scene, u32, u32) {
         "db",
         "prod=# select count(*) from orders;\r\n count \r\n-------\r\n 42917\r\n(1 row)\r\n\r\nprod=# ",
     );
+
+    // `fleet-status`: each card's program reports what it is doing — the live
+    // previews over their own mirrors, the unmirrored member through the host.
+    if statuses {
+        let report = |pairs: &str| format!("\x1b]7501;{pairs}\x1b\\");
+        feed(
+            &mut fleet,
+            &mut sessions,
+            &mine,
+            "edit",
+            &report("state=working:progress=40"),
+        );
+        feed(
+            &mut fleet,
+            &mut sessions,
+            &mine,
+            "build",
+            // msg: "approve Bash: cargo publish --dry-run"
+            &report(
+                "state=blocked:kind=permission:msg=YXBwcm92ZSBCYXNoOiBjYXJnbyBwdWJsaXNoIC0tZHJ5LXJ1bg==",
+            ),
+        );
+        feed(
+            &mut fleet,
+            &mut sessions,
+            &mine,
+            "prod",
+            &report("state=done"),
+        );
+        fleet.update(
+            &mut sessions,
+            &mine,
+            UiEvent::SessionPush {
+                name: "batch".into(),
+                push: ghost_ui_core::SessionPush::Event(
+                    ghost_vt::protocol::SessionEvent::StatusChanged(Some(
+                        ghost_vt::protocol::StatusHeadline {
+                            state: ghost_term::status::StatusState::Error,
+                            kind: None,
+                            progress: None,
+                            app: None,
+                            title: None,
+                            msg: None,
+                            seen: false,
+                            since: 0,
+                        },
+                    )),
+                ),
+            },
+        );
+    }
 
     // The attached-elsewhere content hides behind its toggle by default;
     // `fleet-revealed` renders the expanded state.

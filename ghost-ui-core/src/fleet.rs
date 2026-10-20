@@ -24,9 +24,10 @@ use ghost_render::{
     BadgeKind, CacheCounters, CellMetrics, Frame, Layer, RectPx, Rgba, Run, Scene, SceneId,
     SceneItem, Style, Transform, layout_frame,
 };
-use ghost_vt::protocol::{SessionEvent, SessionState};
+use ghost_vt::protocol::{SessionEvent, SessionState, StatusHeadline};
 
 use crate::event::SessionPush;
+use crate::frame::{BarStatus, PROGRESS_LINE};
 use crate::group::{Group, GroupId};
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{FeedOutcome, TerminalView};
@@ -77,7 +78,7 @@ const MAX_CARD_VIEWPORT_FRAC: f32 = 0.45;
 const SCROLL_LINES: f32 = 3.0;
 /// Card chrome colours (metadata header, button footer).
 const CARD_META_COLOR: Rgba = [0.62, 0.66, 0.74, 1.0];
-const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
+pub(crate) const CARD_BG: Rgba = [0.07, 0.08, 0.10, 1.0];
 const BUTTON_BG: Rgba = [0.17, 0.19, 0.24, 1.0];
 const BUTTON_FG: Rgba = [0.80, 0.83, 0.89, 1.0];
 /// Label of an insensitive action chip (e.g. detach on a session this window
@@ -399,6 +400,46 @@ fn tile_order_key(t: &Tile) -> (i64, &SessionId) {
 }
 
 impl Tile {
+    /// What the card's header says the program is doing. A live mirror says it
+    /// first-hand; a card without one goes by the host's report. A result counts
+    /// as seen by `window_seen` when the window keeps that account for the
+    /// session, else by the host. A card for a session that is gone, or out of
+    /// reach, says nothing: what it last said may no longer be true.
+    fn bar_status(
+        &self,
+        state: &crate::terminal::SessionState,
+        window_seen: Option<bool>,
+    ) -> Option<BarStatus> {
+        if self.dead || self.awaiting_host.is_some() {
+            return None;
+        }
+        let host_seen = |s: ghost_term::status::StatusState| {
+            self.status.as_ref().is_some_and(|h| h.seen && h.state == s)
+        };
+        let mirrored = if self.fed {
+            state.screen().vt().program_status().headline()
+        } else {
+            None
+        };
+        match (mirrored, &self.status) {
+            (Some(h), _) => BarStatus::of(
+                h.state,
+                h.kind,
+                h.progress,
+                h.msg,
+                window_seen.unwrap_or_else(|| host_seen(h.state)),
+            ),
+            (None, Some(h)) => BarStatus::of(
+                h.state,
+                h.kind,
+                h.progress,
+                h.msg.clone(),
+                window_seen.unwrap_or(h.seen),
+            ),
+            (None, None) => None,
+        }
+    }
+
     /// The name a human should see on the card: the display name when labeled, else
     /// the immutable id. Reads the tile's cached [`Tile::display_name`], so the card
     /// renders (and the rename seeds) without borrowing the session state.
@@ -469,6 +510,13 @@ struct Tile {
     /// The OSC 9;4 progress shown in the card header at the last feed, so a
     /// pure progress report (which dirties no screen rows) still repaints.
     progress: Option<ghost_term::Progress>,
+    /// What the session's program says it is doing, as its host reports it —
+    /// from the listing and the host's push. Read for a card with no live
+    /// mirror of its own; a mirrored card reads its emulator.
+    status: Option<StatusHeadline>,
+    /// The mirror's program-status generation at the last feed, so a status
+    /// report (which dirties no screen rows) still repaints.
+    status_generation: u64,
     /// The session's working directory (display form, `~`-abbreviated), from
     /// the listing's descriptor read; `None` when unknown.
     cwd: Option<String>,
@@ -862,6 +910,8 @@ impl FleetModel {
             frame: None,
             frame_dirty: true,
             progress: None,
+            status: None,
+            status_generation: 0,
             cwd: None,
             host: None,
             dead: false,
@@ -1463,6 +1513,8 @@ impl FleetModel {
                 tile.created_at = info.created_at;
                 tile.cwd = info.cwd.clone();
                 tile.host = info.connection.as_ref().map(|c| c.target());
+                dirty |= tile.status != info.status;
+                tile.status = info.status.clone();
                 if apply_display {
                     // Author the name on the one owner and cache it on the tile; the
                     // state remembers it (a later adopt titles the window from it), the
@@ -1503,6 +1555,7 @@ impl FleetModel {
                 let t = self.tiles.last_mut().expect("just pushed");
                 t.cwd = info.cwd.clone();
                 t.host = info.connection.as_ref().map(|c| c.target());
+                t.status = info.status.clone();
                 dirty = true;
             }
         }
@@ -1706,7 +1759,10 @@ impl FleetModel {
                 }
             }
             SessionPush::Event(SessionEvent::TitleChanged(_)) => {}
-            SessionPush::Event(SessionEvent::StatusChanged(_)) => {}
+            SessionPush::Event(SessionEvent::StatusChanged(status)) => {
+                dirty |= tile.status != status;
+                tile.status = status;
+            }
             // Group membership still lives in the UI's own registry; the host's
             // copy is not read yet.
             SessionPush::Event(SessionEvent::GroupChanged(_)) => {}
@@ -2158,10 +2214,14 @@ impl FleetModel {
                 tile.activity = tile.activity.saturating_add(1);
             }
         }
-        // A progress report dirties no screen rows, so the model won't ask for
-        // a redraw — but the card header shows it, so a change repaints here.
+        // A progress or status report dirties no screen rows, so the model won't
+        // ask for a redraw — but the card header shows it, so a change repaints
+        // here.
         let progress = state.screen().vt().progress();
         let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
+        let generation = state.screen().vt().program_status().generation();
+        let progress_changed = progress_changed
+            | (generation != std::mem::replace(&mut tile.status_generation, generation));
         // A tile reaches nothing outside itself: not the window title (that would
         // retitle the window out from under the single view), not the window's state
         // or size, and not the clipboard — a tile may be a session attached
@@ -2223,10 +2283,14 @@ impl FleetModel {
                 tile.activity = tile.activity.saturating_add(1);
             }
         }
-        // A progress report dirties no screen rows, so the model won't ask for a
-        // redraw — but the card header shows it, so a change repaints here.
+        // A progress or status report dirties no screen rows, so the model won't
+        // ask for a redraw — but the card header shows it, so a change repaints
+        // here.
         let progress = state.screen().vt().progress();
         let progress_changed = progress != std::mem::replace(&mut tile.progress, progress);
+        let generation = state.screen().vt().program_status().generation();
+        let progress_changed = progress_changed
+            | (generation != std::mem::replace(&mut tile.status_generation, generation));
         // A tile reaches nothing outside itself (see `session_data`), and never speaks
         // for the child — the shared ingest already answered, once.
         let mut cmds: Vec<Cmd> = cmds
@@ -3749,6 +3813,18 @@ impl FleetModel {
     // ---- view ----
 
     pub fn view(&self, sessions: &Sessions) -> Scene {
+        self.view_with(sessions, &|_| None)
+    }
+
+    /// [`view`](Self::view), told what the window has seen of its own sessions'
+    /// results: `seen(id)` is `Some` for a session the window drives — the host
+    /// counts every result as seen by a window attached to it, so the window
+    /// keeps its own account — and `None` to go by the host's.
+    pub fn view_with(
+        &self,
+        sessions: &Sessions,
+        seen: &dyn Fn(&SessionId) -> Option<bool>,
+    ) -> Scene {
         let (headers, placements, band, _content_h) = self.sections_layout();
         let metrics = self.effective_metrics();
         // Physical px, like everything else the layout measures in.
@@ -3925,6 +4001,41 @@ impl FleetModel {
                 radius: card_radius,
             });
 
+            // What its program is doing, in the titlebar's colours, across the
+            // header — and a working program's progress along its foot.
+            let status = tile.bar_status(state, seen(&id));
+            if let Some(status) = &status {
+                out.push(SceneItem::Rect {
+                    id: SceneId::CardStatus(handle),
+                    rect: header,
+                    color: crate::frame::status_bg(CARD_BG, status),
+                    radius: card_radius,
+                });
+                if let BarStatus::Working { progress } = status {
+                    let h = PROGRESS_LINE.min(header.h);
+                    let (w, alpha) = match progress {
+                        Some(p) => (header.w * f32::from((*p).min(100)) / 100.0, 0.55),
+                        None => (header.w, 0.22),
+                    };
+                    out.push(SceneItem::Rect {
+                        id: SceneId::CardStatus(handle),
+                        rect: RectPx {
+                            x: header.x,
+                            y: header.y + header.h - h,
+                            w,
+                            h,
+                        },
+                        color: [
+                            CARD_META_COLOR[0],
+                            CARD_META_COLOR[1],
+                            CARD_META_COLOR[2],
+                            alpha,
+                        ],
+                        radius: 0.0,
+                    });
+                }
+            }
+
             // Metadata header — or the live buffer of an in-progress rename.
             let header_text = match self.renaming.as_ref().filter(|r| r.id == id) {
                 Some(r) => {
@@ -3958,6 +4069,10 @@ impl FleetModel {
                         tile.host.as_deref(),
                     )
                 ),
+                // Waiting on the user, what for is what to read.
+                None if let Some(BarStatus::Blocked { msg: Some(msg), .. }) = &status => {
+                    format!("{} \u{b7} {}", tile.display(), crate::frame::disarmed(msg))
+                }
                 None => card_meta(
                     tile.display(),
                     &tile.command,
@@ -4361,8 +4476,10 @@ mod tests {
     }
     use super::*;
     use crate::TerminalModel;
+    use crate::frame::BarStatus;
     use crate::input::KeyEventKind;
     use crate::terminal::SessionState;
+    use ghost_term::status::StatusState;
     use ghost_vt::protocol::AttachInfo;
 
     const METRICS: CellMetrics = CellMetrics {
@@ -6740,6 +6857,154 @@ mod tests {
         // Still listed, it is still a preview the shell may source again.
         list(&mut m, &["b"]);
         assert_eq!(previews(&m), ["b"]);
+    }
+
+    /// A host-reported status as the listing or a push carries it.
+    fn headline(state: StatusState, seen: bool) -> ghost_vt::protocol::StatusHeadline {
+        ghost_vt::protocol::StatusHeadline {
+            state,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+            seen,
+            since: 0,
+        }
+    }
+
+    /// The cards' header texts.
+    fn label_texts(m: &Fleet) -> Vec<String> {
+        m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Text {
+                    id: SceneId::Label(_),
+                    runs,
+                    ..
+                } => Some(runs.iter().map(|r| r.text.as_str()).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The colours of the cards' status strips, in tile order.
+    fn strips(m: &Fleet) -> Vec<Rgba> {
+        m.view().layers[0]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SceneItem::Rect {
+                    id: SceneId::CardStatus(_),
+                    color,
+                    ..
+                } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn strip_of(status: &BarStatus) -> Rgba {
+        crate::frame::status_bg(CARD_BG, status)
+    }
+
+    /// The header of each card at a glance tells what its program is doing, in
+    /// the titlebar's colours: working, waiting on the user (with what for, in
+    /// the header), finished or failed until someone has seen it. At rest, or
+    /// seen, the header is plain.
+    #[test]
+    fn a_listed_status_tints_its_cards_header() {
+        let cases = [
+            (
+                headline(StatusState::Working, false),
+                Some(BarStatus::Working { progress: None }),
+            ),
+            (
+                ghost_vt::protocol::StatusHeadline {
+                    kind: Some(ghost_term::status::BlockedKind::Permission),
+                    msg: Some("approve Bash: cargo publish".into()),
+                    ..headline(StatusState::Blocked, false)
+                },
+                Some(BarStatus::Blocked {
+                    urgent: true,
+                    msg: Some("approve Bash: cargo publish".into()),
+                }),
+            ),
+            (headline(StatusState::Done, false), Some(BarStatus::Done)),
+            (headline(StatusState::Error, false), Some(BarStatus::Error)),
+            (headline(StatusState::Done, true), None),
+            (headline(StatusState::Idle, false), None),
+        ];
+        for (status, want) in cases {
+            let mut m = fleet();
+            let mut a = info("a");
+            a.status = Some(status.clone());
+            m.update(UiEvent::SessionList(listed(vec![a])));
+            let drawn = strips(&m);
+            match &want {
+                // The strip, plus a working program's progress line.
+                Some(s) => assert_eq!(drawn.first(), Some(&strip_of(s)), "{status:?}"),
+                None => assert!(drawn.is_empty(), "{status:?}: {drawn:?}"),
+            }
+        }
+        // Waiting, the header says what for.
+        let mut m = fleet();
+        let mut a = info("a");
+        a.status = Some(ghost_vt::protocol::StatusHeadline {
+            kind: Some(ghost_term::status::BlockedKind::Question),
+            msg: Some("answer: ship it?".into()),
+            ..headline(StatusState::Blocked, false)
+        });
+        m.update(UiEvent::SessionList(listed(vec![a])));
+        assert!(
+            label_texts(&m)
+                .iter()
+                .any(|t| t.contains("answer: ship it?")),
+            "{:?}",
+            label_texts(&m)
+        );
+    }
+
+    /// The host's push moves a card's strip between listings, and repaints.
+    #[test]
+    fn a_pushed_status_change_repaints_its_card() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        assert!(strips(&m).is_empty());
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Event(SessionEvent::StatusChanged(Some(headline(
+                StatusState::Error,
+                false,
+            )))),
+        );
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert_eq!(strips(&m), vec![strip_of(&BarStatus::Error)]);
+        let cmds = push(
+            &mut m,
+            "a",
+            SessionPush::Event(SessionEvent::StatusChanged(None)),
+        );
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert!(strips(&m).is_empty());
+    }
+
+    /// A previewed card reads its own mirror, which has the report the moment
+    /// the bytes arrive — and a report changes no screen row, so the card asks
+    /// for the repaint itself.
+    #[test]
+    fn a_mirrored_card_follows_its_own_emulator() {
+        let mut m = fleet();
+        list(&mut m, &["a"]);
+        data(&mut m, "a", b"$ ");
+        let cmds = data(&mut m, "a", b"\x1b]7501;state=working\x1b\\");
+        assert!(cmds.contains(&Cmd::Redraw), "{cmds:?}");
+        assert_eq!(
+            strips(&m).first(),
+            Some(&strip_of(&BarStatus::Working { progress: None }))
+        );
     }
 
     #[test]

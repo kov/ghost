@@ -957,6 +957,24 @@ fn cycle_dir(key: &Key, mods: Mods) -> Option<bool> {
     }
 }
 
+/// What a window has seen of its own sessions' results, for its fleet's cards
+/// (see [`crate::fleet::FleetModel::view_with`]): for a session it drives,
+/// whether it has looked since the program last reported; for any other,
+/// nothing — the host's account stands.
+fn window_seen<'a>(
+    status_seen: &'a HashMap<SessionId, u64>,
+    mine: &'a HashSet<SessionId>,
+    sessions: &'a Sessions,
+) -> impl Fn(&SessionId) -> Option<bool> + 'a {
+    move |id| {
+        mine.contains(id).then(|| {
+            sessions.get(id).is_some_and(|s| {
+                status_seen.get(id) == Some(&s.screen().vt().program_status().generation())
+            })
+        })
+    }
+}
+
 impl RootModel {
     /// Start in the single-terminal view around `model`.
     pub fn single(
@@ -1645,30 +1663,23 @@ impl RootModel {
     /// pressed a key on since.
     pub fn bar_status(&self, sessions: &Sessions) -> Option<crate::frame::BarStatus> {
         use crate::frame::BarStatus;
-        use ghost_term::status::{BlockedKind, StatusState};
+        use ghost_term::status::StatusState;
         let Mode::Single { id, .. } = &self.mode else {
             return None;
         };
         let status = sessions.get(id)?.screen().vt().program_status();
         let headline = status.headline()?;
-        Some(match headline.state {
-            StatusState::Idle => return None,
-            StatusState::Working => BarStatus::Working {
-                progress: headline.progress,
-            },
-            StatusState::Blocked => BarStatus::Blocked {
-                urgent: matches!(
-                    headline.kind,
-                    Some(BlockedKind::Permission | BlockedKind::Question)
-                ),
-                msg: headline.msg,
-            },
-            StatusState::Done if self.status_seen.get(id) == Some(&status.generation()) => {
-                return None;
-            }
-            StatusState::Done => BarStatus::Done,
-            StatusState::Error => BarStatus::Error,
-        })
+        // An error stays on the bar while it is in front: unlike a finished
+        // turn, nothing the user types answers it.
+        let seen = headline.state == StatusState::Done
+            && self.status_seen.get(id) == Some(&status.generation());
+        BarStatus::of(
+            headline.state,
+            headline.kind,
+            headline.progress,
+            headline.msg,
+            seen,
+        )
     }
 
     /// A key pressed in the single view is the user back at this session: a
@@ -2514,7 +2525,10 @@ impl RootModel {
             return vec![Cmd::Redraw];
         };
         self.anim = Some(Anim::dive(
-            f.view(sessions),
+            f.view_with(
+                sessions,
+                &window_seen(&self.status_seen, &self.mine, sessions),
+            ),
             camera,
             Transform::IDENTITY,
             self.anim_ms,
@@ -2642,9 +2656,17 @@ impl RootModel {
                 // Opening a tile dives into where it sat in the grid: snapshot the
                 // fleet world so the whole grid stays visible during the descent (a
                 // freshly spawned session with no tile yet just opens, no dive).
-                anim = f
-                    .dive_camera(&id)
-                    .map(|to| Anim::dive(f.view(sessions), Transform::IDENTITY, to, dur));
+                anim = f.dive_camera(&id).map(|to| {
+                    Anim::dive(
+                        f.view_with(
+                            sessions,
+                            &window_seen(&self.status_seen, &self.mine, sessions),
+                        ),
+                        Transform::IDENTITY,
+                        to,
+                        dur,
+                    )
+                });
                 let (_kept_id, kept_view, warm, cmds) =
                     f.into_single_adopting(sessions, id.clone(), self.size_px, self.scale);
                 // The states never left `sessions`; the fleet hands back only the
@@ -2874,7 +2896,10 @@ impl RootModel {
             Mode::Single { id, view } => {
                 view.view(sessions.get(id).expect("foreground session state present"))
             }
-            Mode::Fleet(f) => f.view(sessions),
+            Mode::Fleet(f) => f.view_with(
+                sessions,
+                &window_seen(&self.status_seen, &self.mine, sessions),
+            ),
         }
     }
 
@@ -2918,7 +2943,14 @@ impl RootModel {
             && let Mode::Fleet(f) = &self.mode
             && let Some(camera) = f.dive_camera(p)
         {
-            return with_camera(f.view(sessions), camera, 0.0);
+            return with_camera(
+                f.view_with(
+                    sessions,
+                    &window_seen(&self.status_seen, &self.mine, sessions),
+                ),
+                camera,
+                0.0,
+            );
         }
 
         // The live scene: in a single view this paints the foreground terminal; in
@@ -3684,7 +3716,17 @@ impl RootModel {
                     return Vec::new();
                 };
                 let to = f.dive_camera(&target);
-                let anim = to.map(|to| Anim::dive(f.view(sessions), Transform::IDENTITY, to, dur));
+                let anim = to.map(|to| {
+                    Anim::dive(
+                        f.view_with(
+                            sessions,
+                            &window_seen(&self.status_seen, &self.mine, sessions),
+                        ),
+                        Transform::IDENTITY,
+                        to,
+                        dur,
+                    )
+                });
                 let (kept_id, kept_view, warm, mut cmds) =
                     f.into_single_adopting(sessions, target.clone(), self.size_px, self.scale);
                 // The states never left `sessions`; the fleet hands back only the
@@ -5539,6 +5581,42 @@ mod tests {
     }
 
     /// Drive the animation clock to completion, returning the number of ticks fed.
+    /// In the fleet, a card of this window's tints by what the window has seen,
+    /// as the header-bar list does — the host counts the window as having seen
+    /// everything, being attached to all of it: the session left behind was
+    /// seen, the background one that finished meanwhile was not.
+    #[test]
+    fn a_finished_background_session_of_the_window_stays_green_in_the_fleet() {
+        let mut r = root(); // single view of alpha
+        r.update(UiEvent::AdoptSession("beta".into())); // foreground beta, alpha warm
+        settle(&mut r);
+        for name in ["alpha", "beta"] {
+            r.update(UiEvent::SessionData {
+                name: name.into(),
+                bytes: b"$ \x1b]7501;state=done\x1b\\".to_vec(),
+                ended: false,
+            });
+        }
+        let done = crate::frame::status_bg(crate::fleet::CARD_BG, &crate::frame::BarStatus::Done);
+        dive_out(&mut r, &[sess("alpha", true, 1), sess("beta", true, 2)]);
+        settle(&mut r);
+        let strips: Vec<crate::Rgba> = r
+            .view()
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|it| match it {
+                SceneItem::Rect {
+                    id: crate::SceneId::CardStatus(_),
+                    color,
+                    ..
+                } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strips, vec![done], "only alpha's result is unseen");
+    }
+
     fn settle(r: &mut Win) -> u32 {
         let mut n = 0;
         let mut now = 10_000;

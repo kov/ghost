@@ -212,6 +212,31 @@ pub enum BarStatus {
     Error,
 }
 
+impl BarStatus {
+    /// How a program's headline shows: nothing at rest, nor for a result
+    /// already `seen`.
+    pub fn of(
+        state: ghost_term::status::StatusState,
+        kind: Option<ghost_term::status::BlockedKind>,
+        progress: Option<u8>,
+        msg: Option<String>,
+        seen: bool,
+    ) -> Option<Self> {
+        use ghost_term::status::{BlockedKind, StatusState};
+        match state {
+            StatusState::Idle => None,
+            StatusState::Working => Some(BarStatus::Working { progress }),
+            StatusState::Blocked => Some(BarStatus::Blocked {
+                urgent: matches!(kind, Some(BlockedKind::Permission | BlockedKind::Question)),
+                msg,
+            }),
+            StatusState::Done | StatusState::Error if seen => None,
+            StatusState::Done => Some(BarStatus::Done),
+            StatusState::Error => Some(BarStatus::Error),
+        }
+    }
+}
+
 /// The titlebar's button for the window's other sessions' statuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttentionBadge {
@@ -297,15 +322,23 @@ pub fn notice_bg(bar: &Titlebar) -> Rgba {
     match (bar.notice.as_ref().map(|n| n.tone), &bar.status) {
         (Some(NoticeTone::Mode), _) => chilled(bar.bg),
         (Some(NoticeTone::Error), _) => tinted(bar.bg, EMBER, EMBER_MIX),
-        (None, Some(BarStatus::Blocked { urgent, .. })) => tinted(
-            bar.bg,
+        (None, Some(status)) => status_bg(bar.bg, status),
+        (None, None) => bar.bg,
+    }
+}
+
+/// `bg` tinted with what a program says it is doing — the titlebar's strip,
+/// and a fleet card's header, which say it in the same colours.
+pub fn status_bg(bg: Rgba, status: &BarStatus) -> Rgba {
+    match status {
+        BarStatus::Blocked { urgent, .. } => tinted(
+            bg,
             AMBER,
             if *urgent { AMBER_MIX_URGENT } else { AMBER_MIX },
         ),
-        (None, Some(BarStatus::Done)) => tinted(bar.bg, MOSS, MOSS_MIX),
-        (None, Some(BarStatus::Error)) => tinted(bar.bg, ROSE, ROSE_MIX),
-        (None, Some(BarStatus::Working { .. })) => tinted(bar.bg, VIOLET, VIOLET_MIX),
-        (None, None) => bar.bg,
+        BarStatus::Done => tinted(bg, MOSS, MOSS_MIX),
+        BarStatus::Error => tinted(bg, ROSE, ROSE_MIX),
+        BarStatus::Working { .. } => tinted(bg, VIOLET, VIOLET_MIX),
     }
 }
 
@@ -313,7 +346,7 @@ pub fn notice_bg(bar: &Titlebar) -> Rgba {
 /// isolates, and invisible formatting (zero-width characters, the word joiner,
 /// the BOM). A program's message is drawn in the window's own frame, so it must
 /// not be able to reorder or hide what it says.
-fn disarmed(text: &str) -> String {
+pub(crate) fn disarmed(text: &str) -> String {
     text.chars()
         .filter(|c| {
             !matches!(c,
@@ -324,7 +357,7 @@ fn disarmed(text: &str) -> String {
 }
 
 /// How thick the progress line is, in logical pixels.
-const PROGRESS_LINE: f32 = 2.0;
+pub(crate) const PROGRESS_LINE: f32 = 2.0;
 
 /// What the details button says.
 pub const DETAILS_LABEL: &str = "Details";

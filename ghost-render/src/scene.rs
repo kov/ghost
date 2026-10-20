@@ -48,6 +48,9 @@ pub enum SceneId {
     Label(u64),
     /// A tile's activity/bell badge.
     Badge(u64),
+    /// A tile's header strip tinted with its program's status, and the
+    /// progress line along its foot.
+    CardStatus(u64),
     Sidebar,
     NavBar,
     /// An attach-state section header, keyed by locality rank.

@@ -172,12 +172,18 @@ by the most urgent of them.
   a row slides that session in front, as Ctrl-Tab does.
 - A background report repaints the window only when it changes the button.
 - Not yet: how long ago each status changed (the window's emulators have no
-  clock; the host's `since` would serve once the window reads it), and the
-  fleet.
+  clock; the host's `since` would serve once the window reads it).
 
-**Fleet tiles.** Not yet: each tile gets the headline as a small badge beside
-the bell badge, from the host's push (`StatusChanged`, which the fleet ignores
-today).
+**Fleet tiles.** Each card's header row is tinted like the titlebar, with
+the same colours and rules: violet working (with the progress line along its
+foot), amber waiting (and the program's message in the header), green or
+muted red for a result not yet seen; idle, seen, exited and host-away cards
+stay plain. A card with a live mirror reads its own emulator, so it changes
+the moment the bytes arrive; one without reads the host's headline from the
+listing and `StatusChanged`. "Seen" is the window's own account for the
+sessions it drives (the host counts them all seen, the window being attached
+to them) and the host's flag for the rest. The bell and activity marks stay in
+the corner.
 
 ## Testing
 
