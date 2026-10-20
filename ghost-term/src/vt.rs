@@ -260,6 +260,17 @@ impl Vt {
         self.terminal.progress()
     }
 
+    /// What the programs on this terminal last reported over OSC 7501.
+    pub fn program_status(&self) -> &crate::status::ProgramStatus {
+        self.terminal.program_status()
+    }
+
+    /// The program on this terminal exited: end the live work it reported
+    /// (`working` and `blocked`), keeping its results (`done`, `error`).
+    pub fn program_exited(&mut self) {
+        self.terminal.program_exited();
+    }
+
     /// Absolute rows (same space as [`lines_scrolled_off`](Self::lines_scrolled_off))
     /// of OSC 133;A prompt starts still reachable through the retained
     /// scrollback, oldest first.

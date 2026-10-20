@@ -15,6 +15,7 @@ mod links;
 pub mod parser;
 mod pen;
 pub mod policy;
+pub mod status;
 mod tabs;
 pub mod terminal;
 pub mod util;

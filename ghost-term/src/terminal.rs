@@ -15,6 +15,7 @@ use crate::parser::{
 };
 use crate::pen::{Intensity, Pen, Protection};
 use crate::policy::TerminalPolicy;
+use crate::status::ProgramStatus;
 use crate::tabs::Tabs;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -183,6 +184,9 @@ pub struct Terminal {
     /// OSC 9;4 taskbar progress, the running task's own report. Dumped, so a
     /// long task's progress survives detach/reattach.
     progress: Option<Progress>,
+    /// OSC 7501 program status records. Dumped, so a reattaching client sees
+    /// what its programs last said they were doing.
+    program_status: ProgramStatus,
 }
 
 /// Cap on retained prompt marks; the oldest fall off first (they are also the
@@ -318,6 +322,7 @@ impl Terminal {
             palette: Box::new([None; 256]),
             special_colors: [None; 5],
             progress: None,
+            program_status: ProgramStatus::default(),
             bell_count: 0,
             graphics: GraphicsState::default(),
         }
@@ -832,6 +837,9 @@ impl Terminal {
                 use crate::parser::PromptMark::*;
                 match mark {
                     PromptStart => {
+                        // A new prompt ends whatever live work programs had
+                        // reported, on either screen (status is the terminal's).
+                        self.program_status.end_live_work();
                         // Marks belong to the primary buffer's history; a
                         // prompt printed while the alternate screen is active
                         // has no stable row to anchor to.
@@ -892,6 +900,10 @@ impl Terminal {
 
             SetProgress(progress) => {
                 self.progress = progress;
+            }
+
+            ProgramStatus(report) => {
+                self.program_status.apply(report);
             }
 
             SetClipboard(selection, payload) => {
@@ -1766,6 +1778,7 @@ impl Terminal {
         *self.palette = [None; 256];
         self.special_colors = [None; 5];
         self.progress = None;
+        self.program_status.reset();
     }
 
     fn primary_buffer(&self) -> &Buffer {
@@ -1957,6 +1970,16 @@ impl Terminal {
         self.progress
     }
 
+    /// What the programs on this terminal last reported over OSC 7501.
+    pub fn program_status(&self) -> &ProgramStatus {
+        &self.program_status
+    }
+
+    /// The program on this terminal exited: end the live work it reported.
+    pub fn program_exited(&mut self) {
+        self.program_status.end_live_work();
+    }
+
     /// Absolute rows (same space as [`lines_scrolled_off`]) of OSC 133;A
     /// prompt starts still reachable through the retained scrollback,
     /// oldest first.
@@ -2044,6 +2067,7 @@ impl Terminal {
         assert_eq!(self.palette, other.palette);
         assert_eq!(self.special_colors, other.special_colors);
         assert_eq!(self.title, other.title);
+        assert_eq!(self.program_status, other.program_status);
 
         assert_eq!(
             self.primary_buffer().view().collect::<Vec<_>>(),
@@ -3616,6 +3640,15 @@ impl Terminal {
         // 17. restore the reported task progress (OSC 9;4), if any.
         if self.progress.is_some() {
             funs.push(Function::SetProgress(self.progress));
+        }
+
+        // 18. restore the program status records (OSC 7501), least recently
+        // updated first so the replay keeps their order. After the grid, whose
+        // replayed prompt marks would otherwise end the live ones.
+        for record in self.program_status.records() {
+            funs.push(Function::ProgramStatus(crate::status::StatusReport::Set(
+                record.clone(),
+            )));
         }
 
         // 18. restore the indexed-palette overrides (OSC 4) and the special colors

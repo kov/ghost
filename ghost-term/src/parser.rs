@@ -198,6 +198,8 @@ pub enum Function {
     ResetPalette(Vec<u16>),
     /// OSC 9;4 taskbar progress; `None` (state 0) removes it.
     SetProgress(Option<Progress>),
+    /// OSC 7501 program status report (see [`crate::status`]).
+    ProgramStatus(crate::status::StatusReport),
     /// DECSCUSR (`CSI Ps SP q`): set the cursor style. The raw Ps (0..=6) is
     /// carried verbatim; the terminal decodes it to a shape (blink is dropped).
     SetCursorStyle(u8),
@@ -1425,6 +1427,11 @@ impl Parser {
                 (payload.len() <= MAX_CLIPBOARD_B64)
                     .then(|| Function::SetClipboard(selection.to_string(), payload.to_string()))
             }
+            // OSC 7501 — a program status report. The capability query (`?`) is
+            // the host's to answer and sets nothing; a report that breaks the
+            // protocol's rules is dropped whole.
+            "7501" if rest.trim() == "?" => None,
+            "7501" => crate::status::parse(rest).map(Function::ProgramStatus),
             // OSC 9;4 — ConEmu/Windows Terminal taskbar progress. The other
             // OSC 9 sub-commands (desktop notifications, ConEmu extras) are
             // not implemented; dropped whole. A missing percentage reads as 0,
@@ -2026,6 +2033,18 @@ fn dump_function(seq: &mut String, fun: &Function) {
             seq.push(';');
             seq.push_str(payload);
             seq.push('\u{07}');
+        }
+
+        ProgramStatus(crate::status::StatusReport::Set(record)) => {
+            seq.push_str(&crate::status::encode(record));
+        }
+
+        ProgramStatus(crate::status::StatusReport::Clear(id)) if id.is_empty() => {
+            seq.push_str("\u{1b}]7501;state=clear\u{1b}\\");
+        }
+
+        ProgramStatus(crate::status::StatusReport::Clear(id)) => {
+            seq.push_str(&format!("\u{1b}]7501;id={id}:state=clear\u{1b}\\"));
         }
 
         SetProgress(progress) => {
