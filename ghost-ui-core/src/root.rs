@@ -37,6 +37,45 @@ enum Mode {
     Fleet(Box<FleetModel>),
 }
 
+/// One of the window's other sessions with something to say — a row of the
+/// titlebar button's list (see [`RootModel::attention`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionRow {
+    pub id: SessionId,
+    /// The session's name as the user knows it.
+    pub label: String,
+    pub state: ghost_term::status::StatusState,
+    pub kind: Option<ghost_term::status::BlockedKind>,
+    /// What the program says about it, if anything.
+    pub msg: Option<String>,
+}
+
+/// A status in words, for a row that names its session: "build — needs
+/// permission".
+pub fn status_phrase(
+    state: ghost_term::status::StatusState,
+    kind: Option<ghost_term::status::BlockedKind>,
+) -> &'static str {
+    use ghost_term::status::{BlockedKind, StatusState};
+    match (state, kind) {
+        (StatusState::Blocked, Some(BlockedKind::Permission)) => "needs permission",
+        (StatusState::Blocked, Some(BlockedKind::Question)) => "has a question",
+        (StatusState::Blocked, Some(BlockedKind::Auth)) => "needs you to log in",
+        (StatusState::Blocked, None) => "is waiting on you",
+        (StatusState::Done, _) => "is done",
+        (StatusState::Error, _) => "failed",
+        (StatusState::Working, _) => "is working",
+        (StatusState::Idle, _) => "is idle",
+    }
+}
+
+/// Where one row of the unfolded attention list is, for the click that picks it.
+type RowHit = (SessionId, RectPx);
+
+/// The depth the attention list draws at: over the terminal and the model's
+/// own overlays, under the titlebar (which is the window's frame).
+const ATTENTION_Z: i32 = 1_000;
+
 /// The window's session states, keyed by session id — the *single* owner of every
 /// [`SessionState`] this window holds. A per-session fact (the emulator, the theme
 /// it answers OSC 10/11 with, the policy) is stamped once, when the session is
@@ -518,11 +557,16 @@ pub struct RootModel {
     /// Dive duration (ms). Defaults to [`ANIM_MS`]; the shell can slow it down for
     /// validation (kept here rather than read from the env so the core stays pure).
     anim_ms: u64,
-    /// The foreground session's program status the user has seen, as its
-    /// session and [`ProgramStatus::generation`](ghost_term::status::ProgramStatus::generation):
-    /// a `done` the bar stops showing once a key is pressed in the session, until
-    /// the program reports again.
-    status_seen: Option<(SessionId, u64)>,
+    /// The program status the user has seen in each session, as the
+    /// [`ProgramStatus::generation`](ghost_term::status::ProgramStatus::generation)
+    /// it had then: stamped by a key pressed in the foreground session, and on
+    /// leaving a session (it was in front of the user). A `done` or `error`
+    /// reported since is unseen — the bar shows it, or the attention list does.
+    /// Kept here, not taken from the host: this window drives its background
+    /// sessions, so the host counts all of them as seen the moment they report.
+    status_seen: HashMap<SessionId, u64>,
+    /// Whether the attention list (the titlebar button's) is unfolded.
+    attention_open: bool,
     /// The coast after a trackpad flick, where the OS sends none of its own
     /// (see [`crate::kinetic`]), and the pointer spot and modifiers it scrolls
     /// with. Not an [`Anim`]: it is input, not a transition, so it neither owns
@@ -939,7 +983,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
-            status_seen: None,
+            status_seen: HashMap::new(),
+            attention_open: false,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -988,7 +1033,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
-            status_seen: None,
+            status_seen: HashMap::new(),
+            attention_open: false,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -1022,7 +1068,8 @@ impl RootModel {
             pending_dive_in: None,
             anim: None,
             anim_ms: ANIM_MS,
-            status_seen: None,
+            status_seen: HashMap::new(),
+            attention_open: false,
             glide: None,
             wheel_at: None,
             focused_win: true,
@@ -1616,9 +1663,7 @@ impl RootModel {
                 ),
                 msg: headline.msg,
             },
-            StatusState::Done
-                if self.status_seen.as_ref() == Some(&(id.clone(), status.generation())) =>
-            {
+            StatusState::Done if self.status_seen.get(id) == Some(&status.generation()) => {
                 return None;
             }
             StatusState::Done => BarStatus::Done,
@@ -1641,8 +1686,251 @@ impl RootModel {
         };
         let before = self.bar_status(sessions);
         let generation = state.screen().vt().program_status().generation();
-        self.status_seen = Some((id.clone(), generation));
+        self.status_seen.insert(id.clone(), generation);
         before != self.bar_status(sessions)
+    }
+
+    /// The session the single view shows; `None` in the fleet.
+    fn single_id(&self) -> Option<&SessionId> {
+        match &self.mode {
+            Mode::Single { id, .. } => Some(id),
+            Mode::Fleet(_) => None,
+        }
+    }
+
+    fn stamp_seen(&mut self, sessions: &Sessions, id: &SessionId) {
+        if let Some(state) = sessions.get(id) {
+            let generation = state.screen().vt().program_status().generation();
+            self.status_seen.insert(id.clone(), generation);
+        }
+    }
+
+    /// Whether the user has seen what `id`'s program last reported.
+    fn status_seen_in(&self, sessions: &Sessions, id: &SessionId) -> bool {
+        sessions.get(id).is_some_and(|s| {
+            self.status_seen.get(id) == Some(&s.screen().vt().program_status().generation())
+        })
+    }
+
+    /// The window's other sessions with something to say, most urgent first:
+    /// every one waiting on the user or at rest, and every one finished or
+    /// failed since the user last saw it. A working session is left out —
+    /// working is what it is supposed to be doing. Only the single view has
+    /// other sessions to speak of; the fleet shows them all already.
+    pub fn attention(&self, sessions: &Sessions) -> Vec<AttentionRow> {
+        use ghost_term::status::StatusState;
+        if !matches!(self.mode, Mode::Single { .. }) {
+            return Vec::new();
+        }
+        let mut rows: Vec<AttentionRow> = self
+            .warm
+            .keys()
+            .filter_map(|id| {
+                let state = sessions.get(id)?;
+                let headline = state.screen().vt().program_status().headline()?;
+                let listed = match headline.state {
+                    StatusState::Blocked | StatusState::Idle => true,
+                    StatusState::Done | StatusState::Error => !self.status_seen_in(sessions, id),
+                    StatusState::Working => false,
+                };
+                listed.then(|| AttentionRow {
+                    id: id.clone(),
+                    label: state.display().to_string(),
+                    state: headline.state,
+                    kind: headline.kind,
+                    msg: headline.msg,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.state.cmp(&a.state).then_with(|| a.label.cmp(&b.label)));
+        rows
+    }
+
+    /// The titlebar's attention button (see [`crate::frame::AttentionBadge`]),
+    /// or `None` when no other session has anything to say.
+    pub fn attention_badge(&self, sessions: &Sessions) -> Option<crate::frame::AttentionBadge> {
+        let rows = self.attention(sessions);
+        let tone = rows.first()?.state;
+        Some(crate::frame::AttentionBadge {
+            count: rows.len(),
+            tone,
+            open: self.attention_open,
+        })
+    }
+
+    /// Unfold the attention list, or fold it away — the titlebar button. Only
+    /// unfolds when there is something in it.
+    pub fn toggle_attention(&mut self, sessions: &Sessions) -> Vec<Cmd> {
+        self.attention_open = !self.attention_open && !self.attention(sessions).is_empty();
+        vec![Cmd::Redraw]
+    }
+
+    /// Whether the attention list is unfolded (and has something to show).
+    pub fn attention_shown(&self, sessions: &Sessions) -> bool {
+        self.attention_open && !self.attention(sessions).is_empty()
+    }
+
+    /// Bring session `id`, one of this window's, to the front — sliding it in
+    /// as a Ctrl-Tab does.
+    pub fn show_session(&mut self, sessions: &mut Sessions, id: SessionId) -> Vec<Cmd> {
+        if !matches!(self.mode, Mode::Single { .. })
+            || self.single_id() == Some(&id)
+            || !self.mine.contains(&id)
+        {
+            return Vec::new();
+        }
+        let outgoing = self.live_scene(sessions);
+        let mut cmds = self.adopt(sessions, id);
+        let incoming = self.live_scene(sessions);
+        cmds.extend(self.start_slide(outgoing, incoming, true));
+        cmds
+    }
+
+    /// Input while the attention list is unfolded: it is modal like a menu.
+    /// Esc or a click anywhere else folds it; a click on a row folds it and
+    /// brings that session to the front; everything else waits.
+    fn attention_input(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
+        match ev {
+            UiEvent::Key { key, kind, .. } if kind.is_down() => {
+                if matches!(key, Key::Named(NamedKey::Escape)) {
+                    self.attention_open = false;
+                    return vec![Cmd::Redraw];
+                }
+                Vec::new()
+            }
+            UiEvent::Pointer {
+                phase: PointerPhase::Press,
+                pos,
+                ..
+            } => {
+                self.attention_open = false;
+                let hit = self.attention_panel(sessions).and_then(|(_, rows)| {
+                    rows.into_iter()
+                        .find(|(_, r)| r.contains(pos.x as f32, pos.y as f32))
+                        .map(|(id, _)| id)
+                });
+                let mut cmds = vec![Cmd::Redraw];
+                if let Some(id) = hit {
+                    cmds.extend(self.show_session(sessions, id));
+                }
+                cmds
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The unfolded attention list: a panel in the window's top-right corner,
+    /// over the terminal, one row per session — who, what it is doing in words,
+    /// and its message — and where each row is, for the click that picks it.
+    /// One layout for the drawing and the hit test. `None` when there is
+    /// nothing to list.
+    fn attention_panel(&self, sessions: &Sessions) -> Option<(Vec<SceneItem>, Vec<RowHit>)> {
+        use crate::Rgba;
+        const PANEL: Rgba = [0.09, 0.09, 0.11, 0.97];
+        const DIM: Rgba = [0.64, 0.66, 0.70, 1.0];
+        let rows = self.attention(sessions);
+        if rows.is_empty() {
+            return None;
+        }
+        let m = CellMetrics {
+            advance: self.metrics.advance * self.scale,
+            line_height: self.metrics.line_height * self.scale,
+        };
+        let (w, _) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let pad = (m.line_height * 0.6).round();
+        let margin = (m.line_height * 0.5).round();
+        let lines: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    format!("{} — {}", r.label, status_phrase(r.state, r.kind)),
+                    r.msg.clone(),
+                )
+            })
+            .collect();
+        let widest = lines
+            .iter()
+            .flat_map(|(a, b)| {
+                std::iter::once(a.chars().count()).chain(b.iter().map(|b| b.chars().count()))
+            })
+            .max()
+            .unwrap_or(0);
+        let max_cols = (((w - 2.0 * margin - 2.0 * pad) / m.advance).floor() as usize).clamp(8, 64);
+        let cols = widest.clamp(16, max_cols);
+        let fit = |s: &str| -> String {
+            if s.chars().count() <= cols {
+                s.to_string()
+            } else {
+                let mut t: String = s.chars().take(cols - 1).collect();
+                t.push('…');
+                t
+            }
+        };
+        let gap = (m.line_height * 0.5).round();
+        let height: f32 = lines
+            .iter()
+            .map(|(_, msg)| m.line_height * if msg.is_some() { 2.0 } else { 1.0 })
+            .sum::<f32>()
+            + gap * (lines.len() as f32 - 1.0)
+            + 2.0 * pad;
+        let pw = cols as f32 * m.advance + 2.0 * pad;
+        let panel = RectPx {
+            x: (w - margin - pw).max(0.0),
+            y: margin,
+            w: pw,
+            h: height,
+        };
+        let text = |x: f32, y: f32, s: String, color: Rgba| SceneItem::Text {
+            id: SceneId::StatusList,
+            rect: RectPx {
+                x,
+                y,
+                w: (s.chars().count() as f32 * m.advance).max(1.0),
+                h: m.line_height,
+            },
+            runs: vec![Run {
+                start_col: 0,
+                width_cols: s.chars().count(),
+                text: s,
+                style: Style::default(),
+            }],
+            metrics: m,
+            color,
+            scale: 1.0,
+        };
+        let mut items = vec![SceneItem::Rect {
+            id: SceneId::StatusList,
+            rect: panel,
+            color: PANEL,
+            radius: pad * 0.5,
+        }];
+        let mut hits = Vec::new();
+        let mut y = panel.y + pad;
+        for (row, (head, msg)) in rows.iter().zip(lines) {
+            let top = y;
+            items.push(text(
+                panel.x + pad,
+                y,
+                fit(&head),
+                crate::frame::status_color(row.state),
+            ));
+            y += m.line_height;
+            if let Some(msg) = msg {
+                items.push(text(panel.x + pad, y, fit(&msg), DIM));
+                y += m.line_height;
+            }
+            hits.push((
+                row.id.clone(),
+                RectPx {
+                    x: panel.x,
+                    y: top - gap * 0.5,
+                    w: panel.w,
+                    h: y - top + gap,
+                },
+            ));
+            y += gap;
+        }
+        Some((items, hits))
     }
 
     /// Report something this window could not do. `summary` is the line the frame
@@ -1680,9 +1968,25 @@ impl RootModel {
 
     pub fn update(&mut self, sessions: &mut Sessions, ev: UiEvent) -> Vec<Cmd> {
         let saw_result = self.see_status(sessions, &ev);
+        let in_front = self.single_id().cloned();
+        // A background session's output repaints nothing (`feed_warm`), unless
+        // it changes what the titlebar's attention button says.
+        let badge = match &ev {
+            UiEvent::SessionData { name, .. } if in_front.as_ref() != Some(name) => {
+                Some(self.attention_badge(sessions))
+            }
+            _ => None,
+        };
         let mut cmds = self.update_dispatch(sessions, ev);
-        if saw_result {
+        if saw_result || badge.is_some_and(|b| b != self.attention_badge(sessions)) {
             cmds.push(Cmd::Redraw);
+        }
+        // A session the user leaves was in front of them: whatever it had to say
+        // has been seen.
+        if let Some(left) = in_front
+            && self.single_id() != Some(&left)
+        {
+            self.stamp_seen(sessions, &left);
         }
         // A kill emits a Cmd::Kill — the session is gone, so this window no longer
         // drives it. This is the boundary every command crosses (finding #18), so a
@@ -1742,6 +2046,19 @@ impl RootModel {
             )
         {
             return self.error_details_input(ev);
+        }
+        // The unfolded attention list is modal like a menu (see
+        // `attention_input`). One with nothing left to list has folded itself.
+        if self.attention_open && self.attention(sessions).is_empty() {
+            self.attention_open = false;
+        }
+        if self.attention_open
+            && matches!(
+                ev,
+                UiEvent::Key { .. } | UiEvent::Text(_) | UiEvent::Pointer { .. }
+            )
+        {
+            return self.attention_input(sessions, ev);
         }
         // The connect prompt is modal: while it is open it swallows keyboard,
         // text, and pointer input, so neither the typed host nor a stray click
@@ -2607,7 +2924,13 @@ impl RootModel {
         // `foreground_mut` is `None`), so only the single case marks it painted.
         self.foreground_painted
             .set(matches!(self.mode, Mode::Single { .. }));
-        self.live_scene(sessions)
+        let mut scene = self.live_scene(sessions);
+        if self.attention_open
+            && let Some((items, _)) = self.attention_panel(sessions)
+        {
+            scene.layers.push(Layer::new(ATTENTION_Z, items));
+        }
+        scene
     }
 
     /// Keyboard for the connect prompt, routed by phase. In [`Host`] typing goes
@@ -3439,6 +3762,7 @@ mod tests {
     }
     use super::*;
     use crate::input::{KeyEventKind, Mods};
+    use ghost_term::status::StatusState;
 
     const METRICS: CellMetrics = CellMetrics {
         advance: 9.0,
@@ -3622,6 +3946,233 @@ mod tests {
             },
         );
         assert!(cmds.contains(&Cmd::Redraw), "{cmds:?}");
+    }
+
+    /// A window in front of "a" with "b" and "c" warm behind it.
+    fn group_window() -> (RootModel, Sessions) {
+        let (mut root, mut sessions) = status_window();
+        for id in ["b", "c"] {
+            sessions.get_or_mint(&id.into(), 80, 24);
+            root.mine.insert(id.into());
+            root.warm
+                .insert(id.into(), TerminalView::new(METRICS, 80, 24));
+        }
+        (root, sessions)
+    }
+
+    fn attention_of(root: &RootModel, sessions: &Sessions) -> Vec<(String, StatusState)> {
+        root.attention(sessions)
+            .into_iter()
+            .map(|r| (r.label, r.state))
+            .collect()
+    }
+
+    fn drawn_list(root: &RootModel, sessions: &Sessions) -> Vec<String> {
+        root.view(sessions)
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .filter_map(|i| match i {
+                SceneItem::Text { id, runs, .. } if *id == SceneId::StatusList => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press_at(root: &mut RootModel, sessions: &mut Sessions, x: f32, y: f32) -> Vec<Cmd> {
+        root.update(
+            sessions,
+            UiEvent::Pointer {
+                phase: PointerPhase::Press,
+                button: Some(PointerButton::Left),
+                pos: PointPx {
+                    x: f64::from(x),
+                    y: f64::from(y),
+                },
+                mods: Mods::default(),
+                wheel: crate::WheelDelta::Notches(0.0),
+                clicks: 1,
+            },
+        )
+    }
+
+    /// Unfold the list and click session `id`'s row.
+    fn pick(root: &mut RootModel, sessions: &mut Sessions, id: &str) {
+        let _ = root.toggle_attention(sessions);
+        let (_, rows) = root.attention_panel(sessions).expect("a list");
+        let (_, r) = rows
+            .into_iter()
+            .find(|(row, _)| row.name() == id)
+            .expect("listed");
+        press_at(root, sessions, r.x + r.w * 0.5, r.y + r.h * 0.5);
+        let _ = root.update(
+            sessions,
+            UiEvent::Tick {
+                now_ms: u64::MAX / 2,
+            },
+        );
+    }
+
+    #[test]
+    fn the_other_sessions_with_something_to_say_are_listed_most_urgent_first() {
+        let (mut root, mut sessions) = group_window();
+        assert_eq!(root.attention_badge(&sessions), None);
+        report(&mut root, &mut sessions, "b", "state=working");
+        assert_eq!(attention_of(&root, &sessions), vec![], "working is no news");
+        report(&mut root, &mut sessions, "b", "state=idle");
+        report(&mut root, &mut sessions, "c", "state=blocked:kind=question");
+        // The foreground's own status is the bar's, never the list's.
+        report(
+            &mut root,
+            &mut sessions,
+            "a",
+            "state=blocked:kind=permission",
+        );
+        assert_eq!(
+            attention_of(&root, &sessions),
+            vec![
+                ("c".into(), StatusState::Blocked),
+                ("b".into(), StatusState::Idle)
+            ]
+        );
+        assert_eq!(
+            root.attention_badge(&sessions),
+            Some(crate::frame::AttentionBadge {
+                count: 2,
+                tone: StatusState::Blocked,
+                open: false
+            })
+        );
+    }
+
+    /// A result is news until the user has had that session in front of
+    /// them; a later result is news again.
+    #[test]
+    fn a_background_result_is_listed_until_the_user_has_been_to_it() {
+        let (mut root, mut sessions) = group_window();
+        report(&mut root, &mut sessions, "b", "state=done");
+        report(&mut root, &mut sessions, "c", "state=error");
+        assert_eq!(attention_of(&root, &sessions).len(), 2);
+
+        // Over to b through the list, and on to c the same way: no key is
+        // pressed in b, but the user had it in front of them.
+        pick(&mut root, &mut sessions, "b");
+        assert_eq!(root.single_id(), Some(&"b".into()));
+        assert_eq!(
+            root.bar_status(&sessions),
+            Some(crate::frame::BarStatus::Done)
+        );
+        pick(&mut root, &mut sessions, "c");
+        assert_eq!(root.single_id(), Some(&"c".into()));
+        assert_eq!(attention_of(&root, &sessions), vec![], "b was seen");
+
+        report(&mut root, &mut sessions, "b", "state=working");
+        report(&mut root, &mut sessions, "b", "state=done");
+        assert_eq!(
+            attention_of(&root, &sessions),
+            vec![("b".into(), StatusState::Done)],
+            "b's next result is news"
+        );
+    }
+
+    #[test]
+    fn the_unfolded_list_names_each_session_and_a_click_brings_it_in_front() {
+        let (mut root, mut sessions) = group_window();
+        // "approve Bash: rm x"
+        report(
+            &mut root,
+            &mut sessions,
+            "c",
+            "state=blocked:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSB4",
+        );
+        report(&mut root, &mut sessions, "b", "state=idle");
+        assert_eq!(drawn_list(&root, &sessions), Vec::<String>::new(), "folded");
+
+        let cmds = root.toggle_attention(&sessions);
+        assert!(cmds.contains(&Cmd::Redraw));
+        assert_eq!(
+            drawn_list(&root, &sessions),
+            vec![
+                "c — needs permission".to_string(),
+                "approve Bash: rm x".to_string(),
+                "b — is idle".to_string(),
+            ]
+        );
+        assert!(root.attention_badge(&sessions).unwrap().open);
+
+        // Typing waits while the list is open; it never reaches the terminal.
+        let typed = root.update(
+            &mut sessions,
+            UiEvent::Key {
+                key: Key::Char("x".into()),
+                mods: Mods::default(),
+                kind: KeyEventKind::Press,
+                alts: None,
+            },
+        );
+        assert_eq!(typed, vec![]);
+
+        let (_, rows) = root.attention_panel(&sessions).unwrap();
+        let (id, r) = rows[0].clone();
+        assert_eq!(id, SessionId::from("c"));
+        press_at(&mut root, &mut sessions, r.x + r.w * 0.5, r.y + r.h * 0.5);
+        assert_eq!(root.single_id(), Some(&"c".into()), "c is in front");
+        assert!(!root.attention_shown(&sessions), "and the list folded away");
+    }
+
+    /// A background session's output repaints nothing — except when it
+    /// changes what the titlebar's button says.
+    #[test]
+    fn a_background_status_that_changes_the_button_repaints_the_window() {
+        let (mut root, mut sessions) = group_window();
+        let feed = |root: &mut RootModel, sessions: &mut Sessions, bytes: &str| {
+            root.update(
+                sessions,
+                UiEvent::SessionData {
+                    name: "b".into(),
+                    bytes: bytes.as_bytes().to_vec(),
+                    ended: false,
+                },
+            )
+        };
+        let quiet = feed(&mut root, &mut sessions, "chatter\r\n");
+        assert!(!quiet.contains(&Cmd::Redraw), "{quiet:?}");
+        let asked = feed(&mut root, &mut sessions, "\x1b]7501;state=blocked\x1b\\");
+        assert!(asked.contains(&Cmd::Redraw), "{asked:?}");
+        let same = feed(&mut root, &mut sessions, "\x1b]7501;state=blocked\x1b\\");
+        assert!(!same.contains(&Cmd::Redraw), "{same:?}");
+    }
+
+    #[test]
+    fn esc_or_a_click_elsewhere_folds_the_list_away() {
+        let (mut root, mut sessions) = group_window();
+        report(&mut root, &mut sessions, "b", "state=idle");
+        let _ = root.toggle_attention(&sessions);
+        let _ = root.update(
+            &mut sessions,
+            UiEvent::Key {
+                key: Key::Named(NamedKey::Escape),
+                mods: Mods::default(),
+                kind: KeyEventKind::Press,
+                alts: None,
+            },
+        );
+        assert!(!root.attention_shown(&sessions));
+
+        let _ = root.toggle_attention(&sessions);
+        let cmds = press_at(&mut root, &mut sessions, 2.0, 500.0);
+        assert!(!root.attention_shown(&sessions));
+        assert!(
+            cmds.iter().all(|c| !matches!(c, Cmd::SendInput { .. })),
+            "{cmds:?}"
+        );
+        assert_eq!(root.single_id(), Some(&"a".into()), "nothing switched");
+        // And with nothing to list, there is nothing to unfold.
+        report(&mut root, &mut sessions, "b", "state=clear");
+        let _ = root.toggle_attention(&sessions);
+        assert!(!root.attention_shown(&sessions));
     }
 
     /// The bar speaks for the session in front: a background session's

@@ -110,29 +110,35 @@ answers both the attached and detached paths in stream order. It gains
 - The reply is identity, not state. It is safe under every
   escape-sequence policy (`ghost_term::policy`) and needs no new policy switch.
 
-## Background sessions: listing, push, remote
+## Where each view reads it
 
-A session that no window has in the foreground still needs to reach the
-affordance. Status rides the paths the title and the bell already use.
+Three readers, each from the copy nearest to it:
 
-- **Host:**
+- **The window's own sessions** — its foreground and the warm mirrors of its
+  group behind it — are fed live, so their emulators already hold the records.
+  The titlebar and the attention list read the headline straight from there,
+  with no round trip.
+- **Listings and watchers** — `ghost ls --json`, the remote `__watch` feed, a
+  fleet tile that is not previewed — get it from the host:
   - At the end of each turn, if the headline changed, the host writes it into
-    the session's `meta`, in a new `status` field with `serde(default)`.
-  - It pushes `SessionEvent::StatusChanged(Option<Headline>)` to subscribers.
-    The variant is appended, and older subscribers skip the unknown frame.
+    the session's `meta` (a `status` field, absent when there is none), so
+    `SessionInfo.status` carries it with no new remote machinery.
+  - It pushes `SessionEvent::StatusChanged(Option<StatusHeadline>)` to
+    subscribers. The variant is appended; older subscribers skip the frame.
   - A subscriber that starts while a status is set gets the event right after
     its `Snapshot`, which therefore stays unchanged on the wire.
-- **Listing:** `SessionInfo.status` comes from `meta`. So `ghost ls --json`,
-  and therefore a remote host's `__watch` feed, carry it with no new remote
-  machinery.
-- **Seen:**
-  - A `done` or `error` headline in a background session counts as *unseen*
-    until a display client attaches. Switching to the session is seeing it,
-    exactly as with the bell marker.
-  - The host keeps the flag with the record, and it rides along in the headline
-    as `seen: bool`.
-  - In the foreground, a `done` tint fades once the user presses a key in the
-    window. That is UI-local and does not touch the record.
+  - The host adds what the emulator cannot know: `since`, when the state (or
+    its blocked kind) last changed — a new message under the same state keeps
+    it — and `seen`, whether a display client has been attached since.
+
+**Seen is decided where it is looked at.** The host's `seen` is right for a
+session nobody in this process drives. It is wrong for a window's own group:
+the window is the display client of every session in it, so the host counts
+each background result as seen the moment it lands. The window therefore keeps
+its own record — the report counter (`ProgramStatus::generation`) it last saw
+per session — stamped by a key pressed in the foreground session and by
+leaving a session (it was in front of the user). A counter rather than the
+record, because a second turn's `done` says exactly what the first one did.
 
 ## What the user sees
 
@@ -140,36 +146,38 @@ affordance. Status rides the paths the title and the bell already use.
 
 | Headline | Tint |
 | --- | --- |
-| `working` | none |
-| `blocked` | warm amber, strongest for `permission` and `question` |
-| `done` | soft green, until the first keypress |
-| `error` | muted red, distinct from ghost's own error notice |
+| `working` | none; a line along the bar's foot instead |
+| `blocked` | amber, stronger for `permission` and `question` |
+| `done` | green, until the user has seen it |
+| `error` | muted red, distinct from ghost's own failure red |
 | `idle` | none |
 
-- `working` shows a small progress indicator by the title instead of a tint: a
-  determinate bar with `progress`, an indeterminate one otherwise.
-- `msg`, when present, replaces the title while the session is `blocked`. That
-  is when it is worth reading.
+- The progress line is as long as `progress` says, or faint across the whole
+  bar when it says nothing.
+- `msg` replaces the title while the session is `blocked`: what it waits for is
+  what to read. Bidi overrides and invisible formatting are stripped first.
 - ghost's own `Notice` still outranks all of this. A window that failed to do
   something says so first.
 
-**Header-bar affordance, background sessions.** A compact button sits at the
-trailing end of the bar, next to the window buttons. It covers the members of
-this window's group other than its foreground session.
+**Attention button, the window's other sessions.** In the single view, a pill
+at the trailing end of the bar (inside the Details pill, when there is one)
+counts the other sessions of the window's group with something to say, coloured
+by the most urgent of them.
 
-- It is drawn only when some background session has something to say.
-- It carries a count, coloured by the most urgent headline among them.
-- Clicking it unfolds a list with one row per session:
-  - the session's label and host;
-  - the state, with `kind` spelled out: "needs permission", "has a question";
-  - `msg`, and how long ago it changed.
-- Clicking a row switches to that session, exactly as clicking its fleet tile
-  does: a dive into the window that holds it, or a take-over prompt.
-- The list holds `blocked` headlines always, `done` and `error` while unseen,
-  and `idle`.
+- It lists every one `blocked` or `idle`, and every one `done` or `error` the
+  user has not seen; a `working` session is doing what it should.
+- Clicking it unfolds a list over the top-right of the terminal, most urgent
+  first: "build — needs permission", and the program's message under it.
+- The list is modal like a menu: Esc or a click elsewhere folds it; a click on
+  a row slides that session in front, as Ctrl-Tab does.
+- A background report repaints the window only when it changes the button.
+- Not yet: how long ago each status changed (the window's emulators have no
+  clock; the host's `since` would serve once the window reads it), and the
+  fleet.
 
-**Fleet tiles.** Each tile gets the headline as a small badge beside the
-existing bell badge.
+**Fleet tiles.** Not yet: each tile gets the headline as a small badge beside
+the bell badge, from the host's push (`StatusChanged`, which the fleet ignores
+today).
 
 ## Testing
 
@@ -187,11 +195,12 @@ Test-first, outer behaviour first:
   - a subscriber receives `StatusChanged`;
   - a reattach restores the records.
 - **Shell (`ghost-ui/tests/shell.rs`):**
-  - a session reporting `blocked` tints the drawn titlebar;
-  - a background session reporting `blocked` puts a row in the affordance;
-  - clicking the row brings that session to the foreground.
-- **Remote (`shell_remote.rs`):** a remote background session's status reaches
-  the affordance through the watch feed.
+  - a session reporting `blocked` reaches the bar's status, and `done` lasts
+    until a key press;
+  - a background session reporting `blocked` before any window looked is
+    counted on the button, named in the list, and one click away.
+- **Remote (`shell_remote.rs`):** still to write — a remote background
+  session's status reaching the window.
 
 ## What Claude Code sends
 

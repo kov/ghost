@@ -60,6 +60,11 @@ pub enum SceneId {
     NoticeDetails,
     /// The line along the titlebar's foot showing a working program's progress.
     StatusProgress,
+    /// The titlebar's button counting the window's other sessions with
+    /// something to say (see `docs/program-status-design.md`).
+    StatusButton,
+    /// The list that button unfolds over the window.
+    StatusList,
 }
 
 /// Where a [`SceneItem::ChromeText`] sits in its box.

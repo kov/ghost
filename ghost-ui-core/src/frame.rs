@@ -170,6 +170,10 @@ pub struct Titlebar {
     /// the bar shows it: a tint, a message in place of the title, or a progress
     /// line. A [`Self::notice`] outranks it — the window's own word comes first.
     pub status: Option<BarStatus>,
+    /// The window's other sessions with something to say — waiting on the
+    /// user, finished, failed, or at rest: a button that unfolds the list.
+    /// `None` draws no button.
+    pub attention: Option<AttentionBadge>,
     /// Em size of the title, in physical px.
     pub font_px: f32,
     /// Which buttons, on which side — the desktop's choice.
@@ -205,6 +209,17 @@ pub enum BarStatus {
     Done,
     /// Failed: a muted red — not ghost's own failure red, which is louder.
     Error,
+}
+
+/// The titlebar's button for the window's other sessions' statuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionBadge {
+    /// How many sessions have something to say.
+    pub count: usize,
+    /// The most urgent of what they say, which colours the button.
+    pub tone: ghost_term::status::StatusState,
+    /// Whether the list is unfolded.
+    pub open: bool,
 }
 
 /// How loud a [`Notice`] is.
@@ -336,6 +351,52 @@ pub fn details_rect(bar: &Titlebar, strip: RectPx) -> Option<RectPx> {
         w,
         h,
     })
+}
+
+/// The attention button's size, in logical pixels.
+const ATTENTION_W: f32 = 30.0;
+const ATTENTION_H: f32 = 20.0;
+
+/// Where the attention button sits, when there is one: at the inner edge of
+/// the right-hand button group, and inside the details button when the bar
+/// carries that too — the window's own failure stays nearest its controls.
+/// One formula for the drawing and the hit test, as for the details button.
+pub fn attention_rect(bar: &Titlebar, strip: RectPx) -> Option<RectPx> {
+    bar.attention?;
+    let gap = BUTTON_GAP * bar.scale;
+    let w = ATTENTION_W * bar.scale;
+    let h = ATTENTION_H * bar.scale;
+    let right = match details_rect(bar, strip) {
+        Some(d) => d.x,
+        None => button_rects(&bar.buttons, strip, bar.scale)
+            .iter()
+            .filter(|(b, _)| bar.buttons.right.contains(b))
+            .map(|(_, r)| r.x)
+            .fold(strip.x + strip.w, f32::min),
+    };
+    Some(RectPx {
+        x: (right - gap - w).max(strip.x),
+        y: strip.y + (strip.h - h) * 0.5,
+        w,
+        h,
+    })
+}
+
+/// Whether `pos` falls on the attention button.
+pub fn attention_at(pos: PointPx, bar: &Titlebar, strip: RectPx) -> bool {
+    attention_rect(bar, strip).is_some_and(|r| r.contains(pos.x as f32, pos.y as f32))
+}
+
+/// The colour a status speaks in, wherever it is shown: the titlebar's tints
+/// carried all the way, for a mark that has to read on its own.
+pub fn status_color(state: ghost_term::status::StatusState) -> Rgba {
+    use ghost_term::status::StatusState;
+    match state {
+        StatusState::Blocked => AMBER,
+        StatusState::Done => MOSS,
+        StatusState::Error => ROSE,
+        StatusState::Working | StatusState::Idle => [0.62, 0.64, 0.68, 1.0],
+    }
 }
 
 /// Whether `pos` falls on the details button.
@@ -491,6 +552,7 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
     }
     let buttons = button_rects(&bar.buttons, strip, bar.scale);
     let details = details_rect(bar, strip);
+    let attention = attention_rect(bar, strip);
     // A notice stands in for the title: what the window is doing, or what went
     // wrong, matters more than its name for as long as it lasts, and the
     // compositor still knows the real title, so the task switcher goes on naming
@@ -518,6 +580,7 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
         // The details button, when there is one, is part of what the heading has
         // to stay clear of.
         let right = details.map_or(right, |d| right.min(d.x - BUTTON_GAP * bar.scale));
+        let right = attention.map_or(right, |a| right.min(a.x - BUTTON_GAP * bar.scale));
         items.push(SceneItem::ChromeText {
             id: SceneId::Titlebar,
             rect: RectPx {
@@ -527,6 +590,26 @@ pub fn with_frame(content: Scene, bar: &Titlebar, margins: FrameInset) -> Scene 
                 h: strip.h,
             },
             text: heading.clone(),
+            color: bar.fg,
+            size_px: bar.font_px,
+            align: TextAlign::Center,
+        });
+    }
+    // The attention button: a pill in the colour of the most urgent thing it
+    // counts, mixed into the bar so it belongs to the theme — fuller while its
+    // list is open.
+    if let (Some(rect), Some(badge)) = (attention, bar.attention) {
+        let mix = if badge.open { 0.85 } else { 0.6 };
+        items.push(SceneItem::Rect {
+            id: SceneId::StatusButton,
+            rect,
+            color: tinted(bar.bg, status_color(badge.tone), mix),
+            radius: rect.h * 0.5,
+        });
+        items.push(SceneItem::ChromeText {
+            id: SceneId::StatusButton,
+            rect,
+            text: badge.count.to_string(),
             color: bar.fg,
             size_px: bar.font_px,
             align: TextAlign::Center,
@@ -758,6 +841,7 @@ pub fn frame_hit_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_term::status::StatusState;
 
     const SIZE: (u32, u32) = (800, 600);
 
@@ -781,6 +865,7 @@ mod tests {
             title: "ghost".into(),
             notice: None,
             status: None,
+            attention: None,
             font_px: 15.0,
             buttons: ButtonLayout::default(),
             hovered: None,
@@ -1060,6 +1145,98 @@ mod tests {
         assert_eq!(
             bar_of(&with_titlebar(content(800, 565), &bar)).1,
             vec!["approve xr mr now".to_string()]
+        );
+    }
+
+    fn attention_button(scene: &Scene) -> Option<(RectPx, Rgba, String)> {
+        let items: Vec<_> = scene.layers.iter().flat_map(|l| &l.items).collect();
+        let (rect, color) = items.iter().find_map(|i| match i {
+            SceneItem::Rect {
+                id, rect, color, ..
+            } if *id == SceneId::StatusButton => Some((*rect, *color)),
+            _ => None,
+        })?;
+        let text = items.iter().find_map(|i| match i {
+            SceneItem::ChromeText { id, text, .. } if *id == SceneId::StatusButton => {
+                Some(text.clone())
+            }
+            _ => None,
+        })?;
+        Some((rect, color, text))
+    }
+
+    fn with_attention(count: usize, tone: StatusState) -> Titlebar {
+        Titlebar {
+            attention: Some(AttentionBadge {
+                count,
+                tone,
+                open: false,
+            }),
+            ..titlebar(35)
+        }
+    }
+
+    #[test]
+    fn the_bar_counts_the_other_sessions_with_something_to_say() {
+        assert_eq!(
+            attention_button(&with_titlebar(content(800, 565), &titlebar(35))),
+            None
+        );
+        let bar = with_attention(2, StatusState::Blocked);
+        let scene = with_titlebar(content(800, 565), &bar);
+        let (rect, amber, count) = attention_button(&scene).expect("a button");
+        assert_eq!(count, "2");
+        assert!(
+            amber[0] > amber[2],
+            "coloured by what is most urgent: {amber:?}"
+        );
+        let (_, green, _) = attention_button(&with_titlebar(
+            content(800, 565),
+            &with_attention(1, StatusState::Done),
+        ))
+        .unwrap();
+        assert!(green[1] > green[0], "{green:?}");
+        // Beside the window's own buttons, and where a click finds it.
+        let buttons = button_rects(&bar.buttons, BAR, 1.0);
+        let inner = buttons.iter().map(|(_, r)| r.x).fold(f32::MAX, f32::min);
+        assert!(
+            rect.x + rect.w <= inner,
+            "{rect:?} clear of the buttons at {inner}"
+        );
+        let mid = PointPx {
+            x: f64::from(rect.x + rect.w * 0.5),
+            y: f64::from(rect.y + rect.h * 0.5),
+        };
+        assert!(attention_at(mid, &bar, BAR));
+        assert!(!attention_at(PointPx { x: 5.0, y: 5.0 }, &bar, BAR));
+    }
+
+    #[test]
+    fn the_attention_button_keeps_clear_of_the_details_button_and_the_title() {
+        let bar = Titlebar {
+            notice: Some(Notice::error("Could not start a session")),
+            ..with_attention(1, StatusState::Error)
+        };
+        let strip = BAR;
+        let details = details_rect(&bar, strip).unwrap();
+        let attention = attention_rect(&bar, strip).unwrap();
+        assert!(
+            attention.x + attention.w <= details.x,
+            "{attention:?} vs {details:?}"
+        );
+        let scene = with_titlebar(content(800, 565), &bar);
+        let heading = scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                SceneItem::ChromeText { id, rect, .. } if *id == SceneId::Titlebar => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            heading.x + heading.w <= attention.x,
+            "{heading:?} vs {attention:?}"
         );
     }
 
@@ -1605,6 +1782,7 @@ mod inset_tests {
             pressed: None,
             maximized: false,
             status: None,
+            attention: None,
         };
         assert_eq!(with_frame(content, &bar, m).size_px, surface);
     }

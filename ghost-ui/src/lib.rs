@@ -2717,6 +2717,7 @@ impl Graphics {
             maximized: self.window.is_maximized(),
             scale,
             controls_px: self.controls_px(),
+            attention: w.root.attention_badge(sessions),
         }
     }
 
@@ -5381,6 +5382,15 @@ impl App {
             }
             return true;
         }
+        // So does the attention button: it unfolds (or folds) the list of the
+        // window's other sessions with something to say.
+        let on_attention = self.windows.get(&id).is_some_and(|w| {
+            ghost_ui_core::frame::attention_at(pos, &gfx.titlebar(w, &self.states), bar)
+        });
+        if button == PointerButton::Left && on_attention {
+            self.toggle_attention(id);
+            return true;
+        }
         match button {
             // The window menu is the right-click gesture on every desktop; the
             // compositor draws it, so it is the compositor's to open.
@@ -7582,6 +7592,15 @@ impl App {
 
     /// The one shared session-state registry (one emulator per session, fanned to
     /// every viewing window), for rendering a window's `Scene` in a test.
+    /// Unfold window `wid`'s attention list, or fold it away — what its
+    /// titlebar button does.
+    pub fn toggle_attention(&mut self, wid: WindowId) {
+        if let Some(w) = self.windows.get_mut(&wid) {
+            let _ = w.root.toggle_attention(&self.states);
+            w.request_redraw();
+        }
+    }
+
     pub fn states(&self) -> &Sessions {
         &self.states
     }
@@ -12885,6 +12904,7 @@ mod tests {
             scale: 1.0,
             controls_px: 0.0,
             status: w.root.bar_status(&app.states),
+            attention: w.root.attention_badge(&app.states),
         };
         ghost_ui_core::frame::with_titlebar(w.root.view(&app.states), &bar)
             .layers

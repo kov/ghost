@@ -1199,3 +1199,94 @@ fn the_header_bar_shows_what_the_foreground_program_is_doing() {
         support::kill_session("asker");
     });
 }
+
+/// A session waiting in the background of a window shows on the titlebar's
+/// button; the list it unfolds names it and what it waits for, and picking it
+/// there brings it to the front.
+#[test]
+fn a_background_session_asking_for_permission_is_one_click_away() {
+    with_isolated_xdg(|_tmp| {
+        support::spawn_session_running("front", "exec cat");
+        // It asks before any window is looking: the window learns of it from
+        // the screen the host hands over when it attaches.
+        // "approve Bash: rm x", base64.
+        support::spawn_session_running(
+            "asker",
+            "printf '\\033]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSB4\\033\\\\'; exec cat",
+        );
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        open_card(&mut app, wid, &fe, "asker");
+        app.dispatch(
+            wid,
+            press(
+                ghost_ui_core::Key::Named(ghost_ui_core::NamedKey::F9),
+                ghost_ui_core::Mods::NONE,
+            ),
+            &fe,
+        );
+        app.wake(&fe);
+        open_card(&mut app, wid, &fe, "front");
+
+        let badge = |app: &App| app.root(wid).expect("window").attention_badge(app.states());
+        let shown = wait_until(Duration::from_secs(10), || {
+            app.wake(&fe);
+            badge(&app).is_some_and(|b| b.count == 1)
+        });
+        assert!(
+            shown,
+            "the button never counted the asking session: {:?}",
+            badge(&app)
+        );
+        assert_eq!(
+            badge(&app).unwrap().tone,
+            ghost_term::status::StatusState::Blocked
+        );
+
+        // The dive into "front" owns the frame while it plays.
+        let settled = wait_until(Duration::from_secs(10), || {
+            app.wake(&fe);
+            !app.root(wid).expect("window").is_animating()
+        });
+        assert!(settled, "the dive never finished");
+        app.toggle_attention(wid);
+        let scene = app.root(wid).expect("window").view(app.states());
+        let listed = visible_text(&scene);
+        assert!(
+            listed.iter().any(|t| t == "asker — needs permission")
+                && listed.iter().any(|t| t == "approve Bash: rm x"),
+            "the list names it and what it waits for: {listed:?}"
+        );
+
+        let (x, y) = scene
+            .layers
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| match i {
+                ghost_render::SceneItem::Text { rect, runs, .. }
+                    if runs.iter().any(|r| r.text == "asker — needs permission") =>
+                {
+                    Some((f64::from(rect.x + 2.0), f64::from(rect.y + rect.h * 0.5)))
+                }
+                _ => None,
+            })
+            .expect("the row is drawn");
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let switched = wait_until(Duration::from_secs(10), || {
+            app.wake(&fe);
+            app.root(wid)
+                .is_some_and(|r| r.foregrounds(&"asker".into()))
+        });
+        assert!(
+            switched,
+            "picking the row never brought the session in front"
+        );
+        support::kill_session("front");
+        support::kill_session("asker");
+    });
+}
