@@ -148,9 +148,10 @@ each predicted cell whose `expiration_frame ≤ echo_ack`:
 - **Pending** (not yet acked): leave it, and feed the glitch timer.
 
 The cursor prediction is checked the same way. A wrong cursor position resets
-the engine. So does a resize, and so does any resync that re-seeds the
-replica (attach, `Repaint`, the reconnect across a host self-upgrade): the
-overlay's snapshots of the old grid mean nothing against a rebuilt one.
+the engine. So does a resize, and a new connection (attach, reconnect, the
+reconnect across a host self-upgrade) replaces it: predictions made against
+the old grid or the old numbering mean nothing there. A `Repaint` re-feeds the
+same screen, so predictions are simply judged against it as usual.
 
 ### When predictions are visible, and underlined
 
