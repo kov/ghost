@@ -162,8 +162,8 @@ Taken unchanged from mosh's `PredictionEngine` constants:
 
 Mosh's `display_preference` (`Adaptive` default, `Always`, `Never`) becomes
 `[input] predictive_echo = "adaptive" | "always" | "never"` in `ui.toml`.
-`Always` is what the E2E tests use, so they don't depend on the RTT
-estimator's start-up. We don't adopt `Experimental` or `predict_overwrite`.
+The E2E tests run the default, `adaptive`: the harness's 500 ms round trip is
+far above every threshold, so they test what users get. We don't adopt `Experimental` or `predict_overwrite`.
 
 ## Where it lives in ghost
 
@@ -257,7 +257,7 @@ Test-first, driving the real binary, asserting on what is drawn.
    unit tests, because the RTT thresholds and timers are hard to drive end to end.
 3. Host unit test: echo-ack advances after 50 ms with no output, and only for
    seqs whose bytes the PTY drain accepted.
-4. E2E over the latency harness (`predictive_echo = "always"`):
+4. E2E over the latency harness (`ghost-ui/tests/predictive_echo.rs`):
    - At a shell prompt, type `e` and wait for its echo. That confirms the
      epoch. Then `cho hi` is drawn character by character within one frame
      each, long before the RTT, and the final screen matches the host's.
