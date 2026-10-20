@@ -1856,7 +1856,9 @@ impl RootModel {
             .max()
             .unwrap_or(0);
         let max_cols = (((w - 2.0 * margin - 2.0 * pad) / m.advance).floor() as usize).clamp(8, 64);
-        let cols = widest.clamp(16, max_cols);
+        // At least 16 columns where the window has them; never more than it has
+        // (`clamp` panics on a minimum above its maximum).
+        let cols = widest.clamp(16.min(max_cols), max_cols);
         let fit = |s: &str| -> String {
             if s.chars().count() <= cols {
                 s.to_string()
@@ -4143,6 +4145,19 @@ mod tests {
         assert!(asked.contains(&Cmd::Redraw), "{asked:?}");
         let same = feed(&mut root, &mut sessions, "\x1b]7501;state=blocked\x1b\\");
         assert!(!same.contains(&Cmd::Redraw), "{same:?}");
+    }
+
+    /// A window too narrow for the list still draws it — cut short, never a
+    /// panic in the paint, which would take every window down.
+    #[test]
+    fn the_list_fits_a_window_narrower_than_it() {
+        let (mut root, mut sessions) = group_window();
+        report(&mut root, &mut sessions, "b", "state=blocked:kind=question");
+        let _ = root.toggle_attention(&sessions);
+        root.size_px = (120, 100);
+        let drawn = drawn_list(&root, &sessions);
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        assert!(drawn[0].starts_with('b'), "{drawn:?}");
     }
 
     #[test]
