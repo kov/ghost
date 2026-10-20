@@ -942,13 +942,32 @@ impl PumpEnd {
     }
 }
 
+/// The process's session registry, set up as `cfg` says.
+fn sessions_for(cfg: &config::UiConfig) -> Sessions {
+    let mut states = Sessions::new();
+    states.set_predict_preference(cfg.predictive_echo());
+    states
+}
+
 /// Drain up to `max` pending reads off a session, returning the accumulated output
 /// and how it ended. A read error is a transport failure, i.e. `Disconnected`.
 fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd, Option<String>) {
+    let (bytes, end, why, _) = pump_acked(session, max);
+    (bytes, end, why)
+}
+
+/// [`pump`], also returning the newest echo acknowledgement the reads carried
+/// (see [`ghost_vt::client::Pump::echo_ack`]).
+fn pump_acked(
+    session: &mut Session,
+    max: usize,
+) -> (Vec<u8>, PumpEnd, Option<String>, Option<u64>) {
     let mut bytes = Vec::new();
+    let mut ack = None;
     for _ in 0..max {
         match session.pump() {
             Ok(p) => {
+                ack = p.echo_ack.or(ack);
                 let empty = p.output.is_empty();
                 if !empty {
                     bytes.extend_from_slice(&p.output);
@@ -959,16 +978,16 @@ fn pump(session: &mut Session, max: usize) -> (Vec<u8>, PumpEnd, Option<String>)
                         (None, true) => PumpEnd::Disconnected,
                         (None, false) => PumpEnd::Exited,
                     };
-                    return (bytes, end, p.failed);
+                    return (bytes, end, p.failed, ack);
                 }
                 if empty {
                     break;
                 }
             }
-            Err(_) => return (bytes, PumpEnd::Disconnected, None),
+            Err(_) => return (bytes, PumpEnd::Disconnected, None, ack),
         }
     }
-    (bytes, PumpEnd::Live, None)
+    (bytes, PumpEnd::Live, None, ack)
 }
 
 // ---- capture mode (headless) -------------------------------------------
@@ -1812,7 +1831,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
     let next_group_color = (groups.len() % ghost_ui_core::group::GROUP_PALETTE.len()) as u8;
     let mut app = App {
         windows: HashMap::new(),
-        states: Sessions::new(),
+        states: sessions_for(&config::UiConfig::load()),
         sessions: HashMap::new(),
         observers: HashMap::new(),
         observe_failed: HashSet::new(),
@@ -1822,6 +1841,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         drivers: HashMap::new(),
         told_groups: HashMap::new(),
         exec_depth: 0,
+        typing: false,
         reconciling: false,
         dead_fed: HashSet::new(),
         clipboard: None,
@@ -3303,7 +3323,7 @@ impl App {
         let saved = windows::load();
         App {
             windows: HashMap::new(),
-            states: Sessions::new(),
+            states: sessions_for(&config::UiConfig::load()),
             sessions: HashMap::new(),
             observers: HashMap::new(),
             observe_failed: HashSet::new(),
@@ -3313,6 +3333,7 @@ impl App {
             drivers: HashMap::new(),
             told_groups: HashMap::new(),
             exec_depth: 0,
+            typing: false,
             reconciling: false,
             dead_fed: HashSet::new(),
             clipboard: None,
@@ -3654,6 +3675,11 @@ pub struct App {
     /// How deep [`Self::exec`] is nested: the outermost call reconciles sources once
     /// its commands (and everything they dispatched) have run.
     exec_depth: u32,
+    /// Set while the commands of a user-typing event (a key, text, a paste, a
+    /// pointer report) execute: the input they send is what predictive echo
+    /// predicts. Query replies and other answers the frontend sends on its own
+    /// are not typing, and must not disturb the predictions.
+    typing: bool,
     /// Set while [`Self::reconcile_sources`] runs, so the dispatches it makes don't
     /// start another pass inside it.
     reconciling: bool,
@@ -4436,6 +4462,7 @@ impl App {
                 }
             }
         }
+        self.states.set_predict_preference(cfg.predictive_echo());
         let theme = cfg.theme();
         let colors = theme_colors(&theme);
         let pad = cfg.padding();
@@ -4608,11 +4635,20 @@ impl App {
             }
             self.upgrade_older_hosts(listing);
         }
+        let typing = matches!(
+            ev,
+            UiEvent::Key { .. }
+                | UiEvent::Text(_)
+                | UiEvent::ClipboardText(_)
+                | UiEvent::Pointer { .. }
+        );
         let cmds = match self.windows.get_mut(&wid) {
             Some(w) => w.root.update(&mut self.states, ev),
             None => return,
         };
+        let was_typing = std::mem::replace(&mut self.typing, typing);
         self.exec(wid, cmds, event_loop);
+        self.typing = was_typing;
         // A handled event may have changed a window's foreground, view, grid, or
         // membership; mark the workspace for the loop's once-per-wake flush.
         self.workspace_dirty = true;
@@ -4668,9 +4704,22 @@ impl App {
                         .map(str::to_string)
                         .or_else(|| traced.then(|| ghost_ui_core::trace::escape(&bytes)));
                     // Input from any viewing window reaches the one process-wide client.
+                    // A remote session's typing is drawn ahead of its echo (see
+                    // `ghost_ui_core::predict`): the engine sees the bytes just
+                    // before they go out, then learns the number they went under.
+                    let predicting = self.typing && session.is_remote();
+                    if predicting
+                        && self.sessions.contains_key(&session)
+                        && self.states.predict_input(&session, &bytes, Instant::now())
+                    {
+                        self.repaint_viewers(&session);
+                    }
                     match self.sessions.get_mut(&session) {
                         Some(s) => {
                             let res = s.send_input(&bytes);
+                            if let Some(seq) = s.last_input_seq() {
+                                self.states.predict_sent(&session, seq);
+                            }
                             if let Some(what) = what {
                                 // `pending` is the backpressure: `send_input` reports
                                 // success for whatever a non-blocking write refused
@@ -7060,6 +7109,11 @@ impl App {
     fn drive_with_client(&mut self, id: &SessionId, s: Session) {
         self.observers.remove(id);
         self.sessions.insert(id.clone(), s);
+        // Its numbering starts over and its resync re-seeds the screen: the old
+        // connection's predictions mean nothing now.
+        if self.states.predict_reconnected(id) {
+            self.repaint_viewers(id);
+        }
     }
 
     /// Drop shared states nothing references any more — a session that vanished (killed
@@ -8401,6 +8455,16 @@ impl App {
         fallback
     }
 
+    /// Ask every window showing `name` for a repaint — for a change no feed
+    /// carried, like a prediction appearing or being taken back.
+    fn repaint_viewers(&mut self, name: &SessionId) {
+        let now_ms = self.now_ms();
+        for w in self.windows.values_mut().filter(|w| w.root.views(name)) {
+            w.pacer.request();
+            w.render_trace.saw_redraw_cmd(now_ms);
+        }
+    }
+
     /// Every window currently showing `name`, in any mode.
     fn windows_viewing(&self, name: &SessionId) -> Vec<WindowId> {
         self.windows
@@ -8665,10 +8729,10 @@ impl App {
             // The pump is also where a `flush_pending` retries input the transport
             // refused, so the depth AFTER it is what is really stuck (see
             // `note_input_queue`).
-            let (bytes, end, why, queued) = match self.sessions.get_mut(&name) {
+            let (bytes, end, why, queued, ack, srtt) = match self.sessions.get_mut(&name) {
                 Some(s) => {
-                    let (bytes, end, why) = pump(s, 32);
-                    (bytes, end, why, s.pending_input())
+                    let (bytes, end, why, ack) = pump_acked(s, 32);
+                    (bytes, end, why, s.pending_input(), ack, s.srtt())
                 }
                 None => continue,
             };
@@ -8719,6 +8783,17 @@ impl App {
             if !bytes.is_empty() || ended {
                 tracing::trace!(target: "ghost::present", session = %name, n = bytes.len(), "feed");
                 self.feed_driven_to_windows(&name, &bytes, ended, fe);
+            }
+            // Judge the predictions against the screen this pump left — only now,
+            // with every byte that came before the ack already fed.
+            if name.is_remote()
+                && !ended
+                && (ack.is_some()
+                    || !bytes.is_empty()
+                    || self.states.predict_wants_tick(&name).is_some())
+                && self.states.predict_update(&name, ack, srtt, now)
+            {
+                self.repaint_viewers(&name);
             }
             if ended {
                 ended_driven.push(name);

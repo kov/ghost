@@ -14,7 +14,8 @@
 //! (`query_replies`, `bracket_paste`, `selection_text`) live here too.
 
 use ghost_render::{
-    Frame, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_frame_at_px,
+    Frame, Layer, RectPx, Scene, SceneId, SceneItem, Selection, TermDamage, layout_cells,
+    layout_frame_at_px,
 };
 use ghost_term::{
     ActionPolicy, ClipboardSelection, FullscreenOp, Line, MaximizeOp, MouseProtocol, XtwinopsOp,
@@ -27,6 +28,7 @@ use std::rc::Rc;
 use std::collections::HashMap;
 
 use crate::input::{Key, KeyAlternates, KeyEventKind, Mods, NamedKey};
+use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::{
     CellMetrics, Cmd, PointPx, PointerButton, PointerIcon, PointerPhase, SessionId, UiEvent,
     WheelDelta, encode, mouse,
@@ -227,6 +229,11 @@ pub(crate) struct SessionState {
     /// input (the renderer applies it) and its changes go through
     /// `SceneCache::invalidate` at the shell.
     content_gen: u64,
+    /// Predictive local echo for this session's display connection: what the user
+    /// typed that the host hasn't echoed yet (see [`crate::predict`]). Never part
+    /// of `screen` — views lay its overlay over their frame — so it bumps its own
+    /// generation, not `content_gen`.
+    predict: PredictionEngine,
 }
 
 /// A session paired with one view of it. A thin shell over a [`SessionState`] and
@@ -422,7 +429,7 @@ struct Frozen {
 /// nothing about but the frame carries ([`ghost_render::CursorLayout::hollow`]):
 /// keying on it means a focus change mints a new `Rc`, so every freshness check
 /// downstream sees the frame it did change.
-type FrameKey = (u64, u64, CellMetrics, usize, f32, bool);
+type FrameKey = (u64, u64, u64, CellMetrics, usize, f32, bool);
 
 /// How long a frozen view is kept without interaction before it lets go and
 /// snaps back to the live session. Long enough to read what you selected and
@@ -503,12 +510,48 @@ struct Presented {
     /// one gap `moved` can't see. Diffing this against the current drawn cursor in
     /// [`Self::damage`] dirties just its row(s), no whole-view repaint.
     cursor: Option<(usize, usize, u8, bool)>,
+    /// The predictive-echo overlay at the present: its generation and the rows it
+    /// drew cells on. A prediction appears or vanishes with no feed behind it, so
+    /// [`Self::damage`] dirties the rows it covered and covers now.
+    prediction: (u64, Option<(usize, usize)>),
 }
 
 /// A cheap identity of one direct graphics placement — image id, placement id, cell
 /// position, footprint, and z — for detecting a feed that changed the placed images
 /// without writing a cell (see [`TerminalModel::placement_signature`]).
 type PlacementSig = (u32, u32, usize, usize, u32, u32, i32);
+
+/// Lay predictive echo's `overlay` over a frame of `vt`'s live screen: the
+/// predicted cells replace the real ones, and the cursor moves to where the
+/// typing is predicted to have put it. Rows are re-laid from their cells, so a
+/// prediction breaks runs exactly as typed text would.
+fn lay_prediction_over(frame: &mut Frame, vt: &ghost_term::Vt, overlay: &Overlay) {
+    if overlay.is_empty() {
+        return;
+    }
+    let mut rows: Vec<usize> = overlay.cells.iter().map(|(r, _, _)| *r).collect();
+    if let (Some(c), Some((row, col))) = (frame.cursor.as_mut(), overlay.cursor) {
+        rows.extend([c.row, row]);
+        c.row = row;
+        c.col = col;
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let cursor = frame.cursor.map(|c| (c.row, c.col));
+    for (row, line) in vt.view().enumerate() {
+        if rows.binary_search(&row).is_err() || row >= frame.rows_layout.len() {
+            continue;
+        }
+        let mut cells = line.cells().to_vec();
+        for (_, col, cell) in overlay.cells.iter().filter(|(r, _, _)| *r == row) {
+            if let Some(slot) = cells.get_mut(*col) {
+                *slot = *cell;
+            }
+        }
+        let cursor_col = cursor.and_then(|(r, c)| (r == row).then_some(c));
+        frame.rows_layout[row] = layout_cells(&cells, cursor_col);
+    }
+}
 
 /// Union two optional inclusive row ranges into the one range covering both.
 fn merge_rows(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> Option<(usize, usize)> {
@@ -687,6 +730,7 @@ impl SessionState {
             display_name: String::new(),
             theme: ThemeColors::default(),
             content_gen: 0,
+            predict: PredictionEngine::default(),
         }
     }
 
@@ -694,6 +738,72 @@ impl SessionState {
     /// folds it into its frame-memo key.
     pub(crate) fn content_gen(&self) -> u64 {
         self.content_gen
+    }
+
+    /// What predictive echo draws over the screen right now.
+    pub(crate) fn predicted(&self) -> &Overlay {
+        self.predict.shown()
+    }
+
+    /// Bumped whenever [`predicted`](Self::predicted) changes; a view folds it
+    /// into its frame memo and damage.
+    pub(crate) fn prediction_gen(&self) -> u64 {
+        self.predict.generation()
+    }
+
+    /// The user is sending `bytes` to the session (before they go out). Returns
+    /// whether what is drawn changed.
+    pub(crate) fn predict_input(&mut self, bytes: &[u8], at: std::time::Instant) -> bool {
+        let before = self.predict.generation();
+        self.predict.input(bytes, self.screen.vt(), at);
+        self.predict.generation() != before
+    }
+
+    /// The last input went out numbered `seq`.
+    pub(crate) fn predict_sent(&mut self, seq: u64) {
+        self.predict.sent(seq);
+    }
+
+    /// Re-judge the predictions after a pump: the output it carried is already
+    /// fed, `ack` is the newest echo acknowledgement it brought, `srtt` the link's
+    /// round trip. Returns whether what is drawn changed.
+    pub(crate) fn predict_update(
+        &mut self,
+        ack: Option<u64>,
+        srtt: Option<std::time::Duration>,
+        at: std::time::Instant,
+    ) -> bool {
+        let before = self.predict.generation();
+        if let Some(srtt) = srtt {
+            self.predict.set_srtt(srtt);
+        }
+        match ack {
+            Some(ack) => self.predict.echo_ack(ack, self.screen.vt(), at),
+            None => self.predict.screen_changed(self.screen.vt(), at),
+        }
+        self.predict.generation() != before
+    }
+
+    /// A new connection to the session: its input numbering starts over and the
+    /// screen is about to be re-seeded, so every prediction goes. Returns whether
+    /// what is drawn changed.
+    pub(crate) fn predict_reconnected(&mut self) -> bool {
+        let before = self.predict.generation();
+        self.predict = PredictionEngine::new(self.predict.preference());
+        // A fresh engine starts at generation 0; keep counting up so a view's memo
+        // can't mistake it for the old engine's first state.
+        self.predict.continue_generation(before);
+        self.predict.generation() != before
+    }
+
+    /// When predictions are drawn.
+    pub(crate) fn set_predict_preference(&mut self, preference: DisplayPreference) {
+        self.predict.set_preference(preference);
+    }
+
+    /// How soon the engine wants re-judging without output, if at all.
+    pub(crate) fn predict_wants_tick(&self) -> Option<std::time::Duration> {
+        self.predict.wants_tick()
     }
 
     /// Feed bytes to the emulator, bumping the content version. Every content
@@ -1498,7 +1608,16 @@ impl TerminalView {
                     })
                 })
             });
-            match merge_rows(feed_rows, cursor_rows.flatten()) {
+            let now_predicted = self.prediction_rows(state);
+            let prediction_rows = self.presented.as_ref().and_then(|p| {
+                (p.prediction.0 != state.prediction_gen())
+                    .then(|| merge_rows(p.prediction.1, now_predicted))
+                    .flatten()
+            });
+            match merge_rows(
+                merge_rows(feed_rows, cursor_rows.flatten()),
+                prediction_rows,
+            ) {
                 Some((lo, hi)) => TermDamage::Rows { lo, hi },
                 None => TermDamage::None,
             }
@@ -1516,11 +1635,15 @@ impl TerminalView {
             return None;
         }
         let c = self.screen(state).vt().cursor();
+        let (row, col) = match state.predicted().cursor {
+            Some(at) if self.shows_prediction() => at,
+            _ => (c.row, c.col),
+        };
         c.visible.then(|| {
-            let row = c.row.min((state.rows as usize).saturating_sub(1));
+            let row = row.min((state.rows as usize).saturating_sub(1));
             (
                 row,
-                c.col,
+                col,
                 ghost_vt::query::decscusr_digit(c.shape),
                 !self.focused,
             )
@@ -1543,6 +1666,7 @@ impl TerminalView {
             colors: state.render_colors(),
             palette: *state.palette(),
             cursor: self.drawn_cursor(state),
+            prediction: (state.prediction_gen(), self.prediction_rows(state)),
         });
         self.feed_dirty = None;
         self.view_slid = false;
@@ -1921,6 +2045,11 @@ impl TerminalView {
                 state.content_gen()
             },
             self.freeze_epoch,
+            if self.shows_prediction() {
+                state.prediction_gen()
+            } else {
+                0
+            },
             self.effective_metrics(),
             self.scroll_offset,
             self.scroll_frac,
@@ -1950,7 +2079,31 @@ impl TerminalView {
         if let Some(c) = frame.cursor.as_mut() {
             c.hollow = !self.focused;
         }
+        if self.shows_prediction() {
+            lay_prediction_over(&mut frame, state.screen.vt(), state.predicted());
+        }
         frame
+    }
+
+    /// Whether this view draws predictive echo: only over the live screen, where
+    /// the predictions were made — not scrolled into history, not frozen.
+    fn shows_prediction(&self) -> bool {
+        self.frozen.is_none() && self.scroll_offset == 0 && self.scroll_frac == 0.0
+    }
+
+    /// The rows predictive echo draws cells on, as one inclusive range.
+    fn prediction_rows(&self, state: &SessionState) -> Option<(usize, usize)> {
+        if !self.shows_prediction() {
+            return None;
+        }
+        state
+            .predicted()
+            .cells
+            .iter()
+            .map(|(r, _, _)| *r)
+            .fold(None, |acc, r| {
+                Some(acc.map_or((r, r), |(lo, hi): (usize, usize)| (lo.min(r), hi.max(r))))
+            })
     }
 
     pub(crate) fn view(&self, state: &SessionState) -> Scene {

@@ -1,9 +1,8 @@
 # Predictive local echo
 
-Design for mosh-style predictive echo in ghost: typing into a remote session
-shows up immediately, and the host's real output confirms it or replaces it.
-Written 2026-10-20. The approach is mosh's, with only the changes our wire
-needs. Mosh references are to `src/frontend/terminaloverlay.cc` (the
+Mosh-style predictive echo in ghost: typing into a remote session shows up
+immediately, and the host's real output confirms it or replaces it. The
+approach is mosh's, with only the changes our wire needs. Mosh references are to `src/frontend/terminaloverlay.cc` (the
 prediction engine), `src/statesync/completeterminal.cc` (echo ack) and
 `src/network/` (RTT) in mobile-shell/mosh.
 
@@ -84,10 +83,10 @@ clamped to [20, 250] ms. SRTT/RTTVAR use the RFC 6298 estimator (α = 1/8,
 β = 1/4) and start at SRTT = 1000 ms. So predictions are shown from the first
 keystroke and turn off once the link proves fast.
 
-Ghost has no RTT measurement today. We add `ClientMsg::Ping(u64)` /
-`ServerMsg::Pong(u64)` at the same protocol level. The client pings on a
-timer while attached, plus once right after attach, and feeds every Pong into
-the same estimator.
+Ghost times the link with `ClientMsg::Ping(u64)` / `ServerMsg::Pong(u64)` at
+the same protocol level. `Session` pings once right after attach, then while the
+user types (one ping in flight, at most every 250 ms), so an idle session never
+chatters. Every Pong feeds the estimator (`ghost_vt::echo`).
 
 The ping measures the whole path the user feels: GUI → ssh → `ghost __pipe` →
 host and back, without the 50 ms echo delay.
@@ -105,9 +104,13 @@ treats any escape sequence.
 | Printable, width 1 | Cell at the predicted cursor; cells to the right shift one column (insert); cursor +1 |
 | Printable in the last column | Same, plus the epoch turns tentative and the cursor wraps to the next row |
 | DEL (0x7f) | Cursor −1; cells to the right shift left |
-| `CSI C` / `CSI D` (also `ESC O C/D`, rewritten to CSI) | Cursor ±1 |
+| `CSI C` / `CSI D` with no parameters (also `ESC O C/D`, rewritten to CSI) | Cursor ±1 |
 | CR | Epoch turns tentative; cursor goes to column 0 of the next row (on the last row, that row is predicted blank — no scroll prediction) |
 | Anything else (control chars, other CSI, ESC, width ≠ 1) | Epoch turns tentative, nothing drawn |
+
+Mosh moves the cursor for any `CSI … C/D`; ghost only for the bare form, because
+a parameterised one (`CSI 1;5C`, Ctrl+→) is word motion in a line editor and
+would only ever be guessed wrong.
 
 Inserted characters take the renditions of the cell to their left (mosh's
 heuristic). Cells that shift off the predicted edge are `unknown` and drawn
@@ -162,118 +165,93 @@ Taken unchanged from mosh's `PredictionEngine` constants:
 
 Mosh's `display_preference` (`Adaptive` default, `Always`, `Never`) becomes
 `[input] predictive_echo = "adaptive" | "always" | "never"` in `ui.toml`.
-The E2E tests run the default, `adaptive`: the harness's 500 ms round trip is
-far above every threshold, so they test what users get. We don't adopt `Experimental` or `predict_overwrite`.
+It hot-reloads like the rest of `[input]`. The E2E tests run the default,
+`adaptive`: the harness's 500 ms round trip is far above every threshold, so
+they test what users get. We don't adopt `Experimental` or `predict_overwrite`.
 
 ## Where it lives in ghost
 
-**Engine:** a new pure module, `ghost-ui-core/src/predict.rs`. It holds the
-mosh engine (overlay rows, cursor predictions, epochs, triggers, and the RTT
-estimator inputs). It takes the clock as an argument and reads the replica
-through `ghost_term::Vt` (`cursor()`, `line(n).cells()`, `size()`). It owns no
-I/O.
+**Wire** (`ghost-vt`). `protocol.rs` has the four messages and `PROTO_PREDICT`.
+`echo.rs` is the pure timing half: `EchoAck` (the host's per-connection input
+history and mosh's `set_echo_ack` rule), `Rtt` (the estimator) and `InputClock`
+(the client's numbering and ping schedule). `Session::send_input` numbers input
+on a host at `PROTO_PREDICT` (`last_input_seq`), `Session::pump` surfaces
+`Pump::echo_ack` and folds pongs into `Session::srtt`.
 
-**Ownership.** One engine per session, owned by the window view that holds the
-display (`TerminalView`). It is **never** stored in the shared `SessionState`,
-which only `ingest` may mutate (the call-site rule in `terminal.rs`) and which
-every window's view shares. Fleet tiles and observer views have no engine.
-Predictions belong to the client that is typing.
+**Host** (`server.rs`). An `InputSeq`'s bytes go into the PTY queue (`pty_out`),
+and the display `Client`'s `EchoAck` records where in the queue they end. The
+drain stamps each input as written once the PTY takes its last byte. After the
+drain, the newest input written ≥ 50 ms ago is acknowledged, queued behind every
+`Output` read so far. The poll timeout includes the next ack's due time, so a
+silent child still gets its ack. A `Ping` is answered at once.
 
-**Input.** `TerminalView` already produces the final bytes (`key` →
-`encode::encode`, `UiEvent::Text`, paste) and emits `Cmd::SendInput`. The
-engine is fed those same bytes at the point the view emits the command, so it
-sees exactly what goes on the wire, including kitty encoding and bracketed
-paste. A paste is wrapped in `ESC[200~`, so it turns tentative by itself. The
-sequence number is assigned in `Session::send_input` (`ghost-vt/src/client.rs`).
-The view needs the number back to stamp `expiration_frame`, so `send_input`
-returns it, or `SessionState`-adjacent connection state keeps a counter both
-sides read. Settle this in phase 2 against the code.
+**Engine** (`ghost-ui-core/src/predict.rs`). The mosh `PredictionEngine`,
+ported: overlay rows, cursor predictions, epochs, the display triggers. Pure — it
+reads the session's `ghost_term::Vt` and takes the clock as an argument. It
+exposes what to draw as an `Overlay` (cells and a cursor position) plus a
+generation that moves only when that changes.
 
-**Acks and pongs.** `Session::pump` already demultiplexes `ServerMsg`. It
-surfaces `EchoAck(n)` and RTT samples alongside `SessionData`, and the root
-routes them to the display view's engine, which runs `cull`. The wire ordering
-only helps if the client keeps it too. Today `pump(s, 32)` merges several
-`Output`s into one byte buffer before `SessionData`. The cull for `EchoAck(n)`
-must run only after every `Output` that came before it on the stream has been
-ingested. Otherwise a correct prediction is checked against a stale replica,
-reads as incorrect, and resets the engine. Either deliver in wire order
-(ingest, then cull) or carry the ack as an offset into the delivered bytes.
+**Ownership.** One engine per session, beside the replica in `SessionState` —
+one per session per process, like the session's single client connection. It
+is a separate field from `screen`: it never mutates the emulator or bumps
+`content_gen`, so the `ingest` call-site rule is untouched. The shell drives it
+through `Sessions::predict_*`:
 
-**Drawing.** `TerminalView::lay_out_frame` already patches the laid-out frame
-after `layout_frame_at_px` (the hollow cursor). Predicted cells and the
-predicted cursor are patched into `Frame.rows_layout` / `frame.cursor` there.
-Two more pieces are required:
+- **Input.** The App marks the commands of a typing event (`Key`, `Text`,
+  `ClipboardText`, `Pointer`) and, when one sends to a remote session, feeds the
+  bytes to the engine just before `send_input`, then reports the number they
+  went out under. So the engine sees exactly what goes on the wire, including
+  kitty encoding and bracketed paste, and knows each input's exact number.
+  Bytes the frontend sends on its own (query replies, focus reports on attach)
+  aren't typing and never reach the engine.
+- **Acks.** After each pump, once that pump's output has been fed to the
+  replica, the App hands the engine the pump's newest ack and the current RTT.
+  Since every byte that preceded the ack on the wire is in that output, the
+  replica is at least as new as the host's screen when it acked.
+- **Ticks.** While the engine's glitch timers can still fire, the per-wake pump
+  (every 8 ms) re-judges it even with no output.
+- **Reconnects.** Installing a new client for a session (`drive_with_client`)
+  replaces the engine: numbering starts over and the resync re-seeds the screen.
 
-- The frame memo key gains the engine's overlay generation, or a prediction
-  never reaches the screen until the next real output.
-- `TerminalView::damage()` includes every row whose overlay changed, in both
-  directions: when a prediction appears and when it is removed. Otherwise the
-  per-session Surface skips the row and the screen goes stale.
+**Drawing** (`terminal.rs`). `TerminalView::lay_out_frame` lays the overlay
+over the frame: affected rows are re-laid from their cells with the predicted
+cells substituted (`ghost_render::layout_cells`), and the cursor moves to the
+predicted position. Only over the live screen — never scrolled into history or
+frozen. The frame memo key carries the overlay generation, `drawn_cursor`
+reports the predicted cursor, and `damage()` dirties the rows the overlay
+covered at the last present and covers now, so a prediction appearing or being
+taken back repaints with no feed behind it. Selection and copy read the
+replica, never the overlay.
 
-Selection and copy read the replica, never the overlay. A selection never
-copies a character the host hasn't confirmed.
-
-**Host** (`ghost-vt/src/server.rs`). `InputSeq` bytes go into the existing
-`pty_out` queue together with their seq boundary. The drain loop stamps
-`(seq, now)` into `input_history` once the bytes up to that boundary have been
-written. The ack timer joins the poll timeout computation. Within one poll
-iteration the PTY is read and its `Output` queued *before* `echo_ack` is
-recomputed (mosh's order). `EchoAck` is queued
-to the display client only, after any `Output` already queued, which preserves
-the ordering guarantee above. Input recording is unchanged. `Ping` gets an
-immediate `Pong`, without going through the PTY.
-
-**Latency harness.** `ghost __pipe` (`ghost-vt/src/pipe.rs`, `relay()`) is the
-far-end byte relay of every remote session, and the wire is framed end to end
-through it. An env-gated delay queue (`GHOST_TEST_PIPE_DELAY_MS`) holds each
-chunk in a `VecDeque<(Instant, Vec<u8>)>` in both directions, preserving
-order, and polls with the earliest due time as the timeout. The real-sshd
-fixture (`tests/support/remote.rs`, `RealRemote`) sets it in the
-`ghost-remote` wrapper it already writes. The App-level remote tests in
-`tests/shell_remote.rs` (the `FocusRig` pattern: `App::headless`, type with
-`UiEvent::Text`, assert on `visible_text` of the drawn Scene) are the template
-for the E2E cases.
+**Latency harness.** `ghost __pipe` (`pipe.rs`) holds every chunk for
+`GHOST_TEST_PIPE_DELAY_MS` in each direction, order kept. The real-sshd fixture
+arms it with `RealRemote::set_pipe_delay`; the drawn terminal text is read with
+`support::drawn_terminal_text`.
 
 ## Reconnects
 
 A reconnect (remote host upgrade, dropped pipe, future connection survival)
-resets the engine and starts input numbering over on the new connection. The
-host keeps `input_history` per connection. That way a sequence number can never
-be acknowledged by a connection that never saw it.
+replaces the engine and starts input numbering over on the new connection. The
+host keeps its input history per connection, so a number can never be
+acknowledged by a connection that never saw it.
 
 ## Testing
 
-Test-first, driving the real binary, asserting on what is drawn.
+- `ghost-vt` `echo` unit tests: ack timing, RTT estimator, ping schedule.
+  `gui_session.rs`: a real host acknowledges numbered input after the echo
+  timeout while its child prints nothing, and answers the attach ping.
+- `ghost-ui-core` `predict` unit tests: epochs held back and confirmed, correct
+  echoes retired, unechoed keys never drawn, a wrong guess resetting everything,
+  backspace and arrows, escape-coded keys not guessed at, fast links showing
+  nothing, underlining on slow ones, resize resets, generation discipline.
+- `ghost-ui/tests/predictive_echo.rs`, the real App over a real sshd with a
+  250 ms pipe delay each way:
+  - the first key waits for its echo (and proves the harness is slow), the
+    second is drawn before its own echo, and the rest within half a round trip;
+    backspace too;
+  - at a `stty -echo` password prompt, after Enter, no typed key is ever drawn.
 
-1. **Latency harness first.** A test-only delay on the remote pipe, applied in
-   both directions, so a test can set e.g. 300 ms of RTT on a remote session
-   (see [Where it lives](#where-it-lives-in-ghost) for the exact hook). On its
-   own it proves that typed text currently takes a full RTT to appear. That
-   becomes the first failing test once its assertion is "appears before the
-   RTT".
-2. Engine unit tests in `ghost-ui-core` (pure, clock injected): insert, backspace,
-   arrows, wrap, CR, epoch confirm/kill, reset on a wrong cursor, the display
-   triggers' hysteresis. These are ports of mosh's behaviour and make sense as
-   unit tests, because the RTT thresholds and timers are hard to drive end to end.
-3. Host unit test: echo-ack advances after 50 ms with no output, and only for
-   seqs whose bytes the PTY drain accepted.
-4. E2E over the latency harness (`ghost-ui/tests/predictive_echo.rs`):
-   - At a shell prompt, type `e` and wait for its echo. That confirms the
-     epoch. Then `cho hi` is drawn character by character within one frame
-     each, long before the RTT, and the final screen matches the host's.
-   - At a `read -s` prompt, the first key is never drawn; later keys aren't
-     either; nothing is left on screen after the ack.
-   - In a full-screen app that doesn't echo (e.g. `less`), typed keys leave no
-     residue.
-   - Backspace and left arrow inside a typed word are drawn immediately.
-5. Adaptive mode on a local session never shows a prediction (an unchanged
-   frame after typing, until the echo arrives).
-
-## Phases
-
-1. Latency harness + the failing E2E for immediate echo.
-2. Protocol: `InputSeq`, `EchoAck`, `Ping`/`Pong`, `PROTO_PREDICT`; host
-   input history + ack timer; client numbering + RTT estimator.
-3. Prediction engine in `ghost-ui-core` (pure), with unit tests.
-4. Overlay in the drawn frame + damage for predicted rows; E2E goes green.
-5. Config switch, underline flagging, glitch triggers; remaining E2E cases.
+Left/right arrows are covered by the unit tests only: `cat` under a canonical
+tty echoes an arrow as `^[[D`, so an end-to-end arrow test needs a line editor.
+A full-screen app that doesn't echo relies on the same epoch rule as the
+password test.

@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub use ghost_term::CursorShape;
-use ghost_term::{Color, Line, Pen, Vt};
+use ghost_term::{Cell, Color, Line, Pen, Vt};
 
 pub mod cache;
 pub use cache::CacheCounters;
@@ -233,7 +233,12 @@ pub type PaletteOverrides = [Option<[u8; 3]>; 256];
 /// cursor is elsewhere; the cursor cell becomes its own run so ligatures never
 /// render through it.
 pub fn layout_row(line: &Line, cursor_col: Option<usize>) -> RowLayout {
-    let cells = line.cells();
+    layout_cells(line.cells(), cursor_col)
+}
+
+/// [`layout_row`] over a row of cells that is not (or not quite) one of the
+/// emulator's lines — a frontend's provisional content laid over a real row.
+pub fn layout_cells(cells: &[Cell], cursor_col: Option<usize>) -> RowLayout {
     // Trailing default cells (blank space, default pen) draw nothing; stop at
     // the last cell that has something to show.
     let mut end = cells

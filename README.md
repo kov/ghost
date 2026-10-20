@@ -141,6 +141,7 @@ family = "Fira Code"
 [input]
 option_as_meta = true   # macOS: treat Option as Meta
 middle_click_paste = false  # X11/Wayland: middle-click pastes the primary selection
+predictive_echo = "adaptive"  # remote sessions: draw typing before its echo returns, mosh-style ("adaptive" = on slow links, "always", "never")
 word_chars = "-#%&+,./=?@\\_~·"  # extra double-click word characters; default is VTE's
 
 # Content-aware double-click rules. Each matches the logical line under the

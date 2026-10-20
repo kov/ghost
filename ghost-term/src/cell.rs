@@ -36,6 +36,15 @@ impl Cell {
         Cell(' ', Occupancy::Single, pen.without_link())
     }
 
+    /// A one-column cell holding `ch` in `pen`, or `None` when `ch` is not
+    /// exactly one column wide. For a frontend drawing provisional content over
+    /// the grid (predictive echo), which must not guess at wide or combining
+    /// characters.
+    pub fn single(ch: char, pen: Pen) -> Option<Self> {
+        use unicode_width::UnicodeWidthChar;
+        (ch.width() == Some(1)).then_some(Cell(ch, Occupancy::Single, pen))
+    }
+
     pub fn is_default(&self) -> bool {
         self.0 == ' ' && self.1 == Occupancy::Single && self.2.is_default()
     }

@@ -11,6 +11,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::input::{Key, Mods, NamedKey};
 use crate::terminal::{DrivingGeometry, FeedOutcome, SelectionConfig, SessionState, TerminalView};
@@ -52,6 +53,8 @@ pub struct Sessions {
     /// The policy every state is minted with — what a program on the session's tty
     /// may do (see [`ghost_term::policy`]).
     policy: SessionPolicy,
+    /// When predictive echo draws, for every state (see [`crate::predict`]).
+    predict_preference: crate::predict::DisplayPreference,
 }
 
 impl Default for Sessions {
@@ -66,6 +69,7 @@ impl Sessions {
             map: HashMap::new(),
             theme: ThemeColors::default(),
             policy: SessionPolicy::default(),
+            predict_preference: Default::default(),
         }
     }
 
@@ -95,7 +99,8 @@ impl Sessions {
         self.map.get_mut(id)
     }
 
-    fn insert(&mut self, id: SessionId, state: SessionState) {
+    fn insert(&mut self, id: SessionId, mut state: SessionState) {
+        state.set_predict_preference(self.predict_preference);
         // Adopting a whole model must not clobber a live state already held for
         // this id — that would leave two owners for one session, the very thing
         // the single-owner world exists to prevent. Replacing an *ended* state is
@@ -117,6 +122,58 @@ impl Sessions {
     /// own; every path that used to reap here reaped a foregrounded session.
     pub fn discard(&mut self, id: &SessionId) {
         self.map.remove(id);
+    }
+
+    /// Predictive echo (see [`crate::predict`]): the user is sending `bytes` to
+    /// session `id`, about to go out. Returns whether what the session's views
+    /// draw changed — the shell then asks them to repaint.
+    pub fn predict_input(&mut self, id: &SessionId, bytes: &[u8], at: Instant) -> bool {
+        self.map
+            .get_mut(id)
+            .is_some_and(|s| s.predict_input(bytes, at))
+    }
+
+    /// The input just sent to `id` went out numbered `seq`.
+    pub fn predict_sent(&mut self, id: &SessionId, seq: u64) {
+        if let Some(s) = self.map.get_mut(id) {
+            s.predict_sent(seq);
+        }
+    }
+
+    /// Re-judge `id`'s predictions after a pump whose output is already fed: `ack`
+    /// is the newest echo acknowledgement it brought, `srtt` the link's round
+    /// trip. Returns whether what is drawn changed.
+    pub fn predict_update(
+        &mut self,
+        id: &SessionId,
+        ack: Option<u64>,
+        srtt: Option<Duration>,
+        at: Instant,
+    ) -> bool {
+        self.map
+            .get_mut(id)
+            .is_some_and(|s| s.predict_update(ack, srtt, at))
+    }
+
+    /// `id` has a new connection: numbering starts over and the screen is about to
+    /// be re-seeded, so every prediction goes. Returns whether what is drawn changed.
+    pub fn predict_reconnected(&mut self, id: &SessionId) -> bool {
+        self.map
+            .get_mut(id)
+            .is_some_and(|s| s.predict_reconnected())
+    }
+
+    /// When predictions are drawn, for every session held now and minted later.
+    pub fn set_predict_preference(&mut self, preference: crate::predict::DisplayPreference) {
+        self.predict_preference = preference;
+        for s in self.map.values_mut() {
+            s.set_predict_preference(preference);
+        }
+    }
+
+    /// How soon `id`'s predictions want re-judging with no output, if at all.
+    pub fn predict_wants_tick(&self, id: &SessionId) -> Option<Duration> {
+        self.map.get(id).and_then(|s| s.predict_wants_tick())
     }
 
     /// Whether this window holds a state for `id`.
@@ -143,11 +200,12 @@ impl Sessions {
         if self.map.get(id).is_some_and(SessionState::ended) {
             self.map.remove(id);
         }
-        let (theme, policy) = (self.theme, self.policy);
+        let (theme, policy, predict) = (self.theme, self.policy, self.predict_preference);
         self.map.entry(id.clone()).or_insert_with(|| {
             let mut state = SessionState::new(id.clone(), cols, rows);
             let _ = state.set_theme(theme); // a fresh state has no 2031 subscriber
             state.set_policy(policy);
+            state.set_predict_preference(predict);
             state
         })
     }
@@ -169,6 +227,7 @@ impl Sessions {
         let _ = state.set_theme(theme);
         state.set_policy(policy);
         state.set_display_name(display_name);
+        state.set_predict_preference(self.predict_preference);
         self.map.insert(id.clone(), state);
     }
 

@@ -13,6 +13,7 @@
 //! ignored, so a file that carries settings a newer ghost added still loads here.
 
 use ghost_renderer::Theme;
+use ghost_ui_core::predict::DisplayPreference;
 use ghost_ui_core::{DEFAULT_WORD_CHARS, SelectionConfig, SmartRule};
 use serde::Deserialize;
 
@@ -247,6 +248,19 @@ struct Input {
     /// default. Selecting text still publishes it to the primary selection
     /// either way, so other apps can middle-click paste it.
     middle_click_paste: bool,
+    /// When typing into a remote session is drawn before its echo returns
+    /// (mosh's `--predict`): `"adaptive"` (the default) only on a slow link,
+    /// `"always"`, or `"never"`.
+    predictive_echo: PredictiveEcho,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PredictiveEcho {
+    #[default]
+    Adaptive,
+    Always,
+    Never,
 }
 
 impl Default for Input {
@@ -256,6 +270,7 @@ impl Default for Input {
             selection_rules: None,
             option_as_meta: true,
             middle_click_paste: false,
+            predictive_echo: PredictiveEcho::default(),
         }
     }
 }
@@ -434,6 +449,15 @@ impl UiConfig {
     /// composing accented characters. On by default; see [`Input`].
     pub fn option_as_meta(&self) -> bool {
         self.input.option_as_meta
+    }
+
+    /// When predictive local echo draws (see `ghost_ui_core::predict`).
+    pub fn predictive_echo(&self) -> DisplayPreference {
+        match self.input.predictive_echo {
+            PredictiveEcho::Adaptive => DisplayPreference::Adaptive,
+            PredictiveEcho::Always => DisplayPreference::Always,
+            PredictiveEcho::Never => DisplayPreference::Never,
+        }
     }
 
     /// The initial window grid in cells, clamped to a sane range (never 0). The
@@ -657,6 +681,22 @@ mod tests {
                 .unwrap()
                 .option_as_meta()
         );
+    }
+
+    #[test]
+    fn predictive_echo_defaults_to_adaptive_and_parses() {
+        assert_eq!(
+            UiConfig::default().predictive_echo(),
+            DisplayPreference::Adaptive
+        );
+        for (text, want) in [
+            ("adaptive", DisplayPreference::Adaptive),
+            ("always", DisplayPreference::Always),
+            ("never", DisplayPreference::Never),
+        ] {
+            let cfg = UiConfig::parse(&format!("[input]\npredictive_echo = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.predictive_echo(), want, "{text}");
+        }
     }
 
     #[test]
