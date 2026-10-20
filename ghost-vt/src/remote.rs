@@ -934,23 +934,17 @@ impl RemoteSsh {
     /// same bound [`probe`](Self::probe)/[`negotiate`](Self::negotiate) apply. A
     /// timeout is a failed read, so it falls back the same way.
     pub fn session_proto(&self, remote_ghost: &str, name: &str) -> u32 {
-        let level = || -> Option<u32> {
-            let mut child = self
-                .command(&[remote_ghost, "__proto", name])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            if !matches!(wait_bounded(&mut child, PROTO_READ_TIMEOUT), Some(s) if s.success()) {
-                return None;
-            }
-            use std::io::Read as _;
-            let mut buf = String::new();
-            child.stdout.take()?.read_to_string(&mut buf).ok()?;
-            buf.trim().parse().ok()
-        };
-        level().unwrap_or(UNREAD_SESSION_PROTO)
+        self.read_session_proto(remote_ghost, name)
+            .unwrap_or(UNREAD_SESSION_PROTO)
+    }
+
+    /// [`session_proto`](Self::session_proto) without the fallback: `None` when
+    /// the read failed, for a caller that must not mistake a failure for an old
+    /// host.
+    pub fn read_session_proto(&self, remote_ghost: &str, name: &str) -> Option<u32> {
+        self.read_line(remote_ghost, &["__proto", name])?
+            .parse()
+            .ok()
     }
 
     /// Copy the regular file at `path` on the host into `dest` here, over the
@@ -1078,14 +1072,15 @@ impl RemoteSsh {
     }
 
     /// The build of the remote ghost itself — what a host there would be
-    /// upgraded to — from the third field of its `__handoff` report. `None`
-    /// for a ghost too old to report it.
-    pub fn ghost_build(&self, remote_ghost: &str) -> Option<u64> {
-        self.read_line(remote_ghost, &["__handoff"])?
-            .split_whitespace()
-            .nth(2)?
-            .parse()
-            .ok()
+    /// upgraded to — from the third field of its `__handoff` report: `Ok(None)`
+    /// for a ghost too old to report it, an error when it could not be asked.
+    pub fn ghost_build(&self, remote_ghost: &str) -> io::Result<Option<u64>> {
+        let line = self
+            .read_line(remote_ghost, &["__handoff"])
+            .ok_or_else(|| {
+                io::Error::other(format!("`{remote_ghost} __handoff` did not answer"))
+            })?;
+        Ok(line.split_whitespace().nth(2).and_then(|t| t.parse().ok()))
     }
 
     /// Ask the remote session `name`'s host to upgrade itself in place to the ghost

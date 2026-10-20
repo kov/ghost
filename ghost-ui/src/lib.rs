@@ -50,7 +50,7 @@ use instance::LastExit;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ghost_renderer::{
@@ -1942,7 +1942,7 @@ fn interactive(fresh: bool, ssh_window: bool) {
         observers: HashMap::new(),
         observe_failed: HashSet::new(),
         upgrade_hosts_to: upgrade_target(&config::UiConfig::load()),
-        upgrade_tried: HashSet::new(),
+        upgrade_tried: Arc::default(),
         unsourced: Vec::new(),
         drivers: HashMap::new(),
         told_groups: HashMap::new(),
@@ -3457,7 +3457,7 @@ impl App {
             observers: HashMap::new(),
             observe_failed: HashSet::new(),
             upgrade_hosts_to: None,
-            upgrade_tried: HashSet::new(),
+            upgrade_tried: Arc::default(),
             unsourced: Vec::new(),
             drivers: HashMap::new(),
             told_groups: HashMap::new(),
@@ -3787,7 +3787,7 @@ pub struct App {
     upgrade_hosts_to: Option<PathBuf>,
     /// Sessions whose host this run already asked to upgrade (or found current),
     /// so a listing asks each at most once.
-    upgrade_tried: HashSet<SessionId>,
+    upgrade_tried: Arc<Mutex<HashSet<SessionId>>>,
     /// Previews a reconcile left with no source, to be told to their viewers as an
     /// ended mirror (the tile reverts to a placeholder) by the next
     /// [`Self::reconcile_sources`].
@@ -4177,7 +4177,12 @@ impl App {
         let mut local = Vec::new();
         let mut remote: HashMap<String, Vec<String>> = HashMap::new();
         for l in listing {
-            if !self.upgrade_tried.insert(l.id.clone()) {
+            if !self
+                .upgrade_tried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(l.id.clone())
+            {
                 continue;
             }
             match l.id.as_remote() {
@@ -4223,21 +4228,50 @@ impl App {
             });
         }
         for (target, names) in remote {
+            let tried = self.upgrade_tried.clone();
+            let label = target.clone();
+            // Not tried after all, so a later listing asks again: nothing could be
+            // decided about these, and a skip for the rest of the run would be
+            // silent.
+            let untry = move |names: &[String], why: &str| {
+                eprintln!(
+                    "ghost: cannot tell whether {} on {label} need upgrading ({why}); \
+                     asking again on the next listing",
+                    names.join(", ")
+                );
+                let mut tried = tried.lock().unwrap_or_else(|e| e.into_inner());
+                for name in names {
+                    tried.remove(&SessionId::remote(label.as_str(), name.as_str()));
+                }
+            };
             let Some(host) = self.connection(&target) else {
+                untry(&names, "not connected");
                 continue;
             };
             std::thread::spawn(move || {
-                let build = host.remote.ghost_build(&host.remote_ghost);
+                let build = match host.remote.ghost_build(&host.remote_ghost) {
+                    Ok(build) => build,
+                    Err(e) => return untry(&names, &e.to_string()),
+                };
+                let mut undecided = Vec::new();
                 let mut names: Vec<String> = names
                     .into_iter()
                     .filter(|name| {
+                        let Some(proto) = host.remote.read_session_proto(&host.remote_ghost, name)
+                        else {
+                            undecided.push(name.clone());
+                            return false;
+                        };
                         wants_upgrade(
-                            host.remote.session_proto(&host.remote_ghost, name),
+                            proto,
                             host.remote.session_build(&host.remote_ghost, name),
                             build,
                         )
                     })
                     .collect();
+                if !undecided.is_empty() {
+                    untry(&undecided, "their protocol level could not be read");
+                }
                 names.sort();
                 roll_out(
                     &names,
@@ -11958,6 +11992,124 @@ mod tests {
             }
 
             assert!(upgraded, "the host re-exec'd onto the remote ghost's build");
+        });
+    }
+
+    /// A remote host whose upgrade could not be decided — the remote ghost did not
+    /// answer when asked its build — is asked again on a later listing, not
+    /// skipped for the rest of the run. Here the remote ghost fails its first
+    /// `__handoff` and answers from then on.
+    #[test]
+    fn a_remote_upgrade_that_could_not_be_decided_is_retried() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            // A later build than this ghost, so only the remote path reaches it
+            // (see `an_older_remote_build_at_the_same_level_is_upgraded_when_listed`),
+            // behind a wrapper that fails `__handoff` while `refuse` exists.
+            let dir = tempfile::tempdir().unwrap();
+            let later = dir.path().join("ghost-later");
+            std::fs::copy(&ghost_bin, &later).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&later)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+            let refuse = dir.path().join("refuse");
+            let refused = dir.path().join("refused");
+            std::fs::write(&refuse, "").unwrap();
+            let remote_ghost = dir.path().join("ghost");
+            std::fs::write(
+                &remote_ghost,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = __handoff ] && [ -e '{refuse}' ]; then touch '{refused}'; exit 1; fi\nexec '{later}' \"$@\"\n",
+                    refuse = refuse.display(),
+                    refused = refused.display(),
+                    later = later.display(),
+                ),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&remote_ghost, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            let remote_build = ghost_vt::build::of_file(&later);
+
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, remote_ghost.to_str().unwrap());
+            let name = "rupg-retry";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            let mut spun = 0;
+            while !ghost_vt::session::list()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name)
+                && spun < 100
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            std::fs::write(ghost_vt::paths::build_path(name), "1").unwrap();
+
+            let group = app.mint_group();
+            let w = app.open_fleet_window(&fe, group, None);
+            let on_remote_build = || ghost_vt::client::session_build(name) == remote_build;
+            let listed = remote_listing("kov@box", &[info(name, false)]);
+            app.dispatch(w, ghost_ui_core::UiEvent::SessionList(listed.clone()), &fe);
+            // The failed read, and long enough after it for its outcome to land.
+            let mut spun = 0;
+            while !refused.exists() && spun < 250 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let first_refused = refused.exists();
+            let early = on_remote_build();
+
+            std::fs::remove_file(&refuse).unwrap();
+            app.dispatch(w, ghost_ui_core::UiEvent::SessionList(listed), &fe);
+            let mut spun = 0;
+            while !on_remote_build() && spun < 500 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let upgraded = on_remote_build();
+
+            let _ = ghost_vt::session::kill_session(name);
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(first_refused, "the first listing asked and was refused");
+            assert!(!early, "nothing to upgrade to while the build is unknown");
+            assert!(
+                upgraded,
+                "the next listing asked again and upgraded the host"
+            );
         });
     }
 
