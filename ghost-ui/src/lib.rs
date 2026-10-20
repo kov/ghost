@@ -4707,11 +4707,15 @@ impl App {
                     // A remote session's typing is drawn ahead of its echo (see
                     // `ghost_ui_core::predict`): the engine sees the bytes just
                     // before they go out, then learns the number they went under.
-                    let predicting = self.typing && session.is_remote();
-                    if predicting
-                        && self.sessions.contains_key(&session)
-                        && self.states.predict_input(&session, &bytes, Instant::now())
-                    {
+                    // A host too old to number input never acknowledges any, so its
+                    // predictions would only pile up unjudged.
+                    let predicting = self.typing
+                        && session.is_remote()
+                        && self
+                            .sessions
+                            .get(&session)
+                            .is_some_and(|s| s.srtt().is_some());
+                    if predicting && self.states.predict_input(&session, &bytes, Instant::now()) {
                         self.repaint_viewers(&session);
                     }
                     match self.sessions.get_mut(&session) {

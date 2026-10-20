@@ -530,7 +530,10 @@ fn lay_prediction_over(frame: &mut Frame, vt: &ghost_term::Vt, overlay: &Overlay
         return;
     }
     let mut rows: Vec<usize> = overlay.cells.iter().map(|(r, _, _)| *r).collect();
-    if let (Some(c), Some((row, col))) = (frame.cursor.as_mut(), overlay.cursor) {
+    if let (Some(c), Some((row, col))) = (frame.cursor.as_mut(), overlay.cursor)
+        && row < frame.rows
+        && col < frame.cols
+    {
         rows.extend([c.row, row]);
         c.row = row;
         c.col = col;
@@ -822,6 +825,8 @@ impl SessionState {
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
         self.content_gen = self.content_gen.wrapping_add(1);
         self.screen.resize(cols, rows);
+        // Predictions were made against the old grid.
+        self.predict.reset();
     }
 
     fn send(&self, bytes: Vec<u8>) -> Vec<Cmd> {
@@ -1636,7 +1641,7 @@ impl TerminalView {
         }
         let c = self.screen(state).vt().cursor();
         let (row, col) = match state.predicted().cursor {
-            Some(at) if self.shows_prediction() => at,
+            Some((row, col)) if self.shows_prediction() && col < state.cols as usize => (row, col),
             _ => (c.row, c.col),
         };
         c.visible.then(|| {
@@ -8555,5 +8560,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A re-grid makes every prediction meaningless (it was made against the old
+    /// grid), so it goes with the resize itself — not one round trip later, when
+    /// the host's resync would next make the engine look. Otherwise the window
+    /// repaints at the new size with the old overlay, its cursor possibly past the
+    /// new right edge.
+    #[test]
+    fn a_resize_takes_the_predictions_with_it() {
+        let t0 = std::time::Instant::now();
+        let mut state = SessionState::new("alpha".into(), 80, 24);
+        state.set_predict_preference(DisplayPreference::Always);
+        let geom = TerminalView::new(METRICS, 80, 24).driving_geometry();
+        // Confirm the epoch with one echoed key, then predict a second.
+        state.predict_input(b"q", t0);
+        state.predict_sent(1);
+        let _ = state.ingest(b"q", &geom, false);
+        state.predict_update(Some(1), None, t0);
+        state.predict_input(b"w", t0);
+        state.predict_sent(2);
+        assert!(!state.predicted().is_empty(), "the second key is predicted");
+
+        let generation = state.prediction_gen();
+        state.resize(40, 24);
+        assert!(state.predicted().is_empty(), "{:?}", state.predicted());
+        assert_ne!(
+            state.prediction_gen(),
+            generation,
+            "a view's memo must see the overlay change"
+        );
     }
 }
