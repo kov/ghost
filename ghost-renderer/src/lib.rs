@@ -4979,32 +4979,21 @@ impl Renderer {
         // The fallback is borrowed for the layout and handed straight back, so
         // the atlas walk below can take `&mut self` again.
         let mut fallback = self.fallback.take();
+        // Fitted to the box: a heading too wide for it keeps its start and ends
+        // in an ellipsis, rather than running on under what sits beside it.
+        let style = ghost_shaper::TextStyle {
+            weight: self.chrome_weight,
+        };
         let laid = match fallback.as_mut() {
-            Some(fb) => ghost_shaper::layout_text(
-                fonts,
-                fb.as_mut(),
-                text,
-                size_px,
-                ghost_shaper::TextStyle {
-                    weight: self.chrome_weight,
-                },
-            ),
-            None => ghost_shaper::layout_text(
-                fonts,
-                &mut NoFallback,
-                text,
-                size_px,
-                ghost_shaper::TextStyle {
-                    weight: self.chrome_weight,
-                },
-            ),
+            Some(fb) => ghost_shaper::fit_text(fonts, fb.as_mut(), text, size_px, style, rect.w),
+            None => ghost_shaper::fit_text(fonts, &mut NoFallback, text, size_px, style, rect.w),
         };
         self.fallback = fallback;
 
         let x0 = match align {
             ghost_render::TextAlign::Left => rect.x,
-            // Centred on the box, and clipped to it from the left when the text
-            // is wider — a long title should run off the end, not off both.
+            // Centred on the box; fitted text is never wider than it, so a long
+            // title shows its start.
             ghost_render::TextAlign::Center => rect.x + ((rect.w - laid.advance) * 0.5).max(0.0),
         };
         // Centre the FACE, not the ink: a title without descenders must not sit

@@ -191,6 +191,52 @@ pub fn layout_text<'a>(
     }
 }
 
+/// [`layout_text`] fitted into `max_w`: the whole text when it fits, otherwise
+/// as much of its *start* as fits followed by an ellipsis — the space before
+/// the cut dropped — and nothing at all when not even the ellipsis does. The
+/// start is what says what a long title or message is about; its end can wait.
+pub fn fit_text<'a>(
+    fonts: FontSet<'a>,
+    fallback: &mut dyn Fallback,
+    text: &str,
+    size_px: f32,
+    style: TextStyle,
+    max_w: f32,
+) -> TextLayout<'a> {
+    let whole = layout_text(fonts, fallback, text, size_px, style);
+    if whole.advance <= max_w {
+        return whole;
+    }
+    let cut = |n: usize| {
+        let end = text.char_indices().nth(n).map_or(text.len(), |(i, _)| i);
+        format!("{}\u{2026}", text[..end].trim_end())
+    };
+    let fits = |fallback: &mut dyn Fallback, n: usize| {
+        let laid = layout_text(fonts, fallback, &cut(n), size_px, style);
+        (laid.advance <= max_w).then_some(laid)
+    };
+    let Some(mut best) = fits(fallback, 0) else {
+        return TextLayout {
+            glyphs: Vec::new(),
+            advance: 0.0,
+            ..whole
+        };
+    };
+    // The longest start that fits, by bisection: the width only grows with it.
+    let (mut lo, mut hi) = (0, text.chars().count());
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        match fits(fallback, mid) {
+            Some(laid) => {
+                best = laid;
+                lo = mid;
+            }
+            None => hi = mid,
+        }
+    }
+    best
+}
+
 /// One rasterized glyph and where its top-left pixel goes, in a coordinate
 /// space whose origin is the pen start on the baseline (y-down).
 struct Placed {

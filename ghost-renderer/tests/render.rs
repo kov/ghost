@@ -2859,11 +2859,17 @@ impl ghost_shaper::Fallback for EmojiFallback {
 
 /// Render one chrome-text item on its own, returning the image and its box.
 fn chrome_text(text: &str, align: ghost_render::TextAlign) -> (Rendered, RectPx) {
+    chrome_text_in(text, align, 400.0)
+}
+
+/// [`chrome_text`] in a box `box_w` wide at the left of a 400-px image, so ink
+/// past the box shows.
+fn chrome_text_in(text: &str, align: ghost_render::TextAlign, box_w: f32) -> (Rendered, RectPx) {
     let (w, h) = (400u32, 40u32);
     let rect = RectPx {
         x: 0.0,
         y: 0.0,
-        w: w as f32,
+        w: box_w,
         h: h as f32,
     };
     let scene = Scene {
@@ -2897,6 +2903,24 @@ fn ink_span(img: &Rendered) -> Option<(u32, u32)> {
         .filter(|&x| (0..img.height).any(|y| px(img, x, y) != bg))
         .collect();
     Some((*lit.first()?, *lit.last()?))
+}
+
+/// A heading wider than its box — a program's long question in the titlebar —
+/// shows its start and stops at the box's edge, rather than running on under
+/// the buttons beside it.
+#[test]
+fn chrome_text_too_wide_for_its_box_keeps_its_start_inside_it() {
+    let question = "answer: which of these crates should be published first, and should \
+                    the dry run go ahead? (ghost-term / ghost-vt / ghost-ui)";
+    let (img, rect) = chrome_text_in(question, ghost_render::TextAlign::Center, 200.0);
+    write_png("chrome-text-fitted.png", &img);
+    let (start, end) = ink_span(&img).expect("the start of the question draws");
+    assert!(start < 12, "starts at the box's left edge, at {start}");
+    assert!(
+        (end as f32) < rect.x + rect.w,
+        "ends inside the box ({end} vs {})",
+        rect.w
+    );
 }
 
 #[test]
