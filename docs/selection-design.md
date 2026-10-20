@@ -79,6 +79,12 @@ plumbed like `padding` (shell setter onto `TerminalView`, re-applied by
 `App::reload_config`, mirrored onto warm views). `word_at` keeps scanning cells,
 so wide-char handling is unchanged.
 
+Since `.`, `,`, `:` and `?` are word characters, a token ending a sentence would
+take the sentence's punctuation with it. `word_at` drops a trailing run of
+`. , ; : ! ?` when a letter or digit comes right before it, so `see notes.md.`
+selects `notes.md`, while `..` and `foo/..` stay whole. It never trims past the
+clicked cell.
+
 Sites: `ghost-ui-core/src/terminal.rs` `is_word_char` / `word_at`;
 `ghost-ui/src/config.rs` `[input]`; `App::reload_config` in `ghost-ui/src/lib.rs`;
 README config sample.

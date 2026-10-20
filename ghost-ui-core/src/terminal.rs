@@ -3192,6 +3192,30 @@ impl TerminalView {
             erow += 1;
             ecol = 0;
         }
+        // A token ending a sentence leaves the sentence's punctuation behind —
+        // `see notes.md.` selects `notes.md` — when a letter or digit comes
+        // before it: `..` and `foo/..` are paths, dots and all. Never past the
+        // click, which stays inside what it selected.
+        let char_at = |(r, c): (usize, usize)| {
+            self.window_line(state, r)
+                .and_then(|l| l.cells().get(c).map(|cell| cell.char()))
+        };
+        let before = |(r, c): (usize, usize)| -> Option<(usize, usize)> {
+            if c > 0 {
+                return Some((r, c - 1));
+            }
+            let prev = r.checked_sub(1)?;
+            let end = content_len(self.window_line(state, prev)?, self.window_line(state, r));
+            Some((prev, end.checked_sub(1)?))
+        };
+        let mut end = (erow, ecol);
+        while end > (row, col) && char_at(end).is_some_and(|c| SENTENCE_TRAILERS.contains(&c)) {
+            let Some(prev) = before(end) else { break };
+            end = prev;
+        }
+        if end != (erow, ecol) && char_at(end).is_some_and(char::is_alphanumeric) {
+            (erow, ecol) = end;
+        }
         Some(Selection::new((srow, scol), (erow, ecol)))
     }
 
@@ -3840,6 +3864,9 @@ fn starts_with(chars: &[char], prefix: &str) -> bool {
             .zip(chars)
             .all(|(p, c)| c.eq_ignore_ascii_case(&p))
 }
+
+/// Punctuation that ends a sentence rather than a word or path.
+const SENTENCE_TRAILERS: [char; 6] = ['.', ',', ';', ':', '!', '?'];
 
 /// The length of `chars` with the trailing prose trimmed off: sentence
 /// punctuation, and closing brackets with no opener inside the match (a
@@ -4790,6 +4817,36 @@ mod tests {
         match m.view.selection {
             Some(sel) => selection_text(&m.state.screen, sel),
             None => String::new(),
+        }
+    }
+
+    /// A path or word ending a sentence leaves the sentence's punctuation
+    /// behind — what gets opened or pasted is the path — while a token made of
+    /// dots, or ending in one after a separator, keeps them: `..` is a path.
+    #[test]
+    fn double_click_leaves_sentence_punctuation_off_the_end() {
+        let cases: [(&[u8], usize, &str); 7] = [
+            (
+                b"see /tmp/shot/fleet-status.png.",
+                10,
+                "/tmp/shot/fleet-status.png",
+            ),
+            (b"open notes.md, then", 7, "notes.md"),
+            (b"in src/lib.rs: here", 5, "src/lib.rs"),
+            (b"really?! yes", 2, "really"),
+            (b"wait... ok", 1, "wait"),
+            (b"cd .. now", 3, ".."),
+            (b"cd foo/.. now", 4, "foo/.."),
+        ];
+        for (line, col, want) in cases {
+            let mut m = model();
+            feed(&mut m, line);
+            assert_eq!(
+                double_click_text(&mut m, 0, col),
+                want,
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
     }
 
