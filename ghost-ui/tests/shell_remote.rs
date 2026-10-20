@@ -1022,5 +1022,47 @@ fn opening_a_file_named_in_a_remote_session_opens_a_fetched_copy() {
             "remote contents\n",
             "the remote file's own contents"
         );
+
+        // A name with no file behind it over there: nothing opens, and the
+        // header bar says why.
+        app.dispatch(wid, UiEvent::Text("echo gone.txt\r".into()), &fe);
+        assert!(pump_until(
+            &mut app,
+            &fe,
+            &q,
+            Duration::from_secs(20),
+            |app| {
+                let scene = app.root(wid).expect("window").view(app.states());
+                support::terminal_line_point(&scene, "gone.txt").is_some()
+            }
+        ));
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::terminal_line_point(&scene, "gone.txt").expect("echoed");
+        for ev in support::double_click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        app.dispatch(
+            wid,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("o".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: !cfg!(target_os = "macos"),
+                    sup: cfg!(target_os = "macos"),
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+        // What the header bar carries in place of the title.
+        let reported = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.root(wid)
+                .expect("window")
+                .chrome_notice()
+                .is_some_and(|n| n.text == "Could not open a file")
+        });
+        assert!(reported, "the failed fetch never reached the header bar");
+        assert_eq!(fe.system_opens().len(), 1, "and nothing more opened");
     });
 }

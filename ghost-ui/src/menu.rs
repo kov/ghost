@@ -131,7 +131,11 @@ pub enum UserEvent {
     },
     /// A remote file the open chord asked for: the local copy to open, or why
     /// there is none. Posted by the fetch worker (see `App::open_path`).
-    RemoteFileFetched(Result<std::path::PathBuf, String>),
+    RemoteFileFetched {
+        /// The window the chord was pressed in, which reports a failure.
+        wid: winit::window::WindowId,
+        result: Result<std::path::PathBuf, String>,
+    },
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main

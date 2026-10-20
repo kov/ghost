@@ -1282,6 +1282,9 @@ fn cwd_source<'a>(
     }
 }
 
+/// The header bar's line when the open chord can't open what is selected.
+const OPEN_FAILED: &str = "Could not open a file";
+
 /// A path a local session names, as a file here: `~` is this user's home, and a
 /// relative path is relative to the session's directory (`None` when that is
 /// unknown, which leaves a relative path nowhere).
@@ -5161,7 +5164,7 @@ impl App {
                     }
                 }
                 Cmd::OpenUrl(url) => event_loop.open_external(&url),
-                Cmd::OpenPath { session, path } => self.open_path(&session, &path, event_loop),
+                Cmd::OpenPath { session, path } => self.open_path(wid, &session, &path, event_loop),
                 Cmd::PointerIcon(icon) => {
                     if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
                         gfx.window.set_cursor(match icon {
@@ -6338,8 +6341,9 @@ impl App {
     /// it is resolved against the session's directory and opened if it exists;
     /// on a remote host — a session there, or a local `ssh` child — it is copied
     /// into the cache over ssh, off the loop, and the copy opened when it lands
-    /// ([`UserEvent::RemoteFileFetched`]).
-    fn open_path(&mut self, session: &SessionId, path: &str, fe: &dyn Frontend) {
+    /// ([`UserEvent::RemoteFileFetched`]). Whatever stops it is said in `wid`'s
+    /// header bar.
+    fn open_path(&mut self, wid: WindowId, session: &SessionId, path: &str, fe: &dyn Frontend) {
         let (remote, cwd) = match session.local_name() {
             Some(local) => {
                 let desc = ghost_vt::descriptor::read(local);
@@ -6349,16 +6353,26 @@ impl App {
                     Some(spec) => match ghost_vt::remote::RemoteSsh::new(spec) {
                         Ok(r) => (r, None),
                         Err(e) => {
-                            tracing::warn!(target: "ghost::open", "{path}: {e}");
+                            self.report_failure(wid, OPEN_FAILED, format!("{path}: {e}"));
                             return;
                         }
                     },
                     None => {
                         let cwd = desc.and_then(|d| d.cwd);
-                        if let Some(file) = local_open_path(path, cwd.as_deref())
-                            && file.exists()
-                        {
-                            fe.open_external(&file.display().to_string());
+                        match local_open_path(path, cwd.as_deref()) {
+                            Some(file) if file.exists() => {
+                                fe.open_external(&file.display().to_string());
+                            }
+                            Some(file) => self.report_failure(
+                                wid,
+                                OPEN_FAILED,
+                                format!("{}: no such file", file.display()),
+                            ),
+                            None => self.report_failure(
+                                wid,
+                                OPEN_FAILED,
+                                format!("{path}: relative, and the session's directory is unknown"),
+                            ),
                         }
                         return;
                     }
@@ -6396,7 +6410,7 @@ impl App {
                         .map(|()| dest)
                 })
                 .map_err(|e| e.to_string());
-            sink.post(UserEvent::RemoteFileFetched(result));
+            sink.post(UserEvent::RemoteFileFetched { wid, result });
         });
     }
 
@@ -7978,10 +7992,10 @@ impl App {
                 return;
             }
             // A remote file the open chord asked for is here: open the copy.
-            UserEvent::RemoteFileFetched(result) => {
+            UserEvent::RemoteFileFetched { wid, result } => {
                 match result {
                     Ok(copy) => fe.open_external(&copy.display().to_string()),
-                    Err(e) => tracing::warn!(target: "ghost::open", "{e}"),
+                    Err(e) => self.report_failure(wid, OPEN_FAILED, e),
                 }
                 return;
             }

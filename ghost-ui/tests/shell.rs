@@ -1123,6 +1123,14 @@ fn the_open_chord_opens_the_selected_file_or_url() {
             2,
             "a file that isn't there opens nothing"
         );
+        // What the header bar carries in place of the title.
+        let notice = app.root(wid).expect("window").chrome_notice();
+        assert!(
+            notice
+                .as_ref()
+                .is_some_and(|n| n.text == "Could not open a file"),
+            "…and the header bar says so: {notice:?}"
+        );
         support::kill_session("opener");
     });
 }
