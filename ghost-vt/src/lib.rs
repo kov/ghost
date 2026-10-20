@@ -15,6 +15,7 @@ pub mod child;
 pub mod client;
 pub mod connection;
 pub mod descriptor;
+pub mod echo;
 pub mod keys;
 pub mod meta;
 pub mod paths;

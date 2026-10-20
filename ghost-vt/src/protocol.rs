@@ -121,6 +121,15 @@ pub enum ClientMsg {
     /// [`SessionEvent::GroupChanged`]. Sent from [`PROTO_ATTACH`] by the display
     /// client or a control connection; a watcher's is ignored.
     SetGroup(Option<String>),
+    /// [`Self::Input`], numbered, from a display client that predicts its own
+    /// echo (`docs/predictive-echo-design.md`). Numbers start at 1 and rise by
+    /// one per message on this connection. The host answers with
+    /// [`ServerMsg::EchoAck`] once the child has had time to echo it. Sent from
+    /// [`PROTO_PREDICT`]; an older host gets plain `Input`.
+    InputSeq { seq: u64, bytes: Vec<u8> },
+    /// Ask for a [`ServerMsg::Pong`] carrying the same id, straight back, so the
+    /// client can time the round trip. Sent from [`PROTO_PREDICT`].
+    Ping(u64),
 }
 
 /// Who holds a session's display. Richer than the on-disk `attached` marker
@@ -217,6 +226,15 @@ pub enum ServerMsg {
     /// so a client too old to decode it drops the connection instead — which is
     /// exactly what every client did before this message existed.
     SpawnFailed { message: String },
+    /// Every [`ClientMsg::InputSeq`] up to this number was written to the child
+    /// at least [`ECHO_TIMEOUT`](crate::echo::ECHO_TIMEOUT) ago, and every byte
+    /// the child produced before this message was sent ahead of it. So once the
+    /// client has fed all the output that came before it, its screen shows what
+    /// the child did with that input — the moment a prediction can be judged.
+    /// Only to the display client, and only in answer to `InputSeq`.
+    EchoAck(u64),
+    /// The answer to [`ClientMsg::Ping`], with its id.
+    Pong(u64),
 }
 
 /// The protocol feature level this binary speaks. The host writes it to the
@@ -227,7 +245,7 @@ pub enum ServerMsg {
 /// level 0. Bump this when appending a message clients send unprompted — or
 /// when an existing message's *semantics* change in a way clients must gate on
 /// — and add a `PROTO_*` constant for it.
-pub const PROTO_LEVEL: u32 = 8;
+pub const PROTO_LEVEL: u32 = 9;
 
 /// Feature level at which the host understands [`ClientMsg::Theme`].
 pub const PROTO_THEME: u32 = 1;
@@ -288,6 +306,14 @@ pub const PROTO_ATTACH: u32 = 8;
 
 const _: () = assert!(PROTO_ATTACH > PROTO_TRACE);
 const _: () = assert!(PROTO_LEVEL >= PROTO_ATTACH);
+
+/// Feature level at which the host understands [`ClientMsg::InputSeq`] and
+/// [`ClientMsg::Ping`], answering with [`ServerMsg::EchoAck`] and
+/// [`ServerMsg::Pong`] — what predictive local echo needs from the host.
+pub const PROTO_PREDICT: u32 = 9;
+
+const _: () = assert!(PROTO_PREDICT > PROTO_ATTACH);
+const _: () = assert!(PROTO_LEVEL >= PROTO_PREDICT);
 
 /// Upper bound on a frame body, guarding against corrupt or hostile length
 /// prefixes before we allocate.
@@ -399,6 +425,11 @@ mod tests {
             ClientMsg::Kill,
             ClientMsg::Rename("new-name".to_string()),
             ClientMsg::Repaint,
+            ClientMsg::InputSeq {
+                seq: 3,
+                bytes: b"x".to_vec(),
+            },
+            ClientMsg::Ping(9),
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));
@@ -459,6 +490,14 @@ mod tests {
             13
         );
         assert_eq!(wire_tag(&ClientMsg::SetGroup(None)), 14);
+        assert_eq!(
+            wire_tag(&ClientMsg::InputSeq {
+                seq: 0,
+                bytes: Vec::new()
+            }),
+            15
+        );
+        assert_eq!(wire_tag(&ClientMsg::Ping(0)), 16);
     }
 
     #[test]
@@ -489,6 +528,8 @@ mod tests {
             }),
             7,
         );
+        assert_eq!(wire_tag(&ServerMsg::EchoAck(0)), 8);
+        assert_eq!(wire_tag(&ServerMsg::Pong(0)), 9);
 
         // SessionEvent::Resized was appended after PROTO_SUBSCRIBE shipped; it must
         // stay at the tail so level-3 subscribers keep skipping only it.
@@ -520,6 +561,8 @@ mod tests {
             ServerMsg::SpawnFailed {
                 message: "no such file".to_string(),
             },
+            ServerMsg::EchoAck(u64::MAX),
+            ServerMsg::Pong(7),
         ] {
             let mut r = FrameReader::new();
             r.push(&encode(&msg));

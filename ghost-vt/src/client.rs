@@ -291,7 +291,9 @@ impl Subscriber {
                         | ServerMsg::RenameResult { .. }
                         | ServerMsg::UpgradeResult { .. }
                         | ServerMsg::SpawnFailed { .. }
-                        | ServerMsg::Superseded => {}
+                        | ServerMsg::Superseded
+                        | ServerMsg::EchoAck(_)
+                        | ServerMsg::Pong(_) => {}
                     }
                 }
             }
@@ -321,6 +323,11 @@ pub struct Pump {
     /// either way, but a caller with somewhere to show this can say what went
     /// wrong instead of leaving a window that quietly did nothing.
     pub failed: Option<String>,
+    /// The newest [`ServerMsg::EchoAck`] in this batch: every input numbered up
+    /// to it has had its chance to echo. Judge predictions against the screen
+    /// only after feeding `output`, which holds everything the host sent before
+    /// the ack.
+    pub echo_ack: Option<u64>,
 }
 
 /// An attached session for an event-loop front-end (a GUI): attach and
@@ -335,6 +342,9 @@ pub struct Pump {
 pub struct Session {
     name: String,
     client: Client,
+    /// Input numbering and round-trip timing for predictive echo; idle on a
+    /// host below [`PROTO_PREDICT`](crate::protocol::PROTO_PREDICT).
+    clock: crate::echo::InputClock,
 }
 
 impl Session {
@@ -368,6 +378,7 @@ impl Session {
         Ok(Session {
             name: name.to_string(),
             client,
+            clock: Default::default(),
         })
     }
 
@@ -397,6 +408,7 @@ impl Session {
         Ok(Session {
             name: name.to_string(),
             client: Client::connect_ssh(cmd, proto)?,
+            clock: Default::default(),
         })
     }
 
@@ -409,6 +421,7 @@ impl Session {
         Ok(Session {
             name: name.to_string(),
             client: Client::connect(name)?,
+            clock: Default::default(),
         })
     }
 
@@ -418,6 +431,7 @@ impl Session {
         Ok(Session {
             name: name.to_string(),
             client: Client::connect_path(sock)?,
+            clock: Default::default(),
         })
     }
 
@@ -451,8 +465,48 @@ impl Session {
     /// Reports success for input a non-blocking write only *queued* — see
     /// [`pending_input`](Session::pending_input), which is how a caller tells
     /// "delivered" from "accepted".
+    ///
+    /// On a host that speaks [`PROTO_PREDICT`](crate::protocol::PROTO_PREDICT)
+    /// the input is numbered (see [`last_input_seq`](Session::last_input_seq)),
+    /// and the host acknowledges it through [`Pump::echo_ack`].
     pub fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.client.send(&ClientMsg::Input(bytes.to_vec()))
+        if !self.predicts() {
+            return self.client.send(&ClientMsg::Input(bytes.to_vec()));
+        }
+        let seq = self.clock.next_seq();
+        self.client.send(&ClientMsg::InputSeq {
+            seq,
+            bytes: bytes.to_vec(),
+        })?;
+        self.ping_if_due();
+        Ok(())
+    }
+
+    /// The number the last [`send_input`](Session::send_input) went out under, or
+    /// `None` when the host doesn't number input (or none was sent yet).
+    pub fn last_input_seq(&self) -> Option<u64> {
+        self.clock.last_seq()
+    }
+
+    /// The smoothed round trip to the host — mosh's estimate, which reads as one
+    /// second until a ping has been answered — or `None` when the host can't be
+    /// timed (it predates [`PROTO_PREDICT`](crate::protocol::PROTO_PREDICT)).
+    pub fn srtt(&self) -> Option<Duration> {
+        self.predicts().then(|| self.clock.srtt())
+    }
+
+    fn predicts(&self) -> bool {
+        self.client.proto >= crate::protocol::PROTO_PREDICT
+    }
+
+    /// Best effort: a ping that cannot be sent is a connection [`pump`]
+    /// (Session::pump) is about to report lost, which says it better.
+    fn ping_if_due(&mut self) {
+        if self.predicts()
+            && let Some(id) = self.clock.ping_due(Instant::now())
+        {
+            let _ = self.client.send(&ClientMsg::Ping(id));
+        }
     }
 
     /// Bytes an earlier [`send_input`](Session::send_input) accepted but the
@@ -549,6 +603,7 @@ impl Session {
     /// bytes plus an end-of-session flag. Non-blocking when [`as_fd`](Session::as_fd)
     /// polls readable or a read timeout is set; see [`Client::recv_ready`].
     pub fn pump(&mut self) -> io::Result<Pump> {
+        self.ping_if_due();
         self.client.flush_pending()?;
         let mut pump = Pump::default();
         match self.client.recv_ready()? {
@@ -578,6 +633,11 @@ impl Session {
                         // Pushed subscription state; a display client is not a
                         // subscriber, so nothing to do.
                         ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
+                        // Acks only rise, so the batch's last is the one to judge
+                        // by: once the caller has fed this batch's `output`, its
+                        // screen is at least as new as the host's when it acked.
+                        ServerMsg::EchoAck(seq) => pump.echo_ack = Some(seq),
+                        ServerMsg::Pong(id) => self.clock.pong(id, Instant::now()),
                     }
                 }
             }
@@ -822,8 +882,12 @@ fn run_attach(mut client: Client, reconnect: Option<&str>) -> io::Result<()> {
                         return Ok(());
                     }
                     // Pushed subscription state; a display client is not a
-                    // subscriber, so nothing to do.
-                    ServerMsg::Snapshot(_) | ServerMsg::Event(_) => {}
+                    // subscriber, so nothing to do. Nor does this attach number its
+                    // input or ping, so no acks or pongs come back.
+                    ServerMsg::Snapshot(_)
+                    | ServerMsg::Event(_)
+                    | ServerMsg::EchoAck(_)
+                    | ServerMsg::Pong(_) => {}
                 }
             }
         }
@@ -1183,9 +1247,12 @@ mod tests {
             name: "t".into(),
             client: Client {
                 conn: Conn::new(AnyTransport::Unix(cli)),
-                proto: crate::protocol::PROTO_LEVEL,
+                // Below predictive echo, so the host end sees exactly what a
+                // test sends — no pings of its own in between.
+                proto: crate::protocol::PROTO_PREDICT - 1,
                 generation: 0,
             },
+            clock: Default::default(),
         };
         (host, session)
     }

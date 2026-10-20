@@ -196,6 +196,9 @@ struct Client {
     /// [`ServerMsg::UpgradeResult`] here instead (on SUCCESS the exec drops the
     /// connection and the requester reads that EOF as "taken").
     awaiting_upgrade: bool,
+    /// Which of this connection's numbered inputs have reached the child, and
+    /// the newest one old enough to acknowledge (predictive echo).
+    echo: crate::echo::EchoAck,
 }
 
 impl Client {
@@ -210,6 +213,7 @@ impl Client {
             lagged: false,
             hello: None,
             awaiting_upgrade: false,
+            echo: Default::default(),
         })
     }
 
@@ -1395,10 +1399,16 @@ fn host_main(
         // An owed cwd look is decided by wall clock too, and is the common case: a
         // `cd` is followed by silence, so nothing would ever wake us to notice the
         // child moved. Whichever deadline is nearer sets the cap.
-        let deadline = [pending_upgrade.as_ref().map(|p| p.deadline), cwd_look_at]
-            .into_iter()
-            .flatten()
-            .min();
+        // So is an echo acknowledgement: it is owed even when the child stays
+        // silent, since silence is what proves a predicted echo wrong.
+        let deadline = [
+            pending_upgrade.as_ref().map(|p| p.deadline),
+            cwd_look_at,
+            client.as_ref().and_then(|c| c.echo.next_due()),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let poll_timeout: Option<Timespec> = deadline.map(|d| {
             let left = d.saturating_duration_since(Instant::now());
             Timespec {
@@ -1900,6 +1910,9 @@ fn host_main(
                 }
                 Ok(n) => {
                     pty_out.drain(..n);
+                    if let Some(c) = &mut client {
+                        c.echo.drained(n, Instant::now());
+                    }
                     if traced {
                         crate::trace::log(
                             current_name,
@@ -1928,6 +1941,15 @@ fn host_main(
                     break;
                 }
             }
+        }
+
+        // Acknowledge the display client's input that has had its time to echo.
+        // Queued behind every `Output` read so far, which is what lets the
+        // client judge its predictions against the screen as of the ack.
+        if let Some(c) = &mut client
+            && let Some(seq) = c.echo.advance(Instant::now())
+        {
+            c.queue(&ServerMsg::EchoAck(seq));
         }
 
         // A requested in-place self-upgrade fires only at a clean handoff
@@ -2277,6 +2299,38 @@ fn hidden_prompt(pty: &pty_process::blocking::Pty) -> bool {
     }
 }
 
+/// Queue a display client's input for the child: recorded (unless the child is
+/// at a hidden prompt), traced, and appended to the PTY queue the drain empties.
+fn queue_input(
+    bytes: &[u8],
+    pty: &pty_process::blocking::Pty,
+    pty_out: &mut Vec<u8>,
+    recorder: &mut Option<crate::record::FileRecorder>,
+    current_name: &str,
+) {
+    if let Some(r) = recorder
+        && !hidden_prompt(pty)
+    {
+        let _ = r.input(bytes);
+    }
+    pty_out.extend_from_slice(bytes);
+    // Logged at RECEIPT, like the recording — but unlike the
+    // recording it is followed by what the drain did with the bytes,
+    // so "the host got it" and "the child got it" stop being the
+    // same line. `queued` is the backlog including these bytes.
+    if crate::trace::enabled() {
+        crate::trace::log(
+            current_name,
+            format_args!(
+                "host input {} {}B queued={}",
+                crate::trace::escape(bytes),
+                bytes.len(),
+                pty_out.len()
+            ),
+        );
+    }
+}
+
 /// Process a batch of decoded client messages: write input to the PTY, apply
 /// resizes, handle renames and repaints. A Resize sets `c.resynced` (and queues
 /// the repaint), which is how the caller knows the connection is an attach client
@@ -2303,6 +2357,7 @@ fn handle_client_messages(
             // display client and to control connections. Checked per message, since
             // a batch can carry the `Observe` that makes this connection a watcher.
             ClientMsg::Input(_)
+            | ClientMsg::InputSeq { .. }
             | ClientMsg::Resize { .. }
             | ClientMsg::Attach { .. }
             | ClientMsg::Kill
@@ -2324,29 +2379,12 @@ fn handle_client_messages(
                 c.hello = Some(client);
                 apply_resize(c, pty, screen, recorder, cols, rows);
             }
-            ClientMsg::Input(bytes) => {
-                if let Some(r) = recorder
-                    && !hidden_prompt(pty)
-                {
-                    let _ = r.input(&bytes);
-                }
-                pty_out.extend_from_slice(&bytes);
-                // Logged at RECEIPT, like the recording — but unlike the
-                // recording it is followed by what the drain did with the bytes,
-                // so "the host got it" and "the child got it" stop being the
-                // same line. `queued` is the backlog including these bytes.
-                if crate::trace::enabled() {
-                    crate::trace::log(
-                        current_name,
-                        format_args!(
-                            "host input {} {}B queued={}",
-                            crate::trace::escape(&bytes),
-                            bytes.len(),
-                            pty_out.len()
-                        ),
-                    );
-                }
+            ClientMsg::Ping(id) => c.queue(&ServerMsg::Pong(id)),
+            ClientMsg::InputSeq { seq, bytes } => {
+                queue_input(&bytes, pty, pty_out, recorder, current_name);
+                c.echo.queued(seq, pty_out.len());
             }
+            ClientMsg::Input(bytes) => queue_input(&bytes, pty, pty_out, recorder, current_name),
             ClientMsg::Resize { cols, rows } => apply_resize(c, pty, screen, recorder, cols, rows),
             ClientMsg::Trace { on } => crate::trace::set_enabled(on),
             ClientMsg::Detach => return Ok(Disposition::Drop),

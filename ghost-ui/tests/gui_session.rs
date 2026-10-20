@@ -207,3 +207,64 @@ fn pump_reports_end_when_child_exits() {
         "did not render child output before the end; got {acc:?}"
     );
 }
+
+/// Predictive echo's host half: numbered input is acknowledged once the child has
+/// had [`ECHO_TIMEOUT`](ghost_vt::echo::ECHO_TIMEOUT) to echo it — even when it
+/// prints nothing at all, because that silence is what proves a predicted echo
+/// wrong. And the host answers pings, so the client can time the link.
+#[test]
+fn numbered_input_is_acknowledged_even_when_the_child_stays_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path();
+    let name = "gui-ack";
+    let _guard = KillOnDrop { xdg, name };
+
+    // Echo off, then a marker, then silence: nothing typed ever shows.
+    let out = ghost(xdg)
+        .args(["new", name, "-d", "--defer", "--"])
+        .args(["sh", "-c", "stty -echo; echo armed; exec sleep 100"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`ghost new` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || ls(xdg).contains(name)),
+        "session not listed"
+    );
+
+    let mut s = Session::attach_path(&sock(xdg, name), name, 80, 24).expect("attach");
+    s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    let (acc, ended) = pump_for(&mut s, "armed", Duration::from_secs(5));
+    assert!(
+        !ended && acc.contains("armed"),
+        "child never armed: {acc:?}"
+    );
+
+    let sent = Instant::now();
+    s.send_input(b"x").unwrap();
+    let seq = s.last_input_seq().expect("a current host numbers input");
+    let mut acked = None;
+    let mut output = Vec::new();
+    while sent.elapsed() < Duration::from_secs(5) && acked.is_none() {
+        let p = s.pump().expect("pump");
+        output.extend(p.output);
+        acked = p.echo_ack.filter(|&a| a >= seq).map(|_| sent.elapsed());
+    }
+    let acked = acked.expect("the input was never acknowledged");
+    assert!(
+        acked >= ghost_vt::echo::ECHO_TIMEOUT,
+        "acknowledged after {acked:?}, before the child had its time to echo"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains('x'),
+        "the child must stay silent for this test to mean anything"
+    );
+    assert!(
+        s.srtt().expect("a current host can be timed") < Duration::from_secs(1),
+        "the attach ping was never answered: srtt {:?}",
+        s.srtt()
+    );
+}
