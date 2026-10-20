@@ -227,7 +227,8 @@ in the child. So **binary signature-checking is theater — skip it.** Instead:
 
 ## Who asks, and when
 
-The UI asks each listed host once per run, when its protocol level is older
+The UI asks each host once per run, as that host's session listing arrives
+(whatever its windows show), when its protocol level is older
 than the UI's, or its level matches and its published `build` marker is older
 (or absent). The rollout is staged: one host is upgraded and must come back
 listed as the new build, and stay so for a few seconds, before the rest follow

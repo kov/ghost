@@ -8052,13 +8052,20 @@ impl App {
             UserEvent::Menu(action) => action,
             // The watcher thread delivered a remote host's latest listing: stash it
             // and hint a re-enumeration so the fleet merges it in.
+            // Each host's listing is also where its hosts are checked for
+            // upgrading — here, not in a window's `SessionList`, which only a
+            // fleet asks for: a listing arriving while every window shows one
+            // session would otherwise wait for someone to zoom out.
             UserEvent::LocalSessions(infos) => {
+                let listed: Vec<Listed> = infos.iter().cloned().map(Listed::local).collect();
+                self.upgrade_older_hosts(&listed);
                 self.local_infos = Some(infos);
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             UserEvent::RemoteSessions { target, infos } => {
+                self.upgrade_older_hosts(&remote_listing(&target, &infos));
                 self.host_mut(&target).listing = Some(infos);
                 self.sessions_changed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -11749,15 +11756,19 @@ mod tests {
             // Same level, a build from long ago.
             std::fs::write(ghost_vt::paths::build_path(name), "1").unwrap();
 
-            list_and_pump(&mut app, a, &fe, 5_000, || generation_of(name) > 0);
+            // The generation is bumped just before the exec, the build marker
+            // republished just after it: wait for the second.
+            let target = ghost_vt::build::of_file(&ghost_bin);
+            list_and_pump(&mut app, a, &fe, 5_000, || {
+                generation_of(name) > 0 && ghost_vt::client::session_build(name) == target
+            });
             let upgraded = generation_of(name) > 0;
             let republished = ghost_vt::client::session_build(name);
             let _ = ghost_vt::session::kill_session(name);
 
             assert!(upgraded, "the host re-exec'd in place");
             assert_eq!(
-                republished,
-                ghost_vt::build::of_file(&ghost_bin),
+                republished, target,
                 "the upgraded host names the build it runs now"
             );
         });
@@ -11992,6 +12003,93 @@ mod tests {
             }
 
             assert!(upgraded, "the host re-exec'd onto the remote ghost's build");
+        });
+    }
+
+    /// Hosts are upgraded when a host's listing arrives, whatever the windows
+    /// show: here the only window shows one local session — it never asks for
+    /// the session list — and a remote host's listing comes in afterwards, the
+    /// way a host whose ghost took long to stage does.
+    #[test]
+    fn a_remote_listing_arriving_later_upgrades_its_hosts_with_no_fleet_open() {
+        let Some(ghost_bin) = ghost_binary() else {
+            eprintln!("skipping: no `ghost` binary next to the test binary");
+            return;
+        };
+        with_isolated_xdg(|| {
+            let shim = write_ssh_shim();
+            let orig_path = std::env::var_os("PATH");
+            let mut dirs = vec![shim.path().to_path_buf()];
+            if let Some(p) = &orig_path {
+                dirs.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(dirs).unwrap();
+            // SAFETY: single-threaded within `with_isolated_xdg`'s lock.
+            unsafe { std::env::set_var("PATH", &joined) };
+
+            // A later build, so only the remote path can bring the host to it
+            // (see `an_older_remote_build_at_the_same_level_is_upgraded_when_listed`).
+            let later = tempfile::tempdir().unwrap();
+            let remote_ghost = later.path().join("ghost");
+            std::fs::copy(&ghost_bin, &remote_ghost).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&remote_ghost)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+            let remote_build = ghost_vt::build::of_file(&remote_ghost);
+
+            start_listed(&ghost_bin, "here");
+            let mut app = App::headless();
+            app.upgrade_hosts_to = Some(ghost_bin.clone());
+            let fe = HeadlessFrontend::new();
+            let group = app.mint_group();
+            app.open_single_window(&fe, "here", group, None)
+                .expect("the window attaches");
+
+            let spec = ConnectionSpec::parse_target("kov@box").unwrap();
+            app.register_remote(&spec, remote_ghost.to_str().unwrap());
+            let name = "rupg-late";
+            let remote = ghost_vt::remote::RemoteSsh::new(spec.clone()).unwrap();
+            remote
+                .spawn_host(ghost_bin.to_str().unwrap(), name, None)
+                .unwrap();
+            let infos = || ghost_vt::session::list().unwrap_or_default();
+            let mut spun = 0;
+            while !infos().iter().any(|s| s.name == name) && spun < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            std::fs::write(ghost_vt::paths::build_path(name), "1").unwrap();
+
+            app.on_user_event(
+                &fe,
+                UserEvent::RemoteSessions {
+                    target: "kov@box".to_string(),
+                    infos: infos().into_iter().filter(|s| s.name == name).collect(),
+                },
+            );
+            let on_remote_build = || ghost_vt::client::session_build(name) == remote_build;
+            let mut spun = 0;
+            while !on_remote_build() && spun < 500 {
+                app.wake(&fe);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spun += 1;
+            }
+            let upgraded = on_remote_build();
+
+            let _ = ghost_vt::session::kill_session(name);
+            let _ = ghost_vt::session::kill_session("here");
+            // SAFETY: still within the lock.
+            unsafe {
+                match orig_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+
+            assert!(upgraded, "the late listing's host was upgraded");
         });
     }
 
