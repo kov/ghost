@@ -146,7 +146,7 @@ record, because a second turn's `done` says exactly what the first one did.
 
 | Headline | Tint |
 | --- | --- |
-| `working` | none; a line along the bar's foot instead |
+| `working` | violet, gentlest of all, and a line along the bar's foot |
 | `blocked` | amber, stronger for `permission` and `question` |
 | `done` | green, until the user has seen it |
 | `error` | muted red, distinct from ghost's own failure red |

@@ -198,8 +198,9 @@ pub struct Titlebar {
 /// `docs/program-status-design.md`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum BarStatus {
-    /// Running: no tint, a line along the bar's foot — as long as `progress`
-    /// says (0–100), or faint across the whole bar when it says nothing.
+    /// Running: violet, and a line along the bar's foot — as long as
+    /// `progress` says (0–100), or faint across the whole bar when it says
+    /// nothing.
     Working { progress: Option<u8> },
     /// Waiting on the user: amber, strongest when `urgent` (a permission or a
     /// question the user has to answer), and the program's `msg` in place of
@@ -285,6 +286,10 @@ const MOSS: Rgba = [0.36, 0.74, 0.40, 1.0];
 const MOSS_MIX: f32 = 0.35;
 const ROSE: Rgba = [0.74, 0.38, 0.42, 1.0];
 const ROSE_MIX: f32 = 0.38;
+/// Working: violet, gentler than the rest — it is the state a program spends
+/// most of its time in — and clear of the mode notice's ice blue.
+const VIOLET: Rgba = [0.60, 0.46, 0.92, 1.0];
+const VIOLET_MIX: f32 = 0.30;
 
 /// The bar's colour under whatever notice it carries — or, without one, under
 /// its program's status — its own, when there is neither.
@@ -299,7 +304,8 @@ pub fn notice_bg(bar: &Titlebar) -> Rgba {
         ),
         (None, Some(BarStatus::Done)) => tinted(bar.bg, MOSS, MOSS_MIX),
         (None, Some(BarStatus::Error)) => tinted(bar.bg, ROSE, ROSE_MIX),
-        (None, Some(BarStatus::Working { .. }) | None) => bar.bg,
+        (None, Some(BarStatus::Working { .. })) => tinted(bar.bg, VIOLET, VIOLET_MIX),
+        (None, None) => bar.bg,
     }
 }
 
@@ -395,7 +401,8 @@ pub fn status_color(state: ghost_term::status::StatusState) -> Rgba {
         StatusState::Blocked => AMBER,
         StatusState::Done => MOSS,
         StatusState::Error => ROSE,
-        StatusState::Working | StatusState::Idle => [0.62, 0.64, 0.68, 1.0],
+        StatusState::Working => VIOLET,
+        StatusState::Idle => [0.62, 0.64, 0.68, 1.0],
     }
 }
 
@@ -1117,7 +1124,28 @@ mod tests {
             content(800, 565),
             &with_status(BarStatus::Working { progress: Some(25) }),
         );
-        assert_eq!(bar_of(&working).0, bg, "working is no reason to tint");
+        // Working has a colour of its own, so busy reads apart from idle at a
+        // glance — and apart from ghost's own (cold) mode notice and from the
+        // other statuses.
+        let violet = bar_of(&working).0;
+        assert_ne!(violet, bg, "working tints the bar");
+        assert!(
+            violet[2] > violet[1] && violet[0] > violet[1],
+            "violet: {violet:?}"
+        );
+        let mode = bar_of(&with_titlebar(
+            content(800, 565),
+            &Titlebar {
+                notice: Some(Notice::mode("paused")),
+                ..titlebar(35)
+            },
+        ))
+        .0;
+        assert_ne!(violet, mode, "not the mode notice's blue");
+        assert!(
+            violet[0] > mode[0],
+            "redder than the mode's blue: {violet:?} vs {mode:?}"
+        );
         let line = progress_line(&working).expect("a progress line");
         assert_eq!((line.x, line.w), (0.0, 200.0), "a quarter of the bar");
         assert_eq!(line.y + line.h, 35.0, "along its foot");
