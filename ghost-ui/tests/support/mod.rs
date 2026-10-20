@@ -192,6 +192,32 @@ pub fn visible_text(scene: &ghost_render::Scene) -> Vec<String> {
         .collect()
 }
 
+/// Every terminal row the window draws, as text placed at its columns (gaps
+/// between runs read as spaces) — the terminal content itself, which
+/// [`visible_text`] does not cover.
+pub fn drawn_terminal_text(scene: &ghost_render::Scene) -> Vec<String> {
+    scene
+        .layers
+        .iter()
+        .flat_map(|l| &l.items)
+        .filter_map(|item| match item {
+            ghost_render::SceneItem::Terminal { frame, .. } => Some(frame),
+            _ => None,
+        })
+        .flat_map(|frame| &frame.rows_layout)
+        .map(|row| {
+            let mut line = String::new();
+            let mut col = 0;
+            for run in &row.runs {
+                line.extend(std::iter::repeat_n(' ', run.start_col.saturating_sub(col)));
+                line.push_str(&run.text);
+                col = run.start_col + run.width_cols;
+            }
+            line
+        })
+        .collect()
+}
+
 /// Whether the window draws `needle` anywhere (chrome: a band, a chip, a label).
 pub fn sees_text(scene: &ghost_render::Scene, needle: &str) -> bool {
     visible_text(scene).iter().any(|t| t.contains(needle))

@@ -216,6 +216,17 @@ impl RealRemote {
         self.remote_root.path().join("data")
     }
 
+    /// Hold every byte on each future session pipe back by `delay` in each
+    /// direction, so the link's round trip grows by twice that. Applies to
+    /// pipes opened after the call; an open one keeps its delay.
+    pub fn set_pipe_delay(&self, delay: Duration) {
+        std::fs::write(
+            self.remote_root.path().join("pipe-delay-ms"),
+            delay.as_millis().to_string(),
+        )
+        .unwrap();
+    }
+
     /// Make the remote go **silent**, the way a real reboot or network partition
     /// does: the peer stops responding with **no FIN/RST**, so the local
     /// ControlMaster can't tell the connection died — it wedges (TCP dead, process
@@ -437,6 +448,7 @@ fn write_wrapper(dir: &Path, remote_root: &Path) -> PathBuf {
              export XDG_DATA_HOME=\"{r}/data\"\n\
              export XDG_CACHE_HOME=\"{r}/cache\"\n\
              export HOME=\"{r}/home\"\n\
+             [ -f \"{r}/pipe-delay-ms\" ] && export GHOST_TEST_PIPE_DELAY_MS=\"$(cat \"{r}/pipe-delay-ms\")\"\n\
              exec \"{GHOST}\" \"$@\"\n",
         ),
     )
