@@ -96,6 +96,9 @@ pub enum Shortcut {
     CloseWindow,
     /// Spawn a fresh session in this window and switch to it (Cmd+T / Alt+T).
     NewSession,
+    /// Open the selected URL or file in the system handler (Cmd+O / Ctrl+Shift+O
+    /// / Alt+O). Not bare Ctrl+O — that stays terminal input.
+    OpenSelection,
 }
 
 /// Classify a pressed key as a frontend shortcut, if it is one. The primary
@@ -127,6 +130,7 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
             Key::Char(s) if s.eq_ignore_ascii_case("n") => return Some(Shortcut::NewWindow),
             Key::Char(s) if s.eq_ignore_ascii_case("s") => return Some(Shortcut::NewSshWindow),
             Key::Char(s) if s.eq_ignore_ascii_case("g") => return Some(Shortcut::NewSshSession),
+            Key::Char(s) if s.eq_ignore_ascii_case("o") => return Some(Shortcut::OpenSelection),
             _ => {}
         }
     }
@@ -157,6 +161,8 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
             // keeps bare Ctrl+G as BEL (^G).
             Key::Char(s) if s.eq_ignore_ascii_case("g") => return Some(Shortcut::NewSshSession),
             Key::Char(s) if s.eq_ignore_ascii_case("w") => return Some(Shortcut::CloseWindow),
+            // Open the selection: Cmd+O / Ctrl+Shift+O. Bare Ctrl+O stays input.
+            Key::Char(s) if s.eq_ignore_ascii_case("o") => return Some(Shortcut::OpenSelection),
             _ => {}
         }
     }
@@ -167,6 +173,52 @@ pub fn classify_shortcut(key: &Key, mods: Mods) -> Option<Shortcut> {
         Key::Char(s) if s == "0" => Some(Shortcut::ZoomReset),
         _ => None,
     }
+}
+
+/// Whether `uri` has a scheme whose handler is safe to invoke on the user's
+/// say-so (a click, the open chord); anything else (`javascript:`, custom app
+/// schemes, …) stays inert.
+fn openable_url(uri: &str) -> bool {
+    uri.split_once(':').is_some_and(|(scheme, _)| {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "file" | "mailto" | "ftp"
+        )
+    })
+}
+
+/// What the open chord makes of a selection.
+#[derive(Debug, PartialEq)]
+enum OpenTarget {
+    Url(String),
+    /// Not resolved here: whether it exists, and where, depends on which machine
+    /// the session runs on and the directory it is in — the shell's to know.
+    Path(String),
+}
+
+/// Read a selection as something to open: one line, blanks around it dropped. A
+/// URL needs an [`openable_url`] scheme; any other scheme-looking word
+/// (`foo://…`, `javascript:…`) opens nothing. A leading `-` opens nothing either:
+/// the system opener would take it for a flag.
+fn open_target(selected: &str) -> Option<OpenTarget> {
+    let text = selected.trim();
+    if text.is_empty() || text.contains(['\n', '\r', '\0']) || text.starts_with('-') {
+        return None;
+    }
+    if openable_url(text) {
+        return Some(OpenTarget::Url(text.to_string()));
+    }
+    let schemed = text.split_once(':').is_some_and(|(scheme, rest)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+            && (rest.starts_with("//")
+                || matches!(
+                    scheme.to_ascii_lowercase().as_str(),
+                    "javascript" | "data" | "vbscript"
+                ))
+    });
+    (!schemed).then(|| OpenTarget::Path(text.to_string()))
 }
 
 /// The part of a terminal that belongs to the *session*, not to any single view
@@ -2417,6 +2469,7 @@ impl TerminalView {
         match classify_shortcut(key, mods) {
             Some(Shortcut::Paste) => vec![Cmd::ReadClipboard],
             Some(Shortcut::Copy) => self.copy(state),
+            Some(Shortcut::OpenSelection) => self.open_selection(state),
             Some(Shortcut::ZoomIn) => {
                 self.apply_zoom(state, step_zoom(self.zoom, ZOOM_STEP), driving)
             }
@@ -2506,6 +2559,22 @@ impl TerminalView {
                     vec![Cmd::WriteClipboard(text)]
                 }
             }
+            None => Vec::new(),
+        }
+    }
+
+    /// Open what is selected: a URL as itself, anything else as a path for the
+    /// shell to resolve against this session (see [`open_target`]).
+    fn open_selection(&self, state: &SessionState) -> Vec<Cmd> {
+        let Some(sel) = self.selection else {
+            return Vec::new();
+        };
+        match open_target(&selection_text(self.screen(state), sel)) {
+            Some(OpenTarget::Url(url)) => vec![Cmd::OpenUrl(url)],
+            Some(OpenTarget::Path(path)) => vec![Cmd::OpenPath {
+                session: state.session().clone(),
+                path,
+            }],
             None => Vec::new(),
         }
     }
@@ -2928,14 +2997,7 @@ impl TerminalView {
         let line = self.window_line(state, row)?;
         let id = line.cells().get(col)?.pen().link_id()?;
         let uri = vt.hyperlink(id)?;
-        // Only schemes whose handlers are safe to invoke on a click; anything
-        // else (javascript:, custom app schemes, …) stays inert.
-        let scheme = uri.split_once(':')?.0.to_ascii_lowercase();
-        matches!(
-            scheme.as_str(),
-            "http" | "https" | "file" | "mailto" | "ftp"
-        )
-        .then(|| (id, uri.to_string()))
+        openable_url(uri).then(|| (id, uri.to_string()))
     }
 
     /// The safe-to-open hyperlink URI under a pointer position (see
@@ -8590,5 +8652,134 @@ mod tests {
             generation,
             "a view's memo must see the overlay change"
         );
+    }
+
+    /// Select the first `text.len()` cells of the top row with a drag.
+    fn select_top_row(m: &mut TerminalModel, text: &str) {
+        let end = (text.chars().count() as f64 - 1.0) * 9.0 + 4.0;
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            end,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            end,
+            1.0,
+        ));
+    }
+
+    /// The open chord: Cmd+O on macOS, Ctrl+Shift+O elsewhere (Alt+O too).
+    fn open_chord() -> Mods {
+        if cfg!(target_os = "macos") {
+            Mods::SUPER
+        } else {
+            Mods::CTRL | Mods::SHIFT
+        }
+    }
+
+    /// What the open chord does with `on_screen` selected.
+    fn opened(on_screen: &str) -> Vec<Cmd> {
+        let mut m = model();
+        feed(&mut m, on_screen.as_bytes());
+        select_top_row(&mut m, on_screen);
+        key(&mut m, Key::Char("o".into()), open_chord())
+            .into_iter()
+            .filter(|c| matches!(c, Cmd::OpenUrl(_) | Cmd::OpenPath { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn the_open_chord_is_cmd_o_or_ctrl_shift_o_or_alt_o() {
+        let o = Key::Char("o".into());
+        let is_open = |mods| matches!(classify_shortcut(&o, mods), Some(Shortcut::OpenSelection));
+        if cfg!(target_os = "macos") {
+            assert!(is_open(Mods::SUPER));
+            assert!(!is_open(Mods::ALT), "Option stays Meta on macOS");
+        } else {
+            assert!(is_open(Mods::CTRL | Mods::SHIFT));
+            assert!(is_open(Mods::ALT));
+        }
+        assert!(!is_open(Mods::CTRL), "bare Ctrl+O stays terminal input");
+        assert!(!is_open(Mods::NONE));
+    }
+
+    #[test]
+    fn opening_a_selected_url_hands_it_to_the_system() {
+        assert_eq!(
+            opened("https://example.com/doc"),
+            vec![Cmd::OpenUrl("https://example.com/doc".into())]
+        );
+    }
+
+    #[test]
+    fn opening_a_selected_path_asks_the_shell_to_resolve_it_for_this_session() {
+        for path in ["notes.txt", "~/notes.txt", "/etc/hosts", "src/main.rs:12"] {
+            assert_eq!(
+                opened(path),
+                vec![Cmd::OpenPath {
+                    session: "alpha".into(),
+                    path: path.into(),
+                }],
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_blanks_are_not_part_of_what_opens() {
+        assert_eq!(
+            opened("  https://example.com  "),
+            vec![Cmd::OpenUrl("https://example.com".into())]
+        );
+    }
+
+    #[test]
+    fn a_selection_that_is_not_safely_openable_opens_nothing() {
+        // A scheme a click would not open either, an option-looking word the
+        // opener would parse as a flag, and nothing at all.
+        for text in ["javascript:alert(1)", "foo://bar", "-n", "   "] {
+            assert_eq!(opened(text), vec![], "{text:?}");
+        }
+        let mut m = model();
+        assert!(
+            key(&mut m, Key::Char("o".into()), open_chord()).is_empty(),
+            "no selection: nothing"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_selection_opens_nothing() {
+        let mut m = model();
+        feed(&mut m, b"one\r\ntwo");
+        m.update(ptr(PointerPhase::Motion, None, 1.0, 1.0));
+        m.update(ptr(
+            PointerPhase::Press,
+            Some(PointerButton::Left),
+            1.0,
+            1.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Motion,
+            Some(PointerButton::Left),
+            22.0,
+            19.0,
+        ));
+        m.update(ptr(
+            PointerPhase::Release,
+            Some(PointerButton::Left),
+            22.0,
+            19.0,
+        ));
+        assert!(key(&mut m, Key::Char("o".into()), open_chord()).is_empty());
     }
 }

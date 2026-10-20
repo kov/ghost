@@ -451,6 +451,7 @@ fn probe_reply_speaks_our_protocol(reply: &str) -> bool {
 const UNREAD_SESSION_PROTO: u32 = crate::protocol::PROTO_ATTACH - 1;
 
 /// One multiplexed ssh connection to a host, for the transport initiator.
+#[derive(Clone)]
 pub struct RemoteSsh {
     spec: ConnectionSpec,
     control_path: PathBuf,
@@ -950,6 +951,57 @@ impl RemoteSsh {
             buf.trim().parse().ok()
         };
         level().unwrap_or(UNREAD_SESSION_PROTO)
+    }
+
+    /// Copy the regular file at `path` on the host into `dest` here, over the
+    /// shared connection. `path` may be absolute, `~`-rooted (the remote user's
+    /// home), or relative to `cwd` — a relative one with no `cwd` is refused,
+    /// since nobody here knows where the remote shell is. Key/agent auth only
+    /// (`BatchMode`): a connection that would have to prompt fails instead of
+    /// hanging with no tty to prompt on.
+    pub fn fetch_file(&self, path: &str, cwd: Option<&str>, dest: &Path) -> io::Result<()> {
+        if cwd.is_none() && !path.starts_with('/') && path != "~" && !path.starts_with("~/") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{path}: relative, and the remote directory is unknown"),
+            ));
+        }
+        // Positional, never interpolated: `$1` is the path, `$2` the directory.
+        const SCRIPT: &str = "p=$1; case $p in \"~\") p=$HOME ;; \"~/\"*) p=$HOME/${p#\"~/\"} ;; esac; \
+            if [ -n \"$2\" ]; then cd \"$2\" || exit 3; fi; \
+            [ -f \"$p\" ] || exit 2; exec cat \"$p\"";
+        let mut opts = self.control_opts();
+        opts.extend(["-o".into(), "BatchMode=yes".into()]);
+        opts.extend(["-o".into(), "ConnectTimeout=10".into()]);
+        let argv = self
+            .spec
+            .ssh_command(&opts, &["sh", "-c", SCRIPT, "sh", path, cwd.unwrap_or("")]);
+        let out = std::fs::File::create(dest)?;
+        let result = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(Stdio::piped())
+            .output();
+        let failure = match result {
+            Ok(o) if o.status.success() => return Ok(()),
+            Ok(o) => io::Error::other(match o.status.code() {
+                Some(2) => format!("{path}: not a file on {}", self.target()),
+                Some(3) => format!(
+                    "{}: no such directory on {}",
+                    cwd.unwrap_or(""),
+                    self.target()
+                ),
+                _ => format!(
+                    "fetching {path} from {}: {}",
+                    self.target(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            }),
+            Err(e) => e,
+        };
+        let _ = std::fs::remove_file(dest);
+        Err(failure)
     }
 
     /// Kill a remote session by id over the shared connection (`<remote_ghost>

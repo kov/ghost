@@ -39,6 +39,7 @@ mod instance;
 #[cfg(target_os = "macos")]
 mod macos_frame;
 pub mod menu;
+mod opened;
 mod pacer;
 mod rendertrace;
 mod resize;
@@ -1281,6 +1282,25 @@ fn cwd_source<'a>(
     }
 }
 
+/// A path a local session names, as a file here: `~` is this user's home, and a
+/// relative path is relative to the session's directory (`None` when that is
+/// unknown, which leaves a relative path nowhere).
+fn local_open_path(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if path == "~" {
+        return home();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home().map(|h| h.join(rest));
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        cwd.map(|c| c.join(p))
+    }
+}
+
 /// A reported directory in the only form it is safe to hand a host to start a
 /// session in: absolute, or nothing.
 ///
@@ -1823,6 +1843,11 @@ fn interactive(fresh: bool, ssh_window: bool) {
             });
         });
     }
+    // Remote files fetched to be opened age out at each start as well as at each
+    // fetch, so a cache nobody adds to still empties.
+    std::thread::spawn(|| {
+        opened::prune(&opened::root(), opened::KEEP, std::time::SystemTime::now());
+    });
     // Arm the wire trace if the config asks for it, before any window exists — the
     // interesting bytes start flowing with the first attach.
     ghost_ui_core::trace::set_enabled(config::UiConfig::load().wire_trace());
@@ -3010,6 +3035,10 @@ pub trait Frontend {
     fn exit(&self);
     /// Set when the loop next wakes.
     fn set_control_flow(&self, flow: ControlFlow);
+    /// Hand a URL or local path to the system opener (`open` / `xdg-open`). On
+    /// the seam so a headless test sees what would have opened without anything
+    /// launching.
+    fn open_external(&self, target: &str);
 }
 
 /// The production [`Frontend`]: a thin wrapper over the live winit event loop,
@@ -3078,6 +3107,10 @@ impl Frontend for WinitFrontend<'_> {
         spawn_session(name, command, connection, cwd)
     }
 
+    fn open_external(&self, target: &str) {
+        open_url(target);
+    }
+
     fn exit(&self) {
         self.event_loop.exit();
     }
@@ -3140,6 +3173,8 @@ pub struct HeadlessFrontend {
     /// Set to make every spawn fail, standing in for the binary having been
     /// replaced under a running GUI.
     spawns_fail: std::cell::Cell<bool>,
+    /// Everything handed to the system opener, in order.
+    system_opens: std::cell::RefCell<Vec<String>>,
 }
 
 /// One start request a [`HeadlessFrontend`] saw: `(name, cwd, connection)`.
@@ -3160,7 +3195,13 @@ impl HeadlessFrontend {
             removed: std::cell::Cell::new(0),
             spawned: std::cell::RefCell::new(Vec::new()),
             spawns_fail: std::cell::Cell::new(false),
+            system_opens: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Every URL or path the App asked the system to open, in order.
+    pub fn system_opens(&self) -> Vec<String> {
+        self.system_opens.borrow().clone()
     }
 
     /// Make every later spawn fail the way a replaced binary does.
@@ -3307,6 +3348,10 @@ impl Frontend for HeadlessFrontend {
     }
 
     fn set_control_flow(&self, _flow: ControlFlow) {}
+
+    fn open_external(&self, target: &str) {
+        self.system_opens.borrow_mut().push(target.to_string());
+    }
 }
 
 impl App {
@@ -3409,9 +3454,9 @@ fn theme_colors(theme: &ghost_renderer::Theme) -> ghost_ui_core::ThemeColors {
     }
 }
 
-/// Open a hyperlink in the system handler (`Cmd::OpenUrl` — the model has
-/// already allowlisted the scheme). Spawned detached, with a reaper thread so
-/// the handler process never lingers as a zombie.
+/// Open a URL or local path in the system handler ([`Frontend::open_external`];
+/// a URL's scheme has already been allowlisted by the model). Spawned detached,
+/// with a reaper thread so the handler process never lingers as a zombie.
 fn open_url(url: &str) {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -5115,7 +5160,8 @@ impl App {
                         }
                     }
                 }
-                Cmd::OpenUrl(url) => open_url(&url),
+                Cmd::OpenUrl(url) => event_loop.open_external(&url),
+                Cmd::OpenPath { session, path } => self.open_path(&session, &path, event_loop),
                 Cmd::PointerIcon(icon) => {
                     if let Some(gfx) = self.windows.get(&wid).and_then(|w| w.gfx.as_ref()) {
                         gfx.window.set_cursor(match icon {
@@ -6286,6 +6332,72 @@ impl App {
         let fg_id = w.root.foreground().cloned();
         let foreground = fg_id.as_ref().and_then(|id| self.foreground_connection(id));
         inherited_connection(group.as_ref(), foreground.as_ref())
+    }
+
+    /// Open the file `path` names in `session` (the open chord). On this machine
+    /// it is resolved against the session's directory and opened if it exists;
+    /// on a remote host — a session there, or a local `ssh` child — it is copied
+    /// into the cache over ssh, off the loop, and the copy opened when it lands
+    /// ([`UserEvent::RemoteFileFetched`]).
+    fn open_path(&mut self, session: &SessionId, path: &str, fe: &dyn Frontend) {
+        let (remote, cwd) = match session.local_name() {
+            Some(local) => {
+                let desc = ghost_vt::descriptor::read(local);
+                match desc.as_ref().and_then(|d| d.connection.clone()) {
+                    // A plain `ssh` child: where its remote shell is, nobody here
+                    // knows, so only an absolute or `~` path can be fetched.
+                    Some(spec) => match ghost_vt::remote::RemoteSsh::new(spec) {
+                        Ok(r) => (r, None),
+                        Err(e) => {
+                            tracing::warn!(target: "ghost::open", "{path}: {e}");
+                            return;
+                        }
+                    },
+                    None => {
+                        let cwd = desc.and_then(|d| d.cwd);
+                        if let Some(file) = local_open_path(path, cwd.as_deref())
+                            && file.exists()
+                        {
+                            fe.open_external(&file.display().to_string());
+                        }
+                        return;
+                    }
+                }
+            }
+            None => {
+                let Some(target) = session.target() else {
+                    return;
+                };
+                let Some(host) = self.connection(target) else {
+                    return;
+                };
+                let cwd = self
+                    .hosts
+                    .get(target)
+                    .and_then(|h| h.listing.as_ref())
+                    .and_then(|l| l.iter().find(|i| i.name == session.name()))
+                    .and_then(|i| i.cwd.as_deref())
+                    .and_then(spawnable_cwd)
+                    .map(str::to_owned);
+                ((*host.remote).clone(), cwd)
+            }
+        };
+        let Some(sink) = self.sink.clone() else {
+            return;
+        };
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            let root = opened::root();
+            opened::prune(&root, opened::KEEP, std::time::SystemTime::now());
+            let result = opened::destination(&root, &path)
+                .and_then(|dest| {
+                    remote
+                        .fetch_file(&path, cwd.as_deref(), &dest)
+                        .map(|()| dest)
+                })
+                .map_err(|e| e.to_string());
+            sink.post(UserEvent::RemoteFileFetched(result));
+        });
     }
 
     /// The directory a new session spawned into `wid` should start in: where the
@@ -7863,6 +7975,14 @@ impl App {
                 result,
             } => {
                 self.finish_remote_session_spawn(wid, target, name, result, fe);
+                return;
+            }
+            // A remote file the open chord asked for is here: open the copy.
+            UserEvent::RemoteFileFetched(result) => {
+                match result {
+                    Ok(copy) => fe.open_external(&copy.display().to_string()),
+                    Err(e) => tracing::warn!(target: "ghost::open", "{e}"),
+                }
                 return;
             }
         };

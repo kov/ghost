@@ -129,6 +129,9 @@ pub enum UserEvent {
         /// `Ok` when the remote `ghost new` succeeded; `Err(message)` otherwise.
         result: Result<(), String>,
     },
+    /// A remote file the open chord asked for: the local copy to open, or why
+    /// there is none. Posted by the fetch worker (see `App::open_path`).
+    RemoteFileFetched(Result<std::path::PathBuf, String>),
 }
 
 /// The result of the off-loop half of an ssh connect (after auth): what the main

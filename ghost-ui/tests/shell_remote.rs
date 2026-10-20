@@ -916,3 +916,111 @@ fn a_remote_hosts_trace_is_written_on_the_remote_machine() {
         );
     });
 }
+
+/// The open chord on a file name in a session on a remote host can't open that
+/// path here — it names a file over there. The file is fetched over the shared
+/// connection into ghost's cache, from the directory the remote session is working
+/// in, and the local copy is what opens.
+#[test]
+fn opening_a_file_named_in_a_remote_session_opens_a_fetched_copy() {
+    let Some(remote) = RealRemote::start() else {
+        eprintln!("shell_remote: no sshd available; skipping");
+        return;
+    };
+    // SAFETY: process-global, held under SERIAL for the duration.
+    unsafe { std::env::set_var("GHOST_REMOTE_GHOST", remote.remote_ghost()) };
+
+    with_isolated_xdg(|tmp| {
+        let proj = remote.home().join("proj");
+        std::fs::create_dir_all(&proj).expect("a directory on the remote");
+        std::fs::write(proj.join("report.txt"), "remote contents\n").expect("a remote file");
+
+        let r = RemoteSsh::new_in(remote.spec(), remote.control_dir()).expect("open transport");
+        let remote_ghost =
+            retry_some(Duration::from_secs(10), || r.negotiate().ok()).expect("negotiate");
+        r.spawn_host(&remote_ghost, "work", proj.to_str())
+            .expect("spawn remote session");
+
+        let q: Arc<QueuedEvents> = Arc::default();
+        let sink: Arc<dyn EventSink> = q.clone();
+        let mut app = App::headless_with_sink(sink);
+        let fe = HeadlessFrontend::new();
+        let group = app.mint_group();
+        let wid = app.open_fleet_window(&fe, group, None);
+        app.adopt_remote_host(remote.spec(), remote_ghost.clone(), &fe);
+        let discovered = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            app.dispatch(wid, UiEvent::SessionsChanged, &fe);
+            sees_tile(&app.root(wid).expect("window").view(app.states()), "work")
+        });
+        assert!(discovered, "the remote session never appeared in the fleet");
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::tile_center(&scene, "work").expect("a card to click");
+        for ev in support::click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        let scene = app.root(wid).expect("window").view(app.states());
+        if let Some((cx, cy)) = support::button_center(&scene, "Take over") {
+            for ev in support::click_events(cx, cy) {
+                app.dispatch(wid, ev, &fe);
+            }
+        }
+        assert!(pump_until(
+            &mut app,
+            &fe,
+            &q,
+            Duration::from_secs(20),
+            |app| { !app.root(wid).expect("window").is_fleet() }
+        ));
+
+        // The remote shell lists its directory; the user picks the file off screen.
+        app.dispatch(wid, UiEvent::Text("ls\r".into()), &fe);
+        let listed = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |app| {
+            let scene = app.root(wid).expect("window").view(app.states());
+            support::drawn_terminal_text(&scene)
+                .iter()
+                .any(|l| l.trim() == "report.txt")
+        });
+        assert!(listed, "the remote `ls` never showed the file");
+        // The listing line, not the `ls` command echo.
+        let scene = app.root(wid).expect("window").view(app.states());
+        let (x, y) = support::terminal_line_point(&scene, "report.txt").expect("listed");
+        for ev in support::double_click_events(x, y) {
+            app.dispatch(wid, ev, &fe);
+        }
+        app.dispatch(
+            wid,
+            UiEvent::Key {
+                key: ghost_ui_core::Key::Char("o".into()),
+                mods: ghost_ui_core::Mods {
+                    alt: !cfg!(target_os = "macos"),
+                    sup: cfg!(target_os = "macos"),
+                    ..Default::default()
+                },
+                kind: ghost_ui_core::KeyEventKind::Press,
+                alts: None,
+            },
+            &fe,
+        );
+
+        let opened = pump_until(&mut app, &fe, &q, Duration::from_secs(20), |_| {
+            !fe.system_opens().is_empty()
+        });
+        assert!(opened, "nothing was opened");
+        let copy = std::path::PathBuf::from(&fe.system_opens()[0]);
+        assert!(
+            copy.starts_with(tmp.join("cache").join("ghost")),
+            "the copy lives in ghost's cache: {}",
+            copy.display()
+        );
+        assert_eq!(
+            copy.file_name().unwrap(),
+            "report.txt",
+            "named as on the remote"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            "remote contents\n",
+            "the remote file's own contents"
+        );
+    });
+}

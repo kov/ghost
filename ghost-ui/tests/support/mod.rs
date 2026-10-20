@@ -38,6 +38,7 @@ pub fn with_isolated_xdg<T>(f: impl FnOnce(&Path) -> T) -> T {
         std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
         std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
+        std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
     }
     f(tmp.path())
 }
@@ -204,7 +205,15 @@ pub fn drawn_terminal_text(scene: &ghost_render::Scene) -> Vec<String> {
             ghost_render::SceneItem::Terminal { frame, .. } => Some(frame),
             _ => None,
         })
-        .flat_map(|frame| &frame.rows_layout)
+        .flat_map(|frame| frame_rows(frame))
+        .collect()
+}
+
+/// One frame's rows as text placed at their columns.
+fn frame_rows(frame: &ghost_render::Frame) -> Vec<String> {
+    frame
+        .rows_layout
+        .iter()
         .map(|row| {
             let mut line = String::new();
             let mut col = 0;
@@ -216,6 +225,75 @@ pub fn drawn_terminal_text(scene: &ghost_render::Scene) -> Vec<String> {
             line
         })
         .collect()
+}
+
+/// The window-space centre of the first terminal cell where `needle` is drawn —
+/// where the user would point at it.
+pub fn terminal_text_point(scene: &ghost_render::Scene, needle: &str) -> Option<(f64, f64)> {
+    terminal_point(scene, |line| line.find(needle))
+}
+
+/// The window-space centre of the first terminal row that reads exactly `line`
+/// (blanks around it aside), at its first character — a line of output rather
+/// than the command that echoed the same word.
+pub fn terminal_line_point(scene: &ghost_render::Scene, line: &str) -> Option<(f64, f64)> {
+    terminal_point(scene, |l| {
+        (l.trim() == line).then(|| l.len() - l.trim_start().len())
+    })
+}
+
+/// The centre of the first cell `locate` picks out of a drawn row: it returns the
+/// column in that row, if the row is the one.
+fn terminal_point(
+    scene: &ghost_render::Scene,
+    locate: impl Fn(&str) -> Option<usize>,
+) -> Option<(f64, f64)> {
+    scene
+        .layers
+        .iter()
+        .flat_map(|l| &l.items)
+        .find_map(|item| match item {
+            ghost_render::SceneItem::Terminal { frame, rect, .. } => frame_rows(frame)
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let col = locate(line)?;
+                    let m = frame.metrics;
+                    Some((
+                        f64::from(rect.x + (col as f32 + 0.5) * m.advance),
+                        f64::from(rect.y + (row as f32 + 0.5) * m.line_height),
+                    ))
+                }),
+            _ => None,
+        })
+}
+
+/// A double-click (two presses, the second counting two) at `(x, y)`: a word,
+/// path or URL there becomes the selection.
+pub fn double_click_events(x: f64, y: f64) -> Vec<ghost_ui_core::UiEvent> {
+    let ev = |phase, clicks| ghost_ui_core::UiEvent::Pointer {
+        phase,
+        button: Some(ghost_ui_core::PointerButton::Left),
+        pos: ghost_ui_core::PointPx { x, y },
+        mods: ghost_ui_core::Mods::default(),
+        wheel: ghost_ui_core::WheelDelta::NONE,
+        clicks,
+    };
+    let hover = ghost_ui_core::UiEvent::Pointer {
+        phase: ghost_ui_core::PointerPhase::Motion,
+        button: None,
+        pos: ghost_ui_core::PointPx { x, y },
+        mods: ghost_ui_core::Mods::default(),
+        wheel: ghost_ui_core::WheelDelta::NONE,
+        clicks: 0,
+    };
+    vec![
+        hover,
+        ev(ghost_ui_core::PointerPhase::Press, 1),
+        ev(ghost_ui_core::PointerPhase::Release, 1),
+        ev(ghost_ui_core::PointerPhase::Press, 2),
+        ev(ghost_ui_core::PointerPhase::Release, 2),
+    ]
 }
 
 /// Whether the window draws `needle` anywhere (chrome: a band, a chip, a label).

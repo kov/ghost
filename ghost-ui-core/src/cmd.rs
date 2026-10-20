@@ -160,6 +160,13 @@ pub enum Cmd {
     /// Open a hyperlink (OSC 8, Ctrl+click) in the system handler. The URL's
     /// scheme has already been allowlisted by the model.
     OpenUrl(String),
+    /// Open the file a selection names in `session` (the open chord), resolved
+    /// where that session runs: a local path against its directory, a remote one
+    /// fetched into the cache first.
+    OpenPath {
+        session: SessionId,
+        path: String,
+    },
     /// Set the window's pointer shape (hand over a Ctrl-hovered hyperlink).
     PointerIcon(PointerIcon),
     /// Ask the OS to flag this window for attention (taskbar highlight /

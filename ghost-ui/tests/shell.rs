@@ -1050,3 +1050,79 @@ fn the_wire_trace_writes_nothing_until_it_is_asked_for() {
         support::kill_session("untraced-1");
     });
 }
+
+/// Select `needle` on screen with a double-click, the way the user does, then press
+/// the open chord (Cmd+O / Alt+O).
+fn open_on_screen(
+    app: &mut App,
+    wid: winit::window::WindowId,
+    fe: &HeadlessFrontend,
+    needle: &str,
+) {
+    let drawn = wait_until(Duration::from_secs(10), || {
+        app.wake(fe);
+        support::terminal_text_point(&app.root(wid).expect("window").view(app.states()), needle)
+            .is_some()
+    });
+    let scene = app.root(wid).expect("window").view(app.states());
+    assert!(
+        drawn,
+        "{needle} never drawn: {:?}",
+        support::drawn_terminal_text(&scene)
+    );
+    let (x, y) = support::terminal_text_point(&scene, needle).expect("drawn");
+    for ev in support::double_click_events(x, y) {
+        app.dispatch(wid, ev, fe);
+    }
+    app.dispatch(
+        wid,
+        press(ghost_ui_core::Key::Char("o".into()), app_chord()),
+        fe,
+    );
+    app.wake(fe);
+}
+
+/// The open chord on a selected file name opens that file — the one in the
+/// directory the session is working in, not wherever ghost was launched — and a
+/// selected URL opens as itself.
+#[test]
+fn the_open_chord_opens_the_selected_file_or_url() {
+    with_isolated_xdg(|tmp| {
+        let work = tmp.join("work");
+        std::fs::create_dir(&work).expect("a directory to work in");
+        let work = work.canonicalize().expect("canonical work dir");
+        std::fs::write(work.join("notes.txt"), "hello").expect("a file to open");
+        support::spawn_session_running_in(
+            "opener",
+            Some(&work),
+            "echo notes.txt; echo https://example.com/doc; echo missing.txt; exec cat",
+        );
+
+        let mut app = App::headless();
+        let fe = HeadlessFrontend::new();
+        let g = app.mint_group();
+        let wid = app
+            .open_single_window(&fe, "opener", g, None)
+            .expect("window");
+
+        open_on_screen(&mut app, wid, &fe, "notes.txt");
+        assert_eq!(
+            fe.system_opens(),
+            vec![work.join("notes.txt").display().to_string()]
+        );
+
+        open_on_screen(&mut app, wid, &fe, "https://example.com/doc");
+        assert_eq!(
+            fe.system_opens()[1..],
+            ["https://example.com/doc".to_string()]
+        );
+
+        open_on_screen(&mut app, wid, &fe, "missing.txt");
+        assert_eq!(
+            fe.system_opens().len(),
+            2,
+            "a file that isn't there opens nothing"
+        );
+        support::kill_session("opener");
+    });
+}

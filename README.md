@@ -100,6 +100,7 @@ free for the shell); where a bare `Ctrl` chord would collide with terminal input
 | Close window (detaches)         | `Cmd-W` | `Ctrl-Shift-W`              |
 | Copy                            | `Cmd-C` | `Ctrl-Shift-C` / `Alt-C`    |
 | Paste                           | `Cmd-V` | `Ctrl-Shift-V` / `Alt-V`    |
+| Open the selected file or URL   | `Cmd-O` | `Ctrl-Shift-O` / `Alt-O`    |
 | Quit                            | `Cmd-Q` | `Ctrl-Q`                    |
 | Zoom in / out / reset           | `Cmd` `+` / `-` / `0` | `Ctrl` `+` / `-` / `0` |
 | Toggle fleet view               | `F9`    | `F9`                        |
@@ -109,6 +110,13 @@ A new window or session branches off the one you are in: it opens on the same
 host (an ssh window gives an ssh window) and in the same directory. The app icon
 and a bare `ghost` open a window the plain way instead — the fleet when a session
 is detached, else a fresh local session.
+
+Open hands the selection to the system opener. A URL opens as itself (`http`,
+`https`, `file`, `mailto`, `ftp`, the same as a Ctrl/Cmd-click on a link). Anything
+else is a file path, relative to the directory the session is in. A file on a remote
+host is copied over ssh into `$XDG_CACHE_HOME/ghost/opened` first and opened from
+there; copies are deleted after a week. In a plain-`ssh` session ghost can't tell
+where the remote shell is, so only absolute and `~/` paths work there.
 
 Inside the fleet: arrows / `Tab` move focus, `Enter` opens the focused tile,
 `Ctrl-Enter` opens its whole group, `Space` marks a tile, `u` ungroups, `Ctrl-U`

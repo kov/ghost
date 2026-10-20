@@ -128,6 +128,21 @@ pub fn data_dir() -> PathBuf {
     base.join("ghost")
 }
 
+/// The cache directory (`$XDG_CACHE_HOME/ghost`, falling back to
+/// `~/.cache/ghost`): things ghost can always fetch again, such as remote files
+/// copied over to open them here.
+pub fn cache_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".cache")
+        });
+    base.join("ghost")
+}
+
 /// The durable config directory (`$XDG_CONFIG_HOME/ghost`, falling back to
 /// `~/.config/ghost`). Holds user-editable settings (e.g. the GUI frontend's
 /// `gtk.toml`); the core/CLI do not require anything here.
