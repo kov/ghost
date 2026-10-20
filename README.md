@@ -224,6 +224,7 @@ ghost new [NAME]               # start a session running $SHELL and attach to it
 ghost new NAME -- CMD ARGS…    # …or run a specific command
 ghost new -d [NAME]            # start in the background without attaching
 ghost ssh [USER@]HOST          # start a session on a remote host (see below)
+ghost ssh-shell SSH-ARGS…      # run ssh, giving the remote ghost's terminfo (see Terminal type)
 ghost ls                       # list live sessions (name + pid)
 ghost attach NAME              # attach to a session
 ghost kill NAME… | --all       # kill one or more sessions, or every local one
@@ -374,10 +375,21 @@ whose read end sits in the poll set — so the same code runs on Linux and macOS
 Sessions are spawned with `TERM=xterm-kitty` (ghost's emulator implements the kitty
 feature profile, and apps enable modern features — kitty keyboard protocol,
 synchronized output, graphics — based on the TERM name). ghost provides the terminfo
-entry itself: precompiled in the macOS `.app` bundle, or compiled on first use into
-`$XDG_DATA_HOME/ghost/terminfo` with the system `tic`, handed to children via
-`TERMINFO_DIRS`. If the local curses library can't even find `xterm-kitty`, ghost
-falls back to `xterm-256color`. Set `GHOST_TERM` to override the advertised `TERM`.
+entry itself, compiled into the binary — no `tic` or kitty install needed: it is
+written on first use into `$XDG_DATA_HOME/ghost/terminfo` (or found in the macOS
+`.app` bundle) and handed to children via `TERMINFO_DIRS`. If it can't be written,
+ghost falls back to `xterm-256color`. Set `GHOST_TERM` to override the advertised
+`TERM`.
+
+Remote hosts get the entry too. A plain-`ssh` session (a host that can't run ghost)
+writes it into the remote user's `${XDG_CACHE_HOME:-~/.cache}/ghost/terminfo` and
+starts their login shell with `TERMINFO_DIRS` pointing there, so vim, less and
+friends don't complain about an unknown terminal; where the cache can't be written
+the remote shell gets `TERM=xterm-256color` instead. For `ssh` you type yourself,
+`alias ssh='ghost ssh-shell'` does the same for interactive logins and passes
+anything else (a remote command, `-N`, scripts) through to `ssh` untouched. Hosts
+that can't run an arbitrary command — a `ForceCommand`, a restricted shell — need
+the plain `ssh`.
 
 ## Current limitations
 

@@ -18,11 +18,15 @@
 #     flash (visual bell) — not implemented yet; re-add as they land.
 #     Ms (OSC 52 clipboard write) and Cs/Cr (OSC 12/112 cursor colour) are
 #     implemented and advertised.
+#   * pairs#0x7FFF rather than 0x10000: a count past 32767 makes tic write
+#     the 32-bit-number format, which ncurses before 6.1 cannot read — and
+#     this entry is shipped to remote hosts as well. No program needs more
+#     color pairs than that.
 #   * removed rv/xr (they pattern-match kitty's own DA2/XTVERSION replies,
 #     which ghost's differ from; RV/XR, the query strings, stay).
 xterm-kitty|kitty|KovId's TTY,
 	am, hs, km, mc5i, mir, msgr, npc, xenl, Tc, XF, fullkbd,
-	colors#0x100, cols#80, it#8, lines#24, pairs#0x10000,
+	colors#0x100, cols#80, it#8, lines#24, pairs#0x7FFF,
 	acsc=++\,\,--..00``aaffgghhiijjkkllmmnnooppqqrrssttuuvvwwxxyyzz{{||}}~~,
 	bel=^G, bold=\E[1m, cbt=\E[Z, civis=\E[?25l,
 	clear=\E[H\E[2J, cnorm=\E[?12l\E[?25h, cr=\r,

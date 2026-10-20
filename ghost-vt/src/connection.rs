@@ -25,6 +25,62 @@ pub(crate) fn sh_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// The ssh options that take a value, from OpenSSH's getopt string.
+const SSH_VALUE_OPTS: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+/// The ssh options that make an invocation something other than a login at a
+/// prompt: no terminal (`-T`), no command (`-N`), stdio forwarding (`-W`), a
+/// control command (`-O`), printing config (`-G`), the version (`-V`), a query
+/// (`-Q`), a subsystem (`-s`), going to the background (`-f`).
+const SSH_NOT_A_LOGIN: &str = "TNWOGVQsf";
+
+/// The ssh arguments for `ghost ssh-shell` — what `alias ssh='ghost ssh-shell'`
+/// runs: when `args` (ssh's, as typed) ask for an interactive login, the same
+/// login given ghost's terminfo entry on the remote, as a `ghost ssh` session
+/// is ([`crate::terminfo::remote_bootstrap`], with `-t` for the terminal a bare
+/// login would have had). `None` for anything else — a remote command, `-N`
+/// forwarding, `-O` control, no destination — which must reach ssh untouched.
+///
+/// Parsed as OpenSSH does: bundled flags (`-At`), attached values (`-p2222`),
+/// options after the destination (`ssh host -p 22`), and `--`.
+pub fn interactive_login(args: &[String]) -> Option<Vec<String>> {
+    let mut dest = false;
+    let mut terminated = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if !terminated && arg == "--" {
+            terminated = true;
+            continue;
+        }
+        if !terminated && arg.len() > 1 && arg.starts_with('-') {
+            let flags = &arg[1..];
+            for (i, c) in flags.char_indices() {
+                if SSH_NOT_A_LOGIN.contains(c) {
+                    return None;
+                }
+                if SSH_VALUE_OPTS.contains(c) {
+                    // The value is the rest of this word, or the next one.
+                    if i + c.len_utf8() == flags.len() {
+                        it.next();
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if dest {
+            // A word past the destination: a remote command.
+            return None;
+        }
+        dest = true;
+    }
+    dest.then(|| {
+        let mut v = vec!["-t".to_string()];
+        v.extend(args.iter().cloned());
+        v.push(crate::terminfo::remote_bootstrap());
+        v
+    })
+}
+
 /// Which launcher realizes a connection. Distinct from `crate::transport`'s
 /// `Transport` (how the client reaches a *host process*) — this is which binary
 /// the local child runs. Defaults to [`ConnectionKind::Ssh`] so every spec
@@ -144,11 +200,15 @@ impl ConnectionSpec {
         self.ssh_command(&[], &[remote_ghost, "__pipe", name])
     }
 
-    /// `ssh [-p PORT] [-i IDENTITY] [-J JUMP] [extra…] <target>` — the local ssh
-    /// *child* command (an interactive login), options before the destination.
+    /// `ssh -t [-p PORT] [-i IDENTITY] [-J JUMP] [extra…] <target> <bootstrap>` —
+    /// the local ssh *child* command: an interactive login, given ghost's
+    /// terminfo entry on the remote ([`crate::terminfo::remote_bootstrap`]). The
+    /// bootstrap is a remote command, so `-t` keeps the terminal a bare login
+    /// would have had.
     fn ssh_argv(&self) -> Vec<String> {
-        let mut v = vec!["ssh".to_string()];
+        let mut v = vec!["ssh".to_string(), "-t".to_string()];
         v.extend(self.ssh_opts_and_target());
+        v.push(crate::terminfo::remote_bootstrap());
         v
     }
 
@@ -205,11 +265,67 @@ impl ConnectionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminfo::remote_bootstrap;
+
+    fn words(ws: &[&str]) -> Vec<String> {
+        ws.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// An interactive login gets a terminal (`-t`, since it now carries a remote
+    /// command) and the bootstrap providing ghost's terminfo entry there.
+    #[test]
+    fn an_interactive_login_is_given_the_terminfo_bootstrap() {
+        for args in [
+            &["host"][..],
+            &["-p", "2222", "kov@host"],
+            &["-p2222", "-A", "host"],
+            &["-At", "-i", "/k", "host"],
+            &["host", "-p", "2222"], // OpenSSH takes options after the destination
+            &["-o", "ForwardAgent=yes", "host"],
+            &["--", "host"],
+        ] {
+            let mut want = words(&["-t"]);
+            want.extend(words(args));
+            want.push(remote_bootstrap());
+            assert_eq!(interactive_login(&words(args)), Some(want), "{args:?}");
+        }
+    }
+
+    /// Anything but a login at a prompt is left exactly as typed.
+    #[test]
+    fn anything_but_an_interactive_login_is_left_alone() {
+        for args in [
+            &[][..],
+            &["-p", "2222"],                // no destination: ssh's usage error
+            &["host", "uname", "-a"],       // a remote command
+            &["-p", "22", "host", "ls"],    // ...after options
+            &["host", "--", "-x"],          // ...that looks like an option
+            &["-T", "host"],                // no terminal
+            &["-N", "-L", "1:h:2", "host"], // forwarding only
+            &["-W", "h:22", "jump"],        // stdio forwarding
+            &["-O", "check", "host"],       // control command
+            &["-G", "host"],                // print config
+            &["-V"],
+            &["-Q", "cipher"],
+            &["-s", "host", "sftp"], // subsystem
+            &["-fN", "host"],        // backgrounded
+        ] {
+            assert_eq!(interactive_login(&words(args)), None, "{args:?}");
+        }
+    }
 
     #[test]
     fn ssh_argv_bare_host() {
         let spec = ConnectionSpec::parse_target("build-box").unwrap();
-        assert_eq!(spec.argv(), vec!["ssh", "build-box"]);
+        assert_eq!(
+            spec.argv(),
+            vec![
+                "ssh".into(),
+                "-t".into(),
+                "build-box".into(),
+                remote_bootstrap()
+            ]
+        );
         assert_eq!(spec.target(), "build-box");
     }
 
@@ -217,7 +333,15 @@ mod tests {
     fn ssh_argv_user_at_host() {
         let spec = ConnectionSpec::parse_target("kov@build-box").unwrap();
         assert_eq!(spec.user.as_deref(), Some("kov"));
-        assert_eq!(spec.argv(), vec!["ssh", "kov@build-box"]);
+        assert_eq!(
+            spec.argv(),
+            vec![
+                "ssh".into(),
+                "-t".into(),
+                "kov@build-box".into(),
+                remote_bootstrap()
+            ]
+        );
         assert_eq!(spec.target(), "kov@build-box");
     }
 
@@ -235,16 +359,18 @@ mod tests {
         assert_eq!(
             spec.argv(),
             vec![
-                "ssh",
-                "-p",
-                "2222",
-                "-i",
-                "/home/kov/.ssh/id",
-                "-J",
-                "bastion",
-                "-o",
-                "ForwardAgent=yes",
-                "kov@box",
+                "ssh".to_string(),
+                "-t".into(),
+                "-p".into(),
+                "2222".into(),
+                "-i".into(),
+                "/home/kov/.ssh/id".into(),
+                "-J".into(),
+                "bastion".into(),
+                "-o".into(),
+                "ForwardAgent=yes".into(),
+                "kov@box".into(),
+                remote_bootstrap(),
             ]
         );
     }
@@ -312,7 +438,7 @@ mod tests {
         let json = r#"{"host":"box"}"#;
         let spec: ConnectionSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.kind, ConnectionKind::Ssh);
-        assert_eq!(spec.argv(), vec!["ssh", "box"]);
+        assert_eq!(spec.argv()[..3], ["ssh", "-t", "box"]);
     }
 
     #[test]

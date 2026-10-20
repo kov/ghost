@@ -6,9 +6,10 @@
 
 use clap::{Parser, Subcommand};
 use ghost_vt::client;
-use ghost_vt::connection::ConnectionSpec;
+use ghost_vt::connection::{self, ConnectionSpec};
 use ghost_vt::server::{self, SpawnOpts};
 use ghost_vt::session;
+use ghost_vt::terminfo;
 use std::path::{Path, PathBuf};
 
 /// The `ghost` command line: background terminals you can reattach to, plus —
@@ -102,6 +103,17 @@ enum Command {
         /// Extra arguments passed through to ssh verbatim (everything after `--`).
         #[arg(last = true)]
         extra: Vec<String>,
+    },
+    /// Run `ssh` with its arguments, giving an interactive login ghost's
+    /// terminfo entry on the remote host — for `alias ssh='ghost ssh-shell'`. A
+    /// login typed at a ghost prompt then resolves `TERM=xterm-kitty` on hosts
+    /// without kitty installed; anything else (a remote command, `-N`, not a
+    /// terminal) reaches ssh untouched.
+    #[command(disable_help_flag = true)]
+    SshShell {
+        /// ssh's arguments, as typed.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// List running sessions.
     Ls {
@@ -388,6 +400,19 @@ fn dispatch(command: Command) {
                     ssh_child_fallback(spec, name, detached, seed_from);
                 }
             }
+        }
+        Command::SshShell { args } => {
+            use std::io::IsTerminal;
+            use std::os::unix::process::CommandExt;
+            let at_prompt = std::env::var("TERM").is_ok_and(|t| t == terminfo::PREFERRED)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal();
+            let argv = at_prompt
+                .then(|| connection::interactive_login(&args))
+                .flatten()
+                .unwrap_or(args);
+            let err = std::process::Command::new("ssh").args(argv).exec();
+            fail(&format!("could not run ssh: {err}"));
         }
         Command::Ls { json } => match session::list() {
             Ok(sessions) if json => match serde_json::to_string(&sessions) {

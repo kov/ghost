@@ -3336,10 +3336,7 @@ mod tests {
         assert_eq!(effective_command(&cmd, None).unwrap(), cmd);
         // A connection derives the launcher argv and beats an empty command.
         let spec = ConnectionSpec::parse_target("kov@box").unwrap();
-        assert_eq!(
-            effective_command(&[], Some(&spec)).unwrap(),
-            vec!["ssh", "kov@box"]
-        );
+        assert_eq!(effective_command(&[], Some(&spec)).unwrap(), spec.argv());
         // A connection *and* a command is contradictory → rejected.
         assert!(effective_command(&cmd, Some(&spec)).is_err());
     }
