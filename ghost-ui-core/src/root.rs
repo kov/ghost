@@ -469,7 +469,7 @@ fn freeze_damage(scene: &mut Scene) {
 
 /// Cubic ease-in-out on `t` in [0, 1]: slow at both ends, fast in the middle, with
 /// exact fixed points at 0 and 1.
-fn ease_in_out(t: f32) -> f32 {
+pub(crate) fn ease_in_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
         4.0 * t * t * t
@@ -5614,7 +5614,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(strips, vec![done], "only alpha's result is unseen");
+        let tinted = strips.iter().filter(|c| **c == done).count();
+        assert_eq!(
+            (strips.len(), tinted),
+            (2, 1),
+            "only alpha's result is unseen"
+        );
     }
 
     fn settle(r: &mut Win) -> u32 {

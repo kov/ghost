@@ -3628,6 +3628,9 @@ struct WindowState {
     /// press dragged away is cancelled the way every toolkit's is.
     hovered_button: Option<ghost_ui_core::frame::WindowButton>,
     pressed_button: Option<ghost_ui_core::frame::WindowButton>,
+    /// What this window's frames were last drawn in, so a colour change eases
+    /// in rather than landing in one frame.
+    fades: ghost_ui_core::fade::ColorFades,
     /// The resize edge the pointer was last over, so the cursor is put back when
     /// it leaves and a press knows which edge it is grabbing.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -7135,6 +7138,7 @@ impl App {
                 activated: true,
                 hovered_button: None,
                 pressed_button: None,
+                fades: Default::default(),
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -7871,6 +7875,7 @@ impl App {
                 activated: true,
                 hovered_button: None,
                 pressed_button: None,
+                fades: Default::default(),
                 #[cfg(all(unix, not(target_os = "macos")))]
                 frame_edge: None,
                 pointer_down: false,
@@ -8330,17 +8335,25 @@ impl ApplicationHandler<UserEvent> for App {
                         // inside our shadow margins; put that space where it belongs
                         // and draw the bar above it.
                         let bar_px = gfx.bar_px();
-                        let scene = ghost_ui_core::frame::with_frame(
+                        let mut scene = ghost_ui_core::frame::with_frame(
                             scene,
                             bar.as_ref().expect("gfx implies a bar"),
                             margins,
                         );
-                        let model = t_model.elapsed();
                         // During a dive/slide, DEFER session surface rasters off the frame
                         // loop: a mid-animation tile that needs a full raster blits the best
                         // cached surface as a placeholder and is warmed one-per-frame below,
                         // so the animation never stalls on a slow session's raster.
                         let animating = win.root.is_animating();
+                        // Colour changes ease in — but not under a dive or slide,
+                        // which moves the chrome's colours itself.
+                        let fading = if animating {
+                            win.fades.clear();
+                            false
+                        } else {
+                            win.fades.apply(&mut scene, now_ms)
+                        };
+                        let model = t_model.elapsed();
                         gfx.renderer.set_deferring(animating);
                         // Rasterize at the model's render scale (device × zoom) so
                         // glyph size matches the grid the scene was laid out for.
@@ -8470,6 +8483,10 @@ impl ApplicationHandler<UserEvent> for App {
                         // ticks drive the redraws that keep draining this.
                         if animating {
                             gfx.renderer.warm_next(gfx.fonts);
+                        }
+                        // A colour still on its way wants the next frame too.
+                        if fading {
+                            win.pacer.request();
                         }
                     }
                 }

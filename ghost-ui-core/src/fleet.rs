@@ -4002,38 +4002,40 @@ impl FleetModel {
             });
 
             // What its program is doing, in the titlebar's colours, across the
-            // header — and a working program's progress along its foot.
+            // header — and a working program's progress along its foot. At rest
+            // the strip is the card's own colour, but drawn, so a tint leaving
+            // it eases away (see `fade`) rather than vanishing.
             let status = tile.bar_status(state, seen(&id));
-            if let Some(status) = &status {
+            out.push(SceneItem::Rect {
+                id: SceneId::CardStatus(handle),
+                rect: header,
+                color: status
+                    .as_ref()
+                    .map_or(CARD_BG, |s| crate::frame::status_bg(CARD_BG, s)),
+                radius: card_radius,
+            });
+            if let Some(BarStatus::Working { progress }) = &status {
+                let h = PROGRESS_LINE.min(header.h);
+                let (w, alpha) = match progress {
+                    Some(p) => (header.w * f32::from((*p).min(100)) / 100.0, 0.55),
+                    None => (header.w, 0.22),
+                };
                 out.push(SceneItem::Rect {
                     id: SceneId::CardStatus(handle),
-                    rect: header,
-                    color: crate::frame::status_bg(CARD_BG, status),
-                    radius: card_radius,
+                    rect: RectPx {
+                        x: header.x,
+                        y: header.y + header.h - h,
+                        w,
+                        h,
+                    },
+                    color: [
+                        CARD_META_COLOR[0],
+                        CARD_META_COLOR[1],
+                        CARD_META_COLOR[2],
+                        alpha,
+                    ],
+                    radius: 0.0,
                 });
-                if let BarStatus::Working { progress } = status {
-                    let h = PROGRESS_LINE.min(header.h);
-                    let (w, alpha) = match progress {
-                        Some(p) => (header.w * f32::from((*p).min(100)) / 100.0, 0.55),
-                        None => (header.w, 0.22),
-                    };
-                    out.push(SceneItem::Rect {
-                        id: SceneId::CardStatus(handle),
-                        rect: RectPx {
-                            x: header.x,
-                            y: header.y + header.h - h,
-                            w,
-                            h,
-                        },
-                        color: [
-                            CARD_META_COLOR[0],
-                            CARD_META_COLOR[1],
-                            CARD_META_COLOR[2],
-                            alpha,
-                        ],
-                        radius: 0.0,
-                    });
-                }
             }
 
             // Metadata header — or the live buffer of an in-progress rename.
@@ -6945,7 +6947,8 @@ mod tests {
             match &want {
                 // The strip, plus a working program's progress line.
                 Some(s) => assert_eq!(drawn.first(), Some(&strip_of(s)), "{status:?}"),
-                None => assert!(drawn.is_empty(), "{status:?}: {drawn:?}"),
+                // Plain, but drawn: a tint leaving it eases away (see `fade`).
+                None => assert_eq!(drawn, vec![CARD_BG], "{status:?}"),
             }
         }
         // Waiting, the header says what for.
@@ -6971,7 +6974,7 @@ mod tests {
     fn a_pushed_status_change_repaints_its_card() {
         let mut m = fleet();
         list(&mut m, &["a"]);
-        assert!(strips(&m).is_empty());
+        assert_eq!(strips(&m), vec![CARD_BG]);
         let cmds = push(
             &mut m,
             "a",
@@ -6988,7 +6991,7 @@ mod tests {
             SessionPush::Event(SessionEvent::StatusChanged(None)),
         );
         assert!(cmds.contains(&Cmd::Redraw));
-        assert!(strips(&m).is_empty());
+        assert_eq!(strips(&m), vec![CARD_BG]);
     }
 
     /// A previewed card reads its own mirror, which has the report the moment

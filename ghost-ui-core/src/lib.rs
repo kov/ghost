@@ -13,6 +13,7 @@
 pub mod cmd;
 pub mod encode;
 pub mod event;
+pub mod fade;
 pub mod fleet;
 pub mod frame;
 pub mod group;

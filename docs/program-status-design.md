@@ -158,6 +158,10 @@ record, because a second turn's `done` says exactly what the first one did.
   what to read. Bidi overrides and invisible formatting are stripped first.
 - ghost's own `Notice` still outranks all of this. A window that failed to do
   something says so first.
+- A tint arriving or leaving eases over 100 ms rather than landing in one
+  frame. That is true of every colour change in a window's frames (titlebar,
+  card headers, focus), done as one pass over the scene (`ghost-ui-core`'s
+  `fade`).
 
 **Attention button, the window's other sessions.** In the single view, a pill
 at the trailing end of the bar (inside the Details pill, when there is one)
