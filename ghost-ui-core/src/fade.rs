@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use ghost_render::scene::{Rgba, Scene, SceneId, SceneItem};
 
 /// How long a colour takes to reach a new one.
-pub const FADE_MS: u64 = 100;
+pub const FADE_MS: u64 = 200;
 
 /// What each item of a window's scene was last drawn in, and where it is
 /// heading. One per window: the scenes it eases must be that window's frames,
