@@ -42,7 +42,8 @@ enum Mode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionRow {
     pub id: SessionId,
-    /// The session's name as the user knows it.
+    /// The session's name as the user knows it: what its titlebar would say,
+    /// cut short.
     pub label: String,
     pub state: ghost_term::status::StatusState,
     pub kind: Option<ghost_term::status::BlockedKind>,
@@ -67,6 +68,21 @@ pub fn status_phrase(
         (StatusState::Working, _) => "is working",
         (StatusState::Idle, _) => "is idle",
     }
+}
+
+/// The longest name a row of the attention list gives its session, so a long
+/// title leaves room for what the session wants.
+const ATTENTION_LABEL_CHARS: usize = 30;
+
+/// `s` cut to `max` characters, the cut marked with an ellipsis.
+fn capped(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max - 1).collect();
+    t.truncate(t.trim_end().len());
+    t.push('…');
+    t
 }
 
 /// Where one row of the unfolded attention list is, for the click that picks it.
@@ -1746,7 +1762,7 @@ impl RootModel {
                 };
                 listed.then(|| AttentionRow {
                     id: id.clone(),
-                    label: state.display().to_string(),
+                    label: capped(&state.title(), ATTENTION_LABEL_CHARS),
                     state: headline.state,
                     kind: headline.kind,
                     msg: headline.msg,
@@ -4118,6 +4134,41 @@ mod tests {
             attention_of(&root, &sessions),
             vec![("b".into(), StatusState::Done)],
             "b's next result is news"
+        );
+    }
+
+    /// A row is named the way the titlebar would name its session — the
+    /// program's title over the bare id — and a long title is cut short so
+    /// what the session wants still shows.
+    #[test]
+    fn the_unfolded_list_names_each_session_by_its_title() {
+        let (mut root, mut sessions) = group_window();
+        let title = |root: &mut RootModel, sessions: &mut Sessions, name: &str, t: &str| {
+            let _ = root.update(
+                sessions,
+                UiEvent::SessionData {
+                    name: name.into(),
+                    bytes: format!("\x1b]2;{t}\x07").into_bytes(),
+                    ended: false,
+                },
+            );
+        };
+        title(&mut root, &mut sessions, "b", "cargo build");
+        title(
+            &mut root,
+            &mut sessions,
+            "c",
+            "a title far too long to leave room for anything after it",
+        );
+        report(&mut root, &mut sessions, "b", "state=idle");
+        report(&mut root, &mut sessions, "c", "state=error");
+        root.toggle_attention(&sessions);
+        assert_eq!(
+            drawn_list(&root, &sessions),
+            vec![
+                "a title far too long to leave… — failed".to_string(),
+                "cargo build — is idle".to_string(),
+            ]
         );
     }
 
